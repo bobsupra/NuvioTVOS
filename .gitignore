@@ -30,3 +30,7 @@ scripts/scrape_android_compose_animation_docs.py
 tools
 AGENTS.md
 server
+
+# Built IPAs are distributed via GitHub Releases, not committed
+*.ipa
+build-ipa/
