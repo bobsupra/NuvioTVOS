@@ -56,6 +56,10 @@ struct ContentView: View {
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var searchViewModel = SearchViewModel()
     @StateObject private var libraryViewModel = LibraryViewModel()
+    // Owned here (not inside TVHomeView) so the Home catalog + focused card
+    // survive the details/player push, which tears TVHomeView down. Returning
+    // then restores the exact card instead of reloading and jumping to the top.
+    @StateObject private var homeStore = TVHomeStore()
 
     var body: some View {
         ZStack {
@@ -79,75 +83,16 @@ struct ContentView: View {
                             }
                         }
                     }
-                    
-            case .main:
-                TVMainTabView(
-                    selectedTab: $selectedTab,
-                    activeProfile: profileViewModel.activeProfile,
-                    searchViewModel: searchViewModel,
-                    libraryViewModel: libraryViewModel,
-                    onSwitchProfile: {
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            selectedTab = .home
-                            profileViewModel.activeProfile = nil
-                            activeScreen = .profileSelection
-                        }
-                    },
-                    onNavigateToDetails: { contentId, contentType in
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            activeScreen = .details(id: contentId, type: contentType)
-                        }
-                    },
-                    onResumePlayback: { item in
-                        if let url = URL(string: item.streamUrl) {
-                            withAnimation(.easeInOut(duration: 0.28)) {
-                                activeScreen = .player(
-                                    url: url,
-                                    meta: item.meta,
-                                    subtitle: "",
-                                    externalSubtitles: [],
-                                    resumeFrom: item.resumePosition
-                                )
-                            }
-                        }
-                    }
-                )
-                .transition(.opacity)
-                
-            case .details(let contentId, let contentType):
-                DetailsScreen(
-                    id: contentId,
-                    type: contentType,
-                    repository: CinemetaCatalogRepository(),
-                    onPlayClick: { streamUrlString, meta, subtitle, externalSubtitles in
-                        if let url = URL(string: streamUrlString) {
-                            let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
-                            withAnimation(.easeInOut(duration: 0.28)) {
-                                activeScreen = .player(
-                                    url: url,
-                                    meta: meta,
-                                    subtitle: subtitle,
-                                    externalSubtitles: externalSubtitles,
-                                    resumeFrom: isTrailer ? nil : ContinueWatchingStore.item(for: meta.id)?.resumePosition
-                                )
-                            }
-                        }
-                    },
-                    onBack: {
-                        withAnimation(.easeInOut(duration: 0.24)) {
-                            activeScreen = .main
-                        }
-                    }
-                )
-                .transition(.asymmetric(insertion: .move(edge: .trailing), removal: .move(edge: .leading)))
-                
-            case .player(let url, let meta, let subtitle, let externalSubtitles, let resumeFrom):
-                PlayerView(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom) {
-                    withAnimation(.easeInOut(duration: 0.24)) {
-                        activeScreen = meta.isSeries ? .details(id: meta.id, type: meta.type) : .main
-                    }
-                }
-                .transition(.opacity)
+
+            case .main, .details, .player:
+                // The tab view (Home included) stays mounted for the whole
+                // session; Details and Player are presented as overlays on TOP
+                // of it rather than replacing it. Returning therefore leaves
+                // Home exactly as the user left it -- same scroll, same focused
+                // card (tvOS focus memory) -- instead of rebuilding it from
+                // scratch and snapping back to the first card.
+                appContainer
+                    .transition(.opacity)
             }
         }
         // Resolve every @AppStorage in the app against the active profile's
@@ -155,6 +100,15 @@ struct ContentView: View {
         // preferences, etc. Falls back to the shared store before a profile is picked.
         .defaultAppStorage(ProfileSettings.store(for: profileViewModel.activeProfile?.id))
         .background(Color.black.ignoresSafeArea())
+        // Safety net for the Menu button while an overlay is up. During the
+        // overlay's insert animation focus is briefly in limbo (the tab view is
+        // disabled, the overlay hasn't taken focus yet); a Menu press then finds
+        // no `.onExitCommand` handler and tvOS quits the app. This root handler
+        // catches those stray presses and dismisses the overlay instead. When
+        // focus is settled inside Details/Player their own handler fires first,
+        // so this only kicks in for the in-between frames. No handler is attached
+        // on Home, so Menu there keeps its normal tab-level behaviour.
+        .onExitCommand(perform: isOverlayPresented ? dismissOverlay : nil)
         .onAppear {
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
@@ -162,6 +116,163 @@ struct ContentView: View {
             // previously chosen to continue without an account.
             if !authManager.shouldShowLoginGate {
                 activeScreen = .profileSelection
+            }
+        }
+    }
+
+    /// Whether Details or Player is currently covering the tab view.
+    private var isOverlayPresented: Bool {
+        switch activeScreen {
+        case .details, .player: return true
+        default: return false
+        }
+    }
+
+    /// Dismisses the current overlay to the same destination its own back action
+    /// would (Player returns to Details for series/trailers, otherwise Home).
+    /// Used only by the root Menu-button safety net; changing `activeScreen`
+    /// tears the overlay down, so Player's `onDisappear` cleanup still runs.
+    private func dismissOverlay() {
+        switch activeScreen {
+        case .details:
+            withAnimation(.easeInOut(duration: 0.24)) {
+                activeScreen = .main
+            }
+        case let .player(_, meta, subtitle, _, _):
+            let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+            withAnimation(.easeInOut(duration: 0.24)) {
+                activeScreen = (isTrailer || meta.isSeries)
+                    ? .details(id: meta.id, type: meta.type)
+                    : .main
+            }
+        default:
+            break
+        }
+    }
+
+    /// The persistent tab view plus any Details/Player overlay. Keeping the tab
+    /// view here (never swapped out) is what preserves Home's state across the
+    /// details push. The tab view is disabled while an overlay is up so focus
+    /// can't bleed to the cards behind it; re-enabling on return hands focus
+    /// back to the card the user left on.
+    @ViewBuilder
+    private var appContainer: some View {
+        ZStack {
+            mainTabView
+                .disabled(isOverlayPresented)
+
+            if case .details(let contentId, let contentType) = activeScreen {
+                detailsScreen(contentId: contentId, contentType: contentType)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
+
+            if case .player(let url, let meta, let subtitle, let externalSubtitles, let resumeFrom) = activeScreen {
+                playerScreen(
+                    url: url,
+                    meta: meta,
+                    subtitle: subtitle,
+                    externalSubtitles: externalSubtitles,
+                    resumeFrom: resumeFrom
+                )
+                .transition(.opacity)
+                .zIndex(2)
+            }
+        }
+    }
+
+    private var mainTabView: some View {
+        TVMainTabView(
+            selectedTab: $selectedTab,
+            activeProfile: profileViewModel.activeProfile,
+            searchViewModel: searchViewModel,
+            libraryViewModel: libraryViewModel,
+            homeStore: homeStore,
+            onSwitchProfile: {
+                // A fresh profile should get a fresh Home (different Continue
+                // Watching, etc.), so drop the cached catalog.
+                homeStore.reset()
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    selectedTab = .home
+                    profileViewModel.activeProfile = nil
+                    activeScreen = .profileSelection
+                }
+            },
+            onNavigateToDetails: { contentId, contentType in
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .details(id: contentId, type: contentType)
+                }
+            },
+            onResumePlayback: { item in
+                if let url = URL(string: item.streamUrl) {
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        activeScreen = .player(
+                            url: url,
+                            meta: item.meta,
+                            subtitle: "",
+                            externalSubtitles: [],
+                            resumeFrom: item.resumePosition
+                        )
+                    }
+                }
+            }
+        )
+    }
+
+    private func detailsScreen(contentId: String, contentType: String) -> some View {
+        DetailsScreen(
+            id: contentId,
+            type: contentType,
+            repository: CinemetaCatalogRepository(),
+            onPlayClick: { streamUrlString, meta, subtitle, externalSubtitles in
+                if let url = URL(string: streamUrlString) {
+                    let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+                    withAnimation(.easeInOut(duration: 0.28)) {
+                        activeScreen = .player(
+                            url: url,
+                            meta: meta,
+                            subtitle: subtitle,
+                            externalSubtitles: externalSubtitles,
+                            resumeFrom: isTrailer ? nil : ContinueWatchingStore.item(for: meta.id)?.resumePosition
+                        )
+                    }
+                }
+            },
+            onBack: {
+                withAnimation(.easeInOut(duration: 0.24)) {
+                    activeScreen = .main
+                }
+            }
+        )
+    }
+
+    @ViewBuilder
+    private func playerScreen(
+        url: URL,
+        meta: NuvioMeta,
+        subtitle: String,
+        externalSubtitles: [NuvioSubtitle],
+        resumeFrom: Double?
+    ) -> some View {
+        let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        PlayerView(
+            url: url,
+            meta: meta,
+            subtitle: subtitle,
+            externalSubtitles: externalSubtitles,
+            resumeFrom: resumeFrom,
+            onFinished: isTrailer ? {
+                withAnimation(.easeInOut(duration: 0.24)) {
+                    activeScreen = .details(id: meta.id, type: meta.type)
+                }
+            } : nil
+        ) {
+            withAnimation(.easeInOut(duration: 0.24)) {
+                if isTrailer {
+                    activeScreen = .details(id: meta.id, type: meta.type)
+                } else {
+                    activeScreen = meta.isSeries ? .details(id: meta.id, type: meta.type) : .main
+                }
             }
         }
     }
@@ -193,28 +304,55 @@ private struct CrossfadingBackdrop: View {
 
     @State private var image: UIImage?
     @State private var loadedURL: String?
+    @State private var outgoingImage: UIImage?
+    @State private var outgoingOpacity = 0.0
+    @State private var imageOpacity = 1.0
 
     var body: some View {
         ZStack {
             placeholder
+            if let outgoingImage {
+                Image(uiImage: outgoingImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .opacity(outgoingOpacity)
+            }
             if let image {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
-                    .transition(.opacity)
+                    .opacity(imageOpacity)
                     .id(loadedURL)
             }
         }
         .task(id: url) {
-            guard let url, url != loadedURL, let imageURL = URL(string: url) else { return }
+            guard let url, url != loadedURL, let imageURL = URL(string: url) else {
+                outgoingImage = nil
+                outgoingOpacity = 0
+                return
+            }
             guard let loaded = await BackdropImageCache.shared.image(for: imageURL) else { return }
             // `.task(id:)` cancels when `url` changes, so reaching here means this
             // URL is still the focused one. Cancellation leaves the old image up.
             guard !Task.isCancelled else { return }
-            withAnimation(.easeInOut(duration: 0.44)) {
-                image = loaded
-                loadedURL = url
+            let previousImage = image
+            if previousImage != nil {
+                outgoingImage = previousImage
+                outgoingOpacity = 1
             }
+            image = loaded
+            loadedURL = url
+            imageOpacity = previousImage == nil ? 1 : 0
+
+            withAnimation(.easeInOut(duration: 0.30)) {
+                imageOpacity = 1
+                outgoingOpacity = 0
+            }
+
+            try? await Task.sleep(nanoseconds: 300_000_000)
+            guard !Task.isCancelled, loadedURL == url else { return }
+            outgoingImage = nil
+            outgoingOpacity = 0
         }
     }
 }
@@ -245,6 +383,7 @@ private struct TVMainTabView: View {
     let activeProfile: Profile?
     @ObservedObject var searchViewModel: SearchViewModel
     @ObservedObject var libraryViewModel: LibraryViewModel
+    @ObservedObject var homeStore: TVHomeStore
     let onSwitchProfile: () -> Void
     let onNavigateToDetails: (String, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
@@ -294,6 +433,7 @@ private struct TVMainTabView: View {
             }
 
             TVHomeView(
+                store: homeStore,
                 repository: CinemetaCatalogRepository(),
                 onNavigateToDetails: onNavigateToDetails,
                 onResumePlayback: onResumePlayback
@@ -491,6 +631,7 @@ private struct HomeRowTopsKey: PreferenceKey {
 }
 
 struct TVHomeView: View {
+    @ObservedObject var store: TVHomeStore
     let repository: CatalogRepository
     let onNavigateToDetails: (String, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
@@ -505,18 +646,15 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
 
     @State private var isLoading = true
-    @State private var hero: NuvioMeta?
     @State private var focusedMeta: NuvioMeta?
     @State private var pendingFocusedMeta: NuvioMeta?
     @State private var focusSettleTask: Task<Void, Never>?
     @State private var landscapeFocusedId: String?
     @State private var pendingLandscapeFocusedId: String?
     @State private var landscapeFocusTask: Task<Void, Never>?
-    @State private var sections: [TVHomeSection] = []
     @State private var continueWatching: [ContinueWatchingItem] = []
     @State private var errorMessage: String?
     @State private var didRequestInitialCardFocus = false
-    @State private var lastFocusedCardID: String?
     @State private var shouldRestoreHomeFocus = false
     @State private var focusedRowIndex = 0
     @State private var rowTops: [Int: CGFloat] = [:]
@@ -575,7 +713,7 @@ struct TVHomeView: View {
 
             // 3. Scrollable catalog rows overlay, with pinned Hero at the top
             VStack(alignment: .leading, spacing: 0) {
-                if isLoading {
+                if showsLoading {
                     TVLoadingView()
                         .overlay {
                             Color.clear
@@ -613,7 +751,7 @@ struct TVHomeView: View {
                                         title: section.title,
                                         items: section.items,
                                         progressByItemId: section.id == TVHomeSection.continueWatchingId ? continueWatchingByMetaId : [:],
-                                        prefersInitialFocus: !didRequestInitialCardFocus && section.id == firstFocusableSectionId,
+                                        initialFocusCardKey: initialFocusCardKey,
                                         landscapeFocusedId: landscapeFocusedId,
                                         externalFocus: $focusedCardID,
                                         onInitialFocusRequested: {
@@ -680,7 +818,7 @@ struct TVHomeView: View {
                     // focus, so the first Menu press can still reach the sidebar,
                     // while returning from the sidebar restores the saved card.
                     .focusSection()
-                    .defaultFocusIfAvailable($focusedCardID, shouldRestoreHomeFocus ? lastFocusedCardID : nil)
+                    .defaultFocusIfAvailable($focusedCardID, shouldRestoreHomeFocus ? store.lastFocusedCardID : nil)
                 }
             }
             .ignoresSafeArea(.container, edges: .top)
@@ -689,6 +827,12 @@ struct TVHomeView: View {
             await load()
         }
         .onAppear {
+            refreshContinueWatching()
+        }
+        // Home stays mounted behind Details/Player, so `onAppear` no longer
+        // fires on return. Refresh the Continue Watching row whenever the store
+        // changes (progress saved during playback, item finished/removed).
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification)) { _ in
             refreshContinueWatching()
         }
         .onDisappear {
@@ -702,16 +846,39 @@ struct TVHomeView: View {
         }
         .onChange(of: focusedCardID) { newValue in
             if let newValue {
-                lastFocusedCardID = newValue
+                store.lastFocusedCardID = newValue
                 shouldRestoreHomeFocus = false
-            } else if lastFocusedCardID != nil {
+            } else if store.lastFocusedCardID != nil {
                 shouldRestoreHomeFocus = true
             }
         }
     }
 
+    /// The loading spinner should only replace the catalog on a genuine first
+    /// load. When returning from a card the sections are already cached in the
+    /// store, so we render them straight away instead of flashing the spinner.
+    private var showsLoading: Bool {
+        isLoading && store.sections.isEmpty
+    }
+
     private var firstFocusableSectionId: String? {
         visibleSections.first(where: { !$0.items.isEmpty })?.id
+    }
+
+    /// Composite key of the card that should grab focus when the rows appear.
+    /// On a fresh load that's the first card; when returning from details it's
+    /// the card the user left on (persisted in the store), so focus lands back
+    /// exactly where it was — the same behaviour as coming out of the menu.
+    private var initialFocusCardKey: String? {
+        guard !didRequestInitialCardFocus else { return nil }
+        if store.hasLoaded, let saved = store.lastFocusedCardID {
+            return saved
+        }
+        guard let sectionId = firstFocusableSectionId,
+              let first = visibleSections.first(where: { $0.id == sectionId })?.items.first else {
+            return nil
+        }
+        return "\(sectionId)\u{1}\(first.id)"
     }
 
     /// Vertical translation that lands the row at `index` where the first row
@@ -730,7 +897,7 @@ struct TVHomeView: View {
             title: "Continue Watching",
             items: continueWatching.map(\.meta)
         )
-        let allSections = continueWatching.isEmpty ? sections : [resumeSection] + sections
+        let allSections = continueWatching.isEmpty ? store.sections : [resumeSection] + store.sections
 
         return allSections.map { section in
             TVHomeSection(id: section.id, title: section.title, items: section.items.filter(isVisible))
@@ -742,7 +909,7 @@ struct TVHomeView: View {
     }
 
     private var visibleHero: NuvioMeta? {
-        guard let hero, isVisible(hero) else { return visibleSections.first?.items.first }
+        guard let hero = store.hero, isVisible(hero) else { return visibleSections.first?.items.first }
         return hero
     }
 
@@ -785,6 +952,15 @@ struct TVHomeView: View {
 
     @MainActor
     private func load() async {
+        // Returning from a card: the catalog is still cached in the store, so
+        // skip the network round-trip. The saved card re-focuses itself via
+        // `initialFocusCardKey`, which restores the row/scroll position too.
+        if store.hasLoaded {
+            isLoading = false
+            refreshContinueWatching()
+            return
+        }
+
         isLoading = true
         errorMessage = nil
 
@@ -813,15 +989,16 @@ struct TVHomeView: View {
                 )
             }
 
-            sections = loadedSections
+            store.sections = loadedSections
+            store.hero = loadedSections.first?.items.first
+            store.lastFocusedCardID = nil
+            store.hasLoaded = true
             refreshContinueWatching()
-            hero = loadedSections.first?.items.first
             focusedMeta = loadedSections.first?.items.first
             pendingFocusedMeta = focusedMeta
             landscapeFocusedId = nil
             pendingLandscapeFocusedId = nil
             didRequestInitialCardFocus = false
-            lastFocusedCardID = nil
             shouldRestoreHomeFocus = false
             isLoading = false
         } catch {
@@ -850,8 +1027,8 @@ struct TVHomeView: View {
 
     @MainActor
     private func loadMoreSectionIfNeeded(sectionId: String, currentItem: NuvioMeta) {
-        guard let sectionIndex = sections.firstIndex(where: { $0.id == sectionId }) else { return }
-        let section = sections[sectionIndex]
+        guard let sectionIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
+        let section = store.sections[sectionIndex]
         guard section.hasMore,
               !section.isLoadingMore,
               let contentType = section.contentType,
@@ -862,7 +1039,7 @@ struct TVHomeView: View {
         }
 
         let requestedSkip = section.nextSkip ?? section.items.count
-        sections[sectionIndex].isLoadingMore = true
+        store.sections[sectionIndex].isLoadingMore = true
 
         Task { @MainActor in
             do {
@@ -873,17 +1050,17 @@ struct TVHomeView: View {
                     genre: nil
                 )
 
-                guard let latestIndex = sections.firstIndex(where: { $0.id == sectionId }) else { return }
-                let existingIds = Set(sections[latestIndex].items.map(\.id))
+                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
+                let existingIds = Set(store.sections[latestIndex].items.map(\.id))
                 let newItems = page.items.filter { !existingIds.contains($0.id) }
 
-                sections[latestIndex].items.append(contentsOf: newItems)
-                sections[latestIndex].nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
-                sections[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
-                sections[latestIndex].isLoadingMore = false
+                store.sections[latestIndex].items.append(contentsOf: newItems)
+                store.sections[latestIndex].nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
+                store.sections[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
+                store.sections[latestIndex].isLoadingMore = false
             } catch {
-                guard let latestIndex = sections.firstIndex(where: { $0.id == sectionId }) else { return }
-                sections[latestIndex].isLoadingMore = false
+                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
+                store.sections[latestIndex].isLoadingMore = false
             }
         }
     }
@@ -929,7 +1106,7 @@ struct TVHomeView: View {
     }
 }
 
-private struct TVHomeSection: Identifiable {
+struct TVHomeSection: Identifiable {
     static let continueWatchingId = "continue_watching"
 
     let id: String
@@ -942,6 +1119,27 @@ private struct TVHomeSection: Identifiable {
     var isLoadingMore: Bool = false
 }
 
+/// Holds the Home screen's browsing state outside `TVHomeView` so it survives
+/// the details/player push (which tears the view down). Owned by `ContentView`;
+/// lets returning from a card restore the cached catalog + the focused card
+/// instead of reloading and jumping back to the top.
+final class TVHomeStore: ObservableObject {
+    @Published var sections: [TVHomeSection] = []
+    @Published var hero: NuvioMeta?
+    /// True once the catalog has loaded at least once, so `load()` can skip the
+    /// network round-trip on return.
+    @Published var hasLoaded = false
+    /// Composite "<sectionId>\u{1}<metaId>" key of the last focused card.
+    var lastFocusedCardID: String?
+
+    func reset() {
+        sections = []
+        hero = nil
+        hasLoaded = false
+        lastFocusedCardID = nil
+    }
+}
+
 private let TVHomeRowPrefetchThreshold = 6
 
 private struct TVHeroView: View {
@@ -952,17 +1150,7 @@ private struct TVHeroView: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             if let logoUrl = meta.logoUrl {
-                AsyncImage(url: URL(string: logoUrl)) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFit()
-                    } else {
-                        Text(meta.name)
-                            .font(.custom("Inter-Bold", size: 54))
-                    }
-                }
-                .frame(width: 440, height: 114, alignment: .leading)
+                CachedHeroLogo(url: logoUrl, title: meta.name)
             } else {
                 Text(meta.name)
                     .font(.custom("Inter-Bold", size: 54))
@@ -990,12 +1178,83 @@ private struct TVHeroView: View {
     }
 }
 
+private struct CachedHeroLogo: View {
+    let url: String
+    let title: String
+
+    @State private var image: UIImage?
+    @State private var loadedURL: String?
+    @State private var outgoingImage: UIImage?
+    @State private var outgoingOpacity = 0.0
+    @State private var imageOpacity = 1.0
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            if let outgoingImage {
+                Image(uiImage: outgoingImage)
+                    .resizable()
+                    .scaledToFit()
+                    .opacity(outgoingOpacity)
+            }
+            if let image {
+                Image(uiImage: image)
+                    .resizable()
+                    .scaledToFit()
+                    .opacity(imageOpacity)
+                    .id(loadedURL)
+            } else {
+                Text(title)
+                    .font(.custom("Inter-Bold", size: 54))
+                    .lineLimit(2)
+            }
+        }
+        .frame(width: 440, height: 114, alignment: .leading)
+        .task(id: url) {
+            guard url != loadedURL, let imageURL = URL(string: url) else {
+                outgoingImage = nil
+                outgoingOpacity = 0
+                return
+            }
+            guard let loaded = await BackdropImageCache.shared.image(for: imageURL) else {
+                guard !Task.isCancelled else { return }
+                image = nil
+                loadedURL = nil
+                outgoingImage = nil
+                outgoingOpacity = 0
+                return
+            }
+            guard !Task.isCancelled else { return }
+            let previousImage = image
+            if previousImage != nil {
+                outgoingImage = previousImage
+                outgoingOpacity = 1
+            }
+            image = loaded
+            loadedURL = url
+            imageOpacity = previousImage == nil ? 1 : 0
+
+            withAnimation(.easeInOut(duration: 0.14)) {
+                imageOpacity = 1
+                outgoingOpacity = 0
+            }
+
+            try? await Task.sleep(nanoseconds: 140_000_000)
+            guard !Task.isCancelled, loadedURL == url else { return }
+            outgoingImage = nil
+            outgoingOpacity = 0
+        }
+    }
+}
+
 private struct TVCatalogRow: View {
     let id: String
     let title: String
     let items: [NuvioMeta]
     var progressByItemId: [String: ContinueWatchingItem] = [:]
-    let prefersInitialFocus: Bool
+    /// Composite key ("<sectionId>\u{1}<metaId>") of the card that should take
+    /// focus on appear — the first card on a fresh load, or the card the user
+    /// left on when returning from details.
+    let initialFocusCardKey: String?
     let landscapeFocusedId: String?
     var externalFocus: FocusState<String?>.Binding? = nil
     let onInitialFocusRequested: () -> Void
@@ -1055,11 +1314,12 @@ private struct TVCatalogRow: View {
 
             HStack(alignment: .bottom, spacing: rowSpacing) {
                 ForEach(items) { item in
-                    let shouldRequestInitialFocus = prefersInitialFocus && item.id == items.first?.id
+                    let cardKey = "\(id)\u{1}\(item.id)"
+                    let shouldRequestInitialFocus = cardKey == initialFocusCardKey
                     let progressItem = progressByItemId[item.id]
                     PosterCard(
                         meta: item,
-                        isLandscape: homeLayout == "Modern" && landscapeFocusedId == "\(id)\u{1}\(item.id)",
+                        isLandscape: homeLayout == "Modern" && landscapeFocusedId == cardKey,
                         continueProgress: progressItem?.progress,
                         continueRemainingText: progressItem?.remainingText,
                         shouldRequestInitialFocus: shouldRequestInitialFocus,
@@ -1075,7 +1335,7 @@ private struct TVCatalogRow: View {
                             onBlur(blurred)
                         },
                         externalFocus: externalFocus,
-                        externalFocusValue: "\(id)\u{1}\(item.id)"
+                        externalFocusValue: cardKey
                     ) {
                         onSelect(item)
                     }

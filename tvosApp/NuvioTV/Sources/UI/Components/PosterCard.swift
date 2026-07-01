@@ -65,6 +65,9 @@ struct PosterCard: View {
                 .overlay(alignment: .topTrailing) {
                     continueBadge
                 }
+                .overlay(alignment: .topTrailing) {
+                    WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                         .stroke(focusedBorderColor, lineWidth: focusedBorderWidth)
@@ -331,6 +334,43 @@ struct PosterCard: View {
         false
     }
     #endif
+}
+
+struct WatchedCheckmarkBadge: View {
+    let metaId: String
+    let type: String
+    var size: CGFloat = 38
+
+    @State private var isWatched = false
+
+    var body: some View {
+        Group {
+            if isWatched {
+                Image(systemName: "checkmark")
+                    .font(.system(size: size * 0.48, weight: .bold))
+                    .foregroundColor(.white)
+                    .frame(width: size, height: size)
+                    .background(
+                        Circle()
+                            .fill(Color(red: 0.10, green: 0.68, blue: 0.34))
+                    )
+                    .overlay(
+                        Circle()
+                            .stroke(Color.white.opacity(0.45), lineWidth: 1)
+                    )
+                    .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+                    .padding(12)
+            }
+        }
+        .onAppear(perform: refresh)
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
+            refresh()
+        }
+    }
+
+    private func refresh() {
+        isWatched = WatchedStore.contains(metaId: metaId, type: type)
+    }
 }
 
 /// Custom button style for poster cards

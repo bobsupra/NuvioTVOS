@@ -1386,11 +1386,11 @@ private struct TvDetailsCastAndTrailer: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
             HStack(spacing: 18) {
-                TvDetailsSectionButton(title: "Creator and Cast", isSelected: true, onFocus: onFocus) {}
+                TvDetailsSectionButton(title: "Creator and Cast", isSelected: false, onFocus: onFocus) {}
 
                 Text("|")
                     .font(.system(size: 36, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
+                    .foregroundColor(.white.opacity(0.38))
 
                 TvDetailsSectionButton(title: "Trailer", isSelected: false, onFocus: onFocus, action: onTrailerClick)
             }

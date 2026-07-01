@@ -201,6 +201,12 @@ struct ContinueWatchingItem: Identifiable, Codable {
 }
 
 enum ContinueWatchingStore {
+    /// Posted whenever the list changes (progress saved, item removed, profile
+    /// switched) so views like Home can refresh their Continue Watching row
+    /// without relying on `onAppear` — which no longer re-fires now that Home
+    /// stays mounted behind the Details/Player overlays.
+    static let changedNotification = Notification.Name("nuvio.tv.continueWatching.changed")
+
     /// Base key. Used on its own for the legacy (pre-profile) shared list and
     /// suffixed with the active profile id for per-profile watch history.
     private static let baseKey = "nuvio.tv.continueWatching.items"
@@ -216,6 +222,7 @@ enum ContinueWatchingStore {
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
         migrateLegacyHistoryIfNeeded()
+        NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
     private static var storageKey: String {
@@ -268,6 +275,7 @@ enum ContinueWatchingStore {
     private static func persist(_ items: [ContinueWatchingItem]) {
         guard let data = try? JSONEncoder().encode(items) else { return }
         UserDefaults.standard.set(data, forKey: storageKey)
+        NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
     /// One-time copy of the old shared list into the active profile's bucket so

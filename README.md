@@ -35,13 +35,20 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 
 This tvOS app is still early and needs real device/simulator testing. The list below is not complete; contributors should run the app, compare it with the Android TV version, and call out anything that feels broken, rough, or missing.
 
-Known areas that need work:
+Current tvOS status:
+
+- Library basics now work, including adding/removing titles, watched-state persistence, consistent poster sizing, and watched checkmark badges on cards.
+- Search has received initial polish and bug fixes, including consistent poster sizing and watched checkmark badges.
+- Trailer playback now opens in the player, resolves YouTube trailer streams at 1080p or better when available, supports adaptive video/audio streams, and returns to the title details page afterward.
+- Home focus/hero behavior has been improved with smoother card focus, cached hero logo loading, and crossfaded hero/backdrop transitions.
+
+Known areas that still need work:
 
 - Nuvio addon UI flows have not been fully tested on tvOS yet.
 - Video playback is currently choppy/laggy during movies. This may be frame pacing, FPS, rendering, buffering, MPVKit configuration, or something else that needs profiling.
-- The Search page needs polish and bug fixes.
-- The Library page is currently not working correctly.
-- Vertical and horizontal scrolling need smoother animation and better focus feel.
+- Search still needs more real-world testing and bug fixing.
+- Library still needs more sorting/grouping validation and real-world testing.
+- Vertical and horizontal scrolling still need more tuning on real devices.
 - The current layout is using the modern view only. Grid view and the other layout settings from Android TV still need to be brought over.
 - IntroDB integration is needed.
 - Trakt is not implemented yet.

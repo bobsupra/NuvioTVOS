@@ -21,20 +21,11 @@ struct PlayerControls: View {
     }
 
     var body: some View {
-        ZStack {
-            LinearGradient(
-                colors: [.black.opacity(0.62), .black.opacity(0.22), .black.opacity(0.62)],
-                startPoint: .top,
-                endPoint: .bottom
-            )
-            .ignoresSafeArea()
-
-            GlassControlsContainer {
-                VStack {
-                    topBar
-                    Spacer()
-                    bottomControls
-                }
+        GlassControlsContainer {
+            VStack {
+                topBar
+                Spacer()
+                bottomControls
             }
         }
         .sheet(isPresented: $showSettings) {
@@ -105,6 +96,7 @@ struct PlayerControls: View {
         }
         .padding(.horizontal, 60)
         .padding(.top, 34)
+        .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
     }
 
     // MARK: - Bottom controls
@@ -144,6 +136,7 @@ struct PlayerControls: View {
             }
             .focused($focusedControl, equals: .settings)
         }
+        .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
         // Not focusable while hidden so the focus engine hands off to the
         // remote-input overlay (the controls view itself stays mounted).
         .disabled(!viewModel.showControls)
@@ -163,15 +156,16 @@ struct PlayerControls: View {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: size, height: size)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-            .frame(width: size, height: size)
-            .clipShape(Circle())
-            .contentShape(Circle())
-            .shadow(
-                color: .white.opacity(isEmphasized ? 0.74 : 0.42),
-                radius: isFocused ? 18 : 10,
-                x: 0,
-                y: 0
-            )
+                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
+                .frame(width: size, height: size)
+                .clipShape(Circle())
+                .contentShape(Circle())
+                .shadow(
+                    color: .white.opacity(isEmphasized ? 0.74 : 0.42),
+                    radius: isFocused ? 18 : 10,
+                    x: 0,
+                    y: 0
+                )
         }
         .buttonStyle(PosterCardButtonStyle())
         .focusEffectDisabledIfAvailable()
@@ -213,6 +207,7 @@ struct PlayerControls: View {
         .focusable(viewModel.showControls)
         .focused($focusedControl, equals: .timeline)
         .focusEffectDisabledIfAvailable()
+        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
     }
 }

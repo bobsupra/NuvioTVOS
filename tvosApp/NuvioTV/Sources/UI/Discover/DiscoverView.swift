@@ -223,6 +223,9 @@ private struct DiscoverCard: View {
                 }
                 .frame(width: 210, height: 315)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .overlay(alignment: .topTrailing) {
+                    WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
                         .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? 5 : 3)

@@ -112,6 +112,9 @@ struct LibraryItemButton: View {
                 }
                 .frame(width: 210, height: 315)
                 .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                .overlay(alignment: .topTrailing) {
+                    WatchedCheckmarkBadge(metaId: item.id, type: item.contentType)
+                }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                         .stroke(isFocused ? focusBorderColor : Color.clear, lineWidth: focusHighlighter ? 5 : 3)

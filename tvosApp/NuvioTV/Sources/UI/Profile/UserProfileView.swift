@@ -19,20 +19,7 @@ public struct UserProfileView: View {
                 ProfileBackground()
 
                 VStack(spacing: 0) {
-                    Spacer().frame(height: 56)
-
-                    // Brand lockup: gradient play mark + wordmark.
-                    HStack(spacing: 18) {
-                        Image("SplashScreenLegacy")
-                            .resizable()
-                            .scaledToFit()
-                            .frame(width: 60, height: 60)
-                        Text("nuvio")
-                            .font(.custom("Inter-Bold", size: 46))
-                            .foregroundColor(.white)
-                    }
-
-                    Spacer().frame(height: 46)
+                    Spacer().frame(height: 162)
 
                     Text("Who's watching?")
                         .font(.custom("Inter-Bold", size: 62))
@@ -69,10 +56,6 @@ public struct UserProfileView: View {
                     .frame(maxWidth: .infinity)
 
                     Spacer()
-
-                    Text("Use D-pad to choose a profile")
-                        .font(.custom("Inter-Regular", size: 24))
-                        .foregroundColor(.white.opacity(0.45))
 
                     Spacer().frame(height: 56)
                 }

@@ -9,7 +9,11 @@ struct PlayerView: View {
     let subtitle: String
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
+    var onFinished: (() -> Void)? = nil
     var onBack: () -> Void
+
+    @State private var didHandleFinished = false
+    @FocusState private var remoteInputFocused: Bool
 
     var body: some View {
         ZStack {
@@ -47,14 +51,16 @@ struct PlayerView: View {
             }
 
             if !viewModel.showControls {
-                PlayerRemoteInputOverlay(
-                    onSelect: viewModel.revealControls,
-                    onLeft: viewModel.skipBackward,
-                    onRight: viewModel.skipForward,
-                    onExit: onBack
-                )
+                Button(action: viewModel.revealControls) {
+                    Color.clear
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .focused($remoteInputFocused)
+                .focusEffectDisabledIfAvailable()
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .ignoresSafeArea()
+                .onAppear(perform: focusRemoteInput)
             }
 
             // Kept mounted (not gated by an `if`) so the hide animates too: removing
@@ -75,6 +81,22 @@ struct PlayerView: View {
         .onDisappear {
             viewModel.pause()
         }
+        .onChange(of: viewModel.status) { status in
+            guard status == .ended,
+                  !didHandleFinished,
+                  let onFinished else {
+                return
+            }
+            didHandleFinished = true
+            onFinished()
+        }
+        .onChange(of: viewModel.showControls) { isVisible in
+            if isVisible {
+                remoteInputFocused = false
+            } else {
+                focusRemoteInput()
+            }
+        }
         .onPlayPauseCommand {
             viewModel.togglePlayPause()
         }
@@ -91,6 +113,12 @@ struct PlayerView: View {
         }
         .onExitCommand(perform: onBack)
     }
+
+    private func focusRemoteInput() {
+        DispatchQueue.main.async {
+            remoteInputFocused = true
+        }
+    }
 }
 
 // Hosts the libmpv UIViewController (owns the CAMetalLayer surface).
@@ -102,76 +130,4 @@ struct MPVVideoSurface: UIViewControllerRepresentable {
     }
 
     func updateUIViewController(_ uiViewController: MPVPlayerViewController, context: Context) {}
-}
-
-private struct PlayerRemoteInputOverlay: UIViewRepresentable {
-    let onSelect: () -> Void
-    let onLeft: () -> Void
-    let onRight: () -> Void
-    let onExit: () -> Void
-
-    func makeUIView(context: Context) -> RemoteInputView {
-        let view = RemoteInputView()
-        view.backgroundColor = .clear
-        view.isOpaque = false
-        view.onSelect = onSelect
-        view.onLeft = onLeft
-        view.onRight = onRight
-        view.onExit = onExit
-        return view
-    }
-
-    func updateUIView(_ uiView: RemoteInputView, context: Context) {
-        uiView.onSelect = onSelect
-        uiView.onLeft = onLeft
-        uiView.onRight = onRight
-        uiView.onExit = onExit
-        DispatchQueue.main.async {
-            uiView.setNeedsFocusUpdate()
-            uiView.updateFocusIfNeeded()
-        }
-    }
-
-    final class RemoteInputView: UIView {
-        var onSelect: (() -> Void)?
-        var onLeft: (() -> Void)?
-        var onRight: (() -> Void)?
-        var onExit: (() -> Void)?
-
-        override var canBecomeFocused: Bool { true }
-
-        override func didMoveToWindow() {
-            super.didMoveToWindow()
-            setNeedsFocusUpdate()
-            updateFocusIfNeeded()
-        }
-
-        override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-            var handledPresses = Set<UIPress>()
-
-            for press in presses {
-                switch press.type {
-                case .leftArrow:
-                    onLeft?()
-                    handledPresses.insert(press)
-                case .rightArrow:
-                    onRight?()
-                    handledPresses.insert(press)
-                case .select:
-                    onSelect?()
-                    handledPresses.insert(press)
-                case .menu:
-                    onExit?()
-                    handledPresses.insert(press)
-                default:
-                    break
-                }
-            }
-
-            let remainingPresses = presses.subtracting(handledPresses)
-            if !remainingPresses.isEmpty {
-                super.pressesBegan(remainingPresses, with: event)
-            }
-        }
-    }
 }
