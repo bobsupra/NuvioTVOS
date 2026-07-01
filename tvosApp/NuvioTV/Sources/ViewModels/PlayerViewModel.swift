@@ -34,6 +34,7 @@ class PlayerViewModel: ObservableObject {
     private var pollTimer: Timer?
     private var controlsHideTimer: Timer?
     private var hasLoaded = false
+    private var didShutdown = false
     private var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
     private var pendingResumeSeconds: Double?
@@ -223,6 +224,21 @@ class PlayerViewModel: ObservableObject {
         showControls = true
         saveProgress(force: true)
         scheduleControlsHide()
+    }
+
+    func shutdown() {
+        guard !didShutdown else { return }
+        didShutdown = true
+        pollTimer?.invalidate()
+        pollTimer = nil
+        controlsHideTimer?.invalidate()
+        controlsHideTimer = nil
+        trailerResolveTask?.cancel()
+        trailerResolveTask = nil
+        playerController.pausePlayback()
+        saveProgress(force: true)
+        playerController.destroyPlayer()
+        status = .idle
     }
 
     func togglePlayPause() {
@@ -688,6 +704,8 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
         checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "yes"))
+        checkError(mpv_set_option_string(mpv, "target-prim", "auto"))
+        checkError(mpv_set_option_string(mpv, "target-trc", "auto"))
 
         checkError(mpv_initialize(mpv))
         applySubtitleStyle()

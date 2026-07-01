@@ -58,8 +58,9 @@ struct PlayerView: View {
                 .buttonStyle(.plain)
                 .focused($remoteInputFocused)
                 .focusEffectDisabledIfAvailable()
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .ignoresSafeArea()
+                .frame(width: 1, height: 1)
+                .opacity(0.001)
+                .accessibilityHidden(true)
                 .onAppear(perform: focusRemoteInput)
             }
 
@@ -79,7 +80,7 @@ struct PlayerView: View {
             viewModel.load(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
         }
         .onDisappear {
-            viewModel.pause()
+            viewModel.shutdown()
         }
         .onChange(of: viewModel.status) { status in
             guard status == .ended,
@@ -111,7 +112,10 @@ struct PlayerView: View {
                 viewModel.revealControls()
             }
         }
-        .onExitCommand(perform: onBack)
+        .onExitCommand {
+            remoteInputFocused = false
+            onBack()
+        }
     }
 
     private func focusRemoteInput() {
