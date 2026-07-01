@@ -20,9 +20,6 @@
 
 </div>
 
-## Download
-
-**[⬇️ Download `TVOS beta 1.ipa` (Apple TV)](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-1)** &nbsp;·&nbsp; [all releases](https://github.com/bobsupra/NuvioTVOS/releases)
 
 The Apple TV build is published as a `.ipa` on the [Releases page](https://github.com/bobsupra/NuvioTVOS/releases). Sideload it onto an Apple TV with your preferred tool (for example a Mac with Xcode, Apple Configurator, or a sideloading utility). This is a beta build — see the release notes for what works and what still needs testing.
 
