@@ -2,6 +2,9 @@ import Foundation
 import Combine
 import SwiftUI
 import UIKit
+import AVFoundation
+import AVKit
+import CoreMedia
 import Libmpv
 
 // MARK: - PlayerViewModel (MPV-backed)
@@ -759,6 +762,7 @@ final class MPVPlayerViewController: UIViewController {
         pendingURL = nil
         layoutMetalLayer()
         clearPlaybackError()
+        didApplyDisplayCriteria = false
         isPlayerLoading = true
         isPlayerEnded = false
         command("loadfile", args: [url, "replace"])
@@ -851,6 +855,7 @@ final class MPVPlayerViewController: UIViewController {
     func destroyPlayer() {
         NotificationCenter.default.removeObserver(self)
         pendingURL = nil
+        clearDisplayCriteria()
         clearPlaybackError()
         guard let ctx = mpv else { return }
         mpv = nil  // nil first so the event loop stops reading
@@ -948,6 +953,147 @@ final class MPVPlayerViewController: UIViewController {
         return filtered.isEmpty ? base : "\(base) (\(filtered.joined(separator: ", ")))"
     }
 
+    // MARK: - HDR display mode switching
+    //
+    // tvOS never switches the HDMI output to HDR just because a Metal layer
+    // renders PQ/HLG content — only AVFoundation players get that for free.
+    // When "Match Content → Dynamic Range" is enabled on the Apple TV, apps
+    // must request the switch through AVDisplayManager. tvOS 17 added a public
+    // AVDisplayCriteria initializer, so build a format description carrying the
+    // stream's color tags (BT.2020 + PQ/HLG) and hand it to the window. Also
+    // carries the container frame rate, so "Match Frame Rate" works too.
+
+    /// `-[UIWindow avDisplayManager]` is an ObjC *category* from AVKit: calling
+    /// it creates no link-time symbol reference, so the linker drops AVKit from
+    /// the binary and the selector doesn't exist at runtime (crashed on device
+    /// with "unrecognized selector"). Referencing a real AVKit class forces the
+    /// framework to be linked and loaded.
+    private static let avKitLinkAnchor: AnyClass = AVDisplayManager.self
+
+    /// The window we last set criteria on; doubles as the "criteria active" flag.
+    private weak var displayCriteriaWindow: UIWindow?
+    /// Criteria are applied at most once per loaded file (reset in
+    /// `attemptStartPendingLoad`). Re-running on every VIDEO_RECONFIG would
+    /// re-trigger HDMI mode switches — including the RECONFIG our own
+    /// detach/reattach dance produces.
+    private var didApplyDisplayCriteria = false
+    /// True while the HDMI mode switch is settling and video is detached.
+    private var isDisplaySwitchInFlight = false
+
+    private func updateDisplayCriteria() {
+        // AVDisplayManager isn't in the simulator SDK (there's no HDMI output
+        // to switch); this whole path is device-only.
+        #if !targetEnvironment(simulator)
+        guard #available(tvOS 17.0, *) else { return }
+        guard mpv != nil, !isDisplaySwitchInFlight else { return }
+
+        let gamma = (getString("video-params/gamma") ?? "").lowercased()
+        let primaries = (getString("video-params/primaries") ?? "").lowercased()
+
+        // No video attached (e.g. our own `vid=no`, or backgrounding): leave
+        // whatever criteria are in place alone.
+        guard !gamma.isEmpty || !primaries.isEmpty else { return }
+
+        let isHDR = gamma == "pq" || gamma == "hlg" || primaries.contains("2020")
+        guard isHDR else {
+            clearDisplayCriteria()
+            return
+        }
+        guard !didApplyDisplayCriteria, let window = view.window else { return }
+        // Skip (SDR playback, no crash) rather than abort if the category is
+        // ever missing again — e.g. a future tvOS removing it.
+        _ = Self.avKitLinkAnchor
+        guard window.responds(to: NSSelectorFromString("avDisplayManager")) else {
+            print("[MPV] AVDisplayManager unavailable; HDR display switch skipped")
+            return
+        }
+
+        let width = getInt("video-params/w")
+        let height = getInt("video-params/h")
+        guard width > 0, height > 0 else { return }
+
+        var fps = getDouble("container-fps")
+        if fps <= 0 { fps = getDouble("estimated-vf-fps") }
+        if fps <= 0 { fps = 23.976 }
+
+        let codecType: CMVideoCodecType
+        switch (getString("video-format") ?? "").lowercased() {
+        case "h264": codecType = kCMVideoCodecType_H264
+        case "av1": codecType = kCMVideoCodecType_AV1
+        default: codecType = kCMVideoCodecType_HEVC
+        }
+
+        let transfer: CFString = gamma == "hlg"
+            ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
+            : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+        let extensions: [CFString: Any] = [
+            kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+            kCMFormatDescriptionExtension_TransferFunction: transfer,
+            kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+        ]
+
+        var formatDescription: CMVideoFormatDescription?
+        let status = CMVideoFormatDescriptionCreate(
+            allocator: kCFAllocatorDefault,
+            codecType: codecType,
+            width: Int32(width),
+            height: Int32(height),
+            extensions: extensions as CFDictionary,
+            formatDescriptionOut: &formatDescription
+        )
+        guard status == noErr, let formatDescription else {
+            print("[MPV] Failed to build HDR format description (\(status))")
+            return
+        }
+
+        // The HDMI mode switch tears down and rebuilds the display pipeline.
+        // Presenting Vulkan frames into the CAMetalLayer while that happens
+        // crashes MoltenVK, so idle mpv's video chain first (the same
+        // detach/reattach the background/foreground path already survives),
+        // request the switch, and only reattach once the switch has settled.
+        didApplyDisplayCriteria = true
+        isDisplaySwitchInFlight = true
+        setStringProperty("vid", "no")
+
+        let manager = window.avDisplayManager
+        manager.preferredDisplayCriteria = AVDisplayCriteria(
+            refreshRate: Float(fps),
+            formatDescription: formatDescription
+        )
+        displayCriteriaWindow = window
+
+        // Give the switch a beat to start before polling for completion.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            self?.reattachVideoWhenDisplaySettled(manager, attemptsLeft: 16)
+        }
+        #endif
+    }
+
+    #if !targetEnvironment(simulator)
+    private func reattachVideoWhenDisplaySettled(_ manager: AVDisplayManager, attemptsLeft: Int) {
+        guard mpv != nil else {
+            isDisplaySwitchInFlight = false
+            return
+        }
+        if manager.isDisplayModeSwitchInProgress && attemptsLeft > 0 {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                self?.reattachVideoWhenDisplaySettled(manager, attemptsLeft: attemptsLeft - 1)
+            }
+            return
+        }
+        isDisplaySwitchInFlight = false
+        setStringProperty("vid", "auto")
+    }
+    #endif
+
+    private func clearDisplayCriteria() {
+        #if !targetEnvironment(simulator)
+        displayCriteriaWindow?.avDisplayManager.preferredDisplayCriteria = nil
+        displayCriteriaWindow = nil
+        didApplyDisplayCriteria = false
+        #endif
+    }
+
     // MARK: - Error tracking
 
     private func clearPlaybackError() {
@@ -1001,6 +1147,10 @@ final class MPVPlayerViewController: UIViewController {
                         self.applySubtitleStyle()
                         self.updateState()
                     }
+                case MPV_EVENT_VIDEO_RECONFIG:
+                    // Fires once decode starts and whenever the video params
+                    // change — the earliest point video-params/* is reliable.
+                    DispatchQueue.main.async { self.updateDisplayCriteria() }
                 case MPV_EVENT_END_FILE:
                     if let data = eventPtr.pointee.data {
                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee

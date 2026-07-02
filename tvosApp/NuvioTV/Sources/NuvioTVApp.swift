@@ -223,6 +223,15 @@ struct ContentView: View {
         ZStack {
             mainTabView
                 .disabled(isOverlayPresented)
+                // `.disabled` stops the tab *content* from taking focus, but the
+                // sidebar/tab bar itself can still attract the focus engine while
+                // an overlay is settling; focus landing there un-highlights the
+                // overlay's seeded item and makes the next Menu press suspend the
+                // app (system behaviour for Menu on a root tab bar). Alpha-0
+                // views are unfocusable, so fading the tab view out while it's
+                // covered keeps focus inside the overlay. It stays mounted, so
+                // Home's state and focus memory survive for the return trip.
+                .opacity(isOverlayPresented ? 0 : 1)
 
             if case .details(let contentId, let contentType) = activeScreen {
                 detailsScreen(contentId: contentId, contentType: contentType)

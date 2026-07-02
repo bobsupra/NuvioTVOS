@@ -140,6 +140,21 @@ struct DetailsScreen: View {
             #endif
         }
         .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
+        #if os(tvOS)
+        // Menu-press safety net. While the stream picker is up, focus can be
+        // in limbo for a few frames (details content is disabled, the picker
+        // hasn't committed focus yet); a Menu press then skips the picker's
+        // own onExitCommand and bubbles to the app shell, which backs out to
+        // Home or suspends the app. Catching it here closes just the picker,
+        // and otherwise behaves like the regular back action.
+        .onExitCommand {
+            if isStreamPickerPresented {
+                isStreamPickerPresented = false
+            } else {
+                onBack()
+            }
+        }
+        #endif
         .onChange(of: viewModel.uiState.isLoadingStreams) { isLoading in
             if !isLoading {
                 finishSmartPlaybackIfPossible()
@@ -998,6 +1013,8 @@ struct TvDetailsContent: View {
     let onTrailerClick: () -> Void
     let onBack: () -> Void
 
+    @FocusState private var actionFocus: DetailsActionFocus?
+
     var body: some View {
         if let meta = uiState.meta {
             let episodes = sortedEpisodes(meta)
@@ -1028,7 +1045,8 @@ struct TvDetailsContent: View {
                                     },
                                     onWatchlistClick: onWatchlistClick,
                                     onRateClick: onRateClick,
-                                    onTrailerClick: onTrailerClick
+                                    onTrailerClick: onTrailerClick,
+                                    focus: $actionFocus
                                 )
                                 .padding(.bottom, 6)
 
@@ -1073,6 +1091,13 @@ struct TvDetailsContent: View {
             }
             .background(Color.black.ignoresSafeArea())
             .onExitCommand(perform: onBack)
+            // tvOS doesn't re-run default-focus when this content swaps in after
+            // the async load finishes, so focus lands nowhere / off the Play
+            // button. Move it onto Play explicitly once the content appears
+            // (async so it runs after the focus engine's own first pass).
+            .onAppear {
+                DispatchQueue.main.async { actionFocus = .play }
+            }
         } else {
             EmptyView()
         }
@@ -1191,6 +1216,13 @@ private struct TvDetailsLogo: View {
     }
 }
 
+/// Identifies the action-row buttons so focus can be driven programmatically
+/// (tvOS doesn't auto-focus the primary button when the details content swaps in
+/// after the async load — see `TvDetailsContent`).
+private enum DetailsActionFocus: Hashable {
+    case play, watchlist, rate, trailer
+}
+
 private struct TvDetailsActionRow: View {
     let isInWatchlist: Bool
     let isWatched: Bool
@@ -1199,6 +1231,7 @@ private struct TvDetailsActionRow: View {
     let onWatchlistClick: () -> Void
     let onRateClick: () -> Void
     let onTrailerClick: () -> Void
+    var focus: FocusState<DetailsActionFocus?>.Binding
 
     var body: some View {
         HStack(spacing: 26) {
@@ -1206,6 +1239,8 @@ private struct TvDetailsActionRow: View {
                 title: playTitle,
                 systemName: "play.fill",
                 isPrimary: true,
+                focus: focus,
+                tag: .play,
                 action: onPlayClick
             )
 
@@ -1213,6 +1248,8 @@ private struct TvDetailsActionRow: View {
                 title: nil,
                 systemName: isInWatchlist ? "checkmark" : "plus",
                 isPrimary: false,
+                focus: focus,
+                tag: .watchlist,
                 action: onWatchlistClick
             )
 
@@ -1220,6 +1257,8 @@ private struct TvDetailsActionRow: View {
                 title: nil,
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
                 isPrimary: false,
+                focus: focus,
+                tag: .rate,
                 action: onRateClick
             )
 
@@ -1227,6 +1266,8 @@ private struct TvDetailsActionRow: View {
                 title: nil,
                 systemName: "play.rectangle.fill",
                 isPrimary: false,
+                focus: focus,
+                tag: .trailer,
                 action: onTrailerClick
             )
         }
@@ -1237,9 +1278,11 @@ private struct TvDetailsActionButton: View {
     let title: String?
     let systemName: String
     let isPrimary: Bool
+    var focus: FocusState<DetailsActionFocus?>.Binding
+    let tag: DetailsActionFocus
     let action: () -> Void
 
-    @FocusState private var isFocused: Bool
+    private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
         Button(action: action) {
@@ -1261,7 +1304,7 @@ private struct TvDetailsActionButton: View {
             .shadow(color: .black.opacity(isFocused ? 0.35 : 0.18), radius: isFocused ? 18 : 7, y: 8)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
+        .focused(focus, equals: tag)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -2022,6 +2065,17 @@ private struct TvStreamPickerOverlay: View {
             // The picker is only mounted once streams are available, so this
             // first appearance is a fresh focus transition and the seed wins.
             .onAppear { seedInitialFocus() }
+            // The focus engine can still reject the seed after grabFocus reads
+            // back its own write and stops retrying — e.g. the loading spinner
+            // keeps real focus while it fades out, then its removal makes the
+            // engine re-resolve and write nil into this binding, visibly
+            // un-highlighting the first card. If focus ever evaporates while
+            // the picker is up, grab it again.
+            .onChange(of: focusedItem) { newValue in
+                if newValue == nil {
+                    seedInitialFocus()
+                }
+            }
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())

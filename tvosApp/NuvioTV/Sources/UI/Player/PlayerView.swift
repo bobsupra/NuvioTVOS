@@ -50,19 +50,28 @@ struct PlayerView: View {
                 EmptyView()
             }
 
-            if !viewModel.showControls {
-                Button(action: viewModel.revealControls) {
-                    Color.clear
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
+            // Focus sink for when the controls are hidden. tvOS routes the Menu
+            // button to the system (which quits the app) and drops directional
+            // input whenever no view holds focus, so something must always own it
+            // while the controls are down. A bare focusable `Color.clear` is used
+            // deliberately, not a Button: a Button draws a white full-screen focus
+            // glow on tvOS 26+ (even with `.buttonStyle(.plain)` + focus effect
+            // disabled), and dropping its opacity to hide that glow also makes the
+            // focus engine skip it entirely — so `up` produced no move command.
+            // A focusable Color draws no highlight yet stays reliably focusable at
+            // full opacity. Kept mounted full-time (mounting it only when the
+            // controls hide raced the timeline losing focusability, leaving focus in
+            // a void); non-focusable while the controls are up so focus hands cleanly
+            // to the timeline, focusable again the instant they hide. `up`/`down`
+            // reveal via the PlayerView `onMoveCommand`; the select click reveals via
+            // the tap gesture.
+            Color.clear
+                .ignoresSafeArea()
+                .contentShape(Rectangle())
+                .focusable(!viewModel.showControls)
                 .focused($remoteInputFocused)
-                .focusEffectDisabledIfAvailable()
-                .frame(width: 1, height: 1)
-                .opacity(0.001)
+                .onTapGesture { viewModel.revealControls() }
                 .accessibilityHidden(true)
-                .onAppear(perform: focusRemoteInput)
-            }
 
             // Kept mounted (not gated by an `if`) so the hide animates too: removing
             // a view that holds tvOS focus makes the focus engine finalize the
