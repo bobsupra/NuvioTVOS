@@ -11,7 +11,10 @@ struct CloudLibraryService {
     }
 
     private var apiKey: String {
-        (store.string(forKey: SettingsKey.debridApiKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        DebridCredentials.token(
+            for: DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider)),
+            store: store
+        )
     }
 
     var provider: CloudLibraryProvider? {

@@ -59,6 +59,7 @@
 		C0D3102C000000000000002C /* TraktAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002C000000000000002C /* TraktAuthService.swift */; };
 		C0D3102D000000000000002D /* IntroDBSkipService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002D000000000000002D /* IntroDBSkipService.swift */; };
 		C0D3102E000000000000002E /* DebridProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002E000000000000002E /* DebridProvider.swift */; };
+		C0D3103A000000000000003A /* DebridDeviceAuthorization.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3003A000000000000003A /* DebridDeviceAuthorization.swift */; };
 		C0D3102F000000000000002F /* RealDebridResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002F000000000000002F /* RealDebridResolver.swift */; };
 		C0D310300000000000000030 /* DebridResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300300000000000000030 /* DebridResolver.swift */; };
 		C0D310310000000000000031 /* PremiumizeResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300310000000000000031 /* PremiumizeResolver.swift */; };
@@ -156,6 +157,7 @@
 		C0D3002C000000000000002C /* TraktAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Trakt/TraktAuthService.swift; sourceTree = "<group>"; };
 		C0D3002D000000000000002D /* IntroDBSkipService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift; sourceTree = "<group>"; };
 		C0D3002E000000000000002E /* DebridProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/DebridProvider.swift; sourceTree = "<group>"; };
+		C0D3003A000000000000003A /* DebridDeviceAuthorization.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/DebridDeviceAuthorization.swift; sourceTree = "<group>"; };
 		C0D3002F000000000000002F /* RealDebridResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/RealDebridResolver.swift; sourceTree = "<group>"; };
 		C0D300300000000000000030 /* DebridResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/DebridResolver.swift; sourceTree = "<group>"; };
 		C0D300310000000000000031 /* PremiumizeResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/PremiumizeResolver.swift; sourceTree = "<group>"; };
@@ -262,6 +264,7 @@
 				C0D3002C000000000000002C /* TraktAuthService.swift */,
 				C0D3002D000000000000002D /* IntroDBSkipService.swift */,
 				C0D3002E000000000000002E /* DebridProvider.swift */,
+				C0D3003A000000000000003A /* DebridDeviceAuthorization.swift */,
 				C0D3002F000000000000002F /* RealDebridResolver.swift */,
 				C0D300300000000000000030 /* DebridResolver.swift */,
 				C0D300310000000000000031 /* PremiumizeResolver.swift */,
@@ -521,6 +524,7 @@
 				C0D3102C000000000000002C /* TraktAuthService.swift in Sources */,
 				C0D3102D000000000000002D /* IntroDBSkipService.swift in Sources */,
 				C0D3102E000000000000002E /* DebridProvider.swift in Sources */,
+				C0D3103A000000000000003A /* DebridDeviceAuthorization.swift in Sources */,
 				C0D3102F000000000000002F /* RealDebridResolver.swift in Sources */,
 				C0D310300000000000000030 /* DebridResolver.swift in Sources */,
 				C0D310310000000000000031 /* PremiumizeResolver.swift in Sources */,

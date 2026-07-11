@@ -12,16 +12,26 @@ import Foundation
 
 @MainActor
 final class NuvioSyncManager: ObservableObject {
-    /// Posted by the Settings add-on list after a reorder; object is the new
-    /// `[String]` of manifest URLs. Triggers a `sync_push_addons` so the order
-    /// reaches the account (and the Android app) instead of being reverted by
-    /// the next pull.
+    /// Posted by the Settings add-on list after an order/enabled-state change.
+    /// The object is `[StreamAddonPreference]`, with `[String]` accepted for the
+    /// old reorder-only path.
     static let addonOrderChangedNotification = Notification.Name("nuvio.tv.addons.orderChanged")
+    /// Posted after an account pull applies profile-scoped Home inputs (add-ons,
+    /// catalog layout, and watch progress). Home keeps its catalog tree cached,
+    /// so it must explicitly rebuild once those inputs arrive.
+    static let homeContentSyncedNotification = Notification.Name("nuvio.tv.homeContentSynced")
+    /// Short, non-sensitive status strings shown only when Home content is
+    /// missing on a physical Apple TV.
+    static private(set) var addonSyncDiagnostic = "not pulled"
+    static private(set) var progressSyncDiagnostic = "not pulled"
+    static private(set) var catalogSettingsSyncDiagnostic = "not pulled"
+    static private(set) var accountSyncDiagnostic = "not started"
 
     /// True from sign-in until the first profile pull has been applied (or the
     /// pull fails), so the who's-watching screen can wait for real profile
     /// names instead of rendering local stubs.
     @Published private(set) var isPullingAccountProfiles = false
+    @Published private(set) var profileSyncError: String?
 
     private let client = SupabaseSyncClient()
 
@@ -35,8 +45,15 @@ final class NuvioSyncManager: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
-    private var profileBackfillTask: Task<Void, Never>?
+    private var profileSelectionRefreshTask: Task<Void, Never>?
     private var completedInitialPullKeys: Set<String> = []
+    private var automaticAccountPullRetryCount = 0
+    /// Identifies the pull that currently owns `pullTask` and the post-login
+    /// loading gate. A cancelled pull can unwind after its replacement starts;
+    /// without an ownership token, that stale task can reveal the local Guest
+    /// while the replacement is still downloading the account.
+    private var pullGeneration: UInt = 0
+    private var observedAuthUserId: String?
     private var observedActiveProfileId: String?
     private var isApplyingRemote = false
     private var didAttach = false
@@ -92,8 +109,14 @@ final class NuvioSyncManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] notification in
-            let urls = notification.object as? [String] ?? []
-            Task { @MainActor in self?.pushAddonOrder(urls) }
+            let preferences: [StreamAddonPreference]
+            if let postedPreferences = notification.object as? [StreamAddonPreference] {
+                preferences = postedPreferences
+            } else {
+                let urls = notification.object as? [String] ?? []
+                preferences = urls.map { StreamAddonPreference(url: $0, enabled: true) }
+            }
+            Task { @MainActor in self?.pushAddonPreferences(preferences) }
         })
         observers.append(center.addObserver(
             forName: CollectionsStore.locallyEditedNotification,
@@ -103,25 +126,83 @@ final class NuvioSyncManager: ObservableObject {
             let raw = notification.object as? [[String: Any]] ?? []
             Task { @MainActor in self?.pushCollectionsEdit(raw) }
         })
+
+        // `AuthManager` restores its persisted session synchronously in init.
+        // SwiftUI can therefore deliver the current auth/profile publishers
+        // before this manager's `onAppear` attachment runs. Reconcile their
+        // snapshots now so a restored account cannot miss its only startup
+        // pull and leave Home showing local defaults until auth changes again.
+        observedActiveProfileId = profileViewModel.activeProfile?.id
+        authStateChanged(authManager.authState)
     }
 
     func authStateChanged(_ state: AuthState) {
         switch state {
-        case .fullAccount:
+        case let .fullAccount(userId, _):
+            // `AuthManager` republishes the same account after refreshing its
+            // token. Treating that as a new login force-cancelled the bootstrap
+            // request which caused the refresh. Only a genuinely different
+            // account should replace an in-flight pull.
+            let isSameAccount = userId == observedAuthUserId
+            if isSameAccount {
+                // A token refresh republishes the same account. Keep an active
+                // bootstrap intact, and do not repeat one that already landed.
+                if pullTask != nil { return }
+                // Once owned recovery has exhausted its retries, leave the
+                // visible error stable. Only the user's Retry action should
+                // re-arm the gate and start another full bootstrap.
+                if profileSyncError != nil { return }
+                if let key = currentSyncKey(), completedInitialPullKeys.contains(key) {
+                    return
+                }
+            }
+            observedAuthUserId = userId
+            Self.accountSyncDiagnostic = "scheduled"
             if AuthConfig.isConfigured {
                 isPullingAccountProfiles = true
             }
-            schedulePull(force: true)
+            // If the publisher fired before `attach`, no task was created. The
+            // snapshot reconciliation in `attach` reaches this branch again and
+            // starts the missing pull without cancelling any valid same-user work.
+            schedulePull(force: !isSameAccount)
         case .signedOut:
+            Self.accountSyncDiagnostic = "signed out"
+            pullGeneration &+= 1
             pullTask?.cancel()
+            pullTask = nil
             pushTask?.cancel()
-            profileBackfillTask?.cancel()
+            profileSelectionRefreshTask?.cancel()
+            profileSelectionRefreshTask = nil
             completedInitialPullKeys.removeAll()
+            observedAuthUserId = nil
             observedActiveProfileId = nil
             isPullingAccountProfiles = false
+            profileSyncError = nil
         case .loading:
             break
         }
+    }
+
+    /// Called by the successful-login continuation. Auth-state observation is
+    /// still the primary trigger, but this explicit hand-off closes the SwiftUI
+    /// lifecycle gap where the publisher can be delivered before attachment.
+    /// It never restarts an in-flight or already-completed bootstrap.
+    func beginPostLoginSync() {
+        guard AuthConfig.isConfigured, authManager?.isAuthenticated == true else { return }
+        if let key = currentSyncKey(), completedInitialPullKeys.contains(key) { return }
+
+        profileSyncError = nil
+        isPullingAccountProfiles = true
+        schedulePull()
+    }
+
+    /// Retries the complete account bootstrap, not just the profile list. This
+    /// is the same operation a profile switch used to trigger accidentally.
+    func retryInitialAccountPull() {
+        guard AuthConfig.isConfigured, authManager?.isAuthenticated == true else { return }
+        profileSyncError = nil
+        isPullingAccountProfiles = true
+        schedulePull(force: true)
     }
 
     func activeProfileChanged(_ profile: Profile?) {
@@ -132,18 +213,214 @@ final class NuvioSyncManager: ObservableObject {
         schedulePull(force: true)
     }
 
-    private func schedulePull(force: Bool = false) {
-        guard AuthConfig.isConfigured else { return }
-        guard authManager?.isAuthenticated == true else { return }
-        if !force, pullTask?.isCancelled == false { return }
+    /// Mirrors Android's profile-save path: a user edit replaces the complete
+    /// account profile set, then reads it back so the picker reflects exactly
+    /// what the server accepted. This intentionally does not use the delayed
+    /// general snapshot queue.
+    func syncProfilesAfterLocalEdit() {
+        guard AuthConfig.isConfigured, authManager?.isAuthenticated == true else { return }
+        guard let profileViewModel else { return }
+        let profiles = profileViewModel.profiles
+        guard !profiles.isEmpty else { return }
+        guard let syncKey = currentSyncKey(), completedInitialPullKeys.contains(syncKey) else {
+            profileSyncError = "Finish loading the account before saving profile changes."
+            retryInitialAccountPull()
+            return
+        }
+        guard !profiles.contains(where: Self.isPlaceholderProfile) else {
+            profileSyncError = "Account profiles have not finished loading yet."
+            retryInitialAccountPull()
+            return
+        }
 
+        Task { @MainActor [weak self] in
+            guard let self,
+                  let authManager = self.authManager,
+                  let session = await authManager.validSessionForSync(),
+                  authManager.isAuthenticated else { return }
+            do {
+                try self.ensureStillSyncing()
+                try await self.client.pushProfiles(session: session, profiles: profiles)
+                try self.ensureStillSyncing()
+                let remoteProfiles = try await self.client.pullProfiles(session: session)
+                guard !remoteProfiles.isEmpty else {
+                    throw AuthError(message: "The server did not return the saved profiles.")
+                }
+                guard Self.remoteProfiles(remoteProfiles, confirm: profiles) else {
+                    // Never erase a newly created local profile because a
+                    // delayed or broken server read returned only the old
+                    // default row. The user can still select it immediately;
+                    // a later retry will reconcile once Nuvio confirms it.
+                    self.profileSyncError = "Profile saved on this Apple TV, but Nuvio has not confirmed it yet."
+                    print("Nuvio profile save was not yet confirmed; keeping the local profile list.")
+                    return
+                }
+                let merged = ProfileSyncIndexStore.localProfiles(
+                    from: remoteProfiles,
+                    preserving: profiles
+                )
+                self.isApplyingRemote = true
+                let applied = self.profileViewModel?.applyRemoteProfiles(merged) == true
+                self.isApplyingRemote = false
+                guard applied else {
+                    throw AuthError(message: "The saved profiles could not be applied on this Apple TV.")
+                }
+                self.profileSyncError = nil
+                print("Nuvio sync saved and confirmed \(remoteProfiles.count) profile(s).")
+            } catch is CancellationError {
+                self.isApplyingRemote = false
+            } catch {
+                self.isApplyingRemote = false
+                self.profileSyncError = "Couldn't save profiles: \(error.localizedDescription)"
+                print("Nuvio profile sync failed: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    private static func remoteProfiles(_ remoteProfiles: [RemoteProfile], confirm localProfiles: [Profile]) -> Bool {
+        localProfiles.allSatisfy { local in
+            let remoteId = ProfileSyncIndexStore.remoteId(for: local, in: localProfiles)
+            guard let remote = remoteProfiles.first(where: { $0.profileIndex == remoteId }) else {
+                return false
+            }
+            let remoteName = remote.name.isEmpty ? "Nuvio User" : remote.name
+            return remoteName == local.name
+                && (remote.avatarId ?? "") == local.avatarId
+                && remote.usesPrimaryAddons == local.usesPrimaryAddons
+                && remote.usesPrimaryPlugins == local.usesPrimaryPlugins
+        }
+    }
+
+    /// Performs a profiles-only account refresh when the profile picker has no
+    /// real local profiles. This is deliberately independent of startup sync:
+    /// entering the picker must always provide a fresh opportunity to recover
+    /// from a missed auth-state event, an expired JWT, or a transient empty RPC.
+    func refreshProfilesForSelectionIfNeeded(force: Bool = false) {
+        guard AuthConfig.isConfigured, authManager?.isAuthenticated == true else { return }
+        guard let profileViewModel else { return }
+        guard force || profileViewModel.profiles.allSatisfy(Self.isPlaceholderProfile) else {
+            profileSyncError = nil
+            return
+        }
+        guard profileSelectionRefreshTask == nil else { return }
+        // Let the full startup pull finish first. If it succeeds, the picker is
+        // updated by ProfileManager's notification; if not, its completion
+        // reveals the picker and this method runs again from `onAppear`.
+        guard !isPullingAccountProfiles else { return }
+
+        profileSyncError = nil
+        isPullingAccountProfiles = true
+        profileSelectionRefreshTask = Task { @MainActor [weak self] in
+            await self?.refreshProfilesForSelection()
+        }
+    }
+
+    private func refreshProfilesForSelection() async {
+        var shouldPullFullAccount = false
+        defer {
+            isPullingAccountProfiles = false
+            profileSelectionRefreshTask = nil
+            if shouldPullFullAccount {
+                retryInitialAccountPull()
+            }
+        }
+        guard let authManager, let profileViewModel else { return }
+
+        var lastError: Error?
+        let delays: [UInt64] = [0, 1, 2, 4]
+        for (attempt, delay) in delays.enumerated() {
+            if delay > 0 {
+                do {
+                    try await Task.sleep(nanoseconds: delay * 1_000_000_000)
+                } catch {
+                    return
+                }
+            }
+            guard !Task.isCancelled, authManager.isAuthenticated else { return }
+
+            guard let session = await authManager.validSessionForSync(validateWithServer: true) else {
+                lastError = AuthError(message: "Your account session could not be restored.")
+                continue
+            }
+            do {
+                let remoteProfiles = try await client.pullProfiles(session: session)
+                guard !remoteProfiles.isEmpty else {
+                    lastError = nil
+                    continue
+                }
+                let merged = ProfileSyncIndexStore.localProfiles(
+                    from: remoteProfiles,
+                    preserving: profileViewModel.profiles
+                )
+                isApplyingRemote = true
+                let applied = profileViewModel.applyRemoteProfiles(merged)
+                observedActiveProfileId = profileViewModel.activeProfile?.id
+                isApplyingRemote = false
+                guard applied else {
+                    lastError = AuthError(message: "The downloaded profiles could not be applied.")
+                    continue
+                }
+                profileSyncError = nil
+                // A profiles-only recovery must always be followed by the
+                // complete Home/account pull. Do not depend on the timing of
+                // SwiftUI's `$activeProfile` delivery to start it.
+                shouldPullFullAccount = true
+                print("Nuvio profile picker refreshed \(remoteProfiles.count) account profile(s).")
+                return
+            } catch {
+                lastError = error
+                // Match the Android client: if the first authenticated request
+                // is rejected, refresh the JWT before retrying the RPC.
+                if attempt == 0 {
+                    _ = await authManager.refreshSessionForSync()
+                }
+            }
+        }
+
+        isApplyingRemote = false
+        if let lastError {
+            profileSyncError = "Couldn't load account profiles: \(lastError.localizedDescription)"
+        } else {
+            profileSyncError = "No synced profiles were returned for this account."
+        }
+    }
+
+    private func schedulePull(force: Bool = false) {
+        guard AuthConfig.isConfigured else {
+            Self.accountSyncDiagnostic = "backend not configured"
+            return
+        }
+        guard authManager?.isAuthenticated == true else {
+            Self.accountSyncDiagnostic = "not authenticated"
+            return
+        }
+        if !force, pullTask != nil { return }
+
+        pullGeneration &+= 1
+        let generation = pullGeneration
+        automaticAccountPullRetryCount = 0
         pullTask?.cancel()
         pullTask = Task { @MainActor [weak self] in
             if !force {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
-            await self?.pullThenPush()
+            guard !Task.isCancelled else {
+                self?.finishPull(generation: generation)
+                return
+            }
+            await self?.pullThenPush(generation: generation)
         }
+    }
+
+    private func releasePostLoginGate(generation: UInt) {
+        guard generation == pullGeneration else { return }
+        isPullingAccountProfiles = false
+    }
+
+    private func finishPull(generation: UInt) {
+        guard generation == pullGeneration else { return }
+        pullTask = nil
+        isPullingAccountProfiles = false
     }
 
     private func schedulePush() {
@@ -154,8 +431,16 @@ final class NuvioSyncManager: ObservableObject {
 
         pushTask?.cancel()
         pushTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 1_500_000_000)
-            await self?.pushLocalSnapshots()
+            do {
+                try await Task.sleep(nanoseconds: 1_500_000_000)
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  let key = self.currentSyncKey(),
+                  self.completedInitialPullKeys.contains(key) else { return }
+            await self.pushLocalSnapshots()
         }
     }
 
@@ -169,60 +454,83 @@ final class NuvioSyncManager: ObservableObject {
         guard authManager?.isAuthenticated == true else { throw CancellationError() }
     }
 
-    private func pullThenPush() async {
-        // Release the who's-watching sync gate on every exit path; the happy
-        // path clears it earlier, as soon as profile names are in.
-        defer { isPullingAccountProfiles = false }
+    /// A freshly exchanged TV token can become visible to Auth before the sync
+    /// RPCs can read the account rows. Retry session validation and the profile
+    /// RPC as one bootstrap operation, reacquiring the session every time. The
+    /// old code retried one stale token and converted every RPC error to an
+    /// empty profile list, which exposed the local Guest and ended the pull.
+    private func bootstrapAccount(
+        authManager: AuthManager
+    ) async throws -> (session: AuthSession, profiles: [RemoteProfile]) {
+        let delays: [UInt64] = [0, 1, 2, 3, 4, 5]
+        var lastError: Error = AuthError(message: "The account session is not ready yet.")
 
-        guard let authManager, let profileViewModel else { return }
-        guard let session = await authManager.validSessionForSync() else { return }
-
-        do {
-            // The read right after a fresh login often fails transiently —
-            // either an empty result OR a thrown 401/permission error — the
-            // just-issued token racing the backend. Relaunches never hit it.
-            // Retry with backoff, swallowing transient throws, before concluding
-            // the account is fresh; acting on a false-empty (or a swallowed
-            // throw) is what shows the local placeholder on who's-watching. The
-            // sync wait screen covers the delay.
-            var remoteProfiles: [RemoteProfile] = (try? await client.pullProfiles(session: session)) ?? []
-            var attempt = 0
-            while remoteProfiles.isEmpty && attempt < 3 {
-                attempt += 1
-                try await Task.sleep(nanoseconds: UInt64(attempt) * 1_500_000_000)
-                try ensureStillSyncing()
-                remoteProfiles = (try? await client.pullProfiles(session: session)) ?? []
+        for (attempt, delay) in delays.enumerated() {
+            if delay > 0 {
+                try await Task.sleep(nanoseconds: delay * 1_000_000_000)
             }
             try ensureStillSyncing()
-            print("Nuvio sync pulled \(remoteProfiles.count) profile(s) after \(attempt) retry attempt(s).")
-            if !remoteProfiles.isEmpty {
-                let merged = ProfileSyncIndexStore.localProfiles(
-                    from: remoteProfiles,
-                    preserving: profileViewModel.profiles
-                )
-                isApplyingRemote = true
-                profileViewModel.applyRemoteProfiles(merged)
-                isApplyingRemote = false
-                // Real profiles are in — no need for any in-flight backfill.
-                profileBackfillTask?.cancel()
-            } else if profileViewModel.profiles.contains(where: { !Self.isPlaceholderProfile($0) }) {
-                // Seed the account only with profiles the user actually made.
-                // Pushing the untouched "Nuvio Guest" seed here would rename
-                // the account's primary profile if the empty read was false.
-                try await client.pushProfiles(
-                    session: session,
-                    profiles: profileViewModel.profiles
-                )
-            } else {
-                // The read came back empty while we hold only the local
-                // placeholder — almost always the just-issued token racing the
-                // backend, not a truly empty account. Releasing the gate now
-                // shows who's-watching with the placeholder card; keep pulling
-                // in the background so the account's real profiles replace it
-                // live, without the user having to pick a profile and come back.
-                startProfileBackfill()
+            Self.accountSyncDiagnostic = "connecting account (\(attempt + 1)/\(delays.count))"
+
+            guard let session = await authManager.validSessionForSync(validateWithServer: true) else {
+                lastError = AuthError(message: "The account session could not be restored.")
+                continue
             }
-            isPullingAccountProfiles = false
+
+            do {
+                let profiles = try await client.pullProfiles(session: session)
+                try ensureStillSyncing()
+                guard !profiles.isEmpty else {
+                    lastError = AuthError(message: "Nuvio has not returned the account profiles yet.")
+                    continue
+                }
+                return (session, profiles)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch let error as AuthError {
+                lastError = error
+                if error.statusCode == 401 {
+                    _ = await authManager.refreshSessionForSync()
+                }
+            } catch {
+                lastError = error
+            }
+        }
+
+        throw lastError
+    }
+
+    private func pullThenPush(generation: UInt) async {
+        // Release the who's-watching sync gate on every exit path; the happy
+        // path clears it only after profile-scoped Home inputs are persisted.
+        defer { finishPull(generation: generation) }
+
+        guard let authManager, let profileViewModel else {
+            Self.accountSyncDiagnostic = "manager not attached"
+            return
+        }
+
+        do {
+            let bootstrap = try await bootstrapAccount(authManager: authManager)
+            let session = bootstrap.session
+            let remoteProfiles = bootstrap.profiles
+            Self.accountSyncDiagnostic = "applying profiles"
+            let merged = ProfileSyncIndexStore.localProfiles(
+                from: remoteProfiles,
+                preserving: profileViewModel.profiles
+            )
+            isApplyingRemote = true
+            let profilesApplied = profileViewModel.applyRemoteProfiles(merged)
+            // `$activeProfile` can be delivered by SwiftUI after this
+            // synchronous apply returns. Record the imported selection before
+            // clearing the guard so it cannot cancel this same account pull.
+            observedActiveProfileId = profileViewModel.activeProfile?.id
+            isApplyingRemote = false
+            guard profilesApplied else {
+                throw AuthError(message: "The downloaded profiles could not be applied on this Apple TV.")
+            }
+            profileSyncError = nil
+            print("Nuvio sync pulled \(remoteProfiles.count) account profile(s).")
 
             guard let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else {
                 return
@@ -232,36 +540,53 @@ final class NuvioSyncManager: ObservableObject {
                 for: activeProfile,
                 in: profileViewModel.profiles
             )
+            let addonProfileId = activeProfile.usesPrimaryAddons && remoteProfileId != 1
+                ? 1
+                : remoteProfileId
 
-            try ensureStillSyncing()
-            isApplyingRemote = true
-            let settingsApplied = try await client.pullProfileSettings(
-                session: session,
-                remoteProfileId: remoteProfileId,
-                localProfileId: activeProfile.id
-            )
-            if !settingsApplied {
-                try await client.pushProfileSettings(
+            var profileSettingsReconciled = true
+            var pullFailures = 0
+            Self.accountSyncDiagnostic = "pulling account data"
+            do {
+                try ensureStillSyncing()
+                isApplyingRemote = true
+                let settingsApplied = try await client.pullProfileSettings(
                     session: session,
                     remoteProfileId: remoteProfileId,
                     localProfileId: activeProfile.id
                 )
+                if !settingsApplied {
+                    try await client.pushProfileSettings(
+                        session: session,
+                        remoteProfileId: remoteProfileId,
+                        localProfileId: activeProfile.id
+                    )
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Profile settings are independent of Home inputs. Keep pulling
+                // add-ons, catalog layout, and progress, but do not enable the
+                // later snapshot push after this partial reconciliation.
+                profileSettingsReconciled = false
+                print("Nuvio profile settings sync failed: \(error.localizedDescription)")
             }
 
             do {
                 let remoteAddons = try await client.pullAddons(
                     session: session,
-                    remoteProfileId: remoteProfileId
+                    remoteProfileId: addonProfileId
                 )
                 try ensureStillSyncing()
                 lastPulledAddonRows = remoteAddons
-                if !remoteAddons.isEmpty {
-                    let appliedCount = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
-                    print("Nuvio sync pulled \(appliedCount) enabled add-on(s).")
-                }
+                let appliedCount = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
+                Self.addonSyncDiagnostic = "remote \(remoteAddons.count), enabled \(appliedCount)"
+                print("Nuvio sync pulled \(appliedCount) enabled add-on(s).")
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                pullFailures += 1
+                Self.addonSyncDiagnostic = "failed: \(error.localizedDescription)"
                 print("Nuvio add-on sync failed: \(error.localizedDescription)")
             }
 
@@ -277,6 +602,7 @@ final class NuvioSyncManager: ObservableObject {
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                pullFailures += 1
                 print("Nuvio collections sync failed: \(error.localizedDescription)")
             }
 
@@ -287,80 +613,127 @@ final class NuvioSyncManager: ObservableObject {
                 ) {
                     try ensureStillSyncing()
                     client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
+                    Self.catalogSettingsSyncDiagnostic = "pulled \(catalogSettings.items.count) item(s)"
                     print("Nuvio sync pulled home catalog settings (\(catalogSettings.items.count) item(s)).")
+                } else {
+                    Self.catalogSettingsSyncDiagnostic = "server returned none"
                 }
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
+                pullFailures += 1
+                Self.catalogSettingsSyncDiagnostic = "failed: \(error.localizedDescription)"
                 print("Nuvio home catalog sync failed: \(error.localizedDescription)")
             }
 
             // Pull each watch-state collection independently so one failing
             // request (or one undecodable payload) can't abort the others.
-            var pullFailures = 0
-            if Self.watchStateSyncEnabled(for: activeProfile.id) {
-                do {
-                    let remoteLibrary = try await client.pullLibrary(
-                        session: session,
-                        remoteProfileId: remoteProfileId
-                    )
-                    try ensureStillSyncing()
-                    LibraryStore.mergeRemote(remoteLibrary)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    pullFailures += 1
-                    print("Nuvio library sync failed: \(error.localizedDescription)")
-                }
+            let watchStateUploadsEnabled = Self.watchStateSyncEnabled(for: activeProfile.id)
+            // Always pull account state. The local switch may stop this Apple
+            // TV from uploading edits, but it must not make an authenticated
+            // account look empty after reinstalling the app.
+            do {
+                let remoteLibrary = try await client.pullLibrary(
+                    session: session,
+                    remoteProfileId: remoteProfileId
+                )
+                try ensureStillSyncing()
+                LibraryStore.mergeRemote(remoteLibrary)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                pullFailures += 1
+                print("Nuvio library sync failed: \(error.localizedDescription)")
+            }
 
-                do {
-                    let remoteWatched = try await client.pullWatched(
-                        session: session,
-                        remoteProfileId: remoteProfileId
-                    )
-                    try ensureStillSyncing()
-                    WatchedStore.mergeRemote(remoteWatched)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    pullFailures += 1
-                    print("Nuvio watched sync failed: \(error.localizedDescription)")
-                }
+            do {
+                let remoteWatched = try await client.pullWatched(
+                    session: session,
+                    remoteProfileId: remoteProfileId
+                )
+                try ensureStillSyncing()
+                WatchedStore.mergeRemote(remoteWatched)
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                pullFailures += 1
+                print("Nuvio watched sync failed: \(error.localizedDescription)")
+            }
 
-                do {
-                    let remoteProgress = try await client.pullWatchProgress(
-                        session: session,
-                        remoteProfileId: remoteProfileId
-                    )
-                    try ensureStillSyncing()
-                    ContinueWatchingStore.mergeRemote(remoteProgress)
-                } catch is CancellationError {
-                    throw CancellationError()
-                } catch {
-                    pullFailures += 1
-                    print("Nuvio watch progress sync failed: \(error.localizedDescription)")
+            do {
+                let remoteProgress = try await client.pullWatchProgress(
+                    session: session,
+                    remoteProfileId: remoteProfileId
+                )
+                try ensureStillSyncing()
+                guard ContinueWatchingStore.mergeRemote(remoteProgress) else {
+                    throw AuthError(message: ContinueWatchingStore.persistenceDiagnostic)
                 }
+                let uploadStatus = watchStateUploadsEnabled ? "uploads on" : "uploads off"
+                Self.progressSyncDiagnostic = "profile \(activeProfile.id), remote \(remoteProgress.count), stored \(ContinueWatchingStore.items().count), \(uploadStatus); \(ContinueWatchingStore.persistenceDiagnostic)"
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                pullFailures += 1
+                Self.progressSyncDiagnostic = "failed: \(error.localizedDescription)"
+                print("Nuvio watch progress sync failed: \(error.localizedDescription)")
             }
             isApplyingRemote = false
 
+            let pullWasIncomplete = pullFailures > 0 || !profileSettingsReconciled
+            if pullWasIncomplete, automaticAccountPullRetryCount < 2 {
+                automaticAccountPullRetryCount += 1
+                Self.accountSyncDiagnostic = "retrying account data (\(automaticAccountPullRetryCount)/2)"
+                try await Task.sleep(
+                    nanoseconds: UInt64(automaticAccountPullRetryCount) * 1_000_000_000
+                )
+                try ensureStillSyncing()
+                await pullThenPush(generation: generation)
+                return
+            }
+
+            if pullWasIncomplete {
+                profileSyncError = "Some account data couldn't be loaded. Retry the account sync."
+                Self.accountSyncDiagnostic = "account data partially loaded"
+            } else {
+                automaticAccountPullRetryCount = 0
+                profileSyncError = nil
+            }
+
+            // Home may have loaded while this pull was in flight using the
+            // default/no-add-on settings. Rebuild its cached catalog tree only
+            // after all profile-scoped inputs above have landed.
+            NotificationCenter.default.post(name: Self.homeContentSyncedNotification, object: nil)
+            if !pullWasIncomplete {
+                Self.accountSyncDiagnostic = "home inputs pulled"
+            }
+            // The post-login screen represents the complete initial sync. Do
+            // not reveal the picker while progress/add-ons are still being
+            // written under the newly imported profile.
+            releasePostLoginGate(generation: generation)
+
             // Enable pushes only after a complete pull; pushing a snapshot built
             // from a partial pull could overwrite remote state we never saw.
-            guard pullFailures == 0 else { return }
+            guard !pullWasIncomplete else { return }
             if let key = currentSyncKey() {
                 completedInitialPullKeys.insert(key)
             }
             await pushLocalSnapshots()
         } catch is CancellationError {
             isApplyingRemote = false
+            Self.accountSyncDiagnostic = "cancelled; retry pending"
         } catch {
             isApplyingRemote = false
+            Self.accountSyncDiagnostic = "failed: \(error.localizedDescription)"
             print("Nuvio sync failed: \(error.localizedDescription)")
-            // A throw before profiles landed (e.g. the initial read racing a
-            // just-issued token) would otherwise leave who's-watching on the
-            // local placeholder. Keep pulling in the background so the account's
-            // real profiles replace it live. No-op once real profiles exist.
+            // Keep profile recovery inside this same login-owned task. Running
+            // it as detached background work used to lower the gate here and
+            // expose Guest while recovery was still actively pulling.
             if profileViewModel.profiles.allSatisfy(Self.isPlaceholderProfile) {
-                startProfileBackfill()
+                profileSyncError = "Couldn't load the account yet: \(error.localizedDescription)"
+                if await backfillAccountProfiles() {
+                    await pullThenPush(generation: generation)
+                }
             }
         }
     }
@@ -370,48 +743,57 @@ final class NuvioSyncManager: ObservableObject {
     /// returns nothing even though the account has profiles; the who's-watching
     /// screen would then be left showing the local "Nuvio Guest" placeholder
     /// until the user picks a profile (which triggers a fresh pull) and returns.
-    /// This keeps trying quietly — `applyRemoteProfiles` publishes into the
-    /// live-observed profile list, so the real cards appear in place. A truly
-    /// empty account simply keeps reading empty and the loop exits with no
-    /// visible change.
-    private func startProfileBackfill() {
-        profileBackfillTask?.cancel()
+    /// This stays awaited by the post-login bootstrap so the placeholder cannot
+    /// be selected while a recoverable account read is still in progress.
+    private func backfillAccountProfiles() async -> Bool {
         print("Nuvio sync starting profile backfill (post-login read yielded no profiles).")
-        profileBackfillTask = Task { @MainActor [weak self] in
-            // Backoff between attempts (seconds); spans ~55s so a slow backend
-            // that only makes a fresh account's profiles readable well after
-            // the token is issued still gets caught.
-            let delays: [UInt64] = [2, 3, 4, 6, 8, 10, 10, 12]
-            for seconds in delays {
-                try? await Task.sleep(nanoseconds: seconds * 1_000_000_000)
-                guard let self else { return }
-                guard (try? self.ensureStillSyncing()) != nil else { return }
-                guard let authManager = self.authManager,
-                      let profileViewModel = self.profileViewModel else { return }
-                // The user picked a profile (or a later pull imported them), so
-                // real profiles are already present — nothing left to backfill.
-                if profileViewModel.profiles.contains(where: { !Self.isPlaceholderProfile($0) }) {
-                    return
-                }
-                guard let session = await authManager.validSessionForSync() else { return }
-                guard (try? self.ensureStillSyncing()) != nil else { return }
-                let remote = (try? await self.client.pullProfiles(session: session)) ?? []
-                guard !remote.isEmpty else {
-                    print("Nuvio sync profile backfill attempt still empty.")
-                    continue
-                }
-                let merged = ProfileSyncIndexStore.localProfiles(
-                    from: remote,
-                    preserving: profileViewModel.profiles
-                )
-                self.isApplyingRemote = true
-                profileViewModel.applyRemoteProfiles(merged)
-                self.isApplyingRemote = false
-                print("Nuvio sync backfilled \(remote.count) profile(s) into who's-watching.")
-                return
+        // Backoff between attempts (seconds); spans ~55s so a slow backend
+        // that only makes a fresh account's profiles readable well after the
+        // token is issued still gets caught.
+        let delays: [UInt64] = [2, 3, 4, 6, 8, 10, 10, 12]
+        for seconds in delays {
+            do {
+                try await Task.sleep(nanoseconds: seconds * 1_000_000_000)
+                try ensureStillSyncing()
+            } catch {
+                return false
             }
-            print("Nuvio sync profile backfill gave up after \(delays.count) attempts.")
+            guard let authManager, let profileViewModel else { return false }
+            guard let session = await authManager.validSessionForSync(validateWithServer: true) else {
+                continue
+            }
+            guard (try? ensureStillSyncing()) != nil else { return false }
+            let remote: [RemoteProfile]
+            do {
+                remote = try await client.pullProfiles(session: session)
+            } catch let error as AuthError where error.statusCode == 401 {
+                _ = await authManager.refreshSessionForSync()
+                continue
+            } catch {
+                continue
+            }
+            guard !remote.isEmpty else {
+                print("Nuvio sync profile backfill attempt still empty.")
+                continue
+            }
+            let merged = ProfileSyncIndexStore.localProfiles(
+                from: remote,
+                preserving: profileViewModel.profiles
+            )
+            isApplyingRemote = true
+            let applied = profileViewModel.applyRemoteProfiles(merged)
+            observedActiveProfileId = profileViewModel.activeProfile?.id
+            isApplyingRemote = false
+            guard applied else {
+                print("Nuvio sync could not apply backfilled profiles; retrying.")
+                continue
+            }
+            profileSyncError = nil
+            print("Nuvio sync backfilled \(remote.count) profile(s) before profile selection.")
+            return true
         }
+        print("Nuvio sync profile backfill gave up after \(delays.count) attempts.")
+        return false
     }
 
     /// Pushes a locally edited collections blob to the account (same
@@ -444,6 +826,7 @@ final class NuvioSyncManager: ObservableObject {
 
     private func pushLocalSnapshots() async {
         guard let authManager, let profileViewModel else { return }
+        guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
         guard let session = await authManager.validSessionForSync() else { return }
         guard let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else { return }
 
@@ -456,8 +839,6 @@ final class NuvioSyncManager: ObservableObject {
             // A push racing a sign-out would upload the freshly wiped (empty)
             // local snapshots over the account's server data — abort between
             // steps the moment auth flips.
-            try ensureStillSyncing()
-            try await client.pushProfiles(session: session, profiles: profileViewModel.profiles)
             try ensureStillSyncing()
             try await client.pushProfileSettings(
                 session: session,
@@ -480,11 +861,11 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
-    /// Pushes a reordered add-on list to the account. Enabled add-ons take the
-    /// new order; disabled rows and custom names from the last pull are
-    /// appended untouched so the full-set replace can't drop them.
-    private func pushAddonOrder(_ urls: [String]) {
-        guard !urls.isEmpty else { return }
+    /// Pushes the complete local add-on list to the account. The public RPC is
+    /// full-replace, so omitted rows (including an entirely empty list) must be
+    /// allowed to delete their remote counterparts.
+    private func pushAddonPreferences(_ preferences: [StreamAddonPreference]) {
+        let normalizedPreferences = Self.normalizedAddonPreferences(preferences)
         guard AuthConfig.isConfigured else { return }
         guard let authManager, authManager.isAuthenticated else { return }
         guard let profileViewModel,
@@ -494,28 +875,26 @@ final class NuvioSyncManager: ObservableObject {
             for: activeProfile,
             in: profileViewModel.profiles
         )
+        // The public profile contract allows a secondary profile to consume
+        // profile 1's add-ons. It is read-only from that secondary profile;
+        // pushing its local view would replace the primary profile's full set.
+        guard remoteProfileId == 1 || !activeProfile.usesPrimaryAddons else { return }
         let knownRows = lastPulledAddonRows
 
         Task { @MainActor [weak self] in
             guard let self, let session = await authManager.validSessionForSync() else { return }
             var payload: [[String: Any]] = []
-            for (index, url) in urls.enumerated() {
-                let known = knownRows.first { $0.url == url }
+
+            for (index, preference) in normalizedPreferences.enumerated() {
+                let known = knownRows.first {
+                    Self.normalizedAddonURL($0.url) == preference.url
+                }
                 var row: [String: Any] = [
-                    "url": url,
+                    "url": preference.url,
                     "sort_order": index,
-                    "enabled": known?.enabled ?? true
+                    "enabled": preference.enabled
                 ]
                 if let name = known?.name, !name.isEmpty { row["name"] = name }
-                payload.append(row)
-            }
-            for known in knownRows where !urls.contains(known.url) {
-                var row: [String: Any] = [
-                    "url": known.url,
-                    "sort_order": payload.count,
-                    "enabled": known.enabled
-                ]
-                if let name = known.name, !name.isEmpty { row["name"] = name }
                 payload.append(row)
             }
 
@@ -525,11 +904,24 @@ final class NuvioSyncManager: ObservableObject {
                     remoteProfileId: remoteProfileId,
                     rows: payload
                 )
-                print("Nuvio sync pushed \(payload.count) add-on(s) after reorder.")
+                print("Nuvio sync pushed \(payload.count) add-on(s) after settings update.")
             } catch {
-                print("Nuvio add-on order push failed: \(error.localizedDescription)")
+                print("Nuvio add-on push failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private static func normalizedAddonPreferences(_ preferences: [StreamAddonPreference]) -> [StreamAddonPreference] {
+        var seen: Set<String> = []
+        return preferences.compactMap { preference -> StreamAddonPreference? in
+            guard let url = normalizedAddonURL(preference.url),
+                  seen.insert(url).inserted else { return nil }
+            return StreamAddonPreference(url: url, enabled: preference.enabled)
+        }
+    }
+
+    private static func normalizedAddonURL(_ rawValue: String) -> String? {
+        CinemetaCatalogRepository.normalizedManifestURL(from: rawValue)?.absoluteString
     }
 
     private func currentSyncKey() -> String? {
@@ -545,11 +937,17 @@ final class NuvioSyncManager: ObservableObject {
         return "\(userId):\(remoteProfileId)"
     }
 
-    /// The locally seeded default profiles ("Nuvio Guest" / "Nuvio User")
-    /// that exist before any sync or user edit. Never worth pushing.
+    /// The locally seeded Guest that exists before account sync. "Nuvio User"
+    /// is also the legitimate default name returned by Nuvio accounts and must
+    /// not be mistaken for an unsynced placeholder.
     private static func isPlaceholderProfile(_ profile: Profile) -> Bool {
+        if profile.id == "guest" { return true }
+        // Compatibility with an older fresh-install seed that used remote slot
+        // 1 locally. Synced primary profiles are marked admin, so a real account
+        // profile named "Nuvio Guest" is not mistaken for the placeholder.
         let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        return name == "nuvio guest" || name == "nuvio user"
+        return profile.id == "1" && !profile.isAdmin && profile.avatarId.isEmpty
+            && name == "nuvio guest"
     }
 
     private static func watchStateSyncEnabled(for profileId: String) -> Bool {
@@ -603,6 +1001,10 @@ private enum ProfileSyncIndexStore {
     static func localProfiles(from remoteProfiles: [RemoteProfile], preserving localProfiles: [Profile]) -> [Profile] {
         var localByRemoteId: [Int: Profile] = [:]
         localProfiles.forEach { profile in
+            // `guest` is a temporary signed-out/install seed, not an account
+            // profile identity. Preserving it caused remote profile 1 and all
+            // downloaded Home data to remain scoped to `guest` after login.
+            guard profile.id != "guest" else { return }
             let remoteId: Int
             if let numeric = Int(profile.id), (1...6).contains(numeric) {
                 remoteId = numeric
@@ -624,7 +1026,9 @@ private enum ProfileSyncIndexStore {
                     name: remote.name.isEmpty ? "Nuvio User" : remote.name,
                     isPinProtected: false,
                     isAdmin: remote.profileIndex == 1,
-                    avatarId: remote.avatarId?.isEmpty == false ? remote.avatarId! : ""
+                    avatarId: remote.avatarId?.isEmpty == false ? remote.avatarId! : "",
+                    usesPrimaryAddons: remote.usesPrimaryAddons,
+                    usesPrimaryPlugins: remote.usesPrimaryPlugins
                 )
             }
     }
@@ -636,9 +1040,36 @@ private enum ProfileSyncIndexStore {
     }
 }
 
+/// Stable per-install identity required by current Nuvio mutation RPCs. It lets
+/// delta/event sync distinguish this Apple TV's writes from another client.
+private enum SyncClientIdentity {
+    private static let defaultsKey = "client_instance_id"
+    private static let prefix = "nuvio-tv-"
+
+    static func current() -> String {
+        let defaults = UserDefaults.standard
+        if let stored = defaults.string(forKey: defaultsKey)?.trimmingCharacters(in: .whitespacesAndNewlines),
+           isValid(stored) {
+            return stored
+        }
+
+        let suffix = UUID().uuidString.replacingOccurrences(of: "-", with: "").lowercased()
+        let generated = prefix + suffix
+        defaults.set(generated, forKey: defaultsKey)
+        return generated
+    }
+
+    private static func isValid(_ value: String) -> Bool {
+        guard (16...96).contains(value.count) else { return false }
+        return value.allSatisfy { character in
+            character.isLetter || character.isNumber || character == "-" || character == "_"
+        }
+    }
+}
+
 fileprivate final class SupabaseSyncClient {
     private static let pullPageSize = 500
-    private static let settingsPlatform = "tvos"
+    private static let settingsPlatform = "tv"
     private static let settingsFeature = "tvos_settings"
 
     private let session: URLSession = .shared
@@ -648,9 +1079,18 @@ fileprivate final class SupabaseSyncClient {
         return decoder
     }()
     private let catalogRepository: CatalogRepository = CinemetaCatalogRepository()
+    private var lastPulledProfileSettingsJSON: [String: Any]?
 
     func pullProfiles(session: AuthSession) async throws -> [RemoteProfile] {
-        try await rpcRows("sync_pull_profiles", session: session, params: [:]).elements
+        let rows: LossyRows<RemoteProfile> = try await rpcRows(
+            "sync_pull_profiles",
+            session: session,
+            params: [:]
+        )
+        if rows.rawCount > 0, rows.elements.isEmpty {
+            throw AuthError(message: "The profile response was not in a supported format.")
+        }
+        return rows.elements
     }
 
     func pullAddons(session: AuthSession, remoteProfileId: Int) async throws -> [RemoteAddon] {
@@ -679,17 +1119,16 @@ fileprivate final class SupabaseSyncClient {
     }
 
     func applyAddons(_ addons: [RemoteAddon], localProfileId: String) -> Int {
-        let urls = addons
-            .filter(\.enabled)
+        let preferences = addons
             .sorted { $0.sortOrder < $1.sortOrder }
-            .compactMap { CinemetaCatalogRepository.normalizedManifestURL(from: $0.url)?.absoluteString }
-
-        guard !urls.isEmpty else { return 0 }
+            .compactMap { addon -> StreamAddonPreference? in
+                guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: addon.url) else { return nil }
+                return StreamAddonPreference(url: url.absoluteString, enabled: addon.enabled)
+            }
 
         let defaults = ProfileSettings.store(for: localProfileId)
-        defaults.set(urls.first, forKey: SettingsKey.streamAddonManifestURL)
-        defaults.set(urls.joined(separator: "\n"), forKey: SettingsKey.streamAddonManifestURLs)
-        return urls.count
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences, in: defaults)
+        return preferences.filter(\.enabled).count
     }
 
     /// Home-catalog settings platforms in priority order — the shared blob the
@@ -769,15 +1208,20 @@ fileprivate final class SupabaseSyncClient {
 
     func pushProfiles(session: AuthSession, profiles: [Profile]) async throws {
         let payloads = profiles.prefix(6).map { profile -> [String: Any] in
-            [
+            var payload: [String: Any] = [
                 "profile_index": ProfileSyncIndexStore.remoteId(for: profile, in: profiles),
                 "name": profile.name,
                 "avatar_color_hex": "#1E88E5",
-                "uses_primary_addons": false,
-                "uses_primary_plugins": false,
-                "avatar_id": profile.avatarId.isEmpty ? NSNull() : profile.avatarId,
-                "avatar_url": NSNull()
+                "uses_primary_addons": profile.usesPrimaryAddons,
+                "uses_primary_plugins": profile.usesPrimaryPlugins
             ]
+            // Omitting avatar_id preserves a custom remote avatar. The public
+            // API defines an explicit null/empty value as a clear, and tvOS
+            // currently has no explicit "remove avatar" action.
+            if !profile.avatarId.isEmpty {
+                payload["avatar_id"] = profile.avatarId
+            }
+            return payload
         }
         try await rpcVoid(
             "sync_push_profiles",
@@ -803,7 +1247,12 @@ fileprivate final class SupabaseSyncClient {
             ]
         )
         guard let rows = raw as? [[String: Any]],
-              let settingsJSON = rows.first?["settings_json"] as? [String: Any],
+              let settingsJSON = rows.first?["settings_json"] as? [String: Any] else {
+            lastPulledProfileSettingsJSON = nil
+            return false
+        }
+        lastPulledProfileSettingsJSON = settingsJSON
+        guard
               let features = settingsJSON["features"] as? [String: Any],
               let feature = features[Self.settingsFeature] as? [String: Any] else {
             return false
@@ -818,12 +1267,14 @@ fileprivate final class SupabaseSyncClient {
         remoteProfileId: Int,
         localProfileId: String
     ) async throws {
-        let settingsJSON: [String: Any] = [
-            "version": 1,
-            "features": [
-                Self.settingsFeature: exportSettings(localProfileId: localProfileId)
-            ]
-        ]
+        // This RPC atomically replaces the complete (user, profile, platform)
+        // blob. Merge our namespaced feature into the row we just pulled so
+        // Android/other TV feature keys survive a tvOS settings update.
+        var settingsJSON = lastPulledProfileSettingsJSON ?? [:]
+        var features = settingsJSON["features"] as? [String: Any] ?? [:]
+        features[Self.settingsFeature] = exportSettings(localProfileId: localProfileId)
+        settingsJSON["features"] = features
+        if settingsJSON["version"] == nil { settingsJSON["version"] = 1 }
         try await rpcVoid(
             "sync_push_profile_settings_blob",
             session: session,
@@ -993,10 +1444,21 @@ fileprivate final class SupabaseSyncClient {
             // otherwise a series whose last-played episode ended disappears
             // from Continue Watching after sync.
             let finished = (duration - position) < 60 || (position / duration) >= 0.92
+
+            // Never keep an old cached episode guide for a Next Up item. These
+            // are exactly the records that commonly start as "TBA" and then
+            // receive a title, overview, and still after release.
+            let mayBeUpNext = meta.isSeries && season != nil && episode != nil
+                && (finished || position <= 1.5)
+            if mayBeUpNext,
+               let refreshed = try? await catalogRepository.refreshMetadata(id: entry.contentId, type: type) {
+                meta = refreshed
+            }
+
             if finished {
                 guard meta.isSeries, let currentSeason = season, let currentEpisode = episode else { continue }
                 if meta.videos?.isEmpty != false,
-                   let fetched = try? await catalogRepository.getMetadata(id: entry.contentId, type: type) {
+                   let fetched = try? await catalogRepository.refreshMetadata(id: entry.contentId, type: type) {
                     meta = fetched
                 }
                 guard let next = Self.nextEpisode(after: (currentSeason, currentEpisode), in: meta) else {
@@ -1015,6 +1477,12 @@ fileprivate final class SupabaseSyncClient {
             let upNext = finished
                 || (meta.isSeries && season != nil && episode != nil && position <= 1.5)
 
+            let selectedEpisode = Self.episode(in: meta, season: season, episode: episode)
+            let sameEpisodeAsExisting = existing?.season == season && existing?.episode == episode
+            let tmdbEpisode = upNext
+                ? await EpisodeMetadataEnrichment.fetch(meta: meta, season: season, episode: episode)
+                : nil
+
             items.append(
                 ContinueWatchingItem(
                     meta: meta,
@@ -1026,6 +1494,14 @@ fileprivate final class SupabaseSyncClient {
                     lastWatchedAt: Self.date(fromMilliseconds: entry.lastWatched),
                     season: season,
                     episode: episode,
+                    released: tmdbEpisode?.released ?? selectedEpisode?.released
+                        ?? (sameEpisodeAsExisting ? existing?.released : nil),
+                    episodeTitleOverride: tmdbEpisode?.title ?? Self.nonPlaceholder(selectedEpisode?.title)
+                        ?? (sameEpisodeAsExisting ? existing?.episodeTitleOverride : nil),
+                    episodeOverviewOverride: tmdbEpisode?.overview ?? Self.nonEmpty(selectedEpisode?.overview)
+                        ?? (sameEpisodeAsExisting ? existing?.episodeOverviewOverride : nil),
+                    episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? selectedEpisode?.thumbnail
+                        ?? (sameEpisodeAsExisting ? existing?.episodeThumbnailOverride : nil),
                     isUpNext: upNext ? true : nil
                 )
             )
@@ -1036,12 +1512,30 @@ fileprivate final class SupabaseSyncClient {
     private static func nextEpisode(
         after current: (season: Int, episode: Int),
         in meta: NuvioMeta
-    ) -> (season: Int, episode: Int)? {
+    ) -> NuvioVideo? {
         (meta.videos ?? [])
             .filter { $0.season > 0 }
             .sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
             .first { ($0.season, $0.episode) > (current.season, current.episode) }
-            .map { ($0.season, $0.episode) }
+    }
+
+    private static func episode(in meta: NuvioMeta, season: Int?, episode: Int?) -> NuvioVideo? {
+        guard let season, let episode else { return nil }
+        return meta.videos?.first { $0.season == season && $0.episode == episode }
+    }
+
+    private static func nonPlaceholder(_ value: String?) -> String? {
+        guard let value = nonEmpty(value), value.caseInsensitiveCompare("TBA") != .orderedSame else {
+            return nil
+        }
+        return value
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 
     func pushWatchProgress(session: AuthSession, remoteProfileId: Int) async throws {
@@ -1123,7 +1617,11 @@ fileprivate final class SupabaseSyncClient {
         session authSession: AuthSession,
         params: [String: Any]
     ) async throws {
-        _ = try await rpcData(name, session: authSession, params: params)
+        var resolvedParams = params
+        if name.hasPrefix("sync_push_") || name.hasPrefix("sync_delete_") {
+            resolvedParams["p_origin_client_id"] = SyncClientIdentity.current()
+        }
+        _ = try await rpcData(name, session: authSession, params: resolvedParams)
     }
 
     private func rpcJSONObject(
@@ -1156,7 +1654,10 @@ fileprivate final class SupabaseSyncClient {
             throw AuthError(message: "No response from server")
         }
         guard (200..<300).contains(http.statusCode) else {
-            throw AuthError(message: Self.serverErrorMessage(data: data, status: http.statusCode))
+            throw AuthError(
+                message: Self.serverErrorMessage(data: data, status: http.statusCode),
+                statusCode: http.statusCode
+            )
         }
         return try decoder.decode(T.self, from: data)
     }
@@ -1185,7 +1686,10 @@ fileprivate final class SupabaseSyncClient {
             throw AuthError(message: "No response from server")
         }
         guard (200..<300).contains(http.statusCode) else {
-            throw AuthError(message: Self.serverErrorMessage(data: data, status: http.statusCode))
+            throw AuthError(
+                message: Self.serverErrorMessage(data: data, status: http.statusCode),
+                statusCode: http.statusCode
+            )
         }
         if data.isEmpty { return Data("null".utf8) }
         return data
@@ -1195,6 +1699,9 @@ fileprivate final class SupabaseSyncClient {
         let defaults = ProfileSettings.store(for: localProfileId)
         var exported: [String: Any] = [:]
         SettingsKey.all.forEach { key in
+            // Sync policy is device-local. Exporting it lets a temporary test
+            // or another TV disable account progress pulls everywhere.
+            guard key != SettingsKey.accountSyncWatchState else { return }
             guard let value = defaults.object(forKey: key),
                   let encoded = Self.encodeSettingValue(value) else {
                 return
@@ -1207,11 +1714,27 @@ fileprivate final class SupabaseSyncClient {
     private func importSettings(_ remote: [String: Any], localProfileId: String) {
         let defaults = ProfileSettings.store(for: localProfileId)
         SettingsKey.all.forEach { key in
+            guard key != SettingsKey.accountSyncWatchState else { return }
             guard let encoded = remote[key] as? [String: Any],
                   let value = Self.decodeSettingValue(encoded) else {
                 return
             }
             defaults.set(value, forKey: key)
+        }
+
+        // Older clients sync only the legacy primary/secondary/tertiary keys.
+        // If such a payload supplies a primary value, make that legacy snapshot
+        // authoritative and clear omitted lower slots instead of retaining stale
+        // local choices that could make System unexpectedly filter languages.
+        if remote[SettingsKey.subtitleLanguages] == nil,
+           remote[SettingsKey.subtitleLanguage] != nil {
+            defaults.removeObject(forKey: SettingsKey.subtitleLanguages)
+            if remote[SettingsKey.subtitleLanguageSecondary] == nil {
+                defaults.set("None", forKey: SettingsKey.subtitleLanguageSecondary)
+            }
+            if remote[SettingsKey.subtitleLanguageTertiary] == nil {
+                defaults.set("None", forKey: SettingsKey.subtitleLanguageTertiary)
+            }
         }
     }
 
@@ -1284,6 +1807,77 @@ fileprivate final class SupabaseSyncClient {
     }
 }
 
+/// Optional episode-level enrichment. This uses the same TMDB integration the
+/// Details screen already exposes, and is deliberately a no-op until the user
+/// has enabled it and supplied their own key.
+private enum EpisodeMetadataEnrichment {
+    struct Episode {
+        let title: String?
+        let overview: String?
+        let thumbnail: String?
+        let released: String?
+    }
+
+    static func fetch(meta: NuvioMeta, season: Int?, episode: Int?) async -> Episode? {
+        guard meta.isSeries,
+              let tmdbId = meta.tmdbId,
+              let season,
+              let episode,
+              ProfileSettings.current.bool(forKey: SettingsKey.tmdbEnabled) else {
+            return nil
+        }
+
+        let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !apiKey.isEmpty else { return nil }
+
+        var components = URLComponents(
+            string: "https://api.themoviedb.org/3/tv/\(tmdbId)/season/\(season)/episode/\(episode)"
+        )
+        components?.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: "en-US")
+        ]
+        guard let url = components?.url else { return nil }
+
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
+                return nil
+            }
+            let decoded = try JSONDecoder().decode(TmdbEpisodeResponse.self, from: data)
+            return Episode(
+                title: nonEmpty(decoded.name),
+                overview: nonEmpty(decoded.overview),
+                thumbnail: decoded.stillPath.map { "https://image.tmdb.org/t/p/w780\($0)" },
+                released: nonEmpty(decoded.airDate)
+            )
+        } catch {
+            return nil
+        }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
+    }
+}
+
+private struct TmdbEpisodeResponse: Decodable {
+    let name: String?
+    let overview: String?
+    let stillPath: String?
+    let airDate: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, overview
+        case stillPath = "still_path"
+        case airDate = "air_date"
+    }
+}
+
 /// Decodes every row it can and keeps the server's raw row count, so a single
 /// malformed row drops just that row instead of failing the whole page — and
 /// pagination can still advance by the true count.
@@ -1319,11 +1913,15 @@ private struct RemoteProfile: Decodable {
     let profileIndex: Int
     let name: String
     let avatarId: String?
+    let usesPrimaryAddons: Bool
+    let usesPrimaryPlugins: Bool
 
     enum CodingKeys: String, CodingKey {
         case profileIndex
         case name
         case avatarId
+        case usesPrimaryAddons
+        case usesPrimaryPlugins
     }
 
     init(from decoder: Decoder) throws {
@@ -1331,6 +1929,8 @@ private struct RemoteProfile: Decodable {
         profileIndex = try container.decode(Int.self, forKey: .profileIndex)
         name = (try? container.decode(String.self, forKey: .name)) ?? ""
         avatarId = try? container.decodeIfPresent(String.self, forKey: .avatarId)
+        usesPrimaryAddons = (try? container.decode(Bool.self, forKey: .usesPrimaryAddons)) ?? false
+        usesPrimaryPlugins = (try? container.decode(Bool.self, forKey: .usesPrimaryPlugins)) ?? false
     }
 }
 

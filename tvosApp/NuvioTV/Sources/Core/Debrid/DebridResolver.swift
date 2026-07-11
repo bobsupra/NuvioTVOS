@@ -23,7 +23,7 @@ struct DebridResolver {
     }
 
     private var apiKey: String {
-        (store.string(forKey: SettingsKey.debridApiKey) ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        DebridCredentials.token(for: selectedKind, store: store)
     }
 
     /// Resolves a torrent stream to a direct URL. Returns `nil` when the stream

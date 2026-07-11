@@ -65,7 +65,7 @@ struct FilterChip: View {
 
     private var borderColor: Color {
         if isFocused {
-            return .white.opacity(0.86)
+            return AppFocusOutline.color
         } else if selected {
             return .white
         } else {
@@ -75,7 +75,7 @@ struct FilterChip: View {
 
     private var borderWidth: CGFloat {
         if isFocused {
-            return 3
+            return AppFocusOutline.width
         } else if selected {
             return 2
         } else {

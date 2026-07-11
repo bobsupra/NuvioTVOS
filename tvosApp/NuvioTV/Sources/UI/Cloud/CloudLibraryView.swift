@@ -188,7 +188,7 @@ private struct CloudRow: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(Color.white.opacity(isFocused ? 0.5 : 0), lineWidth: 2)
+                    .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
             )
             .scaleEffect(isFocused ? 1.015 : 1)
         }

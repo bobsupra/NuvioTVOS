@@ -1,6 +1,12 @@
 import SwiftUI
 import UIKit
 
+enum AppFocusOutline {
+    static let color = Color.white
+    static let width: CGFloat = 4
+    static let emphasizedWidth: CGFloat = 6
+}
+
 private enum SettingsCategory: String, CaseIterable, Identifiable {
     case account = "Account & Profiles"
     case appearance = "Appearance"
@@ -92,8 +98,14 @@ enum SettingsKey {
     static let mdbListApiKey = "nuvio.tv.settings.integrations.mdbListApiKey"
     static let debridProvider = "nuvio.tv.settings.integrations.debridProvider"
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
+    /// Provider-specific device-flow tokens. Keeping them separate matches the
+    /// Android TV account screen, so Torbox and Premiumize can stay connected
+    /// at the same time.
+    static let torboxAccessToken = "nuvio.tv.settings.integrations.torboxAccessToken"
+    static let premiumizeAccessToken = "nuvio.tv.settings.integrations.premiumizeAccessToken"
     static let streamAddonManifestURL = "nuvio.tv.settings.integrations.streamAddonManifestURL"
     static let streamAddonManifestURLs = "nuvio.tv.settings.integrations.streamAddonManifestURLs"
+    static let streamAddonManifestStates = "nuvio.tv.settings.integrations.streamAddonManifestStates"
 
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
@@ -104,6 +116,7 @@ enum SettingsKey {
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
     static let audioLanguage = "nuvio.tv.settings.playback.audioLanguage"
+    static let subtitleLanguages = "nuvio.tv.settings.playback.subtitleLanguages"
     static let subtitleLanguage = "nuvio.tv.settings.playback.subtitleLanguage"
     static let subtitleLanguageSecondary = "nuvio.tv.settings.playback.subtitleLanguage.secondary"
     static let subtitleLanguageTertiary = "nuvio.tv.settings.playback.subtitleLanguage.tertiary"
@@ -126,10 +139,12 @@ enum SettingsKey {
         traktConnected, traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, traktLibrarySourceMode, traktMoreLikeThisSource,
         tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
-        debridProvider, debridApiKey, streamAddonManifestURL, streamAddonManifestURLs,
+        debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken,
+        streamAddonManifestURL, streamAddonManifestURLs,
+        streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
         autoPlayNext, trailersEnabled, trailerDelay, audioLanguage,
-        subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
+        subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
         fastNavigation, smoothFocus, playbackDiagnostics, focusHighlighter
     ] + SubtitleStyleKey.all
@@ -240,20 +255,100 @@ struct SubtitleStyle {
 
 enum SubtitleLanguagePreferences {
     static let disabledValues = ["System", "None"]
+    static let supportedLanguages = [
+        "English", "Arabic", "Bulgarian", "Chinese", "Croatian", "Czech",
+        "Danish", "Dutch", "Finnish", "French", "German", "Greek", "Hebrew",
+        "Hindi", "Hungarian", "Indonesian", "Italian", "Japanese", "Korean",
+        "Norwegian", "Polish", "Portuguese", "Romanian", "Russian", "Spanish",
+        "Swedish", "Thai", "Turkish", "Ukrainian", "Vietnamese"
+    ]
+    static let settingsOptions = ["System"] + supportedLanguages
 
-    static func ordered(primary: String, secondary: String, tertiary: String) -> [String] {
+    private static let languageCodes: [String: [String]] = [
+        "Arabic": ["ara", "ar"],
+        "Bulgarian": ["bul", "bg"],
+        "Chinese": ["chi", "zho", "zh", "cn"],
+        "Croatian": ["hrv", "hr"],
+        "Czech": ["cze", "ces", "cs"],
+        "Danish": ["dan", "da"],
+        "Dutch": ["dut", "nld", "nl"],
+        "English": ["eng", "en"],
+        "Finnish": ["fin", "fi"],
+        "French": ["fre", "fra", "fr"],
+        "German": ["ger", "deu", "de"],
+        "Greek": ["gre", "ell", "el"],
+        "Hebrew": ["heb", "he"],
+        "Hindi": ["hin", "hi"],
+        "Hungarian": ["hun", "hu"],
+        "Indonesian": ["ind", "id"],
+        "Italian": ["ita", "it"],
+        "Japanese": ["jpn", "ja"],
+        "Korean": ["kor", "ko"],
+        "Norwegian": ["nor", "nb", "no"],
+        "Polish": ["pol", "pl"],
+        "Portuguese": ["por", "pt", "pob", "pb"],
+        "Romanian": ["rum", "ron", "ro"],
+        "Russian": ["rus", "ru"],
+        "Spanish": ["spa", "es"],
+        "Swedish": ["swe", "sv"],
+        "Thai": ["tha", "th"],
+        "Turkish": ["tur", "tr"],
+        "Ukrainian": ["ukr", "uk"],
+        "Vietnamese": ["vie", "vi"]
+    ]
+
+    private static let languageAliases: [String: [String]] = [
+        "Chinese": ["chinese", "mandarin", "cantonese"],
+        "Dutch": ["dutch", "nederlands"],
+        "Greek": ["greek", "ellinika"],
+        "Norwegian": ["norwegian", "norsk", "bokmal", "bokmaal"],
+        "Portuguese": ["portuguese", "portugues", "português", "brazilian", "brasil"],
+        "Russian": ["russian", "russkiy", "русский"],
+        "Spanish": ["spanish", "espanol", "español", "castellano"],
+        "Turkish": ["turkish", "turkce", "türkçe"]
+    ]
+
+    static func ordered(_ languages: [String]) -> [String] {
         var seen: Set<String> = []
-        return [primary, secondary, tertiary]
+        return languages
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { language in
                 !language.isEmpty &&
-                !disabledValues.contains(language) &&
-                seen.insert(language).inserted
+                !isDisabled(language) &&
+                seen.insert(normalized(language)).inserted
             }
     }
 
-    static func orderedFromDefaults() -> [String] {
-        let defaults = ProfileSettings.current
+    static func ordered(primary: String, secondary: String, tertiary: String) -> [String] {
+        // System is an explicit no-filter mode. It must override stale legacy
+        // secondary/tertiary slots so every language remains visible.
+        guard primary.trimmingCharacters(in: .whitespacesAndNewlines)
+            .caseInsensitiveCompare("System") != .orderedSame else {
+            return []
+        }
+        return ordered([primary, secondary, tertiary])
+    }
+
+    /// Reads the unlimited ordered selection. A present JSON `[]` is an
+    /// intentional System choice; an absent/invalid value falls back to the
+    /// legacy three slots so existing profiles migrate without losing choices.
+    static func ordered(
+        encoded: String,
+        primary: String,
+        secondary: String,
+        tertiary: String
+    ) -> [String] {
+        if let decoded = decodedLanguages(encoded) {
+            return decoded
+        }
+        return ordered(primary: primary, secondary: secondary, tertiary: tertiary)
+    }
+
+    static func orderedFromDefaults(defaults: UserDefaults = ProfileSettings.current) -> [String] {
+        let encoded = defaults.string(forKey: SettingsKey.subtitleLanguages) ?? ""
+        if let decoded = decodedLanguages(encoded) {
+            return decoded
+        }
         return ordered(
             primary: defaults.string(forKey: SettingsKey.subtitleLanguage) ?? "System",
             secondary: defaults.string(forKey: SettingsKey.subtitleLanguageSecondary) ?? "None",
@@ -261,40 +356,83 @@ enum SubtitleLanguagePreferences {
         )
     }
 
+    static func encode(_ languages: [String]) -> String {
+        let normalizedLanguages = ordered(languages)
+        guard let data = try? JSONEncoder().encode(normalizedLanguages),
+              let value = String(data: data, encoding: .utf8) else {
+            return "[]"
+        }
+        return value
+    }
+
+    private static func decodedLanguages(_ encoded: String) -> [String]? {
+        guard !encoded.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+              let data = encoded.data(using: .utf8),
+              let languages = try? JSONDecoder().decode([String].self, from: data) else {
+            return nil
+        }
+        return ordered(languages)
+    }
+
+    static func smartMatchingEnabled(defaults: UserDefaults = ProfileSettings.current) -> Bool {
+        (defaults.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool) ?? true
+    }
+
     static func matches(_ languageText: String?, target: String) -> Bool {
         guard let languageText else { return false }
-        let text = languageText.lowercased()
-        let normalized = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        if exactCodes(for: target).contains(normalized) { return true }
+        let text = normalized(languageText)
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        let tokens = Set(trimmed.components(separatedBy: CharacterSet.alphanumerics.inverted).filter { !$0.isEmpty })
+        let codes = exactCodes(for: target)
+        if codes.contains(trimmed) { return true }
+        if let primaryCode = trimmed.components(separatedBy: CharacterSet(charactersIn: "-_")).first,
+           codes.contains(primaryCode) { return true }
+        if !tokens.isDisjoint(with: codes) { return true }
         return aliases(for: target).contains { alias in
-            text.contains(alias)
+            text.contains(normalized(alias))
         }
     }
 
     static func exactCodes(for language: String) -> [String] {
-        switch language {
-        case "Arabic": return ["ara", "ar"]
-        case "English": return ["eng", "en"]
-        case "Norwegian": return ["nor", "nb", "no"]
-        case "Spanish": return ["spa", "es"]
-        case "French": return ["fre", "fra", "fr"]
-        case "German": return ["ger", "deu", "de"]
-        case "Japanese": return ["jpn", "ja"]
-        default: return [language.lowercased()]
-        }
+        languageCodes[language] ?? [normalized(language)]
     }
 
     static func aliases(for language: String) -> [String] {
-        switch language {
-        case "Arabic": return ["arabic", " ara ", "[ara]", "(ara)", ".ara.", "_ara_", "-ara-", " ar ", "[ar]", "(ar)", ".ar.", "_ar_", "-ar-"]
-        case "English": return ["english", " eng ", "[eng]", "(eng)", ".eng.", "_eng_", "-eng-", " en ", "[en]", "(en)", ".en.", "_en_", "-en-"]
-        case "Norwegian": return ["norwegian", " nor ", "[nor]", "(nor)", ".nor.", "_nor_", "-nor-", " nb ", "[nb]", "(nb)", ".nb.", "_nb_", "-nb-", " no ", "[no]", "(no)", ".no.", "_no_", "-no-"]
-        case "Spanish": return ["spanish", " spa ", "[spa]", "(spa)", ".spa.", "_spa_", "-spa-", " es ", "[es]", "(es)", ".es.", "_es_", "-es-"]
-        case "French": return ["french", " fre ", " fra ", "[fre]", "[fra]", "(fre)", "(fra)", ".fre.", ".fra.", " fr ", "[fr]", "(fr)", ".fr.", "_fr_", "-fr-"]
-        case "German": return ["german", " ger ", " deu ", "[ger]", "[deu]", "(ger)", "(deu)", ".ger.", ".deu.", " de ", "[de]", "(de)", ".de.", "_de_", "-de-"]
-        case "Japanese": return ["japanese", " jpn ", "[jpn]", "(jpn)", ".jpn.", "_jpn_", "-jpn-", " ja ", "[ja]", "(ja)", ".ja.", "_ja_", "-ja-"]
-        default: return [language.lowercased()]
+        [normalized(language)] + (languageAliases[language] ?? [])
+    }
+
+    static func mpvLanguageList(for languages: [String]) -> String? {
+        var seen: Set<String> = []
+        let codes = languages.flatMap { exactCodes(for: $0) }
+            .filter { seen.insert($0).inserted }
+        return codes.isEmpty ? nil : codes.joined(separator: ",")
+    }
+
+    static func preferredAudioLanguage(defaults: UserDefaults = ProfileSettings.current) -> String? {
+        let preferred = defaults.string(forKey: SettingsKey.audioLanguage) ?? "System"
+        if !disabledValues.contains(preferred) { return preferred }
+
+        let appLanguage = defaults.string(forKey: SettingsKey.language) ?? "System"
+        if !disabledValues.contains(appLanguage), supportedLanguages.contains(appLanguage) {
+            return appLanguage
         }
+
+        return Locale.preferredLanguages.lazy.compactMap { identifier in
+            let normalizedIdentifier = normalized(identifier)
+            let pieces = normalizedIdentifier.components(separatedBy: CharacterSet(charactersIn: "-_"))
+            let code = pieces.first ?? normalizedIdentifier
+            return supportedLanguages.first { exactCodes(for: $0).contains(code) }
+        }.first
+    }
+
+    private static func isDisabled(_ value: String) -> Bool {
+        disabledValues.contains { $0.caseInsensitiveCompare(value) == .orderedSame }
+    }
+
+    private static func normalized(_ value: String) -> String {
+        value
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .lowercased()
     }
 }
 
@@ -436,6 +574,11 @@ private struct ConditionalSettingsEntryAnchor: ViewModifier {
     }
 }
 
+private enum LanguagePickerKind: Hashable {
+    case audio
+    case subtitles
+}
+
 struct SettingsView: View {
     let activeProfile: Profile?
     let accountEmail: String?
@@ -458,8 +601,9 @@ struct SettingsView: View {
     }
 
     @State private var selectedCategory: SettingsCategory = .account
-    @State private var isSubtitleLanguagePickerPresented = false
+    @State private var presentedLanguagePicker: LanguagePickerKind?
     @FocusState private var focusedCategory: SettingsCategory?
+    @FocusState private var focusedLanguagePreference: LanguagePickerKind?
     /// Whether focus has entered the current category's detail pane at least once.
     /// The entry lock (land on the first row) only fires on the first entry; after
     /// that, re-entry stays unlocked so the detail's own focus restoration can
@@ -468,11 +612,13 @@ struct SettingsView: View {
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
+    @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
     @AppStorage(SettingsKey.subtitleLanguage) private var subtitleLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
 
-    private let subtitlePickerLanguages = ["English", "Arabic", "Norwegian", "Spanish", "French", "German", "Japanese"]
+    private let pickerLanguages = SubtitleLanguagePreferences.settingsOptions
 
     private var accentColor: Color {
         SettingsAccent.color(for: theme)
@@ -527,25 +673,72 @@ struct SettingsView: View {
                 // it came from. Cleared once focus enters so re-entry isn't blocked.
                 .environment(\.settingsEntryLocked, focusedCategory != nil && !detailVisited)
             }
-            .disabled(isSubtitleLanguagePickerPresented)
-            .allowsHitTesting(!isSubtitleLanguagePickerPresented)
+            .disabled(presentedLanguagePicker != nil)
+            .allowsHitTesting(presentedLanguagePicker == nil)
 
-            if isSubtitleLanguagePickerPresented {
-                SubtitleLanguagePickerWindow(
-                    primary: $subtitleLanguage,
-                    secondary: $subtitleLanguageSecondary,
-                    tertiary: $subtitleLanguageTertiary,
-                    languages: subtitlePickerLanguages,
+            if let picker = presentedLanguagePicker {
+                LanguagePickerWindow(
+                    title: picker == .audio ? "Preferred Audio" : "Preferred Subtitle",
+                    subtitle: picker == .audio
+                        ? "Choose the default audio language."
+                        : "Choose any languages in priority order. System shows every language in the player.",
+                    systemImage: picker == .audio ? "speaker.wave.2.fill" : "captions.bubble.fill",
+                    selection: picker == .audio ? audioLanguageSelection : subtitleLanguageSelection,
+                    languages: pickerLanguages,
+                    allowsMultiple: picker == .subtitles,
                     accentColor: accentColor
                 ) {
-                    isSubtitleLanguagePickerPresented = false
+                    dismissLanguagePicker(picker)
                 }
+                .id(picker)
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 .zIndex(1)
             }
         }
         .background(Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea())
-        .animation(.easeOut(duration: 0.16), value: isSubtitleLanguagePickerPresented)
+        .animation(.easeOut(duration: 0.16), value: presentedLanguagePicker != nil)
+    }
+
+    private var audioLanguageSelection: Binding<[String]> {
+        Binding(
+            get: {
+                SubtitleLanguagePreferences.supportedLanguages.contains(audioLanguage)
+                    ? [audioLanguage]
+                    : []
+            },
+            set: { selection in
+                audioLanguage = selection.first ?? "System"
+            }
+        )
+    }
+
+    private var subtitleLanguageSelection: Binding<[String]> {
+        Binding(
+            get: {
+                SubtitleLanguagePreferences.ordered(
+                    encoded: subtitleLanguages,
+                    primary: subtitleLanguage,
+                    secondary: subtitleLanguageSecondary,
+                    tertiary: subtitleLanguageTertiary
+                )
+            },
+            set: { selection in
+                let ordered = SubtitleLanguagePreferences.ordered(selection)
+                subtitleLanguages = SubtitleLanguagePreferences.encode(ordered)
+
+                // Mirror the first three choices for older synced app builds.
+                subtitleLanguage = ordered.indices.contains(0) ? ordered[0] : "System"
+                subtitleLanguageSecondary = ordered.indices.contains(1) ? ordered[1] : "None"
+                subtitleLanguageTertiary = ordered.indices.contains(2) ? ordered[2] : "None"
+            }
+        )
+    }
+
+    private func dismissLanguagePicker(_ picker: LanguagePickerKind) {
+        presentedLanguagePicker = nil
+        DispatchQueue.main.async {
+            focusedLanguagePreference = picker
+        }
     }
 
     private var categoryGrid: some View {
@@ -619,9 +812,18 @@ struct SettingsView: View {
         case .integrations:
             IntegrationSettingsView(accentColor: accentColor)
         case .playback:
-            PlaybackSettingsView(accentColor: accentColor) {
-                isSubtitleLanguagePickerPresented = true
-            }
+            PlaybackSettingsView(
+                accentColor: accentColor,
+                languageFocus: $focusedLanguagePreference,
+                onAudioLanguage: {
+                    focusedLanguagePreference = .audio
+                    presentedLanguagePicker = .audio
+                },
+                onSubtitleLanguages: {
+                    focusedLanguagePreference = .subtitles
+                    presentedLanguagePicker = .subtitles
+                }
+            )
         case .subtitles:
             SubtitleStyleSettingsView(accentColor: accentColor)
         case .advanced:
@@ -659,7 +861,7 @@ private struct SettingsCategoryPill: View {
             .modifier(SettingsCategoryPillBackground(isSelected: isSelected, isFocused: isFocused))
             .overlay(
                 Capsule()
-                    .strokeBorder(borderColor, lineWidth: isFocused ? 3 : 1)
+                    .strokeBorder(borderColor, lineWidth: isFocused ? AppFocusOutline.width : 1)
             )
             .animation(.easeOut(duration: 0.14), value: isSelected)
         }
@@ -827,7 +1029,7 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.reduceMotion) private var reduceMotion = false
 
     private let fonts = ["Inter", "System", "Rounded", "Serif"]
-    private let languages = ["System", "English", "Norwegian", "Spanish", "French", "German", "Japanese"]
+    private let languages = SubtitleLanguagePreferences.settingsOptions
 
     private var accentSwatches: [SettingsSwatch] {
         SettingsAccent.allCases.map { SettingsSwatch(id: $0.rawValue, label: $0.rawValue, color: $0.color) }
@@ -999,8 +1201,10 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
     @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
-
-    private let debridProviders = ["None", "Real-Debrid", "AllDebrid", "Premiumize", "Debrid-Link", "TorBox"]
+    @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
+    @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
+    @State private var debridAccountToConnect: DebridAccountProvider?
+    @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -1042,28 +1246,158 @@ private struct IntegrationSettingsView: View {
                 )
             }
 
-            SettingsGroup(title: "Debrid", subtitle: "Provider and token preference used by stream resolution") {
-                SettingsOptionRow(
-                    title: "Provider",
-                    subtitle: "Preferred debrid provider",
-                    selection: $debridProvider,
-                    options: debridProviders,
+            SettingsGroup(title: "Accounts", subtitle: "Link a debrid account from your phone or browser") {
+                SettingsActionRow(
+                    title: "Torbox",
+                    subtitle: "Link your Torbox account in the browser.",
+                    value: isConnected(.torbox) ? "Connected" : "Not set",
                     accentColor: accentColor
-                )
+                ) {
+                    debridAccountToConnect = .torbox
+                }
 
-                SettingsTextFieldRow(
-                    title: "API Key",
-                    subtitle: "Stored locally on this Apple TV",
-                    placeholder: "Not set",
-                    text: $debridApiKey,
-                    isSecure: true
-                )
-                .opacity(debridProvider == "None" ? 0.46 : 1)
-                .disabled(debridProvider == "None")
+                SettingsActionRow(
+                    title: "Premiumize",
+                    subtitle: "Link your Premiumize account in the browser.",
+                    value: isConnected(.premiumize) ? "Connected" : "Not set",
+                    accentColor: accentColor
+                ) {
+                    debridAccountToConnect = .premiumize
+                }
             }
         }
         .onAppear { traktViewModel.reload() }
         .task { traktViewModel.fetchAccountConnection(auto: true) }
+        .sheet(item: $debridAccountToConnect) { provider in
+            DebridDeviceAuthorizationSheet(
+                provider: provider,
+                isConnected: isConnected(provider),
+                viewModel: debridConnection
+            )
+        }
+    }
+
+    private func isConnected(_ provider: DebridAccountProvider) -> Bool {
+        switch provider {
+        case .torbox:
+            if !torboxAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        case .premiumize:
+            if !premiumizeAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        }
+        return debridProvider == provider.debridKind.rawValue &&
+            !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+}
+
+/// Matches Android TV's debrid account dialog: start the provider device flow,
+/// render its QR, show the short code, then persist the returned access token.
+private struct DebridDeviceAuthorizationSheet: View {
+    let provider: DebridAccountProvider
+    let isConnected: Bool
+    @ObservedObject var viewModel: DebridAccountConnectionViewModel
+
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(spacing: 28) {
+            Text(isConnected ? "\(provider.displayName) Connected" : "Connect \(provider.displayName)")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundColor(.white)
+
+            if isConnected {
+                Text("This Apple TV is linked to your \(provider.displayName) account.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) { dismiss() }
+                    dialogButton(title: "Disconnect", isPrimary: true) {
+                        DebridCredentials.remove(provider: provider, store: ProfileSettings.current)
+                        dismiss()
+                    }
+                }
+            } else if viewModel.state == .starting {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                    .frame(height: 380)
+                statusText
+            } else if let authorization = viewModel.authorization {
+                Text("Scan the QR and enter this code to approve Nuvio.")
+                    .font(.system(size: 25, weight: .medium))
+                    .foregroundColor(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+
+                if let image = QRCode.image(from: authorization.friendlyVerificationURL, scale: 10) {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(16)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }
+
+                VStack(spacing: 12) {
+                    Text(authorization.userCode)
+                        .font(.system(size: 54, weight: .bold, design: .rounded))
+                        .tracking(4)
+                        .foregroundColor(.white)
+                    Text(authorization.friendlyVerificationURL)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.54))
+                        .lineLimit(1)
+                }
+
+                statusText
+                dialogButton(title: "Cancel", isPrimary: true) { dismiss() }
+            } else {
+                Text(viewModel.statusMessage ?? "Unable to start account linking.")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) { dismiss() }
+                    dialogButton(title: "Retry", isPrimary: true) { viewModel.connect(provider) }
+                }
+            }
+        }
+        .frame(width: 960)
+        .padding(.horizontal, 88)
+        .padding(.vertical, 64)
+        .background(Color(red: 0.11, green: 0.11, blue: 0.11))
+        .task(id: provider.id) {
+            if !isConnected { viewModel.connect(provider) }
+        }
+        .onChange(of: viewModel.state) { state in
+            if state == .connected { dismiss() }
+        }
+        .onDisappear { viewModel.cancel() }
+    }
+
+    private var statusText: some View {
+        HStack(spacing: 10) {
+            if viewModel.isPolling { ProgressView().tint(.white) }
+            Text(viewModel.statusMessage ?? "Waiting for approval…")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(.white.opacity(0.64))
+        }
+    }
+
+    @ViewBuilder
+    private func dialogButton(title: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(isPrimary ? .black : .white)
+                .padding(.horizontal, 34)
+                .padding(.vertical, 16)
+                .background(
+                    isPrimary ? Color.white : Color.white.opacity(0.14),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
     }
 }
 
@@ -1314,6 +1648,8 @@ private struct TraktConnectionSettingsCard: View {
 
 private struct PlaybackSettingsView: View {
     let accentColor: Color
+    let languageFocus: FocusState<LanguagePickerKind?>.Binding
+    let onAudioLanguage: () -> Void
     let onSubtitleLanguages: () -> Void
 
     @AppStorage(SettingsKey.playerEngine) private var playerEngine = "Auto"
@@ -1325,6 +1661,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
+    @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
     @AppStorage(SettingsKey.subtitleLanguage) private var subtitleLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
@@ -1335,7 +1672,6 @@ private struct PlaybackSettingsView: View {
     private let engines = ["Auto", "AVPlayer", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
     private let streamQualities = ["Highest", "4K", "1080p", "720p", "Smallest"]
-    private let languages = ["System", "English", "Arabic", "Norwegian", "Spanish", "French", "German", "Japanese"]
     private let frameRateModes = ["Off", "On start/stop", "Always"]
     private let cacheModes = ["Auto", "Small", "Medium", "Large"]
 
@@ -1403,7 +1739,7 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: "Match Subtitle Language",
-                    subtitle: "Prefer links and tracks matching Preferred Subtitles",
+                    subtitle: "Prefer links and tracks matching Preferred Subtitle",
                     isOn: $smartSubtitleMatching,
                     accentColor: accentColor
                 )
@@ -1412,33 +1748,31 @@ private struct PlaybackSettingsView: View {
             }
 
             SettingsGroup(title: "Audio & Subtitles", subtitle: "Language and subtitle rendering defaults") {
-                SettingsChoiceRow(
+                SettingsActionRow(
                     title: "Preferred Audio",
                     subtitle: "Default audio language",
-                    selection: $audioLanguage,
-                    options: languages,
+                    value: audioLanguageSummary,
                     accentColor: accentColor
-                )
+                ) {
+                    onAudioLanguage()
+                }
+                .focused(languageFocus, equals: .audio)
 
                 SettingsActionRow(
-                    title: "Subtitle Languages",
-                    subtitle: "Choose up to 3 languages in priority order",
+                    title: "Preferred Subtitle",
+                    subtitle: "Choose any number of languages in priority order",
                     value: subtitleLanguageSummary,
                     accentColor: accentColor
                 ) {
                     onSubtitleLanguages()
                 }
+                .focused(languageFocus, equals: .subtitles)
 
                 SettingsToggleRow(
                     title: "Forced Subtitles",
                     subtitle: "Use forced subtitles when a matching track exists",
                     isOn: $forcedSubtitles,
                     accentColor: accentColor
-                )
-
-                SettingsInfoRow(
-                    title: "Subtitle Appearance",
-                    value: "Subtitle Style tab"
                 )
             }
 
@@ -1465,13 +1799,22 @@ private struct PlaybackSettingsView: View {
         }
     }
 
+    private var audioLanguageSummary: String {
+        SubtitleLanguagePreferences.settingsOptions.contains(audioLanguage)
+            ? audioLanguage
+            : "System"
+    }
+
     private var subtitleLanguageSummary: String {
         let ordered = SubtitleLanguagePreferences.ordered(
+            encoded: subtitleLanguages,
             primary: subtitleLanguage,
             secondary: subtitleLanguageSecondary,
             tertiary: subtitleLanguageTertiary
         )
-        return ordered.isEmpty ? "System" : ordered.joined(separator: ", ")
+        guard !ordered.isEmpty else { return "System" }
+        guard ordered.count > 2 else { return ordered.joined(separator: ", ") }
+        return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
     }
 }
 
@@ -1812,7 +2155,7 @@ private struct SubtitleColorSwatchButton: View {
                 )
                 .overlay(
                     Circle()
-                        .strokeBorder(ringColor, lineWidth: isFocused ? 3 : (isSelected ? 4 : 0))
+                        .strokeBorder(ringColor, lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 4 : 0))
                         .padding(-4)
                 )
         }
@@ -1826,24 +2169,28 @@ private struct SubtitleColorSwatchButton: View {
     }
 
     private var ringColor: Color {
-        if isFocused { return .white.opacity(0.86) }
+        if isFocused { return AppFocusOutline.color }
         return isSelected ? accentColor : .clear
     }
 }
 
-private struct SubtitleLanguagePickerWindow: View {
-    @Binding var primary: String
-    @Binding var secondary: String
-    @Binding var tertiary: String
+private struct LanguagePickerWindow: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    @Binding var selection: [String]
     let languages: [String]
+    let allowsMultiple: Bool
     let accentColor: Color
     let onDone: () -> Void
 
     @FocusState private var focusedControl: Control?
+    @State private var lastFocusedLanguage: String?
 
     private enum Control: Hashable {
         case language(String)
         case done
+        case leftGuard
     }
 
     var body: some View {
@@ -1853,17 +2200,17 @@ private struct SubtitleLanguagePickerWindow: View {
 
             VStack(alignment: .leading, spacing: 22) {
                 HStack(spacing: 18) {
-                    Image(systemName: "captions.bubble.fill")
+                    Image(systemName: systemImage)
                         .font(.system(size: 38, weight: .semibold))
                         .foregroundColor(accentColor)
                         .frame(width: 58, height: 58)
                         .settingsGlass(shape: Circle(), isProminent: true)
 
                     VStack(alignment: .leading, spacing: 5) {
-                        Text("Subtitle Languages")
+                        Text(title)
                             .font(.system(size: 34, weight: .bold))
                             .foregroundColor(.white)
-                        Text("Pick the order smart playback should try first.")
+                        Text(subtitle)
                             .font(.system(size: 19, weight: .medium))
                             .foregroundColor(.white.opacity(0.58))
                     }
@@ -1872,9 +2219,10 @@ private struct SubtitleLanguagePickerWindow: View {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 10) {
                         ForEach(languages, id: \.self) { language in
-                            SubtitleLanguageListRow(
+                            LanguagePickerListRow(
                                 language: language,
                                 priority: priority(for: language),
+                                isSelected: isSelected(language),
                                 isFocused: focusedControl == .language(language),
                                 accentColor: accentColor
                             ) {
@@ -1887,6 +2235,17 @@ private struct SubtitleLanguagePickerWindow: View {
                 }
                 .frame(maxHeight: 420)
                 .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(alignment: .leading) {
+                    Button(action: {}) {
+                        Color.white.opacity(0.001)
+                            .frame(width: 24, height: 390)
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($focusedControl, equals: .leftGuard)
+                    .focusEffectDisabledIfAvailable()
+                    .offset(x: -18)
+                    .accessibilityHidden(true)
+                }
                 .focusSection()
 
                 HStack {
@@ -1898,14 +2257,21 @@ private struct SubtitleLanguagePickerWindow: View {
                             Text("Done")
                                 .font(.system(size: 21, weight: .bold))
                         }
-                        .foregroundColor(focusedControl == .done && accentColor == .white ? .black : .white)
+                        .foregroundColor(focusedControl == .done ? .black : .white)
                         .padding(.horizontal, 26)
                         .frame(height: 58)
-                        .settingsGlass(shape: Capsule(), isProminent: focusedControl == .done)
+                        .modifier(
+                            TvDetailsGlassBackground(
+                                filled: focusedControl == .done,
+                                shape: Capsule()
+                            )
+                        )
                     }
                     .buttonStyle(PosterCardButtonStyle())
                     .focused($focusedControl, equals: .done)
                     .focusEffectDisabledIfAvailable()
+                    .scaleEffect(focusedControl == .done ? 1.06 : 1)
+                    .animation(.easeOut(duration: 0.14), value: focusedControl == .done)
                 }
             }
             .padding(34)
@@ -1916,67 +2282,82 @@ private struct SubtitleLanguagePickerWindow: View {
                     .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
             )
             .onAppear {
-                focusedControl = .language(selectedLanguages.first ?? languages.first ?? "English")
+                let initialLanguage = selectedLanguages.first ?? "System"
+                let initialFocus = languages.contains(initialLanguage)
+                    ? initialLanguage
+                    : (languages.first ?? "System")
+                lastFocusedLanguage = initialFocus
+                DispatchQueue.main.async {
+                    focusedControl = .language(initialFocus)
+                }
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .focusSection()
-        .onMoveCommand(perform: handleMove)
+        .onChange(of: focusedControl) { control in
+            if case .language(let language) = control {
+                lastFocusedLanguage = language
+            } else if control == .leftGuard {
+                let language = lastFocusedLanguage ?? selectedLanguages.first ?? "System"
+                DispatchQueue.main.async {
+                    focusedControl = .language(languages.contains(language) ? language : (languages.first ?? "System"))
+                }
+            }
+        }
+        .onMoveCommand(perform: handleHorizontalMove)
         .onExitCommand(perform: onDone)
     }
 
     private var selectedLanguages: [String] {
-        SubtitleLanguagePreferences.ordered(
-            primary: primary,
-            secondary: secondary,
-            tertiary: tertiary
-        )
+        SubtitleLanguagePreferences.ordered(selection)
     }
 
     private func priority(for language: String) -> Int? {
-        selectedLanguages.firstIndex(of: language).map { $0 + 1 }
+        guard allowsMultiple, language != "System" else { return nil }
+        return selectedLanguages.firstIndex(of: language).map { $0 + 1 }
+    }
+
+    private func isSelected(_ language: String) -> Bool {
+        if language == "System" {
+            return selectedLanguages.isEmpty
+        }
+        return selectedLanguages.contains(language)
     }
 
     private func toggle(_ language: String) {
-        var selected = selectedLanguages
-        if let index = selected.firstIndex(of: language) {
-            selected.remove(at: index)
-        } else if selected.count < 3 {
-            selected.append(language)
-        } else {
-            selected[2] = language
-        }
-
-        primary = selected.indices.contains(0) ? selected[0] : "System"
-        secondary = selected.indices.contains(1) ? selected[1] : "None"
-        tertiary = selected.indices.contains(2) ? selected[2] : "None"
-    }
-
-    private var focusOrder: [Control] {
-        languages.map { .language($0) } + [.done]
-    }
-
-    private func handleMove(_ direction: MoveCommandDirection) {
-        guard let focusedControl,
-              let currentIndex = focusOrder.firstIndex(of: focusedControl) else {
-            self.focusedControl = .language(selectedLanguages.first ?? languages.first ?? "English")
+        if language == "System" {
+            selection = []
             return
         }
 
-        switch direction {
-        case .up:
-            self.focusedControl = focusOrder[max(currentIndex - 1, 0)]
-        case .down:
-            self.focusedControl = focusOrder[min(currentIndex + 1, focusOrder.count - 1)]
-        default:
-            break
+        guard allowsMultiple else {
+            selection = [language]
+            return
         }
+
+        var selected = selectedLanguages
+        if let index = selected.firstIndex(of: language) {
+            selected.remove(at: index)
+        } else {
+            selected.append(language)
+        }
+        selection = selected
+    }
+
+    private func handleHorizontalMove(_ direction: MoveCommandDirection) {
+        guard direction == .right,
+              case .language(let language) = focusedControl else {
+            return
+        }
+        lastFocusedLanguage = language
+        focusedControl = .done
     }
 }
 
-private struct SubtitleLanguageListRow: View {
+private struct LanguagePickerListRow: View {
     let language: String
     let priority: Int?
+    let isSelected: Bool
     let isFocused: Bool
     let accentColor: Color
     let action: () -> Void
@@ -1997,7 +2378,9 @@ private struct SubtitleLanguageListRow: View {
                         .foregroundColor(accentColor == .white ? .black : .white)
                         .frame(width: 34, height: 34)
                         .background(accentColor, in: Circle())
+                }
 
+                if isSelected {
                     Image(systemName: "checkmark")
                         .font(.system(size: 20, weight: .black))
                         .foregroundColor(accentColor)
@@ -2008,7 +2391,7 @@ private struct SubtitleLanguageListRow: View {
             .settingsGlass(shape: Capsule(), isProminent: isFocused)
             .overlay(
                 Capsule()
-                    .strokeBorder(isFocused ? Color.white.opacity(0.86) : Color.white.opacity(priority == nil ? 0.12 : 0.28), lineWidth: isFocused ? 3 : 1)
+                    .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(isSelected ? 0.28 : 0.12), lineWidth: isFocused ? AppFocusOutline.width : 1)
             )
         }
         .buttonStyle(PosterCardButtonStyle())
@@ -2122,6 +2505,7 @@ private struct AddonsSettingsSection: View {
 
     @AppStorage(SettingsKey.streamAddonManifestURL) private var streamAddonManifestURL = ""
     @AppStorage(SettingsKey.streamAddonManifestURLs) private var streamAddonManifestURLs = ""
+    @AppStorage(SettingsKey.streamAddonManifestStates) private var streamAddonManifestStates = ""
     @State private var addons: [AddonItem] = AddonItem.defaults
     @State private var syncedAddons: [SyncedAddon] = []
 
@@ -2142,6 +2526,7 @@ private struct AddonsSettingsSection: View {
                     accentColor: accentColor,
                     canMoveUp: index > 0,
                     canMoveDown: index < syncedAddons.count - 1,
+                    onEnabledChange: { isEnabled in setAddonEnabled(at: index, isEnabled: isEnabled) },
                     onMove: { up in moveAddon(at: index, up: up) }
                 )
             }
@@ -2154,7 +2539,7 @@ private struct AddonsSettingsSection: View {
                 }
             }
         }
-        .task(id: streamAddonManifestURL + "\n" + streamAddonManifestURLs) {
+        .task(id: streamAddonManifestURL + "\n" + streamAddonManifestURLs + "\n" + streamAddonManifestStates) {
             await loadSyncedAddons()
         }
     }
@@ -2166,13 +2551,26 @@ private struct AddonsSettingsSection: View {
         let target = up ? index - 1 : index + 1
         guard syncedAddons.indices.contains(index), syncedAddons.indices.contains(target) else { return }
         syncedAddons.swapAt(index, target)
+        persistSyncedAddons()
+    }
 
-        let urls = syncedAddons.map { $0.url.absoluteString }
-        streamAddonManifestURL = urls.first ?? ""
-        streamAddonManifestURLs = urls.joined(separator: "\n")
+    private func setAddonEnabled(at index: Int, isEnabled: Bool) {
+        guard syncedAddons.indices.contains(index) else { return }
+        syncedAddons[index].isEnabled = isEnabled
+        persistSyncedAddons()
+    }
+
+    private func persistSyncedAddons() {
+        let preferences = syncedAddons.map {
+            StreamAddonPreference(url: $0.url.absoluteString, enabled: $0.isEnabled)
+        }
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences)
+        streamAddonManifestURL = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURL) ?? ""
+        streamAddonManifestURLs = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURLs) ?? ""
+        streamAddonManifestStates = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestStates) ?? ""
         NotificationCenter.default.post(
             name: NuvioSyncManager.addonOrderChangedNotification,
-            object: urls
+            object: preferences
         )
     }
 
@@ -2180,11 +2578,14 @@ private struct AddonsSettingsSection: View {
     /// upgrades each row with the real name/version/description from its
     /// manifest as the fetches come back.
     private func loadSyncedAddons() async {
-        let urls = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
+        let preferences = CinemetaCatalogRepository.configuredStreamAddonPreferences
         // Keep already-resolved names/descriptions (e.g. across a reorder) so
         // rows don't flash back to host-derived names.
-        var resolved = urls.map { url in
-            syncedAddons.first { $0.url == url } ?? SyncedAddon(url: url)
+        var resolved = preferences.compactMap { preference -> SyncedAddon? in
+            guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: preference.url) else { return nil }
+            var addon = syncedAddons.first { $0.url == url } ?? SyncedAddon(url: url)
+            addon.isEnabled = preference.enabled
+            return addon
         }
         syncedAddons = resolved
 
@@ -2229,12 +2630,14 @@ private struct SyncedAddon: Identifiable {
     var name: String
     var version: String?
     var description: String?
+    var isEnabled: Bool
 
     var id: String { url.absoluteString }
 
-    init(url: URL) {
+    init(url: URL, isEnabled: Bool = true) {
         self.url = url
         self.name = CinemetaCatalogRepository.streamAddonName(for: url)
+        self.isEnabled = isEnabled
     }
 
     mutating func apply(_ manifest: StremioManifest) {
@@ -2271,6 +2674,7 @@ private struct SyncedAddonSettingsRow: View {
     let accentColor: Color
     var canMoveUp: Bool = false
     var canMoveDown: Bool = false
+    var onEnabledChange: ((Bool) -> Void)? = nil
     /// Called with `true` for up, `false` for down. nil hides the arrows.
     var onMove: ((Bool) -> Void)? = nil
 
@@ -2279,6 +2683,12 @@ private struct SyncedAddonSettingsRow: View {
     var body: some View {
         HStack(spacing: 14) {
             rowButton
+
+            if let onEnabledChange {
+                AddonReorderButton(systemImage: addon.isEnabled ? "power.circle.fill" : "power.circle", disabled: false) {
+                    onEnabledChange(!addon.isEnabled)
+                }
+            }
 
             if let onMove {
                 AddonReorderButton(systemImage: "chevron.up", disabled: !canMoveUp) {
@@ -2292,18 +2702,18 @@ private struct SyncedAddonSettingsRow: View {
     }
 
     private var rowButton: some View {
-        Button(action: {}) {
+        Button(action: { onEnabledChange?(!addon.isEnabled) }) {
             SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
                 Image(systemName: "arrow.triangle.2.circlepath")
                     .font(.system(size: 26))
-                    .foregroundColor(accentColor)
+                    .foregroundColor(addon.isEnabled ? accentColor : .white.opacity(0.38))
                     .frame(width: 48, height: 48)
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
                         Text(addon.name)
                             .font(.system(size: 22, weight: .semibold))
-                            .foregroundColor(.white)
+                            .foregroundColor(addon.isEnabled ? .white : .white.opacity(0.46))
                             .lineLimit(1)
                         if let version = addon.version, !version.isEmpty {
                             Text("v\(version)")
@@ -2316,15 +2726,15 @@ private struct SyncedAddonSettingsRow: View {
                     }
                     Text(addon.subtitle)
                         .font(.system(size: 16, weight: .medium))
-                        .foregroundColor(.white.opacity(0.56))
+                        .foregroundColor(.white.opacity(addon.isEnabled ? 0.56 : 0.36))
                         .lineLimit(2)
                 }
 
                 Spacer(minLength: 20)
 
-                Text("Active")
+                Text(addon.isEnabled ? "Active" : "Disabled")
                     .font(.system(size: 18, weight: .bold))
-                    .foregroundColor(.white.opacity(0.7))
+                    .foregroundColor(addon.isEnabled ? .white.opacity(0.7) : .white.opacity(0.42))
                     .lineLimit(1)
             }
         }
@@ -3354,7 +3764,7 @@ private struct SettingsSwatchButton: View {
                     )
                 .overlay(
                     Circle()
-                        .strokeBorder(ringColor, lineWidth: isFocused ? 3 : (isSelected ? 4 : 0))
+                        .strokeBorder(ringColor, lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 4 : 0))
                         .padding(-4)
                 )
 
@@ -3374,7 +3784,7 @@ private struct SettingsSwatchButton: View {
     }
 
     private var ringColor: Color {
-        if isFocused { return .white.opacity(0.86) }
+        if isFocused { return AppFocusOutline.color }
         return isSelected ? accentColor : .clear
     }
 }
@@ -3393,7 +3803,7 @@ private struct SettingsRowShell<Content: View>: View {
         .settingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
         .overlay(
             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(isFocused ? Color.white.opacity(0.86) : Color.white.opacity(0.10), lineWidth: isFocused ? 3 : 1)
+                .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.10), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .animation(.easeOut(duration: 0.18), value: isFocused)
     }
@@ -3440,7 +3850,7 @@ private struct SettingsMiniButton: View {
                 .settingsGlass(shape: Circle(), isProminent: isFocused)
                 .overlay(
                     Circle()
-                        .strokeBorder(isFocused ? Color.white.opacity(0.86) : Color.white.opacity(0.12), lineWidth: isFocused ? 3 : 1)
+                        .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.12), lineWidth: isFocused ? AppFocusOutline.width : 1)
                 )
         }
         .buttonStyle(PosterCardButtonStyle())

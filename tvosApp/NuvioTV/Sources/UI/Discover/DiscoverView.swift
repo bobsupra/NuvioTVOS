@@ -225,7 +225,7 @@ struct FilterMenu<MenuContent: View>: View {
         .modifier(GlassChipBackground(filled: false))
         .overlay(
             Capsule()
-                .strokeBorder(Color.white.opacity(focused ? 0.86 : 0), lineWidth: focused ? 3 : 0)
+                .strokeBorder(focused ? AppFocusOutline.color : .clear, lineWidth: focused ? AppFocusOutline.width : 0)
         )
     }
 }
@@ -287,7 +287,7 @@ private struct DiscoverCard: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? 5 : 3)
+                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
                 .shadow(color: .black.opacity(focused ? 0.5 : 0.2), radius: focused ? 16 : 6)
 
@@ -327,6 +327,6 @@ private struct DiscoverCard: View {
     }
 
     private var focusBorderColor: Color {
-        .white.opacity(0.86)
+        AppFocusOutline.color
     }
 }

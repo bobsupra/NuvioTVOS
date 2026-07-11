@@ -10,13 +10,25 @@ public struct Profile: Equatable, Hashable, Identifiable {
     public var isPinProtected: Bool
     public var isAdmin: Bool
     public var avatarId: String
+    public var usesPrimaryAddons: Bool
+    public var usesPrimaryPlugins: Bool
 
-    public init(id: String, name: String, isPinProtected: Bool = false, isAdmin: Bool = false, avatarId: String = "") {
+    public init(
+        id: String,
+        name: String,
+        isPinProtected: Bool = false,
+        isAdmin: Bool = false,
+        avatarId: String = "",
+        usesPrimaryAddons: Bool = false,
+        usesPrimaryPlugins: Bool = false
+    ) {
         self.id = id
         self.name = name
         self.isPinProtected = isPinProtected
         self.isAdmin = isAdmin
         self.avatarId = avatarId
+        self.usesPrimaryAddons = usesPrimaryAddons
+        self.usesPrimaryPlugins = usesPrimaryPlugins
     }
 }
 
@@ -73,24 +85,45 @@ public struct WatchedItem: Equatable, Hashable, Identifiable {
 
 // MARK: - ProfileManager stub (replaces Rust FFI class)
 
-/// Pure Swift stub for ProfileManager — persists via UserDefaults
+/// Pure Swift stub for ProfileManager.
 public class ProfileManager {
     static let profilesChangedNotification = Notification.Name("nuvio.tv.profiles.changed")
 
     private static let profilesKey = "nuvio.profiles"
     private static let activePinKey = "nuvio.active_profile_id"
     private static let maxProfiles = 6
+    private static let maxProfileIdCharacters = 64
+    private static let maxProfileNameCharacters = 80
+    private static let maxAvatarIdCharacters = 128
+
+    private let profilesURL: URL
 
     public init(baseDir: String) throws {
-        // No-op for stub — we use UserDefaults
+        let baseURL = URL(fileURLWithPath: baseDir, isDirectory: true)
+        try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
+        profilesURL = baseURL.appendingPathComponent("nuvio-profiles.json")
+        try migrateProfilesFromUserDefaultsIfNeeded()
+        UserDefaults.standard.removeObject(forKey: Self.profilesKey)
     }
 
     public func getProfiles() throws -> [Profile] {
-        guard let data = UserDefaults.standard.data(forKey: Self.profilesKey),
-              let decoded = try? JSONDecoder().decode([StoredProfile].self, from: data) else {
+        guard FileManager.default.fileExists(atPath: profilesURL.path) else {
             return []
         }
-        return decoded.map { $0.toProfile() }
+
+        do {
+            let data = try Data(contentsOf: profilesURL)
+            let decoded = try JSONDecoder().decode([StoredProfile].self, from: data)
+            let rawProfiles = decoded.map { $0.toProfile() }
+            let profiles = Self.sanitizedProfiles(rawProfiles)
+            if profiles != rawProfiles {
+                try writeProfiles(profiles)
+            }
+            return profiles
+        } catch {
+            quarantineUnreadableProfilesFile()
+            return []
+        }
     }
 
     public func createProfile(input: CreateProfileInput) throws -> Profile {
@@ -104,37 +137,39 @@ public class ProfileManager {
             avatarId: input.avatarId ?? ""
         )
         profiles.append(profile)
-        saveProfiles(profiles)
+        try saveProfiles(profiles)
         return profile
     }
 
     public func getActiveProfile() throws -> Profile? {
         let profiles = (try? getProfiles()) ?? []
-        if let id = UserDefaults.standard.string(forKey: Self.activePinKey) {
-            return profiles.first(where: { $0.id == id })
+        if let id = UserDefaults.standard.string(forKey: Self.activePinKey),
+           let activeProfile = profiles.first(where: { $0.id == id }) {
+            return activeProfile
         }
         return profiles.first
     }
 
     public func switchProfile(id: String) throws {
-        UserDefaults.standard.set(id, forKey: Self.activePinKey)
+        UserDefaults.standard.set(Self.sanitizedProfileId(id), forKey: Self.activePinKey)
     }
 
     public func deleteProfile(id: String) throws {
         var profiles = (try? getProfiles()) ?? []
         profiles.removeAll(where: { $0.id == id })
-        saveProfiles(profiles)
+        try saveProfiles(profiles)
     }
 
     public func updateProfileAvatar(id: String, avatarId: String) throws {
         var profiles = (try? getProfiles()) ?? []
         guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
         profiles[index].avatarId = avatarId
-        saveProfiles(profiles)
+        try saveProfiles(profiles)
     }
 
     public func replaceProfiles(_ profiles: [Profile]) throws {
-        saveProfiles(profiles)
+        let profiles = Self.sanitizedProfiles(profiles)
+        try saveProfiles(profiles)
         if let activeId = UserDefaults.standard.string(forKey: Self.activePinKey),
            profiles.contains(where: { $0.id == activeId }) {
             return
@@ -149,11 +184,45 @@ public class ProfileManager {
         return true
     }
 
-    private func saveProfiles(_ profiles: [Profile]) {
-        let stored = profiles.map { StoredProfile(from: $0) }
-        if let data = try? JSONEncoder().encode(stored) {
-            UserDefaults.standard.set(data, forKey: Self.profilesKey)
-            NotificationCenter.default.post(name: Self.profilesChangedNotification, object: nil)
+    private func saveProfiles(_ profiles: [Profile]) throws {
+        try writeProfiles(profiles)
+        NotificationCenter.default.post(name: Self.profilesChangedNotification, object: nil)
+    }
+
+    private func writeProfiles(_ profiles: [Profile]) throws {
+        let stored = Self.sanitizedProfiles(profiles).map { StoredProfile(from: $0) }
+        let data = try JSONEncoder().encode(stored)
+        try data.write(to: profilesURL, options: [.atomic])
+    }
+
+    private func migrateProfilesFromUserDefaultsIfNeeded() throws {
+        guard !FileManager.default.fileExists(atPath: profilesURL.path),
+              let data = UserDefaults.standard.data(forKey: Self.profilesKey),
+              let decoded = try? JSONDecoder().decode([StoredProfile].self, from: data) else {
+            return
+        }
+
+        try writeProfiles(decoded.map { $0.toProfile() })
+        UserDefaults.standard.removeObject(forKey: Self.profilesKey)
+    }
+
+    private func quarantineUnreadableProfilesFile() {
+        let backupURL = profilesURL.deletingPathExtension().appendingPathExtension("invalid.json")
+        try? FileManager.default.removeItem(at: backupURL)
+        try? FileManager.default.moveItem(at: profilesURL, to: backupURL)
+    }
+
+    private static func sanitizedProfiles(_ profiles: [Profile]) -> [Profile] {
+        Array(profiles.prefix(maxProfiles)).map { profile in
+            Profile(
+                id: sanitizedProfileId(profile.id),
+                name: sanitizedProfileName(profile.name),
+                isPinProtected: profile.isPinProtected,
+                isAdmin: profile.isAdmin,
+                avatarId: sanitizedAvatarId(profile.avatarId),
+                usesPrimaryAddons: profile.usesPrimaryAddons,
+                usesPrimaryPlugins: profile.usesPrimaryPlugins
+            )
         }
     }
 
@@ -164,6 +233,30 @@ public class ProfileManager {
         }
         return UUID().uuidString
     }
+
+    private static func sanitizedProfileId(_ id: String) -> String {
+        let trimmed = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let fallback = UUID().uuidString
+        let value = trimmed.isEmpty ? fallback : trimmed
+        return String(value.prefix(maxProfileIdCharacters))
+    }
+
+    private static func sanitizedProfileName(_ name: String) -> String {
+        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let value = trimmed.isEmpty ? "Nuvio User" : trimmed
+        return String(value.prefix(maxProfileNameCharacters))
+    }
+
+    private static func sanitizedAvatarId(_ avatarId: String) -> String {
+        let trimmed = avatarId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercased = trimmed.lowercased()
+        guard trimmed.count <= maxAvatarIdCharacters,
+              !lowercased.hasPrefix("data:"),
+              !lowercased.contains("base64,") else {
+            return ""
+        }
+        return trimmed
+    }
 }
 
 // Codable helper for UserDefaults persistence
@@ -173,6 +266,8 @@ private struct StoredProfile: Codable {
     var isPinProtected: Bool
     var isAdmin: Bool
     var avatarId: String
+    var usesPrimaryAddons: Bool?
+    var usesPrimaryPlugins: Bool?
 
     init(from profile: Profile) {
         self.id = profile.id
@@ -180,10 +275,20 @@ private struct StoredProfile: Codable {
         self.isPinProtected = profile.isPinProtected
         self.isAdmin = profile.isAdmin
         self.avatarId = profile.avatarId
+        self.usesPrimaryAddons = profile.usesPrimaryAddons
+        self.usesPrimaryPlugins = profile.usesPrimaryPlugins
     }
 
     func toProfile() -> Profile {
-        Profile(id: id, name: name, isPinProtected: isPinProtected, isAdmin: isAdmin, avatarId: avatarId)
+        Profile(
+            id: id,
+            name: name,
+            isPinProtected: isPinProtected,
+            isAdmin: isAdmin,
+            avatarId: avatarId,
+            usesPrimaryAddons: usesPrimaryAddons ?? false,
+            usesPrimaryPlugins: usesPrimaryPlugins ?? false
+        )
     }
 }
 
@@ -219,6 +324,7 @@ public class ProfileViewModel: ObservableObject {
     @Published public var activeProfile: Profile?
     @Published public var isPinEntryVisible = false
     @Published public var pinError: String?
+    @Published public var profileCreationError: String?
     @Published public var isLoading = false
     @Published public var pendingProfileId: String?
 
@@ -234,9 +340,32 @@ public class ProfileViewModel: ObservableObject {
         if let manager = profileManager {
             self.profileManager = manager
         } else {
-            let documentsPath = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0].path
             do {
-                self.profileManager = try ProfileManager(baseDir: documentsPath)
+                let fileManager = FileManager.default
+                // Some sideload signing/install paths expose Documents as
+                // read-only on tvOS. Application Support is the app-private,
+                // writable location intended for persistent internal data.
+                let supportURL = try fileManager.url(
+                    for: .applicationSupportDirectory,
+                    in: .userDomainMask,
+                    appropriateFor: nil,
+                    create: true
+                ).appendingPathComponent("Nuvio", isDirectory: true)
+                try fileManager.createDirectory(at: supportURL, withIntermediateDirectories: true)
+
+                // Keep profiles from development/older builds when that file
+                // is readable, but never make startup depend on Documents.
+                let legacyURL = fileManager.urls(
+                    for: .documentDirectory,
+                    in: .userDomainMask
+                )[0].appendingPathComponent("nuvio-profiles.json")
+                let profilesURL = supportURL.appendingPathComponent("nuvio-profiles.json")
+                if !fileManager.fileExists(atPath: profilesURL.path),
+                   fileManager.fileExists(atPath: legacyURL.path) {
+                    try? fileManager.copyItem(at: legacyURL, to: profilesURL)
+                }
+
+                self.profileManager = try ProfileManager(baseDir: supportURL.path)
             } catch {
                 print("Failed to initialize ProfileManager: \(error)")
                 self.profileManager = nil
@@ -267,15 +396,33 @@ public class ProfileViewModel: ObservableObject {
         guard let manager = profileManager else {
             // Seed a default profile so the UI isn't empty
             if profiles.isEmpty {
-                profiles = [Profile(id: "1", name: "Nuvio User", isPinProtected: false, isAdmin: true, avatarId: "")]
+                profiles = [
+                    Profile(
+                        id: "guest",
+                        name: "Nuvio Guest",
+                        isPinProtected: false,
+                        isAdmin: true,
+                        avatarId: ""
+                    )
+                ]
             }
             return
         }
         do {
             var list = try manager.getProfiles()
             if list.isEmpty {
-                let input = CreateProfileInput(name: "Nuvio Guest", profileType: .admin, avatarId: "")
-                _ = try manager.createProfile(input: input)
+                // Keep the fresh-install placeholder distinct from remote slot
+                // 1. Account sync replaces `guest` with the real primary profile
+                // instead of preserving the placeholder as account identity.
+                try manager.replaceProfiles([
+                    Profile(
+                        id: "guest",
+                        name: "Nuvio Guest",
+                        isPinProtected: false,
+                        isAdmin: true,
+                        avatarId: ""
+                    )
+                ])
                 list = try manager.getProfiles()
             }
             self.profiles = list
@@ -310,9 +457,19 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
-    public func createProfile(name: String, pin: String?, avatarId: String = "") {
-        guard let manager = profileManager else { return }
+    public func createProfile(
+        name: String,
+        pin: String?,
+        avatarId: String = "",
+        onCreated: (() -> Void)? = nil
+    ) {
+        guard let manager = profileManager else {
+            profileCreationError = "Profiles are unavailable on this device."
+            return
+        }
+        guard !isLoading else { return }
         isLoading = true
+        profileCreationError = nil
         let input = CreateProfileInput(name: name, profileType: .adult, avatarId: avatarId, pin: pin)
         Task {
             do {
@@ -322,7 +479,9 @@ public class ProfileViewModel: ObservableObject {
                 ProfileSettings.seedNewProfile(newProfile.id)
                 loadProfiles()
                 isLoading = false
+                onCreated?()
             } catch {
+                profileCreationError = "Couldn't save this profile: \(error.localizedDescription)"
                 print("Failed to create profile: \(error)")
                 isLoading = false
             }
@@ -389,10 +548,21 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
-    public func applyRemoteProfiles(_ remoteProfiles: [Profile]) {
-        guard !remoteProfiles.isEmpty else { return }
+    @discardableResult
+    public func applyRemoteProfiles(_ remoteProfiles: [Profile]) -> Bool {
+        guard !remoteProfiles.isEmpty else { return false }
+        let preferredActiveId = activeProfile?.id
+
+        guard let manager = profileManager else {
+            return applyProfilesInMemory(remoteProfiles, preferredActiveId: preferredActiveId)
+        }
+
         do {
-            try profileManager?.replaceProfiles(remoteProfiles)
+            try manager.replaceProfiles(remoteProfiles)
+            if let preferredActiveId,
+               remoteProfiles.contains(where: { $0.id == preferredActiveId }) {
+                try manager.switchProfile(id: preferredActiveId)
+            }
             loadProfiles()
             // Unconditional: besides refreshing the profile object this scopes
             // the watch-state stores (setActiveProfile) so the sync's merges
@@ -400,9 +570,34 @@ public class ProfileViewModel: ObservableObject {
             // away from who's-watching listens to `profileChosen`, not
             // `activeProfile`, so this can't yank the user into a profile.
             loadActiveProfile()
+            guard profiles == remoteProfiles,
+                  let activeProfile,
+                  profiles.contains(where: { $0.id == activeProfile.id }) else {
+                print("Persisted remote profiles did not reload as written; using the pulled profiles in memory.")
+                return applyProfilesInMemory(remoteProfiles, preferredActiveId: preferredActiveId)
+            }
+            return true
         } catch {
             print("Failed to apply remote profiles: \(error)")
+            return applyProfilesInMemory(remoteProfiles, preferredActiveId: preferredActiveId)
         }
+    }
+
+    private func applyProfilesInMemory(_ remoteProfiles: [Profile], preferredActiveId: String?) -> Bool {
+        profiles = remoteProfiles
+        let profile = preferredActiveId.flatMap { preferredId in
+            remoteProfiles.first(where: { $0.id == preferredId })
+        } ?? remoteProfiles.first
+
+        ContinueWatchingStore.setActiveProfile(profile?.id)
+        LibraryStore.setActiveProfile(profile?.id)
+        WatchedStore.setActiveProfile(profile?.id)
+        CollectionsStore.setActiveProfile(profile?.id)
+        ProfileSettings.setActiveProfile(profile?.id)
+        activeProfile = profile
+
+        guard profiles == remoteProfiles, let profile else { return false }
+        return profiles.contains(where: { $0.id == profile.id })
     }
 
     public func resetForSignedOut() {

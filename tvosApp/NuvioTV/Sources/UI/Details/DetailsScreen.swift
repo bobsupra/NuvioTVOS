@@ -31,6 +31,7 @@ struct DetailsScreen: View {
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
+    @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
     @AppStorage(SettingsKey.subtitleLanguage) private var subtitleLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
@@ -244,6 +245,7 @@ struct DetailsScreen: View {
 
     private var subtitleLanguagePreferences: [String] {
         SubtitleLanguagePreferences.ordered(
+            encoded: subtitleLanguages,
             primary: subtitleLanguage,
             secondary: subtitleLanguageSecondary,
             tertiary: subtitleLanguageTertiary
@@ -1901,7 +1903,7 @@ private struct TvEpisodeCard: View {
             .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(Color.white.opacity(isFocused ? 0.86 : 0), lineWidth: isFocused ? 3 : 0)
+                    .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
             )
             .shadow(color: .black.opacity(isFocused ? 0.4 : 0.16), radius: isFocused ? 26 : 10, y: 12)
         }
@@ -2077,7 +2079,7 @@ private struct TvEpisodeCard: View {
     }
 }
 
-private struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
+struct TvDetailsGlassBackground<S: InsettableShape>: ViewModifier {
     let filled: Bool
     let shape: S
 
@@ -2601,7 +2603,7 @@ private struct TvStreamCard: View {
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(Color.white.opacity(isFocused ? 0.86 : 0.10), lineWidth: isFocused ? 3 : 1)
+                    .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.10), lineWidth: isFocused ? AppFocusOutline.width : 1)
             )
             .shadow(color: .black.opacity(isFocused ? 0.44 : 0.18), radius: isFocused ? 26 : 10, y: 12)
         }

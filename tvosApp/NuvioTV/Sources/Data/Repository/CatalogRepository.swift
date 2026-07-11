@@ -18,6 +18,11 @@ protocol CatalogRepository {
     /// series ids have no reliable marker to guess from.
     func getMetadata(id: String, type: String) async throws -> NuvioMeta
 
+    /// Fetch current metadata without using an in-memory result from an earlier
+    /// Home load. Up-next entries need this because episode guides can gain a
+    /// title, overview, and still after the series record was first cached.
+    func refreshMetadata(id: String, type: String) async throws -> NuvioMeta
+
     /// Get available streams for content
     func getStreams(id: String, type: String) async throws -> [NuvioStream]
 
@@ -58,6 +63,10 @@ protocol CatalogRepository {
 }
 
 extension CatalogRepository {
+    func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        try await getMetadata(id: id, type: type)
+    }
+
     /// Fallback progressive wrapper: emits the full `getStreams` result as a
     /// single batch. Repositories that fetch from multiple add-ons should
     /// override this to emit results as each add-on returns.
@@ -88,19 +97,16 @@ struct AddonCatalogOption: Identifiable {
     var id: String { "\(addonId)_\(type)_\(catalogId)" }
 }
 
+struct StreamAddonPreference: Codable, Equatable {
+    let url: String
+    var enabled: Bool
+}
+
 /// Live Cinemeta-backed implementation used by the tvOS home prototype.
 final class CinemetaCatalogRepository: CatalogRepository {
+    static private(set) var homeAddonFetchDiagnostic = "not started"
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
-    private let decoder = JSONDecoder()
     private var cachedMetaById: [String: NuvioMeta] = [:]
-    private var streamAddons: [StremioStreamAddon] {
-        Self.configuredStreamAddonManifestURLs.map { manifestURL in
-            StremioStreamAddon(
-                name: Self.streamAddonName(for: manifestURL),
-                manifestURL: manifestURL
-            )
-        }
-    }
     private let subtitleAddons = [
         StremioSubtitleAddon(
             name: "OpenSubtitles v3",
@@ -148,56 +154,74 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// only catalogs and ones needing unsupported extras are skipped; a
     /// required genre is satisfied with the catalog's first declared option.
     private func addonHomeCatalogs() async -> [NuvioCatalog] {
-        let showAddonNames = ProfileSettings.current.object(forKey: SettingsKey.catalogAddonNames) as? Bool ?? true
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
         let maxRows = 24
         var catalogs: [NuvioCatalog] = []
+        var reports: [String] = []
+        Self.homeAddonFetchDiagnostic = "loading"
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
             guard catalogs.count < maxRows else { break }
-            guard let manifest = await manifest(for: manifestURL),
-                  manifest.id != Self.cinemetaAddonId else { continue }
+            guard let manifest = await manifest(for: manifestURL) else {
+                reports.append("\(manifestURL.host ?? "unknown"): manifest failed")
+                continue
+            }
+            guard manifest.id != Self.cinemetaAddonId else { continue }
 
             let base = manifestURL.deletingLastPathComponent()
-            for catalog in manifest.catalogs ?? [] where catalog.eligibleForHome {
-                guard catalogs.count < maxRows else { break }
-                // Skip catalogs the account has disabled for Home.
-                if disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") { continue }
-                let genre = catalog.requiresGenre ? catalog.firstGenreOption : nil
-                if catalog.requiresGenre && genre == nil { continue }
+            let remaining = maxRows - catalogs.count
+            let eligible = (manifest.catalogs ?? []).filter { catalog in
+                guard catalog.eligibleForHome else { return false }
+                guard !disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") else {
+                    return false
+                }
+                return !catalog.requiresGenre || catalog.firstGenreOption != nil
+            }
 
+            // BetterPosters rejects/limits a burst of all 13 catalog requests
+            // on some Apple TV networks. Its proven path is ordered serial
+            // fetching (the same behavior triggered by disabling/re-enabling
+            // the add-on). Continue Watching remains visible during this work.
+            var loadedForManifest = 0
+            var failedForManifest = 0
+            for catalog in eligible.prefix(remaining) {
                 do {
                     var path = "catalog/\(catalog.type)/\(catalog.id)"
-                    if let genreExtra = genre.flatMap({ encodedExtra(name: "genre", value: $0) }) {
+                    if catalog.requiresGenre,
+                       let genre = catalog.firstGenreOption,
+                       let genreExtra = encodedExtra(name: "genre", value: genre) {
                         path += "/" + genreExtra
                     }
                     path += ".json"
-                    let response: CinemetaCatalogResponse = try await fetch(base.appendingPathComponent(path))
+                    let response: CinemetaCatalogResponse = try await fetch(
+                        base.appendingPathComponent(path)
+                    )
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
-                    guard !items.isEmpty else { continue }
-                    items.forEach { cachedMetaById[$0.id] = $0 }
-
+                    guard !items.isEmpty else {
+                        failedForManifest += 1
+                        continue
+                    }
                     let catalogName = catalog.name ?? catalog.id
-                    let addonName = (manifest.name ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
-                    let title = showAddonNames && !addonName.isEmpty && addonName.caseInsensitiveCompare(catalogName) != .orderedSame
-                        ? "\(addonName) • \(catalogName)"
-                        : catalogName
                     catalogs.append(
                         NuvioCatalog(
                             id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
-                            name: title,
+                            name: catalogName,
                             description: catalogName,
-                            itemIds: items.map(\.id)
+                            itemIds: items.map(\.id),
+                            items: items
                         )
                     )
+                    loadedForManifest += 1
                 } catch {
-                    // A dead catalog endpoint must not block the other rows.
-                    continue
+                    failedForManifest += 1
                 }
             }
+            reports.append("\(manifest.id): \(loadedForManifest)/\(eligible.prefix(remaining).count), failed \(failedForManifest)")
         }
+
+        Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
 
         // Order the add-on rows to match the account's Home layout. Rows the
         // account hasn't placed keep their natural (manifest) order, after the
@@ -230,6 +254,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return cached
         }
 
+        return try await loadMetadata(id: id, type: type)
+    }
+
+    func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        cachedMetaById.removeValue(forKey: id)
+        return try await loadMetadata(id: id, type: type)
+    }
+
+    private func loadMetadata(id: String, type: String) async throws -> NuvioMeta {
+
         // Query the correct endpoint based on the caller-provided type. The
         // Details screen uses a fresh repository (empty cache) so this always
         // fetches the full /meta payload — real episodes and per-episode ratings.
@@ -250,7 +284,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        for addon in streamAddons {
+        for addon in await configuredAddons(supporting: "meta", type: metaType, id: id) {
             do {
                 let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: metaType, id: id))
                 let meta = response.meta.toMeta(fallbackType: metaType)
@@ -271,11 +305,51 @@ final class CinemetaCatalogRepository: CatalogRepository {
         ["series", "show", "tv", "tvshow"].contains(type.lowercased())
     }
 
-    /// Every configured manifest URL — the manually entered one plus the list
-    /// synced from the account — deduplicated in priority order. Also read by
-    /// Settings to show the synced add-ons.
+    /// Every enabled manifest URL — the manually entered one plus the list synced
+    /// from the account — deduplicated in priority order.
     static var configuredStreamAddonManifestURLs: [URL] {
+        configuredStreamAddonPreferences.compactMap { preference in
+            guard preference.enabled else { return nil }
+            return normalizedManifestURL(from: preference.url)
+        }
+    }
+
+    /// Full ordered add-on state for Settings. The legacy URL fields are still
+    /// merged in so manually pasted add-ons appear even before a state blob exists.
+    static var configuredStreamAddonPreferences: [StreamAddonPreference] {
         let defaults = ProfileSettings.current
+        var preferences: [StreamAddonPreference] = []
+        if let json = defaults.string(forKey: SettingsKey.streamAddonManifestStates),
+           let data = json.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode([StreamAddonPreference].self, from: data) {
+            preferences.append(contentsOf: decoded)
+        }
+        preferences.append(contentsOf: legacyStreamAddonURLs(in: defaults).map {
+            StreamAddonPreference(url: $0.absoluteString, enabled: true)
+        })
+        return normalizedPreferences(preferences)
+    }
+
+    static func setConfiguredStreamAddonPreferences(
+        _ preferences: [StreamAddonPreference],
+        in defaults: UserDefaults = ProfileSettings.current
+    ) {
+        let normalized = normalizedPreferences(preferences)
+        let enabledURLs = normalized
+            .filter(\.enabled)
+            .map(\.url)
+
+        if let data = try? JSONEncoder().encode(normalized),
+           let json = String(data: data, encoding: .utf8) {
+            defaults.set(json, forKey: SettingsKey.streamAddonManifestStates)
+        } else {
+            defaults.removeObject(forKey: SettingsKey.streamAddonManifestStates)
+        }
+        defaults.set(enabledURLs.first ?? "", forKey: SettingsKey.streamAddonManifestURL)
+        defaults.set(enabledURLs.joined(separator: "\n"), forKey: SettingsKey.streamAddonManifestURLs)
+    }
+
+    private static func legacyStreamAddonURLs(in defaults: UserDefaults) -> [URL] {
         var rawValues = defaults
             .string(forKey: SettingsKey.streamAddonManifestURLs)?
             .components(separatedBy: .newlines) ?? []
@@ -285,13 +359,41 @@ final class CinemetaCatalogRepository: CatalogRepository {
             rawValues.insert(single, at: 0)
         }
 
+        return normalizedURLs(from: rawValues)
+    }
+
+    private static func normalizedPreferences(_ preferences: [StreamAddonPreference]) -> [StreamAddonPreference] {
+        var seen: Set<String> = []
+        return preferences.compactMap { preference -> StreamAddonPreference? in
+            guard let url = normalizedManifestURL(from: preference.url) else { return nil }
+            let key = url.absoluteString
+            guard seen.insert(key).inserted else { return nil }
+            return StreamAddonPreference(url: key, enabled: preference.enabled)
+        }
+    }
+
+    private static func normalizedURLs(from rawValues: [String]) -> [URL] {
         var seen: Set<String> = []
         return rawValues.compactMap { rawValue -> URL? in
             guard let url = normalizedManifestURL(from: rawValue) else { return nil }
-            let key = url.absoluteString
-            guard seen.insert(key).inserted else { return nil }
+            guard seen.insert(url.absoluteString).inserted else { return nil }
             return url
         }
+    }
+
+    private func configuredAddons(supporting resource: String, type: String, id: String) async -> [StremioStreamAddon] {
+        var addons: [StremioStreamAddon] = []
+        for manifestURL in Self.configuredStreamAddonManifestURLs {
+            guard let manifest = await manifest(for: manifestURL),
+                  manifest.supportsResource(resource, type: type, id: id) else { continue }
+            addons.append(
+                StremioStreamAddon(
+                    name: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
+                    manifestURL: manifestURL
+                )
+            )
+        }
+        return addons
     }
 
     static func normalizedManifestURL(from rawValue: String) -> URL? {
@@ -329,12 +431,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func getStreams(id: String, type: String) async throws -> [NuvioStream] {
+        let addons = await configuredAddons(supporting: "stream", type: type, id: id)
         // Fan the add-on requests out concurrently: total latency is the
         // slowest add-on, not the sum of them all. A slow or dead add-on no
         // longer starves the ones that respond quickly.
         var addonStreams: [NuvioStream] = []
         await withTaskGroup(of: [NuvioStream].self) { group in
-            for addon in streamAddons {
+            for addon in addons {
                 let url = addon.streamURL(type: type, id: id)
                 let name = addon.name
                 let manifestURL = addon.manifestURL
@@ -351,12 +454,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func streamsProgressively(id: String, type: String) -> AsyncStream<[NuvioStream]> {
-        let addons = streamAddons
         let subtitleAddons = self.subtitleAddons
         let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
 
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
+                let addons = await self.configuredAddons(supporting: "stream", type: type, id: id)
                 var accumulated: [NuvioStream] = []
                 var subtitles: [NuvioSubtitle] = []
 
@@ -657,7 +760,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if addonId == Self.cinemetaAddonId { return baseURL }
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
-            if let manifest = await manifest(for: manifestURL), manifest.id == addonId {
+            if let manifest = await manifest(for: manifestURL),
+               manifest.id == addonId {
                 return manifestURL.deletingLastPathComponent()
             }
         }
@@ -695,11 +799,14 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func fetch<T: Decodable>(_ url: URL) async throws -> T {
-        let (data, response) = try await URLSession.shared.data(from: url)
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
             throw URLError(.badServerResponse)
         }
-        return try decoder.decode(T.self, from: data)
+        // Each concurrent add-on request gets its own decoder.
+        return try JSONDecoder().decode(T.self, from: data)
     }
 }
 
@@ -713,7 +820,67 @@ private struct CinemetaCatalogResponse: Decodable {
 private struct AddonManifest: Decodable {
     let id: String
     let name: String?
+    let types: [String]?
+    let idPrefixes: [String]?
+    let resources: [AddonManifestResource]?
     let catalogs: [AddonManifestCatalog]?
+
+    var displayName: String? {
+        name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
+    }
+
+    func supportsResource(_ name: String, type: String, id: String) -> Bool {
+        guard let resources, !resources.isEmpty else { return false }
+        let fallbackTypes = types ?? []
+        let fallbackPrefixes = idPrefixes ?? []
+        for resource in resources {
+            if resource.name.caseInsensitiveCompare(name) == .orderedSame,
+               resource.supportsType(type, fallbackTypes: fallbackTypes),
+               resource.supportsId(id, fallbackPrefixes: fallbackPrefixes) {
+                return true
+            }
+        }
+        return false
+    }
+}
+
+private struct AddonManifestResource: Decodable {
+    let name: String
+    let types: [String]
+    let idPrefixes: [String]?
+
+    enum CodingKeys: String, CodingKey {
+        case name
+        case types
+        case idPrefixes
+    }
+
+    init(from decoder: Decoder) throws {
+        let singleValue = try decoder.singleValueContainer()
+        if let value = try? singleValue.decode(String.self) {
+            name = value
+            types = []
+            idPrefixes = nil
+            return
+        }
+
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        name = (try? container.decode(String.self, forKey: .name)) ?? ""
+        types = (try? container.decode([String].self, forKey: .types)) ?? []
+        idPrefixes = try? container.decode([String].self, forKey: .idPrefixes)
+    }
+
+    func supportsType(_ type: String, fallbackTypes: [String]) -> Bool {
+        let supportedTypes = types.isEmpty ? fallbackTypes : types
+        guard !supportedTypes.isEmpty else { return true }
+        return supportedTypes.contains { $0.caseInsensitiveCompare(type) == .orderedSame }
+    }
+
+    func supportsId(_ id: String, fallbackPrefixes: [String]) -> Bool {
+        let prefixes = (idPrefixes?.isEmpty == false) ? (idPrefixes ?? []) : fallbackPrefixes
+        guard !prefixes.isEmpty else { return true }
+        return prefixes.contains { id.lowercased().hasPrefix($0.lowercased()) }
+    }
 }
 
 private struct AddonManifestCatalog: Decodable {
@@ -959,7 +1126,7 @@ private struct CinemetaMeta: Decodable {
             type: type ?? fallbackType,
             year: parsedYear,
             genres: genres ?? genre,
-            rating: Double(imdbRating ?? ""),
+            rating: parsedImdbRating,
             releaseInfo: releaseInfo ?? year,
             runtime: runtime,
             cast: cast,
@@ -972,6 +1139,11 @@ private struct CinemetaMeta: Decodable {
             videos: videos?.compactMap { $0.toVideo() },
             trailerYtIds: trailerYtIds
         )
+    }
+
+    private var parsedImdbRating: Double? {
+        guard let value = imdbRating.flatMap(Double.init), value.isFinite else { return nil }
+        return value
     }
 
     private var trailerYtIds: [String] {

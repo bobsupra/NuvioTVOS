@@ -19,7 +19,7 @@
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
-	<string>2.5</string>
+	<string>2.6</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleURLTypes</key>
@@ -33,7 +33,7 @@
       </dict>
     </array>
     <key>CFBundleVersion</key>
-	<string>31</string>
+	<string>35</string>
     <key>LSApplicationQueriesSchemes</key>
     <array>
       <string>infuse</string>
@@ -62,6 +62,8 @@
     <string>Allow $(PRODUCT_NAME) to access your local network</string>
     <key>NSMicrophoneUsageDescription</key>
     <string>This app does not require microphone access.</string>
+    <key>PREMIUMIZE_CLIENT_ID</key>
+    <string></string>
     <key>UIBackgroundModes</key>
     <array>
       <string>audio</string>

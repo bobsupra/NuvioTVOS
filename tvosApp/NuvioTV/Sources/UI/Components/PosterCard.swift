@@ -6,7 +6,11 @@
 //  Reusable poster card component for iOS/tvOS
 //
 
+import ImageIO
 import SwiftUI
+#if canImport(UIKit)
+import UIKit
+#endif
 
 /// Poster card component with focus animation (tvOS) and tap handling (iOS)
 struct PosterCard: View {
@@ -16,6 +20,9 @@ struct PosterCard: View {
     var continueRemainingText: String? = nil
     var continueEpisodeText: String? = nil
     var continueEpisodeTitleText: String? = nil
+    /// The episode still is more useful than the series backdrop for an up-next
+    /// card: it matches the episode title and the Android Continue Watching row.
+    var continueEpisodeArtworkURL: String? = nil
     /// Fresh next-episode suggestion: the badge reads "Next Up" (or "New Episode"
     /// for a genuinely fresh drop) and the progress bar is hidden, since there's
     /// no real playback position yet.
@@ -35,109 +42,111 @@ struct PosterCard: View {
     /// Fired when the card is held (Siri Remote select press-and-hold), to raise
     /// the liquid-glass quick-actions menu. Nil disables the long-press.
     var onLongPress: ((NuvioMeta) -> Void)? = nil
+    var layoutMode: String = "Modern"
+    var showPosterLabels: Bool = false
+    var smoothFocusAnimations: Bool = true
+    var focusHighlighterEnabled: Bool = false
+    var isWatched: Bool? = nil
     let onClick: () -> Void
 
     #if os(tvOS)
     @FocusState private var isFocused: Bool
     @State private var didRequestInitialFocus = false
-    @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
-    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
-    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
-    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
     #endif
 
     var body: some View {
+        #if os(tvOS)
+        posterContent
+            .contentShape(Rectangle())
+            .focusable(true)
+            .focused($isFocused)
+            .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue ?? meta.id))
+            .nuvioFocusEffectDisabledIfAvailable()
+            .onTapGesture(perform: onClick)
+            // Press-and-hold the select button while the card is focused to
+            // raise the liquid-glass quick-actions menu. Kept simultaneous so
+            // a normal select still fires `onClick`.
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                    onLongPress?(meta)
+                }
+            )
+            .onChange(of: isFocused) { focused in
+                if focused {
+                    onFocus?(meta)
+                } else {
+                    onBlur?(meta)
+                }
+            }
+            .onAppear {
+                guard shouldRequestInitialFocus, !didRequestInitialFocus else {
+                    return
+                }
+
+                didRequestInitialFocus = true
+                onInitialFocusRequested?()
+                DispatchQueue.main.async {
+                    isFocused = true
+                }
+            }
+            // The row cell takes the full (landscape) width so neighbouring
+            // cards are pushed aside rather than overlapped, while the focusable
+            // surface stays portrait-width — keeping up/down navigation aligned.
+            .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
+            .animation(effectiveSmoothFocus ? .spring(response: 0.28, dampingFraction: 0.86) : nil, value: isLandscape)
+        #else
         Button(action: onClick) {
-            VStack(alignment: .leading, spacing: 9) {
-                AsyncImage(url: URL(string: imageUrl ?? "")) { phase in
-                    switch phase {
-                    case .empty:
-                        placeholderView
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                    case .failure:
-                        placeholderView
-                    @unknown default:
-                        placeholderView
-                    }
+            posterContent
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
+        #endif
+    }
+
+    private var posterContent: some View {
+        VStack(alignment: .leading, spacing: 9) {
+            CachedPosterArtwork(urlString: imageUrl, width: cardWidth, height: cardHeight) {
+                placeholderView
+            }
+            .frame(width: cardWidth, height: cardHeight)
+            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+            .overlay(alignment: .bottomLeading) {
+                if isLandscape {
+                    landscapeOverlay
                 }
-                .frame(width: cardWidth, height: cardHeight)
-                .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
-                .overlay(alignment: .bottomLeading) {
-                    if isLandscape {
-                        landscapeOverlay
-                    }
-                }
-                .overlay(alignment: .bottomLeading) {
-                    continueProgressOverlay
-                }
-                .overlay(alignment: .topTrailing) {
-                    continueBadge
-                }
-                .overlay(alignment: .topTrailing) {
-                    if showsWatchedBadge {
+            }
+            .overlay(alignment: .bottomLeading) {
+                continueProgressOverlay
+            }
+            .overlay(alignment: .topTrailing) {
+                continueBadge
+            }
+            .overlay(alignment: .topTrailing) {
+                if showsWatchedBadge {
+                    if let isWatched {
+                        if isWatched {
+                            WatchedCheckmarkIcon()
+                        }
+                    } else {
                         WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
                     }
                 }
-                .overlay(
-                    RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
-                        .stroke(focusedBorderColor, lineWidth: focusedBorderWidth)
-                )
-                .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
+            }
+            .overlay(
+                RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                    .stroke(focusedBorderColor, lineWidth: focusedBorderWidth)
+            )
+            .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
 
-                if showsPosterTitle {
-                    Text(meta.name)
-                        .font(.system(size: homeLayout == "Compact" ? 18 : 20, weight: isFocused ? .semibold : .medium))
-                        .foregroundColor(titleColor)
-                        .lineLimit(1)
-                        .frame(width: cardWidth, alignment: .leading)
-                }
-            }
-            .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        #if os(tvOS)
-        .focused($isFocused)
-        .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue ?? meta.id))
-        .nuvioFocusEffectDisabledIfAvailable()
-        // Press-and-hold the select button while the card is focused to raise the
-        // quick-actions menu. `simultaneousGesture` (not `onLongPressGesture`,
-        // which swallows the Button's primary action on tvOS) keeps a normal
-        // click firing `onClick` while the hold is recognised alongside it.
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                onLongPress?(meta)
-            }
-        )
-        .onChange(of: isFocused) { focused in
-            if focused {
-                onFocus?(meta)
-            } else {
-                onBlur?(meta)
+            if showsPosterTitle {
+                Text(meta.name)
+                    .font(.system(size: effectiveHomeLayout == "Compact" ? 18 : 20, weight: isFocused ? .semibold : .medium))
+                    .foregroundColor(titleColor)
+                    .lineLimit(1)
+                    .frame(width: cardWidth, alignment: .leading)
             }
         }
-        .onAppear {
-            guard shouldRequestInitialFocus, !didRequestInitialFocus else {
-                return
-            }
-
-            didRequestInitialFocus = true
-            onInitialFocusRequested?()
-            DispatchQueue.main.async {
-                isFocused = true
-            }
-        }
-        #endif
-        // The row cell takes the full (landscape) width so neighbouring cards
-        // are pushed aside rather than overlapped, while the focusable button
-        // above stays portrait-width — keeping the focus frame (and thus up/down
-        // navigation) aligned to the card directly below.
-        .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
-        #if os(tvOS)
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.86) : nil, value: isLandscape)
-        #endif
+        .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
     }
 
     // MARK: - Helper Views
@@ -274,11 +283,27 @@ struct PosterCard: View {
     // MARK: - Computed Properties
 
     #if os(tvOS)
+    private var effectiveHomeLayout: String {
+        layoutMode
+    }
+
+    private var effectivePosterLabels: Bool {
+        showPosterLabels
+    }
+
+    private var effectiveSmoothFocus: Bool {
+        smoothFocusAnimations
+    }
+
+    private var effectiveFocusHighlighter: Bool {
+        focusHighlighterEnabled
+    }
+
     private var cardWidth: CGFloat {
         if isLandscape {
             return 560
         }
-        return homeLayout == "Compact" ? 170 : 210
+        return effectiveHomeLayout == "Compact" ? 170 : 210
     }
 
     /// Width the card occupies in the row layout — and therefore its focus
@@ -287,11 +312,11 @@ struct PosterCard: View {
     /// vertical navigation onto the neighbouring column. The 560pt landscape art
     /// overflows this frame to the right and is drawn above siblings (zIndex).
     private var layoutWidth: CGFloat {
-        homeLayout == "Compact" ? 170 : 210
+        effectiveHomeLayout == "Compact" ? 170 : 210
     }
 
     private var cardHeight: CGFloat {
-        isLandscape ? 315 : (homeLayout == "Compact" ? 255 : 315)
+        isLandscape ? 315 : (effectiveHomeLayout == "Compact" ? 255 : 315)
     }
 
     private var totalCardHeight: CGFloat {
@@ -311,16 +336,20 @@ struct PosterCard: View {
     }
 
     private var imageUrl: String? {
-        isLandscape ? (meta.backgroundUrl ?? meta.posterUrl) : meta.posterUrl
+        if isLandscape, continueEpisodeText != nil,
+           let continueEpisodeArtworkURL, !continueEpisodeArtworkURL.isEmpty {
+            return continueEpisodeArtworkURL
+        }
+        return isLandscape ? (meta.backgroundUrl ?? meta.posterUrl) : meta.posterUrl
     }
 
     private var focusedBorderColor: Color {
         guard isFocused else { return .clear }
-        return .white.opacity(0.86)
+        return AppFocusOutline.color
     }
 
     private var focusedBorderWidth: CGFloat {
-        isFocused ? (focusHighlighter ? 5 : 3) : 0
+        isFocused ? (effectiveFocusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
     }
 
     private var shadowOpacity: Double {
@@ -336,7 +365,7 @@ struct PosterCard: View {
     }
 
     private var showsPosterTitle: Bool {
-        posterLabels && !isLandscape
+        effectivePosterLabels && !isLandscape
     }
     #else
     private var cardWidth: CGFloat {
@@ -397,6 +426,152 @@ struct PosterCard: View {
     #endif
 }
 
+#if canImport(UIKit)
+private struct CachedPosterArtwork<Placeholder: View>: View {
+    let urlString: String?
+    let width: CGFloat
+    let height: CGFloat
+    @ViewBuilder let placeholder: Placeholder
+
+    @State private var image: UIImage?
+    @State private var loadedKey: String?
+
+    private var maxPixelSize: Int {
+        let displayScale = UIScreen.main.scale
+        return max(160, Int(ceil(max(width, height) * displayScale)))
+    }
+
+    private var cacheKey: String {
+        "\(urlString ?? "")#\(maxPixelSize)"
+    }
+
+    var body: some View {
+        ZStack {
+            if let image, loadedKey == cacheKey {
+                Image(uiImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else {
+                placeholder
+            }
+        }
+        .task(id: cacheKey) {
+            await load()
+        }
+    }
+
+    @MainActor
+    private func load() async {
+        guard let urlString,
+              let url = URL(string: urlString) else {
+            image = nil
+            loadedKey = nil
+            return
+        }
+
+        let key = cacheKey
+        if let cached = await PosterArtworkCache.shared.image(for: url, maxPixelSize: maxPixelSize) {
+            guard !Task.isCancelled, key == cacheKey else { return }
+            image = cached
+            loadedKey = key
+        } else if loadedKey != key {
+            image = nil
+            loadedKey = nil
+        }
+    }
+}
+
+private actor PosterArtworkCache {
+    static let shared = PosterArtworkCache()
+
+    private let cache = NSCache<NSString, UIImage>()
+    private var inFlight: [String: Task<UIImage?, Never>] = [:]
+
+    init() {
+        cache.countLimit = 220
+        cache.totalCostLimit = 140 * 1024 * 1024
+    }
+
+    func image(for url: URL, maxPixelSize: Int) async -> UIImage? {
+        let boundedPixelSize = min(max(maxPixelSize, 160), 1400)
+        let key = "\(url.absoluteString)#\(boundedPixelSize)" as NSString
+
+        if let cached = cache.object(forKey: key) {
+            return cached
+        }
+
+        if let task = inFlight[key as String] {
+            return await task.value
+        }
+
+        let task = Task.detached(priority: .utility) { () -> UIImage? in
+            guard let (data, _) = try? await URLSession.shared.data(from: url) else {
+                return nil
+            }
+            return downsamplePosterImage(data: data, maxPixelSize: boundedPixelSize)
+        }
+
+        inFlight[key as String] = task
+        let image = await task.value
+        inFlight[key as String] = nil
+
+        if let image {
+            cache.setObject(image, forKey: key, cost: image.decodedByteCost)
+        }
+        return image
+    }
+}
+
+private func downsamplePosterImage(data: Data, maxPixelSize: Int) -> UIImage? {
+    let sourceOptions: [CFString: Any] = [
+        kCGImageSourceShouldCache: false
+    ]
+    guard let source = CGImageSourceCreateWithData(data as CFData, sourceOptions as CFDictionary) else {
+        return UIImage(data: data)
+    }
+
+    let options: [CFString: Any] = [
+        kCGImageSourceCreateThumbnailFromImageAlways: true,
+        kCGImageSourceCreateThumbnailWithTransform: true,
+        kCGImageSourceShouldCacheImmediately: true,
+        kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+    ]
+
+    guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+        return UIImage(data: data)
+    }
+    return UIImage(cgImage: cgImage)
+}
+
+private extension UIImage {
+    var decodedByteCost: Int {
+        guard let cgImage else { return 0 }
+        return cgImage.bytesPerRow * cgImage.height
+    }
+}
+#endif
+
+private struct WatchedCheckmarkIcon: View {
+    var size: CGFloat = 38
+
+    var body: some View {
+        Image(systemName: "checkmark")
+            .font(.system(size: size * 0.48, weight: .bold))
+            .foregroundColor(.white)
+            .frame(width: size, height: size)
+            .background(
+                Circle()
+                    .fill(Color(red: 0.10, green: 0.68, blue: 0.34))
+            )
+            .overlay(
+                Circle()
+                    .stroke(Color.white.opacity(0.45), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
+            .padding(12)
+    }
+}
+
 struct WatchedCheckmarkBadge: View {
     let metaId: String
     let type: String
@@ -407,20 +582,7 @@ struct WatchedCheckmarkBadge: View {
     var body: some View {
         Group {
             if isWatched {
-                Image(systemName: "checkmark")
-                    .font(.system(size: size * 0.48, weight: .bold))
-                    .foregroundColor(.white)
-                    .frame(width: size, height: size)
-                    .background(
-                        Circle()
-                            .fill(Color(red: 0.10, green: 0.68, blue: 0.34))
-                    )
-                    .overlay(
-                        Circle()
-                            .stroke(Color.white.opacity(0.45), lineWidth: 1)
-                    )
-                    .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
-                    .padding(12)
+                WatchedCheckmarkIcon(size: size)
             }
         }
         .onAppear(perform: refresh)

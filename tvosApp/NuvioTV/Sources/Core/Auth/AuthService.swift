@@ -158,9 +158,11 @@ struct AuthService {
             json: ["code": code, "device_nonce": deviceNonce]
         )
         let user = try await getUser(accessToken: result.accessToken)
-        let expiresAt = result.expiresAt ??
-            result.expiresIn.map { Date().timeIntervalSince1970 + $0 } ??
-            jwtExpiry(result.accessToken)
+        let expiresAt = resolvedTokenExpiry(
+            accessToken: result.accessToken,
+            expiresAt: result.expiresAt,
+            expiresIn: result.expiresIn
+        )
         return AuthSession(
             accessToken: result.accessToken,
             refreshToken: result.refreshToken,
@@ -208,7 +210,11 @@ struct AuthService {
         guard let user = token.user else {
             throw AuthError(message: "Missing user in auth response")
         }
-        let expiresAt = token.expiresAt ?? token.expiresIn.map { Date().timeIntervalSince1970 + $0 }
+        let expiresAt = resolvedTokenExpiry(
+            accessToken: token.accessToken,
+            expiresAt: token.expiresAt,
+            expiresIn: token.expiresIn
+        )
         return AuthSession(
             accessToken: token.accessToken,
             refreshToken: token.refreshToken,
@@ -252,7 +258,10 @@ struct AuthService {
             throw AuthError(message: "No response from server")
         }
         guard (200..<300).contains(http.statusCode) else {
-            throw AuthError(message: Self.serverErrorMessage(data: data, status: http.statusCode))
+            throw AuthError(
+                message: Self.serverErrorMessage(data: data, status: http.statusCode),
+                statusCode: http.statusCode
+            )
         }
         if data.isEmpty, T.self == EmptyResponse.self {
             return EmptyResponse() as! T
@@ -292,6 +301,23 @@ struct AuthService {
 }
 
 private struct EmptyResponse: Decodable {}
+
+/// The JWT's signed `exp` claim is authoritative. Some TV exchange deployments
+/// have returned `expires_at` in milliseconds or as a duration, both of which
+/// made a fresh session appear immediately expired and forced a failing refresh.
+private func resolvedTokenExpiry(
+    accessToken: String,
+    expiresAt: Double?,
+    expiresIn: Double?
+) -> TimeInterval? {
+    if let jwt = jwtExpiry(accessToken) { return jwt }
+    if let raw = expiresAt {
+        if raw > 10_000_000_000 { return raw / 1000 }
+        if raw > 1_000_000_000 { return raw }
+        if raw > 0 { return Date().timeIntervalSince1970 + raw }
+    }
+    return expiresIn.map { Date().timeIntervalSince1970 + $0 }
+}
 
 /// Best-effort expiry extraction from a JWT's `exp` claim.
 private func jwtExpiry(_ jwt: String) -> TimeInterval? {

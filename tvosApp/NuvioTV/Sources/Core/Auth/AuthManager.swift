@@ -28,10 +28,14 @@ final class AuthManager: ObservableObject {
 
     private let service = AuthService()
     private let store = SessionStore()
+    /// Authoritative for the current process. Persistence is a restore aid, not
+    /// a prerequisite for using a session that just authenticated successfully.
+    private var currentSession: AuthSession?
 
     private var qrNonce: String?
     private var qrAnonAccessToken: String?
     private var pollTask: Task<Void, Never>?
+    private var refreshTask: Task<AuthSession?, Never>?
 
     var isAuthenticated: Bool { authState.isAuthenticated }
     var isBackendConfigured: Bool { AuthConfig.isConfigured }
@@ -74,42 +78,88 @@ final class AuthManager: ObservableObject {
 
     private func restoreSession() {
         guard let session = store.load() else {
+            currentSession = nil
             authState = .signedOut
             return
         }
+        currentSession = session
         authState = .fullAccount(userId: session.userId, email: session.email ?? "")
         if session.isExpired {
-            Task { await self.refreshIfPossible(session) }
-        }
-    }
-
-    private func refreshIfPossible(_ session: AuthSession) async {
-        if let refreshed = try? await service.refresh(refreshToken: session.refreshToken) {
-            apply(session: refreshed)
+            Task { _ = await self.refreshSessionForSync() }
         }
     }
 
     func currentSessionForSync() -> AuthSession? {
-        store.load()
+        if let currentSession { return currentSession }
+        let restored = store.load()
+        currentSession = restored
+        return restored
     }
 
-    func validSessionForSync() async -> AuthSession? {
-        guard let session = store.load() else { return nil }
-        guard session.isExpired else { return session }
-        return await refreshSessionForSync()
+    func validSessionForSync(validateWithServer: Bool = false) async -> AuthSession? {
+        guard let session = currentSessionForSync() else { return nil }
+        var candidate = session
+        var attemptedRefresh = false
+        if session.isExpired {
+            attemptedRefresh = true
+            // A malformed/stale local expiry must not discard an access token
+            // that the server still accepts. Prefer a refresh, but validate the
+            // existing token below when refreshing is temporarily unavailable.
+            if let refreshed = await refreshSessionForSync() {
+                candidate = refreshed
+            }
+        }
+        guard validateWithServer else { return candidate }
+
+        do {
+            _ = try await service.getUser(accessToken: candidate.accessToken)
+            return candidate
+        } catch let error as AuthError where error.statusCode == 401 {
+            // The server is authoritative. A token can be revoked/rejected
+            // before its locally stored expiry, so refresh once on a real 401.
+            guard !attemptedRefresh else { return nil }
+            return await refreshSessionForSync()
+        } catch {
+            // A transient validation outage should not discard a locally valid
+            // session; the sync request will surface its own network failure.
+            return candidate
+        }
     }
 
     func refreshSessionForSync() async -> AuthSession? {
-        guard let session = store.load() else { return nil }
-        guard let refreshed = try? await service.refresh(refreshToken: session.refreshToken) else {
+        if let refreshTask {
+            guard let refreshed = await refreshTask.value, isAuthenticated else { return nil }
+            if currentSession?.refreshToken != refreshed.refreshToken {
+                apply(session: refreshed)
+            }
+            return refreshed
+        }
+
+        guard let session = currentSessionForSync() else { return nil }
+        let task = Task { [service] in
+            try? await service.refresh(refreshToken: session.refreshToken)
+        }
+        refreshTask = task
+        guard let refreshed = await task.value else {
+            refreshTask = nil
             return nil
         }
+        refreshTask = nil
+        // Never resurrect a session after sign-out while refresh was in flight.
+        guard isAuthenticated,
+              currentSession?.refreshToken == session.refreshToken else { return nil }
         apply(session: refreshed)
         return refreshed
     }
 
     private func apply(session: AuthSession) {
-        store.save(session)
+        currentSession = session
+        if !store.save(session) {
+            // Do not strand a successful login on Home just because secure
+            // persistence is unavailable in this simulator/install. The live
+            // in-memory session remains valid for all sync requests.
+            print("Nuvio session is active, but secure persistence failed.")
+        }
         authState = .fullAccount(userId: session.userId, email: session.email ?? "")
     }
 
@@ -128,7 +178,8 @@ final class AuthManager: ObservableObject {
 
     func signOut() {
         pollTask?.cancel()
-        let session = store.load()
+        let session = currentSession ?? store.load()
+        currentSession = nil
         store.clear()
         store.didSkipLogin = false
         clearQrState()
@@ -343,11 +394,12 @@ struct SessionStore {
         return migrateLegacySession()
     }
 
-    func save(_ session: AuthSession) {
-        if let data = try? JSONEncoder().encode(session) {
-            saveKeychainData(data)
-        }
+    @discardableResult
+    func save(_ session: AuthSession) -> Bool {
+        guard let data = try? JSONEncoder().encode(session) else { return false }
+        let saved = saveKeychainData(data)
         didSkipLogin = false
+        return saved
     }
 
     func clear() {
@@ -365,8 +417,9 @@ struct SessionStore {
               let session = try? JSONDecoder().decode(AuthSession.self, from: data) else {
             return nil
         }
-        saveKeychainData(data)
-        defaults.removeObject(forKey: legacySessionKey)
+        if saveKeychainData(data) {
+            defaults.removeObject(forKey: legacySessionKey)
+        }
         return session
     }
 
@@ -389,18 +442,19 @@ struct SessionStore {
         return item as? Data
     }
 
-    private func saveKeychainData(_ data: Data) {
+    private func saveKeychainData(_ data: Data) -> Bool {
         var addQuery = keychainQuery
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         addQuery[kSecValueData as String] = data
 
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            SecItemUpdate(
+            return SecItemUpdate(
                 keychainQuery as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
-            )
+            ) == errSecSuccess
         }
+        return status == errSecSuccess
     }
 
     private func deleteKeychainData() {

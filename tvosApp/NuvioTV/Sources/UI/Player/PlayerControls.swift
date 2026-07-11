@@ -378,7 +378,7 @@ struct NextEpisodeOverlay: View {
         .glassRoundedRect(cornerRadius: 26)
         .overlay(
             RoundedRectangle(cornerRadius: 26, style: .continuous)
-                .strokeBorder(Color.white.opacity(isFocused ? 0.85 : 0.14), lineWidth: isFocused ? 3 : 1)
+                .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.14), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .shadow(color: .black.opacity(0.55), radius: 22, x: 0, y: 10)
         .animation(.easeInOut(duration: 0.18), value: isFocused)
@@ -469,7 +469,7 @@ struct SkipSegmentOverlay: View {
         .glassRoundedRect(cornerRadius: 24)
         .overlay(
             RoundedRectangle(cornerRadius: 24, style: .continuous)
-                .strokeBorder(Color.white.opacity(isFocused ? 0.85 : 0.14), lineWidth: isFocused ? 3 : 1)
+                .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.14), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .shadow(color: .black.opacity(0.55), radius: 22, x: 0, y: 10)
         .animation(.easeInOut(duration: 0.18), value: isFocused)
@@ -634,28 +634,31 @@ struct PlayerSettingsPanel: View {
     // MARK: Tabs
 
     private var tabBar: some View {
-        HStack(spacing: 40) {
+        HStack(spacing: 22) {
             ForEach(Tab.allCases, id: \.self) { item in
                 let isFocused = focus == .tab(item)
+                let isSelected = tab == item
                 Button {
                     tab = item
                 } label: {
                     Text(item.rawValue)
-                        .font(.system(size: 44, weight: .bold))
-                        .foregroundColor(tab == item || isFocused ? .white : .white.opacity(0.32))
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundColor(isSelected || isFocused ? .black : .white.opacity(0.66))
+                        .padding(.horizontal, 30)
+                        .frame(height: 70)
+                        .modifier(
+                            TvDetailsGlassBackground(
+                                filled: isSelected || isFocused,
+                                shape: Capsule()
+                            )
+                        )
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focus, equals: .tab(item))
                 .focusEffectDisabledIfAvailable()
-                .overlay(alignment: .bottom) {
-                    Capsule()
-                        .fill(Color.white)
-                        .frame(height: 4)
-                        .offset(y: 10)
-                        .opacity(isFocused ? 1 : 0)
-                }
-                .scaleEffect(isFocused ? 1.04 : 1)
+                .scaleEffect(isFocused ? 1.06 : 1)
                 .animation(.easeOut(duration: 0.14), value: isFocused)
+                .animation(.easeOut(duration: 0.14), value: isSelected)
             }
             Spacer()
         }
@@ -719,13 +722,40 @@ struct PlayerSettingsPanel: View {
         return options
     }
 
+    private var visibleOptions: [SubtitlePanelOption] {
+        // Snapshot both inputs once. Reading either computed property from the
+        // filter closure rebuilt the full option list / profile preferences for
+        // every subtitle row.
+        let options = allOptions
+        let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
+        guard SubtitleLanguagePreferences.smartMatchingEnabled(),
+              !preferredLanguages.isEmpty else { return options }
+        return options.filter { option in
+            preferredLanguages.contains { language in
+                optionMatches(option, language: language)
+            }
+        }
+    }
+
+    private func optionMatches(_ option: SubtitlePanelOption, language: String) -> Bool {
+        SubtitleLanguagePreferences.matches(option.language, target: language) ||
+        SubtitleLanguagePreferences.matches(option.title, target: language) ||
+        SubtitleLanguagePreferences.matches(option.detail, target: language)
+    }
+
     /// Language groups for the left column: ones carrying a built-in track
     /// first (they're the likeliest pick), then alphabetical.
     private var languages: [(name: String, count: Int, hasBuiltIn: Bool)] {
+        languageGroups(in: visibleOptions)
+    }
+
+    private func languageGroups(
+        in options: [SubtitlePanelOption]
+    ) -> [(name: String, count: Int, hasBuiltIn: Bool)] {
         var order: [String] = []
         var counts: [String: Int] = [:]
         var builtIn: Set<String> = []
-        for option in allOptions {
+        for option in options {
             if counts[option.language] == nil { order.append(option.language) }
             counts[option.language, default: 0] += 1
             if case .track(let track) = option.kind, track.externalFilename.isEmpty {
@@ -741,13 +771,19 @@ struct PlayerSettingsPanel: View {
     }
 
     private var effectiveLanguage: String? {
-        if let selectedLanguage, languages.contains(where: { $0.name == selectedLanguage }) {
+        resolvedLanguage(in: visibleOptions)
+    }
+
+    private func resolvedLanguage(in options: [SubtitlePanelOption]) -> String? {
+        if let selectedLanguage, options.contains(where: { $0.language == selectedLanguage }) {
             return selectedLanguage
         }
-        if let selected = allOptions.first(where: { $0.isSelected }) {
+        if let selected = options.first(where: { $0.isSelected }) {
             return selected.language
         }
-        return languages.first?.name
+        // This fallback is used only before the panel establishes its selected
+        // language on appear. Preserve the built-in-first ordering.
+        return languageGroups(in: options).first?.name
     }
 
     private var subtitlesAreOff: Bool {
@@ -819,7 +855,12 @@ struct PlayerSettingsPanel: View {
     }
 
     private var subtitlesColumn: some View {
-        let options = allOptions.filter { $0.language == effectiveLanguage }
+        // `effectiveLanguage` used to be evaluated once per option. Its getter
+        // rebuilds/sorts the language list, producing O(n²) work on every focus
+        // move and every player tick. Resolve one immutable snapshot instead.
+        let optionsSnapshot = visibleOptions
+        let language = resolvedLanguage(in: optionsSnapshot)
+        let options = optionsSnapshot.filter { $0.language == language }
         return VStack(alignment: .leading, spacing: 18) {
             columnHeader("Subtitles")
             if options.isEmpty {
@@ -942,6 +983,7 @@ struct PlayerSettingsPanel: View {
                 .padding(.bottom, 26)
             }
             .focusSection()
+            .scrollClipDisabledIfAvailable()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -1045,7 +1087,7 @@ struct PlayerSettingsPanel: View {
                     Circle()
                         .strokeBorder(
                             isFocused ? Color.white : (isSelected ? Color.white.opacity(0.75) : .clear),
-                            lineWidth: isFocused ? 4 : 3
+                            lineWidth: isFocused ? AppFocusOutline.width : 3
                         )
                         .padding(-6)
                 )
@@ -1054,6 +1096,7 @@ struct PlayerSettingsPanel: View {
         .focused($focus, equals: .style(.color(hex)))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.14 : 1)
+        .zIndex(isFocused ? 1 : 0)
         .animation(.easeOut(duration: 0.14), value: isFocused)
     }
 

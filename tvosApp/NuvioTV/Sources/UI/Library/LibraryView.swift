@@ -31,6 +31,8 @@ public struct LibraryView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
     @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
+    @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
+    @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
 
     init(viewModel: LibraryViewModel, onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil, onOpenCloudLibrary: (() -> Void)? = nil) {
         _viewModel = StateObject(wrappedValue: viewModel)
@@ -41,8 +43,16 @@ public struct LibraryView: View {
 
     /// Cloud Library is only reachable for the providers that expose one.
     private var cloudLibraryAvailable: Bool {
-        (debridProvider == "Premiumize" || debridProvider == "TorBox")
-            && !debridApiKey.trimmingCharacters(in: .whitespaces).isEmpty
+        switch DebridProviderKind(settingsValue: debridProvider) {
+        case .torbox:
+            return !torboxAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .premiumize:
+            return !premiumizeAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+                !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        case .none, .realDebrid, .allDebrid, .debridLink:
+            return false
+        }
     }
     
     public var body: some View {
@@ -198,7 +208,7 @@ struct LibraryItemButton: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
-                        .stroke(isFocused ? focusBorderColor : Color.clear, lineWidth: focusHighlighter ? 5 : 3)
+                        .stroke(isFocused ? focusBorderColor : Color.clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
                 .shadow(color: .black.opacity(isFocused ? 0.5 : 0.2), radius: isFocused ? 12 : 4)
                 .scaleEffect(isFocused ? 1.06 : 1.0)
@@ -228,7 +238,7 @@ struct LibraryItemButton: View {
     }
 
     private var focusBorderColor: Color {
-        .white.opacity(0.86)
+        AppFocusOutline.color
     }
 
     private var cardCornerRadius: CGFloat {

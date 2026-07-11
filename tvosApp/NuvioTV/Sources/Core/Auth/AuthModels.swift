@@ -114,5 +114,12 @@ struct TvLoginExchangeResult: Decodable {
 /// A user-facing error message surfaced by the auth layer.
 struct AuthError: LocalizedError {
     let message: String
+    let statusCode: Int?
+
+    init(message: String, statusCode: Int? = nil) {
+        self.message = message
+        self.statusCode = statusCode
+    }
+
     var errorDescription: String? { message }
 }

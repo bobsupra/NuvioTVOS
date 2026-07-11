@@ -119,6 +119,10 @@ class PlayerViewModel: ObservableObject {
     private var didApplyAudioPreference = false
     private var didApplySubtitlePreference = false
     private var lastProgressSave = Date.distantPast
+    /// Last coherent, non-EOF MPV sample. Forced lifecycle saves use this
+    /// instead of a transient reattach/keep-open sample that can report the
+    /// title's full duration as its current position.
+    private var lastStablePlaybackTime: PlayerTime?
     private var controlsAutoHideSuspended = false
     private var skipIntervals: [SkipInterval] = []
     private var autoHiddenSkipIntervalId: String?
@@ -145,6 +149,14 @@ class PlayerViewModel: ObservableObject {
     private var reloadAttempts = 0
     private var isReloadingStream = false
     private static let maxReloadAttempts = 2
+
+    init() {
+        playerController.onPlaybackSuspended = { [weak self] positionMs, durationMs in
+            Task { @MainActor [weak self] in
+                self?.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
+            }
+        }
+    }
 
     deinit {
         let controller = playerController
@@ -222,6 +234,7 @@ class PlayerViewModel: ObservableObject {
         self.pendingTrackSelection = savedSelection
         self.pendingResumeSeconds = isTrailerPlayback ? nil : resumeFrom
         self.didApplyResume = false
+        self.lastStablePlaybackTime = nil
         self.expectedDurationSeconds = isTrailerPlayback ? nil : Self.expectedDuration(for: meta)
         self.didDetectReplacementStream = false
         self.replacementStreamHits = 0
@@ -313,9 +326,9 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        showNextEpisodeCard = true
+        if !showNextEpisodeCard { showNextEpisodeCard = true }
         guard autoPlayNextEnabled, !autoAdvanceDisabled, nextEpisodeIsPlayable else {
-            nextEpisodeCountdown = nil    // manual card: Play button, no timer
+            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
             autoAdvanceDeadline = nil
             return
         }
@@ -326,7 +339,8 @@ class PlayerViewModel: ObservableObject {
             autoAdvanceDeadline = Date().addingTimeInterval(Double(Self.autoCountdownSeconds))
         }
         let secondsLeft = autoAdvanceDeadline?.timeIntervalSinceNow ?? 0
-        nextEpisodeCountdown = max(0, Int(secondsLeft.rounded(.up)))
+        let countdown = max(0, Int(secondsLeft.rounded(.up)))
+        if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
         if secondsLeft <= 0.05 { advance(userInitiated: false) }
     }
 
@@ -365,7 +379,8 @@ class PlayerViewModel: ObservableObject {
               time.current > 0,
               status != .ended,
               subtitle != PlaybackMarkers.trailerSubtitle else {
-            activeSkipInterval = nil
+            if activeSkipInterval != nil { activeSkipInterval = nil }
+            if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             return
         }
 
@@ -375,14 +390,14 @@ class PlayerViewModel: ObservableObject {
         }
 
         guard let interval else {
-            activeSkipInterval = nil
-            skipSegmentCountdown = nil
+            if activeSkipInterval != nil { activeSkipInterval = nil }
+            if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
         }
 
         if autoHiddenSkipIntervalId == interval.id, !showControls {
-            skipSegmentCountdown = nil
+            if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
         }
@@ -396,7 +411,7 @@ class PlayerViewModel: ObservableObject {
 
         if showControls {
             skipSegmentAutoHideDeadline = nil
-            skipSegmentCountdown = nil
+            if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             return
         }
 
@@ -412,7 +427,8 @@ class PlayerViewModel: ObservableObject {
             skipSegmentCountdown = nil
             skipSegmentAutoHideDeadline = nil
         } else {
-            skipSegmentCountdown = max(1, Int(secondsLeft.rounded(.up)))
+            let countdown = max(1, Int(secondsLeft.rounded(.up)))
+            if skipSegmentCountdown != countdown { skipSegmentCountdown = countdown }
         }
     }
 
@@ -552,10 +568,26 @@ class PlayerViewModel: ObservableObject {
         let c = playerController
         c.refreshPlaybackState()
 
-        time = PlayerTime(
+        let latestTime = PlayerTime(
             current: Double(c.positionMs) / 1000.0,
             duration: Double(c.durationMs) / 1000.0
         )
+        if c.hasCoherentTimeSample,
+           !c.isPlayerLoading,
+           !c.isAtEndOfFile,
+           latestTime.duration > 0,
+           latestTime.current >= 0,
+           latestTime.current < latestTime.duration {
+            lastStablePlaybackTime = latestTime
+        }
+        // The settings panel does not display playback time. Publish at most
+        // once per displayed second while it is open, while the controller is
+        // still polled at 4 Hz for playback/error handling.
+        if !showSettingsPanel ||
+            Int(latestTime.current) != Int(time.current) ||
+            latestTime.duration != time.duration {
+            if latestTime != time { time = latestTime }
+        }
 
         // An expired stream link is often answered with a short "slate" clip
         // (e.g. ElfHosted's "Link expired" video) that decodes cleanly, so it
@@ -613,17 +645,19 @@ class PlayerViewModel: ObservableObject {
 
         let previousStatus = status
 
+        let latestStatus: PlayerStatus
         if !c.currentErrorMessage.isEmpty {
-            status = .error(c.currentErrorMessage)
+            latestStatus = .error(c.currentErrorMessage)
         } else if c.isPlayerEnded {
-            status = .ended
+            latestStatus = .ended
         } else if c.isPlayerLoading {
-            status = .buffering
+            latestStatus = .buffering
         } else if c.isPlayerPlaying {
-            status = .playing
+            latestStatus = .playing
         } else {
-            status = .paused
+            latestStatus = .paused
         }
+        if status != latestStatus { status = latestStatus }
 
         // The controls are shown on launch (showControls defaults to true) but the
         // auto-hide timer is only armed by user transport actions. Arm it whenever
@@ -640,18 +674,22 @@ class PlayerViewModel: ObservableObject {
             reloadAttempts = 0
         }
 
-        playbackSpeed = PlaybackSpeed(rawValue: c.currentSpeed) ?? playbackSpeed
+        if let latestSpeed = PlaybackSpeed(rawValue: c.currentSpeed),
+           latestSpeed.rawValue != playbackSpeed.rawValue {
+            playbackSpeed = latestSpeed
+        }
         syncTracks()
     }
 
     private func syncTracks() {
         let c = playerController
 
-        audioTracks = c.audioTracks.map {
+        let latestAudioTracks = c.audioTracks.map {
             AudioTrack(id: "\($0.id)", name: $0.title,
                        language: $0.lang, isSelected: $0.selected,
                        languageName: $0.languageName, detail: $0.detail)
         }
+        if audioTracks != latestAudioTracks { audioTracks = latestAudioTracks }
 
         var subs = c.subtitleTracks.map {
             SubtitleTrack(id: "\($0.id)", name: $0.title,
@@ -661,7 +699,7 @@ class PlayerViewModel: ObservableObject {
         let anySelected = subs.contains { $0.isSelected }
         subs.insert(SubtitleTrack(id: "off", name: "Off", language: "",
                                   isSelected: !anySelected), at: 0)
-        subtitles = subs
+        if subtitles != subs { subtitles = subs }
         applySavedTrackSelectionsIfNeeded()
         applyAudioPreferenceIfNeeded()
         applySubtitlePreferenceIfNeeded()
@@ -709,6 +747,17 @@ class PlayerViewModel: ObservableObject {
 
     func seek(to seconds: Double) {
         playerController.seekToMs(Int64(seconds * 1000))
+    }
+
+    private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
+        guard !didShutdown, durationMs > 0, positionMs >= 0, positionMs < durationMs else { return }
+        let snapshot = PlayerTime(
+            current: Double(positionMs) / 1000.0,
+            duration: Double(durationMs) / 1000.0
+        )
+        time = snapshot
+        lastStablePlaybackTime = snapshot
+        saveProgress(force: true)
     }
 
     func skipActiveInterval() {
@@ -863,7 +912,7 @@ class PlayerViewModel: ObservableObject {
     /// the user's preferred languages, when smart subtitle matching is enabled.
     private static func smartMatchedSubtitles(in subtitles: [NuvioSubtitle]) -> [NuvioSubtitle] {
         guard !subtitles.isEmpty,
-              ProfileSettings.current.bool(forKey: SettingsKey.smartSubtitleMatching) else {
+              SubtitleLanguagePreferences.smartMatchingEnabled() else {
             return []
         }
         var seen: Set<String> = []
@@ -919,8 +968,7 @@ class PlayerViewModel: ObservableObject {
 
     private func applyAudioPreferenceIfNeeded() {
         guard !didApplyAudioPreference, pendingTrackSelection?.audio == nil else { return }
-        let preferred = ProfileSettings.current.string(forKey: SettingsKey.audioLanguage) ?? "System"
-        guard !SubtitleLanguagePreferences.disabledValues.contains(preferred) else {
+        guard let preferred = SubtitleLanguagePreferences.preferredAudioLanguage() else {
             didApplyAudioPreference = true
             return
         }
@@ -932,7 +980,7 @@ class PlayerViewModel: ObservableObject {
     private func applySubtitlePreferenceIfNeeded() {
         guard !didApplySubtitlePreference else { return }
         guard pendingTrackSelection?.subtitle == nil else { return }
-        guard ProfileSettings.current.bool(forKey: SettingsKey.smartSubtitleMatching) else { return }
+        guard SubtitleLanguagePreferences.smartMatchingEnabled() else { return }
 
         let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         guard !preferredLanguages.isEmpty else {
@@ -943,16 +991,23 @@ class PlayerViewModel: ObservableObject {
         var matchingTrack: SubtitleTrack?
         for language in preferredLanguages {
             matchingTrack = subtitles.first { track in
-                track.id != "off" &&
-                (SubtitleLanguagePreferences.matches(track.language, target: language) ||
-                 SubtitleLanguagePreferences.matches(track.name, target: language))
+                subtitleTrack(track, matches: language)
             }
             if matchingTrack != nil { break }
         }
-        guard let matchingTrack else { return }
+        if let matchingTrack {
+            didApplySubtitlePreference = true
+            selectSubtitle(matchingTrack, persist: false)
+            return
+        }
 
+        let pendingPreferredURLs = Set(pendingExternalSubtitles.map(\.url))
+        let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
+        guard pendingPreferredURLs.isSubset(of: loadedExternalURLs) else { return }
+        guard subtitles.contains(where: { $0.id != "off" }) else { return }
+        guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
         didApplySubtitlePreference = true
-        selectSubtitle(matchingTrack, persist: false)
+        selectSubtitle(off, persist: false)
     }
 
     func selectAudio(_ track: AudioTrack, persist: Bool = true) {
@@ -1061,6 +1116,12 @@ class PlayerViewModel: ObservableObject {
         SubtitleLanguagePreferences.matches(track.name, target: language)
     }
 
+    private func subtitleTrack(_ track: SubtitleTrack, matches language: String) -> Bool {
+        track.id != "off" &&
+        (SubtitleLanguagePreferences.matches(track.language, target: language) ||
+         SubtitleLanguagePreferences.matches(track.name, target: language))
+    }
+
     private static func sameTrackText(_ lhs: String?, _ rhs: String?) -> Bool {
         let left = lhs?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
         let right = rhs?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() ?? ""
@@ -1126,20 +1187,25 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveProgress(force: Bool) {
+        let progressTime = force ? (lastStablePlaybackTime ?? time) : time
         guard let activeMeta,
               let activeStreamURL,
-              time.duration > 0,
+              progressTime.current.isFinite,
+              progressTime.duration.isFinite,
+              progressTime.current > 0,
+              progressTime.duration > 0,
+              progressTime.current < progressTime.duration,
               subtitle != PlaybackMarkers.trailerSubtitle,
               !loadedStreamLooksLikeReplacement(),
-              force || time.current >= 10 else {
+              force || progressTime.current >= 10 else {
             return
         }
 
-        if shouldSaveNextUpProgress, let nextEpisode {
+        if shouldSaveNextUpProgress(at: progressTime), let nextEpisode {
             markWatchedIfNeeded()
             ContinueWatchingStore.saveUpNext(
                 meta: activeMeta,
-                duration: time.duration,
+                duration: progressTime.duration,
                 season: nextEpisode.season,
                 episode: nextEpisode.episode,
                 released: nextEpisode.released
@@ -1151,8 +1217,8 @@ class PlayerViewModel: ObservableObject {
         ContinueWatchingStore.save(
             meta: activeMeta,
             streamUrl: activeStreamURL,
-            position: time.current,
-            duration: time.duration,
+            position: progressTime.current,
+            duration: progressTime.duration,
             season: activeEpisodeNumbers?.season,
             episode: activeEpisodeNumbers?.episode
         )
@@ -1160,18 +1226,19 @@ class PlayerViewModel: ObservableObject {
 
         // "Almost finished" already counts as watched, so the checkmark lands
         // without sitting through the credits.
-        if time.duration >= 60, time.current / time.duration >= 0.92 {
+        if progressTime.duration >= 60, progressTime.current / progressTime.duration >= 0.92 {
             markWatchedIfNeeded()
         }
     }
 
-    private var shouldSaveNextUpProgress: Bool {
+    private func shouldSaveNextUpProgress(at playbackTime: PlayerTime) -> Bool {
         guard showNextEpisodeCard,
               nextEpisode != nil,
-              time.duration >= 60 else {
+              playbackTime.duration >= 60 else {
             return false
         }
-        return time.remaining <= Self.nextCardLeadSeconds && time.current / time.duration >= 0.5
+        return playbackTime.remaining <= Self.nextCardLeadSeconds
+            && playbackTime.current / playbackTime.duration >= 0.5
     }
 
     private var nextEpisodeIsPlayable: Bool {
@@ -1493,6 +1560,10 @@ struct PlaybackCacheSettings {
 // status-bar, screen-edge gestures — none exist on tvOS) removed.
 
 final class MPVPlayerViewController: UIViewController {
+    /// Called after a coherent position is captured but before tvOS suspends
+    /// the player. PlayerViewModel uses it for a durable lifecycle save.
+    var onPlaybackSuspended: ((Int64, Int64) -> Void)?
+
 
     private static let defaultAudioOutput = "audiounit"
 
@@ -1513,6 +1584,8 @@ final class MPVPlayerViewController: UIViewController {
     var isPlayerLoading: Bool = true
     var isPlayerPlaying: Bool = false
     var isPlayerEnded: Bool = false
+    private(set) var isAtEndOfFile: Bool = false
+    private(set) var hasCoherentTimeSample: Bool = false
     var durationMs: Int64 = 0
     var positionMs: Int64 = 0
     var bufferedMs: Int64 = 0
@@ -1522,6 +1595,22 @@ final class MPVPlayerViewController: UIViewController {
         return _currentErrorMessage ?? ""
     }
     private var _currentErrorMessage: String?
+    private var _didReachCleanEndOfFile = false
+    private var didReachCleanEndOfFile: Bool {
+        errorStateLock.lock(); defer { errorStateLock.unlock() }
+        return _didReachCleanEndOfFile
+    }
+
+    // tvOS detaches video while another app is frontmost. Freeze the last
+    // coherent time until MPV has reattached and sought back to it; otherwise
+    // keep-open can briefly expose its last frame as time-pos == duration.
+    private var isApplicationBackgrounded = false
+    private var wasPlayingBeforeBackground = false
+    private var lifecyclePositionMs: Int64?
+    private var lifecycleDurationMs: Int64?
+    private var foregroundRestoreTargetMs: Int64?
+    private var foregroundRestoreDeadline: Date?
+    private var lifecycleRestoreFailed = false
 
     // MARK: - Lifecycle
 
@@ -1602,7 +1691,15 @@ final class MPVPlayerViewController: UIViewController {
         // `cache-secs`/`demuxer-readahead-secs` are set high enough that the byte
         // caps, not a time window, are what bound how much gets pulled ahead. Sizes
         // follow Settings → Playback → Network Cache.
+        #if targetEnvironment(simulator)
+        // MoltenVK's tvOS simulator PBO path allocates every uploaded video
+        // frame through MTLSim XPC and can trap in `_xpc_api_misuse` for real
+        // streams. Keep the simulator light and allow VideoToolbox's Metal
+        // texture interop; physical Apple TV keeps the user's cache setting.
+        let cache = PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
+        #else
         let cache = PlaybackCacheSettings.current
+        #endif
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
         checkError(mpv_set_option_string(mpv, "cache-secs", "3600"))
         checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "3600"))
@@ -1612,10 +1709,24 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "vulkan-queue-count", "1"))
         checkError(mpv_set_option_string(mpv, "vulkan-async-compute", "no"))
         checkError(mpv_set_option_string(mpv, "vulkan-async-transfer", "no"))
+        #if targetEnvironment(simulator)
+        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "no"))
+        #else
         checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "yes"))
+        #endif
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
-        checkError(mpv_set_option_string(mpv, "subs-match-os-language", "yes"))
-        checkError(mpv_set_option_string(mpv, "subs-fallback", "yes"))
+        if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
+           let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
+            checkError(mpv_set_option_string(mpv, "alang", alang))
+        }
+        let preferredSubtitleLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
+        let shouldStrictlyMatchSubtitles = SubtitleLanguagePreferences.smartMatchingEnabled() &&
+            !preferredSubtitleLanguages.isEmpty
+        if let slang = SubtitleLanguagePreferences.mpvLanguageList(for: preferredSubtitleLanguages) {
+            checkError(mpv_set_option_string(mpv, "slang", slang))
+        }
+        checkError(mpv_set_option_string(mpv, "subs-match-os-language", shouldStrictlyMatchSubtitles ? "no" : "yes"))
+        checkError(mpv_set_option_string(mpv, "subs-fallback", shouldStrictlyMatchSubtitles ? "no" : "yes"))
         // Honor the user's saved subtitle appearance on every track, including
         // embedded ASS/SSA (without `yes` mpv would ignore our color/size there),
         // and let `sub-margin-y` lift captions off the bottom edge.
@@ -1625,7 +1736,11 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
+        #if targetEnvironment(simulator)
+        checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "no"))
+        #else
         checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "yes"))
+        #endif
         checkError(mpv_set_option_string(mpv, "target-prim", "auto"))
         checkError(mpv_set_option_string(mpv, "target-trc", "auto"))
 
@@ -1661,14 +1776,70 @@ final class MPVPlayerViewController: UIViewController {
 
     @objc private func enterBackground() {
         guard mpv != nil else { return }
+        let sampledDurationMs = milliseconds(from: readDoubleProperty("duration")) ?? durationMs
+        let sampledPositionMs = milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+
+        // Prefer the already-published position if MPV jumps from an early
+        // point straight to its keep-open last frame during suspension.
+        let jumpedToEnd = sampledDurationMs >= 60_000
+            && sampledPositionMs >= sampledDurationMs - 5_000
+            && positionMs < sampledDurationMs * 85 / 100
+            && sampledPositionMs - positionMs > 30_000
+        let safePositionMs = max(0, jumpedToEnd ? positionMs : sampledPositionMs)
+
+        wasPlayingBeforeBackground = !getFlag("pause") && !getFlag("eof-reached")
+        lifecyclePositionMs = safePositionMs
+        lifecycleDurationMs = max(sampledDurationMs, durationMs)
+        foregroundRestoreTargetMs = nil
+        foregroundRestoreDeadline = nil
+        lifecycleRestoreFailed = false
+        isApplicationBackgrounded = true
+        clearCleanEndState()
         pausePlayback()
         setStringProperty("vid", "no")
+        publishLifecycleSnapshot()
+        onPlaybackSuspended?(safePositionMs, lifecycleDurationMs ?? 0)
     }
 
     @objc private func enterForeground() {
         guard mpv != nil else { return }
+        let shouldResume = wasPlayingBeforeBackground
         setStringProperty("vid", "auto")
-        playPlayback()
+        clearCleanEndState()
+
+        if let target = lifecyclePositionMs {
+            foregroundRestoreTargetMs = target
+            foregroundRestoreDeadline = Date().addingTimeInterval(4)
+            let rawPositionMs = milliseconds(from: readDoubleProperty("time-pos"))
+            if rawPositionMs == nil
+                || abs((rawPositionMs ?? target) - target) > 1_500
+                || getFlag("eof-reached") {
+                seekToMs(target)
+            }
+        }
+
+        isApplicationBackgrounded = false
+        if shouldResume {
+            playPlayback()
+        } else {
+            // Preserve an explicit user pause across app switching.
+            pausePlayback()
+        }
+    }
+
+    private func publishLifecycleSnapshot() {
+        if let duration = lifecycleDurationMs, duration > 0 {
+            durationMs = duration
+        }
+        if let position = lifecyclePositionMs {
+            positionMs = position
+            bufferedMs = max(bufferedMs, position)
+        }
+        hasCoherentTimeSample = durationMs > 0 && positionMs >= 0 && positionMs < durationMs
+        isAtEndOfFile = false
+        isPlayerLoading = false
+        isPlayerPlaying = false
+        isPlayerEnded = false
     }
 
     // MARK: - Playback API
@@ -1686,9 +1857,20 @@ final class MPVPlayerViewController: UIViewController {
         guard let url = pendingURL, mpv != nil else { return }
         guard isViewLoaded, view.bounds.width > 1, view.bounds.height > 1 else { return }
         pendingURL = nil
+        lifecyclePositionMs = nil
+        lifecycleDurationMs = nil
+        foregroundRestoreTargetMs = nil
+        foregroundRestoreDeadline = nil
+        lifecycleRestoreFailed = false
+        hasCoherentTimeSample = false
+        isAtEndOfFile = false
         layoutMetalLayer()
         clearPlaybackError()
-        didApplyDisplayCriteria = false
+        resetDisplayCriteriaProbe()
+        // Do not leave the prior title's HDR criteria active while this file
+        // is loading. The new stream's own VIDEO_RECONFIG will apply fresh
+        // criteria once its color parameters are known.
+        clearDisplayCriteria()
         isPlayerLoading = true
         isPlayerEnded = false
         command("loadfile", args: [url, "replace"])
@@ -1816,9 +1998,14 @@ final class MPVPlayerViewController: UIViewController {
     /// Lightweight state refresh — called by the view model poll (every 250ms).
     func refreshPlaybackState() {
         guard mpv != nil else { return }
-        let duration = getDouble("duration")
-        let position = getDouble("time-pos")
-        let cached = getDouble("demuxer-cache-time")
+        if isApplicationBackgrounded || lifecycleRestoreFailed {
+            publishLifecycleSnapshot()
+            return
+        }
+
+        let duration = readDoubleProperty("duration")
+        let position = readDoubleProperty("time-pos")
+        let cached = readDoubleProperty("demuxer-cache-time") ?? 0
         let speed = getDouble("speed")
         let paused = getFlag("pause")
         let eofReached = getFlag("eof-reached")
@@ -1826,16 +2013,55 @@ final class MPVPlayerViewController: UIViewController {
         let seeking = getFlag("seeking")
         let bufferingCache = getFlag("paused-for-cache")
 
+        isAtEndOfFile = eofReached
+
+        if let target = foregroundRestoreTargetMs {
+            let sampledPositionMs = milliseconds(from: position)
+            let restored = duration != nil
+                && sampledPositionMs != nil
+                && abs((sampledPositionMs ?? target) - target) <= 5_000
+                && !eofReached
+
+            if !restored {
+                if let deadline = foregroundRestoreDeadline, Date() < deadline {
+                    clearCleanEndState()
+                    seekToMs(target)
+                    publishLifecycleSnapshot()
+                    return
+                }
+
+                // Never turn a failed lifecycle reattach into a completed
+                // watch. Keep the verified snapshot and surface an error.
+                setPlaybackError("Playback could not resume after returning to Nuvio.")
+                lifecycleRestoreFailed = true
+                publishLifecycleSnapshot()
+                return
+            }
+
+            foregroundRestoreTargetMs = nil
+            foregroundRestoreDeadline = nil
+            lifecyclePositionMs = nil
+            lifecycleDurationMs = nil
+        }
+
+        hasCoherentTimeSample = duration != nil && position != nil
+
         isPlayerLoading = (idle && !paused && !eofReached) || seeking || bufferingCache
         isPlayerPlaying = !paused && !idle && !eofReached
-        // `eof-reached` is also set when a file ends because of an error (e.g. an expired
-        // stream link). Only report a clean end-of-stream when there is no active playback
-        // error, otherwise the watch-progress layer would mark the title as "completed" and
-        // drop it from Continue Watching.
-        isPlayerEnded = eofReached && _currentErrorMessage == nil
-        durationMs = Int64(duration * 1000)
-        positionMs = Int64(max(position, 0) * 1000)
-        bufferedMs = Int64(max(position + cached, 0) * 1000)
+        // Accept completion only after MPV's END_FILE event explicitly reports
+        // EOF. The eof-reached property can race ahead of an END_FILE error.
+        isPlayerEnded = eofReached
+            && didReachCleanEndOfFile
+            && currentErrorMessage.isEmpty
+            && hasCoherentTimeSample
+
+        if let durationMs = milliseconds(from: duration),
+           let positionMs = milliseconds(from: position) {
+            let cachedMs = milliseconds(from: cached) ?? 0
+            self.durationMs = durationMs
+            self.positionMs = max(positionMs, 0)
+            self.bufferedMs = max(positionMs + cachedMs, 0)
+        }
         currentSpeed = Float(speed > 0 ? speed : 1.0)
     }
 
@@ -2001,51 +2227,120 @@ final class MPVPlayerViewController: UIViewController {
     private var didApplyDisplayCriteria = false
     /// True while the HDMI mode switch is settling and video is detached.
     private var isDisplaySwitchInFlight = false
+    /// `VIDEO_RECONFIG` may arrive before SwiftUI has attached this controller
+    /// to a window, or before MPV has populated the stream dimensions. Keep a
+    /// short, coalesced probe alive for those races so HDR does not silently
+    /// stay in SDR on a physical Apple TV.
+    private var displayCriteriaProbeGeneration = 0
+    private var displayCriteriaProbeAttempts = 0
+    private var isDisplayCriteriaProbeScheduled = false
+    private static let maximumDisplayCriteriaProbeAttempts = 15
 
-    private func updateDisplayCriteria() {
+    private enum DisplayCriteriaUpdateResult {
+        case appliedOrAlreadyActive
+        case retry
+        case finished
+    }
+
+    private func resetDisplayCriteriaProbe() {
+        displayCriteriaProbeGeneration &+= 1
+        displayCriteriaProbeAttempts = 0
+        isDisplayCriteriaProbeScheduled = false
+    }
+
+    private func scheduleDisplayCriteriaProbe(after delay: TimeInterval = 0) {
+        #if !targetEnvironment(simulator)
+        guard mpv != nil,
+              !didApplyDisplayCriteria,
+              !isDisplaySwitchInFlight,
+              !isDisplayCriteriaProbeScheduled else { return }
+
+        let generation = displayCriteriaProbeGeneration
+        isDisplayCriteriaProbeScheduled = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self, generation == self.displayCriteriaProbeGeneration else { return }
+            self.isDisplayCriteriaProbeScheduled = false
+            self.probeDisplayCriteria(generation: generation)
+        }
+        #endif
+    }
+
+    private func probeDisplayCriteria(generation: Int) {
+        #if !targetEnvironment(simulator)
+        guard generation == displayCriteriaProbeGeneration else { return }
+
+        switch updateDisplayCriteria() {
+        case .retry:
+            guard displayCriteriaProbeAttempts < Self.maximumDisplayCriteriaProbeAttempts else {
+                print("[MPV] HDR display switch skipped: video parameters did not become ready")
+                return
+            }
+            displayCriteriaProbeAttempts += 1
+            scheduleDisplayCriteriaProbe(after: 0.2)
+        case .appliedOrAlreadyActive, .finished:
+            break
+        }
+        #endif
+    }
+
+    private func updateDisplayCriteria() -> DisplayCriteriaUpdateResult {
         // AVDisplayManager isn't in the simulator SDK (there's no HDMI output
         // to switch); this whole path is device-only.
         #if !targetEnvironment(simulator)
-        guard #available(tvOS 17.0, *) else { return }
-        guard mpv != nil, !isDisplaySwitchInFlight else { return }
+        guard #available(tvOS 17.0, *) else { return .finished }
+        guard mpv != nil, !isDisplaySwitchInFlight else { return .finished }
 
         let gamma = (getString("video-params/gamma") ?? "").lowercased()
         let primaries = (getString("video-params/primaries") ?? "").lowercased()
+        // Dolby Vision Profile 5 can initially present as BT.709 rather than
+        // PQ in video-params. Read the selected track's container metadata
+        // before the HDR gate so it is not incorrectly dismissed as SDR.
+        let dolbyVisionProfile = getInt("current-tracks/video/dolby-vision-profile")
+        let dolbyVisionLevel = getInt("current-tracks/video/dolby-vision-level")
+        let isDolbyVision = dolbyVisionProfile > 0
 
         // No video attached (e.g. our own `vid=no`, or backgrounding): leave
         // whatever criteria are in place alone.
-        guard !gamma.isEmpty || !primaries.isEmpty else { return }
+        guard !gamma.isEmpty || !primaries.isEmpty else { return .retry }
 
-        let isHDR = gamma == "pq" || gamma == "hlg" || primaries.contains("2020")
+        // MPV/FFmpeg have used both concise ("pq" / "hlg") and standards
+        // names (ST 2084 / ARIB B-67) for the same transfer functions.
+        let isHLG = gamma.contains("hlg") || gamma.contains("b67") || gamma.contains("arib")
+        let isPQ = gamma.contains("pq") || gamma.contains("2084")
+        let isHDR = isDolbyVision || isPQ || isHLG || primaries.contains("2020")
         guard isHDR else {
             clearDisplayCriteria()
-            return
+            return .finished
         }
-        guard !didApplyDisplayCriteria, let window = view.window else { return }
+        guard !didApplyDisplayCriteria else { return .appliedOrAlreadyActive }
+        guard let window = view.window else { return .retry }
         // Skip (SDR playback, no crash) rather than abort if the category is
         // ever missing again — e.g. a future tvOS removing it.
         _ = Self.avKitLinkAnchor
         guard window.responds(to: NSSelectorFromString("avDisplayManager")) else {
             print("[MPV] AVDisplayManager unavailable; HDR display switch skipped")
-            return
+            return .finished
         }
 
         let width = getInt("video-params/w")
         let height = getInt("video-params/h")
-        guard width > 0, height > 0 else { return }
+        guard width > 0, height > 0 else { return .retry }
 
         var fps = getDouble("container-fps")
         if fps <= 0 { fps = getDouble("estimated-vf-fps") }
         if fps <= 0 { fps = 23.976 }
 
+        // `video-format` is the decoded pixel format, not the encoded stream
+        // codec. Use the selected track so AV1 HDR is not described as HEVC.
+        let videoCodec = (getString("current-tracks/video/codec") ?? "").lowercased()
         let codecType: CMVideoCodecType
-        switch (getString("video-format") ?? "").lowercased() {
+        switch videoCodec {
         case "h264": codecType = kCMVideoCodecType_H264
         case "av1": codecType = kCMVideoCodecType_AV1
         default: codecType = kCMVideoCodecType_HEVC
         }
 
-        let transfer: CFString = gamma == "hlg"
+        let transfer: CFString = isHLG
             ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
             : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
         let extensions: [CFString: Any] = [
@@ -2065,8 +2360,19 @@ final class MPVPlayerViewController: UIViewController {
         )
         guard status == noErr, let formatDescription else {
             print("[MPV] Failed to build HDR format description (\(status))")
-            return
+            return .finished
         }
+
+        // This is parsed from the stream itself, unlike a source title such as
+        // "4K WEBRip". Dolby Vision needs its per-frame metadata delivered by
+        // the decoder/output path; the MPV Metal renderer cannot manufacture
+        // that metadata for AVDisplayManager, so its compatible HDR10/PQ base
+        // layer is requested here instead. The log makes the exact profile
+        // visible on-device without incorrectly claiming a Dolby Vision output.
+        let sourceRange = isDolbyVision
+            ? "Dolby Vision profile \(dolbyVisionProfile), level \(dolbyVisionLevel) (HDR10/PQ output)"
+            : (isHLG ? "HLG" : "HDR10/PQ")
+        print("[MPV] HDR display request: \(sourceRange); codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), \(width)x\(height) @ \(fps)fps")
 
         // The HDMI mode switch tears down and rebuilds the display pipeline.
         // Presenting Vulkan frames into the CAMetalLayer while that happens
@@ -2088,6 +2394,9 @@ final class MPVPlayerViewController: UIViewController {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.reattachVideoWhenDisplaySettled(manager, attemptsLeft: 16)
         }
+        return .appliedOrAlreadyActive
+        #else
+        return .finished
         #endif
     }
 
@@ -2122,6 +2431,19 @@ final class MPVPlayerViewController: UIViewController {
         errorStateLock.lock()
         recentPlaybackLogs.removeAll(keepingCapacity: true)
         _currentErrorMessage = nil
+        _didReachCleanEndOfFile = false
+        errorStateLock.unlock()
+    }
+
+    private func clearCleanEndState() {
+        errorStateLock.lock()
+        _didReachCleanEndOfFile = false
+        errorStateLock.unlock()
+    }
+
+    private func setCleanEndState(_ reachedEOF: Bool) {
+        errorStateLock.lock()
+        _didReachCleanEndOfFile = reachedEOF
         errorStateLock.unlock()
     }
 
@@ -2140,6 +2462,7 @@ final class MPVPlayerViewController: UIViewController {
     private func setPlaybackError(_ fallback: String) {
         let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
         errorStateLock.lock()
+        _didReachCleanEndOfFile = false
         var parts = recentPlaybackLogs.suffix(3)
         if !trimmedFallback.isEmpty && !parts.contains(trimmedFallback) {
             parts.append(trimmedFallback)
@@ -2161,6 +2484,8 @@ final class MPVPlayerViewController: UIViewController {
                 switch eventPtr.pointee.event_id {
                 case MPV_EVENT_PROPERTY_CHANGE:
                     DispatchQueue.main.async { self.updateState() }
+                case MPV_EVENT_START_FILE:
+                    self.clearPlaybackError()
                 case MPV_EVENT_FILE_LOADED:
                     DispatchQueue.main.async {
                         self.clearPlaybackError()
@@ -2168,18 +2493,26 @@ final class MPVPlayerViewController: UIViewController {
                         self.attachPendingAudioIfNeeded()
                         self.applySubtitleStyle()
                         self.updateState()
+                        self.resetDisplayCriteriaProbe()
+                        self.scheduleDisplayCriteriaProbe()
                     }
                 case MPV_EVENT_VIDEO_RECONFIG:
                     // Fires once decode starts and whenever the video params
                     // change — the earliest point video-params/* is reliable.
-                    DispatchQueue.main.async { self.updateDisplayCriteria() }
+                    // A short retry covers the race where it fires before the
+                    // view is attached to a UIWindow on physical Apple TV.
+                    DispatchQueue.main.async { self.scheduleDisplayCriteriaProbe() }
                 case MPV_EVENT_END_FILE:
                     if let data = eventPtr.pointee.data {
                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
-                        if endFile.reason == MPV_END_FILE_REASON_ERROR {
+                        if endFile.reason == MPV_END_FILE_REASON_EOF {
+                            self.setCleanEndState(true)
+                        } else if endFile.reason == MPV_END_FILE_REASON_ERROR {
                             let errorText = String(cString: mpv_error_string(endFile.error))
                             self.setPlaybackError("[mpv] \(errorText)")
                             print("[MPV] End file error: \(errorText)")
+                        } else {
+                            self.setCleanEndState(false)
                         }
                     }
                 case MPV_EVENT_SHUTDOWN:
@@ -2216,11 +2549,24 @@ final class MPVPlayerViewController: UIViewController {
         return strArgs
     }
 
-    private func getDouble(_ name: String) -> Double {
-        guard mpv != nil else { return 0.0 }
+    private func readDoubleProperty(_ name: String) -> Double? {
+        guard mpv != nil else { return nil }
         var data = Double()
-        mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
+        let result = mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
+        guard result >= 0, data.isFinite else { return nil }
         return data
+    }
+
+    private func getDouble(_ name: String) -> Double {
+        readDoubleProperty(name) ?? 0
+    }
+
+    private func milliseconds(from seconds: Double?) -> Int64? {
+        guard let seconds,
+              seconds.isFinite,
+              seconds >= 0,
+              seconds <= Double(Int64.max) / 1000 else { return nil }
+        return Int64(seconds * 1000)
     }
 
     private func getString(_ name: String) -> String? {

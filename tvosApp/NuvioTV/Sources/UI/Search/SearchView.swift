@@ -350,7 +350,7 @@ private struct SearchResultCard: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? 5 : 3)
+                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
                 .shadow(color: .black.opacity(focused ? 0.5 : 0.2), radius: focused ? 16 : 6)
 
@@ -388,7 +388,7 @@ private struct SearchResultCard: View {
     }
 
     private var focusBorderColor: Color {
-        .white.opacity(0.86)
+        AppFocusOutline.color
     }
 }
 
@@ -502,8 +502,8 @@ struct GlassCapsule: ViewModifier {
         glassed(content)
             .overlay(
                 Capsule().stroke(
-                    Color.white.opacity(focused ? 0.86 : 0.18),
-                    lineWidth: focused ? 3 : 1
+                    focused ? AppFocusOutline.color : Color.white.opacity(0.18),
+                    lineWidth: focused ? AppFocusOutline.width : 1
                 )
             )
             .scaleEffect(focused ? 1.012 : 1.0)

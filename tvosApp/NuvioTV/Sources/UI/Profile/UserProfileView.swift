@@ -3,6 +3,9 @@ import Foundation
 
 public struct UserProfileView: View {
     @StateObject private var viewModel: ProfileViewModel
+    private let accountSyncError: String?
+    private let onRetryAccountSync: (() -> Void)?
+    private let onProfileCreated: (() -> Void)?
     @State private var showingAddProfile = false
     @State private var newProfileName = ""
     @State private var newProfilePin = ""
@@ -11,8 +14,16 @@ public struct UserProfileView: View {
 
     private static let addProfileFocusId = "add_profile"
 
-    public init(viewModel: ProfileViewModel) {
+    public init(
+        viewModel: ProfileViewModel,
+        accountSyncError: String? = nil,
+        onRetryAccountSync: (() -> Void)? = nil,
+        onProfileCreated: (() -> Void)? = nil
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        self.accountSyncError = accountSyncError
+        self.onRetryAccountSync = onRetryAccountSync
+        self.onProfileCreated = onProfileCreated
     }
 
     public var body: some View {
@@ -32,6 +43,29 @@ public struct UserProfileView: View {
                     Text("Select a profile to continue")
                         .font(.custom("Inter-Regular", size: 28))
                         .foregroundColor(.white.opacity(0.6))
+
+                    if let profileCreationError = viewModel.profileCreationError {
+                        Spacer().frame(height: 18)
+                        Text(profileCreationError)
+                            .font(.custom("Inter-Regular", size: 20))
+                            .foregroundColor(.red.opacity(0.9))
+                            .lineLimit(2)
+                            .frame(maxWidth: 900)
+                    }
+
+                    if let accountSyncError, let onRetryAccountSync {
+                        Spacer().frame(height: 18)
+                        HStack(spacing: 18) {
+                            Text(accountSyncError)
+                                .font(.custom("Inter-Regular", size: 20))
+                                .foregroundColor(.orange.opacity(0.9))
+                                .lineLimit(2)
+
+                            Button("Retry", action: onRetryAccountSync)
+                                .buttonStyle(.bordered)
+                        }
+                        .frame(maxWidth: 900)
+                    }
 
                     Spacer()
 
@@ -78,7 +112,8 @@ public struct UserProfileView: View {
                     viewModel.createProfile(
                         name: newProfileName,
                         pin: newProfilePin.isEmpty ? nil : newProfilePin,
-                        avatarId: newProfileAvatarId
+                        avatarId: newProfileAvatarId,
+                        onCreated: onProfileCreated
                     )
                     newProfileName = ""
                     newProfilePin = ""
@@ -193,8 +228,8 @@ struct AddProfileButton: View {
                     )
                     .overlay(
                         Circle()
-                            .stroke(isFocused ? Color.white.opacity(0.86) : Color.white.opacity(0.3),
-                                    lineWidth: isFocused ? 3 : 2)
+                            .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.3),
+                                    lineWidth: isFocused ? AppFocusOutline.width : 2)
                     )
                     .shadow(color: isFocused ? Color.white.opacity(0.3) : .clear, radius: 24)
 
@@ -377,7 +412,7 @@ struct ProfileAvatarView: View {
         .clipShape(Circle())
         .overlay(
             Circle()
-                .stroke(Color.white.opacity(isFocused ? 0.86 : 0.28), lineWidth: isFocused ? 3 : 1)
+                .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.28), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .shadow(color: isFocused ? Color.white.opacity(0.3) : .black.opacity(0.24),
                 radius: isFocused ? 24 : 10, x: 0, y: 8)
@@ -551,7 +586,7 @@ private struct AvatarGridCell: View {
                 .overlay(
                     Circle().stroke(
                         isSelected || isFocused ? Color.white : Color.white.opacity(0.12),
-                        lineWidth: isSelected || isFocused ? 3 : 1
+                        lineWidth: isFocused ? AppFocusOutline.width : (isSelected ? 3 : 1)
                     )
                 )
                 .scaleEffect(isFocused ? 1.1 : 1)

@@ -16,6 +16,7 @@ struct NuvioCatalog: Identifiable, Codable {
     let name: String
     let description: String
     let itemIds: [String]
+    let items: [NuvioMeta]?
     let contentType: String?
     let catalogId: String?
 
@@ -24,6 +25,7 @@ struct NuvioCatalog: Identifiable, Codable {
         name: String,
         description: String,
         itemIds: [String],
+        items: [NuvioMeta]? = nil,
         contentType: String? = nil,
         catalogId: String? = nil
     ) {
@@ -31,6 +33,7 @@ struct NuvioCatalog: Identifiable, Codable {
         self.name = name
         self.description = description
         self.itemIds = itemIds
+        self.items = items
         self.contentType = contentType
         self.catalogId = catalogId
     }
@@ -143,9 +146,8 @@ struct NuvioVideo: Identifiable, Codable, Hashable {
 enum EpisodeReleasePolicy {
     static let showUnairedNextUpKey = "nuvio.tv.settings.layout.showUnairedNextUp"
     static let upcomingNextSeasonWindowDays = 7
-    /// How recently an up-next episode must have aired to count as a "New Episode"
-    /// drop rather than an ordinary "Next Up" episode.
-    static let newEpisodeWindowDays = 30
+    /// The window during which an aired up-next episode is presented as new.
+    static let newEpisodeWindowDays = 60
 
     static var showUnairedNextUp: Bool {
         if UserDefaults.standard.object(forKey: showUnairedNextUpKey) == nil {
@@ -197,12 +199,15 @@ enum EpisodeReleasePolicy {
 
     private static func isoDate(_ value: String?) -> Date? {
         guard let day = isoDay(value) else { return nil }
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.date(from: day)
+        let parts = day.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+        var components = DateComponents()
+        components.calendar = Calendar(identifier: .gregorian)
+        components.timeZone = TimeZone.current
+        components.year = parts[0]
+        components.month = parts[1]
+        components.day = parts[2]
+        return components.date
     }
 
     private static func isoDay(_ value: String?) -> String? {
@@ -214,12 +219,12 @@ enum EpisodeReleasePolicy {
     }
 
     private static func todayIsoDay() -> String {
-        let formatter = DateFormatter()
-        formatter.calendar = Calendar(identifier: .gregorian)
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        formatter.dateFormat = "yyyy-MM-dd"
-        return formatter.string(from: Date())
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents(in: TimeZone.current, from: Date())
+        guard let year = components.year,
+              let month = components.month,
+              let day = components.day else { return "" }
+        return String(format: "%04d-%02d-%02d", year, month, day)
     }
 
     private static func today() -> Date {
@@ -350,6 +355,12 @@ struct ContinueWatchingItem: Identifiable, Codable {
     let season: Int?
     let episode: Int?
     let released: String?
+    /// Fresh episode metadata is stored independently from `meta.videos` so a
+    /// placeholder episode guide entry (for example "TBA") can be corrected
+    /// without discarding the rest of the series metadata.
+    let episodeTitleOverride: String?
+    let episodeOverviewOverride: String?
+    let episodeThumbnailOverride: String?
     /// True when this entry is a fresh next-episode suggestion (the previous
     /// episode was finished) rather than real playback progress. Optional so
     /// old persisted JSON keeps decoding.
@@ -365,21 +376,12 @@ struct ContinueWatchingItem: Identifiable, Codable {
         return "UPCOMING"
     }
 
-    /// Distinguishes a freshly-dropped episode from the ordinary next episode in
-    /// a binge. It's only a "new episode" when the up-next episode is the newest
-    /// aired episode in the series *and* it aired recently — so being mid–Season 1
-    /// while Season 2 is already out reads as "Next Up", not "New Episode".
+    /// An aired up-next episode remains a visible "New Episode" drop through
+    /// the release-alert window. Progress timestamps are not reliable after a
+    /// cross-device sync or a regenerated Next Up entry, so they must not hide
+    /// a genuinely recent episode.
     var isNewEpisodeDrop: Bool {
-        guard isUpNextEntry, hasAired, let numbers = resolvedNumbers else { return false }
-        // A later aired episode existing (e.g. all of Season 2) means this
-        // up-next episode is back-catalog, not the newest drop.
-        let hasLaterAiredEpisode = (meta.videos ?? []).contains { video in
-            (seasonSortKey(video.season), video.episode) > (seasonSortKey(numbers.season), numbers.episode)
-                && EpisodeReleasePolicy.hasAired(video.released)
-        }
-        if hasLaterAiredEpisode { return false }
-        // Guard against labelling a long-finished show's final episode as "new".
-        return EpisodeReleasePolicy.isRecentlyReleased(
+        isUpNextEntry && hasAired && EpisodeReleasePolicy.isRecentlyReleased(
             released ?? episodeVideo?.released,
             within: EpisodeReleasePolicy.newEpisodeWindowDays
         )
@@ -394,6 +396,9 @@ struct ContinueWatchingItem: Identifiable, Codable {
         season: Int? = nil,
         episode: Int? = nil,
         released: String? = nil,
+        episodeTitleOverride: String? = nil,
+        episodeOverviewOverride: String? = nil,
+        episodeThumbnailOverride: String? = nil,
         isUpNext: Bool? = nil
     ) {
         self.meta = meta
@@ -404,6 +409,9 @@ struct ContinueWatchingItem: Identifiable, Codable {
         self.season = season
         self.episode = episode
         self.released = released
+        self.episodeTitleOverride = episodeTitleOverride
+        self.episodeOverviewOverride = episodeOverviewOverride
+        self.episodeThumbnailOverride = episodeThumbnailOverride
         self.isUpNext = isUpNext
     }
 
@@ -438,7 +446,7 @@ struct ContinueWatchingItem: Identifiable, Codable {
     /// "S1 E3 · Title" line for the episode in progress; nil when unknown.
     var episodeDisplayLine: String? {
         guard let label = episodeLabel else { return nil }
-        if let title = episodeVideo?.title, !title.isEmpty {
+        if let title = episodeDisplayTitle {
             return "\(label) · \(title)"
         }
         return label
@@ -457,11 +465,32 @@ struct ContinueWatchingItem: Identifiable, Codable {
         return meta.videos?.first { $0.season == numbers.season && $0.episode == numbers.episode }
     }
 
+    var episodeDisplayTitle: String? {
+        meaningfulEpisodeText(episodeTitleOverride) ?? meaningfulEpisodeText(episodeVideo?.title)
+    }
+
+    var episodeOverview: String? {
+        meaningfulEpisodeText(episodeOverviewOverride) ?? meaningfulEpisodeText(episodeVideo?.overview)
+    }
+
+    var episodeArtworkURL: String? {
+        episodeThumbnailOverride ?? episodeVideo?.thumbnail
+    }
+
     /// Player-style episode line ("S1 · E3 · Title"); nil when unknown.
     var episodeSubtitle: String? {
         guard let numbers = resolvedNumbers else { return nil }
-        let title = episodeVideo?.title ?? "Episode \(numbers.episode)"
+        let title = episodeDisplayTitle ?? "Episode \(numbers.episode)"
         return "S\(numbers.season) · E\(numbers.episode) · \(title)"
+    }
+
+    private func meaningfulEpisodeText(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value.caseInsensitiveCompare("TBA") != .orderedSame else {
+            return nil
+        }
+        return value
     }
 
     var progress: Double {
@@ -496,7 +525,34 @@ enum ContinueWatchingStore {
     /// Base key. Used on its own for the legacy (pre-profile) shared list and
     /// suffixed with the active profile id for per-profile watch history.
     private static let baseKey = "nuvio.tv.continueWatching.items"
+    private static let storageDirectoryName = "nuvio-continue-watching"
     private static let maxItems = 20
+
+    /// Last durable-storage result, suitable for the on-screen sync diagnostic.
+    static private(set) var persistenceDiagnostic = "not attempted"
+
+    private enum PersistenceError: LocalizedError {
+        case applicationSupportUnavailable
+        case verificationFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .applicationSupportUnavailable:
+                return "Application Support is unavailable"
+            case .verificationFailed:
+                return "the saved progress could not be verified"
+            }
+        }
+    }
+
+    struct DebugSnapshot {
+        let profileId: String
+        let source: String
+        let byteCount: Int
+        let decodedCount: Int
+        let keptCount: Int
+        let decodeError: String?
+    }
 
     /// Identifier of the profile whose watch history is currently active.
     /// Set at launch and whenever the user switches profiles so each profile
@@ -517,8 +573,16 @@ enum ContinueWatchingStore {
     }
 
     static func items() -> [ContinueWatchingItem] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([ContinueWatchingItem].self, from: data) else {
+        guard let data = data(for: storageKey) else {
+            return []
+        }
+        let decoded: [ContinueWatchingItem]
+        do {
+            decoded = try makeDecoder().decode([ContinueWatchingItem].self, from: data)
+        } catch {
+            // Keep the payload intact so debugSnapshot() can report the actual
+            // corruption instead of turning it into an unexplained missing file.
+            persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
             return []
         }
 
@@ -531,7 +595,71 @@ enum ContinueWatchingStore {
         items().first { $0.meta.id == metaId }
     }
 
+    /// Read-only storage diagnostics for the on-screen Home failure panel.
+    /// It deliberately bypasses `items()` so a corrupt payload is reported
+    /// instead of being silently removed before the user can photograph it.
+    static func debugSnapshot() -> DebugSnapshot {
+        let key = storageKey
+        let source: String
+        let rawData: Data?
+        if UserDefaults.standard.bool(forKey: fallbackMarkerKey(for: key)),
+           let data = UserDefaults.standard.data(forKey: key) {
+            source = "UserDefaults fallback"
+            rawData = data
+        } else if let url = storageURL(for: key), let data = try? Data(contentsOf: url) {
+            source = "Application Support"
+            rawData = data
+        } else if let url = legacyStorageURL(for: key), let data = try? Data(contentsOf: url) {
+            source = "Documents (legacy)"
+            rawData = data
+        } else if let data = UserDefaults.standard.data(forKey: key) {
+            source = "UserDefaults (legacy)"
+            rawData = data
+        } else {
+            source = "missing"
+            rawData = nil
+        }
+
+        guard let rawData else {
+            return DebugSnapshot(
+                profileId: activeProfileId ?? "none",
+                source: source,
+                byteCount: 0,
+                decodedCount: 0,
+                keptCount: 0,
+                decodeError: nil
+            )
+        }
+        do {
+            let decoded = try makeDecoder().decode([ContinueWatchingItem].self, from: rawData)
+            return DebugSnapshot(
+                profileId: activeProfileId ?? "none",
+                source: source,
+                byteCount: rawData.count,
+                decodedCount: decoded.count,
+                keptCount: decoded.filter { shouldKeep(position: $0.position, duration: $0.duration) }.count,
+                decodeError: nil
+            )
+        } catch {
+            return DebugSnapshot(
+                profileId: activeProfileId ?? "none",
+                source: source,
+                byteCount: rawData.count,
+                decodedCount: 0,
+                keptCount: 0,
+                decodeError: error.localizedDescription
+            )
+        }
+    }
+
     static func save(meta: NuvioMeta, streamUrl: String, position: Double, duration: Double, season: Int? = nil, episode: Int? = nil) {
+        // A temporarily unavailable MPV time-pos must not erase a valid resume
+        // point. Only a coherent, started sample is allowed to replace/remove
+        // existing progress.
+        guard position.isFinite,
+              duration.isFinite,
+              position > 0,
+              duration >= 60 else { return }
         guard shouldKeep(position: position, duration: duration) else {
             remove(metaId: meta.id)
             return
@@ -570,12 +698,66 @@ enum ContinueWatchingStore {
         persist(Array(updated))
     }
 
+    /// Continue Watching can be restored before account sync runs. Refresh only
+    /// incomplete episode guides here so the Home hero does not stay stuck on a
+    /// series synopsis when Cinemeta later supplies the episode overview/still.
+    static func refreshMissingEpisodeDetails() async {
+        let current = items()
+        guard current.contains(where: needsEpisodeGuideRefresh) else { return }
+
+        let repository = CinemetaCatalogRepository()
+        var refreshedItems = current
+        var didRefresh = false
+
+        for index in refreshedItems.indices where needsEpisodeGuideRefresh(refreshedItems[index]) {
+            let item = refreshedItems[index]
+            guard let latest = try? await repository.refreshMetadata(id: item.meta.id, type: item.meta.type),
+                  let numbers = item.episodeNumbers,
+                  let latestEpisode = latest.videos?.first(where: {
+                      $0.season == numbers.season && $0.episode == numbers.episode
+                  }),
+                  !episodeText(latestEpisode.overview).isEmpty else {
+                continue
+            }
+
+            refreshedItems[index] = ContinueWatchingItem(
+                meta: latest,
+                streamUrl: item.streamUrl,
+                position: item.position,
+                duration: item.duration,
+                lastWatchedAt: item.lastWatchedAt,
+                season: item.season,
+                episode: item.episode,
+                released: latestEpisode.released ?? item.released,
+                episodeTitleOverride: item.episodeTitleOverride,
+                episodeOverviewOverride: item.episodeOverviewOverride,
+                episodeThumbnailOverride: item.episodeThumbnailOverride,
+                isUpNext: item.isUpNext
+            )
+            didRefresh = true
+        }
+
+        if didRefresh {
+            persist(refreshedItems)
+        }
+    }
+
+    private static func needsEpisodeGuideRefresh(_ item: ContinueWatchingItem) -> Bool {
+        guard item.meta.isSeries, item.episodeNumbers != nil else { return false }
+        return episodeText(item.episodeOverview).isEmpty
+    }
+
+    private static func episodeText(_ value: String?) -> String {
+        value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
     static func remove(metaId: String) {
         persist(items().filter { $0.meta.id != metaId })
     }
 
-    static func mergeRemote(_ remoteItems: [ContinueWatchingItem]) {
-        guard !remoteItems.isEmpty else { return }
+    @discardableResult
+    static func mergeRemote(_ remoteItems: [ContinueWatchingItem]) -> Bool {
+        guard !remoteItems.isEmpty else { return true }
         var byId: [String: ContinueWatchingItem] = [:]
         // Remote items come second and win timestamp ties, so a re-pull can
         // refresh an entry's presentation (e.g. up-next state) even when the
@@ -586,7 +768,7 @@ enum ContinueWatchingStore {
                 byId[item.meta.id] = item
             }
         }
-        persist(Array(byId.values).sorted { $0.lastWatchedAt > $1.lastWatchedAt }.prefix(maxItems).map { $0 })
+        return persist(Array(byId.values).sorted { $0.lastWatchedAt > $1.lastWatchedAt }.prefix(maxItems).map { $0 })
     }
 
     static func replaceAll(_ newItems: [ContinueWatchingItem]) {
@@ -601,11 +783,53 @@ enum ContinueWatchingStore {
         return remaining >= 60 && (position / duration) < 0.92
     }
 
-    private static func persist(_ items: [ContinueWatchingItem]) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+    @discardableResult
+    private static func persist(_ items: [ContinueWatchingItem]) -> Bool {
+        let storedItems = Array(items.prefix(maxItems))
+        let data: Data
+        do {
+            data = try makeEncoder().encode(storedItems)
+        } catch {
+            persistenceDiagnostic = "encode failed: \(diagnosticText(for: error))"
+            return false
+        }
+
+        let key = storageKey
+        let defaults = UserDefaults.standard
+        var primaryError: Error?
+        if let url = storageURL(for: key) {
+            do {
+                try writeAndVerify(data, to: url)
+                defaults.removeObject(forKey: key)
+                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
+                persistenceDiagnostic = "Application Support: \(storedItems.count) item(s), \(data.count) bytes"
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+                writeTopShelfFeed()
+                return true
+            } catch {
+                primaryError = error
+            }
+        } else {
+            primaryError = PersistenceError.applicationSupportUnavailable
+        }
+
+        // UserDefaults is only a fallback. A marker makes it authoritative over
+        // an older file until a later read can migrate it back successfully.
+        defaults.set(data, forKey: key)
+        defaults.set(true, forKey: fallbackMarkerKey(for: key))
+        guard defaults.data(forKey: key) == data,
+              (try? makeDecoder().decode([ContinueWatchingItem].self, from: data)) != nil else {
+            defaults.removeObject(forKey: fallbackMarkerKey(for: key))
+            let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+            persistenceDiagnostic = "save failed: \(reason); UserDefaults fallback failed"
+            return false
+        }
+
+        let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+        persistenceDiagnostic = "UserDefaults fallback: \(storedItems.count) item(s); \(reason)"
         NotificationCenter.default.post(name: changedNotification, object: nil)
         writeTopShelfFeed()
+        return true
     }
 
     /// Mirrors the active profile's Continue Watching list into the App Group so
@@ -639,6 +863,12 @@ enum ContinueWatchingStore {
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }
             .forEach { defaults.removeObject(forKey: $0) }
+        if let directory = storageDirectoryURL {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        if let legacyDirectory = legacyStorageDirectoryURL {
+            try? FileManager.default.removeItem(at: legacyDirectory)
+        }
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -649,12 +879,160 @@ enum ContinueWatchingStore {
     private static func migrateLegacyHistoryIfNeeded() {
         guard let id = activeProfileId, !id.isEmpty else { return }
         let profileKey = "\(baseKey).\(id)"
-        let defaults = UserDefaults.standard
         // Nothing to migrate, or this profile already has its own history.
-        guard defaults.data(forKey: profileKey) == nil,
-              let legacyData = defaults.data(forKey: baseKey) else { return }
-        defaults.set(legacyData, forKey: profileKey)
-        defaults.removeObject(forKey: baseKey)
+        guard data(for: profileKey) == nil,
+              let legacyData = data(for: baseKey),
+              let profileURL = storageURL(for: profileKey) else { return }
+        do {
+            try writeAndVerify(legacyData, to: profileURL)
+            removeStorage(for: baseKey)
+            persistenceDiagnostic = "migrated shared progress to profile \(id)"
+        } catch {
+            // The shared copy remains the source of truth until this succeeds.
+            persistenceDiagnostic = "profile migration failed: \(diagnosticText(for: error))"
+        }
+    }
+
+    private static var storageDirectoryURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
+    /// Pre-sideload builds used Documents. Some signing/install paths expose
+    /// that directory as read-only on tvOS, so it is migration-only now.
+    private static var legacyStorageDirectoryURL: URL? {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
+    private static func storageURL(for key: String) -> URL? {
+        storageDirectoryURL?.appendingPathComponent(fileName(for: key))
+    }
+
+    private static func legacyStorageURL(for key: String) -> URL? {
+        legacyStorageDirectoryURL?.appendingPathComponent(fileName(for: key))
+    }
+
+    private static func fileName(for key: String) -> String {
+        let encoded = Data(key.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+        return "\(encoded).json"
+    }
+
+    private static func data(for key: String) -> Data? {
+        let defaults = UserDefaults.standard
+        let markerKey = fallbackMarkerKey(for: key)
+
+        // A verified fallback is newer than any file left by the failed write.
+        // Retry the preferred storage opportunistically without risking it.
+        if defaults.bool(forKey: markerKey), let data = defaults.data(forKey: key) {
+            if let url = storageURL(for: key) {
+                do {
+                    try writeAndVerify(data, to: url)
+                    defaults.removeObject(forKey: key)
+                    defaults.removeObject(forKey: markerKey)
+                    persistenceDiagnostic = "recovered Application Support storage"
+                } catch {
+                    persistenceDiagnostic = "using UserDefaults fallback: \(diagnosticText(for: error))"
+                }
+            }
+            return data
+        }
+
+        if let url = storageURL(for: key),
+           let data = try? Data(contentsOf: url) {
+            return data
+        }
+
+        // Preserve progress from older builds when their Documents file is
+        // still readable, but keep all future writes in Application Support.
+        if let legacyURL = legacyStorageURL(for: key),
+           let data = try? Data(contentsOf: legacyURL) {
+            if let url = storageURL(for: key) {
+                do {
+                    try writeAndVerify(data, to: url)
+                    try? FileManager.default.removeItem(at: legacyURL)
+                    persistenceDiagnostic = "migrated Documents progress"
+                } catch {
+                    persistenceDiagnostic = "Documents migration failed: \(diagnosticText(for: error))"
+                }
+            }
+            return data
+        }
+
+        guard let data = defaults.data(forKey: key) else { return nil }
+        if let url = storageURL(for: key) {
+            do {
+                try writeAndVerify(data, to: url)
+                defaults.removeObject(forKey: key)
+                persistenceDiagnostic = "migrated UserDefaults progress"
+            } catch {
+                // Preserve the legacy value until the destination is verified.
+                persistenceDiagnostic = "UserDefaults migration failed: \(diagnosticText(for: error))"
+            }
+        }
+        return data
+    }
+
+    private static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return encoder
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return decoder
+    }
+
+    private static func writeAndVerify(_ data: Data, to url: URL) throws {
+        _ = try makeDecoder().decode([ContinueWatchingItem].self, from: data)
+        try write(data, to: url)
+        guard let saved = try? Data(contentsOf: url), saved == data else {
+            throw PersistenceError.verificationFailed
+        }
+        _ = try makeDecoder().decode([ContinueWatchingItem].self, from: saved)
+    }
+
+    private static func fallbackMarkerKey(for key: String) -> String {
+        "\(key).userDefaultsFallback"
+    }
+
+    private static func diagnosticText(for error: Error) -> String {
+        let singleLine = error.localizedDescription.replacingOccurrences(of: "\n", with: " ")
+        return String(singleLine.prefix(160))
+    }
+
+    private static func write(_ data: Data, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private static func removeStorage(for key: String) {
+        UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.removeObject(forKey: fallbackMarkerKey(for: key))
+        if let url = storageURL(for: key) {
+            try? FileManager.default.removeItem(at: url)
+        }
+        if let legacyURL = legacyStorageURL(for: key) {
+            try? FileManager.default.removeItem(at: legacyURL)
+        }
     }
 }
 

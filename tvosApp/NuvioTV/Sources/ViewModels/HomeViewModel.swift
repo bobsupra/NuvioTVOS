@@ -33,11 +33,17 @@ class HomeViewModel: ObservableObject {
             for catalog in catalogs {
                 // In a real app, we'd batch fetch these or the catalog would contain them
                 // For this mock/prototype, we'll fetch metadata for the first few items
-                var items: [NuvioMeta] = []
-                for id in catalog.itemIds.prefix(10) {
-                    if let meta = try? await repository.getMetadata(id: id, type: catalog.contentType ?? "movie") {
-                        items.append(meta)
+                let items: [NuvioMeta]
+                if let catalogItems = catalog.items {
+                    items = Array(catalogItems.prefix(10))
+                } else {
+                    var resolvedItems: [NuvioMeta] = []
+                    for id in catalog.itemIds.prefix(10) {
+                        if let meta = try? await repository.getMetadata(id: id, type: catalog.contentType ?? "movie") {
+                            resolvedItems.append(meta)
+                        }
                     }
+                    items = resolvedItems
                 }
                 
                 processedCatalogs.append(HomeCatalog(
