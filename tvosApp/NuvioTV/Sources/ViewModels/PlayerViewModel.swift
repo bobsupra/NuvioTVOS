@@ -2372,7 +2372,14 @@ final class MPVPlayerViewController: UIViewController {
         let sourceRange = isDolbyVision
             ? "Dolby Vision profile \(dolbyVisionProfile), level \(dolbyVisionLevel) (HDR10/PQ output)"
             : (isHLG ? "HLG" : "HDR10/PQ")
-        print("[MPV] HDR display request: \(sourceRange); codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), \(width)x\(height) @ \(fps)fps")
+        let targetTRC = isHLG ? "hlg" : "pq"
+        // Keep the renderer's output colorimetry identical to the format
+        // description sent to tvOS. Leaving these on `auto` can adapt a wide
+        // gamut source to BT.709 and then have the TV interpret it as BT.2020,
+        // which exaggerates reds, oranges, and skin tones.
+        setStringProperty("target-prim", "bt.2020")
+        setStringProperty("target-trc", targetTRC)
+        print("[MPV] HDR display request: \(sourceRange); codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), target=bt.2020/\(targetTRC), \(width)x\(height) @ \(fps)fps")
 
         // The HDMI mode switch tears down and rebuilds the display pipeline.
         // Presenting Vulkan frames into the CAMetalLayer while that happens
@@ -2422,6 +2429,10 @@ final class MPVPlayerViewController: UIViewController {
         displayCriteriaWindow?.avDisplayManager.preferredDisplayCriteria = nil
         displayCriteriaWindow = nil
         didApplyDisplayCriteria = false
+        if mpv != nil {
+            setStringProperty("target-prim", "auto")
+            setStringProperty("target-trc", "auto")
+        }
         #endif
     }
 
