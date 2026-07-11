@@ -25,22 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 2.5](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.5) is the current tvOS release. Download the unsigned IPA here:
+[Beta 2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.6) (build 35) is the current tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-tvOS-beta-2.5-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.5/NuvioTV-tvOS-beta-2.5-unsigned.ipa)
+[NuvioTV-2.6-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.6/NuvioTV-2.6-unsigned.ipa)
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
-Beta 2.5 brings the latest tvOS debrid and Apple TV integration pass:
+Beta 2.6 focuses on reliable Apple TV sync, playback, and settings:
 
-- Debrid stream resolving is wired for Real-Debrid, Premiumize, and TorBox.
-- Torrent-only streams can appear in the stream picker and resolve into playable links after a provider key is added in Settings.
-- Stream picker sorting, add-on logos, and focus stability have been improved.
-- Cloud Library is available from Library for Premiumize and TorBox accounts with an API key.
-- Apple TV Top Shelf mirrors Continue Watching and opens titles back into Nuvio.
-- Long-pressing poster, search, discover, and library cards opens quick actions.
-- Continue Watching now uses "Next Up" for ordinary next episodes and reserves "New Episode" for fresh drops.
-- Held Siri Remote seeking works better while the timeline is focused, and buffering is tuned for Stremio/debrid streams.
+- Account and profile sync now retains the correct profile and refreshes Home after login.
+- Continue Watching sync and resume handling are fixed for physical Apple TV, including app backgrounding and return.
+- Player settings have smoother focus behavior and a Liquid Glass treatment for the Subtitles, Audio, and Speed tabs.
+- Preferred audio and subtitle languages support unrestricted selections, with System as the default.
+- TorBox can be linked from Settings with a TV QR code; Premiumize device sign-in is ready once its production OAuth client ID is configured.
+- HDR display-matching detection, Home/details focus restoration, and player metadata diagnostics have been improved.
+
+Known limitation: Premiumize QR linking is not enabled in this build until a production OAuth client ID is configured.
 
 ## About
 
@@ -158,7 +158,7 @@ tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift
 
 The catalog prototype currently uses Cinemeta plus Stremio-compatible stream and subtitle addon endpoints from [CatalogRepository.swift](./tvosApp/NuvioTV/Sources/Data/Repository/CatalogRepository.swift).
 
-For torrent stream resolving, open Settings → Integrations → Debrid, choose Real-Debrid, Premiumize, or TorBox, then enter that provider's API key. Premiumize and TorBox also unlock the Cloud Library button in Library.
+For TorBox, open Settings → Integrations → Accounts and link the account using the TV QR code. Premiumize sign-in uses the same device-linking flow once a production OAuth client ID has been configured. Linked provider credentials are also used by Cloud Library in Library.
 
 ## Tests
 
