@@ -564,6 +564,10 @@ enum ContinueWatchingStore {
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
         migrateLegacyHistoryIfNeeded()
+        // Rebuild Top Shelf on every profile load. Its App Group snapshot may
+        // have been cleared by an update or signing change even when the local
+        // Continue Watching file is still intact.
+        writeTopShelfFeed()
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -608,6 +612,9 @@ enum ContinueWatchingStore {
             rawData = data
         } else if let url = storageURL(for: key), let data = try? Data(contentsOf: url) {
             source = "Application Support"
+            rawData = data
+        } else if let url = fallbackStorageURL(for: key), let data = try? Data(contentsOf: url) {
+            source = "Caches fallback"
             rawData = data
         } else if let url = legacyStorageURL(for: key), let data = try? Data(contentsOf: url) {
             source = "Documents (legacy)"
@@ -800,6 +807,9 @@ enum ContinueWatchingStore {
         if let url = storageURL(for: key) {
             do {
                 try writeAndVerify(data, to: url)
+                if let fallbackURL = fallbackStorageURL(for: key) {
+                    try? FileManager.default.removeItem(at: fallbackURL)
+                }
                 defaults.removeObject(forKey: key)
                 defaults.removeObject(forKey: fallbackMarkerKey(for: key))
                 persistenceDiagnostic = "Application Support: \(storedItems.count) item(s), \(data.count) bytes"
@@ -813,23 +823,33 @@ enum ContinueWatchingStore {
             primaryError = PersistenceError.applicationSupportUnavailable
         }
 
-        // UserDefaults is only a fallback. A marker makes it authoritative over
-        // an older file until a later read can migrate it back successfully.
-        defaults.set(data, forKey: key)
-        defaults.set(true, forKey: fallbackMarkerKey(for: key))
-        guard defaults.data(forKey: key) == data,
-              (try? makeDecoder().decode([ContinueWatchingItem].self, from: data)) != nil else {
-            defaults.removeObject(forKey: fallbackMarkerKey(for: key))
-            let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-            persistenceDiagnostic = "save failed: \(reason); UserDefaults fallback failed"
-            return false
+        // Synced progress can contain several megabytes of episode metadata.
+        // tvOS 27 aborts the process when a value that large is written to
+        // UserDefaults, so the fallback must remain file-backed too.
+        if let fallbackURL = fallbackStorageURL(for: key) {
+            do {
+                try writeAndVerify(data, to: fallbackURL)
+                if let primaryURL = storageURL(for: key),
+                   FileManager.default.fileExists(atPath: primaryURL.path) {
+                    try FileManager.default.removeItem(at: primaryURL)
+                }
+                defaults.removeObject(forKey: key)
+                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
+                let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+                persistenceDiagnostic = "Caches fallback: \(storedItems.count) item(s); \(reason)"
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+                writeTopShelfFeed()
+                return true
+            } catch {
+                let primaryReason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+                persistenceDiagnostic = "save failed: \(primaryReason); Caches fallback: \(diagnosticText(for: error))"
+                return false
+            }
         }
 
         let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-        persistenceDiagnostic = "UserDefaults fallback: \(storedItems.count) item(s); \(reason)"
-        NotificationCenter.default.post(name: changedNotification, object: nil)
-        writeTopShelfFeed()
-        return true
+        persistenceDiagnostic = "save failed: \(reason); Caches unavailable"
+        return false
     }
 
     /// Mirrors the active profile's Continue Watching list into the App Group so
@@ -864,6 +884,9 @@ enum ContinueWatchingStore {
             .filter { $0.hasPrefix(baseKey) }
             .forEach { defaults.removeObject(forKey: $0) }
         if let directory = storageDirectoryURL {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        if let directory = fallbackStorageDirectoryURL {
             try? FileManager.default.removeItem(at: directory)
         }
         if let legacyDirectory = legacyStorageDirectoryURL {
@@ -906,12 +929,22 @@ enum ContinueWatchingStore {
             .appendingPathComponent(storageDirectoryName, isDirectory: true)
     }
 
+    private static var fallbackStorageDirectoryURL: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
     private static func storageURL(for key: String) -> URL? {
         storageDirectoryURL?.appendingPathComponent(fileName(for: key))
     }
 
     private static func legacyStorageURL(for key: String) -> URL? {
         legacyStorageDirectoryURL?.appendingPathComponent(fileName(for: key))
+    }
+
+    private static func fallbackStorageURL(for key: String) -> URL? {
+        fallbackStorageDirectoryURL?.appendingPathComponent(fileName(for: key))
     }
 
     private static func fileName(for key: String) -> String {
@@ -945,6 +978,20 @@ enum ContinueWatchingStore {
 
         if let url = storageURL(for: key),
            let data = try? Data(contentsOf: url) {
+            return data
+        }
+
+        if let fallbackURL = fallbackStorageURL(for: key),
+           let data = try? Data(contentsOf: fallbackURL) {
+            if let url = storageURL(for: key) {
+                do {
+                    try writeAndVerify(data, to: url)
+                    try? FileManager.default.removeItem(at: fallbackURL)
+                    persistenceDiagnostic = "recovered Application Support storage"
+                } catch {
+                    persistenceDiagnostic = "using Caches fallback: \(diagnosticText(for: error))"
+                }
+            }
             return data
         }
 
@@ -1032,6 +1079,9 @@ enum ContinueWatchingStore {
         }
         if let legacyURL = legacyStorageURL(for: key) {
             try? FileManager.default.removeItem(at: legacyURL)
+        }
+        if let fallbackURL = fallbackStorageURL(for: key) {
+            try? FileManager.default.removeItem(at: fallbackURL)
         }
     }
 }

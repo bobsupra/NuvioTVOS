@@ -1681,6 +1681,11 @@ final class MPVPlayerViewController: UIViewController {
     private var wasPlayingBeforeBackground = false
     private var lifecyclePositionMs: Int64?
     private var lifecycleDurationMs: Int64?
+    /// Independent of the UI-facing position, which MPV can overwrite with the
+    /// final frame just before tvOS delivers didEnterBackground.
+    private var lastVerifiedPositionMs: Int64?
+    private var lastVerifiedDurationMs: Int64?
+    private var lastVerifiedWasPlaying = false
     private var foregroundRestoreTargetMs: Int64?
     private var foregroundRestoreDeadline: Date?
     private var lifecycleRestoreFailed = false
@@ -1852,18 +1857,22 @@ final class MPVPlayerViewController: UIViewController {
         guard mpv != nil else { return }
         let sampledDurationMs = milliseconds(from: readDoubleProperty("duration")) ?? durationMs
         let sampledPositionMs = milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
+        let verifiedPositionMs = lastVerifiedPositionMs ?? positionMs
+        let verifiedDurationMs = lastVerifiedDurationMs ?? durationMs
+        let referenceDurationMs = max(sampledDurationMs, verifiedDurationMs)
 
-        // Prefer the already-published position if MPV jumps from an early
-        // point straight to its keep-open last frame during suspension.
-        let jumpedToEnd = sampledDurationMs >= 60_000
-            && sampledPositionMs >= sampledDurationMs - 5_000
-            && positionMs < sampledDurationMs * 85 / 100
-            && sampledPositionMs - positionMs > 30_000
-        let safePositionMs = max(0, jumpedToEnd ? positionMs : sampledPositionMs)
+        // The UI-facing position can already contain MPV's bogus final-frame
+        // value by this point. Compare against the independent verified sample.
+        let jumpedToEnd = referenceDurationMs >= 60_000
+            && sampledPositionMs >= referenceDurationMs - 5_000
+            && verifiedPositionMs < referenceDurationMs * 85 / 100
+            && sampledPositionMs - verifiedPositionMs > 30_000
+        let safePositionMs = max(0, jumpedToEnd ? verifiedPositionMs : sampledPositionMs)
 
-        wasPlayingBeforeBackground = !getFlag("pause") && !getFlag("eof-reached")
+        let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
+        wasPlayingBeforeBackground = mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)
         lifecyclePositionMs = safePositionMs
-        lifecycleDurationMs = max(sampledDurationMs, durationMs)
+        lifecycleDurationMs = max(referenceDurationMs, durationMs)
         foregroundRestoreTargetMs = nil
         foregroundRestoreDeadline = nil
         lifecycleRestoreFailed = false
@@ -1933,6 +1942,9 @@ final class MPVPlayerViewController: UIViewController {
         pendingURL = nil
         lifecyclePositionMs = nil
         lifecycleDurationMs = nil
+        lastVerifiedPositionMs = nil
+        lastVerifiedDurationMs = nil
+        lastVerifiedWasPlaying = false
         foregroundRestoreTargetMs = nil
         foregroundRestoreDeadline = nil
         lifecycleRestoreFailed = false
@@ -1952,22 +1964,34 @@ final class MPVPlayerViewController: UIViewController {
 
     func playPlayback() {
         guard mpv != nil else { return }
+        lastVerifiedWasPlaying = true
         setFlag("pause", false)
     }
 
     func pausePlayback() {
         guard mpv != nil else { return }
+        lastVerifiedWasPlaying = false
         setFlag("pause", true)
     }
 
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        rememberExplicitSeek(to: ms)
         command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute"])
     }
 
     func seekByMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        rememberExplicitSeek(to: positionMs + ms)
         command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "relative"])
+    }
+
+    private func rememberExplicitSeek(to requestedMs: Int64) {
+        let upperBound = durationMs > 0 ? max(durationMs - 1, 0) : Int64.max
+        lastVerifiedPositionMs = min(max(requestedMs, 0), upperBound)
+        if durationMs > 0 {
+            lastVerifiedDurationMs = durationMs
+        }
     }
 
     func setSpeed(_ speed: Float) {
@@ -2132,6 +2156,32 @@ final class MPVPlayerViewController: UIViewController {
         if let durationMs = milliseconds(from: duration),
            let positionMs = milliseconds(from: position) {
             let cachedMs = milliseconds(from: cached) ?? 0
+            let previousPositionMs = lastVerifiedPositionMs
+            let referenceDurationMs = max(durationMs, lastVerifiedDurationMs ?? 0)
+            let implausibleEndJump = referenceDurationMs >= 60_000
+                && positionMs >= referenceDurationMs - 5_000
+                && (previousPositionMs ?? positionMs) < referenceDurationMs * 85 / 100
+                && positionMs - (previousPositionMs ?? positionMs) > 30_000
+
+            if implausibleEndJump, let previousPositionMs {
+                lifecyclePositionMs = previousPositionMs
+                lifecycleDurationMs = referenceDurationMs
+                foregroundRestoreTargetMs = previousPositionMs
+                foregroundRestoreDeadline = Date().addingTimeInterval(4)
+                clearCleanEndState()
+                seekToMs(previousPositionMs)
+                publishLifecycleSnapshot()
+                return
+            }
+
+            if !eofReached,
+               positionMs >= 0,
+               positionMs < durationMs,
+               !implausibleEndJump {
+                lastVerifiedPositionMs = positionMs
+                lastVerifiedDurationMs = durationMs
+                lastVerifiedWasPlaying = !paused && !idle
+            }
             self.durationMs = durationMs
             self.positionMs = max(positionMs, 0)
             self.bufferedMs = max(positionMs + cachedMs, 0)

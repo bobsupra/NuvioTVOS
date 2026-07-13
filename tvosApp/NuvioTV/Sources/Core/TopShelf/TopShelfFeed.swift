@@ -33,12 +33,12 @@ public struct TopShelfEntry: Codable, Equatable {
         self.progress = progress
     }
 
-    /// Deep link back into the app for this card (opens Details). Handled by the
-    /// app's `.onOpenURL`.
+    /// Deep link back into the app for direct Continue Watching playback.
+    /// The app resolves URL-less synced and Next Up entries after opening.
     public var deepLinkURL: URL? {
         var components = URLComponents()
         components.scheme = "nuvio-tv"
-        components.host = "details"
+        components.host = "continue-watching"
         components.queryItems = [
             URLQueryItem(name: "id", value: contentId),
             URLQueryItem(name: "type", value: contentType)

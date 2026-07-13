@@ -69,6 +69,7 @@ struct ContentView: View {
     /// Up) resolve their stream in place instead of opening Details first.
     @State private var isResolvingContinueWatchingStream = false
     @State private var continueWatchingPlaybackTask: Task<Void, Never>?
+    @State private var pendingDeepLinkURL: URL?
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
@@ -131,6 +132,7 @@ struct ContentView: View {
                             withAnimation(.easeInOut(duration: 0.28)) {
                                 activeScreen = .main
                             }
+                            resumePendingDeepLinkIfPossible()
                         }
                 }
 
@@ -185,6 +187,7 @@ struct ContentView: View {
                     activeScreen = .profileSelection
                 } else if autoSelectLast, profileViewModel.activeProfile != nil {
                     activeScreen = .main
+                    resumePendingDeepLinkIfPossible()
                 } else {
                     activeScreen = .profileSelection
                 }
@@ -204,6 +207,7 @@ struct ContentView: View {
                     enterMainAfterPostLoginSync = false
                     if shouldEnterMain {
                         activeScreen = .main
+                        resumePendingDeepLinkIfPossible()
                     }
                 }
             }
@@ -281,11 +285,12 @@ struct ContentView: View {
         }
     }
 
-    /// Handles `nuvio-tv://details?id=…&type=…` deep links (e.g. a Top Shelf card
-    /// tapped on the Apple TV home screen), opening the matching Details screen.
+    /// Handles Top Shelf playback and legacy Details deep links. Continue
+    /// Watching links use the same direct-resume path as cards inside Home.
     /// Ignored while the user is still on the login / profile gate.
     private func handleDeepLink(_ url: URL) {
-        guard url.scheme == "nuvio-tv", url.host == "details",
+        guard url.scheme == "nuvio-tv",
+              url.host == "continue-watching" || url.host == "details",
               let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
               let id = components.queryItems?.first(where: { $0.name == "id" })?.value, !id.isEmpty else {
             return
@@ -293,11 +298,30 @@ struct ContentView: View {
         let type = components.queryItems?.first(where: { $0.name == "type" })?.value ?? "movie"
         switch activeScreen {
         case .login, .profileSelection:
+            pendingDeepLinkURL = url
             return
         default:
-            withAnimation(.easeInOut(duration: 0.28)) {
-                activeScreen = .details(id: id, type: type)
+            if url.host == "continue-watching",
+               let item = ContinueWatchingStore.item(for: id) {
+                resumePlayback(item)
+            } else {
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .details(id: id, type: type)
+                }
             }
+        }
+    }
+
+    /// A Top Shelf action can launch the app before authentication/profile
+    /// routing has finished. Preserve it through that gate, then consume it on
+    /// the next main-actor turn after the active profile has been installed.
+    private func resumePendingDeepLinkIfPossible() {
+        guard pendingDeepLinkURL != nil else { return }
+        Task { @MainActor in
+            await Task.yield()
+            guard let url = pendingDeepLinkURL else { return }
+            pendingDeepLinkURL = nil
+            handleDeepLink(url)
         }
     }
 

@@ -86,7 +86,7 @@ Required invariants:
 - An empty local avatar is omitted from the RPC payload; it must never be sent as `null`, which clears the remote avatar.
 - Applying pulled profiles returns a verified result and falls back to the actual remote list in memory if profile-file persistence is unavailable.
 - A failed/cancelled delayed task must re-check cancellation and initial-pull completion before uploading snapshots.
-- `ContinueWatchingStore.persist` returns success only after verified storage. Application Support is preferred, with a marked and verified UserDefaults fallback for device-specific filesystem failures.
+- `ContinueWatchingStore.persist` returns success only after verified storage. Application Support is preferred, with a verified file-backed Caches fallback for device-specific filesystem failures. Never write a large synced progress payload to UserDefaults: tvOS 27 aborts the process when the preferences domain becomes oversized.
 - A failed progress merge counts as an incomplete account pull and retries; it must never silently release uploads as if persistence succeeded.
 - Non-finite Cinemeta ratings normalize to `nil`, and the progress encoder/decoder also handles non-conforming floats defensively.
 - Failed migrations retain their original data. Corrupt payloads remain available to the Home debug panel instead of being deleted before inspection.
@@ -124,5 +124,21 @@ MoltenVK/libplacebo's PBO frame upload path (`pl_tex_upload_pbo`). This is a
 simulator-only renderer issue; the physical Apple TV uses the normal Vulkan
 path. In `targetEnvironment(simulator)` only, use VideoToolbox-to-Metal
 interop (`vulkan-disable-interop=no`), a 64 MiB/16 MiB cache, and disable HDR
-peak analysis. Keep the physical-device renderer and user cache settings
-unchanged.
+peak analysis. AV1 is not VideoToolbox-decoded in the simulator, so filter
+AV1-labeled streams from selection and reject an unlabeled AV1 stream once its
+actual codec is known. Keep the physical-device renderer, codecs, and user
+cache settings unchanged.
+
+## Beta release workflow
+
+Last verified: Beta 2.8 on 2026-07-13.
+
+1. Confirm `main` and `origin/main` are aligned, inspect the latest `tvos-beta-*` tag, and preserve unrelated dirty files.
+2. Bump `CFBundleShortVersionString` and `CFBundleVersion` in both `tvosApp/NuvioTV/Info.plist` and `tvosApp/TopShelf/Info.plist`.
+3. Update the Latest tvOS Beta section in `README.md` and add `release/tvos-beta-X.Y.md` with Fixed and improved plus Known issues.
+4. Build from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`, Release, generic tvOS destination, with signing disabled. The published MPVKit binary lacks the required tvOS slices on this machine, so temporarily point Libplacebo, FFmpeg, and Libmpv binary targets in `MPVKit/Package.swift` at `dist/release/xcframework/*.xcframework`; restore the manifest exactly after the archive succeeds.
+5. Xcode 27 beta can crash in Release optimization for `AddonManifest.supportsResource`; keep its targeted `@_optimize(none)` workaround and archive with `SWIFT_ENABLE_BATCH_MODE=NO`.
+6. Package `NuvioTV.app` inside `Payload/` as `artifacts/NuvioTV-X.Y-unsigned-release.ipa` and verify the ZIP, app/Top Shelf version and build, arm64 executable, unsigned status, byte size, and SHA-256.
+7. Stage only the intended source, version, notes, archive, IPA, and requested memory changes. Do not stage unrelated `.DS_Store` changes. Commit as `Release tvOS beta X.Y`.
+8. Create annotated tag `tvos-beta-X.Y`, push `main` and the tag, then create a non-draft, non-prerelease GitHub release named `Beta X.Y` and mark it latest.
+9. Upload the IPA asset as `NuvioTV-X.Y-unsigned.ipa`. Verify the public release API reports the correct tag, uploaded asset size/digest, and that remote `main` plus the peeled tag point to the release commit.

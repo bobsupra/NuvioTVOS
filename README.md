@@ -25,24 +25,21 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 2.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.7) (build 36) is the current tvOS release. Download the unsigned IPA here:
+[Beta 2.8](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.8) (build 37) is the current tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-2.7-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.7/NuvioTV-2.7-unsigned.ipa)
+[NuvioTV-2.8-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.8/NuvioTV-2.8-unsigned.ipa)
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
-Beta 2.7 focuses on faster resume playback, cross-device add-on sync, and complete subtitle discovery:
+Beta 2.8 focuses on reliable account recovery, Apple TV Top Shelf playback, and player restoration after switching apps:
 
-- Continue Watching cards now start the last stream directly; URL-less synced and Next Up entries resolve a stream without an extra Details-screen step.
-- Account changes and newly installed add-ons refresh when tvOS returns to the foreground, and manually entered add-on URLs sync immediately.
-- Installed Stremio subtitle add-ons such as SubMaker are discovered alongside OpenSubtitles.
-- Subtitle providers load progressively after playback starts, including resumed playback and streams selected before the player finishes loading.
-- Preferred subtitle and audio languages appear first while every remaining language stays available below them.
-- Text subtitles now honor the app's bottom position instead of embedded ASS/SSA top-alignment tags.
-- BetterPosters and other poster-only catalogs now produce correctly cropped Home backdrops.
-- The Apple TV Simulator avoids unsupported AV1 streams instead of crashing its Metal renderer.
+- Large synced Continue Watching payloads no longer crash tvOS by falling back to oversized UserDefaults storage; progress remains file-backed and sync fails safely if storage is unavailable.
+- Continue Watching is republished to Apple TV Top Shelf whenever the active profile loads, restoring the row after an update or signing change.
+- Top Shelf Continue Watching cards start playback directly, including URL-less synced and Next Up entries, and preserve the action through cold launch/profile selection.
+- Returning after watching another tvOS app restores the last verified player position instead of accepting MPV's transient jump to the final frame.
+- Player restoration preserves whether playback was playing or manually paused before the app switch.
 
-Known issues include a no-audio report on one sideloaded Apple TV setup and an account-specific sync crash after installing several add-ons. Both need affected-device diagnostics. Premiumize QR linking also remains unavailable until a production OAuth client ID is configured.
+Known issues include a no-audio report on one sideloaded Apple TV setup. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 
 ## About
 
