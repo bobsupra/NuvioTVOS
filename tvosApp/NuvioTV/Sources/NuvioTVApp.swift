@@ -50,6 +50,7 @@ enum TVTab: String, CaseIterable, Identifiable {
 
 /// Main content view - entry point for the app with screen routing
 struct ContentView: View {
+    @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
     @State private var resolvedInitialScreen = false
     // Holds the who's-watching screen back until the post-sign-in profile pull
@@ -64,6 +65,10 @@ struct ContentView: View {
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
     /// card). Presented as an overlay over the tab view, like Details/Player.
     @State private var cardMenuMeta: NuvioMeta?
+    /// URL-less Continue Watching entries (for example synced progress or Next
+    /// Up) resolve their stream in place instead of opening Details first.
+    @State private var isResolvingContinueWatchingStream = false
+    @State private var continueWatchingPlaybackTask: Task<Void, Never>?
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
@@ -206,6 +211,11 @@ struct ContentView: View {
         .onReceive(profileViewModel.$activeProfile) { profile in
             syncManager.activeProfileChanged(profile)
         }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                syncManager.refreshAccountFromForeground()
+            }
+        }
     }
 
     /// Whether Details, Player, or the card quick-actions menu is currently
@@ -219,6 +229,7 @@ struct ContentView: View {
     }
 
     private var isOverlayPresented: Bool {
+        if isResolvingContinueWatchingStream { return true }
         if cardMenuMeta != nil { return true }
         return fullScreenOverlayPresented
     }
@@ -227,6 +238,7 @@ struct ContentView: View {
     /// them. The card quick-actions menu is deliberately excluded — it keeps Home
     /// visible behind its glass panel.
     private var fullScreenOverlayPresented: Bool {
+        if isResolvingContinueWatchingStream { return true }
         switch activeScreen {
         case .details, .player, .cloudLibrary: return true
         default: return false
@@ -238,6 +250,12 @@ struct ContentView: View {
     /// Used only by the root Menu-button safety net; changing `activeScreen`
     /// tears the overlay down, so Player's `onDisappear` cleanup still runs.
     private func dismissOverlay() {
+        if isResolvingContinueWatchingStream {
+            continueWatchingPlaybackTask?.cancel()
+            continueWatchingPlaybackTask = nil
+            isResolvingContinueWatchingStream = false
+            return
+        }
         if cardMenuMeta != nil {
             withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
             return
@@ -295,12 +313,81 @@ struct ContentView: View {
         let sorted = videos.sorted {
             (seasonSortKey($0.season), $0.episode) < (seasonSortKey($1.season), $1.episode)
         }
-        let current = sorted.first { $0.season == item.season && $0.episode == item.episode }
+        let numbers = item.episodeNumbers
+        let current = sorted.first { $0.season == numbers?.season && $0.episode == numbers?.episode }
         return (sorted, current)
     }
 
     private static func seasonSortKey(_ season: Int) -> Int {
         season <= 0 ? Int.max : season
+    }
+
+    /// Starts a Continue Watching card immediately. Locally played entries use
+    /// their last stream URL; synced and Next Up entries fetch and smart-select
+    /// a stream in the background without opening Details first.
+    private func resumePlayback(_ item: ContinueWatchingItem) {
+        continueWatchingPlaybackTask?.cancel()
+        continueWatchingPlaybackTask = nil
+        isResolvingContinueWatchingStream = false
+
+        let context = Self.episodeContext(for: item)
+        playbackEpisodes = context.episodes
+        playbackCurrentEpisode = context.current
+
+        let streamUrl = item.streamUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !streamUrl.isEmpty, let url = URL(string: streamUrl) {
+            presentPlayback(
+                url: url,
+                meta: item.meta,
+                subtitle: item.episodeSubtitle ?? "",
+                externalSubtitles: [],
+                resumeFrom: item.resumePosition
+            )
+            return
+        }
+
+        isResolvingContinueWatchingStream = true
+        let profileId = profileViewModel.activeProfile?.id
+        continueWatchingPlaybackTask = Task {
+            let prepared: PreparedNextStream?
+            if let episode = context.current {
+                prepared = await Self.resolveNextEpisodeStream(episode: episode, profileId: profileId)
+            } else if item.meta.isSeries, let numbers = item.episodeNumbers {
+                prepared = await Self.resolveStream(
+                    contentId: "\(item.meta.id):\(numbers.season):\(numbers.episode)",
+                    type: "series",
+                    subtitleLine: item.episodeSubtitle ?? "",
+                    profileId: profileId
+                )
+            } else {
+                prepared = await Self.resolveStream(
+                    contentId: item.meta.id,
+                    type: item.meta.type,
+                    subtitleLine: item.episodeSubtitle ?? "",
+                    profileId: profileId
+                )
+            }
+
+            guard !Task.isCancelled else { return }
+            isResolvingContinueWatchingStream = false
+            continueWatchingPlaybackTask = nil
+
+            if let prepared {
+                presentPlayback(
+                    url: prepared.url,
+                    meta: item.meta,
+                    subtitle: prepared.subtitleLine,
+                    externalSubtitles: prepared.subtitles,
+                    resumeFrom: item.resumePosition
+                )
+            } else {
+                // Keep the manual picker available when no add-on returns a
+                // playable stream automatically.
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .details(id: item.meta.id, type: item.meta.type)
+                }
+            }
+        }
     }
 
     private func presentPlayback(
@@ -402,6 +489,12 @@ struct ContentView: View {
                     .zIndex(1)
             }
 
+            if isResolvingContinueWatchingStream {
+                ContinueWatchingPlaybackLoadingView()
+                    .transition(.opacity)
+                    .zIndex(3)
+            }
+
             if let menuMeta = cardMenuMeta {
                 CardActionMenuOverlay(
                     meta: menuMeta,
@@ -477,27 +570,7 @@ struct ContentView: View {
                 }
             },
             onResumePlayback: { item in
-                let streamUrl = item.streamUrl.trimmingCharacters(in: .whitespacesAndNewlines)
-                if !streamUrl.isEmpty, let url = URL(string: streamUrl) {
-                    // Carry episode context so the player can offer the next
-                    // episode when resuming straight from Home.
-                    let context = Self.episodeContext(for: item)
-                    playbackEpisodes = context.episodes
-                    playbackCurrentEpisode = context.current
-                    presentPlayback(
-                        url: url,
-                        meta: item.meta,
-                        // Rebuild the episode line so the player header shows it
-                        // and progress saves keep the episode identity.
-                        subtitle: item.episodeSubtitle ?? "",
-                        externalSubtitles: [],
-                        resumeFrom: item.resumePosition
-                    )
-                } else {
-                    withAnimation(.easeInOut(duration: 0.28)) {
-                        activeScreen = .details(id: item.meta.id, type: item.meta.type)
-                    }
-                }
+                resumePlayback(item)
             },
             onLongPressCard: { meta in
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -667,6 +740,26 @@ struct ContentView: View {
     }
 }
 
+/// Brief full-screen state while a URL-less Continue Watching entry finds its
+/// preferred stream. Keeping this outside Details avoids an extra focus stop.
+private struct ContinueWatchingPlaybackLoadingView: View {
+    var body: some View {
+        VStack(spacing: 24) {
+            ProgressView()
+                .progressViewStyle(.circular)
+                .tint(.white)
+                .scaleEffect(1.5)
+
+            Text("Finding your stream")
+                .font(.custom("Inter-Bold", size: 36))
+                .foregroundColor(.white)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.ignoresSafeArea())
+        .focusable()
+    }
+}
+
 /// Shown between login and who's-watching while the first account pull is in
 /// flight, so profile names arrive before the selection grid renders.
 private struct AccountSyncWaitView: View {
@@ -723,21 +816,29 @@ private struct CrossfadingBackdrop: View {
     @State private var imageOpacity = 1.0
 
     var body: some View {
-        ZStack {
-            placeholder
-            if let outgoingImage {
-                Image(uiImage: outgoingImage)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .opacity(outgoingOpacity)
+        GeometryReader { proxy in
+            ZStack {
+                placeholder
+                if let outgoingImage {
+                    Image(uiImage: outgoingImage)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .opacity(outgoingOpacity)
+                }
+                if let image {
+                    Image(uiImage: image)
+                        .resizable()
+                        .aspectRatio(contentMode: .fill)
+                        .frame(width: proxy.size.width, height: proxy.size.height)
+                        .opacity(imageOpacity)
+                        .id(loadedURL)
+                }
             }
-            if let image {
-                Image(uiImage: image)
-                    .resizable()
-                    .aspectRatio(contentMode: .fill)
-                    .opacity(imageOpacity)
-                    .id(loadedURL)
-            }
+            // Portrait poster fallbacks must be cropped inside the screen, not
+            // enlarge the root Home layout and let tvOS pan the hero offscreen.
+            .frame(width: proxy.size.width, height: proxy.size.height)
+            .clipped()
         }
         .task(id: url) {
             guard let url, url != loadedURL, let imageURL = URL(string: url) else {
@@ -746,7 +847,9 @@ private struct CrossfadingBackdrop: View {
                 return
             }
             guard let loaded = await BackdropImageCache.shared.image(for: imageURL) else { return }
-            guard loaded.size.width > loaded.size.height else { return }
+            // Some catalog add-ons (including BetterPosters) only provide a
+            // poster URL. PosterCard uses that same image for its landscape
+            // state, so allow the full-screen aspect-fill to use it as well.
             // `.task(id:)` cancels when `url` changes, so reaching here means this
             // URL is still the focused one. Cancellation leaves the old image up.
             guard !Task.isCancelled else { return }
@@ -1589,8 +1692,9 @@ struct TVHomeView: View {
     /// same transaction as focus, matching a TV lazy list's working set.
     private func shouldMaterializeHomeRow(_ index: Int, sectionId: String, total: Int) -> Bool {
         guard total > 0 else { return false }
-        let lower = max(0, focusedRowIndex - 1)
-        let upper = min(total - 1, focusedRowIndex + 1)
+        let clampedFocusedRowIndex = min(max(focusedRowIndex, 0), total - 1)
+        let lower = max(0, clampedFocusedRowIndex - 1)
+        let upper = min(total - 1, clampedFocusedRowIndex + 1)
         if (lower...upper).contains(index) { return true }
 
         // A restored focus target can be outside the initial row window.
@@ -1663,12 +1767,16 @@ struct TVHomeView: View {
     }
 
     private func preferredBackdropURL(for meta: NuvioMeta?) -> String? {
-        guard let background = meta?.backgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !background.isEmpty,
-              background != meta?.posterUrl else {
-            return nil
+        guard let meta else { return nil }
+
+        // Match PosterCard's landscape artwork selection. BetterPosters catalog
+        // entries intentionally contain `poster` without `background`; falling
+        // back here keeps the focused card and the Home backdrop in sync.
+        for candidate in [meta.backgroundUrl, meta.posterUrl] {
+            let url = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !url.isEmpty { return url }
         }
-        return background
+        return nil
     }
 
     private func isVisible(_ meta: NuvioMeta) -> Bool {

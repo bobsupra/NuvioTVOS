@@ -723,49 +723,46 @@ struct PlayerSettingsPanel: View {
     }
 
     private var visibleOptions: [SubtitlePanelOption] {
-        // Snapshot both inputs once. Reading either computed property from the
-        // filter closure rebuilt the full option list / profile preferences for
-        // every subtitle row.
-        let options = allOptions
-        let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
-        guard SubtitleLanguagePreferences.smartMatchingEnabled(),
-              !preferredLanguages.isEmpty else { return options }
-        return options.filter { option in
-            preferredLanguages.contains { language in
-                optionMatches(option, language: language)
-            }
-        }
+        // Smart matching chooses/preloads preferred tracks; it must not hide
+        // other languages from the manual player Settings browser.
+        allOptions
     }
 
-    private func optionMatches(_ option: SubtitlePanelOption, language: String) -> Bool {
-        SubtitleLanguagePreferences.matches(option.language, target: language) ||
-        SubtitleLanguagePreferences.matches(option.title, target: language) ||
-        SubtitleLanguagePreferences.matches(option.detail, target: language)
-    }
-
-    /// Language groups for the left column: ones carrying a built-in track
-    /// first (they're the likeliest pick), then alphabetical.
-    private var languages: [(name: String, count: Int, hasBuiltIn: Bool)] {
+    /// Language groups for the left column: the user's preferred subtitle
+    /// languages in saved priority order, then every other language alphabetically.
+    private var languages: [(name: String, count: Int)] {
         languageGroups(in: visibleOptions)
     }
 
     private func languageGroups(
         in options: [SubtitlePanelOption]
-    ) -> [(name: String, count: Int, hasBuiltIn: Bool)] {
+    ) -> [(name: String, count: Int)] {
         var order: [String] = []
         var counts: [String: Int] = [:]
-        var builtIn: Set<String> = []
         for option in options {
             if counts[option.language] == nil { order.append(option.language) }
             counts[option.language, default: 0] += 1
-            if case .track(let track) = option.kind, track.externalFilename.isEmpty {
-                builtIn.insert(option.language)
-            }
         }
+        let preferredLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         return order
-            .map { (name: $0, count: counts[$0] ?? 0, hasBuiltIn: builtIn.contains($0)) }
+            .map { (name: $0, count: counts[$0] ?? 0) }
             .sorted { lhs, rhs in
-                if lhs.hasBuiltIn != rhs.hasBuiltIn { return lhs.hasBuiltIn }
+                let lhsRank = preferredLanguages.firstIndex {
+                    SubtitleLanguagePreferences.matches(lhs.name, target: $0)
+                }
+                let rhsRank = preferredLanguages.firstIndex {
+                    SubtitleLanguagePreferences.matches(rhs.name, target: $0)
+                }
+                switch (lhsRank, rhsRank) {
+                case let (left?, right?) where left != right:
+                    return left < right
+                case (_?, nil):
+                    return true
+                case (nil, _?):
+                    return false
+                default:
+                    break
+                }
                 return lhs.name.localizedCaseInsensitiveCompare(rhs.name) == .orderedAscending
             }
     }
@@ -863,6 +860,16 @@ struct PlayerSettingsPanel: View {
         let options = optionsSnapshot.filter { $0.language == language }
         return VStack(alignment: .leading, spacing: 18) {
             columnHeader("Subtitles")
+            if viewModel.isLoadingExternalSubtitles {
+                HStack(spacing: 12) {
+                    ProgressView()
+                        .progressViewStyle(.circular)
+                        .tint(.white)
+                    Text("Fetching add-on subtitles…")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+            }
             if options.isEmpty {
                 Text("No subtitles available")
                     .font(.system(size: 23, weight: .medium))
@@ -1122,7 +1129,7 @@ struct PlayerSettingsPanel: View {
             } else {
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 14) {
-                        ForEach(viewModel.audioTracks) { track in
+                        ForEach(orderedAudioTracks) { track in
                             audioTrackCard(track)
                         }
                     }
@@ -1132,6 +1139,31 @@ struct PlayerSettingsPanel: View {
             }
         }
         .frame(width: 840, alignment: .leading)
+    }
+
+    /// Preferred audio first, followed by the remaining languages
+    /// alphabetically. Preserve the stream's original order within a language
+    /// so commentary/Atmos/stereo variants do not jump around unexpectedly.
+    private var orderedAudioTracks: [AudioTrack] {
+        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage()
+        return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
+            let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
+            let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false
+            if lhsPreferred != rhsPreferred { return lhsPreferred }
+
+            let lhsLanguage = lhs.element.languageName.isEmpty ? lhs.element.name : lhs.element.languageName
+            let rhsLanguage = rhs.element.languageName.isEmpty ? rhs.element.name : rhs.element.languageName
+            let comparison = lhsLanguage.localizedCaseInsensitiveCompare(rhsLanguage)
+            if comparison != .orderedSame { return comparison == .orderedAscending }
+            return lhs.offset < rhs.offset
+        }
+        .map(\.element)
+    }
+
+    private func audioTrack(_ track: AudioTrack, matches language: String) -> Bool {
+        SubtitleLanguagePreferences.matches(track.language, target: language) ||
+        SubtitleLanguagePreferences.matches(track.languageName, target: language) ||
+        SubtitleLanguagePreferences.matches(track.name, target: language)
     }
 
     private func audioTrackCard(_ track: AudioTrack) -> some View {

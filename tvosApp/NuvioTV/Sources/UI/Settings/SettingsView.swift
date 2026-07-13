@@ -2506,17 +2506,19 @@ private struct AddonsSettingsSection: View {
     @AppStorage(SettingsKey.streamAddonManifestURL) private var streamAddonManifestURL = ""
     @AppStorage(SettingsKey.streamAddonManifestURLs) private var streamAddonManifestURLs = ""
     @AppStorage(SettingsKey.streamAddonManifestStates) private var streamAddonManifestStates = ""
+    @State private var addonURLInput = ""
     @State private var addons: [AddonItem] = AddonItem.defaults
     @State private var syncedAddons: [SyncedAddon] = []
 
     var body: some View {
-        SettingsGroup(title: "Add-ons", subtitle: "Stremio-compatible catalog and stream sources") {
+        SettingsGroup(title: "Add-ons", subtitle: "Stremio-compatible catalogs, streams, and subtitles") {
             SettingsTextFieldRow(
-                title: "Stream Add-on URL",
+                title: "Add-on URL",
                 subtitle: "Paste your configured Stremio manifest link",
                 placeholder: "https://.../manifest.json",
-                text: $streamAddonManifestURL,
-                fieldWidth: 560
+                text: $addonURLInput,
+                fieldWidth: 560,
+                onCommit: addAddonFromInput
             )
             .settingsEntryAnchor()
 
@@ -2558,6 +2560,29 @@ private struct AddonsSettingsSection: View {
         guard syncedAddons.indices.contains(index) else { return }
         syncedAddons[index].isEnabled = isEnabled
         persistSyncedAddons()
+    }
+
+    /// Finalizing the URL field is an add operation, not just a local settings
+    /// edit. Canonicalize the complete list and notify sync immediately so the
+    /// new add-on reaches the user's other devices.
+    private func addAddonFromInput() {
+        guard let url = CinemetaCatalogRepository.normalizedManifestURL(from: addonURLInput) else { return }
+        var preferences = CinemetaCatalogRepository.configuredStreamAddonPreferences
+        if let index = preferences.firstIndex(where: { $0.url == url.absoluteString }) {
+            preferences[index].enabled = true
+        } else {
+            preferences.append(StreamAddonPreference(url: url.absoluteString, enabled: true))
+        }
+
+        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences)
+        streamAddonManifestURL = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURL) ?? ""
+        streamAddonManifestURLs = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURLs) ?? ""
+        streamAddonManifestStates = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestStates) ?? ""
+        addonURLInput = ""
+        NotificationCenter.default.post(
+            name: NuvioSyncManager.addonOrderChangedNotification,
+            object: preferences
+        )
     }
 
     private func persistSyncedAddons() {
@@ -3513,6 +3538,7 @@ private struct SettingsTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
     @State private var isEditing = false
@@ -3536,7 +3562,8 @@ private struct SettingsTextFieldRow: View {
                     isSecure: isSecure,
                     focused: isFocused,
                     isEditing: $isEditing,
-                    fieldWidth: fieldWidth
+                    fieldWidth: fieldWidth,
+                    onCommit: onCommit
                 )
             }
         }
@@ -3558,10 +3585,16 @@ private struct SettingsGlassTextField: View {
     var focused: Bool
     @Binding var isEditing: Bool
     var fieldWidth: CGFloat = 300
+    var onCommit: () -> Void = {}
 
     var body: some View {
         ZStack(alignment: .leading) {
-            HiddenSettingsTextField(text: $text, isEditing: $isEditing, isSecure: isSecure)
+            HiddenSettingsTextField(
+                text: $text,
+                isEditing: $isEditing,
+                isSecure: isSecure,
+                onCommit: onCommit
+            )
                 .frame(width: 1, height: 1)
                 .offset(x: -4_000)
                 .allowsHitTesting(false)
@@ -3587,6 +3620,7 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
     var isSecure: Bool = false
+    var onCommit: () -> Void = {}
 
     func makeUIView(context: Context) -> HiddenSettingsUITextField {
         let textField = HiddenSettingsUITextField(frame: .zero)
@@ -3622,16 +3656,18 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
     }
 
     func makeCoordinator() -> Coordinator {
-        Coordinator(text: $text, isEditing: $isEditing)
+        Coordinator(text: $text, isEditing: $isEditing, onCommit: onCommit)
     }
 
     final class Coordinator: NSObject, UITextFieldDelegate {
         private let text: Binding<String>
         private let isEditing: Binding<Bool>
+        private let onCommit: () -> Void
 
-        init(text: Binding<String>, isEditing: Binding<Bool>) {
+        init(text: Binding<String>, isEditing: Binding<Bool>, onCommit: @escaping () -> Void) {
             self.text = text
             self.isEditing = isEditing
+            self.onCommit = onCommit
         }
 
         @objc func textDidChange(_ sender: UITextField) {
@@ -3641,6 +3677,7 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
         func textFieldShouldReturn(_ textField: UITextField) -> Bool {
             isEditing.wrappedValue = false
             textField.resignFirstResponder()
+            onCommit()
             return true
         }
 

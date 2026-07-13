@@ -26,6 +26,11 @@ protocol CatalogRepository {
     /// Get available streams for content
     func getStreams(id: String, type: String) async throws -> [NuvioStream]
 
+    /// Fetch subtitle add-ons independently from streams. The player uses this
+    /// after it opens so resume playback and early stream picks can keep filling
+    /// an already-visible subtitle panel as slower providers finish.
+    func subtitlesProgressively(id: String, type: String) -> AsyncStream<[NuvioSubtitle]>
+
     /// Progressive variant of `getStreams`: yields the accumulated stream list
     /// each time another add-on returns, so the picker can show the first
     /// add-on's results immediately and keep filling in the rest as they land
@@ -84,6 +89,12 @@ extension CatalogRepository {
             continuation.onTermination = { _ in task.cancel() }
         }
     }
+
+    func subtitlesProgressively(id: String, type: String) -> AsyncStream<[NuvioSubtitle]> {
+        AsyncStream { continuation in
+            continuation.finish()
+        }
+    }
 }
 
 /// One selectable add-on catalog, offered by the Collections editor when
@@ -107,7 +118,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private var cachedMetaById: [String: NuvioMeta] = [:]
-    private let subtitleAddons = [
+    private let builtInSubtitleAddons = [
         StremioSubtitleAddon(
             name: "OpenSubtitles v3",
             manifestURL: URL(string: "https://opensubtitles-v3.strem.io/manifest.json")!
@@ -449,17 +460,18 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         guard !addonStreams.isEmpty else { return [Self.sampleStream] }
-        let addonSubtitles = await fetchSubtitleAddons(id: id, type: type)
+        let subtitleAddons = await configuredSubtitleAddons(id: id, type: type)
+        let addonSubtitles = await fetchSubtitleAddons(id: id, type: type, addons: subtitleAddons)
         return Self.decorate(addonStreams, with: addonSubtitles)
     }
 
     func streamsProgressively(id: String, type: String) -> AsyncStream<[NuvioStream]> {
-        let subtitleAddons = self.subtitleAddons
         let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
 
         return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
             let task = Task {
                 let addons = await self.configuredAddons(supporting: "stream", type: type, id: id)
+                let subtitleAddons = await self.configuredSubtitleAddons(id: id, type: type)
                 var accumulated: [NuvioStream] = []
                 var subtitles: [NuvioSubtitle] = []
 
@@ -498,6 +510,33 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 // the picker never dead-ends on "No playable streams found".
                 if !Task.isCancelled && accumulated.isEmpty {
                     continuation.yield([Self.sampleStream])
+                }
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    func subtitlesProgressively(id: String, type: String) -> AsyncStream<[NuvioSubtitle]> {
+        let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
+
+        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                let addons = await self.configuredSubtitleAddons(id: id, type: type)
+                var accumulated: [NuvioSubtitle] = []
+
+                await withTaskGroup(of: [NuvioSubtitle].self) { group in
+                    for addon in addons {
+                        let url = addon.subtitleURL(type: subtitleType, id: id)
+                        let name = addon.name
+                        group.addTask { await Self.fetchSubtitles(from: url, source: name) }
+                    }
+
+                    for await subtitles in group {
+                        guard !Task.isCancelled else { break }
+                        accumulated = Self.mergedSubtitles(accumulated, subtitles)
+                        continuation.yield(accumulated)
+                    }
                 }
                 continuation.finish()
             }
@@ -564,7 +603,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
     private static func fetchSubtitles(from url: URL, source: String) async -> [NuvioSubtitle] {
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            var request = URLRequest(url: url)
+            request.timeoutInterval = 15
+            let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else { return [] }
             let decoded = try JSONDecoder().decode(StremioSubtitleResponse.self, from: data)
             return decoded.subtitles.compactMap { $0.toNuvioSubtitle(source: source) }
@@ -596,11 +637,36 @@ final class CinemetaCatalogRepository: CatalogRepository {
         addonName: "Nuvio Sample"
     )
 
-    private func fetchSubtitleAddons(id: String, type: String) async -> [NuvioSubtitle] {
+    /// Built-in subtitles plus every enabled installed add-on whose manifest
+    /// advertises the Stremio `subtitles` resource.
+    private func configuredSubtitleAddons(id: String, type: String) async -> [StremioSubtitleAddon] {
+        let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
+        var addons = builtInSubtitleAddons
+        var seenURLs = Set(addons.map(\.manifestURL))
+
+        for manifestURL in Self.configuredStreamAddonManifestURLs {
+            guard seenURLs.insert(manifestURL).inserted,
+                  let manifest = await manifest(for: manifestURL),
+                  manifest.supportsResource("subtitles", type: subtitleType, id: id) else { continue }
+            addons.append(
+                StremioSubtitleAddon(
+                    name: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
+                    manifestURL: manifestURL
+                )
+            )
+        }
+        return addons
+    }
+
+    private func fetchSubtitleAddons(
+        id: String,
+        type: String,
+        addons: [StremioSubtitleAddon]
+    ) async -> [NuvioSubtitle] {
         let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
         var subtitles: [NuvioSubtitle] = []
 
-        for addon in subtitleAddons {
+        for addon in addons {
             do {
                 let response: StremioSubtitleResponse = try await fetch(addon.subtitleURL(type: subtitleType, id: id))
                 subtitles += response.subtitles.compactMap { $0.toNuvioSubtitle(source: addon.name) }
@@ -829,6 +895,8 @@ private struct AddonManifest: Decodable {
         name?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
     }
 
+    // Work around an Xcode 27 beta LICM optimizer crash in this small manifest loop.
+    @_optimize(none)
     func supportsResource(_ name: String, type: String, id: String) -> Bool {
         guard let resources, !resources.isEmpty else { return false }
         let fallbackTypes = types ?? []

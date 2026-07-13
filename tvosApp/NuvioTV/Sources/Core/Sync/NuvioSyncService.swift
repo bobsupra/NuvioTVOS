@@ -196,6 +196,15 @@ final class NuvioSyncManager: ObservableObject {
         schedulePull()
     }
 
+    /// Refresh cross-device changes whenever tvOS returns to the foreground.
+    /// Startup already owns its initial pull, so only refresh an account/profile
+    /// whose bootstrap completed and never replace an in-flight pull.
+    func refreshAccountFromForeground() {
+        guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
+        guard pullTask == nil else { return }
+        schedulePull(force: true)
+    }
+
     /// Retries the complete account bootstrap, not just the profile list. This
     /// is the same operation a profile switch used to trigger accidentally.
     func retryInitialAccountPull() {
@@ -1487,7 +1496,7 @@ fileprivate final class SupabaseSyncClient {
                 ContinueWatchingItem(
                     meta: meta,
                     // A rolled-over entry must not reuse the finished episode's
-                    // stream URL; empty routes the click to the Details screen.
+                    // stream URL; empty forces Home to resolve the new episode.
                     streamUrl: finished ? "" : (existing?.streamUrl ?? ""),
                     position: position,
                     duration: duration,

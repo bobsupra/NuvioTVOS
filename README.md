@@ -25,22 +25,24 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.6) (build 35) is the current tvOS release. Download the unsigned IPA here:
+[Beta 2.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.7) (build 36) is the current tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-2.6-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.6/NuvioTV-2.6-unsigned.ipa)
+[NuvioTV-2.7-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.7/NuvioTV-2.7-unsigned.ipa)
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
-Beta 2.6 focuses on reliable Apple TV sync, playback, and settings:
+Beta 2.7 focuses on faster resume playback, cross-device add-on sync, and complete subtitle discovery:
 
-- Account and profile sync now retains the correct profile and refreshes Home after login.
-- Continue Watching sync and resume handling are fixed for physical Apple TV, including app backgrounding and return.
-- Player settings have smoother focus behavior and a Liquid Glass treatment for the Subtitles, Audio, and Speed tabs.
-- Preferred audio and subtitle languages support unrestricted selections, with System as the default.
-- TorBox can be linked from Settings with a TV QR code; Premiumize device sign-in is ready once its production OAuth client ID is configured.
-- HDR display-matching detection, Home/details focus restoration, and player metadata diagnostics have been improved.
+- Continue Watching cards now start the last stream directly; URL-less synced and Next Up entries resolve a stream without an extra Details-screen step.
+- Account changes and newly installed add-ons refresh when tvOS returns to the foreground, and manually entered add-on URLs sync immediately.
+- Installed Stremio subtitle add-ons such as SubMaker are discovered alongside OpenSubtitles.
+- Subtitle providers load progressively after playback starts, including resumed playback and streams selected before the player finishes loading.
+- Preferred subtitle and audio languages appear first while every remaining language stays available below them.
+- Text subtitles now honor the app's bottom position instead of embedded ASS/SSA top-alignment tags.
+- BetterPosters and other poster-only catalogs now produce correctly cropped Home backdrops.
+- The Apple TV Simulator avoids unsupported AV1 streams instead of crashing its Metal renderer.
 
-Known limitation: Premiumize QR linking is not enabled in this build until a production OAuth client ID is configured.
+Known issues include a no-audio report on one sideloaded Apple TV setup and an account-specific sync crash after installing several add-ons. Both need affected-device diagnostics. Premiumize QR linking also remains unavailable until a production OAuth client ID is configured.
 
 ## About
 

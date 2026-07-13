@@ -177,6 +177,12 @@ struct PlayerView: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             viewModel.load(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
+            if subtitle != PlaybackMarkers.trailerSubtitle {
+                viewModel.fetchExternalSubtitles(
+                    contentId: subtitleContentId,
+                    type: meta.isSeries ? "series" : meta.type
+                )
+            }
             viewModel.reloadCurrentStream = reloadCurrentStream
             if let resolveNextStream {
                 viewModel.configureNextEpisode(
@@ -257,6 +263,14 @@ struct PlayerView: View {
             remoteInputFocused = false
             onBack()
         }
+    }
+
+    private var subtitleContentId: String {
+        if let currentEpisode { return currentEpisode.id }
+        if meta.isSeries, let numbers = EpisodeTagResolver.episodeNumbers(in: subtitle) {
+            return "\(meta.id):\(numbers.season):\(numbers.episode)"
+        }
+        return meta.id
     }
 
     private func focusRemoteInput() {

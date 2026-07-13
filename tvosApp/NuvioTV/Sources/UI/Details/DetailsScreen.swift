@@ -949,11 +949,12 @@ enum SmartPlaybackSelector {
             if includeDebrid, stream.isDebridResolvable { return (index, stream) }
             return nil
         }
-        let candidates = playable.filter { !isPromotionalStream($0.stream) }
-        if qualityPreference == "Highest", let firstCandidate = (candidates.isEmpty ? playable : candidates).first {
+        let compatible = playable.filter { isPlatformPlaybackCompatible($0.stream) }
+        let candidates = compatible.filter { !isPromotionalStream($0.stream) }
+        if qualityPreference == "Highest", let firstCandidate = (candidates.isEmpty ? compatible : candidates).first {
             return firstCandidate.stream
         }
-        let rankedStreams = (candidates.isEmpty ? playable : candidates).map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
+        let rankedStreams = (candidates.isEmpty ? compatible : candidates).map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
             let resolution = inferredResolution(for: stream)
             let subtitleScore = shouldMatchSubtitles ? subtitleScore(in: stream, languages: subtitleLanguages) : 0
             let qualityScore = score(resolution: resolution, preference: qualityPreference)
@@ -973,8 +974,9 @@ enum SmartPlaybackSelector {
             }
             return includeDebrid && stream.isDebridResolvable
         }
-        let nonPromotional = playable.filter { !isPromotionalStream($0) }
-        return nonPromotional.isEmpty ? playable : nonPromotional
+        let compatible = playable.filter(isPlatformPlaybackCompatible)
+        let nonPromotional = compatible.filter { !isPromotionalStream($0) }
+        return nonPromotional.isEmpty ? compatible : nonPromotional
     }
 
     static func matchingSubtitles(in stream: NuvioStream, languages: [String]) -> [NuvioSubtitle] {
@@ -1048,11 +1050,24 @@ enum SmartPlaybackSelector {
     }
 
     private static func searchableText(for stream: NuvioStream) -> String {
-        ([stream.name, stream.description, stream.addonName] +
+        ([stream.name, stream.description, stream.addonName, stream.filename] +
          stream.subtitles.flatMap { [$0.language, $0.label, $0.url] })
             .compactMap { $0 }
             .joined(separator: " ")
             .lowercased()
+    }
+
+    private static func isPlatformPlaybackCompatible(_ stream: NuvioStream) -> Bool {
+        #if targetEnvironment(simulator)
+        // AV1 falls back to software decoding in the tvOS simulator. Its
+        // decoded frames then use MoltenVK/libplacebo's PBO upload path, which
+        // MTLSimDriver can terminate as XPC API misuse. Prefer another stream;
+        // physical Apple TV keeps AV1 available through its real Metal driver.
+        let codecTokens = searchableText(for: stream).split { !$0.isLetter && !$0.isNumber }
+        return !codecTokens.contains(where: { $0 == "av1" || $0 == "av01" })
+        #else
+        return true
+        #endif
     }
 
 }

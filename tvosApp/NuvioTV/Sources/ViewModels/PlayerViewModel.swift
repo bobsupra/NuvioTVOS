@@ -38,6 +38,8 @@ class PlayerViewModel: ObservableObject {
     /// Every external subtitle the stream offered (all languages), browsable in
     /// the player's subtitle panel and loaded into mpv on demand.
     @Published var availableExternalSubtitles: [NuvioSubtitle] = []
+    /// True while installed subtitle add-ons are still returning results.
+    @Published var isLoadingExternalSubtitles: Bool = false
     /// Current mpv `sub-delay`, in milliseconds. Per-session, not persisted.
     @Published var subtitleDelayMs: Int = 0
     /// Current mpv `audio-delay`, in milliseconds. Per-session, not persisted.
@@ -112,6 +114,9 @@ class PlayerViewModel: ObservableObject {
     private var didApplyResume = false
     private var pendingExternalSubtitles: [NuvioSubtitle] = []
     private var didAddExternalSubtitles = false
+    private var addedExternalSubtitleURLs: Set<String> = []
+    private var pendingSelectedExternalSubtitleURL: String?
+    private var subtitleFetchTask: Task<Void, Never>?
     private var activeTrackSelectionKey: String?
     private var pendingTrackSelection: PlayerTrackSelection?
     private var didApplySavedAudioSelection = false
@@ -163,6 +168,7 @@ class PlayerViewModel: ObservableObject {
         let poll = pollTimer
         let hide = controlsHideTimer
         trailerResolveTask?.cancel()
+        subtitleFetchTask?.cancel()
         Task { @MainActor in
             poll?.invalidate()
             hide?.invalidate()
@@ -217,6 +223,9 @@ class PlayerViewModel: ObservableObject {
     /// advance, so both paths reset resume/track/subtitle state identically.
     private func applyStreamState(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle], resumeFrom: Double?) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
+        subtitleFetchTask?.cancel()
+        subtitleFetchTask = nil
+        isLoadingExternalSubtitles = false
         self.title = meta.name
         self.subtitle = subtitle
         self.status = .buffering
@@ -250,6 +259,8 @@ class PlayerViewModel: ObservableObject {
             availableExternalSubtitles: externalSubtitles
         )
         self.didAddExternalSubtitles = pendingExternalSubtitles.isEmpty
+        self.addedExternalSubtitleURLs = []
+        self.pendingSelectedExternalSubtitleURL = nil
         self.subtitleDelayMs = 0
         self.audioDelayMs = 0
         self.audioAmplificationDb = 0
@@ -264,6 +275,45 @@ class PlayerViewModel: ObservableObject {
         self.didApplyAudioPreference = false
         self.didApplySubtitlePreference = false
         loadSkipIntervalsIfNeeded(meta: meta, isTrailerPlayback: isTrailerPlayback)
+    }
+
+    /// Starts a subtitle-only refresh independent of stream resolution. Results
+    /// merge live into `availableExternalSubtitles`, so an already-open player
+    /// Settings panel updates without closing or restarting playback.
+    func fetchExternalSubtitles(contentId: String, type: String) {
+        subtitleFetchTask?.cancel()
+        guard subtitle != PlaybackMarkers.trailerSubtitle else {
+            isLoadingExternalSubtitles = false
+            return
+        }
+
+        isLoadingExternalSubtitles = true
+        subtitleFetchTask = Task { @MainActor [weak self] in
+            let repository = CinemetaCatalogRepository()
+            for await subtitles in repository.subtitlesProgressively(id: contentId, type: type) {
+                guard let self, !Task.isCancelled else { return }
+                self.mergeExternalSubtitles(subtitles)
+            }
+            guard let self, !Task.isCancelled else { return }
+            self.isLoadingExternalSubtitles = false
+            self.subtitleFetchTask = nil
+        }
+    }
+
+    private func mergeExternalSubtitles(_ fetched: [NuvioSubtitle]) {
+        var seen = Set(availableExternalSubtitles.map(\.url))
+        let newSubtitles = fetched.filter { seen.insert($0.url).inserted }
+        guard !newSubtitles.isEmpty else { return }
+        availableExternalSubtitles += newSubtitles
+
+        let smartMatched = Self.smartMatchedSubtitles(in: newSubtitles)
+        for subtitle in smartMatched where !pendingExternalSubtitles.contains(where: { $0.url == subtitle.url }) {
+            pendingExternalSubtitles.append(subtitle)
+        }
+        if !smartMatched.isEmpty {
+            didAddExternalSubtitles = false
+            addPendingExternalSubtitlesIfNeeded()
+        }
     }
 
     // MARK: - Next-episode auto-play
@@ -703,6 +753,11 @@ class PlayerViewModel: ObservableObject {
         applySavedTrackSelectionsIfNeeded()
         applyAudioPreferenceIfNeeded()
         applySubtitlePreferenceIfNeeded()
+        if let selectedURL = pendingSelectedExternalSubtitleURL,
+           let selectedTrack = subtitles.first(where: { $0.externalFilename == selectedURL }) {
+            selectSubtitle(selectedTrack, persist: false)
+            pendingSelectedExternalSubtitleURL = nil
+        }
     }
 
     // MARK: - Transport
@@ -733,6 +788,9 @@ class PlayerViewModel: ObservableObject {
         stopRepeatingSkip()
         trailerResolveTask?.cancel()
         trailerResolveTask = nil
+        subtitleFetchTask?.cancel()
+        subtitleFetchTask = nil
+        isLoadingExternalSubtitles = false
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = nil
         playerController.pausePlayback()
@@ -884,7 +942,12 @@ class PlayerViewModel: ObservableObject {
             saveSubtitleSelection(subtitle)
             didApplySavedSubtitleSelection = true
             didApplySubtitlePreference = true
-            playerController.addSubtitleUrl(subtitle.url)
+            pendingSelectedExternalSubtitleURL = subtitle.url
+            if !pendingExternalSubtitles.contains(where: { $0.url == subtitle.url }) {
+                pendingExternalSubtitles.append(subtitle)
+            }
+            didAddExternalSubtitles = false
+            addPendingExternalSubtitlesIfNeeded()
         }
     }
 
@@ -927,8 +990,18 @@ class PlayerViewModel: ObservableObject {
 
     private func addPendingExternalSubtitlesIfNeeded() {
         guard !didAddExternalSubtitles, !pendingExternalSubtitles.isEmpty else { return }
-        pendingExternalSubtitles.forEach { subtitle in
+        guard !playerController.isPlayerLoading else { return }
+        var subtitlesToAdd = pendingExternalSubtitles.filter {
+            !addedExternalSubtitleURLs.contains($0.url)
+        }
+        if let selectedURL = pendingSelectedExternalSubtitleURL,
+           let index = subtitlesToAdd.firstIndex(where: { $0.url == selectedURL }) {
+            let selected = subtitlesToAdd.remove(at: index)
+            subtitlesToAdd.append(selected)
+        }
+        subtitlesToAdd.forEach { subtitle in
             playerController.addSubtitleUrl(subtitle.url)
+            addedExternalSubtitleURLs.insert(subtitle.url)
         }
         didAddExternalSubtitles = true
     }
@@ -1727,10 +1800,11 @@ final class MPVPlayerViewController: UIViewController {
         }
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", shouldStrictlyMatchSubtitles ? "no" : "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", shouldStrictlyMatchSubtitles ? "no" : "yes"))
-        // Honor the user's saved subtitle appearance on every track, including
-        // embedded ASS/SSA (without `yes` mpv would ignore our color/size there),
-        // and let `sub-margin-y` lift captions off the bottom edge.
-        checkError(mpv_set_option_string(mpv, "sub-ass-override", "yes"))
+        // Render text subtitles through the app's style instead of honoring
+        // embedded ASS/SSA positioning tags. Some tracks declare top alignment
+        // (for example `\\an8`), which otherwise bypasses the user's bottom
+        // margin and leaves dialogue at the top of the screen.
+        checkError(mpv_set_option_string(mpv, "sub-ass-override", "strip"))
         checkError(mpv_set_option_string(mpv, "sub-use-margins", "yes"))
         checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", "yes"))
         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
@@ -2500,6 +2574,7 @@ final class MPVPlayerViewController: UIViewController {
                 case MPV_EVENT_FILE_LOADED:
                     DispatchQueue.main.async {
                         self.clearPlaybackError()
+                        guard !self.rejectUnsupportedSimulatorCodecIfNeeded() else { return }
                         self.isPlayerLoading = false
                         self.attachPendingAudioIfNeeded()
                         self.applySubtitleStyle()
@@ -2541,6 +2616,27 @@ final class MPVPlayerViewController: UIViewController {
                 }
             }
         }
+    }
+
+    /// MoltenVK on the tvOS simulator can eventually trap while uploading an
+    /// AV1 software-decoded frame through MTLSim shared memory. Stream labels
+    /// are filtered before selection, but this verifies the actual container
+    /// codec as a final safety net for unlabeled direct URLs.
+    private func rejectUnsupportedSimulatorCodecIfNeeded() -> Bool {
+        #if targetEnvironment(simulator)
+        let codec = (getString("current-tracks/video/codec") ?? "").lowercased()
+        guard codec == "av1" || codec == "av01" else { return false }
+
+        setStringProperty("vid", "no")
+        command("stop", checkForErrors: false)
+        setPlaybackError("AV1 playback is unavailable in the Apple TV Simulator. Choose an H.264 or HEVC stream.")
+        isPlayerLoading = false
+        isPlayerPlaying = false
+        isPlayerEnded = false
+        return true
+        #else
+        return false
+        #endif
     }
 
     // MARK: - MPV Helpers
