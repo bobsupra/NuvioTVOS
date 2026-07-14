@@ -1757,7 +1757,11 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
         checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
-        checkError(mpv_set_option_string(mpv, "audio-channels", "auto"))
+        // Follow the active tvOS route's preferred layout and fall back to
+        // stereo when it cannot report one. `auto` can request the source's
+        // original layout even when an HDMI receiver, soundbar, or HomePod
+        // route cannot accept it, resulting in video with no usable audio.
+        checkError(mpv_set_option_string(mpv, "audio-channels", "auto-safe"))
         // Headroom for the Audio → Amplification control (+10 dB ≈ 316%).
         checkError(mpv_set_option_string(mpv, "volume-max", "400"))
         checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "yes"))
