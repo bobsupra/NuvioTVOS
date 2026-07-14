@@ -18,6 +18,9 @@ struct DetailsScreen: View {
     /// both are empty/nil for movies and trailers.
     let onPlayClick: (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void
     let onBack: () -> Void
+    let initiallyPresentStreamPicker: Bool
+    let initialStreamPickerEpisode: NuvioVideo?
+    let onInitialStreamPickerPresented: (() -> Void)?
 
     @StateObject private var viewModel: DetailsViewModel
     @State private var isStreamPickerPresented = false
@@ -27,6 +30,7 @@ struct DetailsScreen: View {
     /// The episode a stream is being picked for (nil for movies); drives the
     /// season/episode header in the stream picker.
     @State private var pendingEpisode: NuvioVideo?
+    @State private var didHandleInitialStreamPicker = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
@@ -47,6 +51,9 @@ struct DetailsScreen: View {
         id: String,
         type: String,
         repository: CatalogRepository,
+        initiallyPresentStreamPicker: Bool = false,
+        initialStreamPickerEpisode: NuvioVideo? = nil,
+        onInitialStreamPickerPresented: (() -> Void)? = nil,
         onPlayClick: @escaping (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
         onBack: @escaping () -> Void
     ) {
@@ -54,6 +61,9 @@ struct DetailsScreen: View {
         self.type = type
         self.onPlayClick = onPlayClick
         self.onBack = onBack
+        self.initiallyPresentStreamPicker = initiallyPresentStreamPicker
+        self.initialStreamPickerEpisode = initialStreamPickerEpisode
+        self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
         _viewModel = StateObject(wrappedValue: DetailsViewModel(repository: repository))
     }
 
@@ -168,9 +178,35 @@ struct DetailsScreen: View {
                 finishSmartPlaybackIfPossible()
             }
         }
+        .onChange(of: viewModel.uiState.isLoading) { isLoading in
+            if !isLoading {
+                presentInitialStreamPickerIfNeeded()
+            }
+        }
         .onAppear {
             viewModel.loadDetails(id: id, type: type)
+            presentInitialStreamPickerIfNeeded()
         }
+    }
+
+    private func presentInitialStreamPickerIfNeeded() {
+        guard initiallyPresentStreamPicker,
+              !didHandleInitialStreamPicker,
+              !viewModel.uiState.isLoading,
+              let meta = viewModel.uiState.meta else { return }
+
+        didHandleInitialStreamPicker = true
+        onInitialStreamPickerPresented?()
+        isSmartPlaybackPending = false
+        pendingEpisode = initialStreamPickerEpisode
+        if let episode = initialStreamPickerEpisode {
+            pendingEpisodeSubtitle = "S\(episode.season) · E\(episode.episode) · \(episode.title)"
+            viewModel.prepareStreams(forId: episode.id, type: "series")
+        } else {
+            pendingEpisodeSubtitle = ""
+            viewModel.prepareStreams(forId: id, type: meta.type)
+        }
+        isStreamPickerPresented = true
     }
 
     private func startStreamFlow(streamId: String, type: String, reload: Bool) {

@@ -89,16 +89,22 @@ struct PinButton: View {
     let number: String
     var isDisabled: Bool = false
     let action: () -> Void
+    @FocusState private var isFocused: Bool
     
     var body: some View {
         Button(action: action) {
             Text(number)
                 .font(.title)
-                .foregroundColor(.white)
+                .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 80, height: 80)
-                .background(isDisabled ? Color.clear : Color.gray.opacity(0.3))
-                .clipShape(Circle())
+                .loginGlassCapsule(highlighted: isFocused)
+                .opacity(isDisabled ? 0 : 1)
         }
+        .buttonStyle(PosterCardButtonStyle())
         .disabled(isDisabled)
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }

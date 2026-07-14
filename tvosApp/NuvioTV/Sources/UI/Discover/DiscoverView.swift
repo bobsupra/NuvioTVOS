@@ -22,25 +22,39 @@ struct DiscoverSection: View {
     /// Card to actively re-focus once the Details overlay dismisses; captured
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreCardID: String?
+    @State private var overlayRestoreGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
+    @Binding private var parentTransitionActive: Bool
 
-    init(onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil) {
+    init(
+        onContentClick: @escaping (String, String) -> Void,
+        onLongPress: ((NuvioMeta) -> Void)? = nil,
+        parentTransitionActive: Binding<Bool>
+    ) {
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
+        _parentTransitionActive = parentTransitionActive
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 18) {
             filterBar
+                .disabled(overlayRestoreCardID != nil)
+                .zIndex(1)
             content
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                .clipped()
+                .zIndex(0)
         }
         .onChange(of: focusedCardID) { newValue in
             if let newValue {
                 lastFocusedCardID = newValue
                 shouldRestoreFocus = false
                 // Restoration complete -- lift the focus restriction.
-                if newValue == overlayRestoreCardID { overlayRestoreCardID = nil }
+                if isEnabled, newValue == overlayRestoreCardID {
+                    overlayRestoreCardID = nil
+                    parentTransitionActive = false
+                }
             } else if lastFocusedCardID != nil {
                 shouldRestoreFocus = true
             }
@@ -51,16 +65,26 @@ struct DiscoverSection: View {
         // -- no scroll-to-top flash. See TVHomeView for the full story.
         .onChange(of: isEnabled) { enabled in
             if !enabled {
+                overlayRestoreGeneration &+= 1
                 overlayRestoreCardID = focusedCardID ?? lastFocusedCardID
             } else if let target = overlayRestoreCardID {
-                for delay in [0.12, 0.45] {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        if overlayRestoreCardID == target { focusedCardID = target }
-                    }
+                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            }
+        }
+    }
+
+    private func restoreOverlayFocus(to target: String, generation: Int) {
+        for delay in [0.12, 0.45] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+                    focusedCardID = target
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    if overlayRestoreCardID == target { overlayRestoreCardID = nil }
-                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+                overlayRestoreCardID = nil
+                parentTransitionActive = false
             }
         }
     }
@@ -130,8 +154,12 @@ struct DiscoverSection: View {
                     DiscoverCard(
                         meta: item,
                         externalFocus: $focusedCardID,
+                        retainFocusAppearance: overlayRestoreCardID == item.id,
                         onLongPress: onLongPress.map { cb in { cb(item) } }
                     ) {
+                        parentTransitionActive = true
+                        overlayRestoreCardID = item.id
+                        lastFocusedCardID = item.id
                         onContentClick(item.id, item.type)
                     }
                     .disabled(overlayRestoreCardID != nil && overlayRestoreCardID != item.id)
@@ -149,7 +177,10 @@ struct DiscoverSection: View {
 
             Color.clear.frame(height: 60)
         }
-        .scrollClipDisabledIfAvailable()
+        // This is a vertical grid beneath fixed controls. Its focused cards
+        // must remain inside the viewport instead of spilling upward over the
+        // Movies / Popular / All Genres menus.
+        .scrollClipDisabled(false)
         .focusSection()
         .defaultFocusIfAvailable($focusedCardID, shouldRestoreFocus ? lastFocusedCardID : nil)
     }
@@ -235,6 +266,7 @@ struct FilterMenu<MenuContent: View>: View {
 private struct DiscoverCard: View {
     let meta: NuvioMeta
     var externalFocus: FocusState<String?>.Binding? = nil
+    var retainFocusAppearance = false
     var onLongPress: (() -> Void)? = nil
     let action: () -> Void
     @FocusState private var focused: Bool
@@ -287,15 +319,15 @@ private struct DiscoverCard: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
+                        .stroke(showsFocusedAppearance ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
-                .shadow(color: .black.opacity(focused ? 0.5 : 0.2), radius: focused ? 16 : 6)
+                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 2) {
                         Text(meta.name)
                             .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(focused ? .white : .white.opacity(0.78))
+                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
                             .lineLimit(1)
                         if let year = meta.year {
                             Text(String(year))
@@ -306,7 +338,7 @@ private struct DiscoverCard: View {
                     .frame(width: DiscoverGridMetrics.posterWidth, alignment: .leading)
                 }
             }
-            .scaleEffect(focused ? 1.06 : 1.0)
+            .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focused)
@@ -315,7 +347,7 @@ private struct DiscoverCard: View {
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
         )
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
+        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
     }
 
     /// "Genre · ★ Rating" overlay, omitting whichever piece is missing.
@@ -328,5 +360,9 @@ private struct DiscoverCard: View {
 
     private var focusBorderColor: Color {
         AppFocusOutline.color
+    }
+
+    private var showsFocusedAppearance: Bool {
+        focused || retainFocusAppearance
     }
 }

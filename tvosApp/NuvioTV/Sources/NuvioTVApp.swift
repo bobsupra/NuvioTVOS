@@ -28,6 +28,12 @@ enum TVScreen {
     case cloudLibrary
 }
 
+private enum PlaybackOrigin {
+    case main
+    case details
+    case cloudLibrary
+}
+
 enum TVTab: String, CaseIterable, Identifiable {
     case profile = "Profile"
     case home = "Home"
@@ -62,6 +68,10 @@ struct ContentView: View {
     /// player can offer/auto-play the next episode. Empty for movies/trailers.
     @State private var playbackEpisodes: [NuvioVideo] = []
     @State private var playbackCurrentEpisode: NuvioVideo?
+    @State private var playbackOrigin: PlaybackOrigin = .main
+    @State private var playbackDidStart = false
+    @State private var reopenStreamPickerOnDetails = false
+    @State private var reopenStreamPickerEpisode: NuvioVideo?
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
     /// card). Presented as an overlay over the tab view, like Details/Player.
     @State private var cardMenuMeta: NuvioMeta?
@@ -185,7 +195,9 @@ struct ContentView: View {
                     awaitingPostLoginSync = true
                     enterMainAfterPostLoginSync = autoSelectLast
                     activeScreen = .profileSelection
-                } else if autoSelectLast, profileViewModel.activeProfile != nil {
+                } else if autoSelectLast,
+                          let activeProfile = profileViewModel.activeProfile,
+                          !activeProfile.isPinProtected {
                     activeScreen = .main
                     resumePendingDeepLinkIfPossible()
                 } else {
@@ -195,6 +207,9 @@ struct ContentView: View {
         }
         .onReceive(authManager.$authState) { state in
             syncManager.authStateChanged(state)
+            if state == .signedOut, profileViewModel.activeProfile?.id != "guest" {
+                profileViewModel.resetForSignedOut()
+            }
         }
         .onReceive(syncManager.$isPullingAccountProfiles) { pulling in
             if !pulling, awaitingPostLoginSync {
@@ -202,6 +217,7 @@ struct ContentView: View {
                     && authManager.isAuthenticated
                     && syncManager.profileSyncError == nil
                     && profileViewModel.activeProfile?.id != "guest"
+                    && profileViewModel.activeProfile?.isPinProtected != true
                 withAnimation(.easeInOut(duration: 0.28)) {
                     awaitingPostLoginSync = false
                     enterMainAfterPostLoginSync = false
@@ -270,12 +286,7 @@ struct ContentView: View {
                 activeScreen = .main
             }
         case let .player(_, meta, subtitle, _, _):
-            let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
-            withAnimation(.easeInOut(duration: 0.24)) {
-                activeScreen = (isTrailer || meta.isSeries)
-                    ? .details(id: meta.id, type: meta.type)
-                    : .main
-            }
+            dismissPlayer(meta: meta, subtitle: subtitle)
         case .cloudLibrary:
             withAnimation(.easeInOut(duration: 0.24)) {
                 activeScreen = .main
@@ -419,7 +430,8 @@ struct ContentView: View {
         meta: NuvioMeta,
         subtitle: String,
         externalSubtitles: [NuvioSubtitle],
-        resumeFrom: Double?
+        resumeFrom: Double?,
+        origin: PlaybackOrigin = .main
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let player = ExternalPlayer.from(
@@ -442,7 +454,8 @@ struct ContentView: View {
             meta: meta,
             subtitle: subtitle,
             externalSubtitles: externalSubtitles,
-            resumeFrom: resumeFrom
+            resumeFrom: resumeFrom,
+            origin: origin
         )
     }
 
@@ -451,8 +464,11 @@ struct ContentView: View {
         meta: NuvioMeta,
         subtitle: String,
         externalSubtitles: [NuvioSubtitle],
-        resumeFrom: Double?
+        resumeFrom: Double?,
+        origin: PlaybackOrigin
     ) {
+        playbackOrigin = origin
+        playbackDidStart = false
         withAnimation(.easeInOut(duration: 0.28)) {
             activeScreen = .player(
                 url: url,
@@ -564,6 +580,16 @@ struct ContentView: View {
                 profileViewModel.updateProfileAvatar(id: profileId, avatarId: avatarId)
                 syncManager.syncProfilesAfterLocalEdit()
             },
+            onChangeProfileName: { profileId, name in
+                profileViewModel.updateProfileName(id: profileId, name: name)
+                syncManager.syncProfilesAfterLocalEdit()
+            },
+            onChangeProfilePin: { profileId, pin in
+                profileViewModel.updateProfilePin(id: profileId, pin: pin)
+            },
+            onVerifyProfilePin: { profileId, pin in
+                profileViewModel.verifyProfilePin(id: profileId, pin: pin)
+            },
             onSignIn: {
                 authManager.requireLogin()
                 homeStore.reset()
@@ -614,9 +640,17 @@ struct ContentView: View {
             id: contentId,
             type: contentType,
             repository: CinemetaCatalogRepository(),
+            initiallyPresentStreamPicker: reopenStreamPickerOnDetails,
+            initialStreamPickerEpisode: reopenStreamPickerEpisode,
+            onInitialStreamPickerPresented: {
+                reopenStreamPickerOnDetails = false
+                reopenStreamPickerEpisode = nil
+            },
             onPlayClick: { streamUrlString, meta, subtitle, externalSubtitles, currentEpisode, episodes in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+                    reopenStreamPickerOnDetails = false
+                    reopenStreamPickerEpisode = nil
                     playbackEpisodes = episodes
                     playbackCurrentEpisode = currentEpisode
                     presentPlayback(
@@ -624,7 +658,8 @@ struct ContentView: View {
                         meta: meta,
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
-                        resumeFrom: isTrailer ? nil : ContinueWatchingStore.item(for: meta.id)?.resumePosition
+                        resumeFrom: isTrailer ? nil : ContinueWatchingStore.item(for: meta.id)?.resumePosition,
+                        origin: .details
                     )
                 }
             },
@@ -642,7 +677,14 @@ struct ContentView: View {
             onPlay: { url, meta in
                 playbackEpisodes = []
                 playbackCurrentEpisode = nil
-                presentPlayback(url: url, meta: meta, subtitle: "", externalSubtitles: [], resumeFrom: nil)
+                presentPlayback(
+                    url: url,
+                    meta: meta,
+                    subtitle: "",
+                    externalSubtitles: [],
+                    resumeFrom: nil,
+                    origin: .cloudLibrary
+                )
             },
             onBack: {
                 withAnimation(.easeInOut(duration: 0.24)) {
@@ -751,14 +793,31 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.24)) {
                     activeScreen = .details(id: meta.id, type: meta.type)
                 }
-            } : nil
+            } : nil,
+            onPlaybackStarted: {
+                playbackDidStart = true
+            }
         ) {
-            withAnimation(.easeInOut(duration: 0.24)) {
-                if isTrailer {
-                    activeScreen = .details(id: meta.id, type: meta.type)
-                } else {
-                    activeScreen = meta.isSeries ? .details(id: meta.id, type: meta.type) : .main
-                }
+            dismissPlayer(meta: meta, subtitle: subtitle)
+        }
+    }
+
+    private func dismissPlayer(meta: NuvioMeta, subtitle: String) {
+        let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        withAnimation(.easeInOut(duration: 0.24)) {
+            switch playbackOrigin {
+            case .details:
+                // A stream that never reached playback should return to the
+                // exact decision point so another source is one click away.
+                reopenStreamPickerOnDetails = !playbackDidStart && !isTrailer
+                reopenStreamPickerEpisode = reopenStreamPickerOnDetails ? playbackCurrentEpisode : nil
+                activeScreen = .details(id: meta.id, type: meta.type)
+            case .cloudLibrary:
+                activeScreen = .cloudLibrary
+            case .main:
+                activeScreen = (isTrailer || meta.isSeries)
+                    ? .details(id: meta.id, type: meta.type)
+                    : .main
             }
         }
     }
@@ -993,6 +1052,9 @@ private struct TVMainTabView: View {
     let isAuthenticated: Bool
     let onSwitchProfile: () -> Void
     let onChangeProfileAvatar: (String, String) -> Void
+    let onChangeProfileName: (String, String) -> Void
+    let onChangeProfilePin: (String, String?) -> Bool
+    let onVerifyProfilePin: (String, String) -> Bool
     let onSignIn: () -> Void
     let onSignOut: () -> Void
     let onNavigateToDetails: (String, String) -> Void
@@ -1005,15 +1067,29 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
     @StateObject private var profileTabAvatar = ProfileTabAvatarRenderer()
 
+    private var displayedProfile: Profile? {
+        if isAuthenticated { return activeProfile }
+        return activeProfile?.id == "guest" ? activeProfile : nil
+    }
+
     /// Name shown on the fallback profile tab (tvOS < 27), mirroring the
     /// sidebar header's display-name logic.
     private var profileTabTitle: String {
-        guard isAuthenticated else { return "Nuvio Guest" }
-        return ProfileDisplayName.resolve(profile: activeProfile, settingsName: settingsProfileName)
+        guard let displayedProfile else { return "Nuvio Guest" }
+        return ProfileDisplayName.resolve(profile: displayedProfile, settingsName: settingsProfileName)
     }
 
     var body: some View {
-        if #available(tvOS 18.0, *) {
+        if #available(tvOS 27.0, *) {
+            tabs
+                .tabViewStyle(.sidebarAdaptable)
+                .tabViewSidebarHeader {
+                    TVSidebarProfileHeader(
+                        profile: displayedProfile,
+                        action: onSwitchProfile
+                    )
+                }
+        } else if #available(tvOS 18.0, *) {
             tabs
                 .tabViewStyle(.sidebarAdaptable)
         } else {
@@ -1026,13 +1102,11 @@ private struct TVMainTabView: View {
             // tvOS 27 surfaces the profile in the sidebar header; older tvOS has
             // no sidebar-header API, so expose the profile as a dedicated tab.
             // The tab label carries the profile name + avatar icon so the menu
-            // shows who's signed in instead of a generic "Profile" entry.
+            // shows who's signed in instead of a generic "Profile" entry. Its
+            // content stays empty: selecting it goes straight to profile
+            // switching, while editing now lives in Settings.
             if #unavailable(tvOS 27.0) {
-                TVProfileTabView(
-                    profile: isAuthenticated ? activeProfile : nil,
-                    onSwitchProfile: onSwitchProfile,
-                    onChangeAvatar: onChangeProfileAvatar
-                )
+                Color.clear
                     .tabItem {
                         Label {
                             Text(profileTabTitle)
@@ -1040,7 +1114,7 @@ private struct TVMainTabView: View {
                             if let avatar = profileTabAvatar.image {
                                 Image(uiImage: avatar).renderingMode(.original)
                             } else {
-                                Image(systemName: ProfileAvatarCatalog.symbolName(for: activeProfile?.avatarId))
+                                Image(systemName: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId))
                             }
                         }
                     }
@@ -1077,9 +1151,13 @@ private struct TVMainTabView: View {
                 .tag(TVTab.library)
 
             SettingsView(
-                activeProfile: isAuthenticated ? activeProfile : nil,
+                activeProfile: displayedProfile,
                 accountEmail: accountEmail,
                 isAuthenticated: isAuthenticated,
+                onChangeProfileName: onChangeProfileName,
+                onChangeProfileAvatar: onChangeProfileAvatar,
+                onChangeProfilePin: onChangeProfilePin,
+                onVerifyProfilePin: onVerifyProfilePin,
                 onSignIn: onSignIn,
                 onSignOut: onSignOut
             )
@@ -1091,15 +1169,20 @@ private struct TVMainTabView: View {
         .background(Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea())
         .onAppear {
             AvatarCatalogStore.shared.loadIfNeeded()
-            profileTabAvatar.refresh(avatarId: activeProfile?.avatarId)
+            profileTabAvatar.refresh(avatarId: displayedProfile?.avatarId)
         }
-        .onChange(of: activeProfile?.avatarId) { newValue in
+        .onChange(of: displayedProfile?.avatarId) { newValue in
             profileTabAvatar.refresh(avatarId: newValue)
+        }
+        .onChange(of: selectedTab) { tab in
+            if tab == .profile {
+                onSwitchProfile()
+            }
         }
         // Re-attempt once the catalog finishes loading, since the first refresh
         // can't resolve the avatar image before then.
         .onReceive(AvatarCatalogStore.shared.$items) { _ in
-            profileTabAvatar.refresh(avatarId: activeProfile?.avatarId)
+            profileTabAvatar.refresh(avatarId: displayedProfile?.avatarId)
         }
     }
 }
@@ -1177,76 +1260,6 @@ private struct TVSidebarAvatar: View {
     }
 }
 
-/// Profile screen surfaced as a tab on tvOS versions without the sidebar header
-/// API (< 27), so the active profile stays visible and switchable on device.
-private struct TVProfileTabView: View {
-    let profile: Profile?
-    let onSwitchProfile: () -> Void
-    let onChangeAvatar: (String, String) -> Void
-
-    @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
-    @State private var showingAvatarPicker = false
-    @FocusState private var focusedControl: TVProfileTabFocus?
-
-    var body: some View {
-        VStack(spacing: 30) {
-            ProfileAvatarView(
-                avatarId: profile?.avatarId ?? ProfileAvatarCatalog.defaultId,
-                size: 124,
-                isFocused: focusedControl == .avatar
-            )
-            .scaleEffect(focusedControl == .avatar ? 1.1 : 1)
-            .animation(.spring(response: 0.28, dampingFraction: 0.82), value: focusedControl)
-
-            VStack(spacing: 8) {
-                Text(displayName)
-                    .font(.system(size: 40, weight: .bold))
-                    .foregroundColor(.white)
-
-                Text("Manage who's watching")
-                    .font(.system(size: 22))
-                    .foregroundColor(.white.opacity(0.6))
-            }
-
-            HStack(spacing: 18) {
-                TVProfileActionButton(
-                    title: "Change Avatar",
-                    systemImage: "person.crop.circle",
-                    isFocused: focusedControl == .avatar
-                ) {
-                    showingAvatarPicker = true
-                }
-                .focused($focusedControl, equals: .avatar)
-                .disabled(profile == nil)
-
-                TVProfileActionButton(
-                    title: "Switch Profile",
-                    systemImage: "person.2.fill",
-                    isFocused: focusedControl == .profile
-                ) {
-                    onSwitchProfile()
-                }
-                .focused($focusedControl, equals: .profile)
-            }
-        }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .sheet(isPresented: $showingAvatarPicker) {
-            ProfileAvatarPickerSheet(
-                isPresented: $showingAvatarPicker,
-                title: displayName,
-                selectedAvatarId: profile?.avatarId ?? ProfileAvatarCatalog.defaultId
-            ) { avatarId in
-                guard let profileId = profile?.id else { return }
-                onChangeAvatar(profileId, avatarId)
-            }
-        }
-    }
-
-    private var displayName: String {
-        ProfileDisplayName.resolve(profile: profile, settingsName: settingsProfileName)
-    }
-}
-
 enum ProfileDisplayName {
     static func resolve(profile: Profile?, settingsName: String) -> String {
         if let profileName = profile?.name.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1255,36 +1268,6 @@ enum ProfileDisplayName {
         }
         let trimmed = settingsName.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? "Nuvio User" : trimmed
-    }
-}
-
-private enum TVProfileTabFocus: Hashable {
-    case avatar
-    case profile
-}
-
-private struct TVProfileActionButton: View {
-    let title: String
-    let systemImage: String
-    let isFocused: Bool
-    let action: () -> Void
-
-    var body: some View {
-        Button(action: action) {
-            Label(title, systemImage: systemImage)
-                .font(.system(size: 24, weight: .semibold))
-                .foregroundColor(isFocused ? .black : .white)
-                .lineLimit(1)
-                .padding(.horizontal, 34)
-                .padding(.vertical, 18)
-                .frame(minWidth: 230)
-                .loginGlassCapsule(highlighted: isFocused)
-                .contentShape(Capsule())
-                .scaleEffect(isFocused ? 1.03 : 1)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }
 
@@ -1515,6 +1498,11 @@ struct TVHomeView: View {
                                                let item = continueWatchingByMetaId[meta.id] {
                                                 onResumePlayback(item)
                                             } else {
+                                                // Latch the visual focus before
+                                                // Details takes ownership of the
+                                                // focus engine, avoiding a one-
+                                                // frame outline flicker on entry.
+                                                overlayRestoreCardID = "\(section.id)\u{1}\(meta.id)"
                                                 onNavigateToDetails(meta.id, meta.type)
                                             }
                                         },
@@ -1862,8 +1850,14 @@ struct TVHomeView: View {
 
             for catalog in catalogs {
                 let items: [NuvioMeta]
+                let pendingItems: [NuvioMeta]
+                let nextSkip: Int
                 if let catalogItems = catalog.items {
                     items = Array(catalogItems.prefix(18))
+                    pendingItems = Array(catalogItems.dropFirst(items.count))
+                    // The add-on already returned these records, even though
+                    // Home reveals them in smaller UI batches.
+                    nextSkip = catalogItems.count
                 } else {
                     var resolvedItems: [NuvioMeta] = []
                     for id in catalog.itemIds.prefix(18) {
@@ -1872,7 +1866,11 @@ struct TVHomeView: View {
                         }
                     }
                     items = resolvedItems
+                    pendingItems = []
+                    nextSkip = items.count
                 }
+
+                let canRequestMore = catalog.contentType != nil && catalog.catalogId != nil
 
                 loadedSections.append(
                     TVHomeSection(
@@ -1881,8 +1879,11 @@ struct TVHomeView: View {
                         items: items,
                         contentType: catalog.contentType,
                         catalogId: catalog.catalogId,
-                        nextSkip: items.count,
-                        hasMore: catalog.contentType != nil && catalog.catalogId != nil && !items.isEmpty
+                        addonId: catalog.addonId,
+                        catalogGenre: catalog.catalogGenre,
+                        pendingItems: pendingItems,
+                        nextSkip: nextSkip,
+                        hasMore: !items.isEmpty && (!pendingItems.isEmpty || canRequestMore)
                     )
                 )
             }
@@ -2025,15 +2026,31 @@ struct TVHomeView: View {
         }
 
         let requestedSkip = section.nextSkip ?? section.items.count
+
+        // Some add-ons return hundreds of items in their first response. Home
+        // mounts them in small batches to keep the horizontal row responsive;
+        // reveal those before making another network request.
+        if !section.pendingItems.isEmpty {
+            let batchCount = min(18, section.pendingItems.count)
+            let batch = Array(section.pendingItems.prefix(batchCount))
+            let existingIds = Set(section.items.map(\.id))
+            store.sections[sectionIndex].items.append(contentsOf: batch.filter { !existingIds.contains($0.id) })
+            store.sections[sectionIndex].pendingItems.removeFirst(batchCount)
+            store.sections[sectionIndex].hasMore = !store.sections[sectionIndex].pendingItems.isEmpty
+                || (section.contentType != nil && section.catalogId != nil)
+            return
+        }
+
         store.sections[sectionIndex].isLoadingMore = true
 
         Task { @MainActor in
             do {
                 let page = try await repository.browseCatalog(
+                    addonId: section.addonId,
                     contentType: contentType,
                     catalogId: catalogId,
                     skip: requestedSkip,
-                    genre: nil
+                    genre: section.catalogGenre
                 )
 
                 guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
@@ -2119,6 +2136,10 @@ struct TVHomeSection: Identifiable {
     var items: [NuvioMeta]
     var contentType: String? = nil
     var catalogId: String? = nil
+    var addonId: String? = nil
+    var catalogGenre: String? = nil
+    /// Items already returned by the first add-on response but not mounted yet.
+    var pendingItems: [NuvioMeta] = []
     var nextSkip: Int? = nil
     var hasMore: Bool = false
     var isLoadingMore: Bool = false
@@ -2494,6 +2515,7 @@ private struct TVCatalogRow: View {
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowSmoothFocus,
                         focusHighlighterEnabled: rowFocusHighlighter,
+                        retainFocusAppearance: restrictFocusToCardKey == cardKey,
                         isWatched: isWatched(item)
                     ) {
                         onSelect(item)

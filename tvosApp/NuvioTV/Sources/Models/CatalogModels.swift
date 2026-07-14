@@ -19,6 +19,10 @@ struct NuvioCatalog: Identifiable, Codable {
     let items: [NuvioMeta]?
     let contentType: String?
     let catalogId: String?
+    /// Source add-on for Home pagination. Nil means the built-in Cinemeta base.
+    let addonId: String?
+    /// Required genre extra used for the initial add-on request, if any.
+    let catalogGenre: String?
 
     init(
         id: String,
@@ -27,7 +31,9 @@ struct NuvioCatalog: Identifiable, Codable {
         itemIds: [String],
         items: [NuvioMeta]? = nil,
         contentType: String? = nil,
-        catalogId: String? = nil
+        catalogId: String? = nil,
+        addonId: String? = nil,
+        catalogGenre: String? = nil
     ) {
         self.id = id
         self.name = name
@@ -36,6 +42,8 @@ struct NuvioCatalog: Identifiable, Codable {
         self.items = items
         self.contentType = contentType
         self.catalogId = catalogId
+        self.addonId = addonId
+        self.catalogGenre = catalogGenre
     }
 }
 

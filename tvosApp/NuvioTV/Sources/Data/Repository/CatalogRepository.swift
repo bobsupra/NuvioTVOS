@@ -59,6 +59,16 @@ protocol CatalogRepository {
         genre: String?
     ) async throws -> CatalogPage
 
+    /// Browse a Home catalog from its original add-on. A nil add-on id uses
+    /// the built-in Cinemeta base URL.
+    func browseCatalog(
+        addonId: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage
+
     /// Get available genres for content type
     func getGenres(contentType: String) async throws -> [String]
 
@@ -68,6 +78,21 @@ protocol CatalogRepository {
 }
 
 extension CatalogRepository {
+    func browseCatalog(
+        addonId: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage {
+        try await browseCatalog(
+            contentType: contentType,
+            catalogId: catalogId,
+            skip: skip,
+            genre: genre
+        )
+    }
+
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
         try await getMetadata(id: id, type: type)
     }
@@ -200,8 +225,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
             for catalog in eligible.prefix(remaining) {
                 do {
                     var path = "catalog/\(catalog.type)/\(catalog.id)"
-                    if catalog.requiresGenre,
-                       let genre = catalog.firstGenreOption,
+                    let catalogGenre = catalog.requiresGenre ? catalog.firstGenreOption : nil
+                    if let genre = catalogGenre,
                        let genreExtra = encodedExtra(name: "genre", value: genre) {
                         path += "/" + genreExtra
                     }
@@ -221,7 +246,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
                             name: catalogName,
                             description: catalogName,
                             itemIds: items.map(\.id),
-                            items: items
+                            items: items,
+                            contentType: catalog.type,
+                            catalogId: catalog.id,
+                            addonId: manifest.id,
+                            catalogGenre: catalogGenre
                         )
                     )
                     loadedForManifest += 1
@@ -725,6 +754,40 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func browseCatalog(
+        addonId: String?,
+        contentType: String,
+        catalogId: String,
+        skip: Int,
+        genre: String?
+    ) async throws -> CatalogPage {
+        let sourceBaseURL: URL
+        if let addonId {
+            guard let resolved = await baseURL(forAddonId: addonId) else {
+                throw URLError(.badURL)
+            }
+            sourceBaseURL = resolved
+        } else {
+            sourceBaseURL = baseURL
+        }
+
+        let items = try await fetchCatalog(
+            sourceBaseURL: sourceBaseURL,
+            type: contentType,
+            catalogId: catalogId,
+            skip: skip == 0 ? nil : skip,
+            search: nil,
+            genre: genre
+        )
+        items.forEach { cachedMetaById[$0.id] = $0 }
+        return CatalogPage(
+            items: items,
+            hasMore: !items.isEmpty,
+            page: 1,
+            nextSkip: skip + items.count
+        )
+    }
+
+    func browseCatalog(
         contentType: String,
         catalogId: String,
         skip: Int,
@@ -835,6 +898,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func fetchCatalog(
+        sourceBaseURL: URL? = nil,
         type: String,
         catalogId: String,
         skip: Int?,
@@ -853,7 +917,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
         path += ".json"
 
-        let response: CinemetaCatalogResponse = try await fetch(baseURL.appendingPathComponent(path))
+        let response: CinemetaCatalogResponse = try await fetch((sourceBaseURL ?? baseURL).appendingPathComponent(path))
         return response.metas.map { $0.toMeta(fallbackType: type) }
     }
 

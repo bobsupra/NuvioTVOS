@@ -131,7 +131,7 @@ cache settings unchanged.
 
 ## Beta release workflow
 
-Last verified: Beta 2.8 on 2026-07-13.
+Last verified: Beta 2.9 on 2026-07-14.
 
 1. Confirm `main` and `origin/main` are aligned, inspect the latest `tvos-beta-*` tag, and preserve unrelated dirty files.
 2. Bump `CFBundleShortVersionString` and `CFBundleVersion` in both `tvosApp/NuvioTV/Info.plist` and `tvosApp/TopShelf/Info.plist`.

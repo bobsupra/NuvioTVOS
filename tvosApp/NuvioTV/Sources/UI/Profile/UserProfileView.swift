@@ -439,6 +439,10 @@ struct AddProfileView: View {
                     TextField("Name", text: $name)
                     SecureField("PIN (Optional)", text: $pin)
                         .keyboardType(.numberPad)
+                        .onChange(of: pin) { value in
+                            let digits = value.filter { $0 >= "0" && $0 <= "9" }
+                            pin = String(digits.prefix(4))
+                        }
                 }
 
                 Section(header: Text("Avatar")) {
@@ -449,7 +453,8 @@ struct AddProfileView: View {
                     onSave()
                     isPresented = false
                 }
-                .disabled(name.isEmpty)
+                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                    || (!pin.isEmpty && pin.count != 4))
             }
             .navigationTitle("Add Profile")
             .toolbar {

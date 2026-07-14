@@ -20,9 +20,11 @@ struct PlayerView: View {
     /// silently recover from an expired link. Nil disables auto-reload.
     var reloadCurrentStream: (() async -> PreparedNextStream?)? = nil
     var onFinished: (() -> Void)? = nil
+    var onPlaybackStarted: (() -> Void)? = nil
     var onBack: () -> Void
 
     @State private var didHandleFinished = false
+    @State private var didReportPlaybackStarted = false
     @FocusState private var remoteInputFocused: Bool
     @FocusState private var nextEpisodeFocused: Bool
     @FocusState private var skipSegmentFocused: Bool
@@ -199,6 +201,10 @@ struct PlayerView: View {
         }
         .onChange(of: viewModel.status) { status in
             UIApplication.shared.isIdleTimerDisabled = (status == .playing || status == .buffering)
+            if status == .playing, !didReportPlaybackStarted {
+                didReportPlaybackStarted = true
+                onPlaybackStarted?()
+            }
             guard status == .ended,
                   !didHandleFinished,
                   let onFinished else {

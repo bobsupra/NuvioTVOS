@@ -15,6 +15,7 @@ struct SearchView: View {
 
     @FocusState private var searchBarFocused: Bool
     @FocusState private var focusedResultID: String?
+    @FocusState private var clearRecentFocused: Bool
     /// Last card focused in the results grid, kept so returning from details
     /// (which steals focus and nils `focusedResultID`) restores that card
     /// instead of snapping back to the first result.
@@ -23,6 +24,8 @@ struct SearchView: View {
     /// Card to actively re-focus once the Details overlay dismisses; captured
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreResultID: String?
+    @State private var overlayRestoreGeneration = 0
+    @State private var discoverOverlayTransitionActive = false
     @Environment(\.isEnabled) private var isEnabled
     @State private var searchTextInputActive = false
     @AppStorage(SettingsKey.amoled) private var amoled = false
@@ -41,17 +44,26 @@ struct SearchView: View {
 
             VStack(alignment: .leading, spacing: 24) {
                 header
+                    .disabled(overlayRestoreResultID != nil || discoverOverlayTransitionActive)
+                    .zIndex(1)
 
                 if viewModel.hasQuery {
                     typeFilter
+                        .disabled(overlayRestoreResultID != nil)
+                        .zIndex(1)
                     resultsContainer
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+                        .zIndex(0)
                 } else {
                     if !viewModel.recentSearches.isEmpty {
                         recentRow
+                            .disabled(discoverOverlayTransitionActive)
                     }
                     if showDiscover {
-                        DiscoverSection(onContentClick: onContentClick, onLongPress: onLongPress)
+                        DiscoverSection(
+                            onContentClick: onContentClick,
+                            onLongPress: onLongPress,
+                            parentTransitionActive: $discoverOverlayTransitionActive
+                        )
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     } else {
                         centeredState {
@@ -65,6 +77,9 @@ struct SearchView: View {
             }
             .padding(.horizontal, 80)
             .padding(.top, 56)
+            // Let the results viewport use the space below tvOS's bottom safe
+            // area instead of leaving a black bar at the screen edge.
+            .ignoresSafeArea(.container, edges: .bottom)
         }
         .onAppear {
             if !viewModel.hasQuery {
@@ -76,7 +91,7 @@ struct SearchView: View {
                 lastFocusedResultID = newValue
                 shouldRestoreResultFocus = false
                 // Restoration complete -- lift the focus restriction.
-                if newValue == overlayRestoreResultID { overlayRestoreResultID = nil }
+                if isEnabled, newValue == overlayRestoreResultID { overlayRestoreResultID = nil }
             } else if lastFocusedResultID != nil {
                 shouldRestoreResultFocus = true
             }
@@ -87,16 +102,25 @@ struct SearchView: View {
         // card -- no scroll-to-top flash. See TVHomeView for the full story.
         .onChange(of: isEnabled) { enabled in
             if !enabled {
+                overlayRestoreGeneration &+= 1
                 overlayRestoreResultID = focusedResultID ?? lastFocusedResultID
             } else if let target = overlayRestoreResultID {
-                for delay in [0.12, 0.45] {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                        if overlayRestoreResultID == target { focusedResultID = target }
-                    }
+                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+            }
+        }
+    }
+
+    private func restoreOverlayFocus(to target: String, generation: Int) {
+        for delay in [0.12, 0.45] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
+                    focusedResultID = target
                 }
-                DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
-                    if overlayRestoreResultID == target { overlayRestoreResultID = nil }
-                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
+                overlayRestoreResultID = nil
             }
         }
     }
@@ -221,8 +245,11 @@ struct SearchView: View {
                     SearchResultCard(
                         meta: item,
                         externalFocus: $focusedResultID,
+                        retainFocusAppearance: overlayRestoreResultID == item.id,
                         onLongPress: onLongPress.map { cb in { cb(item) } }
                     ) {
+                        overlayRestoreResultID = item.id
+                        lastFocusedResultID = item.id
                         onContentClick(item.id, item.type)
                     }
                     .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
@@ -230,9 +257,7 @@ struct SearchView: View {
             }
             .padding(.top, 16)
             .padding(.horizontal, 12)
-            .padding(.bottom, 90)
         }
-        .scrollClipDisabledIfAvailable()
         .focusSection()
         .defaultFocusIfAvailable($focusedResultID, defaultResultFocusID)
     }
@@ -264,11 +289,6 @@ struct SearchView: View {
                 Text("Recent searches")
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundColor(.white.opacity(0.8))
-                Spacer()
-                Button("Clear") { viewModel.clearRecent() }
-                    .buttonStyle(.plain)
-                    .font(.system(size: 20, weight: .medium))
-                    .foregroundColor(.white.opacity(0.55))
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
@@ -278,6 +298,23 @@ struct SearchView: View {
                             viewModel.applyRecent(term)
                         }
                     }
+
+                    Button { viewModel.clearRecent() } label: {
+                        HStack(spacing: 8) {
+                            Image(systemName: "trash")
+                            Text("Clear")
+                        }
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(clearRecentFocused ? .black : .white.opacity(0.85))
+                        .padding(.horizontal, 22)
+                        .frame(height: 50)
+                        .modifier(GlassChipBackground(filled: clearRecentFocused))
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focused($clearRecentFocused)
+                    .focusEffectDisabledIfAvailable()
+                    .scaleEffect(clearRecentFocused ? 1.06 : 1.0)
+                    .animation(.easeOut(duration: 0.14), value: clearRecentFocused)
                 }
                 .padding(.vertical, 8)
                 .padding(.horizontal, 4)
@@ -321,6 +358,7 @@ struct SearchView: View {
 private struct SearchResultCard: View {
     let meta: NuvioMeta
     var externalFocus: FocusState<String?>.Binding? = nil
+    var retainFocusAppearance = false
     var onLongPress: (() -> Void)? = nil
     let action: () -> Void
     @FocusState private var focused: Bool
@@ -350,15 +388,15 @@ private struct SearchResultCard: View {
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(focused ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
+                        .stroke(showsFocusedAppearance ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
-                .shadow(color: .black.opacity(focused ? 0.5 : 0.2), radius: focused ? 16 : 6)
+                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
 
                 if posterLabels {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(meta.name)
                             .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(focused ? .white : .white.opacity(0.78))
+                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
                             .lineLimit(1)
                         Text(subtitle)
                             .font(.system(size: 16, weight: .medium))
@@ -368,7 +406,7 @@ private struct SearchResultCard: View {
                     .frame(width: SearchGridMetrics.posterWidth, alignment: .leading)
                 }
             }
-            .scaleEffect(focused ? 1.06 : 1.0)
+            .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focused)
@@ -377,7 +415,7 @@ private struct SearchResultCard: View {
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
         )
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
+        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
     }
 
     private var subtitle: String {
@@ -389,6 +427,10 @@ private struct SearchResultCard: View {
 
     private var focusBorderColor: Color {
         AppFocusOutline.color
+    }
+
+    private var showsFocusedAppearance: Bool {
+        focused || retainFocusAppearance
     }
 }
 

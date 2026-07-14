@@ -46,6 +46,9 @@ struct PosterCard: View {
     var showPosterLabels: Bool = false
     var smoothFocusAnimations: Bool = true
     var focusHighlighterEnabled: Bool = false
+    /// Keeps the last-selected card visually outlined while an overlay owns
+    /// tvOS focus. The parent supplies this for exactly one saved card.
+    var retainFocusAppearance: Bool = false
     var isWatched: Bool? = nil
     let onClick: () -> Void
 
@@ -140,7 +143,7 @@ struct PosterCard: View {
 
             if showsPosterTitle {
                 Text(meta.name)
-                    .font(.system(size: effectiveHomeLayout == "Compact" ? 18 : 20, weight: isFocused ? .semibold : .medium))
+                    .font(.system(size: effectiveHomeLayout == "Compact" ? 18 : 20, weight: showsFocusedAppearance ? .semibold : .medium))
                     .foregroundColor(titleColor)
                     .lineLimit(1)
                     .frame(width: cardWidth, alignment: .leading)
@@ -344,28 +347,32 @@ struct PosterCard: View {
     }
 
     private var focusedBorderColor: Color {
-        guard isFocused else { return .clear }
+        guard showsFocusedAppearance else { return .clear }
         return AppFocusOutline.color
     }
 
     private var focusedBorderWidth: CGFloat {
-        isFocused ? (effectiveFocusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
+        showsFocusedAppearance ? (effectiveFocusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
     }
 
     private var shadowOpacity: Double {
-        isFocused ? 0.24 : 0.12
+        showsFocusedAppearance ? 0.24 : 0.12
     }
 
     private var shadowRadius: CGFloat {
-        isFocused ? 10 : 4
+        showsFocusedAppearance ? 10 : 4
     }
 
     private var titleColor: Color {
-        isFocused ? .white : .white.opacity(0.55)
+        showsFocusedAppearance ? .white : .white.opacity(0.55)
+    }
+
+    private var showsFocusedAppearance: Bool {
+        isFocused || retainFocusAppearance
     }
 
     private var showsPosterTitle: Bool {
-        effectivePosterLabels && !isLandscape
+        effectivePosterLabels
     }
     #else
     private var cardWidth: CGFloat {

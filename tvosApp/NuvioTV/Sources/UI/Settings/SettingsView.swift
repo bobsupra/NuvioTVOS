@@ -583,6 +583,10 @@ struct SettingsView: View {
     let activeProfile: Profile?
     let accountEmail: String?
     let isAuthenticated: Bool
+    let onChangeProfileName: ((String, String) -> Void)?
+    let onChangeProfileAvatar: ((String, String) -> Void)?
+    let onChangeProfilePin: ((String, String?) -> Bool)?
+    let onVerifyProfilePin: ((String, String) -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
 
@@ -590,12 +594,20 @@ struct SettingsView: View {
         activeProfile: Profile? = nil,
         accountEmail: String? = nil,
         isAuthenticated: Bool = false,
+        onChangeProfileName: ((String, String) -> Void)? = nil,
+        onChangeProfileAvatar: ((String, String) -> Void)? = nil,
+        onChangeProfilePin: ((String, String?) -> Bool)? = nil,
+        onVerifyProfilePin: ((String, String) -> Bool)? = nil,
         onSignIn: (() -> Void)? = nil,
         onSignOut: (() -> Void)? = nil
     ) {
         self.activeProfile = activeProfile
         self.accountEmail = accountEmail
         self.isAuthenticated = isAuthenticated
+        self.onChangeProfileName = onChangeProfileName
+        self.onChangeProfileAvatar = onChangeProfileAvatar
+        self.onChangeProfilePin = onChangeProfilePin
+        self.onVerifyProfilePin = onVerifyProfilePin
         self.onSignIn = onSignIn
         self.onSignOut = onSignOut
     }
@@ -802,6 +814,10 @@ struct SettingsView: View {
                 activeProfile: activeProfile,
                 accountEmail: accountEmail,
                 isAuthenticated: isAuthenticated,
+                onChangeProfileName: onChangeProfileName,
+                onChangeProfileAvatar: onChangeProfileAvatar,
+                onChangeProfilePin: onChangeProfilePin,
+                onVerifyProfilePin: onVerifyProfilePin,
                 onSignIn: onSignIn,
                 onSignOut: onSignOut
             )
@@ -911,26 +927,28 @@ private struct AccountSettingsView: View {
     let activeProfile: Profile?
     let accountEmail: String?
     let isAuthenticated: Bool
+    let onChangeProfileName: ((String, String) -> Void)?
+    let onChangeProfileAvatar: ((String, String) -> Void)?
+    let onChangeProfilePin: ((String, String?) -> Bool)?
+    let onVerifyProfilePin: ((String, String) -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
 
     @AppStorage(SettingsKey.profileName) private var profileName = "Nuvio User"
-    @AppStorage(SettingsKey.profilePinEnabled) private var pinEnabled = false
     @AppStorage(SettingsKey.profileAutoSelectLast) private var autoSelectLastProfile = true
     @AppStorage(SettingsKey.accountSyncWatchState) private var syncWatchState = true
+    @State private var editableProfileName = ""
+    @State private var showingAvatarPicker = false
+    @State private var pinSheetMode: ProfilePinSheetMode?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(title: "Profile", subtitle: "Local profile defaults for this Apple TV") {
                 HStack(spacing: 22) {
-                    Circle()
-                        .fill(accentColor.opacity(0.86))
-                        .frame(width: 84, height: 84)
-                        .overlay(
-                            Text(profileInitial)
-                                .font(.system(size: 38, weight: .black))
-                                .foregroundColor(accentColor == .white ? .black : .white)
-                        )
+                    ProfileAvatarView(
+                        avatarId: activeProfile?.avatarId ?? ProfileAvatarCatalog.defaultId,
+                        size: 84
+                    )
 
                     VStack(alignment: .leading, spacing: 8) {
                         Text(displayProfileName)
@@ -938,7 +956,7 @@ private struct AccountSettingsView: View {
                             .foregroundColor(.white)
                             .lineLimit(1)
 
-                        Text(pinEnabled ? "PIN protection enabled" : "PIN protection disabled")
+                        Text(isPinProtected ? "PIN protection enabled" : "PIN protection disabled")
                             .font(.system(size: 19, weight: .medium))
                             .foregroundColor(.white.opacity(0.58))
                     }
@@ -949,13 +967,37 @@ private struct AccountSettingsView: View {
 
                 // First focusable row in the pane carries the entry anchor —
                 // without one the entry lock leaves the pane unenterable.
+                SettingsTextFieldRow(
+                    title: "Profile Name",
+                    subtitle: "Change the name shown for this profile",
+                    placeholder: "Profile name",
+                    text: $editableProfileName,
+                    fieldWidth: 340,
+                    onCommit: saveProfileName
+                )
+                .settingsEntryAnchor(activeProfile != nil && onChangeProfileName != nil)
+                .disabled(activeProfile == nil || onChangeProfileName == nil)
+
+                SettingsActionRow(
+                    title: "Profile Avatar",
+                    subtitle: "Choose the avatar shown across Nuvio",
+                    value: "Change",
+                    accentColor: accentColor
+                ) {
+                    showingAvatarPicker = true
+                }
+                .opacity(activeProfile != nil && onChangeProfileAvatar != nil ? 1 : 0.46)
+                .disabled(activeProfile == nil || onChangeProfileAvatar == nil)
+
                 SettingsToggleRow(
                     title: "PIN Protection",
                     subtitle: "Require the profile PIN before opening protected profiles",
-                    isOn: $pinEnabled,
+                    isOn: pinProtectionBinding,
                     accentColor: accentColor
                 )
-                .settingsEntryAnchor()
+                .settingsEntryAnchor(activeProfile == nil || onChangeProfileName == nil)
+                .opacity(canManagePin ? 1 : 0.46)
+                .disabled(!canManagePin)
 
                 SettingsToggleRow(
                     title: "Open Last Profile",
@@ -1004,16 +1046,253 @@ private struct AccountSettingsView: View {
                 }
             }
         }
+        .onAppear { refreshEditableName() }
+        .onChange(of: activeProfile) { _ in refreshEditableName() }
+        .sheet(isPresented: $showingAvatarPicker) {
+            if let profile = activeProfile {
+                ProfileAvatarPickerSheet(
+                    isPresented: $showingAvatarPicker,
+                    title: displayProfileName,
+                    selectedAvatarId: profile.avatarId.isEmpty
+                        ? ProfileAvatarCatalog.defaultId
+                        : profile.avatarId
+                ) { avatarId in
+                    onChangeProfileAvatar?(profile.id, avatarId)
+                }
+            }
+        }
+        .sheet(item: $pinSheetMode) { mode in
+            if let profile = activeProfile {
+                ProfilePinManagementView(
+                    mode: mode,
+                    profileName: displayProfileName,
+                    onVerify: { pin in
+                        onVerifyProfilePin?(profile.id, pin) == true
+                    },
+                    onSave: { pin in
+                        onChangeProfilePin?(profile.id, pin) == true
+                    }
+                ) {
+                    pinSheetMode = nil
+                }
+            }
+        }
     }
 
     private var displayProfileName: String {
-        guard isAuthenticated else { return "Nuvio Guest" }
+        if !isAuthenticated, activeProfile == nil { return "Nuvio Guest" }
         return ProfileDisplayName.resolve(profile: activeProfile, settingsName: profileName)
     }
 
-    private var profileInitial: String {
-        let trimmedName = displayProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
-        return String((trimmedName.first ?? "N")).uppercased()
+    private var isPinProtected: Bool {
+        activeProfile?.isPinProtected == true
+    }
+
+    private var canManagePin: Bool {
+        activeProfile != nil && onChangeProfilePin != nil && onVerifyProfilePin != nil
+    }
+
+    private var pinProtectionBinding: Binding<Bool> {
+        Binding(
+            get: { isPinProtected },
+            set: { requestedValue in
+                guard requestedValue != isPinProtected else { return }
+                pinSheetMode = requestedValue ? .enable : .disable
+            }
+        )
+    }
+
+    private func refreshEditableName() {
+        editableProfileName = displayProfileName
+    }
+
+    private func saveProfileName() {
+        let name = editableProfileName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let profileId = activeProfile?.id, !name.isEmpty else {
+            refreshEditableName()
+            return
+        }
+        editableProfileName = name
+        profileName = name
+        onChangeProfileName?(profileId, name)
+    }
+}
+
+private enum ProfilePinSheetMode: String, Identifiable {
+    case enable
+    case disable
+
+    var id: String { rawValue }
+}
+
+private struct ProfilePinManagementView: View {
+    let mode: ProfilePinSheetMode
+    let profileName: String
+    let onVerify: (String) -> Bool
+    let onSave: (String?) -> Bool
+    let onDismiss: () -> Void
+
+    @State private var enteredPin = ""
+    @State private var pendingPin: String?
+    @State private var errorMessage: String?
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.52).ignoresSafeArea()
+
+            VStack(spacing: 24) {
+                Text(title)
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.white)
+
+                Text(instructions)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.64))
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: 18) {
+                    ForEach(0..<4, id: \.self) { index in
+                        Circle()
+                            .fill(index < enteredPin.count ? Color.white : Color.white.opacity(0.24))
+                            .frame(width: 18, height: 18)
+                    }
+                }
+                .padding(.vertical, 4)
+
+                Text(errorMessage ?? " ")
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(.red)
+                    .frame(height: 24)
+
+                LazyVGrid(
+                    columns: Array(repeating: GridItem(.fixed(80)), count: 3),
+                    spacing: 18
+                ) {
+                    ForEach(1...9, id: \.self) { number in
+                        PinButton(number: "\(number)") {
+                            addDigit("\(number)")
+                        }
+                    }
+
+                    PinButton(number: "", isDisabled: true) {}
+                    PinButton(number: "0") { addDigit("0") }
+
+                    PinDeleteButton(action: deleteDigit)
+                }
+
+                PinSheetActionButton(title: "Cancel", action: onDismiss)
+                    .padding(.top, 4)
+            }
+            .frame(width: 520)
+            .padding(48)
+            .loginGlassPanel()
+            .shadow(color: .black.opacity(0.38), radius: 32, y: 18)
+        }
+    }
+
+    private var title: String {
+        switch mode {
+        case .enable:
+            return pendingPin == nil ? "Create PIN" : "Confirm PIN"
+        case .disable:
+            return "Turn Off PIN Protection"
+        }
+    }
+
+    private var instructions: String {
+        switch mode {
+        case .enable:
+            return pendingPin == nil
+                ? "Enter a 4-digit PIN for \(profileName)."
+                : "Enter the same PIN again."
+        case .disable:
+            return "Enter the current PIN for \(profileName)."
+        }
+    }
+
+    private func addDigit(_ digit: String) {
+        guard enteredPin.count < 4 else { return }
+        let completedPin = enteredPin + digit
+        enteredPin = completedPin
+        errorMessage = nil
+        guard completedPin.count == 4 else { return }
+
+        switch mode {
+        case .enable:
+            if pendingPin == nil {
+                pendingPin = completedPin
+                enteredPin = ""
+            } else if pendingPin != completedPin {
+                enteredPin = ""
+                errorMessage = "PINs did not match. Try again."
+            } else if onSave(completedPin) {
+                onDismiss()
+            } else {
+                enteredPin = ""
+                errorMessage = "The PIN could not be saved."
+            }
+
+        case .disable:
+            guard onVerify(completedPin) else {
+                enteredPin = ""
+                errorMessage = "Incorrect PIN"
+                return
+            }
+            if onSave(nil) {
+                onDismiss()
+            } else {
+                enteredPin = ""
+                errorMessage = "PIN protection could not be turned off."
+            }
+        }
+    }
+
+    private func deleteDigit() {
+        guard !enteredPin.isEmpty else { return }
+        enteredPin.removeLast()
+        errorMessage = nil
+    }
+}
+
+private struct PinDeleteButton: View {
+    let action: () -> Void
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Image(systemName: "delete.left")
+                .font(.system(size: 30, weight: .semibold))
+                .foregroundColor(isFocused ? .black : .white)
+                .frame(width: 80, height: 80)
+                .loginGlassCapsule(highlighted: isFocused)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.06 : 1)
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+    }
+}
+
+private struct PinSheetActionButton: View {
+    let title: String
+    let action: () -> Void
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundColor(isFocused ? .black : .white)
+                .padding(.horizontal, 30)
+                .frame(height: 56)
+                .loginGlassCapsule(highlighted: isFocused)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.04 : 1)
+        .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }
 

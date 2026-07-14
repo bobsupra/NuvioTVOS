@@ -1,5 +1,6 @@
 import Foundation
 import Combine
+import Security
 
 // MARK: - Stub types replacing NuvioCore Rust FFI types
 
@@ -99,6 +100,7 @@ public class ProfileManager {
     private let profilesURL: URL
 
     public init(baseDir: String) throws {
+        ProfilePinStore.prepareForUse()
         let baseURL = URL(fileURLWithPath: baseDir, isDirectory: true)
         try FileManager.default.createDirectory(at: baseURL, withIntermediateDirectories: true)
         profilesURL = baseURL.appendingPathComponent("nuvio-profiles.json")
@@ -115,7 +117,11 @@ public class ProfileManager {
             let data = try Data(contentsOf: profilesURL)
             let decoded = try JSONDecoder().decode([StoredProfile].self, from: data)
             let rawProfiles = decoded.map { $0.toProfile() }
-            let profiles = Self.sanitizedProfiles(rawProfiles)
+            let profiles = Self.sanitizedProfiles(rawProfiles).map { profile in
+                var profile = profile
+                profile.isPinProtected = ProfilePinStore.hasPin(for: profile.id)
+                return profile
+            }
             if profiles != rawProfiles {
                 try writeProfiles(profiles)
             }
@@ -129,15 +135,24 @@ public class ProfileManager {
     public func createProfile(input: CreateProfileInput) throws -> Profile {
         var profiles = (try? getProfiles()) ?? []
         let id = nextProfileId(in: profiles)
+        let pin = try Self.validatedPin(input.pin)
         let profile = Profile(
             id: id,
             name: input.name,
-            isPinProtected: input.pin != nil,
+            isPinProtected: pin != nil,
             isAdmin: false,
             avatarId: input.avatarId ?? ""
         )
         profiles.append(profile)
-        try saveProfiles(profiles)
+        if let pin {
+            try ProfilePinStore.save(pin, for: id)
+        }
+        do {
+            try saveProfiles(profiles)
+        } catch {
+            if pin != nil { try? ProfilePinStore.removePin(for: id) }
+            throw error
+        }
         return profile
     }
 
@@ -158,6 +173,7 @@ public class ProfileManager {
         var profiles = (try? getProfiles()) ?? []
         profiles.removeAll(where: { $0.id == id })
         try saveProfiles(profiles)
+        try? ProfilePinStore.removePin(for: id)
     }
 
     public func updateProfileAvatar(id: String, avatarId: String) throws {
@@ -167,9 +183,50 @@ public class ProfileManager {
         try saveProfiles(profiles)
     }
 
-    public func replaceProfiles(_ profiles: [Profile]) throws {
-        let profiles = Self.sanitizedProfiles(profiles)
+    public func updateProfileName(id: String, name: String) throws {
+        var profiles = (try? getProfiles()) ?? []
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        profiles[index].name = name
         try saveProfiles(profiles)
+    }
+
+    public func updateProfilePin(id: String, pin: String?) throws {
+        var profiles = (try? getProfiles()) ?? []
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+
+        let pin = try Self.validatedPin(pin)
+        let previousPin = ProfilePinStore.pin(for: id)
+        if let pin {
+            try ProfilePinStore.save(pin, for: id)
+        } else {
+            try ProfilePinStore.removePin(for: id)
+        }
+        profiles[index].isPinProtected = pin != nil
+
+        do {
+            try saveProfiles(profiles)
+        } catch {
+            if let previousPin {
+                try? ProfilePinStore.save(previousPin, for: id)
+            } else {
+                try? ProfilePinStore.removePin(for: id)
+            }
+            throw error
+        }
+    }
+
+    public func replaceProfiles(_ profiles: [Profile]) throws {
+        let previousIds = Set(((try? getProfiles()) ?? []).map(\.id))
+        let profiles = Self.sanitizedProfiles(profiles).map { profile in
+            var profile = profile
+            profile.isPinProtected = ProfilePinStore.hasPin(for: profile.id)
+            return profile
+        }
+        try saveProfiles(profiles)
+        let retainedIds = Set(profiles.map(\.id))
+        for removedId in previousIds.subtracting(retainedIds) {
+            try? ProfilePinStore.removePin(for: removedId)
+        }
         if let activeId = UserDefaults.standard.string(forKey: Self.activePinKey),
            profiles.contains(where: { $0.id == activeId }) {
             return
@@ -180,8 +237,12 @@ public class ProfileManager {
     }
 
     public func verifyPin(id: String, pin: String) throws -> Bool {
-        // Stub: always valid (real PIN verification would come from Rust)
-        return true
+        guard let storedPin = ProfilePinStore.pin(for: id) else { return false }
+        return Self.constantTimeEquals(storedPin, pin)
+    }
+
+    public func hasPin(id: String) -> Bool {
+        ProfilePinStore.hasPin(for: id)
     }
 
     private func saveProfiles(_ profiles: [Profile]) throws {
@@ -256,6 +317,105 @@ public class ProfileManager {
             return ""
         }
         return trimmed
+    }
+
+    private static func validatedPin(_ pin: String?) throws -> String? {
+        guard let pin else { return nil }
+        let bytes = Array(pin.utf8)
+        guard bytes.count == 4, bytes.allSatisfy({ (48...57).contains($0) }) else {
+            throw ProfilePinError.invalidFormat
+        }
+        return pin
+    }
+
+    private static func constantTimeEquals(_ lhs: String, _ rhs: String) -> Bool {
+        let lhsBytes = Array(lhs.utf8)
+        let rhsBytes = Array(rhs.utf8)
+        guard lhsBytes.count == rhsBytes.count else { return false }
+        var difference: UInt8 = 0
+        for (left, right) in zip(lhsBytes, rhsBytes) {
+            difference |= left ^ right
+        }
+        return difference == 0
+    }
+}
+
+private enum ProfilePinError: LocalizedError {
+    case invalidFormat
+    case keychain(OSStatus)
+
+    var errorDescription: String? {
+        switch self {
+        case .invalidFormat:
+            return "The profile PIN must contain exactly four digits."
+        case .keychain:
+            return "The profile PIN could not be saved securely."
+        }
+    }
+}
+
+/// PINs are device-local and kept in the Keychain; profile/account sync never
+/// receives the secret. The UserDefaults marker clears orphaned Keychain items
+/// after an app reinstall, when the profile database no longer exists.
+private enum ProfilePinStore {
+    private static let service = "com.nuvio.tv.profile-pin"
+    private static let initializedKey = "nuvio.profilePins.keychainInitialized"
+
+    static func prepareForUse() {
+        guard !UserDefaults.standard.bool(forKey: initializedKey) else { return }
+        SecItemDelete([
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service
+        ] as CFDictionary)
+        UserDefaults.standard.set(true, forKey: initializedKey)
+    }
+
+    static func hasPin(for profileId: String) -> Bool {
+        pin(for: profileId) != nil
+    }
+
+    static func pin(for profileId: String) -> String? {
+        var query = keychainQuery(for: profileId)
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    static func save(_ pin: String, for profileId: String) throws {
+        let data = Data(pin.utf8)
+        var addQuery = keychainQuery(for: profileId)
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecValueData as String] = data
+
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            let updateStatus = SecItemUpdate(
+                keychainQuery(for: profileId) as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            )
+            guard updateStatus == errSecSuccess else { throw ProfilePinError.keychain(updateStatus) }
+        } else if status != errSecSuccess {
+            throw ProfilePinError.keychain(status)
+        }
+    }
+
+    static func removePin(for profileId: String) throws {
+        let status = SecItemDelete(keychainQuery(for: profileId) as CFDictionary)
+        guard status == errSecSuccess || status == errSecItemNotFound else {
+            throw ProfilePinError.keychain(status)
+        }
+    }
+
+    private static func keychainQuery(for profileId: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: profileId
+        ]
     }
 }
 
@@ -493,6 +653,29 @@ public class ProfileViewModel: ObservableObject {
         updateProfileAvatar(id: id, avatarId: avatarId)
     }
 
+    public func updateProfileName(id: String, name: String) {
+        let name = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty else { return }
+
+        guard let manager = profileManager else {
+            if let index = profiles.firstIndex(where: { $0.id == id }) {
+                profiles[index].name = name
+                if activeProfile?.id == id {
+                    activeProfile = profiles[index]
+                }
+            }
+            return
+        }
+
+        do {
+            try manager.updateProfileName(id: id, name: name)
+            loadProfiles()
+            loadActiveProfile()
+        } catch {
+            print("Failed to update profile name: \(error)")
+        }
+    }
+
     public func updateProfileAvatar(id: String, avatarId: String) {
         guard !avatarId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return }
 
@@ -515,6 +698,29 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func updateProfilePin(id: String, pin: String?) -> Bool {
+        guard let manager = profileManager else { return false }
+        do {
+            try manager.updateProfilePin(id: id, pin: pin)
+            loadProfiles()
+            loadActiveProfile()
+            return true
+        } catch {
+            print("Failed to update profile PIN: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    public func verifyProfilePin(id: String, pin: String) -> Bool {
+        do {
+            return try profileManager?.verifyPin(id: id, pin: pin) == true
+        } catch {
+            print("Failed to verify profile PIN: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     public func requestSwitch(to profile: Profile) {
         if profile.isPinProtected {
             self.pendingProfileId = profile.id
@@ -530,9 +736,11 @@ public class ProfileViewModel: ObservableObject {
     }
 
     private func switchProfile(id: String, pin: String?) {
-        if let pin = pin, !pin.isEmpty {
-            // Stub: accept any PIN
-            _ = pin
+        if profileManager?.hasPin(id: id) == true {
+            guard let pin, !pin.isEmpty, verifyProfilePin(id: id, pin: pin) else {
+                pinError = "Incorrect PIN"
+                return
+            }
         }
         do {
             try profileManager?.switchProfile(id: id)
@@ -570,7 +778,12 @@ public class ProfileViewModel: ObservableObject {
             // away from who's-watching listens to `profileChosen`, not
             // `activeProfile`, so this can't yank the user into a profile.
             loadActiveProfile()
-            guard profiles == remoteProfiles,
+            let expectedProfiles = remoteProfiles.map { profile in
+                var profile = profile
+                profile.isPinProtected = manager.hasPin(id: profile.id)
+                return profile
+            }
+            guard profiles == expectedProfiles,
                   let activeProfile,
                   profiles.contains(where: { $0.id == activeProfile.id }) else {
                 print("Persisted remote profiles did not reload as written; using the pulled profiles in memory.")
@@ -617,7 +830,7 @@ public class ProfileViewModel: ObservableObject {
             print("Failed to reset signed-out profile: \(error)")
         }
         profiles = [guest]
-        activeProfile = nil
+        activeProfile = guest
 
         // Sign-out is a full local reset: no watch history, watched marks,
         // library items, add-ons, API keys, or preferences may survive into
@@ -633,11 +846,11 @@ public class ProfileViewModel: ObservableObject {
         ProfileSettings.eraseAll(profileIds: previousIds + (1...6).map(String.init) + [guest.id])
         NuvioSyncManager.eraseProfileIndexBindings()
 
-        ContinueWatchingStore.setActiveProfile(nil)
-        LibraryStore.setActiveProfile(nil)
-        WatchedStore.setActiveProfile(nil)
-        CollectionsStore.setActiveProfile(nil)
-        ProfileSettings.clearActiveProfile()
+        ContinueWatchingStore.setActiveProfile(guest.id)
+        LibraryStore.setActiveProfile(guest.id)
+        WatchedStore.setActiveProfile(guest.id)
+        CollectionsStore.setActiveProfile(guest.id)
+        ProfileSettings.setActiveProfile(guest.id)
     }
 }
 

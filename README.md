@@ -25,21 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 2.8](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.8) (build 37) is the current tvOS release. Download the unsigned IPA here:
+[Beta 2.9](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.9) (build 38) is the current tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-2.8-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.8/NuvioTV-2.8-unsigned.ipa)
+[NuvioTV-2.9-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.9/NuvioTV-2.9-unsigned.ipa)
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
-Beta 2.8 focuses on reliable account recovery, Apple TV Top Shelf playback, and player restoration after switching apps:
+Beta 2.9 focuses on navigation polish, catalog browsing, focus stability, and profile management:
 
-- Large synced Continue Watching payloads no longer crash tvOS by falling back to oversized UserDefaults storage; progress remains file-backed and sync fails safely if storage is unavailable.
-- Continue Watching is republished to Apple TV Top Shelf whenever the active profile loads, restoring the row after an update or signing change.
-- Top Shelf Continue Watching cards start playback directly, including URL-less synced and Next Up entries, and preserve the action through cold launch/profile selection.
-- Returning after watching another tvOS app restores the last verified player position instead of accepting MPV's transient jump to the final frame.
-- Player restoration preserves whether playback was playing or manually paused before the app switch.
+- Back from a working stream returns to Details, while backing out of a stream that never started reopens the stream picker at the failed selection point.
+- Home, Search, Discover, and Library retain the selected card outline across Details transitions without flashing or jumping to another row.
+- Add-on Home catalogs now paginate from their original manifest and required genre instead of stopping after the initial non-Cinemeta page.
+- Search and Discover keep catalog cards below their controls, and Recent Searches has a reachable Liquid Glass Clear action at the end of the row.
+- Library adds content-type and genre filters with a consistent poster grid.
+- tvOS 27 shows the active profile name and avatar in the sidebar; profile name, avatar, and secure four-digit PIN management now live in Settings.
 
-Known issues include a no-audio report on one sideloaded Apple TV setup. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
+Known issues include a no-audio report on one sideloaded Apple TV setup. Search bottom-edge presentation still needs verification on a physical Apple TV. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 
 ## About
 
