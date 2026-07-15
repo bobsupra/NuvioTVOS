@@ -34,3 +34,7 @@ server
 # Built IPAs are distributed via GitHub Releases, not committed
 *.ipa
 build-ipa/
+
+# Local Xcode/Swift build products
+/.build/
+*.xcarchive/
