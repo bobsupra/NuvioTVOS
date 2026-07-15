@@ -131,12 +131,12 @@ cache settings unchanged.
 
 ## Beta release workflow
 
-Last verified: Beta 2.9.1 on 2026-07-15.
+Last verified: Beta 3 on 2026-07-15.
 
 1. Confirm `main` and `origin/main` are aligned, inspect the latest `tvos-beta-*` tag, and preserve unrelated dirty files.
 2. Bump `CFBundleShortVersionString` and `CFBundleVersion` in both `tvosApp/NuvioTV/Info.plist` and `tvosApp/TopShelf/Info.plist`.
 3. Update the Latest tvOS Beta section in `README.md` and add `release/tvos-beta-X.Y.md` with Fixed and improved plus Known issues.
-4. Build from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`, Release, generic tvOS destination, with signing disabled. The published MPVKit binary lacks the required tvOS slices on this machine, so temporarily point Libplacebo, FFmpeg, and Libmpv binary targets in `MPVKit/Package.swift` at `dist/release/xcframework/*.xcframework`; restore the manifest exactly after the archive succeeds.
+4. Build from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`, Release, generic tvOS destination, with signing disabled. Beta 3 uses the public `bobsupra/MPVKit` Nuvio branch and `0.41.0-n8.1.2-nuvio.4` Libmpv artifact, which includes both AVFoundation audio and MoltenVK video support for tvOS.
 5. Xcode 27 beta can crash in Release optimization for `AddonManifest.supportsResource`; keep its targeted `@_optimize(none)` workaround and archive with `SWIFT_ENABLE_BATCH_MODE=NO`.
 6. Package `NuvioTV.app` inside `Payload/` as `artifacts/NuvioTV-X.Y-unsigned-release.ipa` and verify the ZIP, app/Top Shelf version and build, arm64 executable, unsigned status, byte size, and SHA-256.
 7. Stage only the intended source, version, notes, archive, IPA, and requested memory changes. Do not stage unrelated `.DS_Store` changes. Commit as `Release tvOS beta X.Y`.

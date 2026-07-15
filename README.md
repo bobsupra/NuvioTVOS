@@ -25,19 +25,21 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 2.9.1](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-2.9.1) (build 39) is the current tvOS release. Download the unsigned IPA here:
+[Beta 3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3) (version 3.0, build 40) is the current tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-2.9.1-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-2.9.1/NuvioTV-2.9.1-unsigned.ipa)
+[NuvioTV-3-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3/NuvioTV-3-unsigned.ipa)
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
-Beta 2.9.1 is a focused Apple TV audio compatibility update and includes everything from Beta 2.9:
+Beta 3 focuses on reliable Apple TV playback and remote interaction:
 
-- Playback now follows the active tvOS audio route's preferred channel layout and falls back safely to stereo when the route cannot report one.
-- This avoids requesting unsupported source layouts from HDMI receivers, soundbars, TVs, and HomePods, which could produce video with no usable audio.
-- All navigation, catalog, library, profile, PIN, and playback improvements from Beta 2.9 remain included.
+- MPV now renders audio through AVFoundation, avoiding the AudioUnit/RemoteIO no-audio failure seen when Apple TV Sound Format is set to Automatic with Dolby Atmos enabled.
+- The custom MPVKit build includes MoltenVK video output alongside AVFoundation audio, fixing the black-screen regression from the first audio test build.
+- Skip Intro, Skip Ending, and Next Episode cards are real focusable buttons, so the Siri Remote Select action works reliably.
+- Episode replacement clears stale playback time before MPV publishes the new timeline, preventing old end-of-episode UI from reappearing.
+- Home now mirrors its manual row movement into native scroll state so tvOS can collapse the Home tab pill consistently with Search and Library.
 
-The audio-route change still needs broad physical-device verification across TVs, receivers, soundbars, and HomePods. Search bottom-edge presentation also needs verification on a physical Apple TV. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
+The new audio/video path and Home tab-pill behavior still need broad physical-device verification across TVs, receivers, soundbars, and HomePods. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 
 ## About
 

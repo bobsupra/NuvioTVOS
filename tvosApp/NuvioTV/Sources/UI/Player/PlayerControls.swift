@@ -331,7 +331,6 @@ struct NextEpisodeOverlay: View {
     let countdown: Int?
     let isAdvancing: Bool
     var isFocused: Bool
-    let onPlay: () -> Void
 
     private var episodeLine: String {
         "S\(episode.season) E\(episode.episode) • \(episode.title)"
@@ -438,7 +437,6 @@ struct SkipSegmentOverlay: View {
     let interval: SkipInterval
     let countdown: Int?
     var isFocused: Bool
-    let onSkip: () -> Void
 
     var body: some View {
         HStack(spacing: 16) {

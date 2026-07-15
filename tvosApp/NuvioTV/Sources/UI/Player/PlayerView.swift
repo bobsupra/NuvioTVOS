@@ -47,7 +47,12 @@ struct PlayerView: View {
                 // the catcher can re-grab first responder — the SwiftUI focus
                 // engine hands first responder to the focused control otherwise,
                 // and a sibling controller would silently stop receiving presses.
+                // A focused skip/next card must own first responder so its
+                // Select press reaches the SwiftUI Button. The parent
+                // onMoveCommand still handles left/right while either card is up.
                 isActive: !viewModel.showSettingsPanel
+                    && !viewModel.showSkipSegmentCard
+                    && !viewModel.showNextEpisodeCard
                     && (!viewModel.showControls || viewModel.isTimelineFocused),
                 onBeginBackward: { viewModel.beginRepeatingSkipBackward() },
                 onBeginForward: { viewModel.beginRepeatingSkipForward() },
@@ -107,14 +112,15 @@ struct PlayerView: View {
                 .accessibilityHidden(true)
 
             if viewModel.showSkipSegmentCard, let interval = viewModel.activeSkipInterval {
-                SkipSegmentOverlay(
-                    interval: interval,
-                    countdown: viewModel.skipSegmentCountdown,
-                    isFocused: skipSegmentFocused,
-                    onSkip: { viewModel.skipActiveInterval() }
-                )
-                .onTapGesture { viewModel.skipActiveInterval() }
-                .focusable(true)
+                Button(action: { viewModel.skipActiveInterval() }) {
+                    SkipSegmentOverlay(
+                        interval: interval,
+                        countdown: viewModel.skipSegmentCountdown,
+                        isFocused: skipSegmentFocused
+                    )
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focusEffectDisabledIfAvailable()
                 .focused($skipSegmentFocused)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
                 .padding(.leading, 60)
@@ -128,16 +134,17 @@ struct PlayerView: View {
             // only when the controls are down so it doesn't fight them for focus.
             // Left/Right still fast-forward, which cancels the countdown.
             if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
-                NextEpisodeOverlay(
-                    episode: next,
-                    countdown: viewModel.nextEpisodeCountdown,
-                    isAdvancing: viewModel.isAdvancingEpisode,
-                    isFocused: nextEpisodeFocused,
-                    onPlay: { viewModel.playNextEpisode() }
-                )
-                .focusable(true)
+                Button(action: { viewModel.playNextEpisode() }) {
+                    NextEpisodeOverlay(
+                        episode: next,
+                        countdown: viewModel.nextEpisodeCountdown,
+                        isAdvancing: viewModel.isAdvancingEpisode,
+                        isFocused: nextEpisodeFocused
+                    )
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focusEffectDisabledIfAvailable()
                 .focused($nextEpisodeFocused)
-                .onTapGesture { viewModel.playNextEpisode() }
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 .padding(.trailing, 60)
                 .padding(.bottom, viewModel.showControls ? 200 : 54)

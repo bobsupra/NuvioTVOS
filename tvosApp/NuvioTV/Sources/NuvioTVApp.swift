@@ -1328,6 +1328,47 @@ private final class TVHomeRowScrollStore {
     }
 }
 
+/// Supplies the native vertical scroll state that tvOS uses to collapse the
+/// sidebar pill. Home keeps its catalog rows manually positioned for focus and
+/// performance, so this noninteractive scroll view mirrors whether focus is at
+/// the top of the catalog without changing Home's visible layout.
+private struct HomeTabBarScrollState: View {
+    let rowIndex: Int
+
+    var body: some View {
+        GeometryReader { geometry in
+            ScrollViewReader { proxy in
+                ScrollView(.vertical, showsIndicators: false) {
+                    VStack(spacing: 0) {
+                        Color.clear
+                            .frame(height: geometry.size.height)
+                            .id(0)
+                        Color.clear
+                            .frame(height: geometry.size.height)
+                            .id(1)
+                    }
+                }
+                .onAppear {
+                    scroll(to: rowIndex, using: proxy)
+                }
+                .onChange(of: rowIndex) { newValue in
+                    scroll(to: newValue, using: proxy)
+                }
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
+    private func scroll(to rowIndex: Int, using proxy: ScrollViewProxy) {
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            proxy.scrollTo(rowIndex == 0 ? 0 : 1, anchor: .top)
+        }
+    }
+}
+
 struct TVHomeView: View {
     @ObservedObject var store: TVHomeStore
     let repository: CatalogRepository
@@ -1377,6 +1418,8 @@ struct TVHomeView: View {
 
     var body: some View {
         ZStack(alignment: .topLeading) {
+            HomeTabBarScrollState(rowIndex: focusedRowIndex)
+
             // 1. Bottom Layer: Full Screen Crossfading Backdrop
             CrossfadingBackdrop(
                 url: homeBackdropURL,
@@ -1526,7 +1569,7 @@ struct TVHomeView: View {
                         .padding(.top, 20)
                         .frame(width: proxy.size.width, alignment: .topLeading)
                         .offset(y: verticalOffset)
-                        .animation(smoothFocus ? .spring(response: 0.4, dampingFraction: 0.95) : nil, value: verticalOffset)
+                        .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 0.82) : nil, value: verticalOffset)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .clipShape(VerticalEdgeClip())

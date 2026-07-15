@@ -229,6 +229,10 @@ class PlayerViewModel: ObservableObject {
         self.title = meta.name
         self.subtitle = subtitle
         self.status = .buffering
+        // A replaced file keeps the previous file's position/duration cached in
+        // the controller until mpv publishes the new timeline. Clear the public
+        // timeline now so end-of-episode UI cannot be re-armed for the new episode.
+        self.time = PlayerTime()
         self.activeMeta = meta
         self.activeStreamURL = url.absoluteString
         self.activeEpisodeNumbers = isTrailerPlayback
@@ -633,9 +637,16 @@ class PlayerViewModel: ObservableObject {
         // The settings panel does not display playback time. Publish at most
         // once per displayed second while it is open, while the controller is
         // still polled at 4 Hz for playback/error handling.
-        if !showSettingsPanel ||
+        // During `loadfile replace`, the controller deliberately marks its time
+        // sample incoherent while its numeric properties still contain the old
+        // file's final position. Do not republish that stale timeline.
+        if c.hasCoherentTimeSample,
+           latestTime.duration > 0,
+           latestTime.current >= 0,
+           latestTime.current < latestTime.duration,
+           (!showSettingsPanel ||
             Int(latestTime.current) != Int(time.current) ||
-            latestTime.duration != time.duration {
+            latestTime.duration != time.duration) {
             if latestTime != time { time = latestTime }
         }
 
@@ -1638,7 +1649,7 @@ final class MPVPlayerViewController: UIViewController {
     var onPlaybackSuspended: ((Int64, Int64) -> Void)?
 
 
-    private static let defaultAudioOutput = "audiounit"
+    private static let defaultAudioOutput = "avfoundation"
 
     private let errorStateLock = NSLock()
     private var metalLayer = MPVMetalLayer()
@@ -1757,14 +1768,17 @@ final class MPVPlayerViewController: UIViewController {
         checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))
         checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
         checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
-        // Follow the active tvOS route's preferred layout and fall back to
-        // stereo when it cannot report one. `auto` can request the source's
-        // original layout even when an HDMI receiver, soundbar, or HomePod
-        // route cannot accept it, resulting in video with no usable audio.
+        // AVSampleBufferAudioRenderer follows tvOS's active output route without
+        // using the failing RemoteIO callback from MPV's AudioUnit backend.
         checkError(mpv_set_option_string(mpv, "audio-channels", "auto-safe"))
+        // AVFoundation accepts interleaved PCM; packed float preserves decoded
+        // precision while supporting route-selected stereo or multichannel audio.
+        checkError(mpv_set_option_string(mpv, "audio-format", "float"))
         // Headroom for the Audio → Amplification control (+10 dB ≈ 316%).
         checkError(mpv_set_option_string(mpv, "volume-max", "400"))
-        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "yes"))
+        // Do not silently replace a failed audio renderer with `ao=null` and
+        // continue as video-only playback.
+        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
 
         // Network buffering. Stremio/debrid links are bursty and often throttle,
         // so prefetch aggressively: `demuxer-max-bytes` is the forward ("preload")
