@@ -72,6 +72,8 @@ enum SettingsKey {
     /// settings; the repository skips these rows. Not part of `all` — it syncs
     /// through its own RPC, not the tvOS settings blob.
     static let homeCatalogDisabled = "nuvio.tv.settings.layout.homeCatalogDisabled"
+    /// Collection ids hidden from Home via the account layout sync.
+    static let homeCollectionDisabled = "nuvio.tv.settings.layout.homeCollectionDisabled"
     /// JSON `[String]` of account catalog keys (`<addonId>_<type>_<catalogId>`)
     /// in the account's Home order. The repository orders the add-on catalog
     /// rows by this; kept separate from `homeCatalogOrder` (the local tvOS
@@ -1945,7 +1947,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.subtitleLanguageSecondary) private var subtitleLanguageSecondary = "None"
     @AppStorage(SettingsKey.subtitleLanguageTertiary) private var subtitleLanguageTertiary = "None"
     @AppStorage(SettingsKey.forcedSubtitles) private var forcedSubtitles = true
-    @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Off"
+    @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Always"
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
 
     private let engines = ["Auto", "AVPlayer", "MPVKit"]
@@ -1959,7 +1961,7 @@ private struct PlaybackSettingsView: View {
             SettingsGroup(title: "Player", subtitle: "Playback engine and episode flow") {
                 SettingsOptionRow(
                     title: "Player Engine",
-                    subtitle: "Preferred internal playback path",
+                    subtitle: "Auto starts with MPVKit, then switches supported Dolby Vision profiles 5/8 to native AVPlayer after an on-device remux; unsupported DV stays on HDR10/PQ fallback",
                     selection: $playerEngine,
                     options: engines,
                     accentColor: accentColor
@@ -1983,7 +1985,7 @@ private struct PlaybackSettingsView: View {
 
                 SettingsOptionRow(
                     title: "Frame Rate Matching",
-                    subtitle: "Match display refresh to video where supported",
+                    subtitle: "Match display refresh to video; Apple TV Match Content must also be enabled",
                     selection: $frameRateMatching,
                     options: frameRateModes,
                     accentColor: accentColor
@@ -1991,7 +1993,7 @@ private struct PlaybackSettingsView: View {
 
                 SettingsOptionRow(
                     title: "Network Cache",
-                    subtitle: "Preload buffer size — Auto scales to device RAM, Large forces 1 GB",
+                    subtitle: "Preload buffer — Auto scales to device RAM (keeps memory low to avoid kills). Small if the app still closes during long plays",
                     selection: $networkCache,
                     options: cacheModes,
                     accentColor: accentColor
@@ -3154,77 +3156,146 @@ private struct HomeCatalogOrderRow: View {
 
 // MARK: - Collections manager
 
-/// Settings → Layout → Collections: view, create, pin, and delete the
-/// account's collections and attach add-on catalogs to them. Edits mutate the
-/// raw synced JSON (so Android-only fields survive) and push to the account.
+/// Settings → Layout → Collections: Android-style Export / Import / New entry
+/// points, liquid-glass panels, and a full create/edit form. Edits mutate the
+/// raw synced JSON so Android-only fields survive the round-trip.
 private struct CollectionsSettingsSection: View {
     let accentColor: Color
 
     @State private var collections: [[String: Any]] = []
-    @State private var showingCreate = false
-    @State private var pickerTarget: CollectionPickerTarget?
+    @State private var activeSheet: CollectionsSheet?
+    @State private var statusToast: String?
+    @State private var toastClearTask: Task<Void, Never>?
 
     var body: some View {
         SettingsGroup(title: "Collections", subtitle: "Group catalogs into folders on your home screen") {
-            ForEach(Array(collections.enumerated()), id: \.offset) { index, collection in
-                CollectionSettingsRow(
-                    name: (collection["title"] as? String) ?? "Untitled",
-                    detail: detailText(for: collection),
-                    isPinned: (collection["pinToTop"] as? Bool) ?? false,
-                    accentColor: accentColor,
-                    onAddCatalog: { pickerTarget = CollectionPickerTarget(index: index) },
-                    onTogglePin: { togglePin(index) },
-                    onDelete: { remove(index) }
-                )
+            CollectionsActionBar(
+                accentColor: accentColor,
+                canExport: !collections.isEmpty,
+                onExport: exportCollections,
+                onImport: { activeSheet = .importCollections },
+                onNew: { activeSheet = .editor(nil) }
+            )
+
+            if collections.isEmpty {
+                Text("No collections yet. Use New Collection, or Import a JSON backup.")
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white.opacity(0.5))
+                    .padding(.vertical, 8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } else {
+                ForEach(Array(collections.enumerated()), id: \.offset) { index, collection in
+                    CollectionSettingsRow(
+                        name: (collection["title"] as? String) ?? "Untitled",
+                        detail: detailText(for: collection),
+                        isPinned: (collection["pinToTop"] as? Bool) ?? false,
+                        accentColor: accentColor,
+                        onEdit: { activeSheet = .editor(index) },
+                        onTogglePin: { togglePin(index) },
+                        onDelete: { remove(index) }
+                    )
+                }
             }
 
-            CreateCollectionRow(accentColor: accentColor) {
-                showingCreate = true
+            if let statusToast {
+                Text(statusToast)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(accentColor)
+                    .transition(.opacity)
             }
         }
         .onAppear { collections = CollectionsStore.rawCollections() }
         .onReceive(NotificationCenter.default.publisher(for: CollectionsStore.changedNotification)) { _ in
             collections = CollectionsStore.rawCollections()
         }
-        .sheet(isPresented: $showingCreate) {
-            CreateCollectionSheet { name in
-                create(named: name)
+        .sheet(item: $activeSheet) { sheet in
+            Group {
+                switch sheet {
+                case .importCollections:
+                    ImportCollectionsSheet(accentColor: accentColor) { imported in
+                        importCollections(imported)
+                    }
+                case .editor(let index):
+                    CollectionEditorSheet(
+                        accentColor: accentColor,
+                        existing: index.flatMap { collections[safe: $0] },
+                        onSave: { payload in
+                            if let index {
+                                guard collections.indices.contains(index) else { return }
+                                // Preserve unknown Android-only keys by merging onto the existing dict.
+                                var merged = collections[index]
+                                for (key, value) in payload { merged[key] = value }
+                                collections[index] = merged
+                            } else {
+                                collections.append(payload)
+                            }
+                            CollectionsStore.saveLocalEdit(collections)
+                        }
+                    )
+                }
             }
-        }
-        .sheet(item: $pickerTarget) { target in
-            CollectionCatalogPickerSheet(
-                collectionName: (collections[safe: target.index]?["title"] as? String) ?? "",
-                selectedIds: selectedSourceIds(at: target.index),
-                onToggle: { option in toggleSource(option, at: target.index) }
-            )
+            // Let liquid glass frost over Settings instead of an opaque sheet plate.
+            .modifier(ClearPresentationBackgroundIfAvailable())
         }
     }
 
     private func detailText(for collection: [String: Any]) -> String {
         let folders = (collection["folders"] as? [[String: Any]]) ?? []
-        let sourceCount = folders.reduce(0) { $0 + ((($1["sources"] as? [[String: Any]])?.count) ?? 0) }
+        let sourceCount = folders.reduce(0) { partial, folder in
+            partial + (((folder["sources"] as? [[String: Any]])?.count) ?? 0)
+                + (((folder["catalogSources"] as? [[String: Any]])?.count) ?? 0)
+        }
         let folderText = "\(folders.count) folder\(folders.count == 1 ? "" : "s")"
         return "\(folderText) • \(sourceCount) catalog\(sourceCount == 1 ? "" : "s")"
     }
 
-    private func create(named name: String) {
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        collections.append([
-            "id": UUID().uuidString,
-            "title": trimmed,
-            "pinToTop": false,
-            "viewMode": "TABBED_GRID",
-            "showAllTab": true,
-            "folders": [[
-                "id": UUID().uuidString,
-                "title": trimmed,
-                "tileShape": "SQUARE",
-                "hideTitle": false,
-                "sources": [[String: Any]]()
-            ]]
-        ])
+    private func exportCollections() {
+        guard let data = try? JSONSerialization.data(
+            withJSONObject: collections,
+            options: [.prettyPrinted, .sortedKeys]
+        ) else {
+            showToast("Export failed")
+            return
+        }
+        // tvOS has no general pasteboard/share sheet for arbitrary files in this
+        // context — write a stable JSON export the Import flow can re-load.
+        let url = Self.collectionsExportURL
+        do {
+            try data.write(to: url, options: .atomic)
+            showToast("Exported to Documents/nuvio-collections.json")
+        } catch {
+            showToast("Export failed: \(error.localizedDescription)")
+        }
+    }
+
+    static var collectionsExportURL: URL {
+        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("nuvio-collections.json")
+    }
+
+    private func importCollections(_ imported: [[String: Any]]) {
+        // Merge by id: imported wins on collision, existing keep unique entries.
+        var byId: [String: [String: Any]] = [:]
+        for row in collections {
+            if let id = row["id"] as? String { byId[id] = row }
+        }
+        for row in imported {
+            if let id = row["id"] as? String { byId[id] = row }
+        }
+        // Preserve order: existing first, then newly imported ids.
+        var merged: [[String: Any]] = []
+        var seen = Set<String>()
+        for row in collections {
+            guard let id = row["id"] as? String, let latest = byId[id], seen.insert(id).inserted else { continue }
+            merged.append(latest)
+        }
+        for row in imported {
+            guard let id = row["id"] as? String, let latest = byId[id], seen.insert(id).inserted else { continue }
+            merged.append(latest)
+        }
+        collections = merged
         CollectionsStore.saveLocalEdit(collections)
+        showToast("Imported \(imported.count) collection\(imported.count == 1 ? "" : "s")")
     }
 
     private func togglePin(_ index: Int) {
@@ -3240,68 +3311,29 @@ private struct CollectionsSettingsSection: View {
         CollectionsStore.saveLocalEdit(collections)
     }
 
-    /// Sources already attached anywhere in the collection, as option ids.
-    private func selectedSourceIds(at index: Int) -> Set<String> {
-        guard let folders = collections[safe: index]?["folders"] as? [[String: Any]] else { return [] }
-        var ids = Set<String>()
-        for folder in folders {
-            for source in (folder["sources"] as? [[String: Any]]) ?? [] {
-                if let addonId = source["addonId"] as? String,
-                   let type = source["type"] as? String,
-                   let catalogId = source["catalogId"] as? String {
-                    ids.insert("\(addonId)_\(type)_\(catalogId)")
-                }
+    private func showToast(_ message: String) {
+        toastClearTask?.cancel()
+        withAnimation(.easeOut(duration: 0.2)) { statusToast = message }
+        toastClearTask = Task {
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                withAnimation(.easeOut(duration: 0.2)) { statusToast = nil }
             }
         }
-        return ids
-    }
-
-    /// Adds/removes the catalog in the collection's first folder (created on
-    /// demand), leaving every other field of the JSON untouched.
-    private func toggleSource(_ option: AddonCatalogOption, at index: Int) {
-        guard collections.indices.contains(index) else { return }
-        var folders = (collections[index]["folders"] as? [[String: Any]]) ?? []
-        if folders.isEmpty {
-            folders = [[
-                "id": UUID().uuidString,
-                "title": (collections[index]["title"] as? String) ?? "Folder",
-                "tileShape": "SQUARE",
-                "hideTitle": false,
-                "sources": [[String: Any]]()
-            ]]
-        }
-
-        let matches: ([String: Any]) -> Bool = { source in
-            source["addonId"] as? String == option.addonId
-                && source["type"] as? String == option.type
-                && source["catalogId"] as? String == option.catalogId
-        }
-
-        if selectedSourceIds(at: index).contains(option.id) {
-            for folderIndex in folders.indices {
-                var sources = (folders[folderIndex]["sources"] as? [[String: Any]]) ?? []
-                sources.removeAll(where: matches)
-                folders[folderIndex]["sources"] = sources
-            }
-        } else {
-            var sources = (folders[0]["sources"] as? [[String: Any]]) ?? []
-            sources.append([
-                "provider": "addon",
-                "addonId": option.addonId,
-                "type": option.type,
-                "catalogId": option.catalogId
-            ])
-            folders[0]["sources"] = sources
-        }
-
-        collections[index]["folders"] = folders
-        CollectionsStore.saveLocalEdit(collections)
     }
 }
 
-private struct CollectionPickerTarget: Identifiable {
-    let index: Int
-    var id: Int { index }
+private enum CollectionsSheet: Identifiable {
+    case importCollections
+    case editor(Int?)
+
+    var id: String {
+        switch self {
+        case .importCollections: return "import"
+        case .editor(let index): return "editor-\(index.map(String.init) ?? "new")"
+        }
+    }
 }
 
 private extension Array {
@@ -3310,12 +3342,105 @@ private extension Array {
     }
 }
 
+/// Export / Import / New Collection actions — same Liquid Glass language as LoginView.
+private struct CollectionsActionBar: View {
+    let accentColor: Color
+    let canExport: Bool
+    let onExport: () -> Void
+    let onImport: () -> Void
+    let onNew: () -> Void
+
+    var body: some View {
+        HStack(spacing: 14) {
+            CollectionsGlassButton(
+                title: "Export",
+                systemImage: "square.and.arrow.up",
+                prominent: false,
+                disabled: !canExport,
+                action: onExport
+            )
+            CollectionsGlassButton(
+                title: "Import",
+                systemImage: "square.and.arrow.down",
+                prominent: false,
+                disabled: false,
+                action: onImport
+            )
+            CollectionsGlassButton(
+                title: "New Collection",
+                systemImage: "plus",
+                prominent: true,
+                disabled: false,
+                action: onNew
+            )
+        }
+        .padding(28)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .loginGlassPanel()
+    }
+}
+
+/// Settings-style capsule button — flat glass fill + focus outline (matches
+/// settings pills / FilterChip) so nested glass panels don't double-box.
+private struct CollectionsGlassButton: View {
+    let title: String
+    var systemImage: String? = nil
+    var prominent: Bool = false
+    var disabled: Bool = false
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                if let systemImage { Image(systemName: systemImage) }
+                Text(title)
+            }
+            .font(.system(size: 22, weight: .semibold))
+            .foregroundColor(foreground)
+            .padding(.horizontal, 26)
+            .frame(height: 58)
+            .frame(minWidth: 180)
+            .background(chipBackground, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(borderColor, lineWidth: focused ? AppFocusOutline.width : 1)
+            )
+            .opacity(disabled ? 0.5 : 1)
+            .scaleEffect(focused && !disabled ? 1.03 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .disabled(disabled)
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .entryLockable()
+    }
+
+    private var foreground: Color {
+        if focused || prominent { return .black }
+        return .white.opacity(0.9)
+    }
+
+    private var chipBackground: Color {
+        if focused { return .white }
+        if prominent { return Color.white.opacity(0.88) }
+        return Color.white.opacity(0.08)
+    }
+
+    private var borderColor: Color {
+        if focused { return AppFocusOutline.color }
+        return Color.white.opacity(prominent ? 0.20 : 0.14)
+    }
+}
+
 private struct CollectionSettingsRow: View {
     let name: String
     let detail: String
     let isPinned: Bool
     let accentColor: Color
-    let onAddCatalog: () -> Void
+    let onEdit: () -> Void
     let onTogglePin: () -> Void
     let onDelete: () -> Void
 
@@ -3323,9 +3448,9 @@ private struct CollectionSettingsRow: View {
 
     var body: some View {
         HStack(spacing: 14) {
-            Button(action: onAddCatalog) {
+            Button(action: onEdit) {
                 SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                    Image(systemName: "folder")
+                    Image(systemName: "folder.fill")
                         .font(.system(size: 24))
                         .foregroundColor(accentColor)
                         .frame(width: 48, height: 48)
@@ -3342,7 +3467,7 @@ private struct CollectionSettingsRow: View {
                                     .foregroundColor(accentColor)
                             }
                         }
-                        Text("\(detail) — click to add catalogs")
+                        Text("\(detail) — click to edit")
                             .font(.system(size: 16, weight: .medium))
                             .foregroundColor(.white.opacity(0.56))
                             .lineLimit(1)
@@ -3362,61 +3487,1114 @@ private struct CollectionSettingsRow: View {
     }
 }
 
-private struct CreateCollectionRow: View {
+// MARK: Collection editor (New / Edit)
+
+/// Full create/edit sheet matching Android CollectionEditor essentials:
+/// name, pin-to-top, focus glow, view mode, folders, and catalog sources.
+private struct CollectionEditorSheet: View {
     let accentColor: Color
-    let action: () -> Void
+    let existing: [String: Any]?
+    let onSave: ([String: Any]) -> Void
 
-    @FocusState private var isFocused: Bool
+    @Environment(\.dismiss) private var dismiss
+    @State private var title: String = ""
+    @State private var pinToTop = false
+    @State private var focusGlowEnabled = true
+    @State private var viewMode = "TABBED_GRID"
+    @State private var showAllTab = true
+    @State private var folders: [[String: Any]] = []
+    @State private var sourcePicker: FolderSourcePicker?
 
-    var body: some View {
-        Button(action: action) {
-            SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                Image(systemName: "plus.circle")
-                    .font(.system(size: 24))
-                    .foregroundColor(accentColor)
-                    .frame(width: 48, height: 48)
+    private var isNew: Bool { existing == nil }
 
-                Text("New Collection")
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundColor(.white)
+    /// Which source-add flow is open for a folder index (Android: Catalog / TMDB / Trakt).
+    private enum FolderSourcePicker: Identifiable {
+        case catalogs(Int)
+        case tmdb(Int)
+        case trakt(Int)
 
-                Spacer(minLength: 20)
+        var id: String {
+            switch self {
+            case .catalogs(let i): return "catalogs-\(i)"
+            case .tmdb(let i): return "tmdb-\(i)"
+            case .trakt(let i): return "trakt-\(i)"
             }
         }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
-        .focusEffectDisabledIfAvailable()
-        .entryLockable()
+
+        var folderIndex: Int {
+            switch self {
+            case .catalogs(let i), .tmdb(let i), .trakt(let i): return i
+            }
+        }
+    }
+
+    private let viewModes: [(id: String, label: String)] = [
+        ("TABBED_GRID", "Tabs"),
+        ("ROWS", "Rows"),
+        ("FOLLOW_LAYOUT", "Follow layout")
+    ]
+
+    var body: some View {
+        // Match LanguagePickerWindow (Preferred Subtitle / Preferred Audio): same
+        // scrim, 900pt panel width, settingsGlass chrome, and footer layout.
+        ZStack {
+            Color.black.opacity(0.62)
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 0) {
+                // Fixed header — above scroll content (zIndex) so scrolled rows
+                // never paint through the title.
+                HStack(spacing: 18) {
+                    Image(systemName: isNew ? "folder.badge.plus" : "folder.fill")
+                        .font(.system(size: 38, weight: .semibold))
+                        .foregroundColor(accentColor)
+                        .frame(width: 58, height: 58)
+                        .settingsGlass(shape: Circle(), isProminent: true)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(isNew ? "New Collection" : "Edit Collection")
+                            .font(.system(size: 34, weight: .bold))
+                            .foregroundColor(.white)
+                        Text(isNew
+                             ? "Name the collection, pin it if you want, then add folders and catalogs."
+                             : "Update folders, pin status, and catalog sources for this collection.")
+                            .font(.system(size: 19, weight: .medium))
+                            .foregroundColor(.white.opacity(0.58))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                }
+                .padding(.bottom, 22)
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color.black.opacity(0.001)) // solid hit/layer for stacking
+                .zIndex(2)
+
+                // Clipped scroll region (same pattern as LanguagePickerWindow).
+                // Do NOT use scrollClipDisabled — that let content bleed through
+                // the header and Cancel/Create footer.
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 18) {
+                        // Same glass search bar as the Search tab (magnifier +
+                        // hidden UITextField + GlassCapsule), not a native TextField.
+                        // Do not auto-focus / open the keyboard on present.
+                        SettingsSearchStyleField(
+                            text: $title,
+                            placeholder: "Collection name",
+                            autoFocus: false
+                        )
+
+                        // Same row chrome as the rest of Settings (SettingsRowShell
+                        // + focus outline) — avoids nested glass panels / double boxes.
+                        SettingsToggleRow(
+                            title: "Pin above catalogs",
+                            subtitle: "Show this collection above standard Home rows",
+                            isOn: $pinToTop,
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: "Focus glow",
+                            subtitle: "Soft glow around focused folder cards (Android)",
+                            isOn: $focusGlowEnabled,
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: "Show All tab",
+                            subtitle: "Include an All tab when browsing folder tabs",
+                            isOn: $showAllTab,
+                            accentColor: accentColor
+                        )
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            Text("View mode")
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.55))
+                            HStack(spacing: 12) {
+                                ForEach(viewModes, id: \.id) { mode in
+                                    CollectionChipButton(
+                                        title: mode.label,
+                                        isSelected: viewMode == mode.id
+                                    ) {
+                                        viewMode = mode.id
+                                    }
+                                }
+                            }
+                        }
+
+                        Divider().background(Color.white.opacity(0.1)).padding(.vertical, 2)
+
+                        VStack(alignment: .leading, spacing: 14) {
+                            HStack {
+                                Text("Folders")
+                                    .font(.system(size: 22, weight: .bold))
+                                    .foregroundColor(.white)
+                                Spacer()
+                                CollectionsGlassButton(
+                                    title: "Add folder",
+                                    systemImage: "plus",
+                                    prominent: false,
+                                    action: addFolder
+                                )
+                            }
+
+                            if folders.isEmpty {
+                                Text("Add at least one folder, then attach catalogs.")
+                                    .font(.system(size: 18, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.5))
+                            }
+
+                            ForEach(Array(folders.enumerated()), id: \.offset) { index, folder in
+                                CollectionFolderEditorCard(
+                                    folder: binding(forFolderAt: index),
+                                    accentColor: accentColor,
+                                    onAddCatalog: { sourcePicker = .catalogs(index) },
+                                    onAddTmdb: { sourcePicker = .tmdb(index) },
+                                    onAddTrakt: { sourcePicker = .trakt(index) },
+                                    onDelete: { removeFolder(at: index) }
+                                )
+                            }
+                        }
+                    }
+                    .padding(.top, 2)
+                    // Room so the last focused control can scroll fully above footer.
+                    .padding(.bottom, 36)
+                    // Extra side inset so focus-scaled chips/buttons don't clip
+                    // against the scroll/panel edges (Add folder, View mode, etc.).
+                    .padding(.horizontal, 12)
+                }
+                .frame(maxHeight: 520)
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .focusSection()
+                .zIndex(0)
+
+                // Fixed footer — sits above scroll so Cancel/Create never sit
+                // under/over folder rows.
+                HStack(spacing: 14) {
+                    Spacer()
+                    CollectionsGlassButton(title: "Cancel", action: { dismiss() })
+                    CollectionsGlassButton(
+                        title: isNew ? "Create" : "Save",
+                        systemImage: isNew ? "plus" : "checkmark",
+                        prominent: true,
+                        disabled: !canSave,
+                        action: save
+                    )
+                }
+                .padding(.top, 22)
+                .padding(.horizontal, 12)
+                .frame(maxWidth: .infinity)
+                .background(Color.black.opacity(0.001))
+                .zIndex(2)
+            }
+            // Wider side padding than Preferred Subtitle (34) so scaled controls
+            // clear the rounded glass edge instead of getting clipped.
+            .padding(.vertical, 34)
+            .padding(.horizontal, 48)
+            .frame(width: 900)
+            .settingsGlass(shape: RoundedRectangle(cornerRadius: 34, style: .continuous), isProminent: true)
+            .overlay(
+                RoundedRectangle(cornerRadius: 34, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+            )
+            .clipShape(RoundedRectangle(cornerRadius: 34, style: .continuous))
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .onAppear(perform: loadExisting)
+        .sheet(item: $sourcePicker) { picker in
+            switch picker {
+            case .catalogs(let index):
+                CollectionCatalogPickerSheet(
+                    collectionName: folderTitle(at: index),
+                    selectedIds: selectedSourceIds(at: index),
+                    onToggle: { option in toggleSource(option, at: index) }
+                )
+            case .tmdb(let index):
+                CollectionTmdbSourceSheet(accentColor: accentColor) { payload in
+                    appendSource(payload, at: index)
+                }
+            case .trakt(let index):
+                CollectionTraktSourceSheet(accentColor: accentColor) { payload in
+                    appendSource(payload, at: index)
+                }
+            }
+        }
+    }
+
+    private var canSave: Bool {
+        !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !folders.isEmpty
+    }
+
+    private func loadExisting() {
+        guard let existing else {
+            // Seed one empty folder (title is placeholder-only until the user types).
+            folders = [Self.makeEmptyFolder(title: "")]
+            return
+        }
+        title = (existing["title"] as? String) ?? ""
+        pinToTop = (existing["pinToTop"] as? Bool) ?? false
+        focusGlowEnabled = (existing["focusGlowEnabled"] as? Bool) ?? true
+        viewMode = (existing["viewMode"] as? String) ?? "TABBED_GRID"
+        showAllTab = (existing["showAllTab"] as? Bool) ?? true
+        folders = (existing["folders"] as? [[String: Any]]) ?? []
+        if folders.isEmpty {
+            folders = [Self.makeEmptyFolder(title: "")]
+        }
+    }
+
+    private static func makeEmptyFolder(title: String) -> [String: Any] {
+        [
+            "id": UUID().uuidString,
+            "title": title,
+            "tileShape": "SQUARE",
+            "hideTitle": false,
+            "focusGifEnabled": true,
+            "sources": [[String: Any]]()
+        ]
+    }
+
+    private func save() {
+        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty, !folders.isEmpty else { return }
+        // If the only folder still has an empty title, inherit the collection name.
+        var savedFolders = folders
+        if savedFolders.count == 1 {
+            let folderTitle = (savedFolders[0]["title"] as? String ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+            if folderTitle.isEmpty {
+                savedFolders[0]["title"] = trimmed
+            }
+        }
+        var payload: [String: Any] = [
+            "id": (existing?["id"] as? String) ?? UUID().uuidString,
+            "title": trimmed,
+            "pinToTop": pinToTop,
+            "focusGlowEnabled": focusGlowEnabled,
+            "viewMode": viewMode,
+            "showAllTab": showAllTab,
+            "folders": savedFolders
+        ]
+        if let backdrop = existing?["backdropImageUrl"] as? String {
+            payload["backdropImageUrl"] = backdrop
+        }
+        onSave(payload)
+        dismiss()
+    }
+
+    private func addFolder() {
+        folders.append(Self.makeEmptyFolder(title: ""))
+    }
+
+    private func appendSource(_ source: [String: Any], at index: Int) {
+        guard folders.indices.contains(index) else { return }
+        var sources = (folders[index]["sources"] as? [[String: Any]]) ?? []
+        sources.append(source)
+        folders[index]["sources"] = sources
+    }
+
+    private func removeFolder(at index: Int) {
+        guard folders.indices.contains(index) else { return }
+        folders.remove(at: index)
+    }
+
+    private func binding(forFolderAt index: Int) -> Binding<[String: Any]> {
+        Binding(
+            get: { folders.indices.contains(index) ? folders[index] : [:] },
+            set: { newValue in
+                guard folders.indices.contains(index) else { return }
+                folders[index] = newValue
+            }
+        )
+    }
+
+    private func folderTitle(at index: Int) -> String {
+        (folders[safe: index]?["title"] as? String) ?? "Folder"
+    }
+
+    private func selectedSourceIds(at index: Int) -> Set<String> {
+        guard let folder = folders[safe: index] else { return [] }
+        var ids = Set<String>()
+        for source in (folder["sources"] as? [[String: Any]]) ?? [] {
+            if let addonId = source["addonId"] as? String,
+               let type = source["type"] as? String,
+               let catalogId = source["catalogId"] as? String {
+                ids.insert("\(addonId)_\(type)_\(catalogId)")
+            }
+        }
+        return ids
+    }
+
+    private func toggleSource(_ option: AddonCatalogOption, at index: Int) {
+        guard folders.indices.contains(index) else { return }
+        var sources = (folders[index]["sources"] as? [[String: Any]]) ?? []
+        let matches: ([String: Any]) -> Bool = { source in
+            source["addonId"] as? String == option.addonId
+                && source["type"] as? String == option.type
+                && source["catalogId"] as? String == option.catalogId
+        }
+        if sources.contains(where: matches) {
+            sources.removeAll(where: matches)
+        } else {
+            sources.append([
+                "provider": "addon",
+                "addonId": option.addonId,
+                "type": option.type,
+                "catalogId": option.catalogId
+            ])
+        }
+        folders[index]["sources"] = sources
+    }
+
+}
+
+/// Glass search-style field matching `SearchView.searchBar`: hidden UITextField
+/// (no system white pill), optional magnifier + live text, clear, `GlassCapsule`.
+private struct SettingsSearchStyleField: View {
+    @Binding var text: String
+    var placeholder: String = "Search"
+    var autoFocus: Bool = false
+    var showsClear: Bool = true
+    /// When false, omits the magnifying-glass (e.g. folder title with an icon outside).
+    var showsMagnifier: Bool = true
+    var height: CGFloat = 86
+    var fontSize: CGFloat = 30
+    var horizontalPadding: CGFloat = 34
+
+    @FocusState private var isFocused: Bool
+    @State private var isEditing = false
+
+    var body: some View {
+        ZStack(alignment: .leading) {
+            HiddenSettingsTextField(
+                text: $text,
+                isEditing: $isEditing
+            )
+            .frame(width: 1, height: 1)
+            .offset(x: -4_000)
+            .allowsHitTesting(false)
+
+            Button {
+                isFocused = true
+                isEditing = true
+            } label: {
+                Color.clear
+                    .frame(maxWidth: .infinity)
+                    .frame(height: height)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+
+            HStack(spacing: showsMagnifier ? 18 : 0) {
+                if showsMagnifier {
+                    Image(systemName: "magnifyingglass")
+                        .font(.system(size: fontSize, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.7))
+                }
+
+                Text(text.isEmpty ? placeholder : text)
+                    .font(.system(size: fontSize, weight: .regular))
+                    .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
+                    .lineLimit(1)
+                    .allowsHitTesting(false)
+
+                Spacer(minLength: 0)
+
+                if showsClear && !text.isEmpty {
+                    Button {
+                        text = ""
+                        isFocused = true
+                        isEditing = false
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .font(.system(size: fontSize))
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+                }
+            }
+        }
+        .padding(.horizontal, horizontalPadding)
+        .frame(height: height)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .modifier(GlassCapsule(focused: isFocused || isEditing))
+        .onAppear {
+            guard autoFocus else { return }
+            DispatchQueue.main.async {
+                isFocused = true
+                isEditing = true
+            }
+        }
     }
 }
 
-private struct CreateCollectionSheet: View {
-    let onCreate: (String) -> Void
+/// Settings-style chip (same glass language as category pills / FilterChip).
+/// Uses a flat fill + focus outline instead of nested `loginGlassCapsule`
+/// so chips do not read as a second glass box inside the editor panel.
+private struct CollectionChipButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
 
-    @Environment(\.dismiss) private var dismiss
-    @State private var name = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
-        VStack(spacing: 28) {
-            Text("New Collection")
-                .font(.system(size: 38, weight: .bold))
-                .foregroundColor(.white)
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundColor(textColor)
+                .padding(.horizontal, 28)
+                .frame(height: 52)
+                .background(chipBackground, in: Capsule())
+                .overlay(
+                    Capsule()
+                        .strokeBorder(borderColor, lineWidth: focused ? AppFocusOutline.width : 1)
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(focused ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+    }
 
-            TextField("Collection name", text: $name)
-                .frame(maxWidth: 700)
+    private var textColor: Color {
+        if focused { return .black }
+        return isSelected ? .white.opacity(0.96) : .white.opacity(0.85)
+    }
 
-            HStack(spacing: 20) {
-                Button("Create") {
-                    onCreate(name)
-                    dismiss()
+    private var chipBackground: Color {
+        if focused { return .white }
+        return Color.white.opacity(isSelected ? 0.18 : 0.06)
+    }
+
+    private var borderColor: Color {
+        if focused { return AppFocusOutline.color }
+        return Color.white.opacity(isSelected ? 0.28 : 0.12)
+    }
+}
+
+/// Folder create/edit card matching Android `FolderEditorContent` field order:
+/// title → cover (none/emoji/image) → focus GIF → hero backdrop/video/logo →
+/// tile shape → hide title → catalogs (addon / TMDB / Trakt).
+private struct CollectionFolderEditorCard: View {
+    @Binding var folder: [String: Any]
+    let accentColor: Color
+    let onAddCatalog: () -> Void
+    let onAddTmdb: () -> Void
+    let onAddTrakt: () -> Void
+    let onDelete: () -> Void
+
+    private enum CoverMode: String, CaseIterable, Identifiable {
+        case none = "None"
+        case emoji = "Emoji"
+        case image = "Image URL"
+        var id: String { rawValue }
+    }
+
+    private let coverEmojis = ["📁", "🎬", "⭐", "🔥", "💎", "🎮", "📺", "🚀", "❤️", "🎵", "🍿", "🏆"]
+
+    /// Matches Preferred Subtitle / LanguagePickerWindow panel radius.
+    private let cardRadius: CGFloat = 34
+
+    /// Dictionary subscripts on `Binding<[String: Any]>` do not write back
+    /// (value-type copy). Always assign a full replacement dictionary.
+    private func updateFolder(_ mutate: (inout [String: Any]) -> Void) {
+        var copy = folder
+        mutate(&copy)
+        folder = copy
+    }
+
+    private func stringBinding(_ key: String) -> Binding<String> {
+        Binding(
+            get: { (folder[key] as? String) ?? "" },
+            set: { newValue in
+                updateFolder { dict in
+                    // Title stays as "" (placeholder mode); other empty optionals drop the key.
+                    if key == "title" {
+                        dict[key] = newValue
+                        return
+                    }
+                    let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if trimmed.isEmpty {
+                        dict.removeValue(forKey: key)
+                    } else {
+                        dict[key] = trimmed
+                    }
                 }
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        )
+    }
 
-                Button("Cancel") { dismiss() }
+    private func boolBinding(_ key: String, default defaultValue: Bool) -> Binding<Bool> {
+        Binding(
+            get: { (folder[key] as? Bool) ?? defaultValue },
+            set: { newValue in updateFolder { $0[key] = newValue } }
+        )
+    }
+
+    private var tileShape: CollectionTileShape {
+        CollectionTileShape.fromStored(folder["tileShape"] as? String)
+    }
+
+    private var sources: [[String: Any]] {
+        (folder["sources"] as? [[String: Any]]) ?? []
+    }
+
+    private var coverMode: CoverMode {
+        // Non-nil key = that mode, even when the value is still empty (placeholder).
+        if folder["coverImageUrl"] != nil { return .image }
+        if folder["coverEmoji"] != nil { return .emoji }
+        return .none
+    }
+
+    private var coverImageBinding: Binding<String> {
+        Binding(
+            get: { (folder["coverImageUrl"] as? String) ?? "" },
+            // Keep the key (even empty) so Image URL mode stays selected.
+            set: { newValue in updateFolder { $0["coverImageUrl"] = newValue } }
+        )
+    }
+
+    private var coverEmojiBinding: Binding<String> {
+        Binding(
+            get: { (folder["coverEmoji"] as? String) ?? "" },
+            // Keep the key so Emoji mode stays selected while empty.
+            set: { newValue in updateFolder { $0["coverEmoji"] = newValue } }
+        )
+    }
+
+    private func setCoverMode(_ mode: CoverMode) {
+        updateFolder { dict in
+            switch mode {
+            case .none:
+                dict.removeValue(forKey: "coverImageUrl")
+                dict.removeValue(forKey: "coverEmoji")
+            case .emoji:
+                dict.removeValue(forKey: "coverImageUrl")
+                // Don't prefill emoji as "real" text — leave empty until user picks.
+                if dict["coverEmoji"] == nil {
+                    dict["coverEmoji"] = ""
+                }
+            case .image:
+                dict.removeValue(forKey: "coverEmoji")
+                if dict["coverImageUrl"] == nil {
+                    dict["coverImageUrl"] = ""
+                }
             }
         }
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.92).ignoresSafeArea())
+    }
+
+    private func sourceLabel(_ source: [String: Any]) -> String {
+        let provider = (source["provider"] as? String ?? "addon").lowercased()
+        switch provider {
+        case "tmdb":
+            let title = (source["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let type = source["tmdbSourceType"] as? String ?? "TMDB"
+            if let title, !title.isEmpty { return "TMDB · \(title)" }
+            return "TMDB · \(type)"
+        case "trakt":
+            let title = (source["title"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let title, !title.isEmpty { return "Trakt · \(title)" }
+            if let id = source["traktListId"] { return "Trakt · list \(id)" }
+            return "Trakt list"
+        default:
+            let catalogId = source["catalogId"] as? String ?? "catalog"
+            let type = (source["type"] as? String ?? "").capitalized
+            let addon = source["addonId"] as? String ?? "addon"
+            return type.isEmpty ? "\(addon) · \(catalogId)" : "\(type) · \(catalogId)"
+        }
+    }
+
+    private func removeSource(at index: Int) {
+        updateFolder { dict in
+            var list = (dict["sources"] as? [[String: Any]]) ?? []
+            guard list.indices.contains(index) else { return }
+            list.remove(at: index)
+            dict["sources"] = list
+        }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            HStack(alignment: .center, spacing: 14) {
+                // Same glass search bar as collection title — empty placeholder, no seed text.
+                SettingsSearchStyleField(
+                    text: stringBinding("title"),
+                    placeholder: "Folder title",
+                    showsMagnifier: true,
+                    height: 64,
+                    fontSize: 24,
+                    horizontalPadding: 24
+                )
+
+                CollectionsGlassButton(
+                    title: "Remove",
+                    systemImage: "trash",
+                    action: onDelete
+                )
+            }
+
+            // MARK: Cover — None / Emoji / Image URL
+            labeledSection("Cover") {
+                HStack(spacing: 12) {
+                    ForEach(CoverMode.allCases) { mode in
+                        CollectionChipButton(
+                            title: mode == .emoji && coverMode == .emoji
+                                ? {
+                                    let e = (folder["coverEmoji"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                                    return e.isEmpty ? "Emoji" : "\(e) Emoji"
+                                }()
+                                : mode.rawValue,
+                            isSelected: coverMode == mode
+                        ) {
+                            setCoverMode(mode)
+                        }
+                    }
+                }
+
+                if coverMode == .image {
+                    SettingsSearchStyleField(
+                        text: coverImageBinding,
+                        placeholder: "Image URL",
+                        height: 58,
+                        fontSize: 20,
+                        horizontalPadding: 22
+                    )
+                }
+
+                if coverMode == .emoji {
+                    SettingsSearchStyleField(
+                        text: coverEmojiBinding,
+                        placeholder: "Type or pick an emoji",
+                        showsMagnifier: false,
+                        height: 58,
+                        fontSize: 22,
+                        horizontalPadding: 22
+                    )
+                    // Dedicated emoji chips — CollectionChipButton was clipping/hiding glyphs.
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 12) {
+                            ForEach(coverEmojis, id: \.self) { emoji in
+                                CollectionEmojiChip(
+                                    emoji: emoji,
+                                    isSelected: (folder["coverEmoji"] as? String) == emoji
+                                ) {
+                                    updateFolder { $0["coverEmoji"] = emoji }
+                                }
+                            }
+                        }
+                        .padding(.vertical, 4)
+                        .padding(.horizontal, 2)
+                    }
+                }
+            }
+
+            // MARK: Focus GIF
+            labeledSection("Focus GIF") {
+                SettingsSearchStyleField(
+                    text: stringBinding("focusGifUrl"),
+                    placeholder: "GIF / animated image URL (optional)",
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+                SettingsToggleRow(
+                    title: "Play focus GIF",
+                    subtitle: "Show the GIF when this folder card is focused",
+                    isOn: boolBinding("focusGifEnabled", default: true),
+                    accentColor: accentColor
+                )
+            }
+
+            // MARK: Modern Home hero fields (Android parity)
+            labeledSection("Hero Backdrop (Modern Home)") {
+                SettingsSearchStyleField(
+                    text: stringBinding("heroBackdropUrl"),
+                    placeholder: "Custom hero backdrop URL (optional)",
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+            }
+
+            labeledSection("Hero Video (Modern Home)") {
+                SettingsSearchStyleField(
+                    text: stringBinding("heroVideoUrl"),
+                    placeholder: "Custom hero video URL (optional)",
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+            }
+
+            labeledSection("Title Logo (Modern Home)") {
+                SettingsSearchStyleField(
+                    text: stringBinding("titleLogoUrl"),
+                    placeholder: "Custom title logo URL (optional)",
+                    height: 58,
+                    fontSize: 20,
+                    horizontalPadding: 22
+                )
+            }
+
+            // MARK: Tile shape (existing)
+            labeledSection("Tile shape") {
+                HStack(spacing: 12) {
+                    ForEach(CollectionTileShape.allCases) { shape in
+                        CollectionChipButton(
+                            title: shape.label,
+                            isSelected: tileShape == shape
+                        ) {
+                            updateFolder { $0["tileShape"] = shape.rawValue }
+                        }
+                    }
+                }
+                CollectionTileShapePreview(shape: tileShape)
+            }
+
+            // MARK: Hide title
+            SettingsToggleRow(
+                title: "Hide title",
+                subtitle: "Hide the folder name on the Home card",
+                isOn: boolBinding("hideTitle", default: false),
+                accentColor: accentColor
+            )
+
+            // MARK: Catalogs — Android: Add Catalog / TMDB / Trakt
+            labeledSection("Catalogs") {
+                if sources.isEmpty {
+                    Text("No sources yet")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                } else {
+                    VStack(spacing: 10) {
+                        ForEach(Array(sources.enumerated()), id: \.offset) { index, source in
+                            HStack(spacing: 12) {
+                                Text(sourceLabel(source))
+                                    .font(.system(size: 18, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .lineLimit(1)
+                                Spacer(minLength: 8)
+                                CollectionsGlassButton(
+                                    title: "Remove",
+                                    systemImage: "xmark",
+                                    action: { removeSource(at: index) }
+                                )
+                            }
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .settingsGlass(
+                                shape: RoundedRectangle(cornerRadius: 18, style: .continuous),
+                                isProminent: false
+                            )
+                        }
+                    }
+                }
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        CollectionsGlassButton(
+                            title: "Add Catalog",
+                            systemImage: "plus",
+                            action: onAddCatalog
+                        )
+                        CollectionsGlassButton(
+                            title: "Add TMDB Source",
+                            systemImage: "plus",
+                            action: onAddTmdb
+                        )
+                        CollectionsGlassButton(
+                            title: "Add Trakt List",
+                            systemImage: "plus",
+                            action: onAddTrakt
+                        )
+                    }
+                    .padding(.vertical, 4)
+                }
+            }
+        }
+        .padding(22)
+        .settingsGlass(shape: RoundedRectangle(cornerRadius: cardRadius, style: .continuous), isProminent: false)
+        .overlay(
+            RoundedRectangle(cornerRadius: cardRadius, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+        )
+    }
+
+    @ViewBuilder
+    private func labeledSection<Content: View>(
+        _ title: String,
+        @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.white.opacity(0.55))
+            content()
+        }
+    }
+}
+
+/// Circular emoji picker chip — large glyph, no capsule clipping of emoji.
+private struct CollectionEmojiChip: View {
+    let emoji: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Text(emoji)
+                .font(.system(size: 30))
+                .frame(width: 58, height: 58)
+                .background(
+                    Circle().fill(focused ? Color.white : Color.white.opacity(isSelected ? 0.22 : 0.10))
+                )
+                .overlay(
+                    Circle()
+                        .strokeBorder(
+                            focused ? AppFocusOutline.color : Color.white.opacity(isSelected ? 0.45 : 0.16),
+                            lineWidth: focused ? AppFocusOutline.width : 1
+                        )
+                )
+                .scaleEffect(focused ? 1.08 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+    }
+}
+
+/// Small outline of poster / landscape / square so tile shape choice is visible.
+private struct CollectionTileShapePreview: View {
+    let shape: CollectionTileShape
+
+    private var previewHeight: CGFloat { 72 }
+    private var previewWidth: CGFloat { previewHeight * CGFloat(shape.aspectRatio) }
+
+    var body: some View {
+        HStack(spacing: 14) {
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color.white.opacity(0.12))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.35), lineWidth: 1.5)
+                )
+                .frame(width: previewWidth, height: previewHeight)
+                .animation(.easeOut(duration: 0.16), value: shape)
+
+            Text(shape.label)
+                .font(.system(size: 17, weight: .semibold))
+                .foregroundColor(.white.opacity(0.7))
+            Spacer()
+        }
+        .padding(.top, 4)
+    }
+}
+
+// MARK: Import collections
+
+private struct ImportCollectionsSheet: View {
+    let accentColor: Color
+    let onImport: ([[String: Any]]) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var mode: ImportMode = .file
+    @State private var loadedRows: [[String: Any]]?
+    @State private var urlText = ""
+    @State private var errorMessage: String?
+    @State private var isLoading = false
+    @State private var statusNote: String?
+
+    private enum ImportMode: String, CaseIterable, Identifiable {
+        case file = "From export file"
+        case url = "From URL"
+        var id: String { rawValue }
+    }
+
+    var body: some View {
+        ZStack {
+            Color.tvBackground.ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 24) {
+                Text("Import Collections")
+                    .font(.system(size: 40, weight: .bold))
+                    .foregroundColor(.white)
+
+                Text("Import a Nuvio collections JSON export (same format as Android). Use a prior Apple TV export, or host the JSON and fetch by URL.")
+                    .font(.system(size: 22, weight: .regular))
+                    .foregroundColor(.white.opacity(0.6))
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 12) {
+                    ForEach(ImportMode.allCases) { item in
+                        CollectionChipButton(
+                            title: item.rawValue,
+                            isSelected: mode == item
+                        ) {
+                            mode = item
+                            errorMessage = nil
+                            statusNote = nil
+                            if item == .file { loadLocalExport() }
+                        }
+                    }
+                }
+
+                Group {
+                    switch mode {
+                    case .file:
+                        VStack(alignment: .leading, spacing: 14) {
+                            Text("Looks for Documents/nuvio-collections.json — the file written by Export on this Apple TV.")
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundColor(.white.opacity(0.55))
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            CollectionsGlassButton(
+                                title: "Reload export file",
+                                systemImage: "arrow.clockwise",
+                                action: loadLocalExport
+                            )
+                        }
+                    case .url:
+                        VStack(alignment: .leading, spacing: 14) {
+                            TextField("https://…/nuvio-collections.json", text: $urlText)
+                                .font(.system(size: 22, weight: .medium))
+                                .padding(.horizontal, 24)
+                                .frame(height: 58)
+                                .modifier(GlassCapsule(focused: false))
+
+                            if isLoading {
+                                ProgressView().tint(.white)
+                            } else {
+                                CollectionsGlassButton(
+                                    title: "Fetch URL",
+                                    systemImage: "arrow.down.circle",
+                                    prominent: true,
+                                    disabled: urlText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+                                    action: { Task { await fetchURL() } }
+                                )
+                            }
+                        }
+                    }
+                }
+
+                if let loadedRows {
+                    Text("Ready to import \(loadedRows.count) collection\(loadedRows.count == 1 ? "" : "s")")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Color(red: 0.49, green: 1.0, blue: 0.61))
+                } else if let statusNote {
+                    Text(statusNote)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.55))
+                }
+
+                if let errorMessage {
+                    Text(errorMessage)
+                        .font(.system(size: 19, weight: .medium))
+                        .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                        .padding(.horizontal, 18)
+                        .padding(.vertical, 12)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color.red.opacity(0.18))
+                        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                }
+
+                Spacer(minLength: 8)
+
+                Divider().background(Color.white.opacity(0.1))
+
+                HStack(spacing: 14) {
+                    CollectionsGlassButton(title: "Cancel", action: { dismiss() })
+                    CollectionsGlassButton(
+                        title: "Import",
+                        systemImage: "square.and.arrow.down",
+                        prominent: true,
+                        disabled: loadedRows == nil,
+                        action: {
+                            if let loadedRows {
+                                onImport(loadedRows)
+                                dismiss()
+                            }
+                        }
+                    )
+                }
+            }
+            .padding(40)
+            .frame(maxWidth: 900, maxHeight: 780)
+            .loginGlassPanel()
+        }
+        .onAppear { loadLocalExport() }
+    }
+
+    private func loadLocalExport() {
+        let url = CollectionsSettingsSection.collectionsExportURL
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            loadedRows = nil
+            statusNote = "No export file found yet. Use Export first, or switch to From URL."
+            errorMessage = nil
+            return
+        }
+        do {
+            let data = try Data(contentsOf: url)
+            guard let rows = parseCollections(data: data) else {
+                loadedRows = nil
+                errorMessage = "Export file is not valid collections JSON"
+                return
+            }
+            loadedRows = rows
+            statusNote = nil
+            errorMessage = nil
+        } catch {
+            loadedRows = nil
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func fetchURL() async {
+        let trimmed = urlText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed) else {
+            errorMessage = "Invalid URL"
+            return
+        }
+        isLoading = true
+        errorMessage = nil
+        defer { isLoading = false }
+        do {
+            let (data, response) = try await URLSession.shared.data(from: url)
+            if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+                errorMessage = "HTTP \(http.statusCode)"
+                return
+            }
+            guard let rows = parseCollections(data: data) else {
+                errorMessage = "URL did not return valid collections JSON"
+                loadedRows = nil
+                return
+            }
+            loadedRows = rows
+            statusNote = nil
+            errorMessage = nil
+        } catch {
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    private func parseCollections(data: Data) -> [[String: Any]]? {
+        guard let object = try? JSONSerialization.jsonObject(with: data) else { return nil }
+        if let rows = object as? [[String: Any]] {
+            return rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) ? rows : nil
+        }
+        if let wrapped = object as? [String: Any],
+           let rows = wrapped["collections"] as? [[String: Any]],
+           rows.allSatisfy({ $0["id"] is String && $0["title"] is String }) {
+            return rows
+        }
+        return nil
     }
 }
 
@@ -3432,67 +4610,285 @@ private struct CollectionCatalogPickerSheet: View {
     @State private var isLoading = true
 
     var body: some View {
-        VStack(spacing: 24) {
-            Text("Add Catalogs to \(collectionName)")
-                .font(.system(size: 34, weight: .bold))
-                .foregroundColor(.white)
-                .lineLimit(1)
+        ZStack {
+            Color.black.opacity(0.62).ignoresSafeArea()
 
-            if isLoading {
-                ProgressView().tint(.white)
-                    .frame(maxHeight: .infinity)
-            } else if options.isEmpty {
-                Text("No add-on catalogs available. Install add-ons with catalogs first.")
-                    .font(.system(size: 22))
-                    .foregroundColor(.white.opacity(0.6))
-                    .frame(maxHeight: .infinity)
-            } else {
-                ScrollView {
-                    VStack(spacing: 12) {
-                        ForEach(options) { option in
-                            Button {
-                                if localSelected.contains(option.id) {
-                                    localSelected.remove(option.id)
-                                } else {
-                                    localSelected.insert(option.id)
-                                }
-                                onToggle(option)
-                            } label: {
-                                HStack(spacing: 14) {
-                                    Image(systemName: localSelected.contains(option.id) ? "checkmark.circle.fill" : "circle")
-                                        .font(.system(size: 24))
-                                        .foregroundColor(localSelected.contains(option.id) ? .green : .white.opacity(0.4))
-                                    VStack(alignment: .leading, spacing: 2) {
-                                        Text(option.catalogName)
-                                            .font(.system(size: 22, weight: .semibold))
-                                            .foregroundColor(.white)
-                                            .lineLimit(1)
-                                        Text("\(option.addonName) • \(option.type.capitalized)")
-                                            .font(.system(size: 16, weight: .medium))
-                                            .foregroundColor(.white.opacity(0.56))
-                                            .lineLimit(1)
+            VStack(spacing: 24) {
+                Text("Add Catalogs to \(collectionName)")
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.white)
+                    .lineLimit(1)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if isLoading {
+                    ProgressView().tint(.white)
+                        .frame(maxHeight: .infinity)
+                } else if options.isEmpty {
+                    Text("No add-on catalogs available. Install add-ons with catalogs first.")
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .frame(maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        VStack(spacing: 12) {
+                            ForEach(options) { option in
+                                let selected = localSelected.contains(option.id)
+                                Button {
+                                    if selected {
+                                        localSelected.remove(option.id)
+                                    } else {
+                                        localSelected.insert(option.id)
                                     }
-                                    Spacer()
+                                    onToggle(option)
+                                } label: {
+                                    HStack(spacing: 14) {
+                                        Image(systemName: selected ? "checkmark.circle.fill" : "circle")
+                                            .font(.system(size: 24))
+                                            .foregroundColor(selected
+                                                             ? Color(red: 0.49, green: 1.0, blue: 0.61)
+                                                             : .white.opacity(0.4))
+                                        VStack(alignment: .leading, spacing: 2) {
+                                            Text(option.catalogName)
+                                                .font(.system(size: 22, weight: .semibold))
+                                                .foregroundColor(.white)
+                                                .lineLimit(1)
+                                            Text("\(option.addonName) • \(option.type.capitalized)")
+                                                .font(.system(size: 16, weight: .medium))
+                                                .foregroundColor(.white.opacity(0.56))
+                                                .lineLimit(1)
+                                        }
+                                        Spacer()
+                                    }
+                                    .padding(.horizontal, 24)
+                                    .padding(.vertical, 16)
+                                    .settingsGlass(
+                                        shape: RoundedRectangle(cornerRadius: 22, style: .continuous),
+                                        isProminent: selected
+                                    )
                                 }
-                                .padding(.horizontal, 24)
-                                .padding(.vertical, 14)
+                                .buttonStyle(PosterCardButtonStyle())
+                                .focusEffectDisabledIfAvailable()
                             }
                         }
                     }
-                    .padding(.horizontal, 80)
+                    .frame(maxHeight: 480)
+                    .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }
+
+                HStack {
+                    Spacer()
+                    CollectionsGlassButton(
+                        title: "Done",
+                        systemImage: "checkmark",
+                        prominent: true,
+                        action: { dismiss() }
+                    )
                 }
             }
-
-            Button("Done") { dismiss() }
+            .padding(.vertical, 34)
+            .padding(.horizontal, 48)
+            .frame(width: 900)
+            .settingsGlass(shape: RoundedRectangle(cornerRadius: 34, style: .continuous), isProminent: true)
+            .overlay(
+                RoundedRectangle(cornerRadius: 34, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+            )
         }
-        .padding(.vertical, 60)
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.92).ignoresSafeArea())
         .task {
             localSelected = selectedIds
             options = await CinemetaCatalogRepository().availableAddonCatalogs()
             isLoading = false
         }
+    }
+}
+
+// MARK: - TMDB / Trakt source sheets (Android folder source buttons)
+
+/// Minimal TMDB source form — writes Android-compatible `provider: tmdb` JSON.
+private struct CollectionTmdbSourceSheet: View {
+    let accentColor: Color
+    let onAdd: ([String: Any]) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var titleText = ""
+    @State private var tmdbIdText = ""
+    @State private var sourceType = "DISCOVER"
+    @State private var mediaType = "movie"
+
+    private let sourceTypes = ["DISCOVER", "COLLECTION", "COMPANY", "NETWORK", "LIST", "PERSON", "DIRECTOR"]
+    private let mediaTypes = [("movie", "Movie"), ("tv", "TV")]
+
+    private var canAdd: Bool {
+        !titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    var body: some View {
+        sourceSheetChrome(title: "Add TMDB Source", subtitle: "Attach a TMDB list, collection, company, or discover query.") {
+            labeled("Title") {
+                SettingsSearchStyleField(text: $titleText, placeholder: "Source title", height: 58, fontSize: 20, horizontalPadding: 22)
+            }
+            labeled("TMDB ID (optional)") {
+                SettingsSearchStyleField(text: $tmdbIdText, placeholder: "Numeric TMDB id", height: 58, fontSize: 20, horizontalPadding: 22)
+            }
+            labeled("Source type") {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 10) {
+                        ForEach(sourceTypes, id: \.self) { type in
+                            CollectionChipButton(title: type.capitalized, isSelected: sourceType == type) {
+                                sourceType = type
+                            }
+                        }
+                    }
+                }
+            }
+            labeled("Media type") {
+                HStack(spacing: 12) {
+                    ForEach(mediaTypes, id: \.0) { id, label in
+                        CollectionChipButton(title: label, isSelected: mediaType == id) {
+                            mediaType = id
+                        }
+                    }
+                }
+            }
+        } footer: {
+            CollectionsGlassButton(title: "Cancel", action: { dismiss() })
+            CollectionsGlassButton(
+                title: "Add",
+                systemImage: "plus",
+                prominent: true,
+                disabled: !canAdd,
+                action: add
+            )
+        }
+    }
+
+    private func add() {
+        let trimmedTitle = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedTitle.isEmpty else { return }
+        var payload: [String: Any] = [
+            "provider": "tmdb",
+            "tmdbSourceType": sourceType,
+            "title": trimmedTitle,
+            "mediaType": mediaType,
+            "sortBy": "popularity.desc"
+        ]
+        if let id = Int(tmdbIdText.trimmingCharacters(in: .whitespacesAndNewlines)), id > 0 {
+            payload["tmdbId"] = id
+        }
+        onAdd(payload)
+        dismiss()
+    }
+}
+
+/// Minimal Trakt list form — writes Android-compatible `provider: trakt` JSON.
+private struct CollectionTraktSourceSheet: View {
+    let accentColor: Color
+    let onAdd: ([String: Any]) -> Void
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var titleText = ""
+    @State private var listIdText = ""
+    @State private var mediaType = "movie"
+
+    private let mediaTypes = [("movie", "Movie"), ("tv", "TV")]
+
+    private var canAdd: Bool {
+        !titleText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && Int64(listIdText.trimmingCharacters(in: .whitespacesAndNewlines)) != nil
+    }
+
+    var body: some View {
+        sourceSheetChrome(title: "Add Trakt List", subtitle: "Attach a public Trakt list by numeric list id.") {
+            labeled("Title") {
+                SettingsSearchStyleField(text: $titleText, placeholder: "List title", height: 58, fontSize: 20, horizontalPadding: 22)
+            }
+            labeled("Trakt list ID") {
+                SettingsSearchStyleField(text: $listIdText, placeholder: "e.g. 123456", height: 58, fontSize: 20, horizontalPadding: 22)
+            }
+            labeled("Media type") {
+                HStack(spacing: 12) {
+                    ForEach(mediaTypes, id: \.0) { id, label in
+                        CollectionChipButton(title: label, isSelected: mediaType == id) {
+                            mediaType = id
+                        }
+                    }
+                }
+            }
+        } footer: {
+            CollectionsGlassButton(title: "Cancel", action: { dismiss() })
+            CollectionsGlassButton(
+                title: "Add",
+                systemImage: "plus",
+                prominent: true,
+                disabled: !canAdd,
+                action: add
+            )
+        }
+    }
+
+    private func add() {
+        let trimmedTitle = titleText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let listId = Int64(listIdText.trimmingCharacters(in: .whitespacesAndNewlines)), listId > 0 else { return }
+        guard !trimmedTitle.isEmpty else { return }
+        onAdd([
+            "provider": "trakt",
+            "title": trimmedTitle,
+            "traktListId": listId,
+            "mediaType": mediaType,
+            "sortBy": "rank",
+            "sortHow": "asc"
+        ])
+        dismiss()
+    }
+}
+
+/// Shared liquid-glass panel chrome for the TMDB / Trakt add sheets.
+private func sourceSheetChrome<Content: View, Footer: View>(
+    title: String,
+    subtitle: String,
+    @ViewBuilder content: () -> Content,
+    @ViewBuilder footer: () -> Footer
+) -> some View {
+    ZStack {
+        Color.black.opacity(0.62).ignoresSafeArea()
+        VStack(alignment: .leading, spacing: 22) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.system(size: 19, weight: .medium))
+                    .foregroundColor(.white.opacity(0.58))
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            VStack(alignment: .leading, spacing: 18) {
+                content()
+            }
+            HStack(spacing: 14) {
+                Spacer()
+                footer()
+            }
+        }
+        .padding(.vertical, 34)
+        .padding(.horizontal, 48)
+        .frame(width: 900)
+        .settingsGlass(shape: RoundedRectangle(cornerRadius: 34, style: .continuous), isProminent: true)
+        .overlay(
+            RoundedRectangle(cornerRadius: 34, style: .continuous)
+                .strokeBorder(Color.white.opacity(0.20), lineWidth: 1)
+        )
+    }
+    .frame(maxWidth: .infinity, maxHeight: .infinity)
+}
+
+@ViewBuilder
+private func labeled<Content: View>(_ title: String, @ViewBuilder content: () -> Content) -> some View {
+    VStack(alignment: .leading, spacing: 10) {
+        Text(title)
+            .font(.system(size: 17, weight: .semibold))
+            .foregroundColor(.white.opacity(0.55))
+        content()
     }
 }
 
@@ -4189,6 +5585,19 @@ private extension View {
                 (isProminent ? Color.white.opacity(0.18) : Color.white.opacity(0.07)),
                 in: shape
             )
+        }
+    }
+}
+
+/// Makes a sheet's system plate transparent so liquid-glass content can frost
+/// over the presenter (Settings). No-op on older OS versions.
+private struct ClearPresentationBackgroundIfAvailable: ViewModifier {
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(tvOS 16.4, *) {
+            content.presentationBackground(.clear)
+        } else {
+            content
         }
     }
 }

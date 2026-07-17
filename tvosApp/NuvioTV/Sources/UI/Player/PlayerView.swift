@@ -3,6 +3,7 @@ import UIKit
 
 struct PlayerView: View {
     @StateObject private var viewModel = PlayerViewModel()
+    @Environment(\.scenePhase) private var scenePhase
 
     let url: URL
     let meta: NuvioMeta
@@ -17,8 +18,17 @@ struct PlayerView: View {
     /// selection), supplied by the app layer. Nil disables auto-advance.
     var resolveNextStream: ((NuvioVideo) async -> PreparedNextStream?)? = nil
     /// Re-resolves a fresh stream for the *current* title/episode, used to
-    /// silently recover from an expired link. Nil disables auto-reload.
-    var reloadCurrentStream: (() async -> PreparedNextStream?)? = nil
+    /// recover from an expired link, load timeout, or playback error.
+    /// `excludedURLs` are sources already tried this session. Nil disables failover.
+    var reloadCurrentStream: ((_ excludedURLs: [String]) async -> PreparedNextStream?)? = nil
+    /// Lists alternate streams for the Sources side panel.
+    var fetchPlaybackSources: ((_ contentId: String, _ type: String) async -> [NuvioStream])? = nil
+    /// Resolves a user-selected source for mid-playback switching.
+    var resolvePlaybackStream: ((
+        _ stream: NuvioStream,
+        _ contentId: String,
+        _ subtitleLine: String
+    ) async -> PreparedNextStream?)? = nil
     var onFinished: (() -> Void)? = nil
     var onPlaybackStarted: (() -> Void)? = nil
     var onBack: () -> Void
@@ -33,26 +43,38 @@ struct PlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // libmpv renders into the Metal layer owned by this controller.
-            MPVVideoSurface(controller: viewModel.playerController)
-                .ignoresSafeArea()
+            // MPV Metal surface, or AVPlayer layer for native Dolby Vision.
+            // Aspect fill/stretch is temporarily disabled — always present FIT.
+            Group {
+                if viewModel.activeEngineKind == .avPlayer {
+                    AVPlayerVideoSurface(controller: viewModel.avPlayerController)
+                } else {
+                    MPVVideoSurface(controller: viewModel.playerController)
+                }
+            }
+            .ignoresSafeArea()
+
+            // Window-level trackpad capture for Infuse-style scrubbing / peek.
+            RemoteTouchCatcher(
+                isActive: {
+                    !viewModel.showSettingsPanel
+                        && (viewModel.isScrubbing
+                            || (!viewModel.showControls && !viewModel.showNextEpisodeCard))
+                },
+                onBegan: { viewModel.remoteTouchBegan() },
+                onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
+                onEnded: { dx, dy in viewModel.remoteTouchEnded(dx: dx, dy: dy) }
+            )
+            .allowsHitTesting(false)
+            .frame(width: 0, height: 0)
 
             RemoteSeekPressCatcher(
-                // Active when the controls are hidden, or when they're up and the
-                // timeline scrubber holds focus — so a held left/right keeps
-                // seeking until release in both states. Never while the play/
-                // settings buttons are focused (there left/right navigates) or
-                // the settings panel is open. Passed as a plain Bool (not a
-                // closure) so `updateUIViewController` runs on every change and
-                // the catcher can re-grab first responder — the SwiftUI focus
-                // engine hands first responder to the focused control otherwise,
-                // and a sibling controller would silently stop receiving presses.
-                // A focused skip/next card must own first responder so its
-                // Select press reaches the SwiftUI Button. The parent
-                // onMoveCommand still handles left/right while either card is up.
+                // Hold left/right continuous seek when controls are hidden, or
+                // when the timeline is focused. (Arrow holds are unreliable while
+                // a focused progress bar owns the focus engine — hide chrome to
+                // hold-seek.)
                 isActive: !viewModel.showSettingsPanel
-                    && !viewModel.showSkipSegmentCard
-                    && !viewModel.showNextEpisodeCard
+                    && !viewModel.isScrubbing
                     && (!viewModel.showControls || viewModel.isTimelineFocused),
                 onBeginBackward: { viewModel.beginRepeatingSkipBackward() },
                 onBeginForward: { viewModel.beginRepeatingSkipForward() },
@@ -88,6 +110,40 @@ struct PlayerView: View {
                 EmptyView()
             }
 
+            // Mid-session source failover: keep video visible, show a light
+            // status card while the next link resolves.
+            if viewModel.isSwitchingSource {
+                VStack(spacing: 14) {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        .scaleEffect(1.3)
+                    Text("Trying next source…")
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.9))
+                }
+                .padding(.horizontal, 36)
+                .padding(.vertical, 28)
+                .glassRoundedRect(cornerRadius: 24)
+                .transition(.opacity)
+                .zIndex(5)
+            }
+
+            if let toast = viewModel.playerToast {
+                VStack {
+                    Text(toast)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 14)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .padding(.top, 48)
+                    Spacer()
+                }
+                .transition(.opacity)
+                .allowsHitTesting(false)
+                .zIndex(6)
+            }
+
             // Focus sink for when the controls are hidden. tvOS routes the Menu
             // button to the system (which quits the app) and drops directional
             // input whenever no view holds focus, so something must always own it
@@ -106,10 +162,65 @@ struct PlayerView: View {
             Color.clear
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
-                .focusable(!viewModel.showControls && !viewModel.showNextEpisodeCard && !viewModel.showSkipSegmentCard)
+                .focusable(
+                    (!viewModel.showControls || viewModel.isScrubbing || viewModel.showPauseOverlay)
+                        && !viewModel.showNextEpisodeCard
+                        && !viewModel.showSkipSegmentCard
+                        && !viewModel.showSettingsPanel
+                )
                 .focused($remoteInputFocused)
-                .onTapGesture { viewModel.revealControls() }
+                .onTapGesture {
+                    if viewModel.isScrubbing {
+                        viewModel.commitScrub()
+                    } else if viewModel.showPauseOverlay {
+                        viewModel.play()
+                    } else if viewModel.peekVisible {
+                        viewModel.beginScrub()
+                    } else {
+                        viewModel.revealControls()
+                    }
+                }
                 .accessibilityHidden(true)
+
+            // Light-tap peek timeline (no full chrome).
+            if viewModel.peekVisible, !viewModel.showControls, !viewModel.isScrubbing {
+                PeekBar(clock: viewModel.clock)
+                    .transition(.opacity)
+                    .zIndex(1)
+            }
+
+            // Infuse scrub HUD (trackpad / D-pad fine seek).
+            if viewModel.isScrubbing {
+                InfuseScrubHUD(
+                    clock: viewModel.clock,
+                    title: viewModel.title,
+                    episodeLine: viewModel.subtitle.isEmpty ? nil : viewModel.subtitle,
+                    wheelEngaged: viewModel.wheelEngaged
+                )
+                .transition(.opacity)
+                .zIndex(4)
+            }
+
+            // Accumulated D-pad skip preview over bare video.
+            if viewModel.pendingSeekDelta != 0, !viewModel.showControls, !viewModel.isScrubbing {
+                SeekHUD(clock: viewModel.clock, delta: viewModel.pendingSeekDelta)
+                    .transition(.opacity)
+                    .zIndex(4)
+            }
+
+            // Pause metadata sheet ("You're watching…").
+            if viewModel.showPauseOverlay {
+                PauseOverlayView(
+                    title: viewModel.title,
+                    episodeLine: viewModel.pauseOverlayEpisodeLine,
+                    year: viewModel.pauseOverlayYear,
+                    description: viewModel.pauseOverlayDescription,
+                    cast: viewModel.pauseOverlayCast,
+                    logoURL: viewModel.pauseOverlayLogoURL
+                )
+                .transition(.opacity)
+                .zIndex(2)
+            }
 
             if viewModel.showSkipSegmentCard, let interval = viewModel.activeSkipInterval {
                 Button(action: { viewModel.skipActiveInterval() }) {
@@ -165,11 +276,13 @@ struct PlayerView: View {
                 onFocusSkipSegment: { focusSkipSegment() },
                 onFocusNextEpisode: { focusNextEpisode() }
             )
-                .opacity(viewModel.showControls && !viewModel.showSettingsPanel ? 1 : 0)
-                .scaleEffect(viewModel.showControls ? 1 : 0.95)
-                .allowsHitTesting(viewModel.showControls && !viewModel.showSettingsPanel)
+                .opacity(viewModel.showControls && !viewModel.showSettingsPanel && !viewModel.isScrubbing && !viewModel.showPauseOverlay ? 1 : 0)
+                .scaleEffect(viewModel.showControls && !viewModel.isScrubbing && !viewModel.showPauseOverlay ? 1 : 0.95)
+                .allowsHitTesting(viewModel.showControls && !viewModel.showSettingsPanel && !viewModel.isScrubbing && !viewModel.showPauseOverlay)
                 .animation(.playerControls, value: viewModel.showControls)
                 .animation(.playerControls, value: viewModel.showSettingsPanel)
+                .animation(.playerControls, value: viewModel.isScrubbing)
+                .animation(.playerControls, value: viewModel.showPauseOverlay)
 
             // Settings panel (subtitles / audio / speed), over the dimmed video.
             if viewModel.showSettingsPanel {
@@ -179,12 +292,30 @@ struct PlayerView: View {
                 .transition(.opacity)
                 .zIndex(2)
             }
+
+            // Episodes / Sources side panels.
+            if viewModel.sidePanel == .episodes {
+                PlayerEpisodesPanel(viewModel: viewModel)
+                    .zIndex(7)
+            } else if viewModel.sidePanel == .sources {
+                PlayerSourcesPanel(viewModel: viewModel)
+                    .zIndex(7)
+            }
         }
         .animation(.playerControls, value: viewModel.showSettingsPanel)
         .animation(.playerControls, value: viewModel.showNextEpisodeCard)
         .animation(.playerControls, value: viewModel.showSkipSegmentCard)
+        .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
+        .animation(.easeOut(duration: 0.16), value: viewModel.peekVisible)
+        .animation(.easeOut(duration: 0.16), value: viewModel.pendingSeekDelta != 0)
+        .animation(.easeOut(duration: 0.2), value: viewModel.isSwitchingSource)
+        .animation(.easeOut(duration: 0.2), value: viewModel.playerToast)
+        .animation(.easeOut(duration: 0.22), value: viewModel.showPauseOverlay)
+        .animation(.easeOut(duration: 0.22), value: viewModel.sidePanel)
         .onAppear {
-            UIApplication.shared.isIdleTimerDisabled = true
+            // Hold for the full player session (not only .playing/.buffering).
+            // Status flicker previously re-enabled Sleep After mid-watch.
+            PlaybackWakeLock.acquire()
             viewModel.load(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
             if subtitle != PlaybackMarkers.trailerSubtitle {
                 viewModel.fetchExternalSubtitles(
@@ -193,6 +324,8 @@ struct PlayerView: View {
                 )
             }
             viewModel.reloadCurrentStream = reloadCurrentStream
+            viewModel.fetchPlaybackSources = fetchPlaybackSources
+            viewModel.resolvePlaybackStream = resolvePlaybackStream
             if let resolveNextStream {
                 viewModel.configureNextEpisode(
                     episodes: episodes,
@@ -203,11 +336,13 @@ struct PlayerView: View {
             }
         }
         .onDisappear {
-            UIApplication.shared.isIdleTimerDisabled = false
+            PlaybackWakeLock.release()
             viewModel.shutdown()
         }
         .onChange(of: viewModel.status) { status in
-            UIApplication.shared.isIdleTimerDisabled = (status == .playing || status == .buffering)
+            // Keep reasserting while the player is up — never re-enable sleep
+            // based on transient status (pause/buffer/error) mid-session.
+            PlaybackWakeLock.reassert()
             if status == .playing, !didReportPlaybackStarted {
                 didReportPlaybackStarted = true
                 onPlaybackStarted?()
@@ -220,15 +355,40 @@ struct PlayerView: View {
             didHandleFinished = true
             onFinished()
         }
+        .onChange(of: scenePhase) { phase in
+            if phase == .active {
+                PlaybackWakeLock.reassert()
+            }
+        }
         .onChange(of: viewModel.showControls) { isVisible in
-            if isVisible {
+            if isVisible, !viewModel.isScrubbing, !viewModel.showPauseOverlay {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
                 skipSegmentFocused = false
+            } else if viewModel.isScrubbing || viewModel.showPauseOverlay {
+                focusRemoteInput()
             } else if viewModel.showNextEpisodeCard {
                 focusNextEpisode()
             } else if viewModel.showSkipSegmentCard {
                 focusSkipSegment()
+            } else {
+                focusRemoteInput()
+            }
+        }
+        .onChange(of: viewModel.showPauseOverlay) { visible in
+            if visible {
+                nextEpisodeFocused = false
+                skipSegmentFocused = false
+                focusRemoteInput()
+            }
+        }
+        .onChange(of: viewModel.isScrubbing) { scrubbing in
+            if scrubbing {
+                nextEpisodeFocused = false
+                skipSegmentFocused = false
+                focusRemoteInput()
+            } else if viewModel.showControls {
+                remoteInputFocused = false
             } else {
                 focusRemoteInput()
             }
@@ -256,12 +416,40 @@ struct PlayerView: View {
             viewModel.togglePlayPause()
         }
         .onMoveCommand { direction in
+            // Trackpad swipes also emit move commands; the pan recognizer sets
+            // moveSuppressed so a swipe does not double-fire as a skip.
+            if viewModel.moveSuppressed { return }
+
+            if viewModel.isScrubbing {
+                switch direction {
+                case .left:
+                    viewModel.scrubJump(-Double(max(viewModel.seekStepSeconds * 4, 60)))
+                case .right:
+                    viewModel.scrubJump(Double(max(viewModel.seekStepSeconds * 4, 60)))
+                default:
+                    viewModel.cancelScrub()
+                }
+                return
+            }
+
+            if viewModel.showPauseOverlay {
+                switch direction {
+                case .left:
+                    viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
+                case .right:
+                    viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
+                default:
+                    viewModel.revealControls()
+                }
+                return
+            }
+
             guard !viewModel.showControls else { return }
             switch direction {
             case .left:
-                viewModel.skipBackward()
+                viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
             case .right:
-                viewModel.skipForward()
+                viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
             default:
                 viewModel.revealControls()
             }
@@ -271,6 +459,23 @@ struct PlayerView: View {
             // where focus hasn't landed inside it yet.
             if viewModel.showSettingsPanel {
                 viewModel.showSettingsPanel = false
+                return
+            }
+            if viewModel.sidePanel != nil {
+                viewModel.closeSidePanel()
+                return
+            }
+            if viewModel.isScrubbing {
+                viewModel.cancelScrub()
+                return
+            }
+            if viewModel.showPauseOverlay {
+                viewModel.dismissPauseOverlay()
+                viewModel.revealControls()
+                return
+            }
+            if viewModel.peekVisible {
+                viewModel.hidePeek()
                 return
             }
             remoteInputFocused = false
@@ -316,6 +521,17 @@ struct MPVVideoSurface: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: MPVPlayerViewController, context: Context) {}
 }
 
+// Hosts AVPlayer for native Dolby Vision / AVFoundation playback.
+struct AVPlayerVideoSurface: UIViewControllerRepresentable {
+    let controller: AVPlayerEngineController
+
+    func makeUIViewController(context: Context) -> AVPlayerEngineController {
+        controller
+    }
+
+    func updateUIViewController(_ uiViewController: AVPlayerEngineController, context: Context) {}
+}
+
 private struct RemoteSeekPressCatcher: UIViewControllerRepresentable {
     let isActive: Bool
     let onBeginBackward: () -> Void
@@ -335,9 +551,6 @@ private struct RemoteSeekPressCatcher: UIViewControllerRepresentable {
         controller.onBeginBackward = onBeginBackward
         controller.onBeginForward = onBeginForward
         controller.onEnd = onEnd
-        // Re-assert on every SwiftUI update: when a control gains focus the focus
-        // engine takes first responder, so a sibling catcher has to grab it back
-        // to keep receiving the held left/right presses on the device.
         controller.setActive(isActive)
     }
 }
@@ -353,73 +566,95 @@ private final class RemoteSeekPressViewController: UIViewController {
     var onEnd: () -> Void = {}
 
     private var activeDirection: Direction?
-    private var isActive = false
+    private var acceptsNewHolds = false
+    private weak var gestureWindow: UIWindow?
+    private lazy var backwardHoldRecognizer = makeHoldRecognizer(
+        pressType: .leftArrow,
+        action: #selector(handleBackwardHold(_:))
+    )
+    private lazy var forwardHoldRecognizer = makeHoldRecognizer(
+        pressType: .rightArrow,
+        action: #selector(handleForwardHold(_:))
+    )
 
-    override var canBecomeFirstResponder: Bool { isActive }
-
-    /// Enable/disable seek interception and (re)claim first responder so held
-    /// directional presses route here instead of the focused SwiftUI control.
+    /// Window-level press recognizers receive Siri Remote holds even when a
+    /// focused SwiftUI view owns the responder chain. A sibling view controller's
+    /// `pressesBegan` is not guaranteed to receive those presses.
     func setActive(_ active: Bool) {
-        isActive = active
-        if active {
-            if !isFirstResponder { becomeFirstResponder() }
-        } else {
-            if activeDirection != nil {
-                activeDirection = nil
-                onEnd()
-            }
-            if isFirstResponder { resignFirstResponder() }
-        }
+        acceptsNewHolds = active
+        updateRecognizerState()
     }
 
     override func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
-        if isActive { becomeFirstResponder() }
+        installRecognizersIfNeeded()
     }
 
-    override func didMove(toParent parent: UIViewController?) {
-        super.didMove(toParent: parent)
-        if parent != nil, isActive {
-            becomeFirstResponder()
-        }
+    override func viewDidDisappear(_ animated: Bool) {
+        super.viewDidDisappear(animated)
+        uninstallRecognizers()
     }
 
-    override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        guard activeDirection == nil,
-              isActive,
-              let direction = seekDirection(in: presses) else {
-            super.pressesBegan(presses, with: event)
-            return
-        }
-
-        activeDirection = direction
-        switch direction {
-        case .backward: onBeginBackward()
-        case .forward: onBeginForward()
-        }
+    private func makeHoldRecognizer(pressType: UIPress.PressType, action: Selector) -> UILongPressGestureRecognizer {
+        let recognizer = UILongPressGestureRecognizer(target: self, action: action)
+        recognizer.allowedPressTypes = [NSNumber(value: pressType.rawValue)]
+        recognizer.minimumPressDuration = 0.35
+        recognizer.cancelsTouchesInView = true
+        recognizer.isEnabled = false
+        return recognizer
     }
 
-    override func pressesEnded(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        if activeDirection != nil, seekDirection(in: presses) != nil {
-            activeDirection = nil
-            onEnd()
-        } else {
-            super.pressesEnded(presses, with: event)
-        }
+    private func installRecognizersIfNeeded() {
+        guard let window = view.window, gestureWindow !== window else { return }
+        uninstallRecognizers()
+        window.addGestureRecognizer(backwardHoldRecognizer)
+        window.addGestureRecognizer(forwardHoldRecognizer)
+        gestureWindow = window
+        updateRecognizerState()
     }
 
-    override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
+    private func uninstallRecognizers() {
         if activeDirection != nil {
             activeDirection = nil
             onEnd()
-        } else {
-            super.pressesCancelled(presses, with: event)
         }
+        gestureWindow?.removeGestureRecognizer(backwardHoldRecognizer)
+        gestureWindow?.removeGestureRecognizer(forwardHoldRecognizer)
+        gestureWindow = nil
     }
 
-    private func seekDirection(in presses: Set<UIPress>) -> Direction? {
-        if presses.contains(where: { $0.type == .leftArrow }) { return .backward }
-        if presses.contains(where: { $0.type == .rightArrow }) { return .forward }
-        return nil
+    private func updateRecognizerState() {
+        // Once a hold starts, keep its recognizer alive through the brief focus
+        // handoff that occurs when seeking reveals the controls.
+        let enabled = acceptsNewHolds || activeDirection != nil
+        backwardHoldRecognizer.isEnabled = enabled
+        forwardHoldRecognizer.isEnabled = enabled
+    }
+
+    @objc private func handleBackwardHold(_ recognizer: UILongPressGestureRecognizer) {
+        handleHold(recognizer, direction: .backward)
+    }
+
+    @objc private func handleForwardHold(_ recognizer: UILongPressGestureRecognizer) {
+        handleHold(recognizer, direction: .forward)
+    }
+
+    private func handleHold(_ recognizer: UILongPressGestureRecognizer, direction: Direction) {
+        switch recognizer.state {
+        case .began:
+            guard acceptsNewHolds, activeDirection == nil else { return }
+            activeDirection = direction
+            switch direction {
+            case .backward: onBeginBackward()
+            case .forward: onBeginForward()
+            }
+        case .ended, .cancelled, .failed:
+            guard activeDirection == direction else { return }
+            activeDirection = nil
+            onEnd()
+            updateRecognizerState()
+        default:
+            break
+        }
     }
 }

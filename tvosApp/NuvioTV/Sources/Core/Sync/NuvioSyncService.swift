@@ -40,8 +40,12 @@ final class NuvioSyncManager: ObservableObject {
     /// the whole set, so a reorder must round-trip these untouched.
     private var lastPulledAddonRows: [RemoteAddon] = []
 
-    private weak var authManager: AuthManager?
-    private weak var profileViewModel: ProfileViewModel?
+    // These are lifetime dependencies, not callbacks. Retaining them guarantees
+    // that a delayed sync always sees the same live profile storage attached by
+    // the SwiftUI root. The root owns all three objects, and neither dependency
+    // points back to this manager, so this creates no retain cycle.
+    private var authManager: AuthManager?
+    private var profileViewModel: ProfileViewModel?
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
@@ -59,14 +63,19 @@ final class NuvioSyncManager: ObservableObject {
     private var didAttach = false
 
     deinit {
+        pullTask?.cancel()
+        pushTask?.cancel()
+        profileSelectionRefreshTask?.cancel()
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
     func attach(authManager: AuthManager, profileViewModel: ProfileViewModel) {
-        guard !didAttach else { return }
-        didAttach = true
+        // `onAppear` may run again after SwiftUI rebuilds the root. Refresh the
+        // dependencies even though notification observers only attach once.
         self.authManager = authManager
         self.profileViewModel = profileViewModel
+        guard !didAttach else { return }
+        didAttach = true
 
         let center = NotificationCenter.default
         observers.append(center.addObserver(
@@ -606,7 +615,10 @@ final class NuvioSyncManager: ObservableObject {
                 ) {
                     try ensureStillSyncing()
                     CollectionsStore.applyRemote(collectionsBlob)
-                    print("Nuvio sync pulled collections (\(collectionsBlob.count) bytes).")
+                    let count = CollectionsStore.collections().count
+                    print("Nuvio sync pulled collections (\(collectionsBlob.count) bytes, \(count) collection(s)).")
+                } else {
+                    print("Nuvio sync pulled collections: server returned none.")
                 }
             } catch is CancellationError {
                 throw CancellationError()
@@ -807,6 +819,11 @@ final class NuvioSyncManager: ObservableObject {
 
     /// Pushes a locally edited collections blob to the account (same
     /// `sync_push_collections` contract as Android).
+    ///
+    /// Always pull-merges first: a Settings edit on this Apple TV must not
+    /// wipe collections that only exist on Android (created after the last
+    /// full pull, or never decoded locally). Intentional deletes of ids that
+    /// were present in the last pull still go through.
     private func pushCollectionsEdit(_ raw: [[String: Any]]) {
         guard AuthConfig.isConfigured else { return }
         guard let authManager, authManager.isAuthenticated else { return }
@@ -817,20 +834,50 @@ final class NuvioSyncManager: ObservableObject {
             for: activeProfile,
             in: profileViewModel.profiles
         )
+        let previouslyPulledIds = CollectionsStore.lastPulledCollectionIds()
 
         Task { @MainActor [weak self] in
             guard let self, let session = await authManager.validSessionForSync() else { return }
             do {
+                var payload = raw
+                if let remoteBlob = try await self.client.pullCollections(
+                    session: session,
+                    remoteProfileId: remoteProfileId
+                ),
+                   let remoteRows = Self.collectionsArray(from: remoteBlob) {
+                    payload = CollectionsStore.mergeLocalEdit(
+                        local: raw,
+                        remote: remoteRows,
+                        previouslyPulledIds: previouslyPulledIds
+                    )
+                }
+
                 try await self.client.pushCollections(
                     session: session,
                     remoteProfileId: remoteProfileId,
-                    rawCollections: raw
+                    rawCollections: payload
                 )
-                print("Nuvio sync pushed \(raw.count) collection(s).")
+                // Keep local cache aligned with what we uploaded (includes
+                // remote-only rows we preserved).
+                if let data = try? JSONSerialization.data(withJSONObject: payload) {
+                    CollectionsStore.applyRemote(data)
+                }
+                print("Nuvio sync pushed \(payload.count) collection(s).")
             } catch {
                 print("Nuvio collections push failed: \(error.localizedDescription)")
             }
         }
+    }
+
+    private static func collectionsArray(from data: Data) -> [[String: Any]]? {
+        let object = try? JSONSerialization.jsonObject(with: data)
+        if let array = object as? [[String: Any]] { return array }
+        if let text = object as? String,
+           let inner = text.data(using: .utf8),
+           let array = (try? JSONSerialization.jsonObject(with: inner)) as? [[String: Any]] {
+            return array
+        }
+        return nil
     }
 
     private func pushLocalSnapshots() async {
@@ -936,12 +983,15 @@ final class NuvioSyncManager: ObservableObject {
     private func currentSyncKey() -> String? {
         guard let authManager, let profileViewModel else { return nil }
         guard case let .fullAccount(userId, _) = authManager.authState else { return nil }
-        guard let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else {
+        // Read the published array once so both the fallback selection and the
+        // remote-index lookup use the same main-actor snapshot.
+        let profiles = profileViewModel.profiles
+        guard let activeProfile = profileViewModel.activeProfile ?? profiles.first else {
             return nil
         }
         let remoteProfileId = ProfileSyncIndexStore.remoteId(
             for: activeProfile,
-            in: profileViewModel.profiles
+            in: profiles
         )
         return "\(userId):\(remoteProfileId)"
     }
@@ -1124,6 +1174,20 @@ fileprivate final class SupabaseSyncClient {
               !(blob is NSNull) else {
             return nil
         }
+        // Backend may return a JSON array or a double-encoded JSON string.
+        if let array = blob as? [[String: Any]] {
+            return try JSONSerialization.data(withJSONObject: array)
+        }
+        if let text = blob as? String {
+            let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.isEmpty, trimmed != "null" else { return nil }
+            if let inner = trimmed.data(using: .utf8),
+               let array = try? JSONSerialization.jsonObject(with: inner) as? [[String: Any]] {
+                return try JSONSerialization.data(withJSONObject: array)
+            }
+            // Already a JSON array string — pass through for applyRemote.
+            return trimmed.data(using: .utf8)
+        }
         return try JSONSerialization.data(withJSONObject: blob)
     }
 
@@ -1168,18 +1232,30 @@ fileprivate final class SupabaseSyncClient {
 
     /// Applies the pulled Home catalog layout: records the add-on catalog order
     /// (so the repository sorts Home's add-on rows to match the account) and the
-    /// set of catalogs hidden from Home (so the repository drops them). Both are
-    /// stored in account key format `<addonId>_<type>_<catalogId>`.
+    /// set of catalogs hidden from Home (so the repository drops them). Catalog
+    /// keys use `<addonId>_<type>_<catalogId>`; collection keys use
+    /// `collection_<collectionId>` so rows can be ordered alongside catalogs.
     func applyHomeCatalogSettings(_ payload: HomeCatalogSyncPayload, localProfileId: String) {
-        // Collections map to per-folder rows on tvOS, so only catalog items
-        // participate in the order/disabled sets here.
         let catalogItems = payload.items.filter { !$0.isCollection }
-        let orderKeys = catalogItems
+        let collectionItems = payload.items.filter(\.isCollection)
+
+        // Interleave catalogs and collections in the account's saved order so
+        // Home can place collection rows among addon catalogs.
+        let orderKeys = payload.items
             .sorted { $0.order < $1.order }
-            .map { "\($0.addonId)_\($0.type)_\($0.catalogId)" }
+            .map { item -> String in
+                if item.isCollection {
+                    return "collection_\(item.collectionId)"
+                }
+                return "\(item.addonId)_\(item.type)_\(item.catalogId)"
+            }
         let disabledKeys = catalogItems
             .filter { !$0.enabled }
             .map { "\($0.addonId)_\($0.type)_\($0.catalogId)" }
+        let disabledCollectionIds = collectionItems
+            .filter { !$0.enabled }
+            .map(\.collectionId)
+            .filter { !$0.isEmpty }
 
         let defaults = ProfileSettings.store(for: localProfileId)
         if let data = try? JSONEncoder().encode(orderKeys) {
@@ -1187,6 +1263,9 @@ fileprivate final class SupabaseSyncClient {
         }
         if let data = try? JSONEncoder().encode(disabledKeys) {
             defaults.set(data, forKey: SettingsKey.homeCatalogDisabled)
+        }
+        if let data = try? JSONEncoder().encode(disabledCollectionIds) {
+            defaults.set(data, forKey: SettingsKey.homeCollectionDisabled)
         }
     }
 
@@ -1962,16 +2041,32 @@ struct HomeCatalogSyncItem {
     let enabled: Bool
     let order: Int
     let isCollection: Bool
+    let collectionId: String
 
     init?(dictionary: [String: Any]) {
         self.addonId = dictionary["addon_id"] as? String ?? ""
         self.type = dictionary["type"] as? String ?? ""
         self.catalogId = dictionary["catalog_id"] as? String ?? ""
-        self.enabled = dictionary["enabled"] as? Bool ?? true
-        self.order = (dictionary["order"] as? NSNumber)?.intValue ?? 0
-        self.isCollection = dictionary["is_collection"] as? Bool ?? false
+        self.enabled = Self.boolValue(dictionary["enabled"], default: true)
+        self.order = (dictionary["order"] as? NSNumber)?.intValue
+            ?? (dictionary["order"] as? Int)
+            ?? 0
+        self.isCollection = Self.boolValue(dictionary["is_collection"], default: false)
+        self.collectionId = dictionary["collection_id"] as? String ?? ""
         // A non-collection item is only meaningful with an add-on catalog key.
-        if !isCollection && (addonId.isEmpty || catalogId.isEmpty) { return nil }
+        // Collection rows need a collection id.
+        if isCollection {
+            if collectionId.isEmpty { return nil }
+        } else if addonId.isEmpty || catalogId.isEmpty {
+            return nil
+        }
+    }
+
+    /// JSONSerialization often surfaces booleans as NSNumber; accept both.
+    private static func boolValue(_ raw: Any?, default defaultValue: Bool) -> Bool {
+        if let value = raw as? Bool { return value }
+        if let number = raw as? NSNumber { return number.boolValue }
+        return defaultValue
     }
 }
 

@@ -32,6 +32,16 @@ struct SkipInterval: Identifiable, Equatable {
     let type: String
     let provider: String
 
+    /// Outro / credits / ending — paired with the Next Episode card.
+    var isEnding: Bool {
+        switch type.lowercased() {
+        case "outro", "ed", "credits", "ending", "mixed-ed":
+            return true
+        default:
+            return false
+        }
+    }
+
     var label: String {
         switch type.lowercased() {
         case "intro", "op", "opening", "mixed-op":

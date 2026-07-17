@@ -20,6 +20,7 @@
 		C0D310060000000000000006 /* FilterSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300060000000000000006 /* FilterSection.swift */; };
 		C0D310070000000000000007 /* PosterCard.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300070000000000000007 /* PosterCard.swift */; };
 		C0D310080000000000000008 /* FilterChip.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300080000000000000008 /* FilterChip.swift */; };
+		C0D310F900000000000000F9 /* AnimatedRemoteGIFView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300F900000000000000F9 /* AnimatedRemoteGIFView.swift */; };
 		F11748422D0307B40044C1D9 /* AppDelegate.swift in Sources */ = {isa = PBXBuildFile; fileRef = F11748412D0307B40044C1D9 /* AppDelegate.swift */; };
 
 		C0D3100A000000000000000A /* PlayerModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3000A000000000000000A /* PlayerModels.swift */; };
@@ -33,6 +34,10 @@
 		C0D310120000000000000012 /* LibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300120000000000000012 /* LibraryView.swift */; };
 		C0D310130000000000000013 /* PlayerControls.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300130000000000000013 /* PlayerControls.swift */; };
 		C0D310140000000000000014 /* PlayerView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300140000000000000014 /* PlayerView.swift */; };
+		C0D3103C000000000000003C /* ScrubberViews.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3003C000000000000003C /* ScrubberViews.swift */; };
+		C0D3103D000000000000003D /* PauseOverlayView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3003D000000000000003D /* PauseOverlayView.swift */; };
+		C0D3103E000000000000003E /* SidePanels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3003E000000000000003E /* SidePanels.swift */; };
+		C0D3103B000000000000003B /* RemoteInput.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3003B000000000000003B /* RemoteInput.swift */; };
 		C0D310150000000000000015 /* ProfilePinView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300150000000000000015 /* ProfilePinView.swift */; };
 		C0D310160000000000000016 /* UserProfileView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300160000000000000016 /* UserProfileView.swift */; };
 		C0D310170000000000000017 /* SearchView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300170000000000000017 /* SearchView.swift */; };
@@ -43,6 +48,11 @@
 		C0D3101C000000000000001C /* HomeViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001C000000000000001C /* HomeViewModel.swift */; };
 		C0D3101D000000000000001D /* LibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001D000000000000001D /* LibraryViewModel.swift */; };
 		C0D3101E000000000000001E /* PlayerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001E000000000000001E /* PlayerViewModel.swift */; };
+		C0D31052 /* AVPlayerEngineController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30052 /* AVPlayerEngineController.swift */; };
+		C0D31051 /* PlaybackEngineControlling.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30051 /* PlaybackEngineControlling.swift */; };
+		C0D31050 /* DolbyVisionPlaybackPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30050 /* DolbyVisionPlaybackPolicy.swift */; };
+		C0D31053 /* DolbyVisionRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30053 /* DolbyVisionRemuxer.swift */; };
+		C0D31054 /* PlaybackWakeLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30054 /* PlaybackWakeLock.swift */; };
 		C0D3101F000000000000001F /* ProfileViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001F000000000000001F /* ProfileViewModel.swift */; };
 		C0D310200000000000000020 /* SearchViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300200000000000000020 /* SearchViewModel.swift */; };
 		C0D310220000000000000022 /* NuvioCoreStubs.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300220000000000000022 /* NuvioCoreStubs.swift */; };
@@ -117,6 +127,7 @@
 		C0D300060000000000000006 /* FilterSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Catalog/FilterSection.swift; sourceTree = "<group>"; };
 		C0D300070000000000000007 /* PosterCard.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Components/PosterCard.swift; sourceTree = "<group>"; };
 		C0D300080000000000000008 /* FilterChip.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Components/FilterChip.swift; sourceTree = "<group>"; };
+		C0D300F900000000000000F9 /* AnimatedRemoteGIFView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Components/AnimatedRemoteGIFView.swift; sourceTree = "<group>"; };
 		F11748412D0307B40044C1D9 /* AppDelegate.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; name = AppDelegate.swift; path = NuvioTV/AppDelegate.swift; sourceTree = "<group>"; };
 		F11748442D0722820044C1D9 /* NuvioTV-Bridging-Header.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; name = "NuvioTV-Bridging-Header.h"; path = "NuvioTV/NuvioTV-Bridging-Header.h"; sourceTree = "<group>"; };
 		C0D300090000000000000009 /* NuvioCore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Data/Rust/NuvioCore.swift; sourceTree = "<group>"; };
@@ -131,6 +142,10 @@
 		C0D300120000000000000012 /* LibraryView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Library/LibraryView.swift; sourceTree = "<group>"; };
 		C0D300130000000000000013 /* PlayerControls.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/PlayerControls.swift; sourceTree = "<group>"; };
 		C0D300140000000000000014 /* PlayerView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/PlayerView.swift; sourceTree = "<group>"; };
+		C0D3003B000000000000003B /* RemoteInput.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/RemoteInput.swift; sourceTree = "<group>"; };
+		C0D3003C000000000000003C /* ScrubberViews.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/ScrubberViews.swift; sourceTree = "<group>"; };
+		C0D3003D000000000000003D /* PauseOverlayView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/PauseOverlayView.swift; sourceTree = "<group>"; };
+		C0D3003E000000000000003E /* SidePanels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/SidePanels.swift; sourceTree = "<group>"; };
 		C0D300150000000000000015 /* ProfilePinView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Profile/ProfilePinView.swift; sourceTree = "<group>"; };
 		C0D300160000000000000016 /* UserProfileView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Profile/UserProfileView.swift; sourceTree = "<group>"; };
 		C0D300170000000000000017 /* SearchView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Search/SearchView.swift; sourceTree = "<group>"; };
@@ -141,6 +156,11 @@
 		C0D3001C000000000000001C /* HomeViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/HomeViewModel.swift; sourceTree = "<group>"; };
 		C0D3001D000000000000001D /* LibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/LibraryViewModel.swift; sourceTree = "<group>"; };
 		C0D3001E000000000000001E /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/PlayerViewModel.swift; sourceTree = "<group>"; };
+		C0D30052 /* AVPlayerEngineController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/AVPlayerEngineController.swift; sourceTree = "<group>"; };
+		C0D30051 /* PlaybackEngineControlling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineControlling.swift; sourceTree = "<group>"; };
+		C0D30050 /* DolbyVisionPlaybackPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/DolbyVisionPlaybackPolicy.swift; sourceTree = "<group>"; };
+		C0D30053 /* DolbyVisionRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/DolbyVisionRemuxer.swift; sourceTree = "<group>"; };
+		C0D30054 /* PlaybackWakeLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackWakeLock.swift; sourceTree = "<group>"; };
 		C0D3001F000000000000001F /* ProfileViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/ProfileViewModel.swift; sourceTree = "<group>"; };
 		C0D300200000000000000020 /* SearchViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/SearchViewModel.swift; sourceTree = "<group>"; };
 		C0D300220000000000000022 /* NuvioCoreStubs.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/NuvioCoreStubs.swift; sourceTree = "<group>"; };
@@ -229,6 +249,7 @@
 				C0D300060000000000000006 /* FilterSection.swift */,
 				C0D300070000000000000007 /* PosterCard.swift */,
 				C0D300080000000000000008 /* FilterChip.swift */,
+				C0D300F900000000000000F9 /* AnimatedRemoteGIFView.swift */,
 
 				C0D3000A000000000000000A /* PlayerModels.swift */,
 				C0D3000B000000000000000B /* ActionButtons.swift */,
@@ -241,6 +262,10 @@
 				C0D300120000000000000012 /* LibraryView.swift */,
 				C0D300130000000000000013 /* PlayerControls.swift */,
 				C0D300140000000000000014 /* PlayerView.swift */,
+				C0D3003B000000000000003B /* RemoteInput.swift */,
+				C0D3003C000000000000003C /* ScrubberViews.swift */,
+				C0D3003D000000000000003D /* PauseOverlayView.swift */,
+				C0D3003E000000000000003E /* SidePanels.swift */,
 				C0D300150000000000000015 /* ProfilePinView.swift */,
 				C0D300160000000000000016 /* UserProfileView.swift */,
 				C0D300170000000000000017 /* SearchView.swift */,
@@ -251,6 +276,11 @@
 				C0D3001C000000000000001C /* HomeViewModel.swift */,
 				C0D3001D000000000000001D /* LibraryViewModel.swift */,
 				C0D3001E000000000000001E /* PlayerViewModel.swift */,
+				C0D30052 /* AVPlayerEngineController.swift */,
+				C0D30051 /* PlaybackEngineControlling.swift */,
+				C0D30050 /* DolbyVisionPlaybackPolicy.swift */,
+				C0D30053 /* DolbyVisionRemuxer.swift */,
+				C0D30054 /* PlaybackWakeLock.swift */,
 				C0D3001F000000000000001F /* ProfileViewModel.swift */,
 				C0D300200000000000000020 /* SearchViewModel.swift */,
 				C0D300220000000000000022 /* NuvioCoreStubs.swift */,
@@ -489,6 +519,7 @@
 				C0D310060000000000000006 /* FilterSection.swift in Sources */,
 				C0D310070000000000000007 /* PosterCard.swift in Sources */,
 				C0D310080000000000000008 /* FilterChip.swift in Sources */,
+				C0D310F900000000000000F9 /* AnimatedRemoteGIFView.swift in Sources */,
 
 				C0D3100A000000000000000A /* PlayerModels.swift in Sources */,
 				C0D3100B000000000000000B /* ActionButtons.swift in Sources */,
@@ -501,6 +532,10 @@
 				C0D310120000000000000012 /* LibraryView.swift in Sources */,
 				C0D310130000000000000013 /* PlayerControls.swift in Sources */,
 				C0D310140000000000000014 /* PlayerView.swift in Sources */,
+				C0D3103B000000000000003B /* RemoteInput.swift in Sources */,
+				C0D3103C000000000000003C /* ScrubberViews.swift in Sources */,
+				C0D3103D000000000000003D /* PauseOverlayView.swift in Sources */,
+				C0D3103E000000000000003E /* SidePanels.swift in Sources */,
 				C0D310150000000000000015 /* ProfilePinView.swift in Sources */,
 				C0D310160000000000000016 /* UserProfileView.swift in Sources */,
 				C0D310170000000000000017 /* SearchView.swift in Sources */,
@@ -511,6 +546,11 @@
 				C0D3101C000000000000001C /* HomeViewModel.swift in Sources */,
 				C0D3101D000000000000001D /* LibraryViewModel.swift in Sources */,
 				C0D3101E000000000000001E /* PlayerViewModel.swift in Sources */,
+				C0D31052 /* AVPlayerEngineController.swift in Sources */,
+				C0D31051 /* PlaybackEngineControlling.swift in Sources */,
+				C0D31050 /* DolbyVisionPlaybackPolicy.swift in Sources */,
+				C0D31053 /* DolbyVisionRemuxer.swift in Sources */,
+				C0D31054 /* PlaybackWakeLock.swift in Sources */,
 				C0D3101F000000000000001F /* ProfileViewModel.swift in Sources */,
 				C0D310200000000000000020 /* SearchViewModel.swift in Sources */,
 				C0D310220000000000000022 /* NuvioCoreStubs.swift in Sources */,

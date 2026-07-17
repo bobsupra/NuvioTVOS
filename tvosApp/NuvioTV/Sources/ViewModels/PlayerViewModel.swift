@@ -5,22 +5,39 @@ import UIKit
 import AVFoundation
 import AVKit
 import CoreMedia
+import GameController
 import Libmpv
 
-// MARK: - PlayerViewModel (MPV-backed)
+// MARK: - Playback clock
 //
-// Drives playback through libmpv (gpu-next / VideoToolbox) instead of AVPlayer
-// so that the universe of Stremio addon streams — MKV containers, AC3/EAC3/DTS
-// audio, HEVC/AV1, etc. — actually plays on tvOS. AVPlayer rejected most of
-// these with the "prohibitory" sign; MPV decodes them natively and fast.
+// Time + scrub target live on a separate ObservableObject so high-frequency
+// scrub updates and position ticks only re-render the small HUD/timeline views,
+// not the whole player ZStack (video surface + overlays).
+
+@MainActor
+final class PlaybackClock: ObservableObject {
+    @Published var position: Double = 0
+    @Published var duration: Double = 0
+    @Published var buffered: Double = 0
+    /// Live scrub position while the Infuse scrub HUD is up.
+    @Published var scrubTarget: Double?
+    @Published var wheelAngle: Double = 0
+}
+
+// MARK: - PlayerViewModel (dual-engine)
 //
-// The published surface is kept identical to the old AVPlayer view model so the
-// existing PlayerControls / settings sheet keep working unchanged.
+// Default backend is libmpv (gpu-next / VideoToolbox) so Stremio/debrid streams
+// — MKV, AC3/EAC3/DTS, HEVC/AV1 — play on tvOS. AVPlayer is used when Settings
+// force it, or after Auto has packet-remuxed Dolby Vision into local fMP4 HLS
+// so the TV can engage true Dolby Vision mode. MPV stays alive as the immediate
+// HDR10/PQ fallback if the native pipeline cannot display the remux.
 
 @MainActor
 class PlayerViewModel: ObservableObject {
     @Published var status: PlayerStatus = .idle
     @Published var time: PlayerTime = PlayerTime()
+    /// High-frequency time/scrub state for HUDs. Mirrors `time` on each tick.
+    let clock = PlaybackClock()
     @Published var subtitles: [SubtitleTrack] = []
     @Published var audioTracks: [AudioTrack] = []
     @Published var playbackSpeed: PlaybackSpeed = .normal
@@ -33,6 +50,14 @@ class PlayerViewModel: ObservableObject {
     /// with the controls visible, matching the controls-hidden behaviour.
     /// @Published so the catcher re-asserts first responder when it flips.
     @Published var isTimelineFocused: Bool = false
+    /// Infuse-style scrub mode (touchpad drag / D-pad jump / wheel fine-tune).
+    @Published private(set) var isScrubbing = false
+    /// Accumulated D-pad skip preview (seconds). Zero when idle.
+    @Published var pendingSeekDelta: Double = 0
+    /// Light-tap peek timeline (no full controls).
+    @Published private(set) var peekVisible = false
+    /// True while the finger is at the trackpad edge for wheel fine-tune.
+    @Published private(set) var wheelEngaged = false
     @Published var title: String = ""
     @Published var subtitle: String = ""
     /// Every external subtitle the stream offered (all languages), browsable in
@@ -49,6 +74,20 @@ class PlayerViewModel: ObservableObject {
     @Published var audioAmplificationDb: Int = 0
     /// Full-screen settings panel (subtitles / audio / speed) visibility.
     @Published var showSettingsPanel: Bool = false
+    /// In-player side sheet (episodes / sources).
+    @Published var sidePanel: PlayerSidePanel? = nil
+    /// Alternate streams for the current title (Sources panel).
+    @Published private(set) var availableSources: [NuvioStream] = []
+    @Published private(set) var isLoadingSources = false
+    /// Netflix/Infuse-style metadata sheet while paused (shown after a short delay).
+    @Published var showPauseOverlay: Bool = false
+    /// How the video fills the display (Fit / Fill / Stretch).
+    @Published var aspectMode: PlayerAspectMode = PlayerAspectMode.current
+    /// Decoded frame size for aspect-mode scaling (0 until first frame).
+    @Published private(set) var videoNaturalSize: CGSize = .zero
+    private var pauseOverlayTask: Task<Void, Never>?
+    /// Seconds to wait after pausing before the metadata sheet appears.
+    private static let pauseOverlayDelaySeconds: UInt64 = 5
 
     // MARK: Next-episode auto-play
 
@@ -91,14 +130,41 @@ class PlayerViewModel: ObservableObject {
     /// the countdown is a fixed 10s from the card appearing (skips the credits)
     /// rather than tracking the video's final seconds.
     private var autoAdvanceDeadline: Date?
-    /// Card appears this many seconds before the end — generous enough to cover a
-    /// typical credit roll so the countdown auto-advances through it.
+    /// Fallback when IntroDB has no ending marker: show the Next Episode card
+    /// this many seconds before the end. When an ending skip exists, the card
+    /// arms at the same moment as Skip Ending instead.
     private static let nextCardLeadSeconds: Double = 120
     private static let autoCountdownSeconds = 10
+    /// Same lead-in used by skip-segment detection so both cards arm together.
+    private static let skipSegmentStartLead: Double = 0.35
 
-    /// The UIKit view controller that owns the Metal surface MPV renders into.
-    /// PlayerView hosts this via a UIViewControllerRepresentable.
+    /// libmpv Metal host. PlayerView shows this when `activeEngineKind == .mpv`.
     let playerController = MPVPlayerViewController()
+    /// AVFoundation host for native Dolby Vision (and forced AVPlayer setting).
+    let avPlayerController = AVPlayerEngineController()
+    /// Which backend is driving the current (or next) stream.
+    @Published private(set) var activeEngineKind: PlayerEngineKind = .mpv
+    /// Short on-screen note after engine selection (native DV vs HDR fallback).
+    @Published private(set) var hdrModeToast: String?
+    @Published private(set) var isUsingNativeDolbyVision = false
+
+    private var nativeDVRemuxAllowed = false
+    private var nativeDVRemuxAttempted = false
+    private var nativeDVRemuxer: DolbyVisionRemuxer?
+    private var retiredNativeDVRemuxers: [DolbyVisionRemuxer] = []
+    private var nativeDVFailedURLs: Set<String> = []
+    private var nativeDVPlaylistURL: String?
+    private var nativeDVStartOffset: Double = 0
+    private var nativeDVWrittenSeconds: Double = 0
+    private var nativeDVOriginalDuration: Double = 0
+    private var nativeDVRemuxFinished = false
+    private var nativeDVDeferredSourceError: String?
+    private var nativeDVSourceErrorDeadline: Date?
+
+    /// Backend used for transport / poll — switches with `activeEngineKind`.
+    private var engine: PlaybackEngineControlling {
+        activeEngineKind == .avPlayer ? avPlayerController : playerController
+    }
 
     private var pollTimer: Timer?
     private var controlsHideTimer: Timer?
@@ -123,6 +189,9 @@ class PlayerViewModel: ObservableObject {
     private var didApplySavedSubtitleSelection = false
     private var didApplyAudioPreference = false
     private var didApplySubtitlePreference = false
+    /// Progressive subtitle fetches may improve an automatic match, but must
+    /// never replace a subtitle (including Off) explicitly chosen in the panel.
+    private var hasExplicitSubtitleSelection = false
     private var lastProgressSave = Date.distantPast
     /// Last coherent, non-EOF MPV sample. Forced lifecycle saves use this
     /// instead of a transient reattach/keep-open sample that can report the
@@ -135,7 +204,33 @@ class PlayerViewModel: ObservableObject {
     private var skipIntervalLoadTask: Task<Void, Never>?
     private static let skipSegmentAutoHideSeconds = 5
     private var seekRepeatTimer: Timer?
-    private static let seekRepeatInterval: TimeInterval = 0.28
+    /// Hold-to-seek tick rate — faster than a casual tap cadence so a held
+    /// direction ramps at least as quickly as rapid tapping.
+    private static let seekRepeatInterval: TimeInterval = 0.11
+
+    // MARK: Scrub / seek accumulation
+
+    /// Coarse D-pad jump while scrubbing (seconds). Pan zooms, presses hop.
+    private var scrubJumpSeconds: Double { max(Double(seekStepSeconds) * 4, 60) }
+    private var scrubValue: Double?
+    private var lastScrubPublish = Date.distantPast
+    private var scrubTimeoutTask: Task<Void, Never>?
+    private var scrubLastDx: CGFloat = 0
+    private var suppressMoveUntil = Date.distantPast
+    var moveSuppressed: Bool { Date() < suppressMoveUntil }
+    private enum TouchIntent { case undecided, scrub, consumed }
+    private var touchIntent: TouchIntent = .undecided
+    private var wheelLastAngle: Double?
+    private let wheelSecondsPerRevolution: Double = 24
+    private var gcTouchDown = false
+    private var gcTouchStartTime = Date()
+    private var gcPanFiredThisTouch = false
+    private var controllerConnectObserver: NSObjectProtocol?
+    private var peekTask: Task<Void, Never>?
+    private var seekDebounceTask: Task<Void, Never>?
+    private var lastNudgeAt: Date?
+    private var nudgeStreak = 0
+    private var didConfigureWheelTracking = false
 
     /// Best estimate of the real title's length, captured at load time from the
     /// existing Continue Watching entry (most reliable) or the metadata runtime.
@@ -149,30 +244,67 @@ class PlayerViewModel: ObservableObject {
     private static let replacementConfirmTicks = 4   // ~1s at the 0.25s poll cadence
 
     /// Re-resolves a fresh stream for the current title/episode when a link
-    /// expires. Supplied by the app layer; nil disables silent recovery.
-    var reloadCurrentStream: (() async -> PreparedNextStream?)?
+    /// expires or a source fails. `excludedURLs` are links already tried this
+    /// session so failover never loops a dead source. Nil disables recovery.
+    var reloadCurrentStream: ((_ excludedURLs: [String]) async -> PreparedNextStream?)?
+    /// Lists playable sources for a content id (Sources panel).
+    var fetchPlaybackSources: ((_ contentId: String, _ type: String) async -> [NuvioStream])?
+    /// Resolves a user-picked source into a ready stream (debrid + URL).
+    var resolvePlaybackStream: ((
+        _ stream: NuvioStream,
+        _ contentId: String,
+        _ subtitleLine: String
+    ) async -> PreparedNextStream?)?
     private var reloadAttempts = 0
     private var isReloadingStream = false
-    private static let maxReloadAttempts = 2
+    private static let maxReloadAttempts = 5
+
+    // MARK: Load watchdog + source failover
+
+    /// True while a mid-session source switch is resolving/loading.
+    @Published private(set) var isSwitchingSource = false
+    /// Brief on-screen notice ("Source failed — trying another").
+    @Published var playerToast: String?
+    /// URLs that failed to load/play this session (watchdog, mpv error, slate).
+    private var failedStreamURLs: Set<String> = []
+    private var currentLoadStarted = false
+    private var loadWatchdogTask: Task<Void, Never>?
+    private var isFailingOver = false
+    private var toastClearTask: Task<Void, Never>?
+    /// A source that hasn't started within this long is treated as dead.
+    private let loadTimeoutSeconds: UInt64 = 30
 
     init() {
-        playerController.onPlaybackSuspended = { [weak self] positionMs, durationMs in
+        let suspend: (Int64, Int64) -> Void = { [weak self] positionMs, durationMs in
             Task { @MainActor [weak self] in
                 self?.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
             }
         }
+        playerController.onPlaybackSuspended = suspend
+        avPlayerController.onPlaybackSuspended = suspend
+        avPlayerController.onNativeVideoUnavailable = { [weak self] urlString, reason in
+            self?.fallBackToMPV(urlString: urlString, reason: reason)
+        }
+        avPlayerController.onVideoReady = { [weak self] urlString in
+            self?.nativeDolbyVisionVideoDidBecomeReady(urlString: urlString)
+        }
     }
 
     deinit {
-        let controller = playerController
+        let mpv = playerController
+        let av = avPlayerController
         let poll = pollTimer
         let hide = controlsHideTimer
+        let remuxers = retiredNativeDVRemuxers + [nativeDVRemuxer].compactMap { $0 }
+        remuxers.forEach { $0.cancel() }
         trailerResolveTask?.cancel()
         subtitleFetchTask?.cancel()
         Task { @MainActor in
             poll?.invalidate()
             hide?.invalidate()
-            controller.destroyPlayer()
+            mpv.destroyPlayer()
+            av.destroyPlayer()
+            remuxers.forEach { $0.cleanup() }
         }
     }
 
@@ -204,9 +336,12 @@ class PlayerViewModel: ObservableObject {
                         return
                     }
                     self.activeStreamURL = playbackSource.videoUrl
-                    self.playerController.loadFile(playbackSource.videoUrl)
+                    // Trailers are ordinary progressive streams — keep MPV for
+                    // dual audio-url support.
+                    self.selectEngine(.mpv, decisionMessage: nil)
+                    self.engine.loadFile(playbackSource.videoUrl)
                     if let audioUrl = playbackSource.audioUrl {
-                        self.playerController.addAudioUrl(audioUrl)
+                        self.engine.addAudioUrl(audioUrl)
                     }
                     self.startPolling()
                 }
@@ -214,8 +349,336 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        playerController.loadFile(url.absoluteString)
+        applyEnginePolicy(
+            for: url,
+            streamName: nil,
+            streamDescription: subtitle,
+            // Debrid URLs often encode the release name in the path.
+            filename: url.lastPathComponent
+        )
+        engine.loadFile(url.absoluteString)
+        // mpv letterboxes; fill/stretch are SwiftUI transforms on the host.
+        engine.setAspectMode(.fit)
+        videoNaturalSize = .zero
         startPolling()
+        configureWheelTrackingIfNeeded()
+        startLoadWatchdog()
+    }
+
+    /// Picks MPV vs AVPlayer from Settings + Dolby Vision policy.
+    private func applyEnginePolicy(
+        for url: URL,
+        streamName: String?,
+        streamDescription: String?,
+        filename: String?
+    ) {
+        let result = DolbyVisionPlaybackPolicy.resolve(
+            url: url,
+            streamName: streamName,
+            streamDescription: streamDescription,
+            filename: filename
+        )
+        let engineSetting = ProfileSettings.current
+            .string(forKey: SettingsKey.playerEngine) ?? "Auto"
+        let normalizedSetting = engineSetting
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let isAuto = normalizedSetting != "avplayer"
+            && normalizedSetting != "mpvkit"
+            && normalizedSetting != "mpv"
+        nativeDVRemuxAllowed = isAuto && result.decision != .mpvHdrFallback
+        print("[Player] Engine policy: \(result.reason)")
+        selectEngine(result.engine, decisionMessage: DolbyVisionPlaybackPolicy.statusMessage(for: result))
+    }
+
+    private func selectEngine(_ kind: PlayerEngineKind, decisionMessage: String?) {
+        if activeEngineKind != kind {
+            // Pause the outgoing backend so two audio pipelines never run together.
+            switch activeEngineKind {
+            case .mpv: playerController.pausePlayback()
+            case .avPlayer: avPlayerController.pausePlayback()
+            }
+        }
+        activeEngineKind = kind
+        if let decisionMessage {
+            hdrModeToast = decisionMessage
+            showPlayerToast(decisionMessage)
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: 4_000_000_000)
+                if self?.hdrModeToast == decisionMessage {
+                    self?.hdrModeToast = nil
+                }
+            }
+        } else {
+            hdrModeToast = nil
+        }
+    }
+
+    /// AVPlayer may successfully open the container and audio track while the
+    /// Dolby Vision video track remains black. Retry that same source through
+    /// MPV so its HDR10/PQ-compatible base layer remains watchable.
+    private func fallBackToMPV(urlString: String, reason: String) {
+        if isUsingNativeDolbyVision, urlString == nativeDVPlaylistURL {
+            abandonNativeDolbyVision(reason: reason)
+            return
+        }
+
+        guard !didShutdown,
+              activeEngineKind == .avPlayer,
+              activeStreamURL == urlString else { return }
+
+        let avPosition = Double(avPlayerController.positionMs) / 1000.0
+        let resume = max(avPosition, time.current)
+        if resume > 5 {
+            pendingResumeSeconds = resume
+            didApplyResume = false
+        }
+
+        print("[Player] AVPlayer fallback: \(reason)")
+        status = .buffering
+        didAddExternalSubtitles = false
+        addedExternalSubtitleURLs.removeAll()
+        selectEngine(.mpv, decisionMessage: "Dolby Vision → HDR10/PQ (MPV fallback)")
+        playerController.loadFile(urlString)
+        playerController.setAspectMode(.fit)
+        videoNaturalSize = .zero
+        startLoadWatchdog()
+    }
+
+    /// MPV identifies the actual Dolby Vision profile after probing. For P5/P8,
+    /// keep MPV playing while a packet-only local HLS remux is prepared.
+    private func maybeStartNativeDolbyVisionRemux() {
+        guard nativeDVRemuxAllowed,
+              !nativeDVRemuxAttempted,
+              !isUsingNativeDolbyVision,
+              activeEngineKind == .mpv,
+              currentLoadStarted,
+              playerController.hasCoherentTimeSample,
+              !playerController.isPlayerLoading,
+              let sourceURL = activeStreamURL,
+              !nativeDVFailedURLs.contains(sourceURL),
+              URL(string: sourceURL)?.isFileURL != true else { return }
+        let bufferedAheadMs = playerController.bufferedMs - playerController.positionMs
+        guard bufferedAheadMs >= 2_000 || playerController.positionMs >= 5_000 else { return }
+        if let pendingResumeSeconds,
+           pendingResumeSeconds > 5,
+           abs(time.current - pendingResumeSeconds) > 5 {
+            return
+        }
+
+        let profile = playerController.dolbyVisionProfile
+        guard profile > 0 else { return }
+        nativeDVRemuxAttempted = true
+
+        guard profile == 5 || profile == 8 else {
+            print("[Player] Native DV remux skipped: profile \(profile)")
+            showPlayerToast("Dolby Vision profile \(profile) → HDR10/PQ")
+            return
+        }
+
+        #if targetEnvironment(simulator)
+        let displaySupportsDolbyVision = false
+        #else
+        let displaySupportsDolbyVision = AVPlayer.availableHDRModes.contains(.dolbyVision)
+        #endif
+        guard displaySupportsDolbyVision else {
+            print("[Player] Native DV remux skipped: display does not advertise Dolby Vision")
+            showPlayerToast("Dolby Vision unavailable on this display → HDR10/PQ")
+            return
+        }
+
+        let startAt = max(time.current - 2, 0)
+        nativeDVOriginalDuration = max(time.duration, Double(playerController.durationMs) / 1000)
+        let preferredLanguage = playerController.audioTracks
+            .first(where: \.selected)?.lang ?? ""
+        let remuxer = DolbyVisionRemuxer(
+            input: sourceURL,
+            startAt: startAt,
+            preferredAudioLanguage: preferredLanguage
+        )
+        nativeDVRemuxer = remuxer
+
+        remuxer.onProgress = { [weak self, weak remuxer] written in
+            guard let self, let remuxer, self.nativeDVRemuxer === remuxer else { return }
+            self.nativeDVWrittenSeconds = max(self.nativeDVWrittenSeconds, written)
+        }
+        remuxer.onFinished = { [weak self, weak remuxer] in
+            guard let self, let remuxer, self.nativeDVRemuxer === remuxer else { return }
+            self.nativeDVRemuxFinished = true
+        }
+        remuxer.onReady = { [weak self, weak remuxer] playlistURL, actualStart in
+            guard let self, let remuxer, self.nativeDVRemuxer === remuxer,
+                  self.activeStreamURL == sourceURL,
+                  self.activeEngineKind == .mpv,
+                  !self.didShutdown else { return }
+            self.activateNativeDolbyVision(
+                playlistURL: playlistURL,
+                actualStart: actualStart
+            )
+        }
+        remuxer.onIneligible = { [weak self, weak remuxer] reason in
+            guard let self, let remuxer else { return }
+            self.nativeDolbyVisionRemuxFailed(
+                reason: reason,
+                sourceURL: sourceURL,
+                remuxer: remuxer
+            )
+        }
+        remuxer.onError = { [weak self, weak remuxer] reason in
+            guard let self, let remuxer else { return }
+            self.nativeDolbyVisionRemuxFailed(
+                reason: reason,
+                sourceURL: sourceURL,
+                remuxer: remuxer
+            )
+        }
+
+        print("[Player] Preparing native Dolby Vision P\(profile) from \(startAt)s")
+        remuxer.start()
+    }
+
+    private func activateNativeDolbyVision(playlistURL: URL, actualStart: Double) {
+        let sourcePosition = max(time.current, actualStart)
+        nativeDVStartOffset = actualStart
+        nativeDVPlaylistURL = playlistURL.absoluteString
+        nativeDVDeferredSourceError = nil
+        nativeDVSourceErrorDeadline = nil
+        isUsingNativeDolbyVision = true
+
+        print("[Player] Native DV playlist ready at source t=\(actualStart)s")
+        status = .buffering
+        playerController.suspendDisplayCriteriaForNativePlayback()
+        selectEngine(.avPlayer, decisionMessage: nil)
+        avPlayerController.loadFile(playlistURL.absoluteString)
+        avPlayerController.seekToMs(Int64(max(sourcePosition - actualStart, 0) * 1000))
+        avPlayerController.setAspectMode(.fit)
+        videoNaturalSize = .zero
+    }
+
+    private func nativeDolbyVisionVideoDidBecomeReady(urlString: String) {
+        guard isUsingNativeDolbyVision, urlString == nativeDVPlaylistURL else { return }
+        let message = "Native Dolby Vision"
+        hdrModeToast = message
+        showPlayerToast(message)
+    }
+
+    private func nativeDolbyVisionRemuxFailed(
+        reason: String,
+        sourceURL: String,
+        remuxer: DolbyVisionRemuxer
+    ) {
+        guard nativeDVRemuxer === remuxer, activeStreamURL == sourceURL else { return }
+        print("[Player] Native DV remux unavailable: \(reason)")
+        nativeDVFailedURLs.insert(sourceURL)
+        nativeDVDeferredSourceError = nil
+        nativeDVSourceErrorDeadline = nil
+        if isUsingNativeDolbyVision {
+            abandonNativeDolbyVision(reason: reason)
+            return
+        }
+
+        remuxer.cancel()
+        retiredNativeDVRemuxers.append(remuxer)
+        nativeDVRemuxer = nil
+        showPlayerToast("Native Dolby Vision unavailable → HDR10/PQ")
+    }
+
+    private func abandonNativeDolbyVision(
+        reason: String?,
+        resumeAt: Double? = nil,
+        allowRetry: Bool = false
+    ) {
+        guard !didShutdown, isUsingNativeDolbyVision else { return }
+
+        let nativePosition = nativeDVStartOffset
+            + Double(avPlayerController.positionMs) / 1000
+        let resume = max(resumeAt ?? max(nativePosition, time.current), 0)
+        if !allowRetry, let sourceURL = activeStreamURL {
+            nativeDVFailedURLs.insert(sourceURL)
+        }
+
+        avPlayerController.pausePlayback()
+        if let remuxer = nativeDVRemuxer {
+            remuxer.cancel()
+            retiredNativeDVRemuxers.append(remuxer)
+        }
+        nativeDVRemuxer = nil
+        nativeDVPlaylistURL = nil
+        nativeDVStartOffset = 0
+        nativeDVWrittenSeconds = 0
+        nativeDVRemuxFinished = false
+        nativeDVDeferredSourceError = nil
+        nativeDVSourceErrorDeadline = nil
+        isUsingNativeDolbyVision = false
+        nativeDVRemuxAttempted = !allowRetry
+
+        if let reason {
+            print("[Player] Native DV fallback to retained MPV stream: \(reason)")
+        }
+        selectEngine(
+            .mpv,
+            decisionMessage: reason == nil
+                ? nil
+                : "Native Dolby Vision unavailable → HDR10/PQ"
+        )
+        playerController.restoreDisplayCriteriaAfterNativePlayback()
+        playerController.seekToMs(Int64(resume * 1000))
+        playerController.playPlayback()
+        status = .buffering
+    }
+
+    private func resetNativeDolbyVisionSession() {
+        if isUsingNativeDolbyVision {
+            avPlayerController.pausePlayback()
+        }
+        if let remuxer = nativeDVRemuxer {
+            remuxer.cancel()
+            retiredNativeDVRemuxers.append(remuxer)
+        }
+        nativeDVRemuxer = nil
+        nativeDVPlaylistURL = nil
+        nativeDVStartOffset = 0
+        nativeDVWrittenSeconds = 0
+        nativeDVOriginalDuration = 0
+        nativeDVRemuxFinished = false
+        nativeDVDeferredSourceError = nil
+        nativeDVSourceErrorDeadline = nil
+        nativeDVRemuxAllowed = false
+        nativeDVRemuxAttempted = false
+        isUsingNativeDolbyVision = false
+    }
+
+    /// A second read of some debrid URLs can make MPV's original connection
+    /// close while the packet-copy remux is already producing valid media.
+    /// Give that remux a short chance to become ready before declaring the
+    /// original URL dead and cycling through every source.
+    private func shouldDeferSourceFailureForNativeDolbyVision(_ message: String) -> Bool {
+        guard activeEngineKind == .mpv,
+              !isUsingNativeDolbyVision,
+              nativeDVRemuxer != nil else { return false }
+
+        if nativeDVDeferredSourceError == nil {
+            nativeDVDeferredSourceError = message
+            nativeDVSourceErrorDeadline = Date().addingTimeInterval(15)
+            print("[Player] Deferring MPV source error while native DV remux finishes: \(message)")
+        }
+
+        if let deadline = nativeDVSourceErrorDeadline, Date() < deadline {
+            return true
+        }
+
+        print("[Player] Native DV remux did not recover before the source-error deadline")
+        if let remuxer = nativeDVRemuxer {
+            remuxer.cancel()
+            retiredNativeDVRemuxers.append(remuxer)
+        }
+        if let sourceURL = activeStreamURL {
+            nativeDVFailedURLs.insert(sourceURL)
+        }
+        nativeDVRemuxer = nil
+        nativeDVDeferredSourceError = nil
+        nativeDVSourceErrorDeadline = nil
+        return false
     }
 
     /// Applies all per-stream state for a title/episode. Shared by the initial
@@ -223,6 +686,7 @@ class PlayerViewModel: ObservableObject {
     /// advance, so both paths reset resume/track/subtitle state identically.
     private func applyStreamState(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle], resumeFrom: Double?) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
+        resetNativeDolbyVisionSession()
         subtitleFetchTask?.cancel()
         subtitleFetchTask = nil
         isLoadingExternalSubtitles = false
@@ -233,6 +697,13 @@ class PlayerViewModel: ObservableObject {
         // the controller until mpv publishes the new timeline. Clear the public
         // timeline now so end-of-episode UI cannot be re-armed for the new episode.
         self.time = PlayerTime()
+        self.clock.position = 0
+        self.clock.duration = 0
+        self.clock.buffered = 0
+        self.clock.scrubTarget = nil
+        self.resetScrubSession()
+        self.pendingSeekDelta = 0
+        self.hidePeek()
         self.activeMeta = meta
         self.activeStreamURL = url.absoluteString
         self.activeEpisodeNumbers = isTrailerPlayback
@@ -278,6 +749,7 @@ class PlayerViewModel: ObservableObject {
         self.didApplySavedSubtitleSelection = savedSelection?.subtitle == nil
         self.didApplyAudioPreference = false
         self.didApplySubtitlePreference = false
+        self.hasExplicitSubtitleSelection = false
         loadSkipIntervalsIfNeeded(meta: meta, isTrailerPlayback: isTrailerPlayback)
     }
 
@@ -315,6 +787,9 @@ class PlayerViewModel: ObservableObject {
             pendingExternalSubtitles.append(subtitle)
         }
         if !smartMatched.isEmpty {
+            if pendingTrackSelection?.subtitle == nil, !hasExplicitSubtitleSelection {
+                didApplySubtitlePreference = false
+            }
             didAddExternalSubtitles = false
             addPendingExternalSubtitlesIfNeeded()
         }
@@ -358,8 +833,8 @@ class PlayerViewModel: ObservableObject {
             }
     }
 
-    /// Re-evaluated on every poll tick: shows the card near the end and runs the
-    /// countdown in the final seconds when auto-play is armed.
+    /// Re-evaluated on every poll tick: shows the card with Skip Ending (when
+    /// IntroDB has an outro) and runs the auto-play countdown once armed.
     private func updateNextEpisodeState() {
         guard let _ = nextEpisode,
               subtitle != PlaybackMarkers.trailerSubtitle,
@@ -369,13 +844,7 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        let remaining = time.remaining
-        // Require both a near-the-end remaining time and majority progress, so a
-        // very short clip (where `remaining <= lead` is true almost from the
-        // start) can't pop the card — and auto-advance — before it's watched.
-        guard remaining > 0,
-              remaining <= Self.nextCardLeadSeconds,
-              time.current / time.duration >= 0.5 else {
+        guard shouldPresentNextEpisodeCard else {
             clearNextEpisodeCard()
             return
         }
@@ -396,6 +865,19 @@ class PlayerViewModel: ObservableObject {
         let countdown = max(0, Int(secondsLeft.rounded(.up)))
         if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
         if secondsLeft <= 0.05 { advance(userInitiated: false) }
+    }
+
+    /// Prefer IntroDB ending start so Next Episode and Skip Ending appear together.
+    /// Without an ending marker, fall back to the fixed lead-before-end window.
+    private var shouldPresentNextEpisodeCard: Bool {
+        guard time.remaining > 0,
+              time.current / time.duration >= 0.5 else {
+            return false
+        }
+        if let ending = skipIntervals.first(where: \.isEnding) {
+            return time.current >= max(ending.startTime - Self.skipSegmentStartLead, 0)
+        }
+        return time.remaining <= Self.nextCardLeadSeconds
     }
 
     private func clearNextEpisodeCard() {
@@ -561,50 +1043,147 @@ class PlayerViewModel: ObservableObject {
         isAdvanceInFlight = false
         isAdvancingEpisode = false
         isReloadingStream = false
+        isSwitchingSource = false
         showControls = false
 
-        playerController.loadFile(prepared.url.absoluteString)
+        applyEnginePolicy(
+            for: prepared.url,
+            streamName: prepared.streamName,
+            streamDescription: prepared.streamDescription ?? prepared.subtitleLine,
+            filename: prepared.filename
+        )
+        engine.loadFile(prepared.url.absoluteString)
+        engine.setAspectMode(.fit)
+        videoNaturalSize = .zero
         if pollTimer == nil { startPolling() }
+        startLoadWatchdog()
     }
 
-    /// Silently recovers from an expired link: fetches a fresh stream for the
-    /// current title/episode and reloads it at the last known position, instead
-    /// of dead-ending on the "link expired" error. Falls back to that error only
-    /// when there's no resolver or the retries are exhausted.
+    /// Silently recovers from an expired link / dead source: fetches another
+    /// stream for the current title (excluding URLs already tried) and reloads
+    /// at the last known position.
     private func recoverExpiredStream() {
-        guard let reloadCurrentStream,
-              reloadAttempts < Self.maxReloadAttempts,
-              !isReloadingStream else {
-            surfaceExpiredStreamError()
-            return
-        }
-        reloadAttempts += 1
-        isReloadingStream = true
-        showNextEpisodeCard = false
-        nextEpisodeCountdown = nil
-        autoAdvanceDeadline = nil
-        status = .buffering
-        playerController.pausePlayback()
-
-        // Resume where the real stream left off — progress saving skips the slate,
-        // so Continue Watching still holds the last genuine position.
-        let resume = activeMeta.flatMap { ContinueWatchingStore.item(for: $0.id)?.resumePosition }
-
-        Task { @MainActor in
-            guard let prepared = await reloadCurrentStream() else {
-                isReloadingStream = false
-                surfaceExpiredStreamError()
-                return
-            }
-            replaceStream(prepared: prepared, episode: nil, resumeFrom: resume)
-        }
+        if let url = activeStreamURL { failedStreamURLs.insert(url) }
+        attemptFailover(
+            reason: "This stream link has expired. Go back and start it again to load a fresh stream.",
+            toast: "Link expired — trying another source"
+        )
     }
 
     private func surfaceExpiredStreamError() {
         isReloadingStream = false
+        isFailingOver = false
+        isSwitchingSource = false
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
         status = .error("This stream link has expired. Go back and start it again to load a fresh stream.")
+    }
+
+    // MARK: Load timeout watchdog
+
+    private func startLoadWatchdog() {
+        // Trailers / missing resolver: no alternate sources to fail over to.
+        guard reloadCurrentStream != nil else { return }
+        currentLoadStarted = false
+        loadWatchdogTask?.cancel()
+        let targetURL = activeStreamURL
+        let timeout = loadTimeoutSeconds
+        loadWatchdogTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
+            guard !Task.isCancelled, let self,
+                  !self.currentLoadStarted,
+                  !self.didShutdown,
+                  !self.isFailingOver,
+                  self.activeStreamURL == targetURL
+            else { return }
+            if let url = self.activeStreamURL {
+                self.failedStreamURLs.insert(url)
+            }
+            self.showPlayerToast("Source didn't load — trying another")
+            self.attemptFailover(
+                reason: "The source didn't start within \(self.loadTimeoutSeconds) seconds. Every available source was tried.",
+                toast: nil
+            )
+        }
+    }
+
+    /// Playback has demonstrably begun for the current load — disarm the
+    /// watchdog. Idempotent.
+    private func markLoadStarted() {
+        guard !currentLoadStarted else { return }
+        currentLoadStarted = true
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+    }
+
+    // MARK: Automatic source failover
+
+    /// A stream died or never started. Remember the position, pick the next
+    /// viable source (excluding failed URLs), and switch silently. The error
+    /// overlay only appears when every candidate is exhausted.
+    private func attemptFailover(reason: String, toast: String?) {
+        guard !isFailingOver, !didShutdown else { return }
+        guard let reloadCurrentStream else {
+            status = .error(reason)
+            return
+        }
+        guard reloadAttempts < Self.maxReloadAttempts else {
+            isReloadingStream = false
+            isFailingOver = false
+            isSwitchingSource = false
+            status = .error(reason)
+            return
+        }
+
+        if let url = activeStreamURL {
+            failedStreamURLs.insert(url)
+        }
+
+        isFailingOver = true
+        isReloadingStream = true
+        isSwitchingSource = true
+        reloadAttempts += 1
+        showNextEpisodeCard = false
+        nextEpisodeCountdown = nil
+        autoAdvanceDeadline = nil
+        status = .buffering
+        engine.pausePlayback()
+        if let toast { showPlayerToast(toast) }
+
+        // Prefer the last stable position (slate/error ticks can lie).
+        let resume = lastStablePlaybackTime?.current
+            ?? (time.current > 5 ? time.current : nil)
+            ?? activeMeta.flatMap { ContinueWatchingStore.item(for: $0.id)?.resumePosition }
+
+        let excluded = Array(failedStreamURLs)
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.isFailingOver = false
+                // isSwitchingSource cleared in replaceStream / error paths
+            }
+            guard let prepared = await reloadCurrentStream(excluded) else {
+                self.isReloadingStream = false
+                self.isSwitchingSource = false
+                self.status = .error(reason)
+                return
+            }
+            // Don't mark the new URL failed yet — the watchdog / error path will
+            // if this candidate also dies before playback starts.
+            self.replaceStream(prepared: prepared, episode: nil, resumeFrom: resume)
+        }
+    }
+
+    private func showPlayerToast(_ message: String) {
+        playerToast = message
+        toastClearTask?.cancel()
+        toastClearTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 2_800_000_000)
+            guard !Task.isCancelled, let self else { return }
+            if self.playerToast == message {
+                self.playerToast = nil
+            }
+        }
     }
 
     // MARK: - Polling (mirrors MPV state into the published properties)
@@ -619,12 +1198,20 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func tick() {
-        let c = playerController
+        let sampledEngineKind = activeEngineKind
+        let c = engine
         c.refreshPlaybackState()
+        // An AVPlayer error callback can synchronously restore MPV while the
+        // old controller is being refreshed. Discard that stale AV sample.
+        guard activeEngineKind == sampledEngineKind else { return }
 
+        let rawCurrent = Double(c.positionMs) / 1000.0
+        let rawDuration = Double(c.durationMs) / 1000.0
         let latestTime = PlayerTime(
-            current: Double(c.positionMs) / 1000.0,
-            duration: Double(c.durationMs) / 1000.0
+            current: isUsingNativeDolbyVision ? nativeDVStartOffset + rawCurrent : rawCurrent,
+            duration: isUsingNativeDolbyVision
+                ? max(nativeDVOriginalDuration, nativeDVStartOffset + rawDuration)
+                : rawDuration
         )
         if c.hasCoherentTimeSample,
            !c.isPlayerLoading,
@@ -648,6 +1235,20 @@ class PlayerViewModel: ObservableObject {
             Int(latestTime.current) != Int(time.current) ||
             latestTime.duration != time.duration) {
             if latestTime != time { time = latestTime }
+            // Keep the high-frequency clock in sync for scrub/seek HUDs even when
+            // the coarser `time` publication is throttled by the settings panel.
+            if clock.position != latestTime.current { clock.position = latestTime.current }
+            if clock.duration != latestTime.duration { clock.duration = latestTime.duration }
+            let rawBufferedSeconds = Double(c.bufferedMs) / 1000.0
+            let bufferedSeconds = isUsingNativeDolbyVision
+                ? min(nativeDVStartOffset + rawBufferedSeconds, latestTime.duration)
+                : rawBufferedSeconds
+            if clock.buffered != bufferedSeconds { clock.buffered = bufferedSeconds }
+        }
+
+        let frameSize = c.videoFrameSize
+        if frameSize.width > 1, frameSize.height > 1, frameSize != videoNaturalSize {
+            videoNaturalSize = frameSize
         }
 
         // An expired stream link is often answered with a short "slate" clip
@@ -658,9 +1259,12 @@ class PlayerViewModel: ObservableObject {
         // stream's transient ended/loading state so nothing flickers or re-fires.
         if isAdvanceInFlight { return }
 
-        if subtitle != PlaybackMarkers.trailerSubtitle, detectReplacementStream(c) { return }
+        if !isUsingNativeDolbyVision,
+           subtitle != PlaybackMarkers.trailerSubtitle,
+           detectReplacementStream(c) { return }
 
         applyPendingResumeIfNeeded()
+        maybeStartNativeDolbyVisionRemux()
         addPendingExternalSubtitlesIfNeeded()
         updateSkipIntervalState()
 
@@ -701,8 +1305,22 @@ class PlayerViewModel: ObservableObject {
             updateNextEpisodeState()
         }
 
-        // Don't clobber an explicit error state.
+        // Don't clobber an explicit error state (failover already exhausted).
         if case .error = status { return }
+
+        // mpv hard-failed this source — try the next one before surfacing UI.
+        if !c.currentErrorMessage.isEmpty, !isFailingOver, !isReloadingStream {
+            if shouldDeferSourceFailureForNativeDolbyVision(c.currentErrorMessage) {
+                if status != .buffering { status = .buffering }
+                return
+            }
+            if let url = activeStreamURL { failedStreamURLs.insert(url) }
+            attemptFailover(
+                reason: c.currentErrorMessage,
+                toast: "Source failed — trying another"
+            )
+            return
+        }
 
         let previousStatus = status
 
@@ -720,6 +1338,11 @@ class PlayerViewModel: ObservableObject {
         }
         if status != latestStatus { status = latestStatus }
 
+        // First real frames/audio — disarm the load watchdog.
+        if status == .playing || (status == .paused && time.duration > 0 && !c.isPlayerLoading) {
+            markLoadStarted()
+        }
+
         // The controls are shown on launch (showControls defaults to true) but the
         // auto-hide timer is only armed by user transport actions. Arm it whenever
         // playback (re)starts so the initial controls fade on their own — without
@@ -729,10 +1352,11 @@ class PlayerViewModel: ObservableObject {
             scheduleControlsHide()
         }
 
-        // A genuine stream is playing: allow the expired-link recovery to retry
-        // fresh next time (each expiry event gets its own attempt budget).
+        // A genuine stream is playing: reset failover budget for the next
+        // independent failure later in the session.
         if status == .playing, time.duration >= 60, !didDetectReplacementStream {
             reloadAttempts = 0
+            failedStreamURLs.removeAll()
         }
 
         if let latestSpeed = PlaybackSpeed(rawValue: c.currentSpeed),
@@ -743,7 +1367,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func syncTracks() {
-        let c = playerController
+        let c = engine
 
         let latestAudioTracks = c.audioTracks.map {
             AudioTrack(id: "\($0.id)", name: $0.title,
@@ -775,18 +1399,50 @@ class PlayerViewModel: ObservableObject {
 
     func play() {
         if status == .ended { seek(to: 0) }
-        playerController.playPlayback()
+        engine.playPlayback()
         status = .playing
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
         showControls = true
         scheduleControlsHide()
     }
 
     func pause() {
-        playerController.pausePlayback()
+        engine.pausePlayback()
         status = .paused
-        showControls = true
         saveProgress(force: true)
-        scheduleControlsHide()
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
+        // Show transport first; metadata sheet fades in after a short delay
+        // (trailers stay on simple controls only).
+        showControls = true
+        if subtitle != PlaybackMarkers.trailerSubtitle, !showSettingsPanel, !isScrubbing {
+            schedulePauseOverlay()
+        } else {
+            scheduleControlsHide()
+        }
+    }
+
+    /// After 3s of still being paused, hide transport and show the metadata sheet.
+    private func schedulePauseOverlay() {
+        pauseOverlayTask?.cancel()
+        pauseOverlayTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: Self.pauseOverlayDelaySeconds * 1_000_000_000)
+            guard !Task.isCancelled, let self else { return }
+            guard self.status == .paused,
+                  !self.showSettingsPanel,
+                  !self.isScrubbing,
+                  self.subtitle != PlaybackMarkers.trailerSubtitle
+            else { return }
+            self.showControls = false
+            self.showPauseOverlay = true
+            self.updateSkipIntervalState()
+        }
+    }
+
+    private func cancelPauseOverlaySchedule() {
+        pauseOverlayTask?.cancel()
+        pauseOverlayTask = nil
     }
 
     func shutdown() {
@@ -797,6 +1453,23 @@ class PlayerViewModel: ObservableObject {
         controlsHideTimer?.invalidate()
         controlsHideTimer = nil
         stopRepeatingSkip()
+        cancelScrub()
+        hidePeek()
+        seekDebounceTask?.cancel()
+        loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        toastClearTask?.cancel()
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
+        sidePanel = nil
+        availableSources = []
+        pendingSeekDelta = 0
+        playerToast = nil
+        isSwitchingSource = false
+        if let controllerConnectObserver {
+            NotificationCenter.default.removeObserver(controllerConnectObserver)
+            self.controllerConnectObserver = nil
+        }
         trailerResolveTask?.cancel()
         trailerResolveTask = nil
         subtitleFetchTask?.cancel()
@@ -805,26 +1478,82 @@ class PlayerViewModel: ObservableObject {
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = nil
         playerController.pausePlayback()
+        avPlayerController.pausePlayback()
+        let remuxers = retiredNativeDVRemuxers + [nativeDVRemuxer].compactMap { $0 }
+        remuxers.forEach { $0.cancel() }
+        nativeDVRemuxer = nil
+        retiredNativeDVRemuxers.removeAll()
         saveProgress(force: true)
+        // Leave both engines destroyed so a re-entry cannot resume a ghost pipeline.
         playerController.destroyPlayer()
+        avPlayerController.destroyPlayer()
+        remuxers.forEach { $0.cleanup() }
         status = .idle
     }
 
     func togglePlayPause() {
+        if isScrubbing {
+            commitScrub()
+            return
+        }
         if status == .playing { pause() } else { play() }
     }
 
     func seek(to seconds: Double) {
-        playerController.seekToMs(Int64(seconds * 1000))
+        let duration = time.duration > 0 ? time.duration : clock.duration
+        let target = duration > 0
+            ? min(max(seconds, 0), max(duration - 0.25, 0))
+            : max(seconds, 0)
+        if isUsingNativeDolbyVision {
+            let availableEnd = nativeDVStartOffset + nativeDVWrittenSeconds
+            let isInWrittenWindow = target >= nativeDVStartOffset
+                && (nativeDVRemuxFinished || target <= max(availableEnd - 0.5, nativeDVStartOffset))
+            if isInWrittenWindow {
+                avPlayerController.seekToMs(
+                    Int64(max(target - nativeDVStartOffset, 0) * 1000)
+                )
+            } else {
+                // The local EVENT playlist does not contain this source time.
+                // Resume instantly through the retained MPV item; the next poll
+                // starts a fresh remux around the requested position.
+                abandonNativeDolbyVision(
+                    reason: nil,
+                    resumeAt: target,
+                    allowRetry: true
+                )
+            }
+        } else {
+            engine.seekToMs(Int64(target * 1000))
+        }
+        // Instant UI feedback while mpv catches up.
+        clock.position = target
+        var snapshot = time
+        snapshot.current = target
+        if snapshot.duration <= 0, clock.duration > 0 {
+            snapshot.duration = clock.duration
+        }
+        time = snapshot
+        if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
     }
 
     private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
-        guard !didShutdown, durationMs > 0, positionMs >= 0, positionMs < durationMs else { return }
+        let sourcePositionMs = isUsingNativeDolbyVision
+            ? Int64(nativeDVStartOffset * 1000) + positionMs
+            : positionMs
+        let sourceDurationMs = isUsingNativeDolbyVision && nativeDVOriginalDuration > 0
+            ? Int64(nativeDVOriginalDuration * 1000)
+            : durationMs
+        guard !didShutdown,
+              sourceDurationMs > 0,
+              sourcePositionMs >= 0,
+              sourcePositionMs < sourceDurationMs else { return }
         let snapshot = PlayerTime(
-            current: Double(positionMs) / 1000.0,
-            duration: Double(durationMs) / 1000.0
+            current: Double(sourcePositionMs) / 1000.0,
+            duration: Double(sourceDurationMs) / 1000.0
         )
         time = snapshot
+        clock.position = snapshot.current
+        clock.duration = snapshot.duration
         lastStablePlaybackTime = snapshot
         saveProgress(force: true)
     }
@@ -841,41 +1570,48 @@ class PlayerViewModel: ObservableObject {
     }
 
     func skipForward() {
-        performSeekStep(ms: seekStepMs)
+        nudgeSeek(Double(seekStepSeconds))
     }
 
     func skipBackward() {
-        performSeekStep(ms: -seekStepMs)
+        nudgeSeek(-Double(seekStepSeconds))
     }
 
     func beginRepeatingSkipForward() {
-        beginRepeatingSeek(ms: seekStepMs)
+        beginRepeatingNudge(base: Double(seekStepSeconds))
     }
 
     func beginRepeatingSkipBackward() {
-        beginRepeatingSeek(ms: -seekStepMs)
+        beginRepeatingNudge(base: -Double(seekStepSeconds))
     }
 
     func stopRepeatingSkip() {
-        seekRepeatTimer?.invalidate()
-        seekRepeatTimer = nil
+        stopRepeatingNudge(commit: true)
     }
 
-    private func beginRepeatingSeek(ms: Int64) {
-        stopRepeatingSkip()
-        performSeekStep(ms: ms)
-        seekRepeatTimer = Timer.scheduledTimer(withTimeInterval: Self.seekRepeatInterval, repeats: true) { [weak self] _ in
+    /// Hold-to-seek uses the same accelerating accumulation as rapid taps
+    /// (`nudgeSeek`), not fixed-size hard seeks — so holding feels at least as
+    /// fast as mashing the button.
+    private func beginRepeatingNudge(base: Double) {
+        stopRepeatingNudge(commit: false)
+        // Keep any pending delta from the initial press; continue the streak.
+        applyNudge(base, holdMode: true)
+        let timer = Timer(timeInterval: Self.seekRepeatInterval, repeats: true) { [weak self] _ in
             Task { @MainActor in
-                self?.performSeekStep(ms: ms)
+                self?.applyNudge(base, holdMode: true)
             }
         }
+        RunLoop.main.add(timer, forMode: .common)
+        seekRepeatTimer = timer
     }
 
-    private func performSeekStep(ms: Int64) {
-        playerController.seekByMs(ms)
-        if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
-        showControls = true
-        scheduleControlsHide()
+    private func stopRepeatingNudge(commit: Bool) {
+        seekRepeatTimer?.invalidate()
+        seekRepeatTimer = nil
+        if commit {
+            // Land immediately on release instead of waiting for tap debounce.
+            commitPendingSeekIfNeeded()
+        }
     }
 
     private var seekStepMs: Int64 {
@@ -886,6 +1622,387 @@ class PlayerViewModel: ObservableObject {
         let value = PlayerSeekSettings.validSteps.contains(seconds) ? seconds : PlayerSeekSettings.defaultStep
         seekStepSeconds = value
         PlayerSeekSettings.current = value
+    }
+
+    // MARK: - Infuse-style scrubbing + D-pad seek accumulation
+
+    private var hasStartedPlayback: Bool {
+        status == .playing || status == .paused || time.duration > 0 || clock.duration > 0
+    }
+
+    private var playbackPosition: Double {
+        clock.duration > 0 ? clock.position : time.current
+    }
+
+    private var playbackDuration: Double {
+        clock.duration > 0 ? clock.duration : time.duration
+    }
+
+    private var secondsPerPoint: Double {
+        let duration = playbackDuration
+        guard duration > 0 else { return 0.5 }
+        return max(duration / 3200, 0.35)
+    }
+
+    private func suppressMoveBriefly() {
+        suppressMoveUntil = Date().addingTimeInterval(0.4)
+    }
+
+    private func publishScrub(_ value: Double) {
+        scrubValue = value
+        let now = Date()
+        guard now.timeIntervalSince(lastScrubPublish) > 0.033 else { return }
+        lastScrubPublish = now
+        clock.scrubTarget = value
+    }
+
+    private func restartScrubTimeout() {
+        scrubTimeoutTask?.cancel()
+        scrubTimeoutTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 6_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.cancelScrub()
+        }
+    }
+
+    private func resetScrubSession() {
+        scrubTimeoutTask?.cancel()
+        scrubValue = nil
+        isScrubbing = false
+        resetWheel()
+        clock.scrubTarget = nil
+        touchIntent = .undecided
+        scrubLastDx = 0
+    }
+
+    func beginScrub() {
+        guard hasStartedPlayback, !showSettingsPanel else { return }
+        hidePeek()
+        commitPendingSeekIfNeeded()
+        // Scrubbing replaces the pause sheet for the gesture.
+        dismissPauseOverlay()
+        showControls = false
+        let position = playbackPosition
+        scrubValue = position
+        clock.scrubTarget = position
+        isScrubbing = true
+        resetWheel()
+        restartScrubTimeout()
+    }
+
+    func endScrubGesture() {
+        if let target = scrubValue {
+            clock.scrubTarget = target
+        }
+    }
+
+    func commitScrub() {
+        guard let target = scrubValue else {
+            resetScrubSession()
+            return
+        }
+        seek(to: target)
+        resetScrubSession()
+        showControls = true
+        if status == .paused,
+           subtitle != PlaybackMarkers.trailerSubtitle,
+           !showSettingsPanel {
+            // Transport first; pause sheet returns after the usual idle delay.
+            schedulePauseOverlay()
+        } else {
+            scheduleControlsHide()
+        }
+    }
+
+    func cancelScrub() {
+        resetScrubSession()
+        if status == .paused,
+           subtitle != PlaybackMarkers.trailerSubtitle,
+           !showSettingsPanel {
+            showControls = false
+            schedulePauseOverlay()
+        }
+    }
+
+    /// Coarse left/right jump while scrubbing.
+    func scrubJump(_ seconds: Double) {
+        guard isScrubbing, let target = scrubValue else { return }
+        let duration = playbackDuration
+        let proposed = target + seconds
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    // MARK: Trackpad input
+
+    func remoteTouchBegan() {
+        scrubLastDx = 0
+        suppressMoveBriefly()
+        noteSwipeStarted()
+        touchIntent = isScrubbing ? .scrub : .undecided
+    }
+
+    func remoteTouchMoved(dx: CGFloat, dy: CGFloat) {
+        suppressMoveBriefly()
+        switch touchIntent {
+        case .scrub:
+            scrubPanPoints(dx: dx)
+        case .consumed:
+            break
+        case .undecided:
+            let adx = abs(dx), ady = abs(dy)
+            guard max(adx, ady) > 45 else { return }
+            if ady > adx {
+                touchIntent = .consumed
+                // Vertical swipe: reveal controls. (Info panel is a later port.)
+                revealControls()
+            } else {
+                // Horizontal drag → enter Infuse scrub and start tracking.
+                // beginScrub dismisses the pause sheet if it was up.
+                beginScrub()
+                touchIntent = .scrub
+                scrubPanPoints(dx: dx)
+            }
+        }
+    }
+
+    func remoteTouchEnded(dx: CGFloat, dy: CGFloat) {
+        if touchIntent == .scrub { endScrubGesture() }
+        touchIntent = .undecided
+    }
+
+    private func scrubPanPoints(dx: CGFloat) {
+        let inc = dx - scrubLastDx
+        scrubLastDx = dx
+        guard let target = scrubValue, !wheelEngaged else { return }
+        let duration = playbackDuration
+        let proposed = target + Double(inc) * secondsPerPoint
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    private func noteSwipeStarted() {
+        gcPanFiredThisTouch = true
+    }
+
+    // MARK: Wheel fine-tune (GameController absolute d-pad)
+
+    private func wheelSample(x: Double, y: Double) {
+        guard isScrubbing else {
+            resetWheel()
+            return
+        }
+        let radius = (x * x + y * y).squareRoot()
+        if radius < 0.1 {
+            wheelEngaged = false
+            wheelLastAngle = nil
+            return
+        }
+        if !wheelEngaged {
+            guard radius > 0.72 else { return }
+            wheelEngaged = true
+            wheelLastAngle = nil
+        }
+        guard radius > 0.22 else {
+            wheelLastAngle = nil
+            return
+        }
+
+        let angle = atan2(y, x)
+        defer {
+            wheelLastAngle = angle
+            clock.wheelAngle = angle
+        }
+        guard let last = wheelLastAngle, let target = scrubValue else { return }
+        var delta = angle - last
+        if delta > .pi { delta -= 2 * .pi }
+        if delta < -.pi { delta += 2 * .pi }
+        guard abs(delta) < 1.0 else { return }
+        let seconds = -delta / (2 * .pi) * wheelSecondsPerRevolution
+        let duration = playbackDuration
+        let proposed = target + seconds
+        let clamped = max(0, min(proposed, duration > 0 ? duration - 1 : proposed))
+        publishScrub(clamped)
+        restartScrubTimeout()
+    }
+
+    private func resetWheel() {
+        wheelLastAngle = nil
+        wheelEngaged = false
+    }
+
+    private func dpadSample(x: Double, y: Double) {
+        if isScrubbing {
+            wheelSample(x: x, y: y)
+            return
+        }
+
+        let touching = abs(x) > 0.001 || abs(y) > 0.001
+        if touching {
+            if !gcTouchDown {
+                gcTouchDown = true
+                gcTouchStartTime = Date()
+                gcPanFiredThisTouch = false
+            }
+        } else if gcTouchDown {
+            gcTouchDown = false
+            let dur = Date().timeIntervalSince(gcTouchStartTime)
+            if dur < 0.6, !gcPanFiredThisTouch {
+                remoteTapped()
+            }
+        }
+    }
+
+    /// Light touchpad contact (no click, no swipe) → peek bar.
+    private func remoteTapped() {
+        guard hasStartedPlayback, !isScrubbing, !showControls, !showSettingsPanel else { return }
+        showPeek()
+    }
+
+    func showPeek() {
+        guard hasStartedPlayback, !showControls, !isScrubbing, !showSettingsPanel else { return }
+        peekVisible = true
+        peekTask?.cancel()
+        peekTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 4_000_000_000)
+            guard !Task.isCancelled else { return }
+            self?.peekVisible = false
+        }
+    }
+
+    func hidePeek() {
+        peekTask?.cancel()
+        peekVisible = false
+    }
+
+    private func configureWheelTrackingIfNeeded() {
+        guard !didConfigureWheelTracking else {
+            configureWheelTracking()
+            return
+        }
+        didConfigureWheelTracking = true
+        configureWheelTracking()
+        controllerConnectObserver = NotificationCenter.default.addObserver(
+            forName: .GCControllerDidConnect,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.configureWheelTracking()
+            }
+        }
+    }
+
+    private func configureWheelTracking() {
+        for controller in GCController.controllers() {
+            guard let pad = controller.microGamepad else { continue }
+            pad.reportsAbsoluteDpadValues = true
+            pad.dpad.valueChangedHandler = { [weak self] _, x, y in
+                Task { @MainActor in
+                    self?.dpadSample(x: Double(x), y: Double(y))
+                }
+            }
+        }
+    }
+
+    // MARK: D-pad accumulating seek
+
+    /// One left/right press. Rapid presses accumulate into one seek with
+    /// acceleration, previewed by `pendingSeekDelta` / SeekHUD. Hold-to-seek
+    /// uses the same path via `beginRepeatingNudge`.
+    func nudgeSeek(_ base: Double) {
+        applyNudge(base, holdMode: false)
+    }
+
+    private func applyNudge(_ base: Double, holdMode: Bool) {
+        guard hasStartedPlayback, !isScrubbing, !showSettingsPanel else { return }
+        hidePeek()
+
+        let now = Date()
+        // Hold ticks are ~0.11s apart; taps need a looser window.
+        let streakWindow = holdMode ? 0.25 : 0.35
+        let maxStreak = holdMode ? 28 : 12
+        let accelPerStep = holdMode ? 0.75 : 0.6
+        if let last = lastNudgeAt, now.timeIntervalSince(last) < streakWindow {
+            nudgeStreak = min(nudgeStreak + 1, maxStreak)
+        } else if !holdMode {
+            nudgeStreak = 0
+        }
+        // Hold mode: don't reset streak on a slightly late tick.
+        lastNudgeAt = now
+
+        let accel = 1.0 + Double(nudgeStreak) * accelPerStep
+        pendingSeekDelta += base * accel
+
+        let duration = playbackDuration
+        let position = playbackPosition
+        if duration > 0 {
+            let target = min(max(position + pendingSeekDelta, 0), duration - 1)
+            pendingSeekDelta = target - position
+        }
+
+        if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
+
+        // Left/right skip always dismisses the pause metadata sheet so SeekHUD /
+        // transport can take over (same idea as Android onUserInteraction).
+        if showPauseOverlay {
+            dismissPauseOverlay()
+            showControls = false
+        } else if showControls {
+            scheduleControlsHide()
+            if status == .paused,
+               subtitle != PlaybackMarkers.trailerSubtitle,
+               !showSettingsPanel {
+                // Restart the 3s countdown if transport is already up while paused.
+                schedulePauseOverlay()
+            }
+        }
+
+        seekDebounceTask?.cancel()
+        if holdMode {
+            // Commit on finger-up (`stopRepeatingNudge`), not mid-hold.
+            return
+        }
+        seekDebounceTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: 650_000_000)
+            guard !Task.isCancelled, let self else { return }
+            self.commitPendingSeekIfNeeded()
+        }
+    }
+
+    private func commitPendingSeekIfNeeded() {
+        seekDebounceTask?.cancel()
+        let delta = pendingSeekDelta
+        pendingSeekDelta = 0
+        nudgeStreak = 0
+        guard delta != 0 else { return }
+        // Belt-and-braces: skip must never leave the pause sheet up.
+        if showPauseOverlay {
+            dismissPauseOverlay()
+        }
+        seek(to: playbackPosition + delta)
+        if !isScrubbing, !showControls {
+            // After a bare-video skip, briefly flash controls so the user sees
+            // the landing position, then auto-hide (or return to pause sheet).
+            showControls = true
+            if status == .paused,
+               subtitle != PlaybackMarkers.trailerSubtitle,
+               !showSettingsPanel {
+                schedulePauseOverlay()
+            } else {
+                scheduleControlsHide()
+            }
+        } else if showControls {
+            if status == .paused,
+               subtitle != PlaybackMarkers.trailerSubtitle,
+               !showSettingsPanel {
+                schedulePauseOverlay()
+            } else {
+                scheduleControlsHide()
+            }
+        }
     }
 
     /// Cancels the countdown for the current episode after a manual seek; the
@@ -899,53 +2016,54 @@ class PlayerViewModel: ObservableObject {
 
     func setSpeed(_ speed: PlaybackSpeed) {
         playbackSpeed = speed
-        playerController.setSpeed(speed.rawValue)
+        engine.setSpeed(speed.rawValue)
     }
 
     func applySubtitleStyle() {
-        playerController.applySubtitleStyle()
+        engine.applySubtitleStyle()
     }
 
     /// Shifts subtitle timing; positive shows captions later.
     func setSubtitleDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -30_000), 30_000)
         subtitleDelayMs = clamped
-        playerController.setSubtitleDelay(Double(clamped) / 1000.0)
+        engine.setSubtitleDelay(Double(clamped) / 1000.0)
     }
 
     /// Shifts audio timing; positive delays the audio.
     func setAudioDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -3_000), 3_000)
         audioDelayMs = clamped
-        playerController.setAudioDelay(Double(clamped) / 1000.0)
+        engine.setAudioDelay(Double(clamped) / 1000.0)
     }
 
     /// PCM amplification in whole dB (0…10).
     func setAudioAmplificationDb(_ db: Int) {
         let clamped = min(max(db, 0), 10)
         audioAmplificationDb = clamped
-        playerController.setAudioVolumeGain(dB: Double(clamped))
+        engine.setAudioVolumeGain(dB: Double(clamped))
     }
 
     // MARK: - Track selection
 
     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
         if track.id == "off" {
-            playerController.selectSubtitle(-1)
+            engine.selectSubtitle(-1)
         } else if let id = Int(track.id) {
-            playerController.selectSubtitle(id)
+            engine.selectSubtitle(id)
         }
         subtitles = subtitles.map { var t = $0; t.isSelected = (t.id == track.id); return t }
         if persist {
             saveSubtitleSelection(track)
             didApplySavedSubtitleSelection = true
             didApplySubtitlePreference = true
+            hasExplicitSubtitleSelection = true
         }
     }
 
     /// Selects an external subtitle from the panel: if mpv already loaded this
     /// URL (eagerly or from an earlier pick) just switch to that track,
-    /// otherwise `sub-add` it now — mpv selects newly added tracks itself.
+    /// otherwise `sub-add` it now and explicitly select that requested track.
     func selectExternalSubtitle(_ subtitle: NuvioSubtitle) {
         if let track = subtitles.first(where: { $0.externalFilename == subtitle.url }) {
             selectSubtitle(track)
@@ -953,6 +2071,7 @@ class PlayerViewModel: ObservableObject {
             saveSubtitleSelection(subtitle)
             didApplySavedSubtitleSelection = true
             didApplySubtitlePreference = true
+            hasExplicitSubtitleSelection = true
             pendingSelectedExternalSubtitleURL = subtitle.url
             if !pendingExternalSubtitles.contains(where: { $0.url == subtitle.url }) {
                 pendingExternalSubtitles.append(subtitle)
@@ -1001,7 +2120,7 @@ class PlayerViewModel: ObservableObject {
 
     private func addPendingExternalSubtitlesIfNeeded() {
         guard !didAddExternalSubtitles, !pendingExternalSubtitles.isEmpty else { return }
-        guard !playerController.isPlayerLoading else { return }
+        guard !engine.isPlayerLoading else { return }
         var subtitlesToAdd = pendingExternalSubtitles.filter {
             !addedExternalSubtitleURLs.contains($0.url)
         }
@@ -1011,7 +2130,10 @@ class PlayerViewModel: ObservableObject {
             subtitlesToAdd.append(selected)
         }
         subtitlesToAdd.forEach { subtitle in
-            playerController.addSubtitleUrl(subtitle.url)
+            engine.addSubtitle(
+                subtitle,
+                select: subtitle.url == pendingSelectedExternalSubtitleURL
+            )
             addedExternalSubtitleURLs.insert(subtitle.url)
         }
         didAddExternalSubtitles = true
@@ -1072,21 +2194,25 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        var matchingTrack: SubtitleTrack?
+        let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
         for language in preferredLanguages {
-            matchingTrack = subtitles.first { track in
+            if let matchingTrack = subtitles.first(where: { track in
                 subtitleTrack(track, matches: language)
+            }) {
+                didApplySubtitlePreference = true
+                selectSubtitle(matchingTrack, persist: false)
+                return
             }
-            if matchingTrack != nil { break }
-        }
-        if let matchingTrack {
-            didApplySubtitlePreference = true
-            selectSubtitle(matchingTrack, persist: false)
-            return
+
+            let hasPendingMatch = pendingExternalSubtitles.contains { subtitle in
+                !loadedExternalURLs.contains(subtitle.url) &&
+                (SubtitleLanguagePreferences.matches(subtitle.language, target: language) ||
+                 SubtitleLanguagePreferences.matches(subtitle.label, target: language))
+            }
+            if hasPendingMatch { return }
         }
 
         let pendingPreferredURLs = Set(pendingExternalSubtitles.map(\.url))
-        let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
         guard pendingPreferredURLs.isSubset(of: loadedExternalURLs) else { return }
         guard subtitles.contains(where: { $0.id != "off" }) else { return }
         guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
@@ -1096,7 +2222,7 @@ class PlayerViewModel: ObservableObject {
 
     func selectAudio(_ track: AudioTrack, persist: Bool = true) {
         if let id = Int(track.id) {
-            playerController.selectAudio(id)
+            engine.selectAudio(id)
         }
         audioTracks = audioTracks.map { var t = $0; t.isSelected = (t.id == track.id); return t }
         if persist {
@@ -1220,10 +2346,11 @@ class PlayerViewModel: ObservableObject {
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard !self.controlsAutoHideSuspended else { return }
-                if self.status == .playing || self.status == .paused {
-                    self.showControls = false
-                    self.updateSkipIntervalState()
-                }
+                // While paused, the dedicated pause-overlay timer owns visibility
+                // (3s delay). Don't fight it by auto-hiding controls early.
+                guard self.status == .playing else { return }
+                self.showControls = false
+                self.updateSkipIntervalState()
             }
         }
     }
@@ -1235,21 +2362,232 @@ class PlayerViewModel: ObservableObject {
     }
 
     func revealControls() {
+        hidePeek()
+        if isScrubbing { return }
+        // Full transport chrome supersedes the pause metadata sheet.
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
         showControls = true
         updateSkipIntervalState()
-        if status == .playing || status == .paused {
+        if status == .playing {
+            scheduleControlsHide()
+        } else if status == .paused {
+            // Restart the 3s countdown to the pause sheet.
+            if subtitle != PlaybackMarkers.trailerSubtitle, !showSettingsPanel {
+                schedulePauseOverlay()
+            }
+        }
+    }
+
+    /// Dismisses the pause sheet without resuming (e.g. Menu / open settings).
+    func dismissPauseOverlay() {
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
+    }
+
+    // MARK: - Side panels (episodes / sources)
+
+    var canShowEpisodesPanel: Bool {
+        !seriesEpisodes.isEmpty && subtitle != PlaybackMarkers.trailerSubtitle
+    }
+
+    var canShowSourcesPanel: Bool {
+        fetchPlaybackSources != nil && subtitle != PlaybackMarkers.trailerSubtitle
+    }
+
+    var panelEpisodes: [NuvioVideo] {
+        guard let current = currentEpisodeVideo else { return seriesEpisodes }
+        // Same season first (current season), then the rest in order.
+        let season = current.season
+        let same = seriesEpisodes.filter { $0.season == season }
+        return same.isEmpty ? seriesEpisodes : same
+    }
+
+    var panelCurrentEpisodeId: String? {
+        currentEpisodeVideo?.id
+    }
+
+    func openSidePanel(_ panel: PlayerSidePanel) {
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
+        showSettingsPanel = false
+        controlsHideTimer?.invalidate()
+        controlsAutoHideSuspended = true
+        showControls = false
+        sidePanel = panel
+        if panel == .sources {
+            loadSourcesIfNeeded(force: true)
+        }
+    }
+
+    func closeSidePanel() {
+        sidePanel = nil
+        controlsAutoHideSuspended = false
+        if status == .paused {
+            showControls = false
+            schedulePauseOverlay()
+        } else {
+            showControls = true
             scheduleControlsHide()
         }
+    }
+
+    private var panelSourceContentId: String? {
+        currentEpisodeVideo?.id ?? activeMeta?.id
+    }
+
+    private var panelSourceContentType: String {
+        if currentEpisodeVideo != nil { return "series" }
+        return activeMeta?.type ?? "movie"
+    }
+
+    private var panelSourceSubtitleLine: String {
+        if let episode = currentEpisodeVideo {
+            return "S\(episode.season) · E\(episode.episode) · \(episode.title)"
+        }
+        return subtitle
+    }
+
+    func loadSourcesIfNeeded(force: Bool = false) {
+        guard let fetchPlaybackSources,
+              let contentId = panelSourceContentId else { return }
+        guard force || availableSources.isEmpty, !isLoadingSources else { return }
+        isLoadingSources = true
+        let type = panelSourceContentType
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            let streams = await fetchPlaybackSources(contentId, type)
+            self.availableSources = streams
+            self.isLoadingSources = false
+        }
+    }
+
+    func isCurrentSource(_ stream: NuvioStream) -> Bool {
+        guard let active = activeStreamURL else { return false }
+        if let url = stream.url, !url.isEmpty {
+            return url == active
+        }
+        return false
+    }
+
+    func selectSource(_ stream: NuvioStream) {
+        guard let resolvePlaybackStream,
+              let contentId = panelSourceContentId else {
+            showPlayerToast("Can't switch sources right now")
+            return
+        }
+        if isCurrentSource(stream) {
+            closeSidePanel()
+            return
+        }
+        let resume = lastStablePlaybackTime?.current
+            ?? (time.current > 10 ? time.current : nil)
+        let subtitleLine = panelSourceSubtitleLine
+        isSwitchingSource = true
+        status = .buffering
+        engine.pausePlayback()
+        showPlayerToast("Switching source…")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isSwitchingSource = false }
+            guard let prepared = await resolvePlaybackStream(stream, contentId, subtitleLine) else {
+                self.showPlayerToast("Couldn't open this source")
+                self.status = .paused
+                return
+            }
+            self.failedStreamURLs.removeAll()
+            self.replaceStream(prepared: prepared, episode: nil, resumeFrom: resume)
+            self.closeSidePanel()
+            self.showPlayerToast("Source switched")
+        }
+    }
+
+    func selectEpisode(_ episode: NuvioVideo) {
+        guard let resolveNextStream else {
+            showPlayerToast("Episode switching unavailable")
+            return
+        }
+        if episode.id == currentEpisodeVideo?.id {
+            closeSidePanel()
+            return
+        }
+        isSwitchingSource = true
+        status = .buffering
+        engine.pausePlayback()
+        showPlayerToast("Loading episode…")
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.isSwitchingSource = false }
+            guard let prepared = await resolveNextStream(episode) else {
+                self.showPlayerToast("Couldn't load this episode")
+                self.status = .paused
+                return
+            }
+            self.failedStreamURLs.removeAll()
+            self.availableSources = []
+            self.replaceStream(prepared: prepared, episode: episode, resumeFrom: nil)
+            self.closeSidePanel()
+        }
+    }
+
+    func setAspectMode(_ mode: PlayerAspectMode) {
+        // Aspect modes temporarily disabled — always FIT.
+        aspectMode = .fit
+        PlayerAspectMode.current = .fit
+        engine.setAspectMode(.fit)
+        _ = mode
+    }
+
+    /// Published accessors for the pause overlay (meta is private).
+    var pauseOverlayLogoURL: URL? {
+        guard let raw = activeMeta?.logoUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
+        return URL(string: raw)
+    }
+
+    var pauseOverlayYear: Int? { activeMeta?.year }
+
+    var pauseOverlayDescription: String? {
+        // Prefer episode overview when we have one; fall back to title synopsis.
+        if let overview = currentEpisodeVideo?.overview, !overview.isEmpty {
+            return overview
+        }
+        return activeMeta?.description
+    }
+
+    var pauseOverlayCast: [String] {
+        activeMeta?.cast ?? []
+    }
+
+    var pauseOverlayEpisodeLine: String? {
+        // For series, `subtitle` is already "S1 · E2 · Title". For movies empty.
+        let line = subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !line.isEmpty, line != PlaybackMarkers.trailerSubtitle else { return nil }
+        return line
     }
 
     func setControlsAutoHideSuspended(_ suspended: Bool) {
         controlsAutoHideSuspended = suspended
         if suspended {
             controlsHideTimer?.invalidate()
+            cancelPauseOverlaySchedule()
+            showPauseOverlay = false
             showControls = true
             updateSkipIntervalState()
         } else if showControls {
-            scheduleControlsHide()
+            if status == .playing {
+                scheduleControlsHide()
+            } else if status == .paused,
+                      subtitle != PlaybackMarkers.trailerSubtitle,
+                      !isScrubbing {
+                schedulePauseOverlay()
+            }
+        } else if status == .paused,
+                  subtitle != PlaybackMarkers.trailerSubtitle,
+                  !isScrubbing {
+            schedulePauseOverlay()
         }
     }
 
@@ -1298,19 +2636,20 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
+        let season = resolvedEpisodeNumbers?.season
+        let episode = resolvedEpisodeNumbers?.episode
         ContinueWatchingStore.save(
             meta: activeMeta,
             streamUrl: activeStreamURL,
             position: progressTime.current,
             duration: progressTime.duration,
-            season: activeEpisodeNumbers?.season,
-            episode: activeEpisodeNumbers?.episode
+            season: season,
+            episode: episode
         )
         lastProgressSave = Date()
 
-        // "Almost finished" already counts as watched, so the checkmark lands
-        // without sitting through the credits.
-        if progressTime.duration >= 60, progressTime.current / progressTime.duration >= 0.92 {
+        // Ending start / 92% — checkmark without sitting through the credits.
+        if shouldMarkAsWatched(at: progressTime) {
             markWatchedIfNeeded()
         }
     }
@@ -1321,12 +2660,39 @@ class PlayerViewModel: ObservableObject {
               playbackTime.duration >= 60 else {
             return false
         }
-        return playbackTime.remaining <= Self.nextCardLeadSeconds
-            && playbackTime.current / playbackTime.duration >= 0.5
+        // Mirror card presentation: ending-marker path or lead-seconds fallback.
+        return shouldPresentNextEpisodeCard
+    }
+
+    /// When to stamp the episode/title watched during an in-progress save.
+    /// Aligns with Skip Ending / Next Episode when IntroDB has an outro so a
+    /// user who leaves during credits still gets the checkmark.
+    private func shouldMarkAsWatched(at playbackTime: PlayerTime) -> Bool {
+        guard playbackTime.duration >= 60,
+              playbackTime.current > 0,
+              playbackTime.current / playbackTime.duration >= 0.5 else {
+            return false
+        }
+        if let ending = skipIntervals.first(where: \.isEnding),
+           playbackTime.current >= max(ending.startTime - Self.skipSegmentStartLead, 0) {
+            return true
+        }
+        return playbackTime.current / playbackTime.duration >= 0.92
     }
 
     private var nextEpisodeIsPlayable: Bool {
         nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) } ?? false
+    }
+
+    /// Season/episode for the item currently playing. Prefer the structured
+    /// episode object from Details / auto-advance; fall back to parsing the
+    /// player subtitle line or stream filename so a format mismatch cannot
+    /// drop the mark as a whole-title entry (which the episode strip ignores).
+    private var resolvedEpisodeNumbers: (season: Int, episode: Int)? {
+        if let current = currentEpisodeVideo, current.season > 0 || current.episode > 0 {
+            return (current.season, current.episode)
+        }
+        return activeEpisodeNumbers
     }
 
     /// Marks the current playback watched — the specific episode for series,
@@ -1334,13 +2700,17 @@ class PlayerViewModel: ObservableObject {
     /// past the threshold don't rewrite the store.
     private func markWatchedIfNeeded() {
         guard let activeMeta else { return }
-        let season = activeEpisodeNumbers?.season
-        let episode = activeEpisodeNumbers?.episode
+        let numbers = resolvedEpisodeNumbers
+        let season = numbers?.season
+        let episode = numbers?.episode
         if let season, let episode {
             guard !WatchedStore.containsEpisode(metaId: activeMeta.id, season: season, episode: episode) else {
                 return
             }
         } else {
+            // Series without resolved S/E must not write a whole-title mark —
+            // that would checkmark the poster but never the episode card.
+            if activeMeta.isSeries { return }
             guard !WatchedStore.contains(metaId: activeMeta.id, type: activeMeta.type) else { return }
         }
         WatchedStore.markWatched(activeMeta, season: season, episode: episode)
@@ -1348,16 +2718,23 @@ class PlayerViewModel: ObservableObject {
 
     /// Extracts "S1 · E3" from the episode subtitle DetailsScreen passes along
     /// (see `pendingEpisodeSubtitle`). Movies use an empty subtitle → nil.
+    /// Accepts middle-dot / dash / plain spacing so a typography change cannot
+    /// silently leave `activeEpisodeNumbers` nil.
     private static func episodeNumbers(fromSubtitle subtitle: String) -> (season: Int, episode: Int)? {
-        guard let match = subtitle.range(of: #"^S(\d+) · E(\d+)"#, options: .regularExpression) else {
+        let pattern = #"^S(\d+)\s*[·.\-–—]?\s*E(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive) else {
             return nil
         }
-        let numbers = subtitle[match]
-            .components(separatedBy: CharacterSet.decimalDigits.inverted)
-            .filter { !$0.isEmpty }
-            .compactMap { Int($0) }
-        guard numbers.count == 2 else { return nil }
-        return (numbers[0], numbers[1])
+        let range = NSRange(subtitle.startIndex..<subtitle.endIndex, in: subtitle)
+        guard let match = regex.firstMatch(in: subtitle, options: [], range: range),
+              match.numberOfRanges >= 3,
+              let seasonRange = Range(match.range(at: 1), in: subtitle),
+              let episodeRange = Range(match.range(at: 2), in: subtitle),
+              let season = Int(subtitle[seasonRange]),
+              let episode = Int(subtitle[episodeRange]) else {
+            return nil
+        }
+        return (season, episode)
     }
 
     /// Fallback for series resumes that predate episode tracking (their entry
@@ -1394,13 +2771,13 @@ class PlayerViewModel: ObservableObject {
     /// it — that the loaded file is a replacement/expired-link slate, then
     /// pauses and surfaces an error. Returns true once handled so the caller
     /// skips all progress bookkeeping. Idempotent after the first detection.
-    private func detectReplacementStream(_ c: MPVPlayerViewController) -> Bool {
+    private func detectReplacementStream(_ c: PlaybackEngineControlling) -> Bool {
         // A reload is already resolving/loading a fresh stream — treat the old
         // slate as handled so no bookkeeping runs against it.
         if isReloadingStream { return true }
         if didDetectReplacementStream { return true }
 
-        // Judge only once the file has loaded; while opening, mpv reports a
+        // Judge only once the file has loaded; while opening, engines report a
         // zero/partial duration that would read as a false mismatch.
         guard !c.isPlayerLoading, loadedStreamLooksLikeReplacement() else {
             replacementStreamHits = 0
@@ -1411,7 +2788,7 @@ class PlayerViewModel: ObservableObject {
         guard replacementStreamHits >= Self.replacementConfirmTicks else { return false }
 
         didDetectReplacementStream = true
-        playerController.pausePlayback()
+        engine.pausePlayback()
         // Try to silently reload a fresh link before surfacing the error.
         recoverExpiredStream()
         return true
@@ -1599,13 +2976,13 @@ struct TrackInfo {
 /// libmpv network-cache sizes, driven by Settings → Playback → Network Cache.
 /// `forwardBuffer` is how far ahead mpv prefetches ("preload"); `backBuffer`
 /// keeps already-played data resident for instant backward seeks. Values are
-/// libmpv bytesize strings (e.g. `"1024MiB"`).
+/// libmpv bytesize strings (e.g. `"128MiB"`).
 ///
-/// The buffer is a cap, not a fixed allocation, but it fills fastest on exactly
-/// the heavy content (fast host, high-bitrate 4K) where tvOS is most likely to
-/// jetsam the app. "Large" opts into the full 1 GB regardless; "Auto" scales the
-/// ceiling to the device's RAM so a 2 GB Apple TV HD isn't pushed toward an OOM
-/// kill while a 4 GB Apple TV 4K still gets the big preload.
+/// Caps are intentionally modest on tvOS. Apple TV often has only 2–4 GB RAM
+/// total; demuxer cache + decode surfaces + Metal/Vulkan can jetsam the app
+/// (bug type 298 / `per-process-limit`) once a process approaches ~2 GB.
+/// Older defaults (Auto ≈ 512 MiB–1 GiB forward alone) filled aggressively on
+/// debrid/4K hosts and caused frequent foreground kills during long watches.
 struct PlaybackCacheSettings {
     let forwardBuffer: String
     let backBuffer: String
@@ -1613,26 +2990,29 @@ struct PlaybackCacheSettings {
     static var current: PlaybackCacheSettings {
         switch ProfileSettings.current.string(forKey: SettingsKey.networkCache) ?? "Auto" {
         case "Small":
-            return PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
+            // Minimal readahead — prefer stability over seek/buffer comfort.
+            return PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
         case "Medium":
-            return PlaybackCacheSettings(forwardBuffer: "512MiB", backBuffer: "128MiB")
+            return PlaybackCacheSettings(forwardBuffer: "128MiB", backBuffer: "32MiB")
         case "Large":
-            return PlaybackCacheSettings(forwardBuffer: "1024MiB", backBuffer: "256MiB")
+            // Still well under previous 1 GiB default; enough for bursty hosts.
+            return PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
         default:
             return auto
         }
     }
 
-    /// Ceiling scaled to total device RAM (`physicalMemory` is bytes):
-    /// > 3.5 GB → 1 GB, ~3 GB → 512 MiB, ≤ 2 GB (Apple TV HD) → 256 MiB.
+    /// Ceiling scaled to total device RAM (`physicalMemory` is bytes).
+    /// Prefer staying far below jetsam: demuxer is only one slice of peak RSS.
+    /// > 3.5 GB (newer 4K) → 192/48, ~3 GB (common 4K) → 128/32, ≤ 2.5 GB (HD) → 64/16.
     private static var auto: PlaybackCacheSettings {
         let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
         if gib > 3.5 {
-            return PlaybackCacheSettings(forwardBuffer: "1024MiB", backBuffer: "256MiB")
+            return PlaybackCacheSettings(forwardBuffer: "192MiB", backBuffer: "48MiB")
         } else if gib > 2.5 {
-            return PlaybackCacheSettings(forwardBuffer: "512MiB", backBuffer: "128MiB")
+            return PlaybackCacheSettings(forwardBuffer: "128MiB", backBuffer: "32MiB")
         } else {
-            return PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
+            return PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
         }
     }
 }
@@ -1643,7 +3023,7 @@ struct PlaybackCacheSettings {
 // Compose plumbing and iOS-only UIViewController overrides (home indicator,
 // status-bar, screen-edge gestures — none exist on tvOS) removed.
 
-final class MPVPlayerViewController: UIViewController {
+final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling {
     /// Called after a coherent position is captured but before tvOS suspends
     /// the player. PlayerViewModel uses it for a durable lifecycle save.
     var onPlaybackSuspended: ((Int64, Int64) -> Void)?
@@ -1708,7 +3088,9 @@ final class MPVPlayerViewController: UIViewController {
         view.backgroundColor = .black
         view.layer.masksToBounds = true
 
-        metalLayer.contentsGravity = .resizeAspect
+        // `.resize` lets mpv own letterboxing/cropping via panscan/keepaspect.
+        // `.resizeAspect` would re-letterbox after mpv already rendered.
+        metalLayer.contentsGravity = .resize
         metalLayer.contentsScale = UIScreen.main.nativeScale
         metalLayer.framebufferOnly = true
         metalLayer.backgroundColor = UIColor.black.cgColor
@@ -1780,13 +3162,9 @@ final class MPVPlayerViewController: UIViewController {
         // continue as video-only playback.
         checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
 
-        // Network buffering. Stremio/debrid links are bursty and often throttle,
-        // so prefetch aggressively: `demuxer-max-bytes` is the forward ("preload")
-        // buffer — up to ~1 GB by default — and `demuxer-max-back-bytes` keeps
-        // already-played data so backward seeks are instant instead of re-fetched.
-        // `cache-secs`/`demuxer-readahead-secs` are set high enough that the byte
-        // caps, not a time window, are what bound how much gets pulled ahead. Sizes
-        // follow Settings → Playback → Network Cache.
+        // Network buffering. Byte caps (Settings → Playback → Network Cache)
+        // are the hard limit; keep time windows modest so we do not encourage
+        // filling multi‑hundred‑MB demuxer caches on every debrid stream.
         #if targetEnvironment(simulator)
         // MoltenVK's tvOS simulator PBO path allocates every uploaded video
         // frame through MTLSim XPC and can trap in `_xpc_api_misuse` for real
@@ -1797,8 +3175,9 @@ final class MPVPlayerViewController: UIViewController {
         let cache = PlaybackCacheSettings.current
         #endif
         checkError(mpv_set_option_string(mpv, "cache", "yes"))
-        checkError(mpv_set_option_string(mpv, "cache-secs", "3600"))
-        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "3600"))
+        // ~2 minutes of readahead intent; demuxer-max-bytes still hard-caps RAM.
+        checkError(mpv_set_option_string(mpv, "cache-secs", "120"))
+        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "120"))
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer))
         checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer))
         checkError(mpv_set_option_string(mpv, "vulkan-swap-mode", "fifo"))
@@ -1978,6 +3357,7 @@ final class MPVPlayerViewController: UIViewController {
         isPlayerLoading = true
         isPlayerEnded = false
         command("loadfile", args: [url, "replace"])
+        setAspectMode(.fit)
     }
 
     func playPlayback() {
@@ -2016,6 +3396,43 @@ final class MPVPlayerViewController: UIViewController {
         guard mpv != nil else { return }
         var s = Double(speed)
         mpv_set_property(mpv, "speed", MPV_FORMAT_DOUBLE, &s)
+    }
+
+    /// Decoded video dimensions (0 until the first frame reports params).
+    var videoFrameSize: CGSize {
+        let w = getInt("video-params/w")
+        let h = getInt("video-params/h")
+        guard w > 1, h > 1 else { return .zero }
+        return CGSize(width: w, height: h)
+    }
+
+    /// Actual profile parsed by FFmpeg from the selected HEVC track.
+    var dolbyVisionProfile: Int {
+        getInt("current-tracks/video/dolby-vision-profile")
+    }
+
+    /// AVPlayer must own the window's dynamic-range request while it presents
+    /// the local Dolby Vision playlist.
+    func suspendDisplayCriteriaForNativePlayback() {
+        clearDisplayCriteria()
+    }
+
+    func restoreDisplayCriteriaAfterNativePlayback() {
+        resetDisplayCriteriaProbe()
+        scheduleDisplayCriteriaProbe()
+    }
+
+    /// Keep mpv in letterbox FIT. Fill/stretch are SwiftUI scaleEffect on the host.
+    func setAspectMode(_ mode: PlayerAspectMode) {
+        guard mpv != nil else { return }
+        setDoubleProperty("video-zoom", 0)
+        setDoubleProperty("video-pan-x", 0)
+        setDoubleProperty("video-pan-y", 0)
+        setDoubleProperty("panscan", 0)
+        setFlag("keepaspect", true)
+        setStringProperty("video-unscaled", "no")
+        metalLayer.contentsGravity = .resize
+        _ = mode
     }
 
     func setMuted(_ muted: Bool) {
@@ -2064,9 +3481,14 @@ final class MPVPlayerViewController: UIViewController {
         }
     }
 
-    func addSubtitleUrl(_ url: String) {
+    func addSubtitle(_ subtitle: NuvioSubtitle, select: Bool) {
         guard mpv != nil else { return }
-        command("sub-add", args: [url, "select"])
+        command("sub-add", args: [
+            subtitle.url,
+            select ? "select" : "auto",
+            subtitle.label ?? "",
+            subtitle.language
+        ])
     }
 
     func addAudioUrl(_ url: String) {
@@ -2343,15 +3765,16 @@ final class MPVPlayerViewController: UIViewController {
         }
     }
 
-    // MARK: - HDR display mode switching
+    // MARK: - Display mode matching (frame rate + HDR)
     //
     // tvOS never switches the HDMI output to HDR just because a Metal layer
     // renders PQ/HLG content — only AVFoundation players get that for free.
     // When "Match Content → Dynamic Range" is enabled on the Apple TV, apps
     // must request the switch through AVDisplayManager. tvOS 17 added a public
     // AVDisplayCriteria initializer, so build a format description carrying the
-    // stream's color tags (BT.2020 + PQ/HLG) and hand it to the window. Also
-    // carries the container frame rate, so "Match Frame Rate" works too.
+    // stream's color tags and hand it to the window. SDR streams must go through
+    // the same path when Nuvio's Frame Rate Matching setting is enabled; gating
+    // criteria on HDR alone leaves 23.976/24 fps SDR video juddering at 60 Hz.
 
     /// `-[UIWindow avDisplayManager]` is an ObjC *category* from AVKit: calling
     /// it creates no link-time symbol reference, so the linker drops AVKit from
@@ -2450,7 +3873,9 @@ final class MPVPlayerViewController: UIViewController {
         let isHLG = gamma.contains("hlg") || gamma.contains("b67") || gamma.contains("arib")
         let isPQ = gamma.contains("pq") || gamma.contains("2084")
         let isHDR = isDolbyVision || isPQ || isHLG || primaries.contains("2020")
-        guard isHDR else {
+        let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
+        let shouldMatchFrameRate = frameRateMode.caseInsensitiveCompare("Off") != .orderedSame
+        guard isHDR || shouldMatchFrameRate else {
             clearDisplayCriteria()
             return .finished
         }
@@ -2482,14 +3907,23 @@ final class MPVPlayerViewController: UIViewController {
         default: codecType = kCMVideoCodecType_HEVC
         }
 
-        let transfer: CFString = isHLG
-            ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
-            : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
-        let extensions: [CFString: Any] = [
-            kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
-            kCMFormatDescriptionExtension_TransferFunction: transfer,
-            kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
-        ]
+        let extensions: [CFString: Any]
+        if isHDR {
+            let transfer: CFString = isHLG
+                ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
+                : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
+            extensions = [
+                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
+                kCMFormatDescriptionExtension_TransferFunction: transfer,
+                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
+            ]
+        } else {
+            extensions = [
+                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
+                kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_ITU_R_709_2,
+                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
+            ]
+        }
 
         var formatDescription: CMVideoFormatDescription?
         let status = CMVideoFormatDescriptionCreate(
@@ -2511,17 +3945,31 @@ final class MPVPlayerViewController: UIViewController {
         // that metadata for AVDisplayManager, so its compatible HDR10/PQ base
         // layer is requested here instead. The log makes the exact profile
         // visible on-device without incorrectly claiming a Dolby Vision output.
-        let sourceRange = isDolbyVision
-            ? "Dolby Vision profile \(dolbyVisionProfile), level \(dolbyVisionLevel) (HDR10/PQ output)"
-            : (isHLG ? "HLG" : "HDR10/PQ")
-        let targetTRC = isHLG ? "hlg" : "pq"
-        // Keep the renderer's output colorimetry identical to the format
-        // description sent to tvOS. Leaving these on `auto` can adapt a wide
-        // gamut source to BT.709 and then have the TV interpret it as BT.2020,
-        // which exaggerates reds, oranges, and skin tones.
-        setStringProperty("target-prim", "bt.2020")
-        setStringProperty("target-trc", targetTRC)
-        print("[MPV] HDR display request: \(sourceRange); codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), target=bt.2020/\(targetTRC), \(width)x\(height) @ \(fps)fps")
+        let sourceRange: String
+        // Honest labeling: MPV cannot emit native Dolby Vision over HDMI —
+        // this path is the Android-equivalent STRIP_TO_HDR10 / PQ fallback.
+        if isDolbyVision {
+            sourceRange = "Dolby Vision profile \(dolbyVisionProfile), level \(dolbyVisionLevel) → HDR10/PQ (not native DV)"
+        } else if isHLG {
+            sourceRange = "HLG"
+        } else if isHDR {
+            sourceRange = "HDR10/PQ"
+        } else {
+            sourceRange = "SDR"
+        }
+        if isHDR {
+            let targetTRC = isHLG ? "hlg" : "pq"
+            // Keep the renderer's output colorimetry identical to the format
+            // description sent to tvOS. Leaving these on `auto` can adapt a wide
+            // gamut source to BT.709 and then have the TV interpret it as BT.2020,
+            // which exaggerates reds, oranges, and skin tones.
+            setStringProperty("target-prim", "bt.2020")
+            setStringProperty("target-trc", targetTRC)
+        } else {
+            setStringProperty("target-prim", "auto")
+            setStringProperty("target-trc", "auto")
+        }
+        print("[MPV] Display request: \(sourceRange); frameRateMode=\(frameRateMode), codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), \(width)x\(height) @ \(fps)fps")
 
         // The HDMI mode switch tears down and rebuilds the display pipeline.
         // Presenting Vulkan frames into the CAMetalLayer while that happens
@@ -2646,6 +4094,7 @@ final class MPVPlayerViewController: UIViewController {
                         self.isPlayerLoading = false
                         self.attachPendingAudioIfNeeded()
                         self.applySubtitleStyle()
+                        self.setAspectMode(.fit)
                         self.updateState()
                         self.resetDisplayCriteriaProbe()
                         self.scheduleDisplayCriteriaProbe()
@@ -2768,6 +4217,12 @@ final class MPVPlayerViewController: UIViewController {
     private func setStringProperty(_ name: String, _ value: String) {
         guard mpv != nil else { return }
         checkError(mpv_set_property_string(mpv, name, value))
+    }
+
+    private func setDoubleProperty(_ name: String, _ value: Double) {
+        guard mpv != nil else { return }
+        var data = value
+        checkError(mpv_set_property(mpv, name, MPV_FORMAT_DOUBLE, &data))
     }
 
     private func getInt(_ name: String) -> Int {

@@ -541,8 +541,10 @@ public class ProfileViewModel: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            self?.loadProfiles()
-            self?.loadActiveProfile()
+            Task { @MainActor [weak self] in
+                self?.loadProfiles()
+                self?.loadActiveProfile()
+            }
         }
     }
 

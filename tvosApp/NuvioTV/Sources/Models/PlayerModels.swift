@@ -61,6 +61,68 @@ enum PlayerSeekSettings {
     }
 }
 
+/// How the video fills the screen. Applied as a SwiftUI transform on the video
+/// host (mpv always letterboxes into the Metal layer; we scale that surface).
+enum PlayerAspectMode: String, CaseIterable, Identifiable {
+    case fit
+    case fill
+    case stretch
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .fit: return "Fit"
+        case .fill: return "Fill"
+        case .stretch: return "Stretch"
+        }
+    }
+
+    var detail: String {
+        switch self {
+        case .fit: return "Letterbox — show entire frame"
+        case .fill: return "Crop edges to fill the screen"
+        case .stretch: return "Stretch to fill (may distort)"
+        }
+    }
+
+    private static let key = "player.aspectMode"
+
+    static var current: PlayerAspectMode {
+        get {
+            let raw = UserDefaults.standard.string(forKey: key) ?? ""
+            return PlayerAspectMode(rawValue: raw) ?? .fit
+        }
+        set {
+            UserDefaults.standard.set(newValue.rawValue, forKey: key)
+        }
+    }
+
+    /// Scale factors for the video host relative to a FITTED presentation.
+    /// Matches Infuse/NuvioTVAppleTV: zoom crops bars, stretch distorts.
+    func scale(video: CGSize, container: CGSize) -> CGSize {
+        guard video.width > 1, video.height > 1,
+              container.width > 1, container.height > 1 else {
+            return CGSize(width: 1, height: 1)
+        }
+        let videoAspect = video.width / video.height
+        let containerAspect = container.width / container.height
+        switch self {
+        case .fit:
+            return CGSize(width: 1, height: 1)
+        case .fill:
+            let factor = max(containerAspect / videoAspect, videoAspect / containerAspect)
+            return CGSize(width: factor, height: factor)
+        case .stretch:
+            if videoAspect > containerAspect {
+                return CGSize(width: 1, height: videoAspect / containerAspect)
+            } else {
+                return CGSize(width: containerAspect / videoAspect, height: 1)
+            }
+        }
+    }
+}
+
 enum QualityOption: Identifiable, Equatable {
     case auto
     case manual(resolution: String, bitrate: Int)
@@ -140,6 +202,10 @@ struct PreparedNextStream {
     /// The "S1 · E2 · Title" line the player shows and parses episode numbers from.
     let subtitleLine: String
     let subtitles: [NuvioSubtitle]
+    /// Optional stream card name / description for engine policy (Dolby Vision hints).
+    var streamName: String? = nil
+    var streamDescription: String? = nil
+    var filename: String? = nil
 }
 
 struct PlayerTime: Equatable {

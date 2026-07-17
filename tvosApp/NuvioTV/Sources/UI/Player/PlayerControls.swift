@@ -2,6 +2,8 @@ import SwiftUI
 
 private enum PlayerControlFocus: Hashable {
     case play
+    case episodes
+    case sources
     case settings
     case timeline
 }
@@ -16,11 +18,26 @@ struct PlayerControls: View {
     @FocusState private var focusedControl: PlayerControlFocus?
 
     private var progress: CGFloat {
-        CGFloat(min(max(viewModel.time.progress, 0), 1))
+        let duration = max(viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration, 0.001)
+        let position = (viewModel.clock.duration > 0 ? viewModel.clock.position : viewModel.time.current)
+            + viewModel.pendingSeekDelta
+        return CGFloat(min(max(position / duration, 0), 1))
     }
 
     private var isShowingPause: Bool {
         viewModel.status == .playing
+    }
+
+    private var displayCurrent: Double {
+        let position = (viewModel.clock.duration > 0 ? viewModel.clock.position : viewModel.time.current)
+            + viewModel.pendingSeekDelta
+        let duration = viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration
+        return min(max(position, 0), max(duration, 0))
+    }
+
+    private var displayRemaining: Double {
+        let duration = viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration
+        return max(0, duration - displayCurrent)
     }
 
     var body: some View {
@@ -32,72 +49,116 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showSettingsPanel) { isPresented in
-            // When the settings panel closes, hand focus back to the button
-            // that opened it (the controls stay mounted the whole time).
             if !isPresented, viewModel.showControls {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
         }
         .onAppear {
-            DispatchQueue.main.async {
-                focusedControl = .timeline
-            }
+            DispatchQueue.main.async { focusedControl = .timeline }
         }
         .onChange(of: viewModel.showControls) { isVisible in
-            // Controls stay mounted, so re-grab focus each time they reappear.
-            if isVisible, !isSkipSegmentFocused, !isNextEpisodeFocused {
+            // Don't steal focus while the pause metadata sheet owns the remote.
+            if isVisible,
+               !viewModel.showPauseOverlay,
+               !isSkipSegmentFocused,
+               !isNextEpisodeFocused {
                 DispatchQueue.main.async { focusedControl = .timeline }
             }
         }
+        .onChange(of: viewModel.showPauseOverlay) { visible in
+            if visible { focusedControl = nil }
+        }
         .onChange(of: isSkipSegmentFocused) { isFocused in
-            if isFocused {
-                focusedControl = nil
-            }
+            if isFocused { focusedControl = nil }
         }
         .onChange(of: isNextEpisodeFocused) { isFocused in
-            if isFocused {
-                focusedControl = nil
-            }
+            if isFocused { focusedControl = nil }
         }
-        .onChange(of: focusedControl) { control in
-            // Let the remote press-catcher take over left/right for continuous
-            // hold-to-seek while the scrubber is focused.
-            viewModel.isTimelineFocused = (control == .timeline)
+        .onChange(of: focusedControl) { newControl in
+            // Keep this in lockstep with focus so hold-to-seek gating is correct
+            // even before the next render cycle.
+            viewModel.isTimelineFocused = (newControl == .timeline)
+            // Navigating transport should not race the auto-hide timer; keep
+            // chrome up while any control row item (not timeline) is focused.
+            if let newControl, newControl != .timeline {
+                viewModel.setControlsAutoHideSuspended(true)
+            } else if newControl == .timeline {
+                viewModel.setControlsAutoHideSuspended(false)
+                if viewModel.status == .playing {
+                    viewModel.scheduleControlsHide()
+                }
+            }
         }
         .onDisappear {
             viewModel.isTimelineFocused = false
             viewModel.setControlsAutoHideSuspended(false)
         }
         .onMoveCommand { direction in
-            guard !isSkipSegmentFocused, !isNextEpisodeFocused else { return }
-            switch direction {
-            case .up:
-                if focusedControl == .timeline, viewModel.showSkipSegmentCard {
+            handleMove(direction)
+        }
+    }
+
+    /// Transport + timeline are focusable whenever chrome is up. Do not gate on
+    /// `focusedControl != .timeline` — toggling `.focusable` when moving between
+    /// buttons left Select dead after visiting settings/episodes/sources.
+    private var controlsInteractable: Bool {
+        viewModel.showControls
+            && !viewModel.showPauseOverlay
+            && !viewModel.showSettingsPanel
+            && viewModel.sidePanel == nil
+    }
+
+    /// Left-to-right order of currently visible transport buttons.
+    private var transportFocusOrder: [PlayerControlFocus] {
+        var order: [PlayerControlFocus] = [.play]
+        if viewModel.canShowEpisodesPanel { order.append(.episodes) }
+        if viewModel.canShowSourcesPanel { order.append(.sources) }
+        order.append(.settings)
+        return order
+    }
+
+    private func handleMove(_ direction: MoveCommandDirection) {
+        guard !isSkipSegmentFocused, !isNextEpisodeFocused else { return }
+        guard controlsInteractable else { return }
+
+        switch direction {
+        case .up:
+            if focusedControl == .timeline {
+                if viewModel.showSkipSegmentCard {
                     focusedControl = nil
                     DispatchQueue.main.async { onFocusSkipSegment() }
-                } else if focusedControl == .timeline, viewModel.showNextEpisodeCard {
+                } else if viewModel.showNextEpisodeCard {
                     focusedControl = nil
                     DispatchQueue.main.async { onFocusNextEpisode() }
                 } else {
                     focusedControl = .play
                 }
-            case .down:
-                focusedControl = .timeline
-            case .left:
-                if focusedControl == .settings {
-                    focusedControl = .play
-                } else if focusedControl == .timeline {
-                    viewModel.skipBackward()
-                }
-            case .right:
-                if focusedControl == .play {
-                    focusedControl = .settings
-                } else if focusedControl == .timeline {
-                    viewModel.skipForward()
-                }
-            default:
-                break
             }
+        case .down:
+            if focusedControl != .timeline {
+                focusedControl = .timeline
+            }
+        case .left:
+            if focusedControl == .timeline {
+                viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
+                // Keep focus pinned while seeking / hold-to-seek.
+                focusedControl = .timeline
+            } else if let current = focusedControl,
+                      let index = transportFocusOrder.firstIndex(of: current),
+                      index > 0 {
+                focusedControl = transportFocusOrder[index - 1]
+            }
+        case .right:
+            if focusedControl == .timeline {
+                viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
+                focusedControl = .timeline
+            } else if let current = focusedControl,
+                      let index = transportFocusOrder.firstIndex(of: current),
+                      index < transportFocusOrder.count - 1 {
+                focusedControl = transportFocusOrder[index + 1]
+            }
+        default:
+            break
         }
     }
 
@@ -140,10 +201,11 @@ struct PlayerControls: View {
     }
 
     private var transportRow: some View {
-        HStack {
+        HStack(spacing: 18) {
             glassIconButton(
                 size: 70,
                 iconSize: 30,
+                focusKey: .play,
                 isFocused: focusedControl == .play,
                 isEmphasized: isShowingPause
             ) {
@@ -156,14 +218,44 @@ struct PlayerControls: View {
                         .opacity(isShowingPause ? 1 : 0)
                 }
             }
-            .focused($focusedControl, equals: .play)
             .id("play_pause_button")
 
             Spacer()
 
+            if viewModel.canShowEpisodesPanel {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .episodes,
+                    isFocused: focusedControl == .episodes,
+                    isEmphasized: false
+                ) {
+                    viewModel.openSidePanel(.episodes)
+                } icon: {
+                    Image(systemName: "list.bullet")
+                }
+                .id("episodes_button")
+            }
+
+            if viewModel.canShowSourcesPanel {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .sources,
+                    isFocused: focusedControl == .sources,
+                    isEmphasized: false
+                ) {
+                    viewModel.openSidePanel(.sources)
+                } icon: {
+                    Image(systemName: "square.stack.3d.up")
+                }
+                .id("sources_button")
+            }
+
             glassIconButton(
                 size: 70,
                 iconSize: 30,
+                focusKey: .settings,
                 isFocused: focusedControl == .settings,
                 isEmphasized: false
             ) {
@@ -171,25 +263,29 @@ struct PlayerControls: View {
             } icon: {
                 Image(systemName: "ellipsis")
             }
-            .focused($focusedControl, equals: .settings)
             .id("settings_button")
         }
         .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
-        // Not focusable while hidden so the focus engine hands off to the
-        // remote-input overlay (the controls view itself stays mounted), and
-        // not while the settings panel owns the screen.
-        .disabled(!viewModel.showControls || viewModel.showSettingsPanel)
+        .disabled(!controlsInteractable)
     }
 
     private func glassIconButton<Icon: View>(
         size: CGFloat,
         iconSize: CGFloat,
+        focusKey: PlayerControlFocus,
         isFocused: Bool,
         isEmphasized: Bool,
         action: @escaping () -> Void,
         @ViewBuilder icon: () -> Icon
     ) -> some View {
-        Button(action: action) {
+        // Use a real Button action for Siri Remote Select. Do not stack an extra
+        // `.focusable(...)` on the Button — toggling that when focus leaves the
+        // timeline (or moves settings → play) can leave the control visually
+        // focused while Select no longer activates the action.
+        Button {
+            focusedControl = focusKey
+            action()
+        } label: {
             icon()
                 .font(.system(size: iconSize, weight: .semibold))
                 .foregroundColor(isFocused ? .black : .white)
@@ -207,6 +303,7 @@ struct PlayerControls: View {
                 )
         }
         .buttonStyle(PosterCardButtonStyle())
+        .focused($focusedControl, equals: focusKey)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.06 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -220,34 +317,47 @@ struct PlayerControls: View {
 
     private var timelineBar: some View {
         VStack(spacing: 8) {
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule()
-                        .fill(Color.white.opacity(isTimelineFocused ? 0.50 : 0.34))
-                        .frame(height: isTimelineFocused ? 10 : 7)
-
-                    Capsule()
-                        .fill(Color.white.opacity(0.95))
-                        .frame(width: geo.size.width * progress, height: isTimelineFocused ? 10 : 7)
-                        .shadow(color: .white.opacity(isTimelineFocused ? 0.85 : 0.55), radius: isTimelineFocused ? 5 : 2, x: 0, y: 0)
-                }
-                .frame(maxHeight: .infinity, alignment: .center)
-            }
+            let duration = max(viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration, 0.001)
+            let buffered = viewModel.clock.buffered
+            PlayerProgressTrack(
+                played: Double(progress),
+                buffered: buffered / duration,
+                height: isTimelineFocused ? 10 : 7,
+                showThumb: isTimelineFocused,
+                emphasized: isTimelineFocused,
+                glassTrack: true
+            )
             .frame(height: 14)
 
             HStack {
-                Text(PlayerTime.formatted(time: viewModel.time.current))
+                Text(PlayerTime.formatted(time: displayCurrent))
+                if viewModel.pendingSeekDelta != 0 {
+                    Text(PlayerTimeFormat.signedDelta(viewModel.pendingSeekDelta))
+                        .foregroundColor(.white.opacity(0.85))
+                }
                 Spacer()
-                Text("-" + PlayerTime.formatted(time: viewModel.time.remaining))
+                Text("-" + PlayerTime.formatted(time: displayRemaining))
             }
             .font(.system(size: 22, weight: .bold))
             .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
         }
-        .focusable(viewModel.showControls && !viewModel.showSettingsPanel)
+        .focusable(
+            viewModel.showControls
+                && !viewModel.showSettingsPanel
+                && !viewModel.isScrubbing
+                && !viewModel.showPauseOverlay
+        )
         .focused($focusedControl, equals: .timeline)
         .focusEffectDisabledIfAvailable()
+        .onTapGesture { viewModel.beginScrub() }
+        .onMoveCommand { direction in
+            // Timeline owns move while focused so hold-to-seek cannot promote
+            // focus onto the transport buttons.
+            handleMove(direction)
+        }
         .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
+        .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
     }
 }
 
@@ -545,6 +655,8 @@ struct PlayerSettingsPanel: View {
         case subtitles = "Subtitles"
         case audio = "Audio"
         case speed = "Speed"
+        // Picture / aspect modes temporarily disabled.
+        // case picture = "Picture"
     }
 
     private enum StyleControl: Hashable {
@@ -570,6 +682,7 @@ struct PlayerSettingsPanel: View {
         case audioControl(AudioControl)
         case speed(Float)
         case seekStep(Int)
+        case aspect(String)
         case style(StyleControl)
     }
 
@@ -1337,6 +1450,60 @@ struct PlayerSettingsPanel: View {
             .frame(width: 420, alignment: .leading)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    private var picturePage: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            columnHeader("Aspect Ratio")
+            Text("How the video fills the screen")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(.white.opacity(0.5))
+            ScrollView(showsIndicators: false) {
+                VStack(spacing: 14) {
+                    ForEach(PlayerAspectMode.allCases) { mode in
+                        aspectRow(mode)
+                    }
+                }
+                .padding(.vertical, 6)
+            }
+            .focusSection()
+        }
+        .frame(maxWidth: 720, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+    }
+
+    private func aspectRow(_ mode: PlayerAspectMode) -> some View {
+        let isFocused = focus == .aspect(mode.rawValue)
+        let isSelected = viewModel.aspectMode == mode
+        return Button {
+            viewModel.setAspectMode(mode)
+        } label: {
+            HStack(spacing: 16) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(mode.label)
+                        .font(.system(size: 28, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+                    Text(mode.detail)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(isFocused ? .black.opacity(0.55) : .white.opacity(0.5))
+                }
+                Spacer(minLength: 8)
+                if isSelected {
+                    Image(systemName: "checkmark")
+                        .font(.system(size: 26, weight: .bold))
+                        .foregroundColor(isFocused ? .black : .white)
+                }
+            }
+            .padding(.horizontal, 26)
+            .padding(.vertical, 20)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(isFocused ? Color.white : Color.white.opacity(0.08))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: .aspect(mode.rawValue))
+        .focusEffectDisabledIfAvailable()
     }
 
     private func simpleRow(

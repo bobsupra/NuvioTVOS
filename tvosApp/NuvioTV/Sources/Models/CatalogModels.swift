@@ -78,6 +78,38 @@ struct NuvioMeta: Identifiable, Codable {
 
     var isSeries: Bool { type == "series" }
 
+    /// Compact copy for watched / library-style persistence.
+    /// Drops the full episode guide (can be huge) and non-finite ratings so a
+    /// single bad `Double.nan` cannot make `JSONEncoder` silently drop the
+    /// entire watched list (Continue Watching already guards against this).
+    var persistenceSnapshot: NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating.flatMap { $0.isFinite ? $0 : nil },
+            releaseInfo: releaseInfo,
+            runtime: runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            released: released,
+            status: status,
+            videos: nil,
+            trailerYtIds: trailerYtIds
+        )
+    }
+
     /// Series status badge text ("ONGOING" / "ENDED"); nil for movies or
     /// when Cinemeta didn't provide a status. Shared by the details header
     /// and the Home hero.
@@ -1210,69 +1242,178 @@ enum LibraryStore {
 /// (`CollectionsDataStore.SerializableCollection`). Only the fields tvOS
 /// renders are declared; unknown fields in the blob are ignored, and every
 /// optional has a default so older/newer payload shapes still decode.
-struct NuvioCollection: Codable, Identifiable {
+struct NuvioCollection: Decodable, Identifiable {
     let id: String
     let title: String
     var pinToTop: Bool
     var folders: [NuvioCollectionFolder]
 
+    enum CodingKeys: String, CodingKey {
+        case id, title, pinToTop, folders
+        case pin_to_top
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
-        pinToTop = try c.decodeIfPresent(Bool.self, forKey: .pinToTop) ?? false
+        pinToTop = try c.decodeIfPresent(Bool.self, forKey: .pinToTop)
+            ?? c.decodeIfPresent(Bool.self, forKey: .pin_to_top)
+            ?? false
         folders = try c.decodeIfPresent([NuvioCollectionFolder].self, forKey: .folders) ?? []
     }
 }
 
-struct NuvioCollectionFolder: Codable, Identifiable {
+/// Folder card aspect on Home — mirrors Android `PosterShape` / `tileShape`.
+enum CollectionTileShape: String, CaseIterable, Identifiable, Hashable {
+    case poster = "POSTER"
+    case landscape = "LANDSCAPE"
+    case square = "SQUARE"
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .poster: return "Poster"
+        case .landscape: return "Landscape"
+        case .square: return "Square"
+        }
+    }
+
+    /// Width / height, matching Android `PosterShape.aspectRatio()`.
+    var aspectRatio: Double {
+        switch self {
+        case .poster: return 0.675
+        case .landscape: return 1.78
+        case .square: return 1
+        }
+    }
+
+    static func fromStored(_ value: String?) -> CollectionTileShape {
+        guard let value else { return .square }
+        switch value.uppercased() {
+        case "POSTER": return .poster
+        case "LANDSCAPE": return .landscape
+        case "SQUARE": return .square
+        default:
+            switch value.lowercased() {
+            case "poster": return .poster
+            case "landscape": return .landscape
+            case "square": return .square
+            default: return .square
+            }
+        }
+    }
+}
+
+struct NuvioCollectionFolder: Decodable, Identifiable {
     let id: String
     let title: String
     var coverImageUrl: String?
     var coverEmoji: String?
+    var focusGifUrl: String?
+    var focusGifEnabled: Bool
+    var hideTitle: Bool
+    var heroBackdropUrl: String?
+    var heroVideoUrl: String?
+    var titleLogoUrl: String?
+    /// Android `tileShape`: POSTER / LANDSCAPE / SQUARE.
+    var tileShape: CollectionTileShape
     var sources: [NuvioCollectionSource]
     /// Legacy pre-`sources` field still present in old blobs.
     var catalogSources: [NuvioCollectionCatalogSource]
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, coverImageUrl, coverEmoji, tileShape, sources, catalogSources
+        case focusGifUrl, focusGifEnabled, hideTitle
+        case heroBackdropUrl, heroVideoUrl, titleLogoUrl
+        case cover_image_url, cover_emoji, tile_shape, catalog_sources
+        case focus_gif_url, focus_gif_enabled, hide_title
+        case hero_backdrop_url, hero_video_url, title_logo_url
+    }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         id = try c.decode(String.self, forKey: .id)
         title = try c.decode(String.self, forKey: .title)
         coverImageUrl = try c.decodeIfPresent(String.self, forKey: .coverImageUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .cover_image_url)
         coverEmoji = try c.decodeIfPresent(String.self, forKey: .coverEmoji)
+            ?? c.decodeIfPresent(String.self, forKey: .cover_emoji)
+        focusGifUrl = try c.decodeIfPresent(String.self, forKey: .focusGifUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .focus_gif_url)
+        focusGifEnabled = try c.decodeIfPresent(Bool.self, forKey: .focusGifEnabled)
+            ?? c.decodeIfPresent(Bool.self, forKey: .focus_gif_enabled)
+            ?? true
+        hideTitle = try c.decodeIfPresent(Bool.self, forKey: .hideTitle)
+            ?? c.decodeIfPresent(Bool.self, forKey: .hide_title)
+            ?? false
+        heroBackdropUrl = try c.decodeIfPresent(String.self, forKey: .heroBackdropUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .hero_backdrop_url)
+        heroVideoUrl = try c.decodeIfPresent(String.self, forKey: .heroVideoUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .hero_video_url)
+        titleLogoUrl = try c.decodeIfPresent(String.self, forKey: .titleLogoUrl)
+            ?? c.decodeIfPresent(String.self, forKey: .title_logo_url)
+        let shapeRaw = try c.decodeIfPresent(String.self, forKey: .tileShape)
+            ?? c.decodeIfPresent(String.self, forKey: .tile_shape)
+        tileShape = CollectionTileShape.fromStored(shapeRaw)
         sources = try c.decodeIfPresent([NuvioCollectionSource].self, forKey: .sources) ?? []
-        catalogSources = try c.decodeIfPresent([NuvioCollectionCatalogSource].self, forKey: .catalogSources) ?? []
+        catalogSources = try c.decodeIfPresent([NuvioCollectionCatalogSource].self, forKey: .catalogSources)
+            ?? c.decodeIfPresent([NuvioCollectionCatalogSource].self, forKey: .catalog_sources)
+            ?? []
     }
 
     /// Add-on backed catalog sources, merging the modern `sources` array with
     /// the legacy `catalogSources` field (mirrors the Android accessor).
     /// TMDB/Trakt sources are skipped — tvOS resolves add-on catalogs only.
     var addonCatalogSources: [NuvioCollectionCatalogSource] {
-        var merged = sources.compactMap { source -> NuvioCollectionCatalogSource? in
+        var seen = Set<String>()
+        var merged: [NuvioCollectionCatalogSource] = []
+        for source in sources {
             guard source.provider.isEmpty || source.provider.lowercased() == "addon",
-                  let addonId = source.addonId,
-                  let type = source.type,
-                  let catalogId = source.catalogId else { return nil }
-            return NuvioCollectionCatalogSource(addonId: addonId, type: type, catalogId: catalogId, genre: source.genre)
+                  let addonId = source.addonId, !addonId.isEmpty,
+                  let type = source.type, !type.isEmpty,
+                  let catalogId = source.catalogId, !catalogId.isEmpty else { continue }
+            let key = "\(addonId)_\(type)_\(catalogId)_\(source.genre ?? "")"
+            guard seen.insert(key).inserted else { continue }
+            merged.append(
+                NuvioCollectionCatalogSource(
+                    addonId: addonId,
+                    type: type,
+                    catalogId: catalogId,
+                    genre: source.genre
+                )
+            )
         }
-        merged.append(contentsOf: catalogSources)
+        for source in catalogSources {
+            let key = "\(source.addonId)_\(source.type)_\(source.catalogId)_\(source.genre ?? "")"
+            guard seen.insert(key).inserted else { continue }
+            merged.append(source)
+        }
         return merged
     }
 }
 
-struct NuvioCollectionSource: Codable {
+struct NuvioCollectionSource: Decodable {
     var provider: String
     var addonId: String?
     var type: String?
     var catalogId: String?
     var genre: String?
 
+    enum CodingKeys: String, CodingKey {
+        case provider, addonId, type, catalogId, genre
+        case addon_id, catalog_id
+    }
+
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         provider = try c.decodeIfPresent(String.self, forKey: .provider) ?? "addon"
         addonId = try c.decodeIfPresent(String.self, forKey: .addonId)
+            ?? c.decodeIfPresent(String.self, forKey: .addon_id)
         type = try c.decodeIfPresent(String.self, forKey: .type)
         catalogId = try c.decodeIfPresent(String.self, forKey: .catalogId)
+            ?? c.decodeIfPresent(String.self, forKey: .catalog_id)
         genre = try c.decodeIfPresent(String.self, forKey: .genre)
     }
 }
@@ -1291,12 +1432,89 @@ struct NuvioCollectionCatalogSource: Codable {
     }
 }
 
+/// One folder card inside a Home collection row (Android-style grouping).
+/// Selecting it opens the folder's resolved catalog sources, rather than
+/// flattening those catalogs into top-level Home rows.
+struct TVCollectionFolderItem: Identifiable, Hashable {
+    let id: String
+    let collectionId: String
+    let folderId: String
+    let title: String
+    let coverImageUrl: String?
+    let coverEmoji: String?
+    let focusGifUrl: String?
+    let focusGifEnabled: Bool
+    /// Full-screen Modern Home backdrop when this folder is focused.
+    let heroBackdropUrl: String?
+    /// Optional looping hero trailer URL (Android Modern Home; not yet played on tvOS).
+    let heroVideoUrl: String?
+    /// Optional wordmark shown in the hero title area instead of plain text.
+    let titleLogoUrl: String?
+    let tileShape: CollectionTileShape
+    let sources: [NuvioCollectionCatalogSource]
+
+    init(
+        collectionId: String,
+        folder: NuvioCollectionFolder,
+        sources: [NuvioCollectionCatalogSource]
+    ) {
+        self.collectionId = collectionId
+        self.folderId = folder.id
+        self.id = "\(collectionId)_\(folder.id)"
+        self.title = folder.title
+        self.coverImageUrl = folder.coverImageUrl
+        self.coverEmoji = folder.coverEmoji
+        self.focusGifUrl = folder.focusGifUrl
+        self.focusGifEnabled = folder.focusGifEnabled
+        self.heroBackdropUrl = folder.heroBackdropUrl
+        self.heroVideoUrl = folder.heroVideoUrl
+        self.titleLogoUrl = folder.titleLogoUrl
+        self.tileShape = folder.tileShape
+        self.sources = sources
+    }
+
+    /// Focus GIF overlay URL when the toggle is on and a URL is set.
+    var activeFocusGifURLString: String? {
+        guard focusGifEnabled else { return nil }
+        let trimmed = focusGifUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return trimmed.isEmpty ? nil : trimmed
+    }
+
+    /// Backdrop for the full-screen Home layer — matches Android
+    /// `firstNonBlank(heroBackdropUrl, coverImageUrl)`.
+    var preferredHeroBackdropURLString: String? {
+        for candidate in [heroBackdropUrl, coverImageUrl] {
+            let url = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !url.isEmpty { return url }
+        }
+        return nil
+    }
+
+    var preferredTitleLogoURLString: String? {
+        let url = titleLogoUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return url.isEmpty ? nil : url
+    }
+
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+    static func == (lhs: TVCollectionFolderItem, rhs: TVCollectionFolderItem) -> Bool {
+        lhs.id == rhs.id
+            && lhs.focusGifUrl == rhs.focusGifUrl
+            && lhs.focusGifEnabled == rhs.focusGifEnabled
+            && lhs.tileShape == rhs.tileShape
+            && lhs.coverEmoji == rhs.coverEmoji
+            && lhs.coverImageUrl == rhs.coverImageUrl
+            && lhs.heroBackdropUrl == rhs.heroBackdropUrl
+            && lhs.titleLogoUrl == rhs.titleLogoUrl
+    }
+}
+
 /// Per-profile cache of the account's collections. Written only by the sync
 /// pull (Android/phone remain the editors); read by the Home screen.
 enum CollectionsStore {
     static let changedNotification = Notification.Name("nuvio.tv.collections.changed")
 
     private static let baseKey = "nuvio.tv.collections.json"
+    private static let lastPulledIdsKey = "nuvio.tv.collections.lastPulledIds"
     private(set) static var activeProfileId: String?
 
     static func setActiveProfile(_ profileId: String?) {
@@ -1309,19 +1527,71 @@ enum CollectionsStore {
         return "\(baseKey).\(id)"
     }
 
-    static func collections() -> [NuvioCollection] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([NuvioCollection].self, from: data) else {
+    private static var lastPulledIdsStorageKey: String {
+        guard let id = activeProfileId, !id.isEmpty else { return lastPulledIdsKey }
+        return "\(lastPulledIdsKey).\(id)"
+    }
+
+    /// Collection ids present in the last successful account pull. Used when
+    /// pushing a local edit so remote-only collections (created on Android
+    /// after this device last synced) are not wiped, while intentional deletes
+    /// of previously-pulled ids still go through.
+    static func lastPulledCollectionIds() -> Set<String> {
+        guard let data = UserDefaults.standard.data(forKey: lastPulledIdsStorageKey),
+              let ids = try? JSONDecoder().decode([String].self, from: data) else {
             return []
         }
-        return decoded
+        return Set(ids)
+    }
+
+    private static func rememberPulledIds(_ ids: [String]) {
+        guard let data = try? JSONEncoder().encode(ids) else { return }
+        UserDefaults.standard.set(data, forKey: lastPulledIdsStorageKey)
+    }
+
+    /// Decode one collection at a time so a single bad row cannot drop the rest.
+    static func collections() -> [NuvioCollection] {
+        rawCollections().compactMap { row in
+            guard let data = try? JSONSerialization.data(withJSONObject: row) else { return nil }
+            do {
+                return try JSONDecoder().decode(NuvioCollection.self, from: data)
+            } catch {
+                let id = row["id"] as? String ?? "?"
+                let title = row["title"] as? String ?? "?"
+                print("CollectionsStore: skip undecodable collection id=\(id) title=\(title): \(error)")
+                return nil
+            }
+        }
     }
 
     /// Replaces the cache with the account's blob. Raw data is stored as-is so
     /// fields tvOS doesn't model yet survive round-trips of the app version.
+    /// Accepts the blob when at least one collection decodes (or the array is
+    /// empty); a single corrupt row no longer blocks the whole apply.
     static func applyRemote(_ json: Data) {
-        guard (try? JSONDecoder().decode([NuvioCollection].self, from: json)) != nil else { return }
-        UserDefaults.standard.set(json, forKey: storageKey)
+        guard let rows = parseCollectionsArray(from: json) else {
+            print("CollectionsStore.applyRemote: payload is not a JSON array (\(json.count) bytes)")
+            return
+        }
+
+        let decoded = rows.compactMap { row -> NuvioCollection? in
+            guard let data = try? JSONSerialization.data(withJSONObject: row) else { return nil }
+            return try? JSONDecoder().decode(NuvioCollection.self, from: data)
+        }
+        if !rows.isEmpty && decoded.isEmpty {
+            print("CollectionsStore.applyRemote: refused — 0/\(rows.count) collections decoded")
+            return
+        }
+        if decoded.count != rows.count {
+            print("CollectionsStore.applyRemote: partial decode \(decoded.count)/\(rows.count)")
+        } else {
+            print("CollectionsStore.applyRemote: \(decoded.count) collection(s)")
+        }
+
+        // Prefer re-encoded raw rows so a double-encoded string input is stored cleanly.
+        let storeData = (try? JSONSerialization.data(withJSONObject: rows)) ?? json
+        UserDefaults.standard.set(storeData, forKey: storageKey)
+        rememberPulledIds(decoded.map(\.id))
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -1334,27 +1604,86 @@ enum CollectionsStore {
     /// dicts instead of the typed models so fields only the Android app knows
     /// (view modes, tile shapes, TMDB sources, …) survive the round-trip.
     static func rawCollections() -> [[String: Any]] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
-              let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: Any]] else {
-            return []
+        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return [] }
+        return parseCollectionsArray(from: data) ?? []
+    }
+
+    /// Accepts a JSON array, or a JSON string that itself encodes an array
+    /// (double-encoded blobs some backends have returned).
+    private static func parseCollectionsArray(from data: Data) -> [[String: Any]]? {
+        let object = try? JSONSerialization.jsonObject(with: data)
+        if let array = object as? [[String: Any]] {
+            return array
         }
-        return rows
+        if let text = object as? String,
+           let inner = text.data(using: .utf8),
+           let array = (try? JSONSerialization.jsonObject(with: inner)) as? [[String: Any]] {
+            return array
+        }
+        return nil
     }
 
     /// Persists a local edit and asks the sync manager to push it.
+    /// Accepts partial decode (same as applyRemote) so one odd row does not
+    /// block saving the rest of the list.
     static func saveLocalEdit(_ raw: [[String: Any]]) {
-        guard let data = try? JSONSerialization.data(withJSONObject: raw),
-              (try? JSONDecoder().decode([NuvioCollection].self, from: data)) != nil else { return }
+        guard let data = try? JSONSerialization.data(withJSONObject: raw) else { return }
+        let decodedCount = raw.compactMap { row -> NuvioCollection? in
+            guard let item = try? JSONSerialization.data(withJSONObject: row) else { return nil }
+            return try? JSONDecoder().decode(NuvioCollection.self, from: item)
+        }.count
+        guard raw.isEmpty || decodedCount > 0 else {
+            print("CollectionsStore.saveLocalEdit: refused — no decodable collections")
+            return
+        }
         UserDefaults.standard.set(data, forKey: storageKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         NotificationCenter.default.post(name: locallyEditedNotification, object: raw)
+    }
+
+    /// Merge a local edit into the latest remote blob.
+    /// - Local rows win on the same id (edits / creates on this device).
+    /// - Remote-only rows are kept unless their id was known from the last pull
+    ///   and is missing locally (intentional delete on this device).
+    static func mergeLocalEdit(
+        local: [[String: Any]],
+        remote: [[String: Any]],
+        previouslyPulledIds: Set<String>
+    ) -> [[String: Any]] {
+        let localIds = Set(local.compactMap { $0["id"] as? String })
+        let intentionalDeletes = previouslyPulledIds.subtracting(localIds)
+
+        var byId: [String: [String: Any]] = [:]
+        var order: [String] = []
+
+        for row in remote {
+            guard let id = row["id"] as? String, !id.isEmpty else { continue }
+            if intentionalDeletes.contains(id) { continue }
+            byId[id] = row
+            order.append(id)
+        }
+        for row in local {
+            guard let id = row["id"] as? String, !id.isEmpty else { continue }
+            if byId[id] == nil { order.append(id) }
+            byId[id] = row
+        }
+
+        let merged = order.compactMap { byId[$0] }
+        let preserved = merged.count - local.count
+        if preserved > 0 {
+            print("CollectionsStore.mergeLocalEdit: kept \(preserved) remote-only collection(s)")
+        }
+        if !intentionalDeletes.isEmpty {
+            print("CollectionsStore.mergeLocalEdit: dropped \(intentionalDeletes.count) intentionally deleted id(s)")
+        }
+        return merged
     }
 
     /// Deletes every profile's collections on sign-out.
     static func eraseAllProfiles() {
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys
-            .filter { $0.hasPrefix(baseKey) }
+            .filter { $0.hasPrefix(baseKey) || $0.hasPrefix(lastPulledIdsKey) }
             .forEach { defaults.removeObject(forKey: $0) }
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -1400,7 +1729,7 @@ enum WatchedStore {
 
     static func items() -> [WatchedStoreItem] {
         guard let data = readData(forKey: storageKey),
-              let decoded = try? JSONDecoder().decode([WatchedStoreItem].self, from: data) else {
+              let decoded = try? makeDecoder().decode([WatchedStoreItem].self, from: data) else {
             return []
         }
 
@@ -1445,8 +1774,18 @@ enum WatchedStore {
     }
 
     static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) {
-        ContinueWatchingStore.remove(metaId: meta.id)
-        let item = WatchedStoreItem(meta: meta, watchedAt: Date(), season: season, episode: episode)
+        // Episode-level marks must not wipe a series "Up Next" row that was just
+        // written for the following episode. Only clear Continue Watching when
+        // this is a whole-title mark (movies / explicit series watched).
+        if season == nil, episode == nil {
+            ContinueWatchingStore.remove(metaId: meta.id)
+        }
+        let item = WatchedStoreItem(
+            meta: meta.persistenceSnapshot,
+            watchedAt: Date(),
+            season: season,
+            episode: episode
+        )
         let updated = [item] + items().filter {
             !($0.meta.id == meta.id
                 && $0.meta.type.caseInsensitiveCompare(meta.type) == .orderedSame
@@ -1550,13 +1889,49 @@ enum WatchedStore {
     }
 
     static func replaceAll(_ newItems: [WatchedStoreItem]) {
-        persist(newItems.sorted { $0.watchedAt > $1.watchedAt })
+        // Re-snapshot so older rows with non-finite ratings or bloated guides
+        // cannot poison a later encode of the full list.
+        let sanitized = newItems.map {
+            WatchedStoreItem(
+                meta: $0.meta.persistenceSnapshot,
+                watchedAt: $0.watchedAt,
+                season: $0.season,
+                episode: $0.episode
+            )
+        }
+        persist(sanitized.sorted { $0.watchedAt > $1.watchedAt })
     }
 
     private static func persist(_ items: [WatchedStoreItem]) {
-        guard let data = try? JSONEncoder().encode(items) else { return }
-        writeData(data, forKey: storageKey)
-        NotificationCenter.default.post(name: changedNotification, object: nil)
+        do {
+            let data = try makeEncoder().encode(items)
+            guard writeData(data, forKey: storageKey) else { return }
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        } catch {
+            print("Nuvio watched storage encode failed: \(error.localizedDescription)")
+        }
+    }
+
+    private static func makeEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        // Same strategy as ContinueWatchingStore — default JSONEncoder throws on
+        // Double.nan and a bare `try?` would drop the whole watched write.
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return encoder
+    }
+
+    private static func makeDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return decoder
     }
 
     /// Deletes every profile's watched marks and tombstones (the tombstone keys
