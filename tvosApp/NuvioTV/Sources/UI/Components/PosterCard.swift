@@ -96,7 +96,8 @@ struct PosterCard: View {
             // cards are pushed aside rather than overlapped, while the focusable
             // surface stays portrait-width — keeping up/down navigation aligned.
             .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
-            .animation(effectiveSmoothFocus ? .spring(response: 0.28, dampingFraction: 0.86) : nil, value: isLandscape)
+            // Critically damped — no overshoot when expanding to landscape on Home.
+            .animation(effectiveSmoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: isLandscape)
         #else
         Button(action: onClick) {
             posterContent

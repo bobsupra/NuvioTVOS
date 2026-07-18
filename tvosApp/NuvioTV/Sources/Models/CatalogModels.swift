@@ -288,7 +288,16 @@ struct NuvioSubtitle: Identifiable, Codable, Equatable {
 }
 
 struct NuvioStream: Identifiable, Codable {
-    var id: String { url ?? infoHash.map { "\($0):\(fileIdx ?? -1)" } ?? UUID().uuidString }
+    /// Stable identity for lists and focus. Prefer URL / torrent key; never mint a
+    /// fresh UUID on each access (that forces full SwiftUI list rebuilds).
+    var id: String {
+        if let url, !url.isEmpty { return url }
+        if let infoHash, !infoHash.isEmpty {
+            return "\(infoHash):\(fileIdx ?? -1)"
+        }
+        // Deterministic content fallback for rare shells with no playable key.
+        return "stream:\(name ?? "")|\(description ?? "")|\(addonName ?? "")|\(filename ?? "")"
+    }
     let url: String?
     let name: String?
     let description: String?
@@ -346,6 +355,84 @@ struct NuvioStream: Identifiable, Codable {
             subtitles: subtitles, addonLogoURL: logo, infoHash: infoHash,
             fileIdx: fileIdx, sources: sources, filename: filename
         )
+    }
+
+    /// Merges external subtitle-add-on results without dropping torrent metadata
+    /// (infoHash, fileIdx, sources, filename) or branding (logo, addon name).
+    func mergingExternalSubtitles(_ external: [NuvioSubtitle]) -> NuvioStream {
+        guard !external.isEmpty else { return self }
+        var seen = Set(subtitles.map(\.url))
+        var merged = subtitles
+        for subtitle in external where seen.insert(subtitle.url).inserted {
+            merged.append(subtitle)
+        }
+        return NuvioStream(
+            url: url,
+            name: name,
+            description: description,
+            addonName: addonName,
+            subtitles: merged,
+            addonLogoURL: addonLogoURL,
+            infoHash: infoHash,
+            fileIdx: fileIdx,
+            sources: sources,
+            filename: filename
+        )
+    }
+}
+
+/// One add-on's stream results in the progressive picker, matching Android's
+/// `AddonStreamGroup`: created as loading before requests start, then updated
+/// independently as that add-on completes, fails, or times out.
+struct AddonStreamGroup: Identifiable {
+    var id: String { addonId }
+    /// Stable identity (manifest URL / manifest id) — never the display name.
+    let addonId: String
+    let displayName: String
+    var streams: [NuvioStream]
+    var isLoading: Bool
+    var error: String?
+
+    init(
+        addonId: String,
+        displayName: String,
+        streams: [NuvioStream] = [],
+        isLoading: Bool = true,
+        error: String? = nil
+    ) {
+        self.addonId = addonId
+        self.displayName = displayName
+        self.streams = streams
+        self.isLoading = isLoading
+        self.error = error
+    }
+}
+
+enum StreamsEmptyStateReason: Equatable {
+    case noAddonsConfigured
+    case noCompatibleAddons
+    case noStreamsFound
+}
+
+/// Shared stream-discovery snapshot observed by Details and reused when
+/// returning from playback for the same request key.
+struct StreamsDiscoveryState {
+    var requestKey: String? = nil
+    /// Monotonic publication counter. Advances whenever the repository replaces
+    /// this snapshot, including metadata-only updates with unchanged stream ids.
+    var revision: UInt64 = 0
+    var groups: [AddonStreamGroup] = []
+    var isAnyLoading: Bool = false
+    var emptyStateReason: StreamsEmptyStateReason? = nil
+    /// True once this request finished its initial setup (even if empty).
+    var hasResolvedTargets: Bool = false
+
+    var allStreams: [NuvioStream] {
+        groups.flatMap(\.streams)
+    }
+
+    var hasAnyStreams: Bool {
+        groups.contains { !$0.streams.isEmpty }
     }
 }
 
@@ -1242,15 +1329,48 @@ enum LibraryStore {
 /// (`CollectionsDataStore.SerializableCollection`). Only the fields tvOS
 /// renders are declared; unknown fields in the blob are ignored, and every
 /// optional has a default so older/newer payload shapes still decode.
+/// How a collection folder opens — mirrors Android `FolderViewMode`.
+enum CollectionFolderViewMode: String, CaseIterable, Hashable {
+    case tabbedGrid = "TABBED_GRID"
+    case rows = "ROWS"
+    case followLayout = "FOLLOW_LAYOUT"
+
+    /// Rows-style layout (horizontal catalog strips), including follow-home.
+    var usesCatalogRows: Bool {
+        switch self {
+        case .rows, .followLayout: return true
+        case .tabbedGrid: return false
+        }
+    }
+
+    static func fromStored(_ value: String?) -> CollectionFolderViewMode {
+        guard let value else { return .tabbedGrid }
+        switch value.uppercased() {
+        case "ROWS": return .rows
+        case "FOLLOW_LAYOUT": return .followLayout
+        case "TABBED_GRID": return .tabbedGrid
+        default:
+            switch value.lowercased() {
+            case "rows": return .rows
+            case "follow_layout": return .followLayout
+            default: return .tabbedGrid
+            }
+        }
+    }
+}
+
 struct NuvioCollection: Decodable, Identifiable {
     let id: String
     let title: String
     var pinToTop: Bool
+    /// Tabs vs Rows when browsing a folder inside this collection.
+    var viewMode: CollectionFolderViewMode
+    var showAllTab: Bool
     var folders: [NuvioCollectionFolder]
 
     enum CodingKeys: String, CodingKey {
-        case id, title, pinToTop, folders
-        case pin_to_top
+        case id, title, pinToTop, folders, viewMode, showAllTab
+        case pin_to_top, view_mode, show_all_tab
     }
 
     init(from decoder: Decoder) throws {
@@ -1260,6 +1380,12 @@ struct NuvioCollection: Decodable, Identifiable {
         pinToTop = try c.decodeIfPresent(Bool.self, forKey: .pinToTop)
             ?? c.decodeIfPresent(Bool.self, forKey: .pin_to_top)
             ?? false
+        let modeRaw = try c.decodeIfPresent(String.self, forKey: .viewMode)
+            ?? c.decodeIfPresent(String.self, forKey: .view_mode)
+        viewMode = CollectionFolderViewMode.fromStored(modeRaw)
+        showAllTab = try c.decodeIfPresent(Bool.self, forKey: .showAllTab)
+            ?? c.decodeIfPresent(Bool.self, forKey: .show_all_tab)
+            ?? true
         folders = try c.decodeIfPresent([NuvioCollectionFolder].self, forKey: .folders) ?? []
     }
 }
@@ -1452,11 +1578,16 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
     let titleLogoUrl: String?
     let tileShape: CollectionTileShape
     let sources: [NuvioCollectionCatalogSource]
+    /// Parent collection view mode (Tabs / Rows / Follow layout).
+    let viewMode: CollectionFolderViewMode
+    let showAllTab: Bool
 
     init(
         collectionId: String,
         folder: NuvioCollectionFolder,
-        sources: [NuvioCollectionCatalogSource]
+        sources: [NuvioCollectionCatalogSource],
+        viewMode: CollectionFolderViewMode = .tabbedGrid,
+        showAllTab: Bool = true
     ) {
         self.collectionId = collectionId
         self.folderId = folder.id
@@ -1471,6 +1602,8 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
         self.titleLogoUrl = folder.titleLogoUrl
         self.tileShape = folder.tileShape
         self.sources = sources
+        self.viewMode = viewMode
+        self.showAllTab = showAllTab
     }
 
     /// Focus GIF overlay URL when the toggle is on and a URL is set.
@@ -1505,6 +1638,8 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
             && lhs.coverImageUrl == rhs.coverImageUrl
             && lhs.heroBackdropUrl == rhs.heroBackdropUrl
             && lhs.titleLogoUrl == rhs.titleLogoUrl
+            && lhs.viewMode == rhs.viewMode
+            && lhs.showAllTab == rhs.showAllTab
     }
 }
 
@@ -1717,6 +1852,24 @@ enum WatchedStore {
     private static let storageDirectoryName = "WatchedStore"
     private(set) static var activeProfileId: String?
 
+    /// Last durable-storage result, for diagnostics on physical devices where
+    /// Application Support writes can fail while Simulator succeeds.
+    static private(set) var persistenceDiagnostic = "not attempted"
+
+    private enum PersistenceError: LocalizedError {
+        case applicationSupportUnavailable
+        case verificationFailed
+
+        var errorDescription: String? {
+            switch self {
+            case .applicationSupportUnavailable:
+                return "Application Support is unavailable"
+            case .verificationFailed:
+                return "the saved watched list could not be verified"
+            }
+        }
+    }
+
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -1728,12 +1881,16 @@ enum WatchedStore {
     }
 
     static func items() -> [WatchedStoreItem] {
-        guard let data = readData(forKey: storageKey),
-              let decoded = try? makeDecoder().decode([WatchedStoreItem].self, from: data) else {
+        guard let data = readData(forKey: storageKey) else { return [] }
+        do {
+            return try makeDecoder().decode([WatchedStoreItem].self, from: data)
+                .sorted { $0.watchedAt > $1.watchedAt }
+        } catch {
+            // Keep the payload intact so a later successful write can replace
+            // it; silent decode-to-empty would wipe history on the next mark.
+            persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
             return []
         }
-
-        return decoded.sorted { $0.watchedAt > $1.watchedAt }
     }
 
     /// Whole-title watched state (movies, or a series marked watched
@@ -1762,24 +1919,21 @@ enum WatchedStore {
         })
     }
 
+    /// Toggles whole-title watched state and returns the **actual** persisted
+    /// result. Callers must not assume the opposite of the previous value —
+    /// a failed device write keeps the prior state.
     @discardableResult
     static func toggle(meta: NuvioMeta) -> Bool {
         if contains(metaId: meta.id, type: meta.type) {
             remove(metaId: meta.id, type: meta.type)
-            return false
+        } else {
+            markWatched(meta)
         }
-
-        markWatched(meta)
-        return true
+        return contains(metaId: meta.id, type: meta.type)
     }
 
-    static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) {
-        // Episode-level marks must not wipe a series "Up Next" row that was just
-        // written for the following episode. Only clear Continue Watching when
-        // this is a whole-title mark (movies / explicit series watched).
-        if season == nil, episode == nil {
-            ContinueWatchingStore.remove(metaId: meta.id)
-        }
+    @discardableResult
+    static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) -> Bool {
         let item = WatchedStoreItem(
             meta: meta.persistenceSnapshot,
             watchedAt: Date(),
@@ -1791,29 +1945,42 @@ enum WatchedStore {
                 && $0.meta.type.caseInsensitiveCompare(meta.type) == .orderedSame
                 && $0.season == season && $0.episode == episode)
         }
+        guard persist(updated) else { return false }
+        // The mark is durable now, so it is safe to cancel any pending remote
+        // delete. A failed watched-list write must leave that protection intact.
         clearTombstone(metaId: meta.id, season: season, episode: episode)
-        persist(updated)
+
+        // Only clear Continue Watching after the watched mark is durable, so a
+        // failed write does not drop resume progress with nothing to replace it.
+        if season == nil, episode == nil {
+            ContinueWatchingStore.remove(metaId: meta.id)
+        }
+        return true
     }
 
     /// Removes the whole-title mark only; per-episode history stays. Leaves a
     /// tombstone so the next sync deletes the remote row instead of pulling the
-    /// mark right back.
-    static func remove(metaId: String, type: String) {
-        addTombstone(metaId: metaId, season: nil, episode: nil)
-        persist(items().filter {
+    /// mark right back. Tombstone is written only after the local list saves.
+    @discardableResult
+    static func remove(metaId: String, type: String) -> Bool {
+        let updated = items().filter {
             !($0.meta.id == metaId
                 && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
                 && $0.season == nil && $0.episode == nil)
-        })
+        }
+        guard persist(updated) else { return false }
+        addTombstone(metaId: metaId, season: nil, episode: nil)
+        return true
     }
 
     /// Merges a FULL remote snapshot. Tombstones (locally removed marks) block
     /// their remote row and stay alive until a pull shows the row is really
     /// gone from the server — the pushed delete is best-effort, so the pull is
     /// the confirmation. A newer re-watch on another device supersedes one.
-    static func mergeRemote(_ remoteItems: [WatchedStoreItem]) {
+    @discardableResult
+    static func mergeRemote(_ remoteItems: [WatchedStoreItem]) -> Bool {
         let removedMarks = tombstones()
-        guard !remoteItems.isEmpty || !removedMarks.isEmpty else { return }
+        guard !remoteItems.isEmpty || !removedMarks.isEmpty else { return true }
 
         let stillBlocking = removedMarks.filter { tombstone in
             remoteItems.contains {
@@ -1822,7 +1989,7 @@ enum WatchedStore {
             }
         }
         if stillBlocking.count != removedMarks.count {
-            persistTombstones(stillBlocking)
+            _ = persistTombstones(stillBlocking)
         }
 
         let accepted = remoteItems.filter { item in
@@ -1839,7 +2006,7 @@ enum WatchedStore {
                 byKey[key] = item
             }
         }
-        persist(Array(byKey.values).sorted { $0.watchedAt > $1.watchedAt })
+        return persist(Array(byKey.values).sorted { $0.watchedAt > $1.watchedAt })
     }
 
     // MARK: Tombstones — locally deleted marks awaiting remote deletion
@@ -1869,23 +2036,26 @@ enum WatchedStore {
         let updated = tombstones().filter {
             !($0.metaId == metaId && $0.season == season && $0.episode == episode)
         } + [entry]
-        persistTombstones(updated)
+        _ = persistTombstones(updated)
     }
 
     private static func clearTombstone(metaId: String, season: Int?, episode: Int?) {
-        persistTombstones(tombstones().filter {
+        _ = persistTombstones(tombstones().filter {
             !($0.metaId == metaId && $0.season == season && $0.episode == episode)
         })
     }
 
     /// Called after the remote rows were deleted successfully.
     static func clearTombstones(_ cleared: [Tombstone]) {
-        persistTombstones(tombstones().filter { !cleared.contains($0) })
+        _ = persistTombstones(tombstones().filter { !cleared.contains($0) })
     }
 
-    private static func persistTombstones(_ entries: [Tombstone]) {
-        guard let data = try? JSONEncoder().encode(entries) else { return }
-        writeData(data, forKey: tombstoneStorageKey)
+    @discardableResult
+    private static func persistTombstones(_ entries: [Tombstone]) -> Bool {
+        guard let data = try? JSONEncoder().encode(entries) else { return false }
+        return writeData(data, forKey: tombstoneStorageKey, verify: { payload in
+            _ = try makeDecoder().decode([Tombstone].self, from: payload)
+        })
     }
 
     static func replaceAll(_ newItems: [WatchedStoreItem]) {
@@ -1899,17 +2069,26 @@ enum WatchedStore {
                 episode: $0.episode
             )
         }
-        persist(sanitized.sorted { $0.watchedAt > $1.watchedAt })
+        _ = persist(sanitized.sorted { $0.watchedAt > $1.watchedAt })
     }
 
-    private static func persist(_ items: [WatchedStoreItem]) {
+    @discardableResult
+    private static func persist(_ items: [WatchedStoreItem]) -> Bool {
+        let data: Data
         do {
-            let data = try makeEncoder().encode(items)
-            guard writeData(data, forKey: storageKey) else { return }
-            NotificationCenter.default.post(name: changedNotification, object: nil)
+            data = try makeEncoder().encode(items)
         } catch {
+            persistenceDiagnostic = "encode failed: \(diagnosticText(for: error))"
             print("Nuvio watched storage encode failed: \(error.localizedDescription)")
+            return false
         }
+
+        let saved = writeData(data, forKey: storageKey, verify: { payload in
+            _ = try makeDecoder().decode([WatchedStoreItem].self, from: payload)
+        })
+        guard saved else { return false }
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+        return true
     }
 
     private static func makeEncoder() -> JSONEncoder {
@@ -1941,14 +2120,39 @@ enum WatchedStore {
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }
             .forEach { defaults.removeObject(forKey: $0) }
-        try? FileManager.default.removeItem(at: storageDirectoryURL)
+        if let directory = storageDirectoryURL {
+            try? FileManager.default.removeItem(at: directory)
+        }
+        if let directory = fallbackStorageDirectoryURL {
+            try? FileManager.default.removeItem(at: directory)
+        }
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
+    // MARK: - Durable file storage (Application Support + Caches fallback)
+
     private static func readData(forKey key: String) -> Data? {
-        let fileURL = fileURL(forKey: key)
-        if let fileData = try? Data(contentsOf: fileURL) {
-            return fileData
+        // A failed primary write can leave an older Application Support file
+        // beside a newer Caches fallback. Always choose the newest verified
+        // byte stream instead of blindly preferring the stale primary copy.
+        if let stored = newestStoredFile(forKey: key) {
+            if stored.isFallback, let primaryURL = storageURL(forKey: key) {
+                // Promote directly to the primary path. Calling writeData here
+                // could succeed by writing Caches again and then delete the only
+                // good fallback while incorrectly reporting a recovery.
+                do {
+                    try writeAndVerify(stored.data, to: primaryURL, verify: nil)
+                    try? FileManager.default.removeItem(at: stored.url)
+                    persistenceDiagnostic = "recovered Application Support storage"
+                } catch {
+                    persistenceDiagnostic = "using Caches fallback: \(diagnosticText(for: error))"
+                }
+            } else if !stored.isFallback,
+                      let fallbackURL = fallbackStorageURL(forKey: key),
+                      FileManager.default.fileExists(atPath: fallbackURL.path) {
+                try? FileManager.default.removeItem(at: fallbackURL)
+            }
+            return stored.data
         }
 
         guard let defaultsData = UserDefaults.standard.data(forKey: key) else {
@@ -1958,35 +2162,146 @@ enum WatchedStore {
         // Older builds stored watched history in UserDefaults. Large accounts
         // can exceed tvOS preferences limits, so migrate each profile key to a
         // file the first time it is touched.
-        if writeData(defaultsData, forKey: key) {
+        if writeData(defaultsData, forKey: key, updateDiagnostic: false) {
             UserDefaults.standard.removeObject(forKey: key)
+            persistenceDiagnostic = "migrated UserDefaults watched history"
         }
         return defaultsData
     }
 
-    @discardableResult
-    private static func writeData(_ data: Data, forKey key: String) -> Bool {
-        do {
-            try FileManager.default.createDirectory(
-                at: storageDirectoryURL,
-                withIntermediateDirectories: true
-            )
-            try data.write(to: fileURL(forKey: key), options: .atomic)
-            return true
-        } catch {
-            print("Nuvio watched storage write failed: \(error.localizedDescription)")
-            return false
+    private struct StoredFile {
+        let data: Data
+        let url: URL
+        let modifiedAt: Date
+        let isFallback: Bool
+    }
+
+    private static func newestStoredFile(forKey key: String) -> StoredFile? {
+        var candidates: [StoredFile] = []
+        if let url = storageURL(forKey: key),
+           let data = try? Data(contentsOf: url) {
+            let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            candidates.append(StoredFile(data: data, url: url, modifiedAt: modifiedAt, isFallback: false))
+        }
+        if let url = fallbackStorageURL(forKey: key),
+           let data = try? Data(contentsOf: url) {
+            let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                .contentModificationDate ?? .distantPast
+            candidates.append(StoredFile(data: data, url: url, modifiedAt: modifiedAt, isFallback: true))
+        }
+        return candidates.max { lhs, rhs in
+            if lhs.modifiedAt == rhs.modifiedAt {
+                // A remaining fallback represents a primary-write failure, so
+                // let it win coarse filesystem timestamp ties.
+                return !lhs.isFallback && rhs.isFallback
+            }
+            return lhs.modifiedAt < rhs.modifiedAt
         }
     }
 
-    private static var storageDirectoryURL: URL {
-        let root = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
-            ?? FileManager.default.temporaryDirectory
-        return root.appendingPathComponent(storageDirectoryName, isDirectory: true)
+    /// Writes `data` with a verify-read. Tries Application Support, then Caches.
+    /// Optional `verify` round-trips the payload through JSON decode so a write
+    /// that `items()` cannot load never reports success.
+    @discardableResult
+    private static func writeData(
+        _ data: Data,
+        forKey key: String,
+        updateDiagnostic: Bool = true,
+        verify: ((Data) throws -> Void)? = nil
+    ) -> Bool {
+        var primaryError: Error?
+
+        if let url = storageURL(forKey: key) {
+            do {
+                try writeAndVerify(data, to: url, verify: verify)
+                if let fallbackURL = fallbackStorageURL(forKey: key),
+                   FileManager.default.fileExists(atPath: fallbackURL.path) {
+                    try? FileManager.default.removeItem(at: fallbackURL)
+                }
+                if updateDiagnostic {
+                    persistenceDiagnostic = "Application Support: \(data.count) bytes"
+                }
+                return true
+            } catch {
+                primaryError = error
+            }
+        } else {
+            primaryError = PersistenceError.applicationSupportUnavailable
+        }
+
+        // Physical tvOS sideloads / some install paths can reject Application
+        // Support writes while Simulator succeeds. Keep a verified Caches copy
+        // so the mark still survives the session (and often longer).
+        if let fallbackURL = fallbackStorageURL(forKey: key) {
+            do {
+                try writeAndVerify(data, to: fallbackURL, verify: verify)
+                if let primaryURL = storageURL(forKey: key),
+                   FileManager.default.fileExists(atPath: primaryURL.path) {
+                    try? FileManager.default.removeItem(at: primaryURL)
+                }
+                let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+                if updateDiagnostic {
+                    persistenceDiagnostic = "Caches fallback: \(data.count) bytes; \(reason)"
+                    print("Nuvio watched storage using Caches fallback: \(reason)")
+                }
+                return true
+            } catch {
+                let primaryReason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+                persistenceDiagnostic = "save failed: \(primaryReason); Caches fallback: \(diagnosticText(for: error))"
+                print("Nuvio watched storage write failed: \(persistenceDiagnostic)")
+                return false
+            }
+        }
+
+        let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
+        persistenceDiagnostic = "save failed: \(reason); Caches unavailable"
+        print("Nuvio watched storage write failed: \(persistenceDiagnostic)")
+        return false
     }
 
-    private static func fileURL(forKey key: String) -> URL {
-        storageDirectoryURL.appendingPathComponent(fileName(forKey: key), isDirectory: false)
+    private static func writeAndVerify(
+        _ data: Data,
+        to url: URL,
+        verify: ((Data) throws -> Void)?
+    ) throws {
+        if let verify {
+            try verify(data)
+        }
+        try write(data, to: url)
+        guard let saved = try? Data(contentsOf: url), saved == data else {
+            throw PersistenceError.verificationFailed
+        }
+        if let verify {
+            try verify(saved)
+        }
+    }
+
+    private static func write(_ data: Data, to url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try data.write(to: url, options: [.atomic])
+    }
+
+    private static var storageDirectoryURL: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
+    private static var fallbackStorageDirectoryURL: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
+    private static func storageURL(forKey key: String) -> URL? {
+        storageDirectoryURL?.appendingPathComponent(fileName(forKey: key), isDirectory: false)
+    }
+
+    private static func fallbackStorageURL(forKey key: String) -> URL? {
+        fallbackStorageDirectoryURL?.appendingPathComponent(fileName(forKey: key), isDirectory: false)
     }
 
     private static func fileName(forKey key: String) -> String {
@@ -1996,6 +2311,11 @@ enum WatchedStore {
             .replacingOccurrences(of: "+", with: "-")
             .replacingOccurrences(of: "=", with: "")
             + ".json"
+    }
+
+    private static func diagnosticText(for error: Error) -> String {
+        let singleLine = error.localizedDescription.replacingOccurrences(of: "\n", with: " ")
+        return String(singleLine.prefix(160))
     }
 }
 
@@ -2155,9 +2475,13 @@ struct DetailsUiState {
     var isLoading: Bool = true
     var meta: NuvioMeta? = nil
     var streams: [NuvioStream] = []
+    /// Per-add-on groups for the stream picker (stable ids, loading/error).
+    var streamGroups: [AddonStreamGroup] = []
+    /// Mirrors `StreamsDiscoveryState.revision` for cheap picker cache invalidation.
+    var streamsRevision: UInt64 = 0
     var isLoadingStreams: Bool = false
+    var streamsEmptyReason: StreamsEmptyStateReason? = nil
     var error: String? = nil
     var isInWatchlist: Bool = false
     var isWatched: Bool = false
-    var userRating: Int? = nil
 }

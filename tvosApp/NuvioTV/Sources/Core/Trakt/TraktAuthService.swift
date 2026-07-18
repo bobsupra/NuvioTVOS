@@ -594,8 +594,27 @@ final class TraktAuthService {
         guard let http = response as? HTTPURLResponse else {
             throw TraktServiceError.message("Invalid Trakt response.")
         }
-        let value = data.isEmpty ? nil : try? decoder.decode(T.self, from: data)
-        return HTTPResult(statusCode: http.statusCode, value: value, errorMessage: Self.errorMessage(from: data))
+        let rawError = Self.errorMessage(from: data)
+        // Prefer decoding only on success so proxy error payloads never surface as
+        // cryptic Decodable cast failures for TraktDeviceCodeResponse / tokens.
+        var value: T?
+        if (200..<300).contains(http.statusCode), !data.isEmpty {
+            do {
+                value = try decoder.decode(T.self, from: data)
+            } catch {
+                return HTTPResult(
+                    statusCode: http.statusCode,
+                    value: nil,
+                    errorMessage: rawError
+                        ?? "Trakt response could not be read (\(error.localizedDescription))."
+                )
+            }
+        }
+        return HTTPResult(
+            statusCode: http.statusCode,
+            value: value,
+            errorMessage: Self.friendlyProxyError(rawError, status: http.statusCode)
+        )
     }
 
     private func baseRequest(path: String) -> URLRequest {
@@ -635,6 +654,23 @@ final class TraktAuthService {
             }
         }
         return nil
+    }
+
+    /// Maps known Nuvio edge-function boot failures to an actionable message.
+    private static func friendlyProxyError(_ raw: String?, status: Int) -> String? {
+        let lowered = (raw ?? "").lowercased()
+        if lowered.contains("invalidworkercreation")
+            || lowered.contains("entrypoint")
+            || lowered.contains("bootstrap runtime") {
+            return "Trakt login service is down on the Nuvio server (edge function failed to start). Redeploy functions/v1/trakt with TRAKT_CLIENT_ID and TRAKT_CLIENT_SECRET, then try again."
+        }
+        if status == 502 || status == 503 || status == 504 {
+            return raw ?? "Trakt login service is temporarily unavailable (\(status))."
+        }
+        if status >= 500 {
+            return raw ?? "Trakt login service error (\(status))."
+        }
+        return raw
     }
 }
 
@@ -771,7 +807,7 @@ final class TraktSettingsViewModel: ObservableObject {
                 deviceCodeExpiresAtMillis = Date().timeIntervalSince1970 * 1000.0 + Double(response.expiresIn * 1000)
                 pollInterval = response.interval
                 mode = .awaitingApproval
-                statusMessage = "Enter this code at trakt.tv/activate."
+                statusMessage = "Waiting for approval…"
                 isLoading = false
                 startPolling()
             } catch {

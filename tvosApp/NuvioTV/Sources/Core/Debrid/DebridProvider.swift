@@ -9,8 +9,9 @@ import Foundation
 //
 // Ported from the Android app's `core/debrid` resolvers.
 
-/// The provider identifiers as stored by Settings → Integrations → Debrid.
-/// Raw values match the option strings in `SettingsView.debridProviders`.
+/// Provider identifiers stored under `SettingsKey.debridProvider`.
+/// Settings → Integrations → Debrid links Real-Debrid, TorBox, and Premiumize.
+/// AllDebrid and Debrid-Link are retained for stored/synced values only.
 enum DebridProviderKind: String, CaseIterable {
     case none = "None"
     case realDebrid = "Real-Debrid"
@@ -21,6 +22,33 @@ enum DebridProviderKind: String, CaseIterable {
 
     init(settingsValue: String?) {
         self = DebridProviderKind(rawValue: settingsValue ?? "None") ?? .none
+    }
+
+    /// Providers that can resolve torrent streams today.
+    var hasResolver: Bool {
+        switch self {
+        case .realDebrid, .premiumize, .torbox: return true
+        case .none, .allDebrid, .debridLink: return false
+        }
+    }
+
+    /// Android TV `debrid_settings.preferred_resolver_provider_id` values.
+    var androidProviderId: String? {
+        switch self {
+        case .torbox: return "torbox"
+        case .premiumize: return "premiumize"
+        case .realDebrid: return "realdebrid"
+        case .none, .allDebrid, .debridLink: return nil
+        }
+    }
+
+    init(androidProviderId: String?) {
+        switch (androidProviderId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "torbox": self = .torbox
+        case "premiumize": self = .premiumize
+        case "realdebrid", "real-debrid", "real_debrid": self = .realDebrid
+        default: self = .none
+        }
     }
 }
 

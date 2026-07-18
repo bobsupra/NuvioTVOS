@@ -37,7 +37,6 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertTrue(viewModel.uiState.streams.isEmpty, "Streams should be empty initially")
         XCTAssertNil(viewModel.uiState.error, "Error should be nil initially")
         XCTAssertFalse(viewModel.uiState.isInWatchlist, "Should not be in watchlist initially")
-        XCTAssertNil(viewModel.uiState.userRating, "User rating should be nil initially")
     }
 
     // MARK: - Load Details Tests
@@ -128,31 +127,6 @@ final class DetailsViewModelTests: XCTestCase {
         }
     }
 
-    // MARK: - Rating Tests
-
-    func testRateContent() {
-        XCTAssertNil(viewModel.uiState.userRating, "User rating should be nil initially")
-
-        viewModel.rateContent(rating: 8)
-
-        XCTAssertEqual(viewModel.uiState.userRating, 8, "User rating should be set to 8")
-    }
-
-    func testRateContentMultipleTimes() {
-        viewModel.rateContent(rating: 7)
-        XCTAssertEqual(viewModel.uiState.userRating, 7, "First rating should be 7")
-
-        viewModel.rateContent(rating: 9)
-        XCTAssertEqual(viewModel.uiState.userRating, 9, "Rating should be updated to 9")
-    }
-
-    func testRateContentValidRange() {
-        // Test various ratings in valid range (1-10)
-        for rating in 1...10 {
-            viewModel.rateContent(rating: rating)
-            XCTAssertEqual(viewModel.uiState.userRating, rating, "Rating should be set to \(rating)")
-        }
-    }
 
     // MARK: - Loading State Tests
 
@@ -286,17 +260,4 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.uiState.isInWatchlist, "Watchlist state should reset when loading new content")
     }
 
-    func testRatingStatePersistsAfterLoad() async {
-        // Rate content
-        viewModel.rateContent(rating: 8)
-        XCTAssertEqual(viewModel.uiState.userRating, 8)
-
-        // Load details
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-
-        // Rating state should NOT persist after loading new content
-        // (This is correct behavior - each new content has its own rating)
-        XCTAssertNil(viewModel.uiState.userRating, "Rating state should reset when loading new content")
-    }
 }

@@ -44,9 +44,10 @@ struct DebridResolver {
         return await provider.resolve(request, apiKey: apiKey)
     }
 
-    /// Maps a provider kind to its implementation. AllDebrid and Debrid-Link have
-    /// no resolver yet (matching the Android app) and return `nil`.
+    /// Maps a provider kind to its implementation. Unimplemented kinds
+    /// (AllDebrid, Debrid-Link) and None return `nil`.
     private func provider(for kind: DebridProviderKind) -> DebridProvider? {
+        guard kind.hasResolver else { return nil }
         switch kind {
         case .realDebrid: return RealDebridResolver()
         case .premiumize: return PremiumizeResolver()

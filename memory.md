@@ -42,7 +42,7 @@ The fresh-install Guest also used to overlap with remote profile slot `1`, makin
   - Login continuation starts/joins sync.
   - Profile selection and Retry use the blocking sync gate.
   - Restored sessions with only a local Guest use the same gate.
-- `tvosApp/NuvioTV/Sources/NuvioCoreStubs.swift`
+- `tvosApp/NuvioTV/Sources/DomainModels.swift`
   - `ProfileViewModel.loadProfiles` seeds the temporary `guest` identity.
   - `profileChosen` is emitted only for an explicit user selection.
 - `tvosApp/NuvioTV/Sources/Core/Auth/AuthManager.swift`

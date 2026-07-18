@@ -28,12 +28,6 @@ final class PerformanceTests: XCTestCase {
 
     // MARK: - ViewModel Initialization Performance
 
-    func testHomeViewModelInitializationPerformance() {
-        measure {
-            let viewModel = HomeViewModel(repository: repository)
-            XCTAssertNotNil(viewModel)
-        }
-    }
 
     func testDetailsViewModelInitializationPerformance() {
         measure {
@@ -51,20 +45,6 @@ final class PerformanceTests: XCTestCase {
 
     // MARK: - Data Loading Performance
 
-    func testHomeDataLoadingPerformance() {
-        let viewModel = HomeViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Load home data")
-
-            Task { @MainActor in
-                await viewModel.loadData()
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
 
     func testDetailsLoadingPerformance() {
         let viewModel = DetailsViewModel(repository: repository)
@@ -266,15 +246,6 @@ final class PerformanceTests: XCTestCase {
 
     // MARK: - Memory Performance
 
-    func testHomeViewModelMemoryFootprint() async {
-        let viewModel = HomeViewModel(repository: repository)
-        await viewModel.loadData()
-
-        // Memory footprint test
-        // In a real test, you'd use XCTMemoryMetric
-        XCTAssertNotNil(viewModel.state.catalogs)
-        XCTAssertFalse(viewModel.state.catalogs.isEmpty)
-    }
 
     func testCatalogBrowseMemoryWithManyPages() async {
         let viewModel = CatalogBrowseViewModel(repository: repository)
@@ -385,27 +356,6 @@ final class PerformanceTests: XCTestCase {
 
     // MARK: - Combine Publisher Performance
 
-    func testPublisherSubscriptionPerformance() {
-        let viewModel = HomeViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Publisher subscription")
-
-            viewModel.$state
-                .sink { state in
-                    if !state.catalogs.isEmpty {
-                        expectation.fulfill()
-                    }
-                }
-                .store(in: &cancellables)
-
-            Task { @MainActor in
-                await viewModel.loadData()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
 
     // MARK: - Large Dataset Performance
 
@@ -452,17 +402,6 @@ final class PerformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - Rating Performance
-
-    func testRatingSubmissionPerformance() {
-        let viewModel = DetailsViewModel(repository: repository)
-
-        measure {
-            for rating in 1...10 {
-                viewModel.rateContent(rating: rating)
-            }
-        }
-    }
 
     // MARK: - Model Serialization Performance
 

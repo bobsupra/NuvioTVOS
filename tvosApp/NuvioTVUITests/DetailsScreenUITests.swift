@@ -123,27 +123,28 @@ final class DetailsScreenUITests: XCTestCase {
         }
     }
 
-    // MARK: - Rating Tests
+    // MARK: - Watched toggle
 
-    func testRateButtonExists() throws {
+    func testWatchedControlExists() throws {
         navigateToDetailsScreen()
 
-        // Rate button should be present
-        if app.buttons["Rate"].exists {
-            XCTAssertTrue(true, "Rate button exists")
+        // tvOS details uses an icon-only watched button (no star/rating UI).
+        if app.buttons["Watched"].exists || app.buttons["Unwatched"].exists || app.buttons["Rate"].exists {
+            XCTAssertTrue(true, "Watched control exists")
         }
     }
 
-    func testRatingInteraction() throws {
+    func testWatchedToggleInteraction() throws {
         navigateToDetailsScreen()
 
-        if app.buttons["Rate"].exists {
-            app.buttons["Rate"].tap()
+        if app.buttons["Watched"].exists {
+            app.buttons["Watched"].tap()
             sleep(1)
-
-            // Rating dialog or picker should appear
-            // Test will vary based on implementation
-            XCTAssertTrue(app.exists, "Rating interaction should be handled")
+            XCTAssertTrue(app.exists, "Watched toggle should be handled")
+        } else if app.buttons["Unwatched"].exists {
+            app.buttons["Unwatched"].tap()
+            sleep(1)
+            XCTAssertTrue(app.exists, "Watched toggle should be handled")
         }
     }
 

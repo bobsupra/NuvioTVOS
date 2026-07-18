@@ -745,9 +745,7 @@ struct ContentView: View {
         profileId: String?,
         excludingURLs: Set<String> = []
     ) async -> PreparedNextStream? {
-        let repository = CinemetaCatalogRepository()
-        let streams = ((try? await repository.getStreams(id: contentId, type: type)) ?? [])
-            .filter { $0.addonName != "Nuvio Sample" }   // ignore the placeholder fallback
+        let streams = await StreamsRepository.shared.collectStreams(type: type, videoId: contentId)
         guard !streams.isEmpty else { return nil }
 
         let store = ProfileSettings.store(for: profileId)
@@ -810,9 +808,7 @@ struct ContentView: View {
         type: String,
         profileId: String?
     ) async -> [NuvioStream] {
-        let repository = CinemetaCatalogRepository()
-        let streams = ((try? await repository.getStreams(id: contentId, type: type)) ?? [])
-            .filter { $0.addonName != "Nuvio Sample" }
+        let streams = await StreamsRepository.shared.collectStreams(type: type, videoId: contentId)
         let store = ProfileSettings.store(for: profileId)
         let quality = store.string(forKey: SettingsKey.smartStreamQuality) ?? "Highest"
         let matchSubtitles = store.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool ?? true
@@ -1486,6 +1482,8 @@ private struct HomeRowHeightsKey: PreferenceKey {
 
 private final class TVHomeFocusWork {
     var pendingFocusedMeta: NuvioMeta?
+    var pendingFocusedFolder: TVCollectionFolderItem?
+    var pendingSectionId: String?
     var focusSettleTask: Task<Void, Never>?
     var pendingLandscapeFocusedId: String?
     var landscapeFocusTask: Task<Void, Never>?
@@ -1496,6 +1494,8 @@ private final class TVHomeFocusWork {
         focusSettleTask = nil
         landscapeFocusTask = nil
         pendingFocusedMeta = nil
+        pendingFocusedFolder = nil
+        pendingSectionId = nil
         pendingLandscapeFocusedId = nil
     }
 }
@@ -1729,12 +1729,14 @@ struct TVHomeView: View {
                                                     focusedRowIndex = index
                                                     verticalOffset = offsetForRow(index, in: sections)
                                                 }
+                                                // Row window + card focus update immediately; hero /
+                                                // full-screen backdrop wait for settle so horizontal
+                                                // paging does not thrash decode + layout each step.
                                                 focusedSectionId = section.id
-                                                focusedMeta = nil
-                                                focusedCollectionFolder = folder
                                                 overlayRestoreCardID = nil
                                                 let cardKey = "\(section.id)\u{1}\(folder.id)"
                                                 focusedCardID = cardKey
+                                                settleFolderFocus(folder, in: section.id)
                                             },
                                             onSelect: { folder in
                                                 overlayRestoreCardID = "\(section.id)\u{1}\(folder.id)"
@@ -1776,8 +1778,11 @@ struct TVHomeView: View {
                                                 focusedRowIndex = index
                                                 verticalOffset = offsetForRow(index, in: sections)
                                             }
-                                            focusedCollectionFolder = nil
-                                            settleFocus(on: meta, in: section.id)
+                                            // Immediate: focus engine + row window.
+                                            // Deferred: hero text + full-screen backdrop.
+                                            focusedSectionId = section.id
+                                            focusedCardID = "\(section.id)\u{1}\(meta.id)"
+                                            settleCatalogFocus(on: meta, in: section.id)
                                             scheduleLandscapeFocus(cardKey: "\(section.id)\u{1}\(meta.id)")
                                         },
                                         onBlur: { meta in
@@ -1820,7 +1825,7 @@ struct TVHomeView: View {
                         .padding(.top, TVHomeLayout.rowsTopPadding)
                         .frame(width: proxy.size.width, alignment: .topLeading)
                         .offset(y: verticalOffset)
-                        .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 0.82) : nil, value: verticalOffset)
+                        .animation(smoothFocus ? TVHomeLayout.scrollSpring : nil, value: verticalOffset)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .clipShape(VerticalEdgeClip())
@@ -1856,6 +1861,8 @@ struct TVHomeView: View {
             await ContinueWatchingStore.refreshMissingEpisodeDetails()
         }
         .onAppear {
+            // Classic was never a distinct layout; collapse legacy values to Modern.
+            if homeLayout == "Classic" { homeLayout = "Modern" }
             refreshContinueWatching()
             refreshWatchedTitles()
         }
@@ -2012,20 +2019,30 @@ struct TVHomeView: View {
         return section.collectionFolders.isEmpty ? estimatedCatalogRowHeight : estimatedCollectionRowHeight
     }
 
-    /// Keep only the focused row and its immediate neighbours. The next row is
-    /// already mounted for the focus engine, and the window advances in the
-    /// same transaction as focus, matching a TV lazy list's working set.
+    /// Keep a small working set of Home rows mounted for the focus engine.
+    ///
+    /// ±1 is enough for a single step, but rapid reverse (up → down → up → down)
+    /// demounts the next row before tvOS evaluates the next press, so that press
+    /// is eaten and the user has to click again. ±2 keeps one extra row in each
+    /// direction so the engine always has a live focus target after a direction
+    /// change. Prefer the currently focused section id when it is known so the
+    /// window tracks real focus even if `focusedRowIndex` lags by a frame.
     private func shouldMaterializeHomeRow(_ index: Int, sectionId: String, total: Int) -> Bool {
         guard total > 0 else { return false }
-        let clampedFocusedRowIndex = min(max(focusedRowIndex, 0), total - 1)
-        let lower = max(0, clampedFocusedRowIndex - 1)
-        let upper = min(total - 1, clampedFocusedRowIndex + 1)
+
+        let sections = visibleSections.filter(\.hasContent)
+        let sectionFocusIndex = focusedSectionId.flatMap { id in
+            sections.firstIndex(where: { $0.id == id })
+        }
+        let center = sectionFocusIndex ?? min(max(focusedRowIndex, 0), total - 1)
+        let lower = max(0, center - 2)
+        let upper = min(total - 1, center + 2)
         if (lower...upper).contains(index) { return true }
 
         // A restored focus target can be outside the initial row window.
-        let prefix = "\(sectionId)\u{1}"
-        return initialFocusCardKey?.hasPrefix(prefix) == true
-            || overlayRestoreCardID?.hasPrefix(prefix) == true
+        let rowPrefix = "\(sectionId)\u{1}"
+        return initialFocusCardKey?.hasPrefix(rowPrefix) == true
+            || overlayRestoreCardID?.hasPrefix(rowPrefix) == true
     }
 
     /// Vertical translation that lands the row at `index` flush under the hero.
@@ -2294,7 +2311,9 @@ struct TVHomeView: View {
                 TVCollectionFolderItem(
                     collectionId: collection.id,
                     folder: folder,
-                    sources: folder.addonCatalogSources
+                    sources: folder.addonCatalogSources,
+                    viewMode: collection.viewMode,
+                    showAllTab: collection.showAllTab
                 )
             }
             if folders.isEmpty {
@@ -2338,31 +2357,73 @@ struct TVHomeView: View {
         sections.map { section in
             let folders = section.collectionFolders
                 .map {
-                    "\($0.id):\($0.tileShape.rawValue):\($0.title):\($0.focusGifEnabled):\($0.focusGifUrl ?? ""):\($0.heroBackdropUrl ?? ""):\($0.titleLogoUrl ?? "")"
+                    "\($0.id):\($0.tileShape.rawValue):\($0.title):\($0.focusGifEnabled):\($0.focusGifUrl ?? ""):\($0.heroBackdropUrl ?? ""):\($0.titleLogoUrl ?? ""):\($0.viewMode.rawValue):\($0.showAllTab)"
                 }
                 .joined(separator: ",")
             return "\(section.id)|\(section.title)|\(section.isPinnedCollection)|\(folders)"
         }.joined(separator: ";")
     }
 
-    private func settleFocus(on meta: NuvioMeta, in sectionId: String) {
+    /// Idle delay before hero text + full-screen backdrop swap. Short enough to
+    /// feel responsive when parked, long enough that continuous left/right/up/down
+    /// focus does not kick off decode/crossfade every step.
+    private var heroSettleNanoseconds: UInt64 {
+        fastNavigation ? 120_000_000 : 250_000_000
+    }
+
+    /// Catalog title focus: card strip + row offset are immediate; hero/backdrop
+    /// publish only after the settle delay (and cancel if focus moves again).
+    private func settleCatalogFocus(on meta: NuvioMeta, in sectionId: String) {
         focusWork.pendingFocusedMeta = meta
+        focusWork.pendingFocusedFolder = nil
+        focusWork.pendingSectionId = sectionId
+        scheduleHeroSettle()
+    }
+
+    /// Collection folder focus: same freeze as catalog — keep previous hero art
+    /// until the user rests on a folder card.
+    private func settleFolderFocus(_ folder: TVCollectionFolderItem, in sectionId: String) {
+        focusWork.pendingFocusedMeta = nil
+        focusWork.pendingFocusedFolder = folder
+        focusWork.pendingSectionId = sectionId
+        scheduleHeroSettle()
+    }
+
+    private func scheduleHeroSettle() {
         focusWork.focusSettleTask?.cancel()
 
-        let targetId = meta.id
+        let targetMetaId = focusWork.pendingFocusedMeta?.id
+        let targetFolderId = focusWork.pendingFocusedFolder?.id
+        let targetSectionId = focusWork.pendingSectionId
+        let hasFolderPending = targetFolderId != nil
+
         focusWork.focusSettleTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: fastNavigation ? 60_000_000 : 140_000_000)
-            guard !Task.isCancelled,
-                  focusWork.pendingFocusedMeta?.id == targetId,
-                  let settledMeta = focusWork.pendingFocusedMeta else {
+            try? await Task.sleep(nanoseconds: heroSettleNanoseconds)
+            guard !Task.isCancelled else { return }
+
+            if hasFolderPending {
+                guard let folder = focusWork.pendingFocusedFolder,
+                      folder.id == targetFolderId else { return }
+                // Publish folder hero only when it actually changes.
+                if focusedCollectionFolder?.id != folder.id {
+                    focusedCollectionFolder = folder
+                }
+                if focusedMeta != nil {
+                    focusedMeta = nil
+                }
                 return
             }
 
-            // Same card, possibly reached in a different row: still update the
-            // row so the hero's Continue Watching context follows the focus.
-            focusedSectionId = sectionId
-            guard focusedMeta?.id != targetId else { return }
-            focusedMeta = settledMeta
+            guard let settledMeta = focusWork.pendingFocusedMeta,
+                  settledMeta.id == targetMetaId else { return }
+
+            // Leaving a folder hero: clear only after settle so backdrop stays frozen.
+            if focusedCollectionFolder != nil {
+                focusedCollectionFolder = nil
+            }
+            if focusedMeta?.id != settledMeta.id {
+                focusedMeta = settledMeta
+            }
         }
     }
 
@@ -3009,8 +3070,8 @@ private struct TVCatalogRow: View {
             )
             .clipped()
             .offset(x: -edgeInset)
-            .animation(rowSmoothFocus ? .spring(response: 0.4, dampingFraction: 0.95) : nil, value: scrollIndex)
-            .animation(rowSmoothFocus ? .spring(response: 0.18, dampingFraction: 0.86) : nil, value: landscapeFocusedId)
+            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: scrollIndex)
+            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: landscapeFocusedId)
         }
         .frame(height: stripHeight)
     }
@@ -3170,14 +3231,14 @@ private struct TVCollectionFolderRow: View {
             )
             .clipped()
             .offset(x: -edgeInset)
-            .animation(rowSmoothFocus ? .spring(response: 0.4, dampingFraction: 0.95) : nil, value: scrollIndex)
+            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: scrollIndex)
         }
         .frame(height: stripHeight)
     }
 }
 
-/// Folder tile that mirrors `PosterCard` chrome and sizing. Only behaviour
-/// difference: select opens the folder instead of title details.
+/// Folder tile chrome matching Search / Library cards (`SearchResultCard`):
+/// scale on focus, stronger shadow, label styling. Select opens the folder.
 private struct TVCollectionFolderCard: View {
     let folder: TVCollectionFolderItem
     var shouldRequestInitialFocus: Bool = false
@@ -3208,13 +3269,19 @@ private struct TVCollectionFolderCard: View {
 
     private var layoutWidth: CGFloat { cardWidth }
 
+    /// Search-style labels use two lines (title + subtitle); reserve space.
     private var totalCardHeight: CGFloat {
-        cardHeight + (showPosterLabels ? 36 : 0)
+        cardHeight + (showPosterLabels ? 48 : 0)
     }
 
     private var displayTitle: String {
         let t = folder.title.trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? "Folder" : t
+    }
+
+    private var subtitle: String {
+        let count = folder.sources.count
+        return count == 1 ? "1 catalog" : "\(count) catalogs"
     }
 
     private var cardCornerRadius: CGFloat { 16 }
@@ -3253,12 +3320,9 @@ private struct TVCollectionFolderCard: View {
         showFocus ? (focusHighlighterEnabled ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width) : 0
     }
 
-    private var shadowOpacity: Double { showFocus ? 0.24 : 0.12 }
-    private var shadowRadius: CGFloat { showFocus ? 10 : 4 }
-
-    private var titleColor: Color {
-        showFocus ? .white : .white.opacity(0.55)
-    }
+    /// Match SearchResultCard / LibraryItemButton shadow.
+    private var shadowOpacity: Double { showFocus ? 0.5 : 0.2 }
+    private var shadowRadius: CGFloat { showFocus ? 16 : 6 }
 
     /// Focus GIF overlay — same contract as Android TV: only while focused
     /// (or focus retained under an overlay) and only when enabled + URL set.
@@ -3267,7 +3331,8 @@ private struct TVCollectionFolderCard: View {
     }
 
     var body: some View {
-        // Same focus surface as `PosterCard` (focusable + tap, not Button).
+        // Home rows keep focusable + tap (like PosterCard) so external focus
+        // restoration and strip paging stay intact; chrome matches Search cards.
         cardContent
             .contentShape(Rectangle())
             .focusable(true)
@@ -3287,21 +3352,33 @@ private struct TVCollectionFolderCard: View {
                 }
             }
             .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
+            .animation(
+                smoothFocusAnimations ? .spring(response: 0.28, dampingFraction: 0.75) : nil,
+                value: showFocus
+            )
+            .zIndex(showFocus ? 1 : 0)
     }
 
     private var cardContent: some View {
-        VStack(alignment: .leading, spacing: 9) {
+        VStack(alignment: .leading, spacing: 12) {
             artTile
 
             if showPosterLabels {
-                Text(displayTitle)
-                    .font(.system(size: layoutMode == "Compact" ? 18 : 20, weight: showFocus ? .semibold : .medium))
-                    .foregroundColor(titleColor)
-                    .lineLimit(1)
-                    .frame(width: cardWidth, alignment: .leading)
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(displayTitle)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(showFocus ? .white : .white.opacity(0.78))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
+                .frame(width: cardWidth, alignment: .leading)
             }
         }
         .frame(width: layoutWidth, height: totalCardHeight, alignment: .topLeading)
+        .scaleEffect(showFocus ? 1.06 : 1.0)
     }
 
     @ViewBuilder
@@ -3380,10 +3457,10 @@ private struct TVCollectionFolderCard: View {
         .shadow(color: .black.opacity(shadowOpacity), radius: shadowRadius)
     }
 
-    /// Flat grey fill for non-emoji empty / image-loading states (matches `PosterCard`).
+    /// Flat grey fill for non-emoji empty / image-loading states (matches Search cards).
     private var emptyCoverFill: some View {
         Rectangle()
-            .fill(Color.white.opacity(0.08))
+            .fill(Color.white.opacity(0.07))
     }
 
     @ViewBuilder
@@ -3392,11 +3469,9 @@ private struct TVCollectionFolderCard: View {
             Text(emojiText)
                 .font(.system(size: emojiFontSize))
         } else {
-            Image(systemName: "movieclapper")
-                .resizable()
-                .scaledToFit()
-                .frame(width: min(42, cardWidth * 0.22), height: min(42, cardHeight * 0.22))
-                .foregroundColor(.white.opacity(0.38))
+            Image(systemName: "folder")
+                .font(.system(size: 40))
+                .foregroundColor(.white.opacity(0.25))
         }
     }
 }
@@ -3427,7 +3502,23 @@ private struct CollectionFolderEmojiGlass: ViewModifier {
 
 // MARK: - Collection folder browse
 
-/// Full-screen grid of titles resolved from a collection folder's catalog sources.
+/// Grid metrics matching Search / Library poster cards (Tabs view mode).
+private enum CollectionFolderGridMetrics {
+    static let posterWidth: CGFloat = 210
+    static let posterHeight: CGFloat = 315
+    static let posterGap: CGFloat = 28
+}
+
+/// One catalog strip inside Rows view mode (Android `RowsContent`).
+private struct CollectionFolderCatalogRow: Identifiable {
+    let id: String
+    let title: String
+    let items: [NuvioMeta]
+}
+
+/// Full-screen folder browser. Honors collection `viewMode`:
+/// - **Tabs** (`TABBED_GRID`): poster grid (optional source tabs + All).
+/// - **Rows** / **Follow layout**: Home-style horizontal catalog rows per source.
 struct CollectionFolderBrowseView: View {
     let folder: TVCollectionFolderItem
     let collectionTitle: String
@@ -3436,12 +3527,17 @@ struct CollectionFolderBrowseView: View {
     let onBack: () -> Void
 
     @State private var items: [NuvioMeta] = []
+    @State private var catalogRows: [CollectionFolderCatalogRow] = []
     @State private var isLoading = true
     @State private var errorMessage: String?
+    @State private var selectedTabIndex = 0
+    @FocusState private var focusedItemID: String?
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+
+    private var usesRows: Bool { folder.viewMode.usesCatalogRows }
 
     private var heading: String {
         if collectionTitle.caseInsensitiveCompare(folder.title) == .orderedSame {
@@ -3450,8 +3546,41 @@ struct CollectionFolderBrowseView: View {
         return "\(collectionTitle) • \(folder.title)"
     }
 
+    /// Tab labels for Tabs mode: optional "All" + one tab per source.
+    private var tabLabels: [String] {
+        guard !usesRows, folder.sources.count > 1 else { return [] }
+        var labels: [String] = []
+        if folder.showAllTab {
+            labels.append("All")
+        }
+        for source in folder.sources {
+            labels.append(Self.sourceLabel(source))
+        }
+        return labels
+    }
+
+    private var displayedGridItems: [NuvioMeta] {
+        guard !usesRows else { return items }
+        guard !tabLabels.isEmpty else { return items }
+        if folder.showAllTab, selectedTabIndex == 0 {
+            return items
+        }
+        let sourceIndex = folder.showAllTab ? selectedTabIndex - 1 : selectedTabIndex
+        guard folder.sources.indices.contains(sourceIndex) else { return items }
+        let source = folder.sources[sourceIndex]
+        // Items were loaded per-source into catalogRows when multi-source.
+        if let row = catalogRows.first(where: { $0.id == Self.sourceKey(source) }) {
+            return row.items
+        }
+        return items
+    }
+
     private var columns: [GridItem] {
-        Array(repeating: GridItem(.flexible(), spacing: 28), count: 6)
+        [GridItem(
+            .adaptive(minimum: CollectionFolderGridMetrics.posterWidth, maximum: CollectionFolderGridMetrics.posterWidth),
+            spacing: CollectionFolderGridMetrics.posterGap,
+            alignment: .top
+        )]
     }
 
     var body: some View {
@@ -3459,20 +3588,12 @@ struct CollectionFolderBrowseView: View {
             Color.nuvioBackground(amoled: amoled, body: bodyColor)
                 .ignoresSafeArea()
 
-            VStack(alignment: .leading, spacing: 24) {
-                HStack(alignment: .firstTextBaseline) {
-                    VStack(alignment: .leading, spacing: 6) {
-                        Text(heading)
-                            .font(.system(size: 42, weight: .bold))
-                            .foregroundColor(.white)
-                        Text("\(folder.sources.count) catalog\(folder.sources.count == 1 ? "" : "s") in this folder")
-                            .font(.system(size: 20, weight: .medium))
-                            .foregroundColor(.white.opacity(0.55))
-                    }
-                    Spacer()
+            VStack(alignment: .leading, spacing: 20) {
+                header
+
+                if !tabLabels.isEmpty {
+                    tabBar
                 }
-                .padding(.horizontal, 60)
-                .padding(.top, 48)
 
                 if isLoading {
                     Spacer()
@@ -3488,7 +3609,9 @@ struct CollectionFolderBrowseView: View {
                         .foregroundColor(.white.opacity(0.7))
                         .frame(maxWidth: .infinity)
                     Spacer()
-                } else if items.isEmpty {
+                } else if usesRows {
+                    rowsContent
+                } else if displayedGridItems.isEmpty {
                     Spacer()
                     Text("No titles found in this folder")
                         .font(.system(size: 22))
@@ -3496,21 +3619,7 @@ struct CollectionFolderBrowseView: View {
                         .frame(maxWidth: .infinity)
                     Spacer()
                 } else {
-                    ScrollView {
-                        LazyVGrid(columns: columns, spacing: 28) {
-                            ForEach(items) { item in
-                                PosterCard(
-                                    meta: item,
-                                    layoutMode: homeLayout,
-                                    showPosterLabels: posterLabels
-                                ) {
-                                    onSelect(item)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 60)
-                        .padding(.bottom, 60)
-                    }
+                    gridContent
                 }
             }
         }
@@ -3520,15 +3629,348 @@ struct CollectionFolderBrowseView: View {
         }
     }
 
+    private var header: some View {
+        HStack(alignment: .firstTextBaseline) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text(heading)
+                    .font(.system(size: 42, weight: .bold))
+                    .foregroundColor(.white)
+                Text(subtitleLine)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.55))
+            }
+            Spacer()
+        }
+        .padding(.horizontal, 60)
+        .padding(.top, 48)
+    }
+
+    private var subtitleLine: String {
+        let count = folder.sources.count
+        let catalogs = count == 1 ? "1 catalog" : "\(count) catalogs"
+        if usesRows {
+            return "\(catalogs) · Rows"
+        }
+        return catalogs
+    }
+
+    private var tabBar: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 12) {
+                ForEach(Array(tabLabels.enumerated()), id: \.offset) { index, label in
+                    Button {
+                        selectedTabIndex = index
+                        focusedItemID = displayedGridItems.first?.id
+                    } label: {
+                        Text(label)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(selectedTabIndex == index ? .black : .white.opacity(0.85))
+                            .padding(.horizontal, 22)
+                            .frame(height: 48)
+                            .background(
+                                Capsule(style: .continuous)
+                                    .fill(selectedTabIndex == index ? Color.white : Color.white.opacity(0.12))
+                            )
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                }
+            }
+            .padding(.horizontal, 60)
+        }
+        .focusSection()
+    }
+
+    /// Home-style vertical list of horizontal catalog strips.
+    private var rowsContent: some View {
+        Group {
+            if catalogRows.isEmpty {
+                Spacer()
+                Text("No titles found in this folder")
+                    .font(.system(size: 22))
+                    .foregroundColor(.white.opacity(0.7))
+                    .frame(maxWidth: .infinity)
+                Spacer()
+            } else {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
+                        ForEach(catalogRows) { row in
+                            CollectionFolderHomeStyleRow(
+                                id: row.id,
+                                title: row.title,
+                                items: row.items,
+                                layoutMode: homeLayout,
+                                showPosterLabels: posterLabels,
+                                onSelect: onSelect
+                            )
+                        }
+                    }
+                    .padding(.top, 8)
+                    .padding(.bottom, 60)
+                }
+                .focusSection()
+            }
+        }
+    }
+
+    private var gridContent: some View {
+        ScrollView {
+            LazyVGrid(columns: columns, alignment: .leading, spacing: CollectionFolderGridMetrics.posterGap) {
+                ForEach(displayedGridItems) { item in
+                    CollectionFolderResultCard(
+                        meta: item,
+                        externalFocus: $focusedItemID
+                    ) {
+                        onSelect(item)
+                    }
+                }
+            }
+            .padding(.top, 16)
+            .padding(.horizontal, 60)
+            .padding(.bottom, 60)
+        }
+        .focusSection()
+        .defaultFocusIfAvailable($focusedItemID, displayedGridItems.first?.id)
+        .id(selectedTabIndex)
+    }
+
     private func load() async {
         isLoading = true
         errorMessage = nil
-        let resolved = await repository.getCollectionFolderItems(sources: folder.sources, limit: 120)
-        items = resolved
-        isLoading = false
-        if resolved.isEmpty {
-            errorMessage = nil
+        selectedTabIndex = 0
+
+        let sources = folder.sources
+        if sources.isEmpty {
+            items = []
+            catalogRows = []
+            isLoading = false
+            return
         }
+
+        // Always load per-source so Rows mode (and Tabs without All) can split.
+        var rows: [CollectionFolderCatalogRow] = []
+        var all: [NuvioMeta] = []
+        var seen = Set<String>()
+        for source in sources {
+            let resolved = await repository.getCollectionFolderItems(sources: [source], limit: 40)
+            rows.append(
+                CollectionFolderCatalogRow(
+                    id: Self.sourceKey(source),
+                    title: Self.sourceLabel(source),
+                    items: resolved
+                )
+            )
+            for meta in resolved where seen.insert(meta.id).inserted {
+                all.append(meta)
+            }
+        }
+        catalogRows = rows.filter { !$0.items.isEmpty }
+        items = all
+        isLoading = false
+    }
+
+    private static func sourceKey(_ source: NuvioCollectionCatalogSource) -> String {
+        "\(source.addonId)_\(source.type)_\(source.catalogId)_\(source.genre ?? "")"
+    }
+
+    private static func sourceLabel(_ source: NuvioCollectionCatalogSource) -> String {
+        let type = source.type.capitalized
+        let name = source.catalogId
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+        if let genre = source.genre, !genre.isEmpty {
+            return "\(name) (\(type)) · \(genre)"
+        }
+        return "\(name) (\(type))"
+    }
+}
+
+/// One Home-like catalog strip inside Rows mode.
+/// Uses the same focus-driven strip offset + spring as `TVCatalogRow` (not
+/// a native ScrollView), so left/right focus slides cards under the title.
+private struct CollectionFolderHomeStyleRow: View {
+    let id: String
+    let title: String
+    let items: [NuvioMeta]
+    var layoutMode: String = "Modern"
+    var showPosterLabels: Bool = false
+    let onSelect: (NuvioMeta) -> Void
+
+    /// Stable row id so composite card keys stay unique across strips.
+    private var rowId: String { id }
+
+    @State private var scrollIndex: Int = 0
+    @State private var landscapeFocusedId: String?
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var posterWidth: CGFloat {
+        layoutMode == "Compact" ? 170 : 210
+    }
+
+    private var rowSpacing: CGFloat {
+        layoutMode == "Compact" ? 22 : 28
+    }
+
+    private var step: CGFloat { posterWidth + rowSpacing }
+
+    private var stripHeight: CGFloat {
+        let imageHeight: CGFloat = layoutMode == "Compact" ? 255 : 315
+        return imageHeight + (showPosterLabels ? 48 : 0) + TVHomeLayout.stripVerticalPadding * 2
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text(title)
+                .font(.custom("Inter-Bold", size: 30))
+                .foregroundColor(.white)
+                .padding(.leading, TVLayout.rowLeading)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .zIndex(1)
+
+            cardStrip
+                .zIndex(0)
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+    }
+
+    /// Same clipping-window + manual offset pattern as `TVCatalogRow.cardStrip`.
+    private var cardStrip: some View {
+        GeometryReader { geo in
+            let edgeInset = max(0, geo.frame(in: .global).minX)
+            let stripWidth = geo.size.width + edgeInset * 2
+            let rowHomeLayout = layoutMode
+            let rowPosterLabels = showPosterLabels
+            let rowSmoothFocus = smoothFocus
+            let rowFocusHighlighter = focusHighlighter
+            let rowStep = (rowHomeLayout == "Compact" ? 170.0 : 210.0)
+                + (rowHomeLayout == "Compact" ? 22.0 : 28.0)
+
+            HStack(alignment: .bottom, spacing: rowHomeLayout == "Compact" ? 22 : 28) {
+                ForEach(items) { item in
+                    let cardKey = "\(rowId)\u{1}\(item.id)"
+                    PosterCard(
+                        meta: item,
+                        isLandscape: rowHomeLayout == "Modern" && landscapeFocusedId == cardKey,
+                        onFocus: { focused in
+                            if let index = items.firstIndex(where: { $0.id == focused.id }) {
+                                if scrollIndex != index {
+                                    scrollIndex = index
+                                }
+                            }
+                            landscapeFocusedId = cardKey
+                        },
+                        onBlur: { blurred in
+                            let key = "\(rowId)\u{1}\(blurred.id)"
+                            if landscapeFocusedId == key {
+                                landscapeFocusedId = nil
+                            }
+                        },
+                        layoutMode: rowHomeLayout,
+                        showPosterLabels: rowPosterLabels,
+                        smoothFocusAnimations: rowSmoothFocus,
+                        focusHighlighterEnabled: rowFocusHighlighter
+                    ) {
+                        onSelect(item)
+                    }
+                }
+            }
+            .padding(.vertical, TVHomeLayout.stripVerticalPadding)
+            // Pin the focused card under the title (Home BringIntoViewSpec).
+            .offset(x: edgeInset + TVLayout.rowLeading - CGFloat(scrollIndex) * rowStep)
+            .frame(
+                width: stripWidth,
+                height: (rowHomeLayout == "Compact" ? 255 : 315)
+                    + (rowPosterLabels ? 48 : 0)
+                    + TVHomeLayout.stripVerticalPadding * 2,
+                alignment: .leading
+            )
+            .clipped()
+            .offset(x: -edgeInset)
+            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: scrollIndex)
+            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: landscapeFocusedId)
+        }
+        .frame(height: stripHeight)
+    }
+}
+
+/// Poster card chrome matching Search / Library grids (Tabs view mode).
+private struct CollectionFolderResultCard: View {
+    let meta: NuvioMeta
+    var externalFocus: FocusState<String?>.Binding? = nil
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private let cardCornerRadius: CGFloat = 16
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 12) {
+                AsyncImage(url: URL(string: meta.posterUrl ?? "")) { phase in
+                    if case .success(let image) = phase {
+                        image.resizable().aspectRatio(contentMode: .fill)
+                    } else {
+                        ZStack {
+                            Rectangle().fill(Color.white.opacity(0.07))
+                            Image(systemName: meta.type == "series" ? "tv" : "film")
+                                .font(.system(size: 40))
+                                .foregroundColor(.white.opacity(0.25))
+                        }
+                    }
+                }
+                .frame(
+                    width: CollectionFolderGridMetrics.posterWidth,
+                    height: CollectionFolderGridMetrics.posterHeight
+                )
+                .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                .overlay(alignment: .topTrailing) {
+                    WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                }
+                .overlay(
+                    RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+                        .stroke(
+                            focused ? AppFocusOutline.color : .clear,
+                            lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                        )
+                )
+                .shadow(
+                    color: .black.opacity(focused ? 0.5 : 0.2),
+                    radius: focused ? 16 : 6
+                )
+
+                if posterLabels {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(meta.name)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(focused ? .white : .white.opacity(0.78))
+                            .lineLimit(1)
+                        Text(subtitle)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white.opacity(0.45))
+                            .lineLimit(1)
+                    }
+                    .frame(width: CollectionFolderGridMetrics.posterWidth, alignment: .leading)
+                }
+            }
+            .scaleEffect(focused ? 1.06 : 1.0)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: meta.id))
+        .focusEffectDisabledIfAvailable()
+        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
+        .zIndex(focused ? 1 : 0)
+    }
+
+    private var subtitle: String {
+        var parts: [String] = [meta.type == "series" ? "Series" : "Movie"]
+        if let year = meta.year { parts.append(String(year)) }
+        if let rating = meta.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
+        return parts.joined(separator: "  ·  ")
     }
 }
 
@@ -3727,6 +4169,13 @@ private enum TVHomeLayout {
     static let stripVerticalPadding: CGFloat = 28
     /// Section title line (~30pt) + VStack spacing under the title (~10pt) + slack.
     static let rowTitleBlock: CGFloat = 46
+
+    /// Horizontal strip + vertical page offset. Critically damped (`1.0`) so
+    /// paging settles without the rubber-band overshoot of underdamped springs
+    /// (matches Android TV row feel — smooth slide, no bounce).
+    static var scrollSpring: Animation {
+        .spring(response: 0.3, dampingFraction: 1.0)
+    }
 }
 
 private enum TVLayout {

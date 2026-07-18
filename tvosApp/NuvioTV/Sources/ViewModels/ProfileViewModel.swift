@@ -1,1 +1,1 @@
-// ProfileViewModel is now defined in NuvioCoreStubs.swift along with the other pure Swift stubs.
+// ProfileViewModel is defined in DomainModels.swift with the other pure Swift domain types.

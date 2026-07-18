@@ -176,8 +176,8 @@ final class EndToEndFlowTests: XCTestCase {
                 sleep(1)
 
                 // 2. Open rating interface
-                if app.buttons["Rate"].exists {
-                    app.buttons["Rate"].tap()
+                if app.buttons["Watched"].exists {
+                    app.buttons["Watched"].tap()
                     sleep(1)
 
                     // 3. Submit rating (implementation varies)

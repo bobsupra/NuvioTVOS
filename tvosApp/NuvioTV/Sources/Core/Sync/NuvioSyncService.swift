@@ -1130,6 +1130,8 @@ fileprivate final class SupabaseSyncClient {
     private static let pullPageSize = 500
     private static let settingsPlatform = "tv"
     private static let settingsFeature = "tvos_settings"
+    /// Shared with Android TV (`ProfileSettingsSyncService` / `DebridSettingsDataStore`).
+    private static let debridSettingsFeature = "debrid_settings"
 
     private let session: URLSession = .shared
     private let decoder: JSONDecoder = {
@@ -1340,13 +1342,18 @@ fileprivate final class SupabaseSyncClient {
             return false
         }
         lastPulledProfileSettingsJSON = settingsJSON
-        guard
-              let features = settingsJSON["features"] as? [String: Any],
-              let feature = features[Self.settingsFeature] as? [String: Any] else {
+        let features = settingsJSON["features"] as? [String: Any] ?? [:]
+        let tvosFeature = features[Self.settingsFeature] as? [String: Any]
+        let debridFeature = features[Self.debridSettingsFeature] as? [String: Any]
+        guard tvosFeature != nil || debridFeature != nil else {
             return false
         }
 
-        importSettings(feature, localProfileId: localProfileId)
+        if let tvosFeature {
+            importSettings(tvosFeature, localProfileId: localProfileId)
+        }
+        // Android TV stores debrid keys in a sibling feature on the same "tv" blob.
+        importDebridSettings(debridFeature, localProfileId: localProfileId)
         return true
     }
 
@@ -1361,6 +1368,12 @@ fileprivate final class SupabaseSyncClient {
         var settingsJSON = lastPulledProfileSettingsJSON ?? [:]
         var features = settingsJSON["features"] as? [String: Any] ?? [:]
         features[Self.settingsFeature] = exportSettings(localProfileId: localProfileId)
+        // Keep Android stream-filter keys; overlay API keys + preferred resolver.
+        let existingDebrid = features[Self.debridSettingsFeature] as? [String: Any]
+        features[Self.debridSettingsFeature] = exportDebridSettings(
+            localProfileId: localProfileId,
+            existing: existingDebrid
+        )
         settingsJSON["features"] = features
         if settingsJSON["version"] == nil { settingsJSON["version"] = 1 }
         try await rpcVoid(
@@ -1823,6 +1836,123 @@ fileprivate final class SupabaseSyncClient {
             if remote[SettingsKey.subtitleLanguageTertiary] == nil {
                 defaults.set("None", forKey: SettingsKey.subtitleLanguageTertiary)
             }
+        }
+    }
+
+    // MARK: - Android-compatible debrid_settings feature
+
+    /// Preference names written by Android TV `DebridSettingsDataStore` (and
+    /// compose mobile variants with a `debrid_` prefix).
+    private enum AndroidDebridKey {
+        static let torbox = "torbox_api_key"
+        static let premiumize = "premiumize_api_key"
+        static let realDebrid = "real_debrid_api_key"
+        static let preferred = "preferred_resolver_provider_id"
+        static let enabled = "debrid_enabled"
+        static let cloudLibrary = "cloud_library_enabled"
+
+        // Compose / iOS KMP export keys (platform "mobile", but may appear).
+        static let torboxPrefixed = "debrid_torbox_api_key"
+        static let premiumizePrefixed = "debrid_premiumize_api_key"
+        static let realDebridPrefixed = "debrid_real_debrid_api_key"
+        static let preferredPrefixed = "debrid_preferred_resolver_provider_id"
+    }
+
+    private func exportDebridSettings(
+        localProfileId: String,
+        existing: [String: Any]?
+    ) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        var feature = existing ?? [:]
+
+        func putString(_ key: String, _ value: String) {
+            feature[key] = Self.encodeSettingValue(value)
+        }
+        func putBool(_ key: String, _ value: Bool) {
+            feature[key] = Self.encodeSettingValue(value)
+        }
+
+        let torbox = (defaults.string(forKey: SettingsKey.torboxAccessToken) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let premiumize = (defaults.string(forKey: SettingsKey.premiumizeAccessToken) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let realDebrid = (defaults.string(forKey: SettingsKey.realDebridAccessToken) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        putString(AndroidDebridKey.torbox, torbox)
+        putString(AndroidDebridKey.premiumize, premiumize)
+        putString(AndroidDebridKey.realDebrid, realDebrid)
+
+        let selected = DebridProviderKind(settingsValue: defaults.string(forKey: SettingsKey.debridProvider))
+        let preferredId = selected.androidProviderId
+            ?? (torbox.isEmpty ? nil : "torbox")
+            ?? (premiumize.isEmpty ? nil : "premiumize")
+            ?? (realDebrid.isEmpty ? nil : "realdebrid")
+            ?? ""
+        putString(AndroidDebridKey.preferred, preferredId)
+
+        let anyKey = !torbox.isEmpty || !premiumize.isEmpty || !realDebrid.isEmpty
+        putBool(AndroidDebridKey.enabled, anyKey)
+        // Preserve Android's cloud toggle when present; default on when we have keys.
+        if feature[AndroidDebridKey.cloudLibrary] == nil {
+            putBool(AndroidDebridKey.cloudLibrary, anyKey)
+        }
+
+        return feature
+    }
+
+    private func importDebridSettings(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote, !remote.isEmpty else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+
+        func stringValue(_ keys: [String]) -> String? {
+            for key in keys {
+                if let encoded = remote[key] as? [String: Any],
+                   let value = Self.decodeSettingValue(encoded) as? String {
+                    return value
+                }
+                // Tolerate raw strings if an older client wrote them.
+                if let value = remote[key] as? String {
+                    return value
+                }
+            }
+            return nil
+        }
+
+        if let torbox = stringValue([AndroidDebridKey.torbox, AndroidDebridKey.torboxPrefixed]) {
+            defaults.set(torbox, forKey: SettingsKey.torboxAccessToken)
+        }
+        if let premiumize = stringValue([AndroidDebridKey.premiumize, AndroidDebridKey.premiumizePrefixed]) {
+            defaults.set(premiumize, forKey: SettingsKey.premiumizeAccessToken)
+        }
+        if let realDebrid = stringValue([AndroidDebridKey.realDebrid, AndroidDebridKey.realDebridPrefixed]) {
+            defaults.set(realDebrid, forKey: SettingsKey.realDebridAccessToken)
+        }
+
+        let preferredRaw = stringValue([AndroidDebridKey.preferred, AndroidDebridKey.preferredPrefixed])
+        var selected = DebridProviderKind(androidProviderId: preferredRaw)
+
+        // If preferred is missing/empty, pick the first configured provider.
+        if selected == .none {
+            let torbox = (defaults.string(forKey: SettingsKey.torboxAccessToken) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let premiumize = (defaults.string(forKey: SettingsKey.premiumizeAccessToken) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let realDebrid = (defaults.string(forKey: SettingsKey.realDebridAccessToken) ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !torbox.isEmpty {
+                selected = .torbox
+            } else if !premiumize.isEmpty {
+                selected = .premiumize
+            } else if !realDebrid.isEmpty {
+                selected = .realDebrid
+            }
+        }
+
+        if selected != .none {
+            defaults.set(selected.rawValue, forKey: SettingsKey.debridProvider)
+            let token = DebridCredentials.token(for: selected, store: defaults)
+            defaults.set(token, forKey: SettingsKey.debridApiKey)
         }
     }
 

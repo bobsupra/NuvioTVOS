@@ -9,7 +9,7 @@
   <p>
     A native Apple TV port of Nuvio, forked from the mobile app so the living-room experience can be developed independently.
     <br />
-    SwiftUI tvOS shell - Stremio-compatible catalogs - MPVKit playback
+    SwiftUI tvOS shell - Stremio-compatible catalogs - AVPlayer / MPVKit playback
   </p>
 
   <p>
@@ -25,21 +25,26 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-[Beta 3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3) (version 3.0, build 40) is the current tvOS release. Download the unsigned IPA here:
+The tree currently targets **version 3.1.1 (build 42)** (`tvosApp/NuvioTV/Info.plist`).
 
-[NuvioTV-3-unsigned.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3/NuvioTV-3-unsigned.ipa)
+[Beta 3.1.1](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.1) is the latest tvOS release. Download the unsigned IPA here:
 
-Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
+[NuvioTV-3.1.1-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.1/NuvioTV-3.1.1-unsigned-release.ipa)
 
-Beta 3 focuses on reliable Apple TV playback and remote interaction:
+Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-- MPV now renders audio through AVFoundation, avoiding the AudioUnit/RemoteIO no-audio failure seen when Apple TV Sound Format is set to Automatic with Dolby Atmos enabled.
-- The custom MPVKit build includes MoltenVK video output alongside AVFoundation audio, fixing the black-screen regression from the first audio test build.
-- Skip Intro, Skip Ending, and Next Episode cards are real focusable buttons, so the Siri Remote Select action works reliably.
-- Episode replacement clears stale playback time before MPV publishes the new timeline, preventing old end-of-episode UI from reappearing.
-- Home now mirrors its manual row movement into native scroll state so tvOS can collapse the Home tab pill consistently with Search and Library.
+Beta 3.1.1 fixes and improves:
 
-The new audio/video path and Home tab-pill behavior still need broad physical-device verification across TVs, receivers, soundbars, and HomePods. Premiumize QR linking remains unavailable until a production OAuth client ID is configured. The Apple TV Simulator still cannot play AV1, and ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
+- Stream discovery now follows the Android TV model: every compatible configured add-on loads independently, appears as its own filter, and contributes all playable results without a global 80-stream cap.
+- Per-add-on failures and timeouts no longer erase successful providers, while returning to the same title reuses the active/completed search.
+- The stream picker uses revision-based caching and lightweight cards, substantially reducing focus/scroll CPU usage while keeping final external subtitles and torrent metadata current.
+- Add-on filters remain horizontally reachable, focused controls no longer clip, and Sort stays pinned to the right side.
+- Watched and library actions persist reliably from details and title-action menus.
+- Real-Debrid, TorBox, and Premiumize linking/sync behavior is aligned with the shared TV settings model.
+- The tvOS core is now pure Swift, with obsolete Rust/FFI stubs and duplicate legacy views removed.
+- Includes the native Dolby Vision, MPVKit fallback, playback resilience, remote-control, collection, and player improvements from Beta 3.1.
+
+Availability of streams still depends on configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured. The Apple TV Simulator still cannot play AV1. ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 
 ## About
 
@@ -54,13 +59,14 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - Home rows for synced Nuvio collections and add-on catalog lists.
 - Cinemeta-backed catalog and metadata repository with Stremio-compatible stream/subtitle addon hooks.
 - User-configurable Stremio stream add-ons in Settings → Integrations → Add-ons.
-- Debrid provider settings for Real-Debrid, Premiumize, and TorBox torrent stream resolution.
+- Debrid account linking for Real-Debrid, TorBox, and Premiumize (Settings → Integrations → Debrid). AllDebrid and Debrid-Link are not wired.
 - Premiumize and TorBox Cloud Library playback through the built-in player.
 - Apple TV Top Shelf extension backed by the active Continue Watching row.
 - Long-press quick actions for poster cards, including details, library toggle, and watched toggle.
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
-- tvOS profile/account sync surfaces while the full shared account experience is being ported.
-- MPVKit-based player surface with tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
+- tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
+- Dual playback stack (AVPlayer / MPVKit) with tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
+- Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).
 
 ## Contributor Notes
@@ -74,16 +80,16 @@ Current tvOS status:
 - Trailer playback now opens in the player, resolves YouTube trailer streams at 1080p or better when available, supports adaptive video/audio streams, and returns to the title details page afterward.
 - Home focus/hero behavior has been improved with smoother card focus, cached hero logo loading, and crossfaded hero/backdrop transitions.
 - Player polish now covers saved audio/subtitle selections, screensaver prevention during playback, and steadier Play/Pause focus.
+- Movie stutter is resolved with **Frame Rate Matching** (Settings → Playback) when the Apple TV system setting **Match Content** is also enabled.
 
 Known areas that still need work:
 
 - Nuvio addon UI flows have not been fully tested on tvOS yet.
-- Video playback is currently choppy/laggy during movies. This may be frame pacing, FPS, rendering, buffering, MPVKit configuration, or something else that needs profiling.
 - Search still needs more real-world testing and bug fixing.
 - Library still needs more sorting/grouping validation and real-world testing.
 - Vertical and horizontal scrolling still need more tuning on real devices.
-- The current layout is using the modern view only. Grid view and the other layout settings from Android TV still need to be brought over.
-- AllDebrid and Debrid-Link are visible provider options, but resolver backends are not wired yet.
+- Home layout supports Modern and Compact sizing; Classic was removed because it was never distinct. Full Android grid/layout modes are not ported yet.
+- AllDebrid and Debrid-Link have no resolvers and are not offered in the account-link UI.
 - Cloud Library currently supports Premiumize and TorBox only.
 - Top Shelf, debrid resolving, and Cloud Library still need more real-device validation across accounts/providers.
 - If login still returns to the Apple TV Home screen on a real device, please send the device console or crash log.
@@ -155,9 +161,11 @@ To enable QR login and email auth, fill in the Supabase values in:
 tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift
 ```
 
-The catalog prototype currently uses Cinemeta plus Stremio-compatible stream and subtitle addon endpoints from [CatalogRepository.swift](./tvosApp/NuvioTV/Sources/Data/Repository/CatalogRepository.swift).
+Catalogs and metadata use Cinemeta plus Stremio-compatible stream and subtitle add-on endpoints from [CatalogRepository.swift](./tvosApp/NuvioTV/Sources/Data/Repository/CatalogRepository.swift).
 
-For TorBox, open Settings → Integrations → Accounts and link the account using the TV QR code. Premiumize sign-in uses the same device-linking flow once a production OAuth client ID has been configured. Linked provider credentials are also used by Cloud Library in Library.
+For Real-Debrid and TorBox, open Settings → Integrations → Debrid and link with the TV QR code. Premiumize has no public open-source device OAuth — paste the API key from [premiumize.me/account](https://www.premiumize.me/account) (QR only if you set a private `PREMIUMIZE_CLIENT_ID` in `Info.plist`). TorBox/Premiumize credentials also power Cloud Library in Library.
+
+Debrid API keys sync with the Nuvio account on the shared **tv** settings blob (`features.debrid_settings`), matching Android TV, so linking on one TV fills the other after account sync.
 
 ## Tests
 

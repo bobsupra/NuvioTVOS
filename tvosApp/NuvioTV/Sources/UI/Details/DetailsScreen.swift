@@ -95,7 +95,7 @@ struct DetailsScreen: View {
                         startStreamFlow(streamId: video.id, type: "series", reload: true)
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onRateClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched() },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { openTrailer(for: viewModel.uiState.meta!) },
                     onBack: onBack
@@ -114,7 +114,7 @@ struct DetailsScreen: View {
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onRateClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched() },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onBack: onBack
                 )
@@ -123,17 +123,21 @@ struct DetailsScreen: View {
 
             #if os(tvOS)
             if isStreamPickerPresented, let meta = viewModel.uiState.meta {
-                // Only mount the picker once the first stream has arrived (or the
-                // search has finished). Mounting it already-populated means its
-                // appearance is a fresh focus transition, so it reliably auto-
-                // focuses the first stream — the one path that works on tvOS.
-                // While streams are still loading, show a focusable spinner.
-                if !viewModel.uiState.streams.isEmpty || !viewModel.uiState.isLoadingStreams {
+                // Mount the picker once any group exists (loading chips), any
+                // streams arrived, or discovery finished — so add-ons appear
+                // immediately as loading instead of waiting for the first hit.
+                let hasGroups = !viewModel.uiState.streamGroups.isEmpty
+                let hasStreams = !viewModel.uiState.streams.isEmpty
+                let finished = !viewModel.uiState.isLoadingStreams
+                if hasGroups || hasStreams || finished {
                     TvStreamPickerOverlay(
                         meta: meta,
                         episode: pendingEpisode,
                         streams: viewModel.uiState.streams,
+                        groups: viewModel.uiState.streamGroups,
+                        streamsRevision: viewModel.uiState.streamsRevision,
                         isLoading: viewModel.uiState.isLoadingStreams,
+                        emptyReason: viewModel.uiState.streamsEmptyReason,
                         includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
                         isResolvingDebrid: isResolvingDebrid,
                         onSelect: { stream in
@@ -1093,14 +1097,46 @@ enum SmartPlaybackSelector {
             .lowercased()
     }
 
+    /// Codec-relevant fields only (name / description / filename). Subtitle
+    /// labels, languages, and URLs are intentionally excluded so AV1 detection
+    /// does not scan large subtitle payloads during list derivation.
+    static func isAV1LabeledStream(_ stream: NuvioStream) -> Bool {
+        for field in [stream.name, stream.description, stream.filename] {
+            guard let field, !field.isEmpty else { continue }
+            if fieldContainsAV1CodecToken(field) { return true }
+        }
+        return false
+    }
+
+    /// Tokenizes a single field and looks for standalone `av1` / `av01` codec tags.
+    private static func fieldContainsAV1CodecToken(_ field: String) -> Bool {
+        // Lowercase only this field (not subtitles / joined blob).
+        let lower = field.lowercased()
+        var tokenStart: String.Index?
+        var index = lower.startIndex
+        while index <= lower.endIndex {
+            let atEnd = index == lower.endIndex
+            let isTokenChar = !atEnd && (lower[index].isLetter || lower[index].isNumber)
+            if isTokenChar {
+                if tokenStart == nil { tokenStart = index }
+            } else if let start = tokenStart {
+                let token = lower[start..<index]
+                if token == "av1" || token == "av01" { return true }
+                tokenStart = nil
+            }
+            if atEnd { break }
+            index = lower.index(after: index)
+        }
+        return false
+    }
+
     private static func isPlatformPlaybackCompatible(_ stream: NuvioStream) -> Bool {
         #if targetEnvironment(simulator)
         // AV1 falls back to software decoding in the tvOS simulator. Its
         // decoded frames then use MoltenVK/libplacebo's PBO upload path, which
         // MTLSimDriver can terminate as XPC API misuse. Prefer another stream;
         // physical Apple TV keeps AV1 available through its real Metal driver.
-        let codecTokens = searchableText(for: stream).split { !$0.isLetter && !$0.isNumber }
-        return !codecTokens.contains(where: { $0 == "av1" || $0 == "av01" })
+        return !isAV1LabeledStream(stream)
         #else
         return true
         #endif
@@ -1108,12 +1144,159 @@ enum SmartPlaybackSelector {
 
 }
 
+/// How the stream picker orders results. `.default` keeps the add-ons' own
+/// order (usually already best-first); the others re-rank across all sources.
+enum StreamSortOption: String, CaseIterable, Identifiable {
+    case `default` = "Default"
+    case quality = "Quality"
+    case size = "Size"
+    case name = "Name"
+
+    var id: String { rawValue }
+}
+
+/// Pure stream-list derivation for the tvOS stream picker. Kept free of view
+/// state so focus movement cannot re-filter/sort, and unit tests can assert
+/// caching/identity behavior without mounting SwiftUI.
+enum StreamPickerListBuilder {
+    /// Streams for the current add-on filter, preserving group order when "All".
+    static func sourceStreams(
+        streams: [NuvioStream],
+        groups: [AddonStreamGroup],
+        selectedAddonId: String?
+    ) -> [NuvioStream] {
+        if let selectedAddonId {
+            if let group = groups.first(where: { $0.addonId == selectedAddonId }) {
+                return group.streams
+            }
+            let displayName = groups.first(where: { $0.addonId == selectedAddonId })?.displayName
+            return streams.filter { $0.addonName == displayName }
+        }
+        if !groups.isEmpty {
+            return groups.flatMap(\.streams)
+        }
+        return streams
+    }
+
+    static func playableStreams(
+        streams: [NuvioStream],
+        groups: [AddonStreamGroup],
+        selectedAddonId: String?,
+        includeDebrid: Bool
+    ) -> [NuvioStream] {
+        let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
+        return SmartPlaybackSelector.playableStreams(from: source, includeDebrid: includeDebrid)
+    }
+
+    /// Filter + sort result shown in the picker list.
+    static func displayedStreams(
+        streams: [NuvioStream],
+        groups: [AddonStreamGroup],
+        selectedAddonId: String?,
+        sortOption: StreamSortOption,
+        includeDebrid: Bool
+    ) -> [NuvioStream] {
+        let playable = playableStreams(
+            streams: streams,
+            groups: groups,
+            selectedAddonId: selectedAddonId,
+            includeDebrid: includeDebrid
+        )
+        return sorted(playable, by: sortOption)
+    }
+
+    /// Constant-size cache key. Repository revision captures every publication,
+    /// including metadata/subtitle changes with unchanged stream ids and counts.
+    static func cacheKey(
+        revision: UInt64,
+        selectedAddonId: String?,
+        sortOption: StreamSortOption,
+        includeDebrid: Bool
+    ) -> StreamPickerListCacheKey {
+        StreamPickerListCacheKey(
+            revision: revision,
+            selectedAddonId: selectedAddonId,
+            sortOption: sortOption,
+            includeDebrid: includeDebrid
+        )
+    }
+
+    /// Re-orders streams for the chosen sort. `.default` is a no-op so the
+    /// add-ons' own (usually best-first) order is preserved. `.enumerated` keeps
+    /// the sort stable, so streams that tie fall back to their original order.
+    static func sorted(_ streams: [NuvioStream], by option: StreamSortOption) -> [NuvioStream] {
+        switch option {
+        case .default:
+            return streams
+        case .quality:
+            return streams.enumerated().sorted {
+                resolution(for: $0.element) != resolution(for: $1.element)
+                    ? resolution(for: $0.element) > resolution(for: $1.element)
+                    : $0.offset < $1.offset
+            }.map(\.element)
+        case .size:
+            return streams.enumerated().sorted {
+                sizeBytes(for: $0.element) != sizeBytes(for: $1.element)
+                    ? sizeBytes(for: $0.element) > sizeBytes(for: $1.element)
+                    : $0.offset < $1.offset
+            }.map(\.element)
+        case .name:
+            return streams.sorted {
+                ($0.name ?? "").localizedCaseInsensitiveCompare($1.name ?? "") == .orderedAscending
+            }
+        }
+    }
+
+    /// Best-effort resolution parsed from a stream's text (2160/1080/720/480),
+    /// 0 when unknown so untagged streams sink to the bottom of a Quality sort.
+    static func resolution(for stream: NuvioStream) -> Int {
+        let text = "\(stream.name ?? "") \(stream.description ?? "")".lowercased()
+        if text.contains("2160") || text.contains("4k") || text.contains("uhd") { return 2160 }
+        if text.contains("1440") || text.contains("2k") { return 1440 }
+        if text.contains("1080") || text.contains("fhd") { return 1080 }
+        if text.contains("720") { return 720 }
+        if text.contains("480") { return 480 }
+        return 0
+    }
+
+    /// Best-effort file size in bytes parsed from a stream's text (e.g. "12.3 GB",
+    /// "📦 700 MB"). 0 when no size is present.
+    static func sizeBytes(for stream: NuvioStream) -> Int64 {
+        let text = "\(stream.name ?? "") \(stream.description ?? "")"
+        let pattern = #"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)"#
+        guard let match = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else {
+            return 0
+        }
+        let token = String(text[match])
+        let number = token.replacingOccurrences(of: ",", with: ".")
+            .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
+            .first { Double($0) != nil }
+            .flatMap(Double.init) ?? 0
+        let unit = token.uppercased()
+        let multiplier: Double
+        if unit.contains("TB") { multiplier = 1_099_511_627_776 }
+        else if unit.contains("GB") { multiplier = 1_073_741_824 }
+        else if unit.contains("MB") { multiplier = 1_048_576 }
+        else { multiplier = 1024 }
+        return Int64(number * multiplier)
+    }
+}
+
+/// Small Equatable key used by the picker cache. It deliberately contains no
+/// stream URLs, descriptions, or subtitle payloads, so focus changes are O(1).
+struct StreamPickerListCacheKey: Equatable {
+    let revision: UInt64
+    let selectedAddonId: String?
+    let sortOption: StreamSortOption
+    let includeDebrid: Bool
+}
+
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     let onPlayClick: () -> Void
     let onEpisodeSelected: (NuvioVideo) -> Void
     let onWatchlistClick: () -> Void
-    let onRateClick: () -> Void
+    let onWatchedClick: () -> Void
     let onShareClick: () -> Void
     let onTrailerClick: () -> Void
     let onBack: () -> Void
@@ -1150,7 +1333,7 @@ struct TvDetailsContent: View {
                                         }
                                     },
                                     onWatchlistClick: onWatchlistClick,
-                                    onRateClick: onRateClick,
+                                    onWatchedClick: onWatchedClick,
                                     onTrailerClick: onTrailerClick,
                                     focus: $actionFocus
                                 )
@@ -1356,7 +1539,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, watchlist, rate, trailer
+    case play, watchlist, watched, trailer
 }
 
 private struct TvDetailsActionRow: View {
@@ -1365,7 +1548,7 @@ private struct TvDetailsActionRow: View {
     var playTitle: String = "Play"
     let onPlayClick: () -> Void
     let onWatchlistClick: () -> Void
-    let onRateClick: () -> Void
+    let onWatchedClick: () -> Void
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
 
@@ -1374,6 +1557,8 @@ private struct TvDetailsActionRow: View {
             TvDetailsActionButton(
                 title: playTitle,
                 systemName: "play.fill",
+                accessibilityLabel: playTitle,
+                accessibilityHint: "Starts playback or opens stream sources",
                 isPrimary: true,
                 focus: focus,
                 tag: .play,
@@ -1383,6 +1568,10 @@ private struct TvDetailsActionRow: View {
             TvDetailsActionButton(
                 title: nil,
                 systemName: isInWatchlist ? "checkmark" : "plus",
+                accessibilityLabel: isInWatchlist ? "In library" : "Add to library",
+                accessibilityHint: isInWatchlist
+                    ? "Removes this title from your library"
+                    : "Adds this title to your library",
                 isPrimary: false,
                 focus: focus,
                 tag: .watchlist,
@@ -1392,15 +1581,21 @@ private struct TvDetailsActionRow: View {
             TvDetailsActionButton(
                 title: nil,
                 systemName: isWatched ? "eye.fill" : "eye.slash.fill",
+                accessibilityLabel: isWatched ? "Watched" : "Not watched",
+                accessibilityHint: isWatched
+                    ? "Marks this title as unwatched"
+                    : "Marks this title as watched",
                 isPrimary: false,
                 focus: focus,
-                tag: .rate,
-                action: onRateClick
+                tag: .watched,
+                action: onWatchedClick
             )
 
             TvDetailsActionButton(
                 title: nil,
                 systemName: "play.rectangle.fill",
+                accessibilityLabel: "Trailer",
+                accessibilityHint: "Plays the trailer when available",
                 isPrimary: false,
                 focus: focus,
                 tag: .trailer,
@@ -1413,6 +1608,8 @@ private struct TvDetailsActionRow: View {
 private struct TvDetailsActionButton: View {
     let title: String?
     let systemName: String
+    let accessibilityLabel: String
+    var accessibilityHint: String? = nil
     let isPrimary: Bool
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
@@ -1425,11 +1622,13 @@ private struct TvDetailsActionButton: View {
             HStack(spacing: 16) {
                 Image(systemName: systemName)
                     .font(.system(size: isPrimary ? 30 : 36, weight: .bold))
+                    .accessibilityHidden(true)
 
                 if let title {
                     Text(title)
                         .font(.system(size: 32, weight: .medium))
                         .lineLimit(1)
+                        .accessibilityHidden(true)
                 }
             }
             .foregroundColor(foregroundColor)
@@ -1444,6 +1643,10 @@ private struct TvDetailsActionButton: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel(accessibilityLabel)
+        .accessibilityAddTraits(.isButton)
+        .modifier(OptionalAccessibilityHint(hint: accessibilityHint))
     }
 
     private var foregroundColor: Color {
@@ -1451,6 +1654,19 @@ private struct TvDetailsActionButton: View {
             return .black
         }
         return .white
+    }
+}
+
+private struct OptionalAccessibilityHint: ViewModifier {
+    let hint: String?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let hint, !hint.isEmpty {
+            content.accessibilityHint(hint)
+        } else {
+            content
+        }
     }
 }
 
@@ -1747,7 +1963,8 @@ private struct TvDetailsEpisodes: View {
             .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
             .clipped()
             .offset(x: -edgeInset)
-            .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 0.82) : nil, value: episodeScrollIndex)
+            // Critically damped — same no-bounce Home strip feel.
+            .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: episodeScrollIndex)
         }
         .frame(height: TvEpisodeCardLayout.stripHeight)
     }
@@ -2228,22 +2445,14 @@ private struct TvStreamLoadingOverlay: View {
     }
 }
 
-/// How the stream picker orders results. `.default` keeps the add-ons' own
-/// order (usually already best-first); the others re-rank across all sources.
-enum StreamSortOption: String, CaseIterable, Identifiable {
-    case `default` = "Default"
-    case quality = "Quality"
-    case size = "Size"
-    case name = "Name"
-
-    var id: String { rawValue }
-}
-
 private struct TvStreamPickerOverlay: View {
     let meta: NuvioMeta
     let episode: NuvioVideo?
     let streams: [NuvioStream]
+    let groups: [AddonStreamGroup]
+    let streamsRevision: UInt64
     let isLoading: Bool
+    let emptyReason: StreamsEmptyStateReason?
     /// Whether torrent-only streams should be listed (a debrid provider is set).
     let includeDebrid: Bool
     /// A torrent stream is being turned into a playable link right now.
@@ -2251,9 +2460,14 @@ private struct TvStreamPickerOverlay: View {
     let onSelect: (NuvioStream) -> Void
     let onDismiss: () -> Void
 
-    @State private var selectedAddonName: String?
+    /// Filter by stable add-on id (not display name).
+    @State private var selectedAddonId: String?
     @State private var sortOption: StreamSortOption = .default
     @State private var showSortOptions = false
+    /// Cached filter+sort result. Rebuilt only when derivation inputs change —
+    /// never when focus moves between cards.
+    @State private var displayedStreams: [NuvioStream] = []
+    @State private var displayedStreamsCacheKey: StreamPickerListCacheKey?
     // A single focus state for the whole picker (filter chips + stream cards),
     // keyed by string. Filter chips use the "filter::" prefix; stream cards use
     // their natural id. One shared state makes programmatic focus moves reliable
@@ -2262,7 +2476,17 @@ private struct TvStreamPickerOverlay: View {
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
-    private func filterKey(_ name: String) -> String { "filter::\(name)" }
+    private func filterKey(_ addonId: String) -> String { "filter::\(addonId)" }
+
+    /// Inputs that may change the visible stream list (not focus).
+    private var listCacheKey: StreamPickerListCacheKey {
+        StreamPickerListBuilder.cacheKey(
+            revision: streamsRevision,
+            selectedAddonId: selectedAddonId,
+            sortOption: sortOption,
+            includeDebrid: includeDebrid
+        )
+    }
 
     var body: some View {
         GeometryReader { proxy in
@@ -2289,7 +2513,15 @@ private struct TvStreamPickerOverlay: View {
             }
             // The picker is only mounted once streams are available, so this
             // first appearance is a fresh focus transition and the seed wins.
-            .onAppear { seedInitialFocus() }
+            .onAppear {
+                refreshDisplayedStreamsIfNeeded()
+                seedInitialFocus()
+            }
+            // Progressive add-on results, filter chips, sort, and debrid toggle
+            // all flow through this cache key. Focus is excluded.
+            .onChange(of: listCacheKey) { _ in
+                refreshDisplayedStreamsIfNeeded()
+            }
             // The focus engine can still reject the seed after grabFocus reads
             // back its own write and stops retrying — e.g. the loading spinner
             // keeps real focus while it fades out, then its removal makes the
@@ -2311,6 +2543,37 @@ private struct TvStreamPickerOverlay: View {
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())
+    }
+
+    /// Cached list when inputs are unchanged; live derivation only while the
+    /// cache is stale (filter/sort/progressive results). Focus never invalidates
+    /// the key, so focus movement hits the cache path.
+    private var activeDisplayedStreams: [NuvioStream] {
+        let key = listCacheKey
+        if key == displayedStreamsCacheKey {
+            return displayedStreams
+        }
+        return StreamPickerListBuilder.displayedStreams(
+            streams: streams,
+            groups: groups,
+            selectedAddonId: selectedAddonId,
+            sortOption: sortOption,
+            includeDebrid: includeDebrid
+        )
+    }
+
+    /// Rebuilds the cached list only when derivation inputs actually change.
+    private func refreshDisplayedStreamsIfNeeded() {
+        let key = listCacheKey
+        guard key != displayedStreamsCacheKey else { return }
+        displayedStreamsCacheKey = key
+        displayedStreams = StreamPickerListBuilder.displayedStreams(
+            streams: streams,
+            groups: groups,
+            selectedAddonId: selectedAddonId,
+            sortOption: sortOption,
+            includeDebrid: includeDebrid
+        )
     }
 
     private var leftSummary: some View {
@@ -2344,26 +2607,36 @@ private struct TvStreamPickerOverlay: View {
 
     private var filterRow: some View {
         HStack(spacing: 18) {
-            TvStreamFilterButton(
-                title: "All",
-                isSelected: selectedAddonName == nil,
-                focusBinding: $focusedItem,
-                focusValue: filterAllKey,
-                action: { selectedAddonName = nil }
-            )
+            // Only add-on filters scroll. Vertical/edge padding gives the 1.06x
+            // focused scale room to draw without the ScrollView clipping it.
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 18) {
+                    TvStreamFilterButton(
+                        title: "All",
+                        isSelected: selectedAddonId == nil,
+                        focusBinding: $focusedItem,
+                        focusValue: filterAllKey,
+                        action: { selectedAddonId = nil }
+                    )
 
-            ForEach(addonNames, id: \.self) { addonName in
-                TvStreamFilterButton(
-                    title: addonName,
-                    isSelected: selectedAddonName == addonName,
-                    focusBinding: $focusedItem,
-                    focusValue: filterKey(addonName),
-                    action: { selectedAddonName = addonName }
-                )
+                    // Preserve configured add-on order from discovery groups.
+                    ForEach(filterGroups) { group in
+                        TvStreamFilterButton(
+                            title: group.isLoading ? "\(group.displayName)…" : group.displayName,
+                            isSelected: selectedAddonId == group.addonId,
+                            focusBinding: $focusedItem,
+                            focusValue: filterKey(group.addonId),
+                            action: { selectedAddonId = group.addonId }
+                        )
+                    }
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 12)
             }
+            .frame(maxWidth: .infinity, alignment: .leading)
 
-            Spacer(minLength: 0)
-
+            // Sort remains pinned to the trailing edge instead of moving with
+            // the add-on scroller.
             TvStreamFilterButton(
                 title: "Sort: \(sortOption.rawValue)",
                 isSelected: sortOption != .default,
@@ -2371,18 +2644,22 @@ private struct TvStreamPickerOverlay: View {
                 focusValue: sortKey,
                 action: { showSortOptions = true }
             )
+            .fixedSize(horizontal: true, vertical: false)
             .confirmationDialog("Sort streams by", isPresented: $showSortOptions, titleVisibility: .visible) {
                 ForEach(StreamSortOption.allCases) { option in
                     Button(option.rawValue) { sortOption = option }
                 }
             }
         }
+        .padding(.vertical, 4)
         .focusSection()
     }
 
     private var streamPanel: some View {
-        ZStack {
-            if isLoading && playableStreams.isEmpty {
+        // Resolve once per panel body — focus changes hit the cache path only.
+        let streamsToShow = activeDisplayedStreams
+        return ZStack {
+            if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
                     ProgressView()
                         .progressViewStyle(CircularProgressViewStyle(tint: .white))
@@ -2392,26 +2669,59 @@ private struct TvStreamPickerOverlay: View {
                         .font(.system(size: 30, weight: .semibold))
                         .foregroundColor(.white.opacity(0.74))
                 }
-            } else if filteredStreams.isEmpty {
+            } else if streamsToShow.isEmpty {
                 VStack(spacing: 18) {
-                    Image(systemName: "play.slash")
-                        .font(.system(size: 54, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.64))
+                    if selectedGroupIsLoading {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(1.4)
+                        Text("Checking \(selectedGroupName)…")
+                            .font(.system(size: 30, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.74))
+                    } else {
+                        Image(systemName: "play.slash")
+                            .font(.system(size: 54, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.64))
 
-                    Text("No playable streams found")
-                        .font(.system(size: 32, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.78))
+                        Text(emptyPanelTitle)
+                            .font(.system(size: 32, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.78))
+                            .multilineTextAlignment(.center)
+
+                        if let detail = emptyPanelDetail {
+                            Text(detail)
+                                .font(.system(size: 26, weight: .regular))
+                                .foregroundColor(.white.opacity(0.55))
+                                .multilineTextAlignment(.center)
+                        }
+                    }
                 }
+                .padding(.horizontal, 40)
             } else {
                 ScrollView(.vertical, showsIndicators: false) {
                     LazyVStack(spacing: 28) {
-                        ForEach(filteredStreams) { stream in
+                        ForEach(streamsToShow) { stream in
+                            // Focus appearance is owned by the card via local
+                            // @FocusState + ExternalFocusBinding so only the
+                            // old/new cards pay for outline/scale updates.
                             TvStreamCard(
                                 stream: stream,
-                                isFocused: focusedItem == stream.id,
+                                externalFocus: $focusedItem,
                                 action: { onSelect(stream) }
                             )
-                            .focused($focusedItem, equals: stream.id)
+                        }
+
+                        if isLoading {
+                            HStack(spacing: 18) {
+                                ProgressView()
+                                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                                Text("Checking more add-ons…")
+                                    .font(.system(size: 26, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.62))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.top, 8)
+                            .padding(.bottom, 12)
                         }
                     }
                     .padding(40)
@@ -2436,6 +2746,7 @@ private struct TvStreamPickerOverlay: View {
             }
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
+        // Keep outer panel Liquid Glass; cards use a cheap solid/material fill.
         .modifier(TvStreamGlass(shape: RoundedRectangle(cornerRadius: 32, style: .continuous), tint: Color.black.opacity(0.22)))
         // Clip the scrolling content to the panel so partial cards stay inside
         // the box (no overflow below it) until the user scrolls.
@@ -2446,87 +2757,68 @@ private struct TvStreamPickerOverlay: View {
         )
     }
 
-    private var playableStreams: [NuvioStream] {
-        SmartPlaybackSelector.playableStreams(from: streams, includeDebrid: includeDebrid)
+    /// Groups shown as filter chips (configured order; includes loading/error).
+    private var filterGroups: [AddonStreamGroup] {
+        if !groups.isEmpty { return groups }
+        // Fallback when only a flat stream list is available (mock path).
+        let names = Array(Set(streams.compactMap(\.addonName))).sorted()
+        return names.map { name in
+            AddonStreamGroup(
+                addonId: name,
+                displayName: name,
+                streams: streams.filter { $0.addonName == name },
+                isLoading: false
+            )
+        }
     }
 
-    private var filteredStreams: [NuvioStream] {
-        let base = selectedAddonName.map { name in
-            playableStreams.filter { $0.addonName == name }
-        } ?? playableStreams
-        return Self.sorted(base, by: sortOption)
+    private var selectedGroup: AddonStreamGroup? {
+        selectedAddonId.flatMap { id in groups.first(where: { $0.addonId == id }) }
     }
 
-    /// Re-orders streams for the chosen sort. `.default` is a no-op so the
-    /// add-ons' own (usually best-first) order is preserved. `.enumerated` keeps
-    /// the sort stable, so streams that tie fall back to their original order.
-    private static func sorted(_ streams: [NuvioStream], by option: StreamSortOption) -> [NuvioStream] {
-        switch option {
-        case .default:
-            return streams
-        case .quality:
-            return streams.enumerated().sorted {
-                resolution(for: $0.element) != resolution(for: $1.element)
-                    ? resolution(for: $0.element) > resolution(for: $1.element)
-                    : $0.offset < $1.offset
-            }.map(\.element)
-        case .size:
-            return streams.enumerated().sorted {
-                sizeBytes(for: $0.element) != sizeBytes(for: $1.element)
-                    ? sizeBytes(for: $0.element) > sizeBytes(for: $1.element)
-                    : $0.offset < $1.offset
-            }.map(\.element)
-        case .name:
-            return streams.sorted {
-                ($0.name ?? "").localizedCaseInsensitiveCompare($1.name ?? "") == .orderedAscending
+    private var selectedGroupIsLoading: Bool {
+        selectedGroup?.isLoading == true
+    }
+
+    private var selectedGroupName: String {
+        selectedGroup?.displayName ?? "add-on"
+    }
+
+    private var selectedGroupError: String? {
+        selectedGroup?.error
+    }
+
+    private var emptyPanelTitle: String {
+        if let selectedGroup {
+            if selectedGroup.error != nil {
+                return "\(selectedGroup.displayName) failed"
             }
+            return "No streams from \(selectedGroup.displayName)"
+        }
+        switch emptyReason {
+        case .noAddonsConfigured:
+            return "No stream add-ons configured"
+        case .noCompatibleAddons:
+            return "No compatible add-ons"
+        case .noStreamsFound, .none:
+            return isLoading ? "Finding streams" : "No playable streams found"
         }
     }
 
-    /// Best-effort resolution parsed from a stream's text (2160/1080/720/480),
-    /// 0 when unknown so untagged streams sink to the bottom of a Quality sort.
-    private static func resolution(for stream: NuvioStream) -> Int {
-        let text = "\(stream.name ?? "") \(stream.description ?? "")".lowercased()
-        if text.contains("2160") || text.contains("4k") || text.contains("uhd") { return 2160 }
-        if text.contains("1440") || text.contains("2k") { return 1440 }
-        if text.contains("1080") || text.contains("fhd") { return 1080 }
-        if text.contains("720") { return 720 }
-        if text.contains("480") { return 480 }
-        return 0
-    }
-
-    /// Best-effort file size in bytes parsed from a stream's text (e.g. "12.3 GB",
-    /// "📦 700 MB"). 0 when no size is present.
-    private static func sizeBytes(for stream: NuvioStream) -> Int64 {
-        let text = "\(stream.name ?? "") \(stream.description ?? "")"
-        let pattern = #"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)"#
-        guard let match = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else {
-            return 0
+    private var emptyPanelDetail: String? {
+        if let error = selectedGroupError {
+            return error
         }
-        let token = String(text[match])
-        let number = token.replacingOccurrences(of: ",", with: ".")
-            .components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
-            .first { Double($0) != nil }
-            .flatMap(Double.init) ?? 0
-        let unit = token.uppercased()
-        let multiplier: Double
-        if unit.contains("TB") { multiplier = 1_099_511_627_776 }
-        else if unit.contains("GB") { multiplier = 1_073_741_824 }
-        else if unit.contains("MB") { multiplier = 1_048_576 }
-        else { multiplier = 1024 }
-        return Int64(number * multiplier)
-    }
-
-    private var filteredStreamIDs: [String] {
-        filteredStreams.map(\.id)
-    }
-
-    private var addonNames: [String] {
-        Array(Set(playableStreams.compactMap { stream in
-            stream.addonName?.trimmingCharacters(in: .whitespacesAndNewlines)
-        }))
-        .filter { !$0.isEmpty }
-        .sorted()
+        switch emptyReason {
+        case .noAddonsConfigured:
+            return "Enable a stream add-on in Settings."
+        case .noCompatibleAddons:
+            return "Installed add-ons do not support this title."
+        case .noStreamsFound:
+            return isLoading ? nil : "Try another add-on or check back later."
+        case .none:
+            return nil
+        }
     }
 
     private var summaryItems: [String] {
@@ -2543,7 +2835,8 @@ private struct TvStreamPickerOverlay: View {
     /// here wins, landing on the first stream (or the "All" chip if none).
     private func seedInitialFocus() {
         DispatchQueue.main.async {
-            if let firstID = filteredStreams.first?.id {
+            refreshDisplayedStreamsIfNeeded()
+            if let firstID = activeDisplayedStreams.first?.id {
                 grabFocus(firstID, attempt: 0)
             } else {
                 grabFocus(filterAllKey, attempt: 0)
@@ -2596,8 +2889,30 @@ private struct TvStreamFilterButton: View {
 
 private struct TvStreamCard: View {
     let stream: NuvioStream
-    let isFocused: Bool
+    let externalFocus: FocusState<String?>.Binding
     let action: () -> Void
+
+    /// Local focus drives appearance only for this card, so focus moves do not
+    /// push `isFocused` through the parent ForEach for every sibling.
+    @FocusState private var isFocused: Bool
+
+    /// Precomputed once per card identity — not re-derived on every body tick.
+    private let primaryName: String
+    private let secondaryName: String?
+
+    init(
+        stream: NuvioStream,
+        externalFocus: FocusState<String?>.Binding,
+        action: @escaping () -> Void
+    ) {
+        self.stream = stream
+        self.externalFocus = externalFocus
+        self.action = action
+        let lines = Self.nameLines(for: stream)
+        self.primaryName = lines.first ?? "Stream"
+        let rest = lines.dropFirst().joined(separator: " ")
+        self.secondaryName = rest.isEmpty ? nil : rest
+    }
 
     var body: some View {
         Button(action: action) {
@@ -2646,40 +2961,34 @@ private struct TvStreamCard: View {
             .padding(.vertical, 34)
             .frame(minHeight: 250)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .modifier(
-                TvStreamGlass(
-                    shape: RoundedRectangle(cornerRadius: 22, style: .continuous),
-                    tint: Color.white.opacity(isFocused ? 0.16 : 0.04)
-                )
+            // Lightweight fill instead of per-card Liquid Glass (panel keeps glass).
+            .background(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color.white.opacity(isFocused ? 0.14 : 0.06))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.10), lineWidth: isFocused ? AppFocusOutline.width : 1)
+                    .stroke(
+                        isFocused ? AppFocusOutline.color : Color.white.opacity(0.10),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1
+                    )
             )
-            .shadow(color: .black.opacity(isFocused ? 0.44 : 0.18), radius: isFocused ? 26 : 10, y: 12)
         }
         .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: stream.id))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
     }
 
-    private var nameLines: [String] {
+    private static func nameLines(for stream: NuvioStream) -> [String] {
         let raw = stream.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let lines = raw?
             .components(separatedBy: .newlines)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty } ?? []
         return lines.isEmpty ? ["Stream"] : lines
-    }
-
-    private var primaryName: String {
-        nameLines.first ?? "Stream"
-    }
-
-    private var secondaryName: String? {
-        let value = nameLines.dropFirst().joined(separator: " ")
-        return value.isEmpty ? nil : value
     }
 
     /// The source add-on's real logo, falling back to a neutral stream glyph
@@ -2713,7 +3022,7 @@ struct MobileDetailsContent: View {
     let uiState: DetailsUiState
     let onPlayClick: () -> Void
     let onWatchlistClick: () -> Void
-    let onRateClick: () -> Void
+    let onWatchedClick: () -> Void
     let onShareClick: () -> Void
     let onBack: () -> Void
 
@@ -2760,9 +3069,10 @@ struct MobileDetailsContent: View {
                             ActionButtons(
                                 onPlayClick: onPlayClick,
                                 onWatchlistClick: onWatchlistClick,
-                                onRateClick: onRateClick,
+                                onWatchedClick: onWatchedClick,
                                 onShareClick: onShareClick,
-                                isInWatchlist: uiState.isInWatchlist
+                                isInWatchlist: uiState.isInWatchlist,
+                                isWatched: uiState.isWatched
                             )
 
                             // Cast and Crew

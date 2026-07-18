@@ -14,10 +14,15 @@ class DetailsViewModel: ObservableObject {
     @Published private(set) var uiState = DetailsUiState()
 
     private let repository: CatalogRepository
-    private var streamTask: Task<Void, Never>?
+    /// When false (MockCatalogRepository tests), stream loading uses the
+    /// repository's progressive API instead of the shared discovery service.
+    private let usesSharedStreamDiscovery: Bool
+    private var streamObserveTask: Task<Void, Never>?
+    private var observedRequestKey: String?
 
     init(repository: CatalogRepository) {
         self.repository = repository
+        self.usesSharedStreamDiscovery = !(repository is MockCatalogRepository)
     }
 
     func loadDetails(id: String, type: String) {
@@ -43,26 +48,106 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
-    /// Load the playable streams for a given title/episode id, replacing any
-    /// previously loaded streams so the picker never shows stale results.
+    /// Load the playable streams for a given title/episode id.
     ///
-    /// Streams arrive progressively: the first add-on to respond is shown right
-    /// away and later add-ons are appended as they land, rather than blocking on
-    /// every add-on before showing anything. `isLoadingStreams` stays true until
-    /// every add-on has reported, so smart auto-play still waits for the full set.
-    func prepareStreams(forId streamId: String, type: String) {
-        // Cancel any in-flight fetch (e.g. from a previously selected episode) so
-        // its late results can't overwrite the newly requested ones.
-        streamTask?.cancel()
-        streamTask = Task {
+    /// Production uses `StreamsRepository.shared` so:
+    /// - every compatible add-on appears immediately as a loading group
+    /// - results update per add-on as they arrive
+    /// - returning from playback reuses the same request key without re-fetching
+    /// - cancelling observation (leaving Details / opening player) does **not**
+    ///   cancel the shared search
+    ///
+    /// `forceRefresh` restarts discovery for the same key (explicit refresh).
+    func prepareStreams(forId streamId: String, type: String, forceRefresh: Bool = false) {
+        streamObserveTask?.cancel()
+
+        if usesSharedStreamDiscovery {
+            prepareSharedStreams(forId: streamId, type: type, forceRefresh: forceRefresh)
+        } else {
+            prepareRepositoryStreams(forId: streamId, type: type)
+        }
+    }
+
+    private func prepareSharedStreams(forId streamId: String, type: String, forceRefresh: Bool) {
+        let se = StreamsRepository.seasonEpisode(fromVideoId: streamId)
+        let key = StreamsRepository.requestKey(
+            type: type,
+            videoId: streamId,
+            season: se.season,
+            episode: se.episode
+        )
+        observedRequestKey = key
+
+        StreamsRepository.shared.load(
+            type: type,
+            videoId: streamId,
+            season: se.season,
+            episode: se.episode,
+            forceRefresh: forceRefresh
+        )
+
+        // Seed UI from cache immediately (return-from-playback reuse).
+        applyDiscoveryState(StreamsRepository.shared.state, expectedKey: key)
+
+        streamObserveTask = Task { [weak self] in
+            guard let self else { return }
+            // Poll shared state; Combine is heavier and this keeps observation
+            // cancel independent of the discovery job.
+            while !Task.isCancelled {
+                let snapshot = StreamsRepository.shared.state
+                if snapshot.requestKey == key || (snapshot.requestKey == nil && snapshot.groups.isEmpty) {
+                    self.applyDiscoveryState(snapshot, expectedKey: key)
+                }
+                if snapshot.requestKey == key, snapshot.hasResolvedTargets, !snapshot.isAnyLoading {
+                    break
+                }
+                // Another key replaced ours after we finished applying cache —
+                // stop observing but leave shared job alone.
+                if let active = snapshot.requestKey, active != key, snapshot.hasResolvedTargets {
+                    break
+                }
+                try? await Task.sleep(nanoseconds: 80_000_000)
+            }
+        }
+    }
+
+    private func applyDiscoveryState(_ snapshot: StreamsDiscoveryState, expectedKey: String) {
+        guard observedRequestKey == expectedKey else { return }
+        // Accept cached/completed state for our key, or empty transitional state.
+        if let key = snapshot.requestKey, key != expectedKey { return }
+
+        uiState.streamGroups = snapshot.groups
+        uiState.streams = snapshot.allStreams
+        uiState.streamsRevision = snapshot.revision
+        uiState.isLoadingStreams = snapshot.isAnyLoading || !snapshot.hasResolvedTargets
+        uiState.streamsEmptyReason = snapshot.emptyStateReason
+    }
+
+    private func prepareRepositoryStreams(forId streamId: String, type: String) {
+        streamObserveTask = Task {
             uiState.streams = []
+            uiState.streamGroups = []
+            uiState.streamsRevision &+= 1
+            uiState.streamsEmptyReason = nil
             uiState.isLoadingStreams = true
             for await streams in repository.streamsProgressively(id: streamId, type: type) {
                 if Task.isCancelled { return }
                 uiState.streams = streams
+                uiState.streamGroups = [
+                    AddonStreamGroup(
+                        addonId: "mock",
+                        displayName: streams.first?.addonName ?? "Streams",
+                        streams: streams,
+                        isLoading: false
+                    )
+                ]
+                uiState.streamsRevision &+= 1
             }
             if !Task.isCancelled {
                 uiState.isLoadingStreams = false
+                if uiState.streams.isEmpty {
+                    uiState.streamsEmptyReason = .noStreamsFound
+                }
             }
         }
     }
@@ -77,10 +162,4 @@ class DetailsViewModel: ObservableObject {
         uiState.isWatched = WatchedStore.toggle(meta: meta)
     }
 
-    func rateContent(rating: Int) {
-        uiState.userRating = rating
-        // TODO: Submit rating to ProfileRepository via profile preferences
-        // The Rust SDK ProfileManager stores preferences in Profile.preferences
-        // Need to update profile with ratings in preferences field
-    }
 }

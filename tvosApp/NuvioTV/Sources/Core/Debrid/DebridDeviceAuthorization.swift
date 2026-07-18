@@ -3,6 +3,7 @@ import Foundation
 
 /// Providers with the Android TV-style QR/device-code sign-in flow.
 enum DebridAccountProvider: String, CaseIterable, Identifiable {
+    case realDebrid
     case torbox
     case premiumize
 
@@ -10,13 +11,15 @@ enum DebridAccountProvider: String, CaseIterable, Identifiable {
 
     var displayName: String {
         switch self {
-        case .torbox: return "Torbox"
+        case .realDebrid: return "Real-Debrid"
+        case .torbox: return "TorBox"
         case .premiumize: return "Premiumize"
         }
     }
 
     var debridKind: DebridProviderKind {
         switch self {
+        case .realDebrid: return .realDebrid
         case .torbox: return .torbox
         case .premiumize: return .premiumize
         }
@@ -49,14 +52,15 @@ enum DebridCredentials {
         switch kind {
         case .torbox: providerKey = SettingsKey.torboxAccessToken
         case .premiumize: providerKey = SettingsKey.premiumizeAccessToken
-        case .none, .realDebrid, .allDebrid, .debridLink: providerKey = nil
+        case .realDebrid: providerKey = SettingsKey.realDebridAccessToken
+        case .none, .allDebrid, .debridLink: providerKey = nil
         }
 
         let providerValue = providerKey.flatMap { store.string(forKey: $0) }
         let providerToken = providerValue?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if !providerToken.isEmpty { return providerToken }
 
-        // Retain existing manual credentials after upgrading to the account UI.
+        // Retain existing manual credentials after upgrading to the debrid UI.
         guard DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider)) == kind else {
             return ""
         }
@@ -74,18 +78,23 @@ enum DebridCredentials {
         switch provider {
         case .torbox: key = SettingsKey.torboxAccessToken
         case .premiumize: key = SettingsKey.premiumizeAccessToken
+        case .realDebrid: key = SettingsKey.realDebridAccessToken
         }
         store.set(value, forKey: key)
 
         // Keep the legacy selected-provider value in step with a new device
-        // connection. Existing stream and Cloud Library entry points therefore
-        // work immediately, while provider-specific tokens keep both accounts.
+        // connection so stream resolution works immediately.
         store.set(provider.debridKind.rawValue, forKey: SettingsKey.debridProvider)
         store.set(value, forKey: SettingsKey.debridApiKey)
     }
 
     static func remove(provider: DebridAccountProvider, store: UserDefaults) {
-        let key = provider == .torbox ? SettingsKey.torboxAccessToken : SettingsKey.premiumizeAccessToken
+        let key: String
+        switch provider {
+        case .torbox: key = SettingsKey.torboxAccessToken
+        case .premiumize: key = SettingsKey.premiumizeAccessToken
+        case .realDebrid: key = SettingsKey.realDebridAccessToken
+        }
         store.removeObject(forKey: key)
 
         let selected = DebridProviderKind(settingsValue: store.string(forKey: SettingsKey.debridProvider))
@@ -95,11 +104,16 @@ enum DebridCredentials {
     }
 }
 
-private enum PremiumizeOAuthConfiguration {
+/// Premiumize device OAuth only works with a private registered client id.
+/// There is no Real-Debrid-style public open-source client — default is API key entry.
+enum PremiumizeOAuthConfiguration {
     static var clientID: String {
         (Bundle.main.object(forInfoDictionaryKey: "PREMIUMIZE_CLIENT_ID") as? String ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
+
+    /// When false (the normal open-source build), Settings uses API-key paste instead of QR.
+    static var isDeviceOAuthConfigured: Bool { !clientID.isEmpty }
 }
 
 private enum DebridDeviceAuthorizationError: LocalizedError {
@@ -112,10 +126,13 @@ private enum DebridDeviceAuthorizationError: LocalizedError {
     }
 }
 
-/// Port of Android TV's Torbox/Premiumize device-authorization clients.
+/// Device-authorization clients for Real-Debrid, TorBox, and optional Premiumize OAuth.
 struct DebridDeviceAuthorizationService {
     private let session: URLSession
     private let decoder = JSONDecoder()
+
+    /// Public Real-Debrid open-source client id (scopes: unrestrict, torrents, downloads, user).
+    private static let realDebridOpenSourceClientID = "X245A4XAIBGVM"
 
     init(session: URLSession = .shared) {
         self.session = session
@@ -123,6 +140,7 @@ struct DebridDeviceAuthorizationService {
 
     func start(provider: DebridAccountProvider) async throws -> DebridDeviceAuthorization {
         switch provider {
+        case .realDebrid: return try await startRealDebrid()
         case .torbox: return try await startTorbox()
         case .premiumize: return try await startPremiumize()
         }
@@ -131,6 +149,7 @@ struct DebridDeviceAuthorizationService {
     func redeem(_ authorization: DebridDeviceAuthorization) async -> DebridDeviceAuthorizationResult {
         do {
             switch authorization.provider {
+            case .realDebrid: return try await redeemRealDebrid(deviceCode: authorization.deviceCode)
             case .torbox: return try await redeemTorbox(deviceCode: authorization.deviceCode)
             case .premiumize: return try await redeemPremiumize(deviceCode: authorization.deviceCode)
             }
@@ -138,6 +157,110 @@ struct DebridDeviceAuthorizationService {
             return .pending
         } catch {
             return .failed(error.localizedDescription)
+        }
+    }
+
+    // MARK: Real-Debrid (open-source device OAuth)
+
+    private func startRealDebrid() async throws -> DebridDeviceAuthorization {
+        var components = URLComponents(string: "https://api.real-debrid.com/oauth/v2/device/code")!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: Self.realDebridOpenSourceClientID),
+            URLQueryItem(name: "new_credentials", value: "yes")
+        ]
+        guard let url = components.url else {
+            throw DebridDeviceAuthorizationError.message("Invalid Real-Debrid sign-in URL.")
+        }
+
+        let (data, response) = try await data(for: URLRequest(url: url))
+        let auth = try decoder.decode(RealDebridDeviceStart.self, from: data)
+        guard (200...299).contains(response.statusCode),
+              let deviceCode = auth.deviceCode?.nonEmpty,
+              let userCode = auth.userCode?.nonEmpty,
+              let verificationURL = auth.verificationURL?.nonEmpty else {
+            throw DebridDeviceAuthorizationError.message(
+                auth.errorDescription ?? auth.error ?? "Real-Debrid could not start account linking."
+            )
+        }
+
+        return DebridDeviceAuthorization(
+            provider: .realDebrid,
+            deviceCode: deviceCode,
+            userCode: userCode,
+            verificationURL: verificationURL,
+            friendlyVerificationURL: verificationURL,
+            pollingInterval: TimeInterval(max(auth.interval ?? 5, 1)),
+            expiresAt: auth.expiresIn.map { Date().addingTimeInterval(TimeInterval($0)) }
+        )
+    }
+
+    private func redeemRealDebrid(deviceCode: String) async throws -> DebridDeviceAuthorizationResult {
+        // Open-source flow: poll /device/credentials until user-bound client secrets appear,
+        // then exchange them + device_code for an access token.
+        var components = URLComponents(string: "https://api.real-debrid.com/oauth/v2/device/credentials")!
+        components.queryItems = [
+            URLQueryItem(name: "client_id", value: Self.realDebridOpenSourceClientID),
+            URLQueryItem(name: "code", value: deviceCode)
+        ]
+        guard let credentialsURL = components.url else { return .failed("Invalid Real-Debrid credentials URL.") }
+
+        let (data, response) = try await data(for: URLRequest(url: credentialsURL))
+        let credentials = try? decoder.decode(RealDebridDeviceCredentials.self, from: data)
+
+        if let clientID = credentials?.clientID?.nonEmpty,
+           let clientSecret = credentials?.clientSecret?.nonEmpty {
+            return try await exchangeRealDebridToken(
+                deviceCode: deviceCode,
+                clientID: clientID,
+                clientSecret: clientSecret
+            )
+        }
+
+        let message = [
+            credentials?.error,
+            credentials?.errorDescription,
+            String(data: data, encoding: .utf8)
+        ]
+        .compactMap { $0?.lowercased() }
+        .joined(separator: " ")
+
+        if message.contains("pending") || message.contains("slow") ||
+            message.contains("not authorized") || message.contains("waiting") ||
+            [400, 403, 404, 409, 425].contains(response.statusCode) {
+            return .pending
+        }
+        if message.contains("expired") || response.statusCode == 410 { return .expired }
+        if (200...299).contains(response.statusCode) {
+            // Unexpected success payload without credentials — keep waiting.
+            return .pending
+        }
+        return .failed(credentials?.errorDescription ?? credentials?.error ?? "Real-Debrid authorization failed.")
+    }
+
+    private func exchangeRealDebridToken(
+        deviceCode: String,
+        clientID: String,
+        clientSecret: String
+    ) async throws -> DebridDeviceAuthorizationResult {
+        let (data, response) = try await formRequest(
+            url: URL(string: "https://api.real-debrid.com/oauth/v2/token")!,
+            fields: [
+                "client_id": clientID,
+                "client_secret": clientSecret,
+                "code": deviceCode,
+                "grant_type": "http://oauth.net/grant_type/device/1.0"
+            ]
+        )
+        let token = try? decoder.decode(RealDebridDeviceToken.self, from: data)
+        if (200...299).contains(response.statusCode), let accessToken = token?.accessToken?.nonEmpty {
+            return .authorized(accessToken)
+        }
+
+        switch token?.error?.lowercased() {
+        case "authorization_pending", "slow_down": return .pending
+        case "expired_token", "access_denied": return .expired
+        default:
+            return .failed(token?.errorDescription ?? token?.error ?? String(data: data, encoding: .utf8))
         }
     }
 
@@ -241,8 +364,10 @@ struct DebridDeviceAuthorizationService {
     }
 
     private func premiumizeClientID() throws -> String {
-        guard !PremiumizeOAuthConfiguration.clientID.isEmpty else {
-            throw DebridDeviceAuthorizationError.message("Premiumize sign-in is not configured in this build.")
+        guard PremiumizeOAuthConfiguration.isDeviceOAuthConfigured else {
+            throw DebridDeviceAuthorizationError.message(
+                "Premiumize has no public device OAuth. Use the API key from premiumize.me/account."
+            )
         }
         return PremiumizeOAuthConfiguration.clientID
     }
@@ -455,6 +580,52 @@ private struct PremiumizeDeviceStart: Decodable {
 }
 
 private struct PremiumizeDeviceToken: Decodable {
+    let accessToken: String?
+    let error: String?
+    let errorDescription: String?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case error
+        case errorDescription = "error_description"
+    }
+}
+
+private struct RealDebridDeviceStart: Decodable {
+    let deviceCode: String?
+    let userCode: String?
+    let verificationURL: String?
+    let expiresIn: Int?
+    let interval: Int?
+    let error: String?
+    let errorDescription: String?
+
+    enum CodingKeys: String, CodingKey {
+        case deviceCode = "device_code"
+        case userCode = "user_code"
+        case verificationURL = "verification_url"
+        case expiresIn = "expires_in"
+        case interval
+        case error
+        case errorDescription = "error_description"
+    }
+}
+
+private struct RealDebridDeviceCredentials: Decodable {
+    let clientID: String?
+    let clientSecret: String?
+    let error: String?
+    let errorDescription: String?
+
+    enum CodingKeys: String, CodingKey {
+        case clientID = "client_id"
+        case clientSecret = "client_secret"
+        case error
+        case errorDescription = "error_description"
+    }
+}
+
+private struct RealDebridDeviceToken: Decodable {
     let accessToken: String?
     let error: String?
     let errorDescription: String?

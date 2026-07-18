@@ -138,7 +138,7 @@ struct StreamAddonPreference: Codable, Equatable {
     var enabled: Bool
 }
 
-/// Live Cinemeta-backed implementation used by the tvOS home prototype.
+/// Live Cinemeta-backed catalog and metadata repository for the tvOS app.
 final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
@@ -422,8 +422,17 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func configuredAddons(supporting resource: String, type: String, id: String) async -> [StremioStreamAddon] {
+        let urls = Self.configuredStreamAddonManifestURLs
+        // Load missing manifests concurrently so a slow host cannot serialize
+        // compatibility checks for every other add-on.
+        await withTaskGroup(of: Void.self) { group in
+            for manifestURL in urls {
+                group.addTask { _ = await self.manifest(for: manifestURL) }
+            }
+        }
+
         var addons: [StremioStreamAddon] = []
-        for manifestURL in Self.configuredStreamAddonManifestURLs {
+        for manifestURL in urls {
             guard let manifest = await manifest(for: manifestURL),
                   manifest.supportsResource(resource, type: type, id: id) else { continue }
             addons.append(
@@ -471,77 +480,56 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func getStreams(id: String, type: String) async throws -> [NuvioStream] {
-        let addons = await configuredAddons(supporting: "stream", type: type, id: id)
-        // Fan the add-on requests out concurrently: total latency is the
-        // slowest add-on, not the sum of them all. A slow or dead add-on no
-        // longer starves the ones that respond quickly.
-        var addonStreams: [NuvioStream] = []
-        await withTaskGroup(of: [NuvioStream].self) { group in
-            for addon in addons {
-                let url = addon.streamURL(type: type, id: id)
-                let name = addon.name
-                let manifestURL = addon.manifestURL
-                group.addTask { await Self.fetchStreams(from: url, addonName: name, manifestURL: manifestURL) }
-            }
-            for await streams in group {
-                addonStreams += streams
-            }
-        }
-
-        guard !addonStreams.isEmpty else { return [Self.sampleStream] }
-        let subtitleAddons = await configuredSubtitleAddons(id: id, type: type)
-        let addonSubtitles = await fetchSubtitleAddons(id: id, type: type, addons: subtitleAddons)
-        return Self.decorate(addonStreams, with: addonSubtitles)
+        // Shared discovery: request-key cache, per-add-on groups, timeouts.
+        // Does not use the Big Buck Bunny sample fallback.
+        await StreamsRepository.shared.collectStreams(type: type, videoId: id)
     }
 
     func streamsProgressively(id: String, type: String) -> AsyncStream<[NuvioStream]> {
-        let subtitleType = Self.isSeriesType(type) ? "series" : "movie"
+        // Bridge shared discovery into a progressive flat list for callers that
+        // still observe AsyncStream. Observation cancel must NOT cancel the
+        // shared job (returning from playback reuses it).
+        AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task { @MainActor in
+                let se = StreamsRepository.seasonEpisode(fromVideoId: id)
+                let key = StreamsRepository.requestKey(
+                    type: type,
+                    videoId: id,
+                    season: se.season,
+                    episode: se.episode
+                )
+                StreamsRepository.shared.load(
+                    type: type,
+                    videoId: id,
+                    season: se.season,
+                    episode: se.episode,
+                    forceRefresh: false
+                )
 
-        return AsyncStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
-            let task = Task {
-                let addons = await self.configuredAddons(supporting: "stream", type: type, id: id)
-                let subtitleAddons = await self.configuredSubtitleAddons(id: id, type: type)
-                var accumulated: [NuvioStream] = []
-                var subtitles: [NuvioSubtitle] = []
-
-                await withTaskGroup(of: StreamFetchResult.self) { group in
-                    for addon in addons {
-                        let url = addon.streamURL(type: type, id: id)
-                        let name = addon.name
-                        let manifestURL = addon.manifestURL
-                        group.addTask { .streams(await Self.fetchStreams(from: url, addonName: name, manifestURL: manifestURL)) }
+                var lastCount = -1
+                var lastLoading = true
+                while !Task.isCancelled {
+                    let snapshot = StreamsRepository.shared.state
+                    guard snapshot.requestKey == key || snapshot.requestKey == nil else {
+                        // A different title/episode took over; stop bridging.
+                        break
                     }
-                    for addon in subtitleAddons {
-                        let url = addon.subtitleURL(type: subtitleType, id: id)
-                        let name = addon.name
-                        group.addTask { .subtitles(await Self.fetchSubtitles(from: url, source: name)) }
-                    }
-
-                    for await result in group {
-                        if Task.isCancelled { break }
-                        switch result {
-                        case .streams(let new):
-                            guard !new.isEmpty else { continue }
-                            accumulated += new
-                            continuation.yield(Self.decorate(accumulated, with: subtitles))
-                        case .subtitles(let subs):
-                            guard !subs.isEmpty else { continue }
-                            subtitles = Self.mergedSubtitles(subtitles, subs)
-                            // Re-emit so already-shown streams pick up subtitles.
-                            if !accumulated.isEmpty {
-                                continuation.yield(Self.decorate(accumulated, with: subtitles))
-                            }
+                    if snapshot.hasResolvedTargets {
+                        let streams = snapshot.allStreams
+                        if streams.count != lastCount || snapshot.isAnyLoading != lastLoading {
+                            lastCount = streams.count
+                            lastLoading = snapshot.isAnyLoading
+                            continuation.yield(streams)
+                        }
+                        if !snapshot.isAnyLoading {
+                            break
                         }
                     }
-                }
-
-                // No add-on produced anything: fall back to the sample stream so
-                // the picker never dead-ends on "No playable streams found".
-                if !Task.isCancelled && accumulated.isEmpty {
-                    continuation.yield([Self.sampleStream])
+                    try? await Task.sleep(nanoseconds: 80_000_000)
                 }
                 continuation.finish()
             }
+            // Intentionally do not cancel StreamsRepository — only end observation.
             continuation.onTermination = { _ in task.cancel() }
         }
     }
@@ -573,63 +561,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
-    /// Fetch and decode one stream add-on's response, mapping to NuvioStreams.
-    /// A failure (timeout, bad payload, dead endpoint) yields an empty list so
-    /// it can't block the other add-ons.
-    private static func fetchStreams(from url: URL, addonName: String) async -> [NuvioStream] {
-        do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else { return [] }
-            let decoded = try JSONDecoder().decode(StremioStreamResponse.self, from: data)
-            return decoded.streams.compactMap { $0.toNuvioStream(addonName: addonName) }
-        } catch {
-            print("Failed to load streams from \(addonName): \(error.localizedDescription)")
-            return []
-        }
-    }
-
-    /// Fetches an add-on's streams and its manifest `logo` concurrently, then
-    /// tags the streams with the logo. Running them in parallel (and bounding the
-    /// logo fetch with a short timeout) means the cosmetic logo never delays the
-    /// streams themselves — important since stream loading is the critical path.
-    private static func fetchStreams(from url: URL, addonName: String, manifestURL: URL) async -> [NuvioStream] {
-        async let logo = addonLogo(for: manifestURL)
-        let streams = await fetchStreams(from: url, addonName: addonName)
-        guard let resolvedLogo = await logo else { return streams }
-        return streams.map { $0.withAddonLogoURL(resolvedLogo) }
-    }
-
-    /// One-time-per-manifest fetch of an add-on's `logo`, cached for the app's
-    /// lifetime so the stream picker can show each source's real branding. A
-    /// missing/failed logo caches `nil` so we don't refetch on every open. A tight
-    /// timeout keeps a slow manifest from ever holding up stream loading.
-    private static let addonLogoCacheLock = NSLock()
-    private static var addonLogoCache: [URL: String?] = [:]
-
-    private static func addonLogo(for manifestURL: URL) async -> String? {
-        addonLogoCacheLock.lock()
-        if let cached = addonLogoCache[manifestURL] {
-            addonLogoCacheLock.unlock()
-            return cached
-        }
-        addonLogoCacheLock.unlock()
-
-        var request = URLRequest(url: manifestURL)
-        request.timeoutInterval = 5
-
-        var logo: String?
-        if let (data, response) = try? await URLSession.shared.data(for: request),
-           let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode,
-           let manifest = try? JSONDecoder().decode(StremioManifestLogo.self, from: data) {
-            logo = manifest.logo?.trimmingCharacters(in: .whitespacesAndNewlines).nilIfEmpty
-        }
-
-        addonLogoCacheLock.lock()
-        addonLogoCache[manifestURL] = logo
-        addonLogoCacheLock.unlock()
-        return logo
-    }
-
     private static func fetchSubtitles(from url: URL, source: String) async -> [NuvioSubtitle] {
         do {
             var request = URLRequest(url: url)
@@ -643,28 +574,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return []
         }
     }
-
-    /// Cap the list at 80 and merge in any subtitle-add-on results.
-    private static func decorate(_ streams: [NuvioStream], with subtitles: [NuvioSubtitle]) -> [NuvioStream] {
-        let capped = Array(streams.prefix(80))
-        guard !subtitles.isEmpty else { return capped }
-        return capped.map { stream in
-            NuvioStream(
-                url: stream.url,
-                name: stream.name,
-                description: stream.description,
-                addonName: stream.addonName,
-                subtitles: mergedSubtitles(stream.subtitles, subtitles)
-            )
-        }
-    }
-
-    private static let sampleStream = NuvioStream(
-        url: "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/BigBuckBunny.mp4",
-        name: "Sample Stream",
-        description: "Direct 1080p fallback stream",
-        addonName: "Nuvio Sample"
-    )
 
     /// Built-in subtitles plus every enabled installed add-on whose manifest
     /// advertises the Stremio `subtitles` resource.
@@ -1056,13 +965,6 @@ private struct CinemetaMetaResponse: Decodable {
     let meta: CinemetaMeta
 }
 
-/// One result arriving from the progressive stream fetch task group — either a
-/// stream add-on's streams or the subtitle add-ons' subtitles.
-private enum StreamFetchResult {
-    case streams([NuvioStream])
-    case subtitles([NuvioSubtitle])
-}
-
 private struct StremioStreamAddon {
     let name: String
     let manifestURL: URL
@@ -1097,72 +999,8 @@ private struct StremioSubtitleAddon {
     }
 }
 
-private struct StremioStreamResponse: Decodable {
-    let streams: [StremioStream]
-}
-
 private struct StremioSubtitleResponse: Decodable {
     let subtitles: [StremioStreamSubtitle]
-}
-
-private struct StremioStream: Decodable {
-    let url: String?
-    let externalUrl: String?
-    let name: String?
-    let title: String?
-    let description: String?
-    let subtitles: [StremioStreamSubtitle]?
-    let behaviorHints: StremioStreamBehaviorHints?
-    /// Torrent fields used by debrid resolution. Add-ons like Torrentio return
-    /// these instead of a `url`; the debrid layer converts them to a link.
-    let infoHash: String?
-    let fileIdx: Int?
-    let sources: [String]?
-
-    func toNuvioStream(addonName: String) -> NuvioStream? {
-        let streamURL = cleaned(url) ?? cleaned(externalUrl)
-        let hash = cleaned(infoHash)?.lowercased()
-        // Keep torrent-only streams (no URL but an info-hash) so debrid can
-        // resolve them later; drop only streams that have neither.
-        guard streamURL != nil || hash != nil else { return nil }
-
-        let displayName = cleaned(name) ?? cleaned(title) ?? "Stream"
-        var detailLines: [String] = []
-
-        if let title = cleaned(title), title != displayName {
-            detailLines.append(title)
-        }
-        if let description = cleaned(description) {
-            detailLines.append(description)
-        } else if let size = behaviorHints?.videoSize {
-            detailLines.append("Size \(Self.sizeFormatter.string(fromByteCount: size))")
-        }
-
-        return NuvioStream(
-            url: streamURL,
-            name: displayName,
-            description: detailLines.joined(separator: "\n"),
-            addonName: addonName,
-            subtitles: subtitles?.compactMap { $0.toNuvioSubtitle(source: addonName) } ?? [],
-            infoHash: hash,
-            fileIdx: fileIdx,
-            sources: sources ?? [],
-            filename: cleaned(behaviorHints?.filename)
-        )
-    }
-
-    private func cleaned(_ value: String?) -> String? {
-        guard let value else { return nil }
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    private static let sizeFormatter: ByteCountFormatter = {
-        let formatter = ByteCountFormatter()
-        formatter.allowedUnits = [.useGB, .useMB]
-        formatter.countStyle = .file
-        return formatter
-    }()
 }
 
 private struct StremioStreamSubtitle: Decodable {
@@ -1189,17 +1027,6 @@ private struct StremioStreamSubtitle: Decodable {
         let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
         return trimmed.isEmpty ? nil : trimmed
     }
-}
-
-private struct StremioStreamBehaviorHints: Decodable {
-    let videoSize: Int64?
-    let filename: String?
-    let bingeGroup: String?
-}
-
-/// Minimal manifest decode for just the add-on `logo` shown on stream cards.
-private struct StremioManifestLogo: Decodable {
-    let logo: String?
 }
 
 private extension String {
@@ -1362,7 +1189,7 @@ private struct FlexibleString: Decodable {
     }
 }
 
-/// Mock implementation for testing without Rust SDK
+/// In-memory mock catalog for unit tests and SwiftUI previews
 class MockCatalogRepository: CatalogRepository {
     func getCollectionFolderItems(sources: [NuvioCollectionCatalogSource], limit: Int) async -> [NuvioMeta] {
         []

@@ -101,10 +101,10 @@ enum SettingsKey {
     static let debridProvider = "nuvio.tv.settings.integrations.debridProvider"
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     /// Provider-specific device-flow tokens. Keeping them separate matches the
-    /// Android TV account screen, so Torbox and Premiumize can stay connected
-    /// at the same time.
+    /// Android TV debrid screen so multiple providers can stay linked.
     static let torboxAccessToken = "nuvio.tv.settings.integrations.torboxAccessToken"
     static let premiumizeAccessToken = "nuvio.tv.settings.integrations.premiumizeAccessToken"
+    static let realDebridAccessToken = "nuvio.tv.settings.integrations.realDebridAccessToken"
     static let streamAddonManifestURL = "nuvio.tv.settings.integrations.streamAddonManifestURL"
     static let streamAddonManifestURLs = "nuvio.tv.settings.integrations.streamAddonManifestURLs"
     static let streamAddonManifestStates = "nuvio.tv.settings.integrations.streamAddonManifestStates"
@@ -141,7 +141,7 @@ enum SettingsKey {
         traktConnected, traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, traktLibrarySourceMode, traktMoreLikeThisSource,
         tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
-        debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken,
+        debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
@@ -1303,13 +1303,10 @@ private struct AppearanceSettingsView: View {
 
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
-    @AppStorage(SettingsKey.font) private var font = "Inter"
     @AppStorage(SettingsKey.language) private var language = "System"
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.amoledSurfaces) private var amoledSurfaces = false
-    @AppStorage(SettingsKey.reduceMotion) private var reduceMotion = false
 
-    private let fonts = ["Inter", "System", "Rounded", "Serif"]
     private let languages = SubtitleLanguagePreferences.settingsOptions
 
     private var accentSwatches: [SettingsSwatch] {
@@ -1347,27 +1344,12 @@ private struct AppearanceSettingsView: View {
                 .disabled(!amoled)
             }
 
-            SettingsGroup(title: "Text & Motion", subtitle: "Readable defaults for the TV room") {
+            SettingsGroup(title: "Language", subtitle: "Used when Preferred Audio is set to System") {
                 SettingsOptionRow(
-                    title: "Font",
-                    subtitle: "Preferred app typeface",
-                    selection: $font,
-                    options: fonts,
-                    accentColor: accentColor
-                )
-
-                SettingsOptionRow(
-                    title: "Language",
-                    subtitle: "Interface language preference",
+                    title: "App Language",
+                    subtitle: "Fallback language for automatic audio track selection (UI stays English)",
                     selection: $language,
                     options: languages,
-                    accentColor: accentColor
-                )
-
-                SettingsToggleRow(
-                    title: "Reduce Motion",
-                    subtitle: "Use calmer focus transitions and page motion",
-                    isOn: $reduceMotion,
                     accentColor: accentColor
                 )
             }
@@ -1388,7 +1370,8 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
 
-    private let layouts = ["Modern", "Classic", "Compact"]
+    /// Classic was never a distinct layout (behaved like Modern); keep Modern/Compact only.
+    private let layouts = ["Modern", "Compact"]
     private let discoverLocations = ["Search", "Home", "Library", "Off"]
     private let continueWatchingSorts = ["Default", "Recently watched", "Release order", "Next up"]
 
@@ -1397,12 +1380,15 @@ private struct LayoutDiscoverySettingsView: View {
             SettingsGroup(title: "Home Layout", subtitle: "How the home screen presents rows and artwork") {
                 SettingsOptionRow(
                     title: "Layout",
-                    subtitle: "Primary home browsing style",
+                    subtitle: "Modern uses larger posters; Compact tightens row and hero sizing",
                     selection: $homeLayout,
                     options: layouts,
                     accentColor: accentColor
                 )
                 .settingsEntryAnchor()
+                .onAppear {
+                    if homeLayout == "Classic" { homeLayout = "Modern" }
+                }
 
                 SettingsToggleRow(
                     title: "Hero Section",
@@ -1484,7 +1470,9 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.debridApiKey) private var debridApiKey = ""
     @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
+    @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
     @State private var debridAccountToConnect: DebridAccountProvider?
+    @State private var showingTraktLogin = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     var body: some View {
@@ -1492,7 +1480,11 @@ private struct IntegrationSettingsView: View {
             AddonsSettingsSection(accentColor: accentColor)
 
             SettingsGroup(title: "Trakt", subtitle: "Watchlist, progress, history, comments, and recommendations") {
-                TraktConnectionSettingsCard(viewModel: traktViewModel, accentColor: accentColor)
+                TraktConnectionSettingsCard(
+                    viewModel: traktViewModel,
+                    accentColor: accentColor,
+                    onStartLogin: { showingTraktLogin = true }
+                )
             }
 
             SettingsGroup(title: "Metadata Providers", subtitle: "Optional API keys for richer metadata and rating badges") {
@@ -1527,10 +1519,19 @@ private struct IntegrationSettingsView: View {
                 )
             }
 
-            SettingsGroup(title: "Accounts", subtitle: "Link a debrid account from your phone or browser") {
+            SettingsGroup(title: "Debrid", subtitle: "Link providers used to resolve torrent streams") {
                 SettingsActionRow(
-                    title: "Torbox",
-                    subtitle: "Link your Torbox account in the browser.",
+                    title: "Real-Debrid",
+                    subtitle: "Scan the QR and approve on real-debrid.com",
+                    value: isConnected(.realDebrid) ? "Connected" : "Not set",
+                    accentColor: accentColor
+                ) {
+                    debridAccountToConnect = .realDebrid
+                }
+
+                SettingsActionRow(
+                    title: "TorBox",
+                    subtitle: "Link your TorBox account in the browser",
                     value: isConnected(.torbox) ? "Connected" : "Not set",
                     accentColor: accentColor
                 ) {
@@ -1539,7 +1540,9 @@ private struct IntegrationSettingsView: View {
 
                 SettingsActionRow(
                     title: "Premiumize",
-                    subtitle: "Link your Premiumize account in the browser.",
+                    subtitle: PremiumizeOAuthConfiguration.isDeviceOAuthConfigured
+                        ? "Link with QR when a client ID is configured"
+                        : "Paste API key from premiumize.me/account",
                     value: isConnected(.premiumize) ? "Connected" : "Not set",
                     accentColor: accentColor
                 ) {
@@ -1548,13 +1551,26 @@ private struct IntegrationSettingsView: View {
             }
         }
         .onAppear { traktViewModel.reload() }
-        .task { traktViewModel.fetchAccountConnection(auto: true) }
         .sheet(item: $debridAccountToConnect) { provider in
-            DebridDeviceAuthorizationSheet(
-                provider: provider,
-                isConnected: isConnected(provider),
-                viewModel: debridConnection
-            )
+            if provider == .premiumize && !PremiumizeOAuthConfiguration.isDeviceOAuthConfigured {
+                PremiumizeApiKeySheet(
+                    isConnected: isConnected(.premiumize),
+                    accentColor: accentColor
+                )
+            } else {
+                DebridDeviceAuthorizationSheet(
+                    provider: provider,
+                    isConnected: isConnected(provider),
+                    viewModel: debridConnection
+                )
+            }
+        }
+        .sheet(isPresented: $showingTraktLogin) {
+            TraktDeviceLoginSheet(viewModel: traktViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .onChange(of: traktViewModel.mode) { mode in
+            if mode == .connected { showingTraktLogin = false }
         }
     }
 
@@ -1564,14 +1580,165 @@ private struct IntegrationSettingsView: View {
             if !torboxAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
         case .premiumize:
             if !premiumizeAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        case .realDebrid:
+            if !realDebridAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
         }
         return debridProvider == provider.debridKind.rawValue &&
             !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 }
 
-/// Matches Android TV's debrid account dialog: start the provider device flow,
-/// render its QR, show the short code, then persist the returned access token.
+/// Premiumize has no public open-source device OAuth — paste the account API key.
+private struct PremiumizeApiKeySheet: View {
+    let isConnected: Bool
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var apiKey = ""
+    @State private var statusMessage: String?
+    @State private var isValidating = false
+    @State private var validationFailed = false
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Text(isConnected ? "Premiumize Connected" : "Connect Premiumize")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundColor(.white)
+
+            if isConnected {
+                Text("This Apple TV is linked with your Premiumize API key.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+                    .multilineTextAlignment(.center)
+
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) { dismiss() }
+                    dialogButton(title: "Disconnect", isPrimary: true) {
+                        DebridCredentials.remove(provider: .premiumize, store: ProfileSettings.current)
+                        dismiss()
+                    }
+                }
+            } else {
+                Text("Premiumize does not offer public QR/device OAuth for open-source apps. Paste the API key from your account page.")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                Text("premiumize.me/account")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(accentColor)
+
+                SettingsSearchStyleField(
+                    text: $apiKey,
+                    placeholder: "API key",
+                    autoFocus: true,
+                    showsMagnifier: false,
+                    height: 64,
+                    fontSize: 22,
+                    horizontalPadding: 24
+                )
+                .frame(maxWidth: 720)
+
+                if let statusMessage {
+                    Text(statusMessage)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(validationFailed
+                            ? Color(red: 1.0, green: 0.43, blue: 0.43)
+                            : .white.opacity(0.64))
+                        .multilineTextAlignment(.center)
+                }
+
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) { dismiss() }
+                    dialogButton(
+                        title: isValidating ? "Checking…" : "Save",
+                        isPrimary: true
+                    ) {
+                        Task { await save() }
+                    }
+                }
+            }
+        }
+        .frame(width: 960)
+        .padding(.horizontal, 88)
+        .padding(.vertical, 64)
+        .background(Color(red: 0.11, green: 0.11, blue: 0.11))
+    }
+
+    @MainActor
+    private func save() async {
+        let key = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !key.isEmpty else {
+            validationFailed = true
+            statusMessage = "Paste your Premiumize API key first."
+            return
+        }
+
+        isValidating = true
+        validationFailed = false
+        statusMessage = "Checking key…"
+        defer { isValidating = false }
+
+        var request = URLRequest(url: URL(string: "https://www.premiumize.me/api/account/info")!)
+        request.setValue("Bearer \(key)", forHTTPHeaderField: "Authorization")
+
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse else {
+                validationFailed = true
+                statusMessage = "Could not reach Premiumize."
+                return
+            }
+            if http.statusCode == 401 || http.statusCode == 403 {
+                validationFailed = true
+                statusMessage = "Invalid API key."
+                return
+            }
+            guard (200...299).contains(http.statusCode) else {
+                validationFailed = true
+                statusMessage = "Premiumize returned HTTP \(http.statusCode)."
+                return
+            }
+            // Soft-check status field when present.
+            if let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+               let status = (json["status"] as? String)?.lowercased(),
+               status == "error" {
+                validationFailed = true
+                statusMessage = (json["message"] as? String) ?? "Premiumize rejected this key."
+                return
+            }
+
+            DebridCredentials.save(key, for: .premiumize, store: ProfileSettings.current)
+            validationFailed = false
+            statusMessage = "Premiumize connected."
+            dismiss()
+        } catch {
+            validationFailed = true
+            statusMessage = error.localizedDescription
+        }
+    }
+
+    @ViewBuilder
+    private func dialogButton(title: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(isPrimary ? .black : .white)
+                .padding(.horizontal, 34)
+                .padding(.vertical, 16)
+                .background(
+                    isPrimary ? Color.white : Color.white.opacity(0.14),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .disabled(isValidating && isPrimary)
+    }
+}
+
+/// QR / device-code dialog for Real-Debrid, TorBox, and Premiumize when OAuth client id is set.
 private struct DebridDeviceAuthorizationSheet: View {
     let provider: DebridAccountProvider
     let isConnected: Bool
@@ -1685,13 +1852,7 @@ private struct DebridDeviceAuthorizationSheet: View {
 private struct TraktConnectionSettingsCard: View {
     @ObservedObject var viewModel: TraktSettingsViewModel
     let accentColor: Color
-
-    private var activationURL: String {
-        if let code = viewModel.deviceUserCode, !code.isEmpty {
-            return "https://trakt.tv/activate/\(code)"
-        }
-        return viewModel.verificationURL ?? "https://trakt.tv/activate"
-    }
+    let onStartLogin: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -1720,101 +1881,33 @@ private struct TraktConnectionSettingsCard: View {
             }
 
             switch viewModel.mode {
-            case .disconnected:
-                disconnectedBody
-            case .awaitingApproval:
-                awaitingApprovalBody
+            case .disconnected, .awaitingApproval:
+                SettingsActionRow(
+                    title: viewModel.mode == .awaitingApproval ? "Continue Trakt Login" : "Connect with Trakt",
+                    subtitle: viewModel.credentialsConfigured
+                        ? "Scan the QR or enter the code at trakt.tv/activate"
+                        : "Nuvio Trakt proxy is not configured",
+                    value: viewModel.mode == .awaitingApproval ? "Resume" : "Connect",
+                    accentColor: accentColor
+                ) {
+                    onStartLogin()
+                }
+                .opacity(viewModel.credentialsConfigured ? 1 : 0.5)
+                .disabled(!viewModel.credentialsConfigured)
             case .connected:
                 connectedBody
             }
 
-            if let message = viewModel.statusMessage, !message.isEmpty {
+            if let message = viewModel.statusMessage, !message.isEmpty, viewModel.mode == .connected {
                 Text(message)
                     .font(.system(size: 17, weight: .medium))
                     .foregroundColor(.white.opacity(0.62))
             }
 
-            if let error = viewModel.errorMessage, !error.isEmpty {
+            if let error = viewModel.errorMessage, !error.isEmpty, viewModel.mode != .awaitingApproval {
                 Text(error)
                     .font(.system(size: 17, weight: .semibold))
                     .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
-            }
-        }
-    }
-
-    private var disconnectedBody: some View {
-        VStack(spacing: 12) {
-            SettingsActionRow(
-                title: "Fetch Trakt Connection",
-                subtitle: viewModel.credentialsConfigured
-                    ? "Check your Nuvio account for an existing Trakt login"
-                    : "Nuvio Trakt proxy is not configured",
-                value: viewModel.isLoading ? "Checking..." : "Fetch",
-                accentColor: accentColor
-            ) {
-                viewModel.fetchAccountConnection()
-            }
-
-            SettingsActionRow(
-                title: "Start Trakt Login",
-                subtitle: "Use a Trakt activation code on this Apple TV",
-                value: viewModel.isLoading ? "Starting..." : "Connect",
-                accentColor: accentColor
-            ) {
-                viewModel.connect()
-            }
-        }
-    }
-
-    private var awaitingApprovalBody: some View {
-        VStack(alignment: .leading, spacing: 14) {
-            HStack(alignment: .center, spacing: 24) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text("Go to trakt.tv/activate and enter:")
-                        .font(.system(size: 19, weight: .medium))
-                        .foregroundColor(.white.opacity(0.68))
-
-                    Text(viewModel.deviceUserCode ?? "-")
-                        .font(.system(size: 42, weight: .black))
-                        .tracking(4)
-                        .foregroundColor(accentColor)
-
-                    Text(activationURL)
-                        .font(.system(size: 17, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.54))
-                        .lineLimit(1)
-                }
-
-                Spacer(minLength: 16)
-
-                if let image = QRCode.image(from: activationURL, scale: 8) {
-                    Image(uiImage: image)
-                        .interpolation(.none)
-                        .resizable()
-                        .frame(width: 144, height: 144)
-                        .padding(10)
-                        .background(Color.white, in: RoundedRectangle(cornerRadius: 16, style: .continuous))
-                }
-            }
-
-            HStack(spacing: 12) {
-                SettingsActionRow(
-                    title: "Retry Polling",
-                    subtitle: "Ask Trakt again after approving the code",
-                    value: viewModel.isPolling ? "Waiting" : "Retry",
-                    accentColor: accentColor
-                ) {
-                    viewModel.retryPolling()
-                }
-
-                SettingsActionRow(
-                    title: "Cancel",
-                    subtitle: "Clear this device-code login attempt",
-                    value: "Cancel",
-                    accentColor: accentColor
-                ) {
-                    viewModel.cancelDeviceFlow()
-                }
             }
         }
     }
@@ -1908,9 +2001,9 @@ private struct TraktConnectionSettingsCard: View {
     private var statusSubtitle: String {
         switch viewModel.mode {
         case .disconnected:
-            return "Connect Trakt to enable account-level watchlist, progress, comments, and recommendations."
+            return "Connect with a QR code or activation code at trakt.tv/activate."
         case .awaitingApproval:
-            return "Approve this Apple TV in Trakt, then Nuvio will save the token for the active profile."
+            return "Finish approving this Apple TV in Trakt, or resume the login sheet."
         case .connected:
             return "This profile can use Trakt-backed sync and metadata settings."
         }
@@ -1924,6 +2017,145 @@ private struct TraktConnectionSettingsCard: View {
 
     private func statValue(_ value: Int?) -> String {
         value.map(String.init) ?? (viewModel.isStatsLoading ? "..." : "-")
+    }
+}
+
+/// Full-screen-style device login: large QR + activation code + auto-poll.
+private struct TraktDeviceLoginSheet: View {
+    @ObservedObject var viewModel: TraktSettingsViewModel
+    let accentColor: Color
+    @Environment(\.dismiss) private var dismiss
+
+    private var activationURL: String {
+        if let code = viewModel.deviceUserCode, !code.isEmpty {
+            return "https://trakt.tv/activate/\(code)"
+        }
+        return viewModel.verificationURL ?? "https://trakt.tv/activate"
+    }
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Text(viewModel.mode == .connected ? "Trakt Connected" : "Connect Trakt")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundColor(.white)
+
+            if viewModel.mode == .connected {
+                Text(viewModel.username.map { "Signed in as \($0)" } ?? "This Apple TV is linked to Trakt.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+                    .multilineTextAlignment(.center)
+                dialogButton(title: "Done", isPrimary: true) { dismiss() }
+            } else if viewModel.isLoading && viewModel.deviceUserCode == nil {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                    .frame(height: 320)
+                Text(viewModel.statusMessage ?? "Starting Trakt login…")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.64))
+                dialogButton(title: "Cancel", isPrimary: false) {
+                    viewModel.cancelDeviceFlow()
+                    dismiss()
+                }
+            } else if let code = viewModel.deviceUserCode, !code.isEmpty {
+                Text("Scan the QR on your phone, or open trakt.tv/activate and enter the code.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let image = QRCode.image(from: activationURL, scale: 10) {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(16)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }
+
+                VStack(spacing: 12) {
+                    Text(code)
+                        .font(.system(size: 54, weight: .bold, design: .rounded))
+                        .tracking(4)
+                        .foregroundColor(.white)
+                        .accessibilityLabel("Trakt activation code \(code)")
+                    Text(activationURL)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.54))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 10) {
+                    if viewModel.isPolling { ProgressView().tint(.white) }
+                    Text(viewModel.statusMessage ?? "Waiting for approval…")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.64))
+                }
+
+                if let error = viewModel.errorMessage, !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                        .multilineTextAlignment(.center)
+                }
+
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) {
+                        viewModel.cancelDeviceFlow()
+                        dismiss()
+                    }
+                    dialogButton(title: "Retry", isPrimary: true) {
+                        viewModel.cancelDeviceFlow()
+                        viewModel.connect()
+                    }
+                }
+            } else {
+                Text(viewModel.errorMessage ?? "Unable to start Trakt login.")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 18) {
+                    dialogButton(title: "Close", isPrimary: false) { dismiss() }
+                    dialogButton(title: "Retry", isPrimary: true) { viewModel.connect() }
+                }
+            }
+        }
+        .frame(width: 960)
+        .padding(.horizontal, 88)
+        .padding(.vertical, 64)
+        .background(Color(red: 0.11, green: 0.11, blue: 0.11))
+        .onAppear {
+            if viewModel.mode != .connected && viewModel.deviceUserCode == nil {
+                viewModel.connect()
+            } else if viewModel.mode == .awaitingApproval {
+                viewModel.retryPolling()
+            }
+        }
+        .onChange(of: viewModel.mode) { mode in
+            if mode == .connected {
+                // Brief success state then close.
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dialogButton(title: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(isPrimary ? .black : .white)
+                .padding(.horizontal, 34)
+                .padding(.vertical, 16)
+                .background(
+                    isPrimary ? Color.white : Color.white.opacity(0.14),
+                    in: Capsule()
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
     }
 }
 
@@ -2744,31 +2976,37 @@ private struct AdvancedSettingsView: View {
 
 private struct AboutSettingsView: View {
     let accentColor: Color
+    @State private var showingLicenses = false
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             SettingsGroup(title: "NuvioTV", subtitle: "Build and runtime information") {
                 SettingsInfoRow(title: "App Version", value: appVersion)
-                SettingsInfoRow(title: "Engine Core", value: "NuvioCore-FFI v0.4.8")
-                SettingsInfoRow(title: "Playback Stack", value: "AVKit / MPVKit")
+                SettingsInfoRow(title: "Engine Core", value: "Pure Swift")
+                SettingsInfoRow(title: "Playback Stack", value: "AVPlayer / MPVKit")
                 SettingsInfoRow(title: "Catalog Protocol", value: "Stremio compatible")
             }
 
             SettingsGroup(title: "Open Source", subtitle: "Project components used by this tvOS app") {
-                Text("This software uses SwiftUI, AVKit, MPVKit wrappers, the Nuvio Rust SDK surface, and Stremio-compatible catalog APIs.")
+                Text("This software uses SwiftUI, AVPlayer, MPVKit (libmpv), and Stremio-compatible catalog APIs.")
                     .font(.system(size: 21, weight: .medium))
                     .foregroundColor(.white.opacity(0.72))
                     .fixedSize(horizontal: false, vertical: true)
 
                 SettingsActionRow(
                     title: "Licenses & Attributions",
-                    subtitle: "Bundled attribution view is not connected in this prototype",
-                    value: "Local",
-                    accentColor: accentColor,
-                    action: {}
-                )
+                    subtitle: "Open-source components and data providers",
+                    value: "View",
+                    accentColor: accentColor
+                ) {
+                    showingLicenses = true
+                }
                 .settingsEntryAnchor()
             }
+        }
+        .sheet(isPresented: $showingLicenses) {
+            LicensesAttributionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
         }
     }
 
@@ -2776,6 +3014,171 @@ private struct AboutSettingsView: View {
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "1.0"
         let build = Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String ?? "1"
         return "\(version) (\(build))"
+    }
+}
+
+/// Local attributions for components this tvOS build actually ships with.
+private struct LicensesAttributionsSheet: View {
+    let accentColor: Color
+    @Environment(\.dismiss) private var dismiss
+    @FocusState private var closeFocused: Bool
+
+    private struct LicenseEntry: Identifiable {
+        let id: String
+        let title: String
+        let body: String
+        let license: String
+    }
+
+    private let appEntries: [LicenseEntry] = [
+        LicenseEntry(
+            id: "nuvio",
+            title: "NuvioTV",
+            body: "Native Apple TV app for browsing Stremio-compatible catalogs and playing streams.",
+            license: "GPL-3.0"
+        )
+    ]
+
+    private let dataEntries: [LicenseEntry] = [
+        LicenseEntry(
+            id: "tmdb",
+            title: "TMDB",
+            body: "Optional metadata enrichment. This product uses the TMDB API but is not endorsed or certified by TMDB.",
+            license: "TMDB API Terms"
+        ),
+        LicenseEntry(
+            id: "trakt",
+            title: "Trakt",
+            body: "Optional watch progress, history, and recommendations when a Trakt account is linked.",
+            license: "Trakt API Terms"
+        ),
+        LicenseEntry(
+            id: "cinemeta",
+            title: "Cinemeta / Stremio",
+            body: "Default catalog and metadata endpoints using the Stremio-compatible add-on protocol.",
+            license: "Stremio add-on protocol"
+        ),
+        LicenseEntry(
+            id: "premiumize",
+            title: "Premiumize",
+            body: "Optional debrid resolution and Cloud Library when an account is linked.",
+            license: "Premiumize Terms"
+        ),
+        LicenseEntry(
+            id: "torbox",
+            title: "TorBox",
+            body: "Optional debrid resolution and Cloud Library when an account is linked.",
+            license: "TorBox Terms"
+        ),
+        LicenseEntry(
+            id: "mdblist",
+            title: "MDBList",
+            body: "Optional multi-source rating badges when an API key is configured.",
+            license: "MDBList Terms"
+        )
+    ]
+
+    private let playbackEntries: [LicenseEntry] = [
+        LicenseEntry(
+            id: "mpvkit",
+            title: "MPVKit / libmpv",
+            body: "Primary playback engine for broad container and codec support on Apple TV.",
+            license: "GPL-2.0-or-later (libmpv) / project licenses"
+        ),
+        LicenseEntry(
+            id: "ffmpeg",
+            title: "FFmpeg (via MPVKit)",
+            body: "Demuxing, decoding helpers, and related libraries bundled with the MPVKit build.",
+            license: "LGPL / GPL components per FFmpeg build"
+        ),
+        LicenseEntry(
+            id: "avplayer",
+            title: "AVFoundation / AVPlayer",
+            body: "Native Apple TV path used for Dolby Vision-friendly remuxed streams and forced AVPlayer mode.",
+            license: "Apple system frameworks"
+        )
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            HStack(alignment: .center, spacing: 24) {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Licenses & Attributions")
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+                    Text("Components used by this tvOS build")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                }
+                Spacer(minLength: 24)
+                Button(action: { dismiss() }) {
+                    Text("Close")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(closeFocused ? .black : .white)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 16)
+                        .background(
+                            Capsule(style: .continuous)
+                                .fill(closeFocused ? accentColor : Color.white.opacity(0.12))
+                        )
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focused($closeFocused)
+                .focusEffectDisabledIfAvailable()
+            }
+            .padding(.horizontal, 40)
+            .padding(.top, 36)
+            .padding(.bottom, 20)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
+                    licenseSection(title: "App", entries: appEntries)
+                    licenseSection(title: "Data & services", entries: dataEntries)
+                    licenseSection(title: "Playback", entries: playbackEntries)
+                }
+                .padding(.horizontal, 40)
+                .padding(.bottom, 48)
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .background(Color.black.opacity(0.55).ignoresSafeArea())
+        .onAppear { closeFocused = true }
+    }
+
+    @ViewBuilder
+    private func licenseSection(title: String, entries: [LicenseEntry]) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text(title)
+                .font(.system(size: 24, weight: .bold))
+                .foregroundColor(.white.opacity(0.9))
+
+            ForEach(entries) { entry in
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack(alignment: .firstTextBaseline) {
+                        Text(entry.title)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(.white)
+                        Spacer(minLength: 16)
+                        Text(entry.license)
+                            .font(.system(size: 16, weight: .bold))
+                            .foregroundColor(accentColor)
+                            .lineLimit(2)
+                            .multilineTextAlignment(.trailing)
+                    }
+                    Text(entry.body)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.68))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+                .padding(22)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .settingsGlass(shape: RoundedRectangle(cornerRadius: 22, style: .continuous), isProminent: false)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 22, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+                )
+            }
+        }
     }
 }
 
