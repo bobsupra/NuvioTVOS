@@ -8,9 +8,12 @@ enum SearchContentType: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .all: return "All"
-        case .movie: return "Movies"
-        case .series: return "Series"
+        case .all:
+            return L10n.string("library_type_all", fallback: "All")
+        case .movie:
+            return L10n.string("type_movies", fallback: L10n.string("type_movie", fallback: "Movies"))
+        case .series:
+            return L10n.string("type_series_plural", fallback: L10n.string("type_series", fallback: "Series"))
         }
     }
 }

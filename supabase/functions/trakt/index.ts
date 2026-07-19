@@ -89,6 +89,16 @@ Deno.serve(async (request) => {
       return await forwardTrakt(request, route, undefined, token);
     }
 
+    // Details enrichment: comments, related titles, and tmdb id search.
+    // Only allow known-safe read paths so the proxy stays a narrow gate.
+    if (request.method === "GET" && isAllowedDetailsRoute(route)) {
+      const token = request.headers.get("x-trakt-access-token") || "";
+      if (!token) {
+        return jsonResponse({ error: "Missing X-Trakt-Access-Token" }, 401);
+      }
+      return await forwardTrakt(request, route, undefined, token);
+    }
+
     if (request.method === "GET" && route === "account/session") {
       return jsonResponse(
         {
@@ -112,7 +122,10 @@ async function forwardTrakt(
   body?: Record<string, JsonValue>,
   accessToken?: string,
 ): Promise<Response> {
-  const upstream = await fetch(`${TRAKT_API_URL}/${route}`, {
+  // Preserve client query string (page/limit/extended/type) for allowlisted GETs.
+  const search = new URL(request.url).search || "";
+  const pathOnly = route.split("?")[0];
+  const upstream = await fetch(`${TRAKT_API_URL}/${pathOnly}${search}`, {
     method: request.method,
     headers: traktHeaders(accessToken),
     body: body === undefined ? undefined : JSON.stringify(body),
@@ -160,6 +173,21 @@ function routeAfterFunctionName(pathname: string, functionName: string): string 
 
 function stripTrailingSlash(value: string): string {
   return value.replace(/\/+$/, "");
+}
+
+/** Allowlisted GET routes for details (comments / related / id lookup). */
+function isAllowedDetailsRoute(route: string): boolean {
+  const path = route.split("?")[0];
+  if (/^(movies|shows)\/[^/]+\/comments(\/[^/]+)?$/.test(path)) {
+    return true;
+  }
+  if (/^(movies|shows)\/[^/]+\/related$/.test(path)) {
+    return true;
+  }
+  if (/^search\/tmdb\/\d+$/.test(path)) {
+    return true;
+  }
+  return false;
 }
 
 function jsonResponse(body: Record<string, JsonValue>, status: number): Response {

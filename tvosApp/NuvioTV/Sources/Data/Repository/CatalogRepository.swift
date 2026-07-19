@@ -309,14 +309,23 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // fetches the full /meta payload — real episodes and per-episode ratings.
         let metaType = Self.isSeriesType(type) ? "series" : "movie"
         var lastError: Error?
+        var resolvedId = id
+
+        // Map tmdb:123 → imdb when TMDB is configured so Cinemeta can resolve.
+        if id.hasPrefix("tmdb:"),
+           let tmdbNum = Int(id.dropFirst(5)),
+           let imdb = await Self.resolveImdbFromTmdb(tmdbId: tmdbNum, type: metaType) {
+            resolvedId = imdb
+        }
 
         // Cinemeta only resolves IMDb ids; other id spaces synced from the
         // phone app (tmdb:, kitsu:, ...) must come from the configured add-ons.
-        if id.hasPrefix("tt") {
+        if resolvedId.hasPrefix("tt") {
             do {
-                let url = baseURL.appendingPathComponent("meta/\(metaType)/\(id).json")
+                let url = baseURL.appendingPathComponent("meta/\(metaType)/\(resolvedId).json")
                 let response: CinemetaMetaResponse = try await fetch(url)
                 let meta = response.meta.toMeta(fallbackType: metaType)
+                cachedMetaById[id] = meta
                 cachedMetaById[meta.id] = meta
                 return meta
             } catch {
@@ -324,9 +333,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        for addon in await configuredAddons(supporting: "meta", type: metaType, id: id) {
+        for addon in await configuredAddons(supporting: "meta", type: metaType, id: resolvedId) {
             do {
-                let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: metaType, id: id))
+                let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: metaType, id: resolvedId))
                 let meta = response.meta.toMeta(fallbackType: metaType)
                 // Cache under the requested id too in case the addon
                 // canonicalizes to a different id space.
@@ -339,6 +348,28 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         throw lastError ?? URLError(.badServerResponse)
+    }
+
+    /// Best-effort TMDB external_ids lookup so More Like This / production
+    /// browse cards that only have `tmdb:` ids can still open in Cinemeta.
+    private static func resolveImdbFromTmdb(tmdbId: Int, type: String) async -> String? {
+        let enabled = (ProfileSettings.current.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
+        let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard enabled, !apiKey.isEmpty else { return nil }
+        let media = isSeriesType(type) ? "tv" : "movie"
+        var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
+        components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let imdb = json["imdb_id"] as? String,
+              imdb.hasPrefix("tt") else {
+            return nil
+        }
+        return imdb
     }
 
     private static func isSeriesType(_ type: String) -> Bool {

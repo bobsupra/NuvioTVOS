@@ -5,7 +5,14 @@ import Combine
 enum DiscoverType: String, CaseIterable, Identifiable {
     case movie, series
     var id: String { rawValue }
-    var title: String { self == .movie ? "Movies" : "Series" }
+    var title: String {
+        switch self {
+        case .movie:
+            return L10n.string("type_movies", fallback: L10n.string("type_movie", fallback: "Movies"))
+        case .series:
+            return L10n.string("type_series_plural", fallback: L10n.string("type_series", fallback: "Series"))
+        }
+    }
 }
 
 /// Catalog/sort source. Maps to the Cinemeta catalog IDs that actually return data.
@@ -13,7 +20,14 @@ enum DiscoverSort: String, CaseIterable, Identifiable {
     case popular   // Cinemeta "top"
     case topRated  // Cinemeta "imdbRating"
     var id: String { rawValue }
-    var title: String { self == .popular ? "Popular" : "Top Rated" }
+    var title: String {
+        switch self {
+        case .popular:
+            return L10n.string("tvos_discover_popular", fallback: "Popular")
+        case .topRated:
+            return L10n.string("tvos_discover_top_rated", fallback: "Top Rated")
+        }
+    }
     var catalogId: String { self == .popular ? "top" : "imdbRating" }
 }
 

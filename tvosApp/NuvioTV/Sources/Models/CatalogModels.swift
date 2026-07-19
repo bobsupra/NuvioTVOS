@@ -316,6 +316,10 @@ struct NuvioStream: Identifiable, Codable {
     let sources: [String]
     /// Suggested filename for the wanted file, used by some debrid file pickers.
     let filename: String?
+    /// Stremio `behaviorHints.bingeGroup` — same release group for episode autoplay.
+    let bingeGroup: String?
+    /// Explicit cached flag from the add-on when present; otherwise inferred from text.
+    let isCached: Bool?
 
     init(
         url: String?,
@@ -327,7 +331,9 @@ struct NuvioStream: Identifiable, Codable {
         infoHash: String? = nil,
         fileIdx: Int? = nil,
         sources: [String] = [],
-        filename: String? = nil
+        filename: String? = nil,
+        bingeGroup: String? = nil,
+        isCached: Bool? = nil
     ) {
         self.url = url
         self.name = name
@@ -339,6 +345,8 @@ struct NuvioStream: Identifiable, Codable {
         self.fileIdx = fileIdx
         self.sources = sources
         self.filename = filename
+        self.bingeGroup = bingeGroup
+        self.isCached = isCached
     }
 
     /// A stream that has no direct URL but carries a torrent info-hash: it must
@@ -347,13 +355,19 @@ struct NuvioStream: Identifiable, Codable {
         (url?.isEmpty ?? true) && (infoHash?.isEmpty == false)
     }
 
+    /// True when the stream is known or strongly labeled as debrid-cached.
+    var isLikelyCached: Bool {
+        StreamQualityTags.parse(stream: self).isCached
+    }
+
     /// Returns a copy tagged with the source add-on's logo. Used to attach the
     /// logo after streams are fetched, so the logo lookup never blocks them.
     func withAddonLogoURL(_ logo: String?) -> NuvioStream {
         NuvioStream(
             url: url, name: name, description: description, addonName: addonName,
             subtitles: subtitles, addonLogoURL: logo, infoHash: infoHash,
-            fileIdx: fileIdx, sources: sources, filename: filename
+            fileIdx: fileIdx, sources: sources, filename: filename,
+            bingeGroup: bingeGroup, isCached: isCached
         )
     }
 
@@ -376,7 +390,9 @@ struct NuvioStream: Identifiable, Codable {
             infoHash: infoHash,
             fileIdx: fileIdx,
             sources: sources,
-            filename: filename
+            filename: filename,
+            bingeGroup: bingeGroup,
+            isCached: isCached
         )
     }
 }
@@ -2484,4 +2500,11 @@ struct DetailsUiState {
     var error: String? = nil
     var isInWatchlist: Bool = false
     var isWatched: Bool = false
+    /// Related titles under the cast row (TMDB recommendations or Trakt related).
+    var moreLikeThis: [RelatedTitle] = []
+    /// Production companies + networks from TMDB.
+    var companies: [MetaCompany] = []
+    /// Top liked Trakt comments (max 5).
+    var comments: [TraktCommentReview] = []
+    var isLoadingEnrichment: Bool = false
 }

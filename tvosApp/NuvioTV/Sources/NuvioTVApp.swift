@@ -28,6 +28,8 @@ enum TVScreen {
     case cloudLibrary
     /// Browse titles inside one collection folder (catalogs grouped under it).
     case collectionFolder(TVCollectionFolderItem, collectionTitle: String)
+    /// All titles from a production company or network.
+    case productionBrowse(MetaCompany)
 }
 
 private enum PlaybackOrigin {
@@ -44,6 +46,22 @@ enum TVTab: String, CaseIterable, Identifiable {
     case settings = "Settings"
 
     var id: String { rawValue }
+
+    /// Localized tab label (rawValue remains stable for selection identity).
+    var title: String {
+        switch self {
+        case .profile:
+            return L10n.string("settings_profiles", fallback: "Profile")
+        case .home:
+            return L10n.string("nav_home", fallback: "Home")
+        case .search:
+            return L10n.string("nav_search", fallback: "Search")
+        case .library:
+            return L10n.string("nav_library", fallback: "Library")
+        case .settings:
+            return L10n.string("nav_settings", fallback: "Settings")
+        }
+    }
 
     var symbol: String {
         switch self {
@@ -82,6 +100,8 @@ struct ContentView: View {
     @State private var isResolvingContinueWatchingStream = false
     @State private var continueWatchingPlaybackTask: Task<Void, Never>?
     @State private var pendingDeepLinkURL: URL?
+    /// Details title to restore when leaving a production company browse.
+    @State private var productionBrowseReturn: (id: String, type: String)?
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
@@ -148,7 +168,7 @@ struct ContentView: View {
                         }
                 }
 
-            case .main, .details, .player, .cloudLibrary, .collectionFolder:
+            case .main, .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse:
                 // The tab view (Home included) stays mounted for the whole
                 // session; Details and Player are presented as overlays on TOP
                 // of it rather than replacing it. Returning therefore leaves
@@ -163,6 +183,11 @@ struct ContentView: View {
         // settings suite, so each profile keeps its own theme, layout, playback
         // preferences, etc. Falls back to the shared store before a profile is picked.
         .defaultAppStorage(ProfileSettings.store(for: profileViewModel.activeProfile?.id))
+        // Apply selected app language (locale + L10n catalog) and refresh UI on change.
+        .appliesAppLocale()
+        .onChange(of: profileViewModel.activeProfile?.id) { _ in
+            AppLocaleManager.shared.reloadFromProfileStore()
+        }
         .background(Color.black.ignoresSafeArea())
         // Safety net for the Menu button while an overlay is up. During the
         // overlay's insert animation focus is briefly in limbo (the tab view is
@@ -262,7 +287,7 @@ struct ContentView: View {
     private var fullScreenOverlayPresented: Bool {
         if isResolvingContinueWatchingStream { return true }
         switch activeScreen {
-        case .details, .player, .cloudLibrary, .collectionFolder: return true
+        case .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse: return true
         default: return false
         }
     }
@@ -293,34 +318,93 @@ struct ContentView: View {
             withAnimation(.easeInOut(duration: 0.24)) {
                 activeScreen = .main
             }
+        case .productionBrowse:
+            withAnimation(.easeInOut(duration: 0.24)) {
+                if let ret = productionBrowseReturn {
+                    activeScreen = .details(id: ret.id, type: ret.type)
+                } else {
+                    activeScreen = .main
+                }
+                productionBrowseReturn = nil
+            }
         default:
             break
         }
     }
 
-    /// Handles Top Shelf playback and legacy Details deep links. Continue
-    /// Watching links use the same direct-resume path as cards inside Home.
-    /// Ignored while the user is still on the login / profile gate.
+    /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and
+    /// `stremio://` add-on install deep links. Deferred while login/profile gate
+    /// is up so Top Shelf cold-launch still works.
     private func handleDeepLink(_ url: URL) {
-        guard url.scheme == "nuvio-tv",
-              url.host == "continue-watching" || url.host == "details",
-              let components = URLComponents(url: url, resolvingAgainstBaseURL: false),
-              let id = components.queryItems?.first(where: { $0.name == "id" })?.value, !id.isEmpty else {
+        let scheme = (url.scheme ?? "").lowercased()
+
+        // stremio://host/path/manifest.json → install add-on
+        if scheme == "stremio" {
+            handleStremioInstallDeepLink(url)
             return
         }
-        let type = components.queryItems?.first(where: { $0.name == "type" })?.value ?? "movie"
+
+        // nuvio://meta?type=&id=  |  nuvio-tv://details?…  |  nuvio-tv://continue-watching?…
+        // Also accepts com.nuvio.app.tv and path-style /meta/… /details/…
+        guard ["nuvio", "nuvio-tv", "com.nuvio.app.tv"].contains(scheme) else { return }
+
         switch activeScreen {
         case .login, .profileSelection:
             pendingDeepLinkURL = url
             return
         default:
-            if url.host == "continue-watching",
-               let item = ContinueWatchingStore.item(for: id) {
-                resumePlayback(item)
-            } else {
+            break
+        }
+
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        let host = (url.host ?? "").lowercased()
+        let pathParts = url.path.split(separator: "/").map(String.init)
+
+        // Install: nuvio://addon?url=… or nuvio://install?manifest=…
+        if host == "addon" || host == "install" || pathParts.first == "addon" {
+            let manifest = components?.queryItems?.first(where: {
+                $0.name == "url" || $0.name == "manifest"
+            })?.value
+            if let manifest, CommunityAddonCatalog.install(manifestURL: manifest) {
                 withAnimation(.easeInOut(duration: 0.28)) {
-                    activeScreen = .details(id: id, type: type)
+                    selectedTab = .settings
                 }
+            }
+            return
+        }
+
+        let id = components?.queryItems?.first(where: { $0.name == "id" })?.value
+            ?? pathParts.dropFirst().first
+        guard let id, !id.isEmpty else { return }
+        let type = components?.queryItems?.first(where: { $0.name == "type" })?.value
+            ?? (pathParts.count >= 3 ? pathParts[1] : nil)
+            ?? "movie"
+
+        if host == "continue-watching" || pathParts.first == "continue-watching",
+           let item = ContinueWatchingStore.item(for: id) {
+            resumePlayback(item)
+            return
+        }
+
+        withAnimation(.easeInOut(duration: 0.28)) {
+            activeScreen = .details(id: id, type: type)
+        }
+    }
+
+    /// `stremio://…/manifest.json` installs the add-on (same as pasting the URL).
+    private func handleStremioInstallDeepLink(_ url: URL) {
+        switch activeScreen {
+        case .login, .profileSelection:
+            pendingDeepLinkURL = url
+            return
+        default:
+            break
+        }
+        let raw = url.absoluteString
+        let ok = CommunityAddonCatalog.install(manifestURL: raw)
+        if ok {
+            withAnimation(.easeInOut(duration: 0.28)) {
+                selectedTab = .settings
             }
         }
     }
@@ -436,16 +520,18 @@ struct ContentView: View {
         origin: PlaybackOrigin = .main
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
-        let player = ExternalPlayer.from(
-            ProfileSettings.store(for: profileViewModel.activeProfile?.id)
-                .string(forKey: SettingsKey.externalPlayer)
-        )
+        let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
+        let player = ExternalPlayer.from(store.string(forKey: SettingsKey.externalPlayer))
+        let forwardSubtitles = (store.object(forKey: SettingsKey.externalPlayerForwardSubtitles) as? Bool) ?? true
+        let subtitleURLs = forwardSubtitles
+            ? externalSubtitles.compactMap { URL(string: $0.url) }
+            : []
 
         // Hand off to the external app only when it is actually installed
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
         if !isTrailer,
-           let launchURL = player.launchURL(for: url),
+           let launchURL = player.launchURL(for: url, subtitleURLs: subtitleURLs),
            UIApplication.shared.canOpenURL(launchURL) {
             UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
             return
@@ -551,6 +637,30 @@ struct ContentView: View {
                 .zIndex(1)
             }
 
+            if case .productionBrowse(let company) = activeScreen {
+                ProductionBrowseView(
+                    company: company,
+                    onSelect: { title in
+                        productionBrowseReturn = nil
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            activeScreen = .details(id: title.id, type: title.type)
+                        }
+                    },
+                    onBack: {
+                        withAnimation(.easeInOut(duration: 0.24)) {
+                            if let ret = productionBrowseReturn {
+                                activeScreen = .details(id: ret.id, type: ret.type)
+                            } else {
+                                activeScreen = .main
+                            }
+                            productionBrowseReturn = nil
+                        }
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(1)
+            }
+
             if isResolvingContinueWatchingStream {
                 ContinueWatchingPlaybackLoadingView()
                     .transition(.opacity)
@@ -606,11 +716,21 @@ struct ContentView: View {
                 profileViewModel.updateProfileName(id: profileId, name: name)
                 syncManager.syncProfilesAfterLocalEdit()
             },
-            onChangeProfilePin: { profileId, pin in
-                profileViewModel.updateProfilePin(id: profileId, pin: pin)
+            onChangeProfilePin: { profileId, pin, currentPin in
+                if authManager.isAuthenticated {
+                    return await syncManager.updateProfilePin(
+                        profileId: profileId,
+                        pin: pin,
+                        currentPin: currentPin
+                    )
+                }
+                return profileViewModel.updateProfilePin(id: profileId, pin: pin)
             },
             onVerifyProfilePin: { profileId, pin in
-                profileViewModel.verifyProfilePin(id: profileId, pin: pin)
+                if authManager.isAuthenticated {
+                    return await syncManager.verifyProfilePin(profileId: profileId, pin: pin)
+                }
+                return profileViewModel.verifyProfilePin(id: profileId, pin: pin)
             },
             onSignIn: {
                 authManager.requireLogin()
@@ -694,6 +814,17 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.24)) {
                     activeScreen = .main
                 }
+            },
+            onOpenTitle: { contentId, contentType in
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .details(id: contentId, type: contentType)
+                }
+            },
+            onOpenProduction: { company in
+                productionBrowseReturn = (contentId, contentType)
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .productionBrowse(company)
+                }
             }
         )
     }
@@ -752,6 +883,11 @@ struct ContentView: View {
         let quality = store.string(forKey: SettingsKey.smartStreamQuality) ?? "Highest"
         let matchSubtitles = store.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool ?? true
         let languages = SubtitleLanguagePreferences.orderedFromDefaults(defaults: store)
+        let cachedOnly = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
+        // Prefer the series meta id for quality memory when content id is an episode.
+        let metaIdForTags = contentId.split(separator: ":").first.map(String.init) ?? contentId
+        let preferredTags = LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
+            ?? LastStreamQualityStore.load(metaId: contentId, profileId: profileId)
 
         let debrid = DebridResolver(store: store)
         let ranked = Self.rankedPlayableStreams(
@@ -759,7 +895,9 @@ struct ContentView: View {
             qualityPreference: quality,
             subtitleLanguages: languages,
             shouldMatchSubtitles: matchSubtitles,
-            includeDebrid: debrid.isEnabled
+            includeDebrid: debrid.isEnabled,
+            preferredTags: preferredTags,
+            cachedOnly: cachedOnly
         )
         guard !ranked.isEmpty else { return nil }
 
@@ -779,6 +917,11 @@ struct ContentView: View {
                     episode: episode
                 ) else { continue }
                 if excludingURLs.contains(url.absoluteString) { continue }
+                LastStreamQualityStore.save(
+                    metaId: metaIdForTags,
+                    stream: candidate,
+                    profileId: profileId
+                )
                 return PreparedNextStream(
                     url: url,
                     subtitleLine: subtitleLine,
@@ -790,6 +933,11 @@ struct ContentView: View {
             }
 
             guard let urlString = candidate.url, let url = URL(string: urlString) else { continue }
+            LastStreamQualityStore.save(
+                metaId: metaIdForTags,
+                stream: candidate,
+                profileId: profileId
+            )
             return PreparedNextStream(
                 url: url,
                 subtitleLine: subtitleLine,
@@ -814,12 +962,17 @@ struct ContentView: View {
         let matchSubtitles = store.object(forKey: SettingsKey.smartSubtitleMatching) as? Bool ?? true
         let languages = SubtitleLanguagePreferences.orderedFromDefaults(defaults: store)
         let debrid = DebridResolver(store: store)
+        let cachedOnly = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
+        let metaIdForTags = contentId.split(separator: ":").first.map(String.init) ?? contentId
+        let preferredTags = LastStreamQualityStore.load(metaId: metaIdForTags, profileId: profileId)
         return rankedPlayableStreams(
             from: streams,
             qualityPreference: quality,
             subtitleLanguages: languages,
             shouldMatchSubtitles: matchSubtitles,
-            includeDebrid: debrid.isEnabled
+            includeDebrid: debrid.isEnabled,
+            preferredTags: preferredTags,
+            cachedOnly: cachedOnly
         )
     }
 
@@ -861,35 +1014,26 @@ struct ContentView: View {
         )
     }
 
-    /// Ordered candidates for playback / failover: smart-best first, then the
-    /// rest of the playable list in repository order (skipping duplicates).
+    /// Ordered candidates for playback / failover: smart-best first (including
+    /// last-watched DV/HDR/Atmos match), then remaining playable streams.
     private static func rankedPlayableStreams(
         from streams: [NuvioStream],
         qualityPreference: String,
         subtitleLanguages: [String],
         shouldMatchSubtitles: Bool,
-        includeDebrid: Bool
+        includeDebrid: Bool,
+        preferredTags: StreamQualityTags? = nil,
+        cachedOnly: Bool = false
     ) -> [NuvioStream] {
-        let playable = SmartPlaybackSelector.playableStreams(from: streams, includeDebrid: includeDebrid)
-        guard !playable.isEmpty else { return [] }
-        let best = SmartPlaybackSelector.bestStream(
+        SmartPlaybackSelector.rankedStreams(
             from: streams,
             qualityPreference: qualityPreference,
             subtitleLanguages: subtitleLanguages,
             shouldMatchSubtitles: shouldMatchSubtitles,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            preferredTags: preferredTags,
+            cachedOnly: cachedOnly
         )
-        var ordered: [NuvioStream] = []
-        var seen = Set<String>()
-        if let best {
-            ordered.append(best)
-            seen.insert(best.id)
-        }
-        for stream in playable where !seen.contains(stream.id) {
-            ordered.append(stream)
-            seen.insert(stream.id)
-        }
-        return ordered
     }
 
     /// Parses the season/episode out of a Stremio series content id of the form
@@ -1237,8 +1381,8 @@ private struct TVMainTabView: View {
     let onSwitchProfile: () -> Void
     let onChangeProfileAvatar: (String, String) -> Void
     let onChangeProfileName: (String, String) -> Void
-    let onChangeProfilePin: (String, String?) -> Bool
-    let onVerifyProfilePin: (String, String) -> Bool
+    let onChangeProfilePin: (String, String?, String?) async -> Bool
+    let onVerifyProfilePin: (String, String) async -> Bool
     let onSignIn: () -> Void
     let onSignOut: () -> Void
     let onNavigateToDetails: (String, String) -> Void
@@ -1315,7 +1459,7 @@ private struct TVMainTabView: View {
                 onLongPressCard: onLongPressCard
             )
                 .tabItem {
-                    Label(TVTab.home.rawValue, systemImage: TVTab.home.symbol)
+                    Label(TVTab.home.title, systemImage: TVTab.home.symbol)
                 }
                 .tag(TVTab.home)
 
@@ -1326,13 +1470,13 @@ private struct TVMainTabView: View {
                 onLongPress: onLongPressCard
             )
                 .tabItem {
-                    Label(TVTab.search.rawValue, systemImage: TVTab.search.symbol)
+                    Label(TVTab.search.title, systemImage: TVTab.search.symbol)
                 }
                 .tag(TVTab.search)
 
             LibraryView(viewModel: libraryViewModel, onContentClick: onNavigateToDetails, onLongPress: onLongPressCard, onOpenCloudLibrary: onOpenCloudLibrary)
                 .tabItem {
-                    Label(TVTab.library.rawValue, systemImage: TVTab.library.symbol)
+                    Label(TVTab.library.title, systemImage: TVTab.library.symbol)
                 }
                 .tag(TVTab.library)
 
@@ -1348,7 +1492,7 @@ private struct TVMainTabView: View {
                 onSignOut: onSignOut
             )
                 .tabItem {
-                    Label(TVTab.settings.rawValue, systemImage: TVTab.settings.symbol)
+                    Label(TVTab.settings.title, systemImage: TVTab.settings.symbol)
                 }
                 .tag(TVTab.settings)
         }
@@ -4038,7 +4182,7 @@ private struct TVHeroMetaLine: View {
     }
 
     private var formattedRuntime: String? {
-        Self.formatRuntime(meta.runtime)
+        NuvioRuntimeDisplay.formatted(meta.runtime)
     }
 
     private var releaseDate: String? {
@@ -4046,52 +4190,6 @@ private struct TVHeroMetaLine: View {
             return NuvioDateDisplay.formattedDate(released)
         }
         return meta.year.map(String.init)
-    }
-
-    private static func formatRuntime(_ runtime: String?) -> String? {
-        guard let runtime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !runtime.isEmpty else {
-            return nil
-        }
-
-        let normalized = runtime.lowercased()
-        let hours = firstNumber(in: normalized, pattern: #"(\d+)\s*h"#)
-        let minutes = firstNumber(in: normalized, pattern: #"(\d+)\s*m(?:in)?"#)
-        let totalMinutes: Int?
-
-        if hours != nil || minutes != nil {
-            totalMinutes = (hours ?? 0) * 60 + (minutes ?? 0)
-        } else {
-            totalMinutes = Int(normalized.filter(\.isNumber))
-        }
-
-        guard let totalMinutes else {
-            return runtime
-        }
-
-        let wholeHours = totalMinutes / 60
-        let remainingMinutes = totalMinutes % 60
-
-        if wholeHours > 0 && remainingMinutes > 0 {
-            return "\(wholeHours)h \(remainingMinutes)m"
-        } else if wholeHours > 0 {
-            return "\(wholeHours)h"
-        } else {
-            return "\(remainingMinutes)m"
-        }
-    }
-
-    private static func firstNumber(in value: String, pattern: String) -> Int? {
-        guard let regex = try? NSRegularExpression(pattern: pattern),
-              let match = regex.firstMatch(
-                in: value,
-                range: NSRange(value.startIndex..<value.endIndex, in: value)
-              ),
-              let range = Range(match.range(at: 1), in: value) else {
-            return nil
-        }
-
-        return Int(value[range])
     }
 }
 
@@ -4157,6 +4255,55 @@ enum NuvioDateDisplay {
         f.dateFormat = "MMMM d, yyyy"
         return f
     }()
+}
+
+/// Formats Stremio/Cinemeta runtime strings ("142 min", "120", "1h 55min")
+/// into hour/minute display ("2h 22m", "2h", "45m").
+enum NuvioRuntimeDisplay {
+    static func formatted(_ runtime: String?) -> String? {
+        guard let runtime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !runtime.isEmpty else {
+            return nil
+        }
+
+        let normalized = runtime.lowercased()
+        let hours = firstNumber(in: normalized, pattern: #"(\d+)\s*h"#)
+        let minutes = firstNumber(in: normalized, pattern: #"(\d+)\s*m(?:in)?"#)
+        let totalMinutes: Int?
+
+        if hours != nil || minutes != nil {
+            totalMinutes = (hours ?? 0) * 60 + (minutes ?? 0)
+        } else {
+            totalMinutes = Int(normalized.filter(\.isNumber))
+        }
+
+        guard let totalMinutes, totalMinutes > 0 else {
+            return runtime
+        }
+
+        let wholeHours = totalMinutes / 60
+        let remainingMinutes = totalMinutes % 60
+
+        if wholeHours > 0 && remainingMinutes > 0 {
+            return "\(wholeHours)h \(remainingMinutes)m"
+        } else if wholeHours > 0 {
+            return "\(wholeHours)h"
+        } else {
+            return "\(remainingMinutes)m"
+        }
+    }
+
+    private static func firstNumber(in value: String, pattern: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                in: value,
+                range: NSRange(value.startIndex..<value.endIndex, in: value)
+              ),
+              let range = Range(match.range(at: 1), in: value) else {
+            return nil
+        }
+        return Int(value[range])
+    }
 }
 
 /// Shared Home vertical rhythm for catalog *and* collection folder rows.

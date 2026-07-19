@@ -25,24 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.1 (build 42)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.2 (build 43)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.1](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.1) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.2) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.1-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.1/NuvioTV-3.1.1-unsigned-release.ipa)
+[NuvioTV-3.1.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.2/NuvioTV-3.1.2-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-Beta 3.1.1 fixes and improves:
+Beta 3.1.2 fixes and improves:
 
-- Stream discovery now follows the Android TV model: every compatible configured add-on loads independently, appears as its own filter, and contributes all playable results without a global 80-stream cap.
-- Per-add-on failures and timeouts no longer erase successful providers, while returning to the same title reuses the active/completed search.
-- The stream picker uses revision-based caching and lightweight cards, substantially reducing focus/scroll CPU usage while keeping final external subtitles and torrent metadata current.
-- Add-on filters remain horizontally reachable, focused controls no longer clip, and Sort stays pinned to the right side.
-- Watched and library actions persist reliably from details and title-action menus.
-- Real-Debrid, TorBox, and Premiumize linking/sync behavior is aligned with the shared TV settings model.
-- The tvOS core is now pure Swift, with obsolete Rust/FFI stubs and duplicate legacy views removed.
-- Includes the native Dolby Vision, MPVKit fallback, playback resilience, remote-control, collection, and player improvements from Beta 3.1.
+- Adds an in-app language picker with System default and 34 supported UI languages, including right-to-left layout for Arabic and Hebrew.
+- Completes Settings localization across all supported languages, including categories, nested pages, dialogs, descriptions, actions, and option values.
+- Keeps the selected app language profile-scoped and applies language, locale, and layout changes immediately without restarting the app.
+- Improves title details with richer TMDB and Trakt metadata plus production, company, network, cast, and crew browsing.
+- Improves stream quality labeling and selection while preserving the playback, Dolby Vision, debrid, and add-on resilience work from Beta 3.1.1.
+- Refines profile PIN, account synchronization, discovery, search, library, and metadata behavior throughout the tvOS app.
 
 Availability of streams still depends on configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured. The Apple TV Simulator still cannot play AV1. ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 

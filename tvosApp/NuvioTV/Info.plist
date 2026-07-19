@@ -19,7 +19,7 @@
     <key>CFBundlePackageType</key>
     <string>$(PRODUCT_BUNDLE_PACKAGE_TYPE)</string>
     <key>CFBundleShortVersionString</key>
-	<string>3.1.1</string>
+	<string>3.1.2</string>
     <key>CFBundleSignature</key>
     <string>????</string>
     <key>CFBundleURLTypes</key>
@@ -27,19 +27,24 @@
       <dict>
         <key>CFBundleURLSchemes</key>
         <array>
+          <string>nuvio</string>
           <string>nuvio-tv</string>
           <string>com.nuvio.app.tv</string>
+          <string>stremio</string>
         </array>
       </dict>
     </array>
     <key>CFBundleVersion</key>
-	<string>42</string>
+	<string>43</string>
     <key>LSApplicationQueriesSchemes</key>
     <array>
       <string>infuse</string>
       <string>vlc</string>
       <string>vlc-x-callback</string>
       <string>outplayer</string>
+      <string>nplayer-http</string>
+      <string>nplayer-https</string>
+      <string>vidhub</string>
     </array>
     <key>LSMinimumSystemVersion</key>
     <string>12.0</string>

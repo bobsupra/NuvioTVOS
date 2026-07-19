@@ -2989,7 +2989,7 @@ struct PlaybackCacheSettings {
 
     static var current: PlaybackCacheSettings {
         switch ProfileSettings.current.string(forKey: SettingsKey.networkCache) ?? "Auto" {
-        case "Small":
+        case "Small", "Conservative":
             // Minimal readahead — prefer stability over seek/buffer comfort.
             return PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
         case "Medium":
@@ -2997,6 +2997,9 @@ struct PlaybackCacheSettings {
         case "Large":
             // Still well under previous 1 GiB default; enough for bursty hosts.
             return PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
+        case "Max":
+            // High-RAM Apple TV only. Still capped to limit jetsam risk.
+            return PlaybackCacheSettings(forwardBuffer: "512MiB", backBuffer: "96MiB")
         default:
             return auto
         }
@@ -3202,11 +3205,19 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         }
         checkError(mpv_set_option_string(mpv, "subs-match-os-language", shouldStrictlyMatchSubtitles ? "no" : "yes"))
         checkError(mpv_set_option_string(mpv, "subs-fallback", shouldStrictlyMatchSubtitles ? "no" : "yes"))
-        // Render text subtitles through the app's style instead of honoring
-        // embedded ASS/SSA positioning tags. Some tracks declare top alignment
-        // (for example `\\an8`), which otherwise bypasses the user's bottom
-        // margin and leaves dialogue at the top of the screen.
-        checkError(mpv_set_option_string(mpv, "sub-ass-override", "strip"))
+        // ASS/SSA override: Strip (default) flattens styling into app subtitle
+        // style so top-aligned dialogue stays in the safe area; Scale keeps
+        // layout with size adjust; Force applies style more aggressively.
+        let assMode = (ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode) ?? "Strip")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+        let assOverride: String
+        switch assMode {
+        case "scale": assOverride = "scale"
+        case "force": assOverride = "force"
+        default: assOverride = "strip"
+        }
+        checkError(mpv_set_option_string(mpv, "sub-ass-override", assOverride))
         checkError(mpv_set_option_string(mpv, "sub-use-margins", "yes"))
         checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", "yes"))
         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))

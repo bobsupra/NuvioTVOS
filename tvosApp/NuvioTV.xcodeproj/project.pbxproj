@@ -7,6 +7,14 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		A1L100020000000000000002 /* AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1L100010000000000000001 /* AppLanguage.swift */; };
+		A1L100040000000000000004 /* AppLanguageCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A1L100030000000000000003 /* AppLanguageCatalog.json */; };
+		C0D31072 /* ProductionBrowseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30072 /* ProductionBrowseView.swift */; };
+		C0D31071 /* TraktDetailsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30071 /* TraktDetailsService.swift */; };
+		C0D31070 /* TmdbDetailsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30070 /* TmdbDetailsService.swift */; };
+		T0D310E3 /* StreamQualityTagsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E3 /* StreamQualityTagsTests.swift */; };
+		C0D31062 /* CommunityAddonCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30062 /* CommunityAddonCatalog.swift */; };
+		C0D31060 /* StreamQualityTags.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30060 /* StreamQualityTags.swift */; };
 		T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */; };
 		7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */; };
 		0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */; };
@@ -108,6 +116,14 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		A1L100010000000000000001 /* AppLanguage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/AppLanguage.swift; sourceTree = "<group>"; };
+		A1L100030000000000000003 /* AppLanguageCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = NuvioTV/Resources/AppLanguageCatalog.json; sourceTree = "<group>"; };
+		C0D30072 /* ProductionBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Details/ProductionBrowseView.swift; sourceTree = "<group>"; };
+		C0D30071 /* TraktDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Trakt/TraktDetailsService.swift; sourceTree = "<group>"; };
+		C0D30070 /* TmdbDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/TMDB/TmdbDetailsService.swift; sourceTree = "<group>"; };
+		T0D300E3 /* StreamQualityTagsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamQualityTagsTests.swift; sourceTree = "<group>"; };
+		C0D30062 /* CommunityAddonCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Addons/CommunityAddonCatalog.swift; sourceTree = "<group>"; };
+		C0D30060 /* StreamQualityTags.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Streams/StreamQualityTags.swift; sourceTree = "<group>"; };
 		049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_NuvioTV.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07F961A680F5B00A75B9A /* NuvioTV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NuvioTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = NuvioTV/Images.xcassets; sourceTree = "<group>"; };
@@ -221,6 +237,7 @@
 			isa = PBXGroup;
 			children = (
 				F11748412D0307B40044C1D9 /* AppDelegate.swift */,
+				A1L100030000000000000003 /* AppLanguageCatalog.json */,
 				C0D320000000000000000000 /* Sources */,
 				F11748442D0722820044C1D9 /* NuvioTV-Bridging-Header.h */,
 				BB2F792B24A3F905000567C9 /* Supporting */,
@@ -244,6 +261,7 @@
 			isa = PBXGroup;
 			children = (
 				C0D300010000000000000001 /* NuvioTVApp.swift */,
+				A1L100010000000000000001 /* AppLanguage.swift */,
 				C0D300020000000000000002 /* CatalogModels.swift */,
 				C0D300030000000000000003 /* CatalogRepository.swift */,
 				C0D300E100000000000000E1 /* StreamsRepository.swift */,
@@ -291,6 +309,11 @@
 				C0D3002B000000000000002B /* NuvioSyncService.swift */,
 				C0D3002C000000000000002C /* TraktAuthService.swift */,
 				C0D3002D000000000000002D /* IntroDBSkipService.swift */,
+				C0D30072 /* ProductionBrowseView.swift */,
+				C0D30071 /* TraktDetailsService.swift */,
+				C0D30070 /* TmdbDetailsService.swift */,
+				C0D30062 /* CommunityAddonCatalog.swift */,
+				C0D30060 /* StreamQualityTags.swift */,
 				C0D3002E000000000000002E /* DebridProvider.swift */,
 				C0D3003A000000000000003A /* DebridDeviceAuthorization.swift */,
 				C0D3002F000000000000002F /* RealDebridResolver.swift */,
@@ -384,6 +407,7 @@
 			isa = PBXGroup;
 			children = (
 				T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */,
+				T0D300E3 /* StreamQualityTagsTests.swift */,
 			);
 			path = NuvioTVTests;
 			sourceTree = "<group>";
@@ -498,6 +522,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */,
+				A1L100040000000000000004 /* AppLanguageCatalog.json in Resources */,
 				F0A100020000000000000001 /* inter_variable.ttf in Resources */,
 				3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */,
 			);
@@ -550,6 +575,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				C0D310010000000000000001 /* NuvioTVApp.swift in Sources */,
+				A1L100020000000000000002 /* AppLanguage.swift in Sources */,
 				C0D310020000000000000002 /* CatalogModels.swift in Sources */,
 				C0D310030000000000000003 /* CatalogRepository.swift in Sources */,
 				C0D310E100000000000000E1 /* StreamsRepository.swift in Sources */,
@@ -597,6 +623,11 @@
 				C0D3102B000000000000002B /* NuvioSyncService.swift in Sources */,
 				C0D3102C000000000000002C /* TraktAuthService.swift in Sources */,
 				C0D3102D000000000000002D /* IntroDBSkipService.swift in Sources */,
+				C0D31072 /* ProductionBrowseView.swift in Sources */,
+				C0D31071 /* TraktDetailsService.swift in Sources */,
+				C0D31070 /* TmdbDetailsService.swift in Sources */,
+				C0D31062 /* CommunityAddonCatalog.swift in Sources */,
+				C0D31060 /* StreamQualityTags.swift in Sources */,
 				C0D3102E000000000000002E /* DebridProvider.swift in Sources */,
 				C0D3103A000000000000003A /* DebridDeviceAuthorization.swift in Sources */,
 				C0D3102F000000000000002F /* RealDebridResolver.swift in Sources */,
@@ -630,6 +661,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */,
+				T0D310E3 /* StreamQualityTagsTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -643,7 +675,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
@@ -652,7 +684,7 @@
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -677,14 +709,14 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -817,7 +849,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -825,7 +857,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -842,7 +874,7 @@
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -850,7 +882,7 @@
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -868,14 +900,14 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -895,14 +927,14 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 42;
+				CURRENT_PROJECT_VERSION = 43;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.1.1;
+				MARKETING_VERSION = 3.1.2;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;

@@ -98,7 +98,7 @@ public class ProfileManager {
     private static let maxProfileNameCharacters = 80
     private static let maxAvatarIdCharacters = 128
 
-    private let profilesURL: URL
+    private let profilesURL: URL?
 
     public init(baseDir: String) throws {
         ProfilePinStore.prepareForUse()
@@ -109,18 +109,37 @@ public class ProfileManager {
         UserDefaults.standard.removeObject(forKey: Self.profilesKey)
     }
 
-    public func getProfiles() throws -> [Profile] {
-        guard FileManager.default.fileExists(atPath: profilesURL.path) else {
-            return []
-        }
+    private init(userDefaultsBacked: Void) {
+        ProfilePinStore.prepareForUse()
+        profilesURL = nil
+    }
 
+    fileprivate static func userDefaultsBacked() -> ProfileManager {
+        ProfileManager(userDefaultsBacked: ())
+    }
+
+    public func getProfiles() throws -> [Profile] {
         do {
-            let data = try Data(contentsOf: profilesURL)
+            let data: Data
+            if let profilesURL {
+                guard FileManager.default.fileExists(atPath: profilesURL.path) else {
+                    return []
+                }
+                data = try Data(contentsOf: profilesURL)
+            } else {
+                guard let stored = UserDefaults.standard.data(forKey: Self.profilesKey) else {
+                    return []
+                }
+                data = stored
+            }
+
             let decoded = try JSONDecoder().decode([StoredProfile].self, from: data)
             let rawProfiles = decoded.map { $0.toProfile() }
             let profiles = Self.sanitizedProfiles(rawProfiles).map { profile in
                 var profile = profile
-                profile.isPinProtected = ProfilePinStore.hasPin(for: profile.id)
+                // A profile can be protected by the account-level PIN service
+                // even when this Apple TV has no locally cached PIN secret.
+                profile.isPinProtected = profile.isPinProtected || ProfilePinStore.hasPin(for: profile.id)
                 return profile
             }
             if profiles != rawProfiles {
@@ -216,11 +235,24 @@ public class ProfileManager {
         }
     }
 
+    /// Updates the locally persisted lock flag after the authenticated account
+    /// PIN service confirms a set/clear operation. The server owns the secret;
+    /// tvOS only needs the flag to decide whether to present the PIN prompt.
+    public func setProfilePinProtection(id: String, isProtected: Bool) throws {
+        var profiles = (try? getProfiles()) ?? []
+        guard let index = profiles.firstIndex(where: { $0.id == id }) else { return }
+        if !isProtected {
+            try? ProfilePinStore.removePin(for: id)
+        }
+        profiles[index].isPinProtected = isProtected
+        try saveProfiles(profiles)
+    }
+
     public func replaceProfiles(_ profiles: [Profile]) throws {
         let previousIds = Set(((try? getProfiles()) ?? []).map(\.id))
         let profiles = Self.sanitizedProfiles(profiles).map { profile in
             var profile = profile
-            profile.isPinProtected = ProfilePinStore.hasPin(for: profile.id)
+            profile.isPinProtected = profile.isPinProtected || ProfilePinStore.hasPin(for: profile.id)
             return profile
         }
         try saveProfiles(profiles)
@@ -254,11 +286,16 @@ public class ProfileManager {
     private func writeProfiles(_ profiles: [Profile]) throws {
         let stored = Self.sanitizedProfiles(profiles).map { StoredProfile(from: $0) }
         let data = try JSONEncoder().encode(stored)
-        try data.write(to: profilesURL, options: [.atomic])
+        if let profilesURL {
+            try data.write(to: profilesURL, options: [.atomic])
+        } else {
+            UserDefaults.standard.set(data, forKey: Self.profilesKey)
+        }
     }
 
     private func migrateProfilesFromUserDefaultsIfNeeded() throws {
-        guard !FileManager.default.fileExists(atPath: profilesURL.path),
+        guard let profilesURL,
+              !FileManager.default.fileExists(atPath: profilesURL.path),
               let data = UserDefaults.standard.data(forKey: Self.profilesKey),
               let decoded = try? JSONDecoder().decode([StoredProfile].self, from: data) else {
             return
@@ -269,6 +306,10 @@ public class ProfileManager {
     }
 
     private func quarantineUnreadableProfilesFile() {
+        guard let profilesURL else {
+            UserDefaults.standard.removeObject(forKey: Self.profilesKey)
+            return
+        }
         let backupURL = profilesURL.deletingPathExtension().appendingPathExtension("invalid.json")
         try? FileManager.default.removeItem(at: backupURL)
         try? FileManager.default.moveItem(at: profilesURL, to: backupURL)
@@ -496,40 +537,20 @@ public class ProfileViewModel: ObservableObject {
 
     private let profileManager: ProfileManager?
     private var profilesObserver: Any?
+    private var remotePinVerifier: ((String, String) async throws -> Bool)?
 
     public init(profileManager: ProfileManager? = nil) {
         if let manager = profileManager {
             self.profileManager = manager
         } else {
             do {
-                let fileManager = FileManager.default
-                // Some sideload signing/install paths expose Documents as
-                // read-only on tvOS. Application Support is the app-private,
-                // writable location intended for persistent internal data.
-                let supportURL = try fileManager.url(
-                    for: .applicationSupportDirectory,
-                    in: .userDomainMask,
-                    appropriateFor: nil,
-                    create: true
-                ).appendingPathComponent("Nuvio", isDirectory: true)
-                try fileManager.createDirectory(at: supportURL, withIntermediateDirectories: true)
-
-                // Keep profiles from development/older builds when that file
-                // is readable, but never make startup depend on Documents.
-                let legacyURL = fileManager.urls(
-                    for: .documentDirectory,
-                    in: .userDomainMask
-                )[0].appendingPathComponent("nuvio-profiles.json")
-                let profilesURL = supportURL.appendingPathComponent("nuvio-profiles.json")
-                if !fileManager.fileExists(atPath: profilesURL.path),
-                   fileManager.fileExists(atPath: legacyURL.path) {
-                    try? fileManager.copyItem(at: legacyURL, to: profilesURL)
-                }
-
-                self.profileManager = try ProfileManager(baseDir: supportURL.path)
+                self.profileManager = try Self.makeDefaultProfileManager()
             } catch {
                 print("Failed to initialize ProfileManager: \(error)")
-                self.profileManager = nil
+                // A profile picker must never become a read-only shell. Some
+                // unsigned/sideload signing combinations expose no writable
+                // file URL even though app preferences remain persistent.
+                self.profileManager = ProfileManager.userDefaultsBacked()
             }
         }
         loadProfiles()
@@ -549,10 +570,80 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
+    /// Resolves profile storage without relying on
+    /// `FileManager.url(for:in:appropriateFor:create:)`. That API can throw for
+    /// Application Support in some physical-tvOS sideload containers even when
+    /// the app's Library directory is writable. Try persistent sandbox
+    /// locations in order and verify them with a real atomic write before use.
+    private static func makeDefaultProfileManager(fileManager: FileManager = .default) throws -> ProfileManager {
+        var candidates: [URL] = []
+
+        if let applicationSupport = fileManager.urls(
+            for: .applicationSupportDirectory,
+            in: .userDomainMask
+        ).first {
+            candidates.append(applicationSupport.appendingPathComponent("Nuvio", isDirectory: true))
+        }
+
+        let homeLibrary = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
+            .appendingPathComponent("Library", isDirectory: true)
+        candidates.append(
+            homeLibrary
+                .appendingPathComponent("Application Support", isDirectory: true)
+                .appendingPathComponent("Nuvio", isDirectory: true)
+        )
+        candidates.append(homeLibrary.appendingPathComponent("Nuvio", isDirectory: true))
+
+        let documentsURL = fileManager.urls(for: .documentDirectory, in: .userDomainMask).first
+        if let documentsURL {
+            candidates.append(documentsURL.appendingPathComponent("Nuvio", isDirectory: true))
+        }
+
+        var attemptedPaths = Set<String>()
+        var lastError: Error?
+
+        for candidate in candidates {
+            let path = candidate.standardizedFileURL.path
+            guard attemptedPaths.insert(path).inserted else { continue }
+
+            do {
+                try fileManager.createDirectory(at: candidate, withIntermediateDirectories: true)
+
+                let probeURL = candidate.appendingPathComponent(".profile-storage-probe-\(UUID().uuidString)")
+                try Data().write(to: probeURL, options: .atomic)
+                try? fileManager.removeItem(at: probeURL)
+
+                // Keep profiles from development/older builds when that file
+                // is readable, but never make startup depend on Documents.
+                let profilesURL = candidate.appendingPathComponent("nuvio-profiles.json")
+                if let documentsURL {
+                    let legacyURL = documentsURL.appendingPathComponent("nuvio-profiles.json")
+                    if !fileManager.fileExists(atPath: profilesURL.path),
+                       fileManager.fileExists(atPath: legacyURL.path) {
+                        try? fileManager.copyItem(at: legacyURL, to: profilesURL)
+                    }
+                }
+
+                return try ProfileManager(baseDir: candidate.path)
+            } catch {
+                lastError = error
+                print("Profile storage unavailable at \(path): \(error)")
+            }
+        }
+
+        throw lastError ?? CocoaError(.fileNoSuchFile)
+    }
+
     deinit {
         if let observer = profilesObserver {
             NotificationCenter.default.removeObserver(observer)
         }
+    }
+
+    public func configureRemotePinVerifier(
+        _ verifier: @escaping (String, String) async throws -> Bool
+    ) {
+        remotePinVerifier = verifier
     }
 
     public func loadProfiles() {
@@ -724,6 +815,20 @@ public class ProfileViewModel: ObservableObject {
         }
     }
 
+    @discardableResult
+    public func setProfilePinProtection(id: String, isProtected: Bool) -> Bool {
+        guard let manager = profileManager else { return false }
+        do {
+            try manager.setProfilePinProtection(id: id, isProtected: isProtected)
+            loadProfiles()
+            loadActiveProfile()
+            return true
+        } catch {
+            print("Failed to update profile PIN protection: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     public func requestSwitch(to profile: Profile) {
         if profile.isPinProtected {
             self.pendingProfileId = profile.id
@@ -735,7 +840,34 @@ public class ProfileViewModel: ObservableObject {
 
     public func verifyAndSwitch(pin: String) {
         guard let id = pendingProfileId else { return }
-        switchProfile(id: id, pin: pin)
+        if profileManager?.hasPin(id: id) == true {
+            switchProfile(id: id, pin: pin)
+            return
+        }
+
+        guard let remotePinVerifier else {
+            pinError = "PIN verification is unavailable. Check your connection and try again."
+            return
+        }
+
+        isLoading = true
+        pinError = nil
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let unlocked = try await remotePinVerifier(id, pin)
+                self.isLoading = false
+                guard unlocked else {
+                    self.pinError = "Incorrect PIN"
+                    return
+                }
+                self.completeSwitch(id: id)
+            } catch {
+                self.isLoading = false
+                self.pinError = "Couldn't verify the PIN. Check your connection and try again."
+                print("Failed to verify remote profile PIN: \(error.localizedDescription)")
+            }
+        }
     }
 
     private func switchProfile(id: String, pin: String?) {
@@ -745,6 +877,10 @@ public class ProfileViewModel: ObservableObject {
                 return
             }
         }
+        completeSwitch(id: id)
+    }
+
+    private func completeSwitch(id: String) {
         do {
             try profileManager?.switchProfile(id: id)
             loadActiveProfile()
@@ -755,6 +891,7 @@ public class ProfileViewModel: ObservableObject {
                 profileChosen.send(profile)
             }
         } catch {
+            pinError = "Couldn't switch profiles. Try again."
             print("Failed to switch profile: \(error)")
         }
     }
@@ -783,7 +920,7 @@ public class ProfileViewModel: ObservableObject {
             loadActiveProfile()
             let expectedProfiles = remoteProfiles.map { profile in
                 var profile = profile
-                profile.isPinProtected = manager.hasPin(id: profile.id)
+                profile.isPinProtected = profile.isPinProtected || manager.hasPin(id: profile.id)
                 return profile
             }
             guard profiles == expectedProfiles,

@@ -2,8 +2,8 @@
 //  AuthService.swift
 //  NuvioTV
 //
-//  Thin Supabase REST client implementing the email + TV (QR) login flows
-//  directly over URLSession — no Supabase SDK — mirroring Android's AuthManager.
+//  Thin Nuvio API client implementing the email + TV (QR) login flows directly
+//  over URLSession, mirroring Android's AuthManager.
 //
 
 import Foundation
@@ -12,14 +12,14 @@ struct AuthService {
     private let session: URLSession = .shared
     private let decoder = JSONDecoder()
 
-    private var baseURL: String { AuthConfig.normalizedSupabaseURL }
+    private var baseURL: String { AuthConfig.normalizedAPIBaseURL }
     private var apiKey: String { AuthConfig.apiKey }
 
     // MARK: - Email auth
 
     /// POST /auth/v1/token?grant_type=password
     func signInWithEmail(email: String, password: String) async throws -> AuthSession {
-        let token: SupabaseTokenResponse = try await request(
+        let token: NuvioTokenResponse = try await request(
             path: "/auth/v1/token",
             query: ["grant_type": "password"],
             method: "POST",
@@ -31,7 +31,7 @@ struct AuthService {
 
     /// POST /auth/v1/signup
     func signUpWithEmail(email: String, password: String) async throws -> AuthSession {
-        let token: SupabaseTokenResponse = try await request(
+        let token: NuvioTokenResponse = try await request(
             path: "/auth/v1/signup",
             method: "POST",
             bearer: apiKey,
@@ -45,7 +45,7 @@ struct AuthService {
     /// Anonymous GoTrue session used to authorize the TV-login RPCs.
     /// supabase-js posts `{ "data": {} }` to /signup for anonymous sign-in.
     func signInAnonymously() async throws -> AuthSession {
-        let token: SupabaseTokenResponse = try await request(
+        let token: NuvioTokenResponse = try await request(
             path: "/auth/v1/signup",
             method: "POST",
             bearer: apiKey,
@@ -174,7 +174,7 @@ struct AuthService {
 
     /// POST /auth/v1/token?grant_type=refresh_token
     func refresh(refreshToken: String) async throws -> AuthSession {
-        let token: SupabaseTokenResponse = try await request(
+        let token: NuvioTokenResponse = try await request(
             path: "/auth/v1/token",
             query: ["grant_type": "refresh_token"],
             method: "POST",
@@ -185,7 +185,7 @@ struct AuthService {
     }
 
     /// GET /auth/v1/user
-    func getUser(accessToken: String) async throws -> SupabaseUser {
+    func getUser(accessToken: String) async throws -> NuvioUser {
         try await request(
             path: "/auth/v1/user",
             method: "GET",
@@ -206,7 +206,7 @@ struct AuthService {
 
     // MARK: - Helpers
 
-    private func authSession(from token: SupabaseTokenResponse) throws -> AuthSession {
+    private func authSession(from token: NuvioTokenResponse) throws -> AuthSession {
         guard let user = token.user else {
             throw AuthError(message: "Missing user in auth response")
         }

@@ -27,7 +27,7 @@ struct MetadataInfo: View {
                         .foregroundColor(.secondary)
                 }
 
-                if let runtime = meta.runtime {
+                if let runtime = NuvioRuntimeDisplay.formatted(meta.runtime) {
                     Text(runtime)
                         .font(.body)
                         .foregroundColor(.secondary)
@@ -97,7 +97,7 @@ struct TvMetadataInfo: View {
                         .foregroundColor(.secondary)
                 }
 
-                if let runtime = meta.runtime {
+                if let runtime = NuvioRuntimeDisplay.formatted(meta.runtime) {
                     Text(runtime)
                         .font(.title2)
                         .foregroundColor(.secondary)

@@ -15,7 +15,8 @@ class AppDelegate: UIResponder, UIApplicationDelegate {
     _ application: UIApplication,
     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil
   ) -> Bool {
-    // App initialization logic here
+    // Apply in-app language before the first SwiftUI frame is built.
+    AppLocaleManager.bootstrap()
     return true
   }
 

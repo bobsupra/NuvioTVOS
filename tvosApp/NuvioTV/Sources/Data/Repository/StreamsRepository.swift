@@ -634,7 +634,9 @@ private struct StreamAddonStreamDTO: Decodable {
             infoHash: hash,
             fileIdx: fileIdx,
             sources: sources ?? [],
-            filename: cleaned(behaviorHints?.filename)
+            filename: cleaned(behaviorHints?.filename),
+            bingeGroup: cleaned(behaviorHints?.bingeGroup),
+            isCached: behaviorHints?.cached ?? behaviorHints?.isCached
         )
     }
 
@@ -681,4 +683,7 @@ private struct StreamAddonSubtitleDTO: Decodable {
 private struct StreamAddonBehaviorHints: Decodable {
     let videoSize: Int64?
     let filename: String?
+    let bingeGroup: String?
+    let cached: Bool?
+    let isCached: Bool?
 }

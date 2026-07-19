@@ -102,12 +102,15 @@ enum DolbyVisionPlaybackPolicy {
         default:
             // Auto
             if isDV, profile == 7 {
+                // Dual-layer DV profile 7 (dvhe) is not natively playable by
+                // AVPlayer on tvOS. Unlike Android, we do not convert DV7→8.1
+                // on-device; MPV plays the HDR10/PQ base layer instead.
                 return Result(
                     decision: .mpvHdrFallback,
                     engine: .mpv,
                     isDolbyVisionLikely: true,
                     isAVPlayerFriendlyContainer: friendly,
-                    reason: "Auto: Dolby Vision profile 7 is not native AVPlayer-compatible → MPV HDR10/PQ fallback"
+                    reason: "Auto: Dolby Vision Profile 7 (dual-layer) → MPV HDR10/PQ base layer (no on-device DV7→8.1 conversion on Apple TV)"
                 )
             }
             if isDV {
@@ -247,7 +250,7 @@ enum DolbyVisionPlaybackPolicy {
             // Do not claim native DV until AVPlayer produces its first frame.
             return nil
         case .mpvHdrFallback:
-            return "Dolby Vision → HDR10/PQ (MPV)"
+            return "DV Profile 7 → HDR10/PQ base layer (MPV)"
         case .mpvDefault:
             return nil
         }

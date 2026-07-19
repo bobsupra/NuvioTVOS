@@ -109,9 +109,12 @@ struct DiscoverSection: View {
                 }
             }
 
-            FilterMenu(label: viewModel.genre ?? "All Genres") {
+            FilterMenu(label: viewModel.genre ?? L10n.string("tvos_discover_all_genres", fallback: "All Genres")) {
                 Button { viewModel.setGenre(nil) } label: {
-                    menuItem("All Genres", selected: viewModel.genre == nil)
+                    menuItem(
+                        L10n.string("tvos_discover_all_genres", fallback: "All Genres"),
+                        selected: viewModel.genre == nil
+                    )
                 }
                 ForEach(viewModel.genres, id: \.self) { genre in
                     Button { viewModel.setGenre(genre) } label: {
@@ -138,9 +141,14 @@ struct DiscoverSection: View {
             }
         } else if viewModel.items.isEmpty {
             centered {
-                message(icon: "rectangle.on.rectangle.slash",
-                        title: "Nothing here",
-                        subtitle: "Try a different genre or category.")
+                message(
+                    icon: "rectangle.on.rectangle.slash",
+                    title: L10n.string("tvos_discover_empty_title", fallback: "Nothing here"),
+                    subtitle: L10n.string(
+                        "tvos_discover_empty_subtitle",
+                        fallback: "Try a different genre or category."
+                    )
+                )
             }
         } else {
             grid

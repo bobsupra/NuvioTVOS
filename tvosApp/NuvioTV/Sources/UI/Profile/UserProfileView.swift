@@ -96,6 +96,7 @@ public struct UserProfileView: View {
                     Spacer().frame(height: 56)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .disabled(viewModel.isPinEntryVisible)
 
                 if viewModel.isPinEntryVisible {
                     ProfilePinView(viewModel: viewModel)
@@ -278,7 +279,7 @@ struct AvatarCatalogItem: Identifiable, Decodable {
     var imageURL: URL? {
         let path = storagePath.trimmingCharacters(in: CharacterSet(charactersIn: "/ "))
         guard !path.isEmpty else { return nil }
-        return URL(string: "\(AuthConfig.normalizedSupabaseURL)/storage/v1/object/public/avatars/\(path)")
+        return URL(string: "\(AuthConfig.normalizedAPIBaseURL)/storage/v1/object/public/avatars/\(path)")
     }
 
     /// Circle fill shown behind the (transparent-PNG) face while it loads and
@@ -312,7 +313,7 @@ final class AvatarCatalogStore: ObservableObject {
 
     private func load() async {
         defer { isLoading = false }
-        guard let url = URL(string: "\(AuthConfig.normalizedSupabaseURL)/rest/v1/rpc/get_avatar_catalog") else { return }
+        guard let url = URL(string: "\(AuthConfig.normalizedAPIBaseURL)/rest/v1/rpc/get_avatar_catalog") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue(AuthConfig.apiKey, forHTTPHeaderField: "apikey")

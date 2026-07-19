@@ -2,7 +2,7 @@
 //  AuthModels.swift
 //  NuvioTV
 //
-//  App auth state + Supabase wire models for the TV-login / email flows.
+//  App auth state + Nuvio API wire models for the TV-login / email flows.
 //
 
 import Foundation
@@ -19,7 +19,7 @@ enum AuthState: Equatable {
     }
 }
 
-/// A persisted Supabase session (tokens + identity).
+/// A persisted Nuvio account session (tokens + identity).
 struct AuthSession: Codable, Equatable {
     var accessToken: String
     var refreshToken: String
@@ -34,15 +34,15 @@ struct AuthSession: Codable, Equatable {
     }
 }
 
-// MARK: - Supabase wire models
+// MARK: - Nuvio API wire models
 
 /// GoTrue token/session response (sign-in, sign-up, anonymous, refresh).
-struct SupabaseTokenResponse: Decodable {
+struct NuvioTokenResponse: Decodable {
     let accessToken: String
     let refreshToken: String
     let expiresIn: Double?
     let expiresAt: Double?
-    let user: SupabaseUser?
+    let user: NuvioUser?
 
     enum CodingKeys: String, CodingKey {
         case accessToken = "access_token"
@@ -53,7 +53,7 @@ struct SupabaseTokenResponse: Decodable {
     }
 }
 
-struct SupabaseUser: Decodable {
+struct NuvioUser: Decodable {
     let id: String
     let email: String?
 }

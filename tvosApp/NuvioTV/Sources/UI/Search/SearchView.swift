@@ -69,7 +69,10 @@ struct SearchView: View {
                         centeredState {
                             messageState(
                                 icon: "rectangle.grid.2x2",
-                                title: "Discover is hidden from Search"
+                                title: L10n.string(
+                                    "search_start_subtitle_no_discover",
+                                    fallback: "Discover is disabled. Enter at least 2 characters"
+                                )
                             )
                         }
                     }
@@ -129,7 +132,7 @@ struct SearchView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 20) {
-            Text("Search")
+            Text(L10n.string("nav_search", fallback: "Search"))
                 .font(.system(size: 46, weight: .bold))
                 .foregroundColor(.white)
 
@@ -165,7 +168,11 @@ struct SearchView: View {
                     .font(.system(size: 30, weight: .semibold))
                     .foregroundColor(.white.opacity(0.7))
 
-                Text(viewModel.searchText.isEmpty ? "Search movies & shows" : viewModel.searchText)
+                Text(
+                    viewModel.searchText.isEmpty
+                        ? L10n.string("search_placeholder", fallback: "Search movies & series")
+                        : viewModel.searchText
+                )
                     .font(.system(size: 30, weight: .regular))
                     .foregroundColor(viewModel.searchText.isEmpty ? .white.opacity(0.45) : .white)
                     .lineLimit(1)
@@ -207,7 +214,7 @@ struct SearchView: View {
             Spacer()
 
             if !viewModel.results.isEmpty {
-                Text("\(viewModel.results.count) result\(viewModel.results.count == 1 ? "" : "s")")
+                Text(resultsCountLabel)
                     .font(.system(size: 22, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
             }
@@ -230,12 +237,27 @@ struct SearchView: View {
             }
         } else if viewModel.results.isEmpty {
             centeredState {
-                messageState(icon: "magnifyingglass",
-                             title: "No results for “\(viewModel.searchText)”")
+                messageState(
+                    icon: "magnifyingglass",
+                    title: L10n.string("search_no_results_title", fallback: "No Results"),
+                    subtitle: L10n.format(
+                        "tvos_search_no_results_for",
+                        fallback: "No results for “%@”",
+                        viewModel.searchText
+                    )
+                )
             }
         } else {
             resultsGrid
         }
+    }
+
+    private var resultsCountLabel: String {
+        let count = viewModel.results.count
+        if count == 1 {
+            return L10n.format("tvos_search_result_count_one", fallback: "%d result", count)
+        }
+        return L10n.format("tvos_search_result_count_other", fallback: "%d results", count)
     }
 
     private var resultsGrid: some View {
@@ -286,7 +308,7 @@ struct SearchView: View {
     private var recentRow: some View {
         VStack(alignment: .leading, spacing: 12) {
             HStack {
-                Text("Recent searches")
+                Text(L10n.string("search_recent_title", fallback: "Recent searches"))
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundColor(.white.opacity(0.8))
             }
@@ -302,7 +324,7 @@ struct SearchView: View {
                     Button { viewModel.clearRecent() } label: {
                         HStack(spacing: 8) {
                             Image(systemName: "trash")
-                            Text("Clear")
+                            Text(L10n.string("action_clear", fallback: "Clear"))
                         }
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundColor(clearRecentFocused ? .black : .white.opacity(0.85))
@@ -419,7 +441,10 @@ private struct SearchResultCard: View {
     }
 
     private var subtitle: String {
-        var parts: [String] = [meta.type == "series" ? "Series" : "Movie"]
+        let typeLabel = meta.type == "series"
+            ? L10n.string("type_series", fallback: "Series")
+            : L10n.string("type_movie", fallback: "Movie")
+        var parts: [String] = [typeLabel]
         if let year = meta.year { parts.append(String(year)) }
         if let rating = meta.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
         return parts.joined(separator: "  ·  ")

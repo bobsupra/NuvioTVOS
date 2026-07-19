@@ -20,6 +20,18 @@ public class LibraryViewModel: ObservableObject {
         case year = "Year"
         
         public var id: String { self.rawValue }
+
+        /// Localized label for menus; `rawValue` stays English for identity/storage.
+        public var localizedTitle: String {
+            switch self {
+            case .dateAdded:
+                return L10n.string("library_sort_added_desc", fallback: "Date Added")
+            case .title:
+                return L10n.string("library_sort_title_asc", fallback: "Title")
+            case .year:
+                return L10n.string("library_filter_year", fallback: "Year")
+            }
+        }
     }
     
     public enum GroupOption: String, CaseIterable, Identifiable {
@@ -27,6 +39,15 @@ public class LibraryViewModel: ObservableObject {
         case type = "Type"
         
         public var id: String { self.rawValue }
+
+        public var localizedTitle: String {
+            switch self {
+            case .none:
+                return L10n.string("action_none", fallback: "None")
+            case .type:
+                return L10n.string("library_filter_type", fallback: "Type")
+            }
+        }
     }
     
     public init() {
@@ -72,9 +93,12 @@ public class LibraryViewModel: ObservableObject {
 
     public func typeLabel(_ type: String) -> String {
         switch type.lowercased() {
-        case "movie": return "Movies"
-        case "series", "tv": return "Series"
-        default: return type.capitalized
+        case "movie":
+            return L10n.string("type_movies", fallback: L10n.string("type_movie", fallback: "Movies"))
+        case "series", "tv":
+            return L10n.string("type_series_plural", fallback: L10n.string("type_series", fallback: "Series"))
+        default:
+            return type.capitalized
         }
     }
     

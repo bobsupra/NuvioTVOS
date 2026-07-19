@@ -2,9 +2,8 @@
 //  NuvioSyncService.swift
 //  NuvioTV
 //
-//  Supabase-backed profile, settings, library, watched, and progress sync for
-//  tvOS. Mirrors the Android TV app's RPC contract without adding the Supabase
-//  SDK to this target.
+//  Nuvio API profile, settings, library, watched, and progress sync for tvOS.
+//  Mirrors the Android TV app's account contract over URLSession.
 //
 
 import Combine
@@ -33,7 +32,7 @@ final class NuvioSyncManager: ObservableObject {
     @Published private(set) var isPullingAccountProfiles = false
     @Published private(set) var profileSyncError: String?
 
-    private let client = SupabaseSyncClient()
+    private let client = NuvioAPIClient()
 
     /// Full remote addon rows from the last pull — including disabled add-ons
     /// and custom names that tvOS doesn't render. `sync_push_addons` replaces
@@ -74,6 +73,12 @@ final class NuvioSyncManager: ObservableObject {
         // dependencies even though notification observers only attach once.
         self.authManager = authManager
         self.profileViewModel = profileViewModel
+        profileViewModel.configureRemotePinVerifier { [weak self] profileId, pin in
+            guard let self else {
+                throw AuthError(message: "PIN verification is unavailable.")
+            }
+            return try await self.verifyRemoteProfilePin(profileId: profileId, pin: pin)
+        }
         guard !didAttach else { return }
         didAttach = true
 
@@ -229,6 +234,77 @@ final class NuvioSyncManager: ObservableObject {
         observedActiveProfileId = profileId
         guard profile != nil, !isApplyingRemote else { return }
         schedulePull(force: true)
+    }
+
+    private func verifyRemoteProfilePin(profileId: String, pin: String) async throws -> Bool {
+        guard let authManager,
+              let profileViewModel,
+              let profile = profileViewModel.profiles.first(where: { $0.id == profileId }),
+              let session = await authManager.validSessionForSync() else {
+            throw AuthError(message: "The account session is unavailable.")
+        }
+
+        let remoteProfileId = ProfileSyncIndexStore.remoteId(
+            for: profile,
+            in: profileViewModel.profiles
+        )
+        let result = try await client.verifyProfilePin(
+            session: session,
+            remoteProfileId: remoteProfileId,
+            pin: pin
+        )
+        return result.unlocked
+    }
+
+    func verifyProfilePin(profileId: String, pin: String) async -> Bool {
+        do {
+            return try await verifyRemoteProfilePin(profileId: profileId, pin: pin)
+        } catch {
+            print("Remote profile PIN verification failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    func updateProfilePin(
+        profileId: String,
+        pin: String?,
+        currentPin: String?
+    ) async -> Bool {
+        guard let authManager,
+              let profileViewModel,
+              let profile = profileViewModel.profiles.first(where: { $0.id == profileId }),
+              let session = await authManager.validSessionForSync() else {
+            return false
+        }
+
+        let remoteProfileId = ProfileSyncIndexStore.remoteId(
+            for: profile,
+            in: profileViewModel.profiles
+        )
+
+        do {
+            if let pin {
+                try await client.setProfilePin(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    pin: pin,
+                    currentPin: currentPin
+                )
+            } else {
+                try await client.clearProfilePin(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    currentPin: currentPin
+                )
+            }
+            return profileViewModel.setProfilePinProtection(
+                id: profileId,
+                isProtected: pin != nil
+            )
+        } catch {
+            print("Remote profile PIN update failed: \(error.localizedDescription)")
+            return false
+        }
     }
 
     /// Mirrors Android's profile-save path: a user edit replaces the complete
@@ -1078,12 +1154,13 @@ private enum ProfileSyncIndexStore {
         return remoteProfiles
             .sorted { $0.profileIndex < $1.profileIndex }
             .map { remote in
-                let localId = localByRemoteId[remote.profileIndex]?.id ?? String(remote.profileIndex)
+                let preservedProfile = localByRemoteId[remote.profileIndex]
+                let localId = preservedProfile?.id ?? String(remote.profileIndex)
                 bind(localId: localId, remoteId: remote.profileIndex)
                 return Profile(
                     id: localId,
                     name: remote.name.isEmpty ? "Nuvio User" : remote.name,
-                    isPinProtected: false,
+                    isPinProtected: remote.pinEnabled ?? preservedProfile?.isPinProtected ?? false,
                     isAdmin: remote.profileIndex == 1,
                     avatarId: remote.avatarId?.isEmpty == false ? remote.avatarId! : "",
                     usesPrimaryAddons: remote.usesPrimaryAddons,
@@ -1126,7 +1203,7 @@ private enum SyncClientIdentity {
     }
 }
 
-fileprivate final class SupabaseSyncClient {
+fileprivate final class NuvioAPIClient {
     private static let pullPageSize = 500
     private static let settingsPlatform = "tv"
     private static let settingsFeature = "tvos_settings"
@@ -1151,7 +1228,74 @@ fileprivate final class SupabaseSyncClient {
         if rows.rawCount > 0, rows.elements.isEmpty {
             throw AuthError(message: "The profile response was not in a supported format.")
         }
-        return rows.elements
+
+        // Profile rows intentionally exclude PIN secrets. Android obtains the
+        // protection flags from this dedicated RPC, then verifies entered PINs
+        // server-side. Mirror that contract so a clean Apple TV install does
+        // not silently render every account profile as unlocked.
+        do {
+            let lockRows: LossyRows<RemoteProfileLockState> = try await rpcRows(
+                "sync_pull_profile_locks",
+                session: session,
+                params: [:]
+            )
+            let locks = Dictionary(uniqueKeysWithValues: lockRows.elements.map {
+                ($0.profileIndex, $0.pinEnabled)
+            })
+            return rows.elements.map { profile in
+                profile.withPinEnabled(locks[profile.profileIndex] ?? profile.pinEnabled)
+            }
+        } catch {
+            print("Nuvio profile lock sync failed; preserving the last known lock state: \(error.localizedDescription)")
+            return rows.elements
+        }
+    }
+
+    func verifyProfilePin(
+        session: AuthSession,
+        remoteProfileId: Int,
+        pin: String
+    ) async throws -> RemoteProfilePinVerification {
+        let rows: LossyRows<RemoteProfilePinVerification> = try await rpcRows(
+            "verify_profile_pin",
+            session: session,
+            params: [
+                "p_profile_id": remoteProfileId,
+                "p_pin": pin
+            ]
+        )
+        return rows.elements.first ?? RemoteProfilePinVerification(
+            unlocked: false,
+            retryAfterSeconds: 0
+        )
+    }
+
+    func setProfilePin(
+        session: AuthSession,
+        remoteProfileId: Int,
+        pin: String,
+        currentPin: String?
+    ) async throws {
+        var params: [String: Any] = [
+            "p_profile_id": remoteProfileId,
+            "p_pin": pin
+        ]
+        if let currentPin, !currentPin.isEmpty {
+            params["p_current_pin"] = currentPin
+        }
+        try await rpcVoid("set_profile_pin", session: session, params: params)
+    }
+
+    func clearProfilePin(
+        session: AuthSession,
+        remoteProfileId: Int,
+        currentPin: String?
+    ) async throws {
+        var params: [String: Any] = ["p_profile_id": remoteProfileId]
+        if let currentPin, !currentPin.isEmpty {
+            params["p_current_pin"] = currentPin
+        }
+        try await rpcVoid("clear_profile_pin", session: session, params: params)
     }
 
     func pullAddons(session: AuthSession, remoteProfileId: Int) async throws -> [RemoteAddon] {
@@ -1741,7 +1885,7 @@ fileprivate final class SupabaseSyncClient {
         guard AuthConfig.isConfigured else {
             throw AuthError(message: "Account backend is not configured.")
         }
-        guard let url = URL(string: "\(AuthConfig.normalizedSupabaseURL)/rest/v1/\(path)") else {
+        guard let url = URL(string: "\(AuthConfig.normalizedAPIBaseURL)/rest/v1/\(path)") else {
             throw AuthError(message: "Invalid backend URL")
         }
         var request = URLRequest(url: url)
@@ -1771,7 +1915,7 @@ fileprivate final class SupabaseSyncClient {
         guard AuthConfig.isConfigured else {
             throw AuthError(message: "Account backend is not configured.")
         }
-        guard let url = URL(string: "\(AuthConfig.normalizedSupabaseURL)/rest/v1/rpc/\(name)") else {
+        guard let url = URL(string: "\(AuthConfig.normalizedAPIBaseURL)/rest/v1/rpc/\(name)") else {
             throw AuthError(message: "Invalid backend URL")
         }
         var request = URLRequest(url: url)
@@ -2133,6 +2277,7 @@ private struct RemoteProfile: Decodable {
     let avatarId: String?
     let usesPrimaryAddons: Bool
     let usesPrimaryPlugins: Bool
+    let pinEnabled: Bool?
 
     enum CodingKeys: String, CodingKey {
         case profileIndex
@@ -2140,6 +2285,7 @@ private struct RemoteProfile: Decodable {
         case avatarId
         case usesPrimaryAddons
         case usesPrimaryPlugins
+        case pinEnabled
     }
 
     init(from decoder: Decoder) throws {
@@ -2149,7 +2295,31 @@ private struct RemoteProfile: Decodable {
         avatarId = try? container.decodeIfPresent(String.self, forKey: .avatarId)
         usesPrimaryAddons = (try? container.decode(Bool.self, forKey: .usesPrimaryAddons)) ?? false
         usesPrimaryPlugins = (try? container.decode(Bool.self, forKey: .usesPrimaryPlugins)) ?? false
+        pinEnabled = try? container.decodeIfPresent(Bool.self, forKey: .pinEnabled)
     }
+
+    private init(copying profile: RemoteProfile, pinEnabled: Bool?) {
+        profileIndex = profile.profileIndex
+        name = profile.name
+        avatarId = profile.avatarId
+        usesPrimaryAddons = profile.usesPrimaryAddons
+        usesPrimaryPlugins = profile.usesPrimaryPlugins
+        self.pinEnabled = pinEnabled
+    }
+
+    func withPinEnabled(_ pinEnabled: Bool?) -> RemoteProfile {
+        RemoteProfile(copying: self, pinEnabled: pinEnabled)
+    }
+}
+
+private struct RemoteProfileLockState: Decodable {
+    let profileIndex: Int
+    let pinEnabled: Bool
+}
+
+private struct RemoteProfilePinVerification: Decodable {
+    let unlocked: Bool
+    let retryAfterSeconds: Int
 }
 
 /// The account's Home catalog layout blob (`sync_pull_home_catalog_settings`).
@@ -2245,7 +2415,7 @@ private struct RemoteLibraryItem: Decodable {
             logoUrl: nil,
             imdbId: nil,
             tmdbId: nil,
-            type: SupabaseSyncClient.normalizedContentType(contentType),
+            type: NuvioAPIClient.normalizedContentType(contentType),
             year: parsedYear,
             genres: genres,
             rating: imdbRating,
@@ -2306,7 +2476,7 @@ private struct RemoteWatchedItem: Decodable {
             logoUrl: nil,
             imdbId: nil,
             tmdbId: nil,
-            type: SupabaseSyncClient.normalizedContentType(contentType),
+            type: NuvioAPIClient.normalizedContentType(contentType),
             year: nil,
             genres: nil,
             rating: nil,

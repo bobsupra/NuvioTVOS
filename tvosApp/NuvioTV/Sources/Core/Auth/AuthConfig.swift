@@ -2,14 +2,14 @@
 //  AuthConfig.swift
 //  NuvioTV
 //
-//  Backend credentials for the Supabase-backed account system.
+//  Backend credentials for the Nuvio account API.
 //
 
 import Foundation
 
 /// Nuvio account API credentials for the account / TV-login system.
 enum AuthConfig {
-    static let supabaseURL = "https://api.nuvio.tv"
+    static let apiBaseURL = "https://api.nuvio.tv"
 
     /// Public publishable key from the Nuvio Public API docs.
     static let publishableKey = "sb_publishable_1Clq8rlTVACkdcZuqr6_AD__xUUC_EN"
@@ -23,12 +23,12 @@ enum AuthConfig {
     static let legacyTvLoginWebBaseURL = "https://app.nuvio.tv/tv-login"
 
     static var isConfigured: Bool {
-        !supabaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+        !apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
         !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    static var normalizedSupabaseURL: String {
-        var url = supabaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
+    static var normalizedAPIBaseURL: String {
+        var url = apiBaseURL.trimmingCharacters(in: .whitespacesAndNewlines)
         while url.hasSuffix("/") { url.removeLast() }
         return url
     }

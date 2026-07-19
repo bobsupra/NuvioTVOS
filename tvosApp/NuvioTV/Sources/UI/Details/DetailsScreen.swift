@@ -18,6 +18,10 @@ struct DetailsScreen: View {
     /// both are empty/nil for movies and trailers.
     let onPlayClick: (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void
     let onBack: () -> Void
+    /// Open another title (More Like This / production catalog).
+    var onOpenTitle: ((String, String) -> Void)? = nil
+    /// Open a production company / network catalog.
+    var onOpenProduction: ((MetaCompany) -> Void)? = nil
     let initiallyPresentStreamPicker: Bool
     let initialStreamPickerEpisode: NuvioVideo?
     let onInitialStreamPickerPresented: (() -> Void)?
@@ -31,6 +35,7 @@ struct DetailsScreen: View {
     /// season/episode header in the stream picker.
     @State private var pendingEpisode: NuvioVideo?
     @State private var didHandleInitialStreamPicker = false
+    @State private var expandedComment: TraktCommentReview?
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
@@ -55,12 +60,16 @@ struct DetailsScreen: View {
         initialStreamPickerEpisode: NuvioVideo? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
         onPlayClick: @escaping (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
-        onBack: @escaping () -> Void
+        onBack: @escaping () -> Void,
+        onOpenTitle: ((String, String) -> Void)? = nil,
+        onOpenProduction: ((MetaCompany) -> Void)? = nil
     ) {
         self.id = id
         self.type = type
         self.onPlayClick = onPlayClick
         self.onBack = onBack
+        self.onOpenTitle = onOpenTitle
+        self.onOpenProduction = onOpenProduction
         self.initiallyPresentStreamPicker = initiallyPresentStreamPicker
         self.initialStreamPickerEpisode = initialStreamPickerEpisode
         self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
@@ -89,21 +98,46 @@ struct DetailsScreen: View {
                         pendingEpisode = nil
                         startStreamFlow(streamId: id, type: viewModel.uiState.meta?.type ?? type, reload: viewModel.uiState.streams.isEmpty)
                     },
+                    onPlayManually: {
+                        // Hold-to-play-manually: always open the picker even when Auto Select is on.
+                        pendingEpisodeSubtitle = ""
+                        pendingEpisode = nil
+                        startStreamFlow(
+                            streamId: id,
+                            type: viewModel.uiState.meta?.type ?? type,
+                            reload: viewModel.uiState.streams.isEmpty,
+                            forceManualPicker: true
+                        )
+                    },
                     onEpisodeSelected: { video in
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
                         startStreamFlow(streamId: video.id, type: "series", reload: true)
                     },
+                    onEpisodePlayManually: { video in
+                        pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
+                        pendingEpisode = video
+                        startStreamFlow(streamId: video.id, type: "series", reload: true, forceManualPicker: true)
+                    },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
                     onWatchedClick: { viewModel.toggleWatched() },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { openTrailer(for: viewModel.uiState.meta!) },
+                    onOpenTitle: { contentId, contentType in
+                        onOpenTitle?(contentId, contentType)
+                    },
+                    onOpenProduction: { company in
+                        onOpenProduction?(company)
+                    },
+                    onCommentSelect: { comment in
+                        expandedComment = comment
+                    },
                     onBack: onBack
                 )
                 // While the stream picker is open it sits on top as a full-screen
                 // overlay; disable the details content so the focus engine can't
                 // route focus to the (hidden) buttons behind it.
-                .disabled(isStreamPickerPresented)
+                .disabled(isStreamPickerPresented || expandedComment != nil)
                 #else
                 MobileDetailsContent(
                     uiState: viewModel.uiState,
@@ -159,6 +193,15 @@ struct DetailsScreen: View {
                     .zIndex(10)
                 }
             }
+
+            if let expandedComment {
+                CommentDetailOverlay(
+                    comment: expandedComment,
+                    onDismiss: { self.expandedComment = nil }
+                )
+                .transition(.opacity)
+                .zIndex(20)
+            }
             #endif
         }
         .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
@@ -170,7 +213,9 @@ struct DetailsScreen: View {
         // Home or suspends the app. Catching it here closes just the picker,
         // and otherwise behaves like the regular back action.
         .onExitCommand {
-            if isStreamPickerPresented {
+            if expandedComment != nil {
+                expandedComment = nil
+            } else if isStreamPickerPresented {
                 isStreamPickerPresented = false
             } else {
                 onBack()
@@ -213,10 +258,11 @@ struct DetailsScreen: View {
         isStreamPickerPresented = true
     }
 
-    private func startStreamFlow(streamId: String, type: String, reload: Bool) {
+    private func startStreamFlow(streamId: String, type: String, reload: Bool, forceManualPicker: Bool = false) {
         guard let meta = viewModel.uiState.meta else { return }
 
-        if !smartStreamSelection {
+        if forceManualPicker || !smartStreamSelection {
+            isSmartPlaybackPending = false
             if reload {
                 viewModel.prepareStreams(forId: streamId, type: type)
             }
@@ -239,12 +285,15 @@ struct DetailsScreen: View {
         let meta = explicitMeta ?? viewModel.uiState.meta
         guard let meta else { return }
 
+        let cachedOnly = (ProfileSettings.current.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
         if let stream = SmartPlaybackSelector.bestStream(
             from: viewModel.uiState.streams,
             qualityPreference: smartStreamQuality,
             subtitleLanguages: subtitleLanguagePreferences,
             shouldMatchSubtitles: smartSubtitleMatching,
-            includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled
+            includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
+            preferredTags: LastStreamQualityStore.load(metaId: meta.id),
+            cachedOnly: cachedOnly
         ) {
             isSmartPlaybackPending = false
             // Direct streams dismiss the picker immediately; debrid streams keep
@@ -260,6 +309,7 @@ struct DetailsScreen: View {
     /// streams are resolved through the configured debrid provider first, keeping
     /// the picker's spinner up until a link comes back (or the attempt fails).
     private func playStream(_ stream: NuvioStream, meta: NuvioMeta) {
+        LastStreamQualityStore.save(metaId: meta.id, stream: stream)
         if let url = stream.url, !url.isEmpty {
             isStreamPickerPresented = false
             onPlayClick(url, meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
@@ -978,8 +1028,31 @@ enum SmartPlaybackSelector {
         qualityPreference: String,
         subtitleLanguages: [String],
         shouldMatchSubtitles: Bool,
-        includeDebrid: Bool = false
+        includeDebrid: Bool = false,
+        preferredTags: StreamQualityTags? = nil,
+        cachedOnly: Bool = false
     ) -> NuvioStream? {
+        rankedStreams(
+            from: streams,
+            qualityPreference: qualityPreference,
+            subtitleLanguages: subtitleLanguages,
+            shouldMatchSubtitles: shouldMatchSubtitles,
+            includeDebrid: includeDebrid,
+            preferredTags: preferredTags,
+            cachedOnly: cachedOnly
+        ).first
+    }
+
+    /// Ordered playable candidates: best match first (for resume failover).
+    static func rankedStreams(
+        from streams: [NuvioStream],
+        qualityPreference: String,
+        subtitleLanguages: [String],
+        shouldMatchSubtitles: Bool,
+        includeDebrid: Bool = false,
+        preferredTags: StreamQualityTags? = nil,
+        cachedOnly: Bool = false
+    ) -> [NuvioStream] {
         let playable = streams.enumerated().compactMap { index, stream -> (index: Int, stream: NuvioStream)? in
             if let url = stream.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
                 return (index, stream)
@@ -990,24 +1063,35 @@ enum SmartPlaybackSelector {
             return nil
         }
         let compatible = playable.filter { isPlatformPlaybackCompatible($0.stream) }
-        let candidates = compatible.filter { !isPromotionalStream($0.stream) }
-        if qualityPreference == "Highest", let firstCandidate = (candidates.isEmpty ? compatible : candidates).first {
-            return firstCandidate.stream
+        var candidates = compatible.filter { !isPromotionalStream($0.stream) }
+        if candidates.isEmpty { candidates = compatible }
+        if cachedOnly {
+            let cached = candidates.filter { $0.stream.isLikelyCached }
+            if !cached.isEmpty { candidates = cached }
         }
-        let rankedStreams = (candidates.isEmpty ? compatible : candidates).map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
-            let resolution = inferredResolution(for: stream)
+
+        let ranked = candidates.map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
+            let tags = StreamQualityTags.parse(stream: stream)
+            let resolution = tags.resolution > 0 ? tags.resolution : inferredResolution(for: stream)
             let subtitleScore = shouldMatchSubtitles ? subtitleScore(in: stream, languages: subtitleLanguages) : 0
             let qualityScore = score(resolution: resolution, preference: qualityPreference)
-            return (index, stream, subtitleScore + qualityScore)
+            let featureScore = featureBoost(tags: tags, preference: qualityPreference)
+            let resumeScore = preferredTags.map { tags.matchScore(against: $0) } ?? 0
+            let cachedBoost = tags.isCached ? 5_000 : 0
+            return (index, stream, subtitleScore + qualityScore + featureScore + resumeScore + cachedBoost)
         }
 
-        return rankedStreams.sorted { lhs, rhs in
+        return ranked.sorted { lhs, rhs in
             if lhs.score != rhs.score { return lhs.score > rhs.score }
             return lhs.index < rhs.index
-        }.first?.stream
+        }.map(\.stream)
     }
 
-    static func playableStreams(from streams: [NuvioStream], includeDebrid: Bool = false) -> [NuvioStream] {
+    static func playableStreams(
+        from streams: [NuvioStream],
+        includeDebrid: Bool = false,
+        cachedOnly: Bool = false
+    ) -> [NuvioStream] {
         let playable = streams.filter { stream in
             if let url = stream.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
                 return true
@@ -1016,7 +1100,22 @@ enum SmartPlaybackSelector {
         }
         let compatible = playable.filter(isPlatformPlaybackCompatible)
         let nonPromotional = compatible.filter { !isPromotionalStream($0) }
-        return nonPromotional.isEmpty ? compatible : nonPromotional
+        var result = nonPromotional.isEmpty ? compatible : nonPromotional
+        if cachedOnly {
+            let cached = result.filter(\.isLikelyCached)
+            if !cached.isEmpty { result = cached }
+        }
+        return result
+    }
+
+    /// Prefer DV / HDR / Atmos when aiming for highest quality.
+    private static func featureBoost(tags: StreamQualityTags, preference: String) -> Int {
+        guard preference == "Highest" || preference == "4K" else { return 0 }
+        var boost = 0
+        if tags.isDolbyVision { boost += 12_000 }
+        else if tags.isHDR { boost += 8_000 }
+        if tags.isAtmos { boost += 6_000 }
+        return boost
     }
 
     static func matchingSubtitles(in stream: NuvioStream, languages: [String]) -> [NuvioSubtitle] {
@@ -1182,10 +1281,15 @@ enum StreamPickerListBuilder {
         streams: [NuvioStream],
         groups: [AddonStreamGroup],
         selectedAddonId: String?,
-        includeDebrid: Bool
+        includeDebrid: Bool,
+        cachedOnly: Bool = false
     ) -> [NuvioStream] {
         let source = sourceStreams(streams: streams, groups: groups, selectedAddonId: selectedAddonId)
-        return SmartPlaybackSelector.playableStreams(from: source, includeDebrid: includeDebrid)
+        return SmartPlaybackSelector.playableStreams(
+            from: source,
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
+        )
     }
 
     /// Filter + sort result shown in the picker list.
@@ -1194,13 +1298,15 @@ enum StreamPickerListBuilder {
         groups: [AddonStreamGroup],
         selectedAddonId: String?,
         sortOption: StreamSortOption,
-        includeDebrid: Bool
+        includeDebrid: Bool,
+        cachedOnly: Bool = false
     ) -> [NuvioStream] {
         let playable = playableStreams(
             streams: streams,
             groups: groups,
             selectedAddonId: selectedAddonId,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
         )
         return sorted(playable, by: sortOption)
     }
@@ -1211,13 +1317,15 @@ enum StreamPickerListBuilder {
         revision: UInt64,
         selectedAddonId: String?,
         sortOption: StreamSortOption,
-        includeDebrid: Bool
+        includeDebrid: Bool,
+        cachedOnly: Bool = false
     ) -> StreamPickerListCacheKey {
         StreamPickerListCacheKey(
             revision: revision,
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
         )
     }
 
@@ -1289,19 +1397,26 @@ struct StreamPickerListCacheKey: Equatable {
     let selectedAddonId: String?
     let sortOption: StreamSortOption
     let includeDebrid: Bool
+    var cachedOnly: Bool = false
 }
 
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     let onPlayClick: () -> Void
+    var onPlayManually: (() -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
+    var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
     let onShareClick: () -> Void
     let onTrailerClick: () -> Void
+    var onOpenTitle: ((String, String) -> Void)? = nil
+    var onOpenProduction: ((MetaCompany) -> Void)? = nil
+    var onCommentSelect: ((TraktCommentReview) -> Void)? = nil
     let onBack: () -> Void
 
     @FocusState private var actionFocus: DetailsActionFocus?
+    @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
 
     var body: some View {
         if let meta = uiState.meta {
@@ -1322,6 +1437,9 @@ struct TvDetailsContent: View {
                                     isInWatchlist: uiState.isInWatchlist,
                                     isWatched: uiState.isWatched,
                                     playTitle: playTarget.label,
+                                    playHint: smartStreamSelection
+                                        ? "Plays the best link. Hold Select to choose a source manually."
+                                        : "Starts playback or opens stream sources",
                                     onPlayClick: {
                                         guard playTarget.isPlayable else { return }
                                         // Series: play the resume/next-up episode; movies
@@ -1332,6 +1450,20 @@ struct TvDetailsContent: View {
                                             onPlayClick()
                                         }
                                     },
+                                    onPlayLongPress: smartStreamSelection ? {
+                                        guard playTarget.isPlayable else { return }
+                                        if let episode = playTarget.episode {
+                                            if let onEpisodePlayManually {
+                                                onEpisodePlayManually(episode)
+                                            } else {
+                                                onEpisodeSelected(episode)
+                                            }
+                                        } else if let onPlayManually {
+                                            onPlayManually()
+                                        } else {
+                                            onPlayClick()
+                                        }
+                                    } : nil,
                                     onWatchlistClick: onWatchlistClick,
                                     onWatchedClick: onWatchedClick,
                                     onTrailerClick: onTrailerClick,
@@ -1369,6 +1501,55 @@ struct TvDetailsContent: View {
                                 )
                                 .padding(.top, 34)
                                 .id(TvDetailsScrollID.castSection)
+
+                                if !uiState.moreLikeThis.isEmpty {
+                                    TvDetailsRelatedRow(
+                                        title: "More Like This",
+                                        items: uiState.moreLikeThis,
+                                        onSelect: { item in
+                                            onOpenTitle?(item.id, item.type)
+                                        },
+                                        onFocus: {
+                                            withAnimation(.easeOut(duration: 0.24)) {
+                                                scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
+                                            }
+                                        }
+                                    )
+                                    .padding(.top, 40)
+                                    .id(TvDetailsScrollID.moreLikeThisSection)
+                                }
+
+                                if !uiState.companies.isEmpty {
+                                    TvDetailsProductionRow(
+                                        companies: uiState.companies,
+                                        onSelect: { company in
+                                            onOpenProduction?(company)
+                                        },
+                                        onFocus: {
+                                            withAnimation(.easeOut(duration: 0.24)) {
+                                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
+                                            }
+                                        }
+                                    )
+                                    .padding(.top, 40)
+                                    .id(TvDetailsScrollID.productionSection)
+                                }
+
+                                if !uiState.comments.isEmpty {
+                                    TvDetailsCommentsRow(
+                                        comments: uiState.comments,
+                                        onSelect: { comment in
+                                            onCommentSelect?(comment)
+                                        },
+                                        onFocus: {
+                                            withAnimation(.easeOut(duration: 0.24)) {
+                                                scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
+                                            }
+                                        }
+                                    )
+                                    .padding(.top, 40)
+                                    .id(TvDetailsScrollID.commentsSection)
+                                }
                             }
                             .padding(.leading, 96)
                             .padding(.top, 78)
@@ -1451,6 +1632,9 @@ struct TvDetailsContent: View {
 private enum TvDetailsScrollID {
     static let castSection = "tv-details-cast-section"
     static let episodesSection = "tv-details-episodes-section"
+    static let moreLikeThisSection = "tv-details-more-like-this"
+    static let productionSection = "tv-details-production"
+    static let commentsSection = "tv-details-comments"
 }
 
 private struct TvDetailsBackdrop: View {
@@ -1546,7 +1730,9 @@ private struct TvDetailsActionRow: View {
     let isInWatchlist: Bool
     let isWatched: Bool
     var playTitle: String = "Play"
+    var playHint: String = "Starts playback or opens stream sources"
     let onPlayClick: () -> Void
+    var onPlayLongPress: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
     let onTrailerClick: () -> Void
@@ -1558,11 +1744,12 @@ private struct TvDetailsActionRow: View {
                 title: playTitle,
                 systemName: "play.fill",
                 accessibilityLabel: playTitle,
-                accessibilityHint: "Starts playback or opens stream sources",
+                accessibilityHint: playHint,
                 isPrimary: true,
                 focus: focus,
                 tag: .play,
-                action: onPlayClick
+                action: onPlayClick,
+                longPressAction: onPlayLongPress
             )
 
             TvDetailsActionButton(
@@ -1614,6 +1801,7 @@ private struct TvDetailsActionButton: View {
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
+    var longPressAction: (() -> Void)? = nil
 
     private var isFocused: Bool { focus.wrappedValue == tag }
 
@@ -1643,6 +1831,11 @@ private struct TvDetailsActionButton: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.55).onEnded { _ in
+                longPressAction?()
+            }
+        )
         .accessibilityElement(children: .ignore)
         .accessibilityLabel(accessibilityLabel)
         .accessibilityAddTraits(.isButton)
@@ -1754,7 +1947,7 @@ private struct TvDetailsSummary: View {
 
     private var secondaryMetaItems: [String] {
         var items: [String] = []
-        if let runtime = meta.runtime, !runtime.isEmpty {
+        if let runtime = NuvioRuntimeDisplay.formatted(meta.runtime) {
             items.append(runtime)
         }
         if let country = meta.country, !country.isEmpty {
@@ -1838,6 +2031,326 @@ private struct TvDetailsSectionButton: View {
                 onFocus()
             }
         }
+    }
+}
+
+// MARK: - More Like This / Production / Comments
+
+private struct TvDetailsRelatedRow: View {
+    let title: String
+    let items: [RelatedTitle]
+    let onSelect: (RelatedTitle) -> Void
+    let onFocus: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text(title)
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 28) {
+                    ForEach(items) { item in
+                        TvDetailsRelatedCard(item: item, onSelect: { onSelect(item) }, onFocus: onFocus)
+                    }
+                }
+                .padding(.trailing, 80)
+                .padding(.vertical, 8)
+            }
+            .scrollClipDisabledIfAvailable()
+        }
+    }
+}
+
+private struct TvDetailsRelatedCard: View {
+    let item: RelatedTitle
+    let onSelect: () -> Void
+    let onFocus: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color.white.opacity(0.08))
+                    if let poster = item.posterURL, let url = URL(string: poster) {
+                        AsyncImage(url: url) { phase in
+                            if case .success(let image) = phase {
+                                image.resizable().scaledToFill()
+                            }
+                        }
+                        .frame(width: 180, height: 270)
+                        .clipped()
+                    } else {
+                        Image(systemName: "film")
+                            .font(.system(size: 36, weight: .medium))
+                            .foregroundColor(.white.opacity(0.35))
+                    }
+                }
+                .frame(width: 180, height: 270)
+                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(
+                            isFocused ? AppFocusOutline.color : Color.white.opacity(0.12),
+                            lineWidth: isFocused ? AppFocusOutline.width : 1
+                        )
+                )
+
+                Text(item.name)
+                    .font(.system(size: 22, weight: .semibold))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+                    .frame(width: 180, alignment: .leading)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+        .onChange(of: isFocused) { focused in
+            if focused { onFocus() }
+        }
+    }
+}
+
+private struct TvDetailsProductionRow: View {
+    let companies: [MetaCompany]
+    let onSelect: (MetaCompany) -> Void
+    let onFocus: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text("Production")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 22) {
+                    ForEach(companies) { company in
+                        TvDetailsCompanyCard(company: company, onSelect: { onSelect(company) }, onFocus: onFocus)
+                    }
+                }
+                .padding(.trailing, 80)
+                .padding(.vertical, 8)
+            }
+            .scrollClipDisabledIfAvailable()
+        }
+    }
+}
+
+private struct TvDetailsCompanyCard: View {
+    let company: MetaCompany
+    let onSelect: () -> Void
+    let onFocus: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(spacing: 14) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .fill(Color.white)
+                    if let logo = company.logoURL, let url = URL(string: logo) {
+                        AsyncImage(url: url) { phase in
+                            if case .success(let image) = phase {
+                                image
+                                    .resizable()
+                                    .scaledToFit()
+                                    .padding(16)
+                            } else {
+                                Text(company.name)
+                                    .font(.system(size: 20, weight: .semibold))
+                                    .foregroundColor(.black)
+                                    .multilineTextAlignment(.center)
+                                    .padding(12)
+                            }
+                        }
+                    } else {
+                        Text(company.name)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(.black)
+                            .multilineTextAlignment(.center)
+                            .padding(12)
+                    }
+                }
+                .frame(width: 200, height: 100)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 14, style: .continuous)
+                        .stroke(
+                            isFocused ? AppFocusOutline.color : Color.clear,
+                            lineWidth: isFocused ? AppFocusOutline.width : 0
+                        )
+                )
+
+                Text(company.name)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.75))
+                    .lineLimit(2)
+                    .frame(width: 200)
+                    .multilineTextAlignment(.center)
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+        .onChange(of: isFocused) { focused in
+            if focused { onFocus() }
+        }
+        .disabled(company.tmdbId == nil)
+        .opacity(company.tmdbId == nil ? 0.55 : 1)
+    }
+}
+
+private struct TvDetailsCommentsRow: View {
+    let comments: [TraktCommentReview]
+    let onSelect: (TraktCommentReview) -> Void
+    let onFocus: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text("Top Comments")
+                .font(.system(size: 34, weight: .semibold))
+                .foregroundColor(.white.opacity(0.9))
+
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 22) {
+                    ForEach(comments) { comment in
+                        TvDetailsCommentCard(
+                            comment: comment,
+                            onSelect: { onSelect(comment) },
+                            onFocus: onFocus
+                        )
+                    }
+                }
+                .padding(.trailing, 80)
+                .padding(.vertical, 8)
+            }
+            .scrollClipDisabledIfAvailable()
+        }
+    }
+}
+
+private struct TvDetailsCommentCard: View {
+    let comment: TraktCommentReview
+    let onSelect: () -> Void
+    let onFocus: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: onSelect) {
+            VStack(alignment: .leading, spacing: 14) {
+                HStack(spacing: 12) {
+                    Text(comment.author)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Spacer(minLength: 8)
+                    if comment.likes > 0 {
+                        Label("\(comment.likes)", systemImage: "heart.fill")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.55))
+                    }
+                }
+
+                Text(comment.spoiler ? "Spoiler — select to read" : comment.comment)
+                    .font(.system(size: 22, weight: .regular))
+                    .foregroundColor(.white.opacity(comment.spoiler ? 0.45 : 0.82))
+                    .lineLimit(5)
+                    .multilineTextAlignment(.leading)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+
+                if let date = comment.displayDate {
+                    Text(date)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.4))
+                }
+            }
+            .padding(24)
+            .frame(width: 420, height: 240, alignment: .topLeading)
+            .background(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .fill(Color.white.opacity(isFocused ? 0.14 : 0.07))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 20, style: .continuous)
+                    .stroke(
+                        isFocused ? AppFocusOutline.color : Color.white.opacity(0.1),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1
+                    )
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.03 : 1)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+        .onChange(of: isFocused) { focused in
+            if focused { onFocus() }
+        }
+    }
+}
+
+private struct CommentDetailOverlay: View {
+    let comment: TraktCommentReview
+    let onDismiss: () -> Void
+
+    @FocusState private var closeFocused: Bool
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.72).ignoresSafeArea()
+            VStack(alignment: .leading, spacing: 24) {
+                HStack {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(comment.author)
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        if let date = comment.displayDate {
+                            Text(date)
+                                .font(.system(size: 24, weight: .medium))
+                                .foregroundColor(.white.opacity(0.5))
+                        }
+                    }
+                    Spacer()
+                    Button("Close", action: onDismiss)
+                        .focused($closeFocused)
+                }
+
+                ScrollView {
+                    Text(comment.comment)
+                        .font(.system(size: 28, weight: .regular))
+                        .foregroundColor(.white.opacity(0.92))
+                        .lineSpacing(8)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+
+                if comment.likes > 0 {
+                    Label("\(comment.likes) likes", systemImage: "heart.fill")
+                        .font(.system(size: 22, weight: .medium))
+                        .foregroundColor(.white.opacity(0.55))
+                }
+            }
+            .padding(48)
+            .frame(maxWidth: 1100, maxHeight: 620)
+            .background(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .fill(Color.black.opacity(0.9))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .stroke(Color.white.opacity(0.14), lineWidth: 1)
+            )
+        }
+        .onAppear { closeFocused = true }
+        .onExitCommand(perform: onDismiss)
     }
 }
 
@@ -2464,6 +2977,7 @@ private struct TvStreamPickerOverlay: View {
     @State private var selectedAddonId: String?
     @State private var sortOption: StreamSortOption = .default
     @State private var showSortOptions = false
+    @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     /// Cached filter+sort result. Rebuilt only when derivation inputs change —
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
@@ -2476,6 +2990,7 @@ private struct TvStreamPickerOverlay: View {
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
+    private let cachedKey = "filter::cached"
     private func filterKey(_ addonId: String) -> String { "filter::\(addonId)" }
 
     /// Inputs that may change the visible stream list (not focus).
@@ -2484,7 +2999,8 @@ private struct TvStreamPickerOverlay: View {
             revision: streamsRevision,
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
         )
     }
 
@@ -2558,7 +3074,8 @@ private struct TvStreamPickerOverlay: View {
             groups: groups,
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
         )
     }
 
@@ -2572,7 +3089,8 @@ private struct TvStreamPickerOverlay: View {
             groups: groups,
             selectedAddonId: selectedAddonId,
             sortOption: sortOption,
-            includeDebrid: includeDebrid
+            includeDebrid: includeDebrid,
+            cachedOnly: cachedOnly
         )
     }
 
@@ -2634,6 +3152,17 @@ private struct TvStreamPickerOverlay: View {
                 .padding(.vertical, 12)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+
+            if includeDebrid {
+                TvStreamFilterButton(
+                    title: cachedOnly ? "Cached only" : "All cache",
+                    isSelected: cachedOnly,
+                    focusBinding: $focusedItem,
+                    focusValue: cachedKey,
+                    action: { cachedOnly.toggle() }
+                )
+                .fixedSize(horizontal: true, vertical: false)
+            }
 
             // Sort remains pinned to the trailing edge instead of moving with
             // the add-on scroller.
@@ -2939,6 +3468,23 @@ private struct TvStreamCard: View {
                             .lineSpacing(5)
                             .lineLimit(6)
                             .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    let badges = StreamBadgeKind.badges(for: stream)
+                    if !badges.isEmpty {
+                        HStack(spacing: 10) {
+                            ForEach(badges) { badge in
+                                Text(badge.rawValue)
+                                    .font(.system(size: 18, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background(
+                                        Capsule().fill(Color.white.opacity(0.14 + badge.tint.bg * 0.08))
+                                    )
+                            }
+                        }
+                        .padding(.top, 4)
                     }
                 }
 

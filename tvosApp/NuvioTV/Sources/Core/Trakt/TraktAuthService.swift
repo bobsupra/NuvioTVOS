@@ -5,7 +5,7 @@ enum TraktConfig {
     static var proxyURL: String {
         value(
             "TRAKT_PROXY_URL",
-            fallback: "\(AuthConfig.normalizedSupabaseURL)/functions/v1/trakt"
+            fallback: "\(AuthConfig.normalizedAPIBaseURL)/functions/v1/trakt"
         )
     }
 

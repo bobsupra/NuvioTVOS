@@ -144,12 +144,14 @@ enum QualityOption: Identifiable, Equatable {
 
 /// A player the user can hand a stream off to instead of the built-in mpv
 /// engine. `.builtIn` plays in-app; the rest build a deep link that opens an
-/// installed tvOS app (Infuse, VLC, Outplayer) with the stream URL.
+/// installed tvOS app with the stream URL (and optional subtitle URLs).
 enum ExternalPlayer: String, CaseIterable, Identifiable {
     case builtIn = "Nuvio (Built-in)"
     case infuse = "Infuse"
     case vlc = "VLC"
     case outplayer = "Outplayer"
+    case nplayer = "nPlayer"
+    case vidhub = "VidHub"
 
     var id: String { rawValue }
 
@@ -163,24 +165,48 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     }
 
     /// The URL-scheme deep link that hands `streamURL` to this player, or `nil`
-    /// for the built-in player (which plays in-app). Infuse and VLC take the
-    /// source as an x-callback-url query value; Outplayer takes it inline. The
-    /// source is percent-encoded so query separators in the stream URL survive.
-    func launchURL(for streamURL: URL) -> URL? {
+    /// for the built-in player (which plays in-app). Infuse supports multi-`sub=`;
+    /// VLC takes the first subtitle. Source is percent-encoded so query separators
+    /// in the stream URL survive.
+    func launchURL(for streamURL: URL, subtitleURLs: [URL] = []) -> URL? {
         guard self != .builtIn,
               let encoded = streamURL.absoluteString
                 .addingPercentEncoding(withAllowedCharacters: .externalPlayerURLValue) else {
             return nil
         }
+        let encodedSubs = subtitleURLs.compactMap {
+            $0.absoluteString.addingPercentEncoding(withAllowedCharacters: .externalPlayerURLValue)
+        }
         switch self {
         case .builtIn:
             return nil
         case .infuse:
-            return URL(string: "infuse://x-callback-url/play?url=\(encoded)")
+            var query = "infuse://x-callback-url/play?url=\(encoded)"
+            for sub in encodedSubs.prefix(8) {
+                query += "&sub=\(sub)"
+            }
+            return URL(string: query)
         case .vlc:
-            return URL(string: "vlc-x-callback://x-callback-url/stream?url=\(encoded)")
+            var query = "vlc-x-callback://x-callback-url/stream?url=\(encoded)"
+            if let first = encodedSubs.first {
+                query += "&sub=\(first)"
+            }
+            return URL(string: query)
         case .outplayer:
             return URL(string: "outplayer://\(encoded)")
+        case .nplayer:
+            // nPlayer uses nplayer-http / nplayer-https for remote progressive URLs.
+            if streamURL.scheme?.lowercased() == "https" {
+                let path = streamURL.absoluteString.replacingOccurrences(of: "https://", with: "")
+                return URL(string: "nplayer-https://\(path)")
+            }
+            if streamURL.scheme?.lowercased() == "http" {
+                let path = streamURL.absoluteString.replacingOccurrences(of: "http://", with: "")
+                return URL(string: "nplayer-http://\(path)")
+            }
+            return URL(string: "nplayer-\(encoded)")
+        case .vidhub:
+            return URL(string: "vidhub://play?url=\(encoded)")
         }
     }
 }

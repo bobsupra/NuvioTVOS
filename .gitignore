@@ -39,3 +39,7 @@ artifacts/*-ipa/
 # Local Xcode/Swift build products
 /.build/
 *.xcarchive/
+
+# Local backend credentials
+supabase/functions/**/.env
+supabase/functions/**/.env.local

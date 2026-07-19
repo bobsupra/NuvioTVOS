@@ -18,6 +18,7 @@ class DetailsViewModel: ObservableObject {
     /// repository's progressive API instead of the shared discovery service.
     private let usesSharedStreamDiscovery: Bool
     private var streamObserveTask: Task<Void, Never>?
+    private var enrichmentTask: Task<Void, Never>?
     private var observedRequestKey: String?
 
     init(repository: CatalogRepository) {
@@ -26,6 +27,8 @@ class DetailsViewModel: ObservableObject {
     }
 
     func loadDetails(id: String, type: String) {
+        streamObserveTask?.cancel()
+        enrichmentTask?.cancel()
         Task {
             uiState = DetailsUiState(isLoading: true, error: nil)
 
@@ -41,10 +44,52 @@ class DetailsViewModel: ObservableObject {
                 if !meta.isSeries {
                     prepareStreams(forId: id, type: meta.type)
                 }
+                loadEnrichment(for: meta)
             } catch {
                 uiState.isLoading = false
                 uiState.error = error.localizedDescription
             }
+        }
+    }
+
+    /// Loads More Like This, Production companies, and top Trakt comments
+    /// after the primary metadata is on screen.
+    private func loadEnrichment(for meta: NuvioMeta) {
+        enrichmentTask?.cancel()
+        enrichmentTask = Task {
+            uiState.isLoadingEnrichment = true
+            defer {
+                if !Task.isCancelled {
+                    uiState.isLoadingEnrichment = false
+                }
+            }
+
+            async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
+            async let tmdbRelatedTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
+            async let traktRelatedTask = TraktDetailsService.fetchRelated(for: meta)
+            async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
+
+            let companies = await companiesTask
+            let tmdbRelated = await tmdbRelatedTask
+            let traktRelated = await traktRelatedTask
+            let comments = await commentsTask
+
+            guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
+
+            // Prefer Trakt related when the user chose that source and it returned items.
+            let preferTrakt = TraktSettingsStore.moreLikeThisSource == .trakt
+            let moreLikeThis: [RelatedTitle]
+            if preferTrakt, !traktRelated.isEmpty {
+                moreLikeThis = traktRelated
+            } else if !tmdbRelated.isEmpty {
+                moreLikeThis = tmdbRelated
+            } else {
+                moreLikeThis = traktRelated
+            }
+
+            uiState.companies = companies
+            uiState.moreLikeThis = moreLikeThis
+            uiState.comments = comments
         }
     }
 

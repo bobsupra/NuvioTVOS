@@ -57,31 +57,40 @@ public struct LibraryView: View {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
 
             VStack(alignment: .leading, spacing: 24) {
-                Text("Library")
+                Text(L10n.string("library_title", fallback: "Library"))
                     .font(.system(size: 46, weight: .bold))
                     .foregroundColor(.white)
 
                 // Controls
                 HStack(spacing: 16) {
-                    FilterMenu(label: "Sort: \(viewModel.sortOption.rawValue)") {
+                    FilterMenu(
+                        label: "\(L10n.string("library_filter_sort", fallback: "Sort")): \(viewModel.sortOption.localizedTitle)"
+                    ) {
                         ForEach(LibraryViewModel.SortOption.allCases) { option in
                             Button { viewModel.sortOption = option } label: {
-                                menuItem(option.rawValue, selected: viewModel.sortOption == option)
+                                menuItem(option.localizedTitle, selected: viewModel.sortOption == option)
                             }
                         }
                     }
 
-                    FilterMenu(label: "Group: \(viewModel.groupOption.rawValue)") {
+                    FilterMenu(
+                        label: "\(L10n.string("tvos_library_group", fallback: "Group")): \(viewModel.groupOption.localizedTitle)"
+                    ) {
                         ForEach(LibraryViewModel.GroupOption.allCases) { option in
                             Button { viewModel.groupOption = option } label: {
-                                menuItem(option.rawValue, selected: viewModel.groupOption == option)
+                                menuItem(option.localizedTitle, selected: viewModel.groupOption == option)
                             }
                         }
                     }
 
-                    FilterMenu(label: "Content: \(selectedTypeLabel)") {
+                    FilterMenu(
+                        label: "\(L10n.string("tvos_library_content", fallback: "Content")): \(selectedTypeLabel)"
+                    ) {
                         Button { viewModel.contentTypeFilter = nil } label: {
-                            menuItem("All", selected: viewModel.contentTypeFilter == nil)
+                            menuItem(
+                                L10n.string("library_type_all", fallback: "All"),
+                                selected: viewModel.contentTypeFilter == nil
+                            )
                         }
                         ForEach(viewModel.availableContentTypes, id: \.self) { type in
                             Button { viewModel.contentTypeFilter = type } label: {
@@ -93,9 +102,14 @@ public struct LibraryView: View {
                         }
                     }
 
-                    FilterMenu(label: "Genre: \(viewModel.genreFilter ?? "All")") {
+                    FilterMenu(
+                        label: "\(L10n.string("library_filter_genre", fallback: "Genre")): \(viewModel.genreFilter ?? L10n.string("library_type_all", fallback: "All"))"
+                    ) {
                         Button { viewModel.genreFilter = nil } label: {
-                            menuItem("All", selected: viewModel.genreFilter == nil)
+                            menuItem(
+                                L10n.string("library_type_all", fallback: "All"),
+                                selected: viewModel.genreFilter == nil
+                            )
                         }
                         ForEach(viewModel.availableGenres, id: \.self) { genre in
                             Button { viewModel.genreFilter = genre } label: {
@@ -106,7 +120,10 @@ public struct LibraryView: View {
 
                     if cloudLibraryAvailable, let onOpenCloudLibrary {
                         Button(action: onOpenCloudLibrary) {
-                            Label("Cloud", systemImage: "cloud")
+                            Label(
+                                L10n.string("library_source_cloud", fallback: "Cloud"),
+                                systemImage: "cloud"
+                            )
                         }
                     }
                 }
@@ -207,7 +224,9 @@ public struct LibraryView: View {
     }
 
     private var selectedTypeLabel: String {
-        guard let type = viewModel.contentTypeFilter else { return "All" }
+        guard let type = viewModel.contentTypeFilter else {
+            return L10n.string("library_type_all", fallback: "All")
+        }
         return viewModel.typeLabel(type)
     }
 }
@@ -282,7 +301,10 @@ struct LibraryItemButton: View {
     }
 
     private var subtitle: String {
-        var parts = [item.contentType == "series" ? "Series" : "Movie"]
+        let typeLabel = item.contentType == "series"
+            ? L10n.string("type_series", fallback: "Series")
+            : L10n.string("type_movie", fallback: "Movie")
+        var parts = [typeLabel]
         if let year = item.year { parts.append(String(year)) }
         if let rating = item.imdbRating.flatMap(Double.init), rating > 0 {
             parts.append(String(format: "★ %.1f", rating))
