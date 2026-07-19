@@ -35,7 +35,7 @@ Important: release IPAs are often unsigned because no tvOS signing identity is c
 
 Beta 3.1.2 fixes and improves:
 
-- Adds an in-app language picker with System default and 34 supported UI languages, including right-to-left layout for Arabic and Hebrew.
+- Adds an in-app language picker with System default and 34 supported UI languages.
 - Completes Settings localization across all supported languages, including categories, nested pages, dialogs, descriptions, actions, and option values.
 - Keeps the selected app language profile-scoped and applies language, locale, and layout changes immediately without restarting the app.
 - Improves title details with richer TMDB and Trakt metadata plus production, company, network, cast, and crew browsing.
