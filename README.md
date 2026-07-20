@@ -29,7 +29,7 @@ The tree currently targets **version 3.1.3 (build 44)** (`tvosApp/NuvioTV/Info.p
 
 [Beta 3.1.3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.3) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.3-unsigned-debug.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.3/NuvioTV-3.1.3-unsigned-debug.ipa)
+[NuvioTV-3.1.3-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.3/NuvioTV-3.1.3-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
