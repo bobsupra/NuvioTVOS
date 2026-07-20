@@ -143,6 +143,8 @@ enum SettingsKey {
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
 
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
+    static let traktClientID = "nuvio.tv.settings.integrations.traktClientID"
+    static let traktClientSecret = "nuvio.tv.settings.integrations.traktClientSecret"
     static let traktContinueWatchingDaysCap = "nuvio.tv.settings.integrations.traktContinueWatchingDaysCap"
     static let traktShowMetaComments = "nuvio.tv.settings.integrations.traktShowMetaComments"
     static let traktWatchProgressSource = "nuvio.tv.settings.integrations.traktWatchProgressSource"
@@ -190,12 +192,17 @@ enum SettingsKey {
     static let playbackDiagnostics = "nuvio.tv.settings.advanced.playbackDiagnostics"
     static let focusHighlighter = "nuvio.tv.settings.advanced.focusHighlighter"
 
+    /// API app credentials must remain on the Apple TV and never enter the
+    /// account settings payload.
+    static let deviceLocal = Set([traktClientID, traktClientSecret])
+
     static let all = [
         profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, heroEnabled, posterLabels, catalogAddonNames, discoverLocation,
         continueWatchingSort, showUnairedNextUp, hideUnreleased, showFullDates,
-        traktConnected, traktContinueWatchingDaysCap, traktShowMetaComments,
+        traktConnected, traktClientID, traktClientSecret,
+        traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, traktLibrarySourceMode, traktMoreLikeThisSource,
         tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
@@ -974,7 +981,11 @@ struct SettingsView: View {
         case .layout:
             LayoutDiscoverySettingsView(accentColor: accentColor)
         case .integrations:
-            IntegrationSettingsView(accentColor: accentColor)
+            IntegrationSettingsView(
+                accentColor: accentColor,
+                profileID: activeProfile?.id
+            )
+                .id(activeProfile?.id ?? "none")
         case .playback:
             PlaybackSettingsView(
                 accentColor: accentColor,
@@ -1793,7 +1804,9 @@ private struct LayoutDiscoverySettingsView: View {
 private struct IntegrationSettingsView: View {
     let accentColor: Color
 
-    @StateObject private var traktViewModel = TraktSettingsViewModel()
+    @StateObject private var traktViewModel: TraktSettingsViewModel
+    @AppStorage private var traktClientID: String
+    @AppStorage private var traktClientSecret: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
@@ -1805,7 +1818,26 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
     @State private var debridAccountToConnect: DebridAccountProvider?
     @State private var showingTraktLogin = false
+    @State private var showingTraktSettings = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
+
+    init(accentColor: Color, profileID: String?) {
+        self.accentColor = accentColor
+        let profileStore = ProfileSettings.store(for: profileID)
+        _traktViewModel = StateObject(
+            wrappedValue: TraktSettingsViewModel(store: profileStore)
+        )
+        _traktClientID = AppStorage(
+            wrappedValue: "",
+            SettingsKey.traktClientID,
+            store: profileStore
+        )
+        _traktClientSecret = AppStorage(
+            wrappedValue: "",
+            SettingsKey.traktClientSecret,
+            store: profileStore
+        )
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -1818,10 +1850,33 @@ private struct IntegrationSettingsView: View {
                     fallback: "Watchlist, progress, history, comments, and recommendations"
                 )
             ) {
+                SettingsTextFieldRow(
+                    title: "Trakt Client ID",
+                    subtitle: "Create an API app at trakt.tv/oauth/applications",
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $traktClientID,
+                    onCommit: { traktViewModel.credentialsDidChange() }
+                )
+
+                SettingsTextFieldRow(
+                    title: "Trakt Client Secret",
+                    subtitle: L10n.string(
+                        "tvos_settings_stored_locally_on_this_apple_tv",
+                        fallback: "Stored locally on this Apple TV"
+                    ),
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $traktClientSecret,
+                    isSecure: true,
+                    onCommit: { traktViewModel.credentialsDidChange() }
+                )
+
+                SettingsInfoRow(title: "Trakt Redirect URI", value: TraktConfig.redirectURI)
+
                 TraktConnectionSettingsCard(
                     viewModel: traktViewModel,
                     accentColor: accentColor,
-                    onStartLogin: { showingTraktLogin = true }
+                    onStartLogin: { showingTraktLogin = true },
+                    onOpenSettings: { showingTraktSettings = true }
                 )
             }
 
@@ -1906,7 +1961,12 @@ private struct IntegrationSettingsView: View {
                 }
             }
         }
-        .onAppear { traktViewModel.reload() }
+        .onAppear {
+            traktViewModel.reload()
+            traktViewModel.loadConnectedData()
+        }
+        .onChange(of: traktClientID) { _ in traktViewModel.credentialsDidChange() }
+        .onChange(of: traktClientSecret) { _ in traktViewModel.credentialsDidChange() }
         .sheet(item: $debridAccountToConnect) { provider in
             if provider == .premiumize && !PremiumizeOAuthConfiguration.isDeviceOAuthConfigured {
                 PremiumizeApiKeySheet(
@@ -1921,8 +1981,16 @@ private struct IntegrationSettingsView: View {
                 )
             }
         }
-        .sheet(isPresented: $showingTraktLogin) {
+        .sheet(isPresented: $showingTraktLogin, onDismiss: {
+            if traktViewModel.mode == .connected {
+                showingTraktSettings = true
+            }
+        }) {
             TraktDeviceLoginSheet(viewModel: traktViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingTraktSettings) {
+            TraktConnectedSettingsSheet(viewModel: traktViewModel, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
         .onChange(of: traktViewModel.mode) { mode in
@@ -2227,6 +2295,7 @@ private struct TraktConnectionSettingsCard: View {
     @ObservedObject var viewModel: TraktSettingsViewModel
     let accentColor: Color
     let onStartLogin: () -> Void
+    let onOpenSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 14) {
@@ -2260,7 +2329,7 @@ private struct TraktConnectionSettingsCard: View {
                     title: viewModel.mode == .awaitingApproval ? L10n.string("tvos_settings_continue_trakt_login", fallback: "Continue Trakt Login") : L10n.string("tvos_settings_connect_with_trakt", fallback: "Connect with Trakt"),
                     subtitle: viewModel.credentialsConfigured
                         ? "Scan the QR or enter the code at trakt.tv/activate"
-                        : "Nuvio Trakt proxy is not configured",
+                        : "Enter your Trakt Client ID and Client Secret first",
                     value: viewModel.mode == .awaitingApproval ? L10n.string("tvos_settings_resume", fallback: "Resume") : L10n.string("tvos_settings_connect", fallback: "Connect"),
                     accentColor: accentColor
                 ) {
@@ -2287,80 +2356,13 @@ private struct TraktConnectionSettingsCard: View {
     }
 
     private var connectedBody: some View {
-        VStack(spacing: 12) {
-            HStack(spacing: 12) {
-                SettingsInfoRow(title: L10n.string("nav_movies", fallback: "Movies"), value: statValue(viewModel.connectedStats?.moviesWatched))
-                SettingsInfoRow(title: L10n.string("trakt_stat_shows", fallback: "Shows"), value: statValue(viewModel.connectedStats?.showsWatched))
-            }
-
-            HStack(spacing: 12) {
-                SettingsInfoRow(title: L10n.string("tmdb_episodes_title", fallback: "Episodes"), value: statValue(viewModel.connectedStats?.episodesWatched))
-                SettingsInfoRow(title: L10n.string("tvos_settings_hours", fallback: "Hours"), value: viewModel.connectedStats?.totalWatchedHours.map { "\($0)h" } ?? "-")
-            }
-
-            SettingsActionRow(
-                title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
-                subtitle: L10n.string("tvos_settings_refresh_trakt_user_info_and_cached_stats", fallback: "Refresh Trakt user info and cached stats"),
-                value: viewModel.isLoading ? L10n.string("tvos_settings_syncing", fallback: "Syncing") : L10n.string("tvos_settings_refresh", fallback: "Refresh"),
-                accentColor: accentColor
-            ) {
-                viewModel.refreshNow()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
-                subtitle: L10n.string("tvos_settings_choose_where_saved_library_items_should__b99538ad", fallback: "Choose where saved library items should come from"),
-                value: viewModel.librarySourceMode.label,
-                accentColor: accentColor
-            ) {
-                viewModel.cycleLibrarySource()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("trakt_watch_progress_dialog_title", fallback: "Watch Progress"),
-                subtitle: L10n.string("tvos_settings_choose_the_source_for_resume_and_continu_53af657c", fallback: "Choose the source for Resume and Continue Watching"),
-                value: viewModel.watchProgressSource.label,
-                accentColor: accentColor
-            ) {
-                viewModel.cycleWatchProgressSource()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("trakt_continue_watching_window", fallback: "Continue Watching Window"),
-                subtitle: L10n.string("tvos_settings_trakt_history_considered_for_continue_watching", fallback: "Trakt history considered for Continue Watching"),
-                value: continueWatchingLabel,
-                accentColor: accentColor
-            ) {
-                viewModel.cycleContinueWatchingDaysCap()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("trakt_comments_dialog_title", fallback: "Comments"),
-                subtitle: L10n.string("tvos_settings_show_trakt_reviews_on_metadata_screens", fallback: "Show Trakt reviews on metadata screens"),
-                value: viewModel.showMetaComments ? L10n.string("subtitle_on", fallback: "On") : L10n.string("playback_afr_off", fallback: "Off"),
-                accentColor: accentColor
-            ) {
-                viewModel.toggleComments()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("tmdb_more_like_this_title", fallback: "More Like This"),
-                subtitle: L10n.string("tvos_settings_recommendation_source_for_related_titles", fallback: "Recommendation source for related titles"),
-                value: viewModel.moreLikeThisSource.label,
-                accentColor: accentColor
-            ) {
-                viewModel.cycleMoreLikeThisSource()
-            }
-
-            SettingsActionRow(
-                title: L10n.string("debrid_disconnect", fallback: "Disconnect"),
-                subtitle: L10n.string("tvos_settings_remove_this_profile_s_trakt_tokens_from__60ff1f28", fallback: "Remove this profile's Trakt tokens from this Apple TV"),
-                value: L10n.string("debrid_disconnect", fallback: "Disconnect"),
-                accentColor: accentColor
-            ) {
-                viewModel.disconnect()
-            }
-        }
+        SettingsActionRow(
+            title: "Trakt Settings",
+            subtitle: "Account status, watched statistics, library, progress, comments, and recommendations",
+            value: L10n.string("tvos_settings_open", fallback: "Open"),
+            accentColor: accentColor,
+            action: onOpenSettings
+        )
     }
 
     private var statusTitle: String {
@@ -2399,14 +2401,318 @@ private struct TraktConnectionSettingsCard: View {
         }
     }
 
-    private var continueWatchingLabel: String {
-        viewModel.continueWatchingDaysCap == TraktDefaults.continueWatchingDaysCapAll
-            ? "All history"
-            : "\(viewModel.continueWatchingDaysCap) days"
+}
+
+/// Dedicated post-login Trakt page, matching the Android TV account screen.
+private struct TraktConnectedSettingsSheet: View {
+    @ObservedObject var viewModel: TraktSettingsViewModel
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var now = Date()
+    @State private var showingDisconnectConfirmation = false
+
+    private let continueWatchingOptions = [14, 30, 60, 90, 180, 365, TraktDefaults.continueWatchingDaysCapAll]
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.055, green: 0.055, blue: 0.055).ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 24) {
+                    header
+
+                    SettingsGroup(title: "Account Login", subtitle: tokenRefreshLabel) {
+                        SettingsActionRow(
+                            title: L10n.string("debrid_disconnect", fallback: "Disconnect"),
+                            subtitle: L10n.string(
+                                "tvos_settings_remove_this_profile_s_trakt_tokens_from__60ff1f28",
+                                fallback: "Remove this profile's Trakt tokens from this Apple TV"
+                            ),
+                            value: L10n.string("debrid_disconnect", fallback: "Disconnect"),
+                            accentColor: accentColor
+                        ) {
+                            showingDisconnectConfirmation = true
+                        }
+                    }
+
+                    SettingsGroup(
+                        title: "Cached",
+                        subtitle: "Watched activity currently loaded from your Trakt account"
+                    ) {
+                        TraktConnectedStatsStrip(
+                            stats: viewModel.connectedStats,
+                            isLoading: viewModel.isStatsLoading
+                        )
+
+                        SettingsActionRow(
+                            title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
+                            subtitle: L10n.string(
+                                "tvos_settings_refresh_trakt_user_info_and_cached_stats",
+                                fallback: "Refresh Trakt user info and cached stats"
+                            ),
+                            value: viewModel.isLoading
+                                ? L10n.string("tvos_settings_syncing", fallback: "Syncing")
+                                : L10n.string("tvos_settings_refresh", fallback: "Refresh"),
+                            accentColor: accentColor
+                        ) {
+                            viewModel.refreshNow()
+                        }
+                        .disabled(viewModel.isLoading)
+                    }
+
+                    SettingsGroup(
+                        title: "Trakt Features",
+                        subtitle: "Choose how Trakt is used throughout Nuvio"
+                    ) {
+                        SettingsChoiceRow(
+                            title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
+                            subtitle: "Choose which library to use for saving and viewing your collection",
+                            selection: librarySourceSelection,
+                            options: ["Trakt", "Nuvio Library"],
+                            accentColor: accentColor
+                        )
+
+                        SettingsChoiceRow(
+                            title: L10n.string("trakt_watch_progress_dialog_title", fallback: "Watch Progress"),
+                            subtitle: L10n.string(
+                                "tvos_settings_choose_the_source_for_resume_and_continu_53af657c",
+                                fallback: "Choose the source for Resume and Continue Watching"
+                            ),
+                            selection: watchProgressSelection,
+                            options: ["Trakt", "Nuvio Sync"],
+                            accentColor: accentColor
+                        )
+
+                        SettingsChoiceRow(
+                            title: L10n.string("trakt_continue_watching_window", fallback: "Continue Watching Window"),
+                            subtitle: "Choose how much Trakt activity appears in Continue Watching",
+                            selection: continueWatchingSelection,
+                            options: continueWatchingOptions.map(continueWatchingLabel),
+                            accentColor: accentColor
+                        )
+
+                        SettingsChoiceRow(
+                            title: L10n.string("trakt_comments_dialog_title", fallback: "Comments"),
+                            subtitle: L10n.string(
+                                "tvos_settings_show_trakt_reviews_on_metadata_screens",
+                                fallback: "Show Trakt reviews on metadata screens"
+                            ),
+                            selection: commentsSelection,
+                            options: [onLabel, offLabel],
+                            accentColor: accentColor
+                        )
+
+                        SettingsChoiceRow(
+                            title: L10n.string("tmdb_more_like_this_title", fallback: "More Like This"),
+                            subtitle: L10n.string(
+                                "tvos_settings_recommendation_source_for_related_titles",
+                                fallback: "Choose where recommendations come from on detail pages"
+                            ),
+                            selection: moreLikeThisSelection,
+                            options: ["Trakt", "TMDB"],
+                            accentColor: accentColor
+                        )
+                    }
+
+                    if let message = viewModel.statusMessage, !message.isEmpty {
+                        Text(message)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    }
+                    .frame(maxWidth: 1120)
+                    .padding(.horizontal, 64)
+                    .padding(.top, 52)
+                    .padding(.bottom, 24)
+                }
+
+                HStack {
+                    Button { dismiss() } label: {
+                        Text(L10n.string("tvos_settings_back", fallback: "Back"))
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 34)
+                            .padding(.vertical, 16)
+                            .background(Color.white.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+
+                    Spacer()
+                }
+                .frame(maxWidth: 1120)
+                .padding(.horizontal, 64)
+                .padding(.bottom, 40)
+            }
+        }
+        .task {
+            viewModel.reload()
+            viewModel.loadConnectedData()
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: 1_000_000_000)
+                } catch {
+                    return
+                }
+                now = Date()
+            }
+        }
+        .onChange(of: viewModel.mode) { mode in
+            if mode != .connected { dismiss() }
+        }
+        .confirmationDialog(
+            "Disconnect Trakt?",
+            isPresented: $showingDisconnectConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(L10n.string("debrid_disconnect", fallback: "Disconnect"), role: .destructive) {
+                viewModel.disconnect()
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        }
     }
 
-    private func statValue(_ value: Int?) -> String {
-        value.map(String.init) ?? (viewModel.isStatsLoading ? "..." : "-")
+    private var header: some View {
+        HStack(spacing: 20) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .fill(Color(red: 0.94, green: 0.10, blue: 0.17))
+                Text("trakt")
+                    .font(.system(size: 27, weight: .black))
+                    .foregroundColor(.white)
+            }
+            .frame(width: 108, height: 76)
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Trakt")
+                    .font(.system(size: 42, weight: .bold))
+                    .foregroundColor(.white)
+                Text("Connected as \(connectedUsername)")
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundColor(.white.opacity(0.62))
+            }
+
+            Spacer()
+        }
+    }
+
+    private var tokenRefreshLabel: String {
+        guard let expiresAt = viewModel.tokenExpiresAtMillis else {
+            return "Trakt access token refresh time is unavailable"
+        }
+        let seconds = max(Int((expiresAt - now.timeIntervalSince1970 * 1000) / 1000), 0)
+        return seconds == 0
+            ? "Trakt access token refresh is due"
+            : "Trakt access token refreshes in \(durationLabel(seconds: seconds))"
+    }
+
+    private var connectedUsername: String {
+        let username = viewModel.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return username.isEmpty ? "Trakt User" : username
+    }
+
+    private func durationLabel(seconds: Int) -> String {
+        let days = seconds / 86_400
+        let hours = (seconds % 86_400) / 3_600
+        let minutes = (seconds % 3_600) / 60
+        if days > 0 { return "\(days)d \(hours)h" }
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
+    }
+
+    private var librarySourceSelection: Binding<String> {
+        Binding(
+            get: { viewModel.librarySourceMode == .trakt ? "Trakt" : "Nuvio Library" },
+            set: { viewModel.setLibrarySourceMode($0 == "Trakt" ? .trakt : .local) }
+        )
+    }
+
+    private var watchProgressSelection: Binding<String> {
+        Binding(
+            get: { viewModel.watchProgressSource == .trakt ? "Trakt" : "Nuvio Sync" },
+            set: { viewModel.setWatchProgressSource($0 == "Trakt" ? .trakt : .nuvioSync) }
+        )
+    }
+
+    private var continueWatchingSelection: Binding<String> {
+        Binding(
+            get: { continueWatchingLabel(viewModel.continueWatchingDaysCap) },
+            set: { label in
+                guard let days = continueWatchingOptions.first(where: { continueWatchingLabel($0) == label }) else { return }
+                viewModel.setContinueWatchingDaysCap(days)
+            }
+        )
+    }
+
+    private var commentsSelection: Binding<String> {
+        Binding(
+            get: { viewModel.showMetaComments ? onLabel : offLabel },
+            set: { viewModel.setShowMetaComments($0 == onLabel) }
+        )
+    }
+
+    private var moreLikeThisSelection: Binding<String> {
+        Binding(
+            get: { viewModel.moreLikeThisSource == .trakt ? "Trakt" : "TMDB" },
+            set: { viewModel.setMoreLikeThisSource($0 == "Trakt" ? .trakt : .tmdb) }
+        )
+    }
+
+    private var onLabel: String { L10n.string("subtitle_on", fallback: "On") }
+    private var offLabel: String { L10n.string("playback_afr_off", fallback: "Off") }
+
+    private func continueWatchingLabel(_ days: Int) -> String {
+        days == TraktDefaults.continueWatchingDaysCapAll ? "All history" : "\(days) days"
+    }
+}
+
+private struct TraktConnectedStatsStrip: View {
+    let stats: TraktCachedStats?
+    let isLoading: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            stat(value: stats?.moviesWatched, label: L10n.string("nav_movies", fallback: "Movies"))
+            divider
+            stat(value: stats?.showsWatched, label: L10n.string("trakt_stat_shows", fallback: "Shows"))
+            divider
+            stat(value: stats?.episodesWatched, label: L10n.string("tmdb_episodes_title", fallback: "Episodes"))
+            divider
+            stat(
+                text: stats?.totalWatchedHours.map { "\($0)h" },
+                label: L10n.string("tvos_settings_hours", fallback: "Watched Hours")
+            )
+        }
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+        .overlay(alignment: .top) { Divider().overlay(Color.white.opacity(0.16)) }
+        .overlay(alignment: .bottom) { Divider().overlay(Color.white.opacity(0.16)) }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.16))
+            .frame(width: 1, height: 72)
+    }
+
+    private func stat(value: Int?, label: String) -> some View {
+        stat(text: value.map(String.init), label: label)
+    }
+
+    private func stat(text: String?, label: String) -> some View {
+        VStack(spacing: 7) {
+            Text(text ?? (isLoading ? "..." : "-"))
+                .font(.system(size: 27, weight: .semibold))
+                .foregroundColor(.white)
+            Text(label)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(.white.opacity(0.62))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
     }
 }
 
@@ -2588,7 +2894,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Strip"
 
-    private let engines = ["Auto", "AVPlayer", "MPVKit"]
+    private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
     private let streamQualities = ["Highest", "4K", "1080p", "720p", "Smallest"]
     private let frameRateModes = ["Off", "On start/stop", "Always"]
@@ -2608,7 +2914,10 @@ private struct PlaybackSettingsView: View {
             ) {
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_player_engine", fallback: "Player Engine"),
-                    subtitle: L10n.string("tvos_settings_auto_native_dv_for_profiles_5_8_via_remu_18c59722", fallback: "Auto: native DV for profiles 5/8 via remux→AVPlayer; Profile 7 uses MPV HDR10/PQ base layer (no on-device DV7 conversion on Apple TV)"),
+                    subtitle: L10n.string(
+                        "tvos_settings_player_engine_aether",
+                        fallback: "Auto: AetherEngine (native AV or software) with one-way MPVKit fallback. Force AetherEngine or MPVKit for diagnostics."
+                    ),
                     selection: $playerEngine,
                     options: engines,
                     accentColor: accentColor
@@ -2649,7 +2958,10 @@ private struct PlaybackSettingsView: View {
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_buffer_profile", fallback: "Buffer Profile"),
-                    subtitle: L10n.string("tvos_settings_read_ahead_cache_auto_scales_to_device_r_292546ae", fallback: "Read-ahead cache — Auto scales to device RAM. Conservative if the app jetsams; Large/Max for stable high-RAM boxes only"),
+                    subtitle: L10n.string(
+                        "tvos_settings_buffer_profile_aether",
+                        fallback: "Disk-backed forward buffer (Aether segments) / MPV demuxer cache. Auto scales to device RAM."
+                    ),
                     selection: $networkCache,
                     options: cacheModes,
                     accentColor: accentColor
@@ -2765,6 +3077,12 @@ private struct PlaybackSettingsView: View {
                 )
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
+            }
+        }
+        .onAppear {
+            let canonical = PlayerEngineSetting.migrated(from: playerEngine).settingsRawValue
+            if playerEngine != canonical {
+                playerEngine = canonical
             }
         }
     }
@@ -3452,7 +3770,7 @@ private struct AboutSettingsView: View {
             SettingsGroup(title: L10n.string("tvos_settings_nuviotv", fallback: "NuvioTV"), subtitle: L10n.string("tvos_settings_build_and_runtime_information", fallback: "Build and runtime information")) {
                 SettingsInfoRow(title: L10n.string("tvos_settings_app_version", fallback: "App Version"), value: appVersion)
                 SettingsInfoRow(title: L10n.string("tvos_settings_engine_core", fallback: "Engine Core"), value: L10n.string("tvos_settings_pure_swift", fallback: "Pure Swift"))
-                SettingsInfoRow(title: L10n.string("tvos_settings_playback_stack", fallback: "Playback Stack"), value: L10n.string("tvos_settings_avplayer_mpvkit", fallback: "AVPlayer / MPVKit"))
+                SettingsInfoRow(title: L10n.string("tvos_settings_playback_stack", fallback: "Playback Stack"), value: L10n.string("tvos_settings_avplayer_mpvkit", fallback: "AetherEngine / MPVKit"))
                 SettingsInfoRow(title: L10n.string("tvos_settings_catalog_protocol", fallback: "Catalog Protocol"), value: L10n.string("tvos_settings_stremio_compatible", fallback: "Stremio compatible"))
             }
 
@@ -3463,7 +3781,7 @@ private struct AboutSettingsView: View {
                     fallback: "Data sources, acknowledgements, and open-source licenses"
                 )
             ) {
-                Text(L10n.string("tvos_settings_this_software_uses_swiftui_avplayer_mpvk_78048fa2", fallback: "This software uses SwiftUI, AVPlayer, MPVKit (libmpv), and Stremio-compatible catalog APIs."))
+                Text(L10n.string("tvos_settings_this_software_uses_swiftui_avplayer_mpvk_78048fa2", fallback: "This software uses SwiftUI, AetherEngine, MPVKit (libmpv), and Stremio-compatible catalog APIs."))
                     .font(.system(size: 21, weight: .medium))
                     .foregroundColor(.white.opacity(0.72))
                     .fixedSize(horizontal: false, vertical: true)
@@ -3558,9 +3876,21 @@ private struct LicensesAttributionsSheet: View {
 
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
+            id: "aetherengine",
+            title: "AetherEngine 5.14.1",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/5.14.1 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            license: "LGPL-3.0 + App Store exception"
+        ),
+        LicenseEntry(
+            id: "aether-ffmpeg",
+            title: "FFmpegBuild 2.1.3 (AetherLib*)",
+            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.1.3 and Vendor/FFmpegBuild.",
+            license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
+        ),
+        LicenseEntry(
             id: "mpvkit",
             title: L10n.string("tvos_settings_mpvkit_libmpv", fallback: "MPVKit / libmpv"),
-            body: "Primary playback engine for broad container and codec support on Apple TV.",
+            body: "One-way compatibility fallback for dual-URL media, audio controls, ASS Scale, and streams AetherEngine cannot open.",
             license: "GPL-2.0-or-later (libmpv) / project licenses"
         ),
         LicenseEntry(
@@ -3570,9 +3900,9 @@ private struct LicensesAttributionsSheet: View {
             license: "LGPL / GPL components per FFmpeg build"
         ),
         LicenseEntry(
-            id: "avplayer",
-            title: L10n.string("tvos_settings_avfoundation_avplayer", fallback: "AVFoundation / AVPlayer"),
-            body: "Native Apple TV path used for Dolby Vision-friendly remuxed streams and forced AVPlayer mode.",
+            id: "apple-media",
+            title: L10n.string("tvos_settings_avfoundation_avplayer", fallback: "Apple media frameworks"),
+            body: "AVFoundation, VideoToolbox, Core Media, and AudioToolbox system APIs used by AetherEngine's native and hardware-accelerated paths.",
             license: "Apple system frameworks"
         )
     ]

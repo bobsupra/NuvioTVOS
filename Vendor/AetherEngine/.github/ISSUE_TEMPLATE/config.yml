@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/superuser404notfound/AetherEngine/security/advisories/new
+    about: Please report security issues privately through GitHub Security Advisories, not as a public issue. See SECURITY.md for details.
+  - name: Sodalite app bug (tvOS UI, library, requests)
+    url: https://github.com/superuser404notfound/Sodalite/issues
+    about: If the bug is in the Sodalite app itself rather than the playback engine, report it on the Sodalite tracker.
+  - name: AetherPlayer app bug (macOS UI)
+    url: https://github.com/superuser404notfound/AetherPlayer/issues
+    about: If the bug is in the AetherPlayer macOS app shell rather than the engine, report it on the AetherPlayer tracker.

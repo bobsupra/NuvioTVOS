@@ -43,16 +43,29 @@ struct PlayerView: View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // MPV Metal surface, or AVPlayer layer for native Dolby Vision.
-            // Aspect fill/stretch is temporarily disabled — always present FIT.
+            // Aether is primary; MPV owns the one-way compatibility fallback.
             Group {
-                if viewModel.activeEngineKind == .avPlayer {
-                    AVPlayerVideoSurface(controller: viewModel.avPlayerController)
-                } else {
+                switch viewModel.activeEngineKind {
+                case .aether:
+                    AetherPlayerSurface(controller: viewModel.aetherController)
+                case .mpv:
                     MPVVideoSurface(controller: viewModel.playerController)
                 }
             }
             .ignoresSafeArea()
+
+            // Host subtitle overlay for Aether (MPV renders its own subs).
+            if viewModel.activeEngineKind == .aether {
+                PlayerSubtitleOverlay(
+                    cues: viewModel.aetherController.subtitleCues,
+                    sourceTime: viewModel.aetherController.sourceTimeSeconds,
+                    subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
+                    videoNaturalSize: viewModel.videoNaturalSize,
+                    aspectMode: viewModel.aspectMode,
+                    style: viewModel.subtitleStyle
+                )
+                .ignoresSafeArea()
+            }
 
             // Window-level trackpad capture for Infuse-style scrubbing / peek.
             RemoteTouchCatcher(
@@ -301,6 +314,18 @@ struct PlayerView: View {
                 PlayerSourcesPanel(viewModel: viewModel)
                     .zIndex(7)
             }
+
+            #if DEBUG
+            if viewModel.isPlaybackDebugHUDVisible,
+               let info = viewModel.playbackDebugInfo {
+                PlaybackDebugHUD(
+                    info: info,
+                    reason: viewModel.playbackDebugReason
+                )
+                .transition(.opacity.combined(with: .move(edge: .top)))
+                .zIndex(100)
+            }
+            #endif
         }
         .animation(.playerControls, value: viewModel.showSettingsPanel)
         .animation(.playerControls, value: viewModel.showNextEpisodeCard)
@@ -510,6 +535,53 @@ struct PlayerView: View {
     }
 }
 
+#if DEBUG
+private struct PlaybackDebugHUD: View {
+    let info: PlaybackDebugInfo
+    let reason: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 7) {
+            HStack(spacing: 9) {
+                Circle()
+                    .fill(Color.green)
+                    .frame(width: 10, height: 10)
+                Text("PLAYBACK DEBUG")
+                    .font(.system(size: 22, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.green)
+            }
+
+            ForEach(info.screenLines, id: \.self) { line in
+                Text(line)
+                    .font(.system(size: 19, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.white)
+            }
+
+            if !reason.isEmpty {
+                Text("POLICY   \(reason)")
+                    .font(.system(size: 17, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.yellow)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        .padding(.horizontal, 22)
+        .padding(.vertical, 18)
+        .frame(maxWidth: 920, alignment: .leading)
+        .background(.black.opacity(0.82), in: RoundedRectangle(cornerRadius: 14))
+        .overlay {
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(.white.opacity(0.18), lineWidth: 1)
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+        .padding(.leading, 54)
+        .padding(.top, 42)
+        .allowsHitTesting(false)
+        .accessibilityElement(children: .combine)
+        .accessibilityLabel("Playback debug information")
+    }
+}
+#endif
+
 // Hosts the libmpv UIViewController (owns the CAMetalLayer surface).
 struct MPVVideoSurface: UIViewControllerRepresentable {
     let controller: MPVPlayerViewController
@@ -521,15 +593,15 @@ struct MPVVideoSurface: UIViewControllerRepresentable {
     func updateUIViewController(_ uiViewController: MPVPlayerViewController, context: Context) {}
 }
 
-// Hosts AVPlayer for native Dolby Vision / AVFoundation playback.
-struct AVPlayerVideoSurface: UIViewControllerRepresentable {
-    let controller: AVPlayerEngineController
+/// Hosts AetherEngine's `AetherPlayerView` for native / software decode.
+struct AetherPlayerSurface: UIViewControllerRepresentable {
+    let controller: AetherPlaybackController
 
-    func makeUIViewController(context: Context) -> AVPlayerEngineController {
+    func makeUIViewController(context: Context) -> AetherPlaybackController {
         controller
     }
 
-    func updateUIViewController(_ uiViewController: AVPlayerEngineController, context: Context) {}
+    func updateUIViewController(_ uiViewController: AetherPlaybackController, context: Context) {}
 }
 
 private struct RemoteSeekPressCatcher: UIViewControllerRepresentable {

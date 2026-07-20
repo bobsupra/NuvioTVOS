@@ -2036,11 +2036,29 @@ private struct TvDetailsSectionButton: View {
 
 // MARK: - More Like This / Production / Comments
 
+private enum TvDetailsHorizontalStrip {
+    static let verticalPadding: CGFloat = 28
+    static let scrollSpring = Animation.spring(response: 0.3, dampingFraction: 1.0)
+}
+
 private struct TvDetailsRelatedRow: View {
     let title: String
     let items: [RelatedTitle]
     let onSelect: (RelatedTitle) -> Void
     let onFocus: () -> Void
+
+    @State private var scrollIndex = 0
+    @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var cardWidth: CGFloat { homeLayout == "Compact" ? 170 : 210 }
+    private var cardHeight: CGFloat { homeLayout == "Compact" ? 255 : 315 }
+    private var spacing: CGFloat { homeLayout == "Compact" ? 22 : 28 }
+    private var step: CGFloat { cardWidth + spacing }
+    private var stripHeight: CGFloat {
+        cardHeight + 36 + TvDetailsHorizontalStrip.verticalPadding * 2
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -2048,72 +2066,34 @@ private struct TvDetailsRelatedRow: View {
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 28) {
-                    ForEach(items) { item in
-                        TvDetailsRelatedCard(item: item, onSelect: { onSelect(item) }, onFocus: onFocus)
+            HStack(alignment: .bottom, spacing: spacing) {
+                ForEach(Array(items.enumerated()), id: \.element.id) { index, item in
+                    PosterCard(
+                        meta: item.asMeta,
+                        onFocus: { _ in
+                            if scrollIndex != index { scrollIndex = index }
+                            onFocus()
+                        },
+                        layoutMode: homeLayout,
+                        showPosterLabels: true,
+                        smoothFocusAnimations: smoothFocus,
+                        focusHighlighterEnabled: focusHighlighter
+                    ) {
+                        onSelect(item)
                     }
                 }
-                .padding(.trailing, 80)
-                .padding(.vertical, 8)
             }
-            .scrollClipDisabledIfAvailable()
+            .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
+            .offset(x: -CGFloat(scrollIndex) * step)
+            // Deliberately do not clip this strip to the text column. Like the
+            // Home rows, posters keep drawing all the way to the screen edge.
+            .frame(height: stripHeight, alignment: .leading)
+            .animation(
+                smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
+                value: scrollIndex
+            )
         }
-    }
-}
-
-private struct TvDetailsRelatedCard: View {
-    let item: RelatedTitle
-    let onSelect: () -> Void
-    let onFocus: () -> Void
-
-    @FocusState private var isFocused: Bool
-
-    var body: some View {
-        Button(action: onSelect) {
-            VStack(alignment: .leading, spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.white.opacity(0.08))
-                    if let poster = item.posterURL, let url = URL(string: poster) {
-                        AsyncImage(url: url) { phase in
-                            if case .success(let image) = phase {
-                                image.resizable().scaledToFill()
-                            }
-                        }
-                        .frame(width: 180, height: 270)
-                        .clipped()
-                    } else {
-                        Image(systemName: "film")
-                            .font(.system(size: 36, weight: .medium))
-                            .foregroundColor(.white.opacity(0.35))
-                    }
-                }
-                .frame(width: 180, height: 270)
-                .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
-                .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(
-                            isFocused ? AppFocusOutline.color : Color.white.opacity(0.12),
-                            lineWidth: isFocused ? AppFocusOutline.width : 1
-                        )
-                )
-
-                Text(item.name)
-                    .font(.system(size: 22, weight: .semibold))
-                    .foregroundColor(.white)
-                    .lineLimit(2)
-                    .frame(width: 180, alignment: .leading)
-            }
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.05 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
-            if focused { onFocus() }
-        }
+        .focusSection()
     }
 }
 
@@ -2213,27 +2193,46 @@ private struct TvDetailsCommentsRow: View {
     let onSelect: (TraktCommentReview) -> Void
     let onFocus: () -> Void
 
+    @State private var scrollIndex = 0
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+
+    private let cardWidth: CGFloat = 420
+    private let cardHeight: CGFloat = 240
+    private let spacing: CGFloat = 22
+
+    private var stripHeight: CGFloat {
+        cardHeight + TvDetailsHorizontalStrip.verticalPadding * 2
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
             Text("Top Comments")
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 22) {
-                    ForEach(comments) { comment in
-                        TvDetailsCommentCard(
-                            comment: comment,
-                            onSelect: { onSelect(comment) },
-                            onFocus: onFocus
-                        )
-                    }
+            HStack(spacing: 22) {
+                ForEach(Array(comments.enumerated()), id: \.element.id) { index, comment in
+                    TvDetailsCommentCard(
+                        comment: comment,
+                        onSelect: { onSelect(comment) },
+                        onFocus: {
+                            if scrollIndex != index { scrollIndex = index }
+                            onFocus()
+                        }
+                    )
                 }
-                .padding(.trailing, 80)
-                .padding(.vertical, 8)
             }
-            .scrollClipDisabledIfAvailable()
+            .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
+            .offset(x: -CGFloat(scrollIndex) * (cardWidth + spacing))
+            // Keep comment cards edge-to-edge as well; the parent vertical
+            // scroll view owns the viewport instead of this row clipping it.
+            .frame(height: stripHeight, alignment: .leading)
+            .animation(
+                smoothFocus ? TvDetailsHorizontalStrip.scrollSpring : nil,
+                value: scrollIndex
+            )
         }
+        .focusSection()
     }
 }
 
@@ -2320,7 +2319,20 @@ private struct CommentDetailOverlay: View {
                         }
                     }
                     Spacer()
-                    Button("Close", action: onDismiss)
+                    Button(action: onDismiss) {
+                        Text("Close")
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(closeFocused ? .black : .white)
+                            .padding(.horizontal, 26)
+                            .frame(height: 54)
+                            .modifier(
+                                TvDetailsGlassBackground(
+                                    filled: closeFocused,
+                                    shape: Capsule()
+                                )
+                            )
+                    }
+                        .buttonStyle(PosterCardButtonStyle())
                         .focused($closeFocused)
                 }
 
@@ -2340,9 +2352,11 @@ private struct CommentDetailOverlay: View {
             }
             .padding(48)
             .frame(maxWidth: 1100, maxHeight: 620)
-            .background(
-                RoundedRectangle(cornerRadius: 28, style: .continuous)
-                    .fill(Color.black.opacity(0.9))
+            .modifier(
+                TvStreamGlass(
+                    shape: RoundedRectangle(cornerRadius: 28, style: .continuous),
+                    tint: Color.black.opacity(0.34)
+                )
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 28, style: .continuous)

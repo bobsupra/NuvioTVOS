@@ -1,0 +1,147 @@
+name: Release .dmg
+
+# Builds, signs, notarizes, and uploads Examples/DemoPlayerMac as a
+# .dmg asset on every published GitHub Release. Can also be invoked
+# manually against an existing tag via `workflow_dispatch`.
+#
+# Required secrets on the repo (Settings → Secrets and variables →
+# Actions → New repository secret):
+#
+#   DEVELOPER_ID_P12_BASE64    base64 of the Developer ID Application
+#                              cert + private key exported from
+#                              Keychain Access as a .p12 file.
+#                              See .github/RELEASE_SETUP.md for how
+#                              to export and base64-encode.
+#   DEVELOPER_ID_P12_PASSWORD  password used when exporting the .p12
+#   DEVELOPER_ID               the full identity string, e.g.
+#                              "Developer ID Application: Your Name
+#                              (TEAMID0123)"
+#   APPLE_ID                   Apple ID email used for notarization
+#   APPLE_TEAM_ID              10-character team ID (parenthesised part
+#                              of the DEVELOPER_ID identity above)
+#   APPLE_APP_PASSWORD         app-specific password from
+#                              account.apple.com (xxxx-xxxx-xxxx-xxxx)
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing release tag to attach the .dmg to (e.g. 2.0.0)'
+        required: true
+        type: string
+
+# Needed for `gh release upload --clobber` to overwrite an existing
+# asset on the release. Default GITHUB_TOKEN scopes on newer repos are
+# read-only; without this the upload step fails with `HTTP 403:
+# Resource not accessible by integration`.
+permissions:
+  contents: write
+
+concurrency:
+  group: release-dmg-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  build-and-upload:
+    name: Build + notarize + upload .dmg
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Resolve tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "release" ]; then
+            TAG="${{ github.event.release.tag_name }}"
+          else
+            TAG="${{ inputs.tag }}"
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Building for tag: $TAG"
+
+      - name: Import Developer ID certificate into temporary keychain
+        env:
+          DEVELOPER_ID_P12_BASE64: ${{ secrets.DEVELOPER_ID_P12_BASE64 }}
+          DEVELOPER_ID_P12_PASSWORD: ${{ secrets.DEVELOPER_ID_P12_PASSWORD }}
+        run: |
+          # Decode the .p12 from the secret.
+          echo "$DEVELOPER_ID_P12_BASE64" | base64 --decode > /tmp/cert.p12
+
+          # Use a fresh keychain unique to this run so leaking it has
+          # no consequence past the job.
+          KEYCHAIN="ci-$RANDOM.keychain-db"
+          KEYCHAIN_PASSWORD="$(uuidgen)"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Import the cert + private key. -T grants codesign access to
+          # the private key without further keychain prompts.
+          security import /tmp/cert.p12 \
+            -P "$DEVELOPER_ID_P12_PASSWORD" \
+            -k "$KEYCHAIN" \
+            -T /usr/bin/codesign
+
+          # Authorize codesign to use the imported key without UI prompt.
+          security set-key-partition-list \
+            -S apple-tool:,apple: \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+
+          # Make the temporary keychain the search default for this run
+          # so codesign + notarytool find the identity.
+          security list-keychain -d user -s "$KEYCHAIN" login.keychain-db
+          security default-keychain -s "$KEYCHAIN"
+
+          # Sanity: the cert is visible to codesigning.
+          security find-identity -v -p codesigning "$KEYCHAIN"
+
+          rm /tmp/cert.p12
+
+      - name: Store notarization credentials
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+        run: |
+          # No --keychain flag: notarytool writes to whatever
+          # `security default-keychain` points at, which the prior step
+          # set to our disposable CI keychain.
+          xcrun notarytool store-credentials AETHER_NOTARY \
+            --apple-id "$APPLE_ID" \
+            --team-id "$APPLE_TEAM_ID" \
+            --password "$APPLE_APP_PASSWORD"
+
+      - name: Build + notarize + package
+        env:
+          DEVELOPER_ID: ${{ secrets.DEVELOPER_ID }}
+          VERSION: ${{ steps.tag.outputs.tag }}
+        run: |
+          cd Examples/DemoPlayerMac
+          DEVELOPER_ID="$DEVELOPER_ID" \
+          NOTARY_PROFILE="AETHER_NOTARY" \
+          VERSION="$VERSION" \
+          ./Scripts/build-dmg.sh
+
+      - name: Upload .dmg to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          DMG="Examples/DemoPlayerMac/build/AetherEngine-Demo-${{ steps.tag.outputs.tag }}.dmg"
+          ls -la "$DMG"
+          gh release upload "${{ steps.tag.outputs.tag }}" "$DMG" --clobber
+
+      - name: Tear down keychain
+        if: always()
+        run: |
+          if [ -n "${KEYCHAIN:-}" ]; then
+            security delete-keychain "$KEYCHAIN" || true
+          fi

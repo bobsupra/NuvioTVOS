@@ -35,7 +35,7 @@
       </dict>
     </array>
     <key>CFBundleVersion</key>
-	<string>43</string>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
     <key>LSApplicationQueriesSchemes</key>
     <array>
       <string>infuse</string>

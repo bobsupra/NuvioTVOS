@@ -52,6 +52,8 @@ struct PosterCard: View {
     var isWatched: Bool? = nil
     let onClick: () -> Void
 
+    private let landscapeTransitionDuration: TimeInterval = 0.3
+
     #if os(tvOS)
     @FocusState private var isFocused: Bool
     @State private var didRequestInitialFocus = false
@@ -97,7 +99,12 @@ struct PosterCard: View {
             // surface stays portrait-width — keeping up/down navigation aligned.
             .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
             // Critically damped — no overshoot when expanding to landscape on Home.
-            .animation(effectiveSmoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: isLandscape)
+            .animation(
+                effectiveSmoothFocus
+                    ? .spring(response: landscapeTransitionDuration, dampingFraction: 1.0)
+                    : nil,
+                value: isLandscape
+            )
         #else
         Button(action: onClick) {
             posterContent
@@ -109,7 +116,12 @@ struct PosterCard: View {
 
     private var posterContent: some View {
         VStack(alignment: .leading, spacing: 9) {
-            CachedPosterArtwork(urlString: imageUrl, width: cardWidth, height: cardHeight) {
+            CachedPosterArtwork(
+                urlString: imageUrl,
+                width: cardWidth,
+                height: cardHeight,
+                minimumSwapDelay: isLandscape && effectiveSmoothFocus ? landscapeTransitionDuration : 0
+            ) {
                 placeholderView
             }
             .frame(width: cardWidth, height: cardHeight)
@@ -439,10 +451,17 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
     let urlString: String?
     let width: CGFloat
     let height: CGFloat
+    let minimumSwapDelay: TimeInterval
     @ViewBuilder let placeholder: Placeholder
 
     @State private var image: UIImage?
     @State private var loadedKey: String?
+    /// Keep the preceding artwork variant alive while the card changes shape.
+    /// A Home card swaps between poster and backdrop URLs; retaining both lets
+    /// the poster reappear immediately and crop down with the width animation
+    /// instead of flashing the placeholder for a frame.
+    @State private var previousImage: UIImage?
+    @State private var previousLoadedKey: String?
 
     private var maxPixelSize: Int {
         let displayScale = UIScreen.main.scale
@@ -455,7 +474,7 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
 
     var body: some View {
         ZStack {
-            if let image, loadedKey == cacheKey {
+            if let image = displayedImage {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
@@ -468,23 +487,52 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
         }
     }
 
+    private var displayedImage: UIImage? {
+        if loadedKey == cacheKey { return image }
+        if previousLoadedKey == cacheKey { return previousImage }
+
+        // While a brand-new variant is loading, keep real artwork on screen.
+        // For landscape expansion this naturally starts with a zoomed poster;
+        // for collapse the matching portrait is normally `previousImage`.
+        return image ?? previousImage
+    }
+
     @MainActor
     private func load() async {
         guard let urlString,
               let url = URL(string: urlString) else {
             image = nil
             loadedKey = nil
+            previousImage = nil
+            previousLoadedKey = nil
             return
         }
 
         let key = cacheKey
+        let loadStartedAt = Date()
+        if loadedKey == key { return }
+
+        // Moving back from landscape to portrait should be synchronous. The
+        // portrait was retained when the landscape artwork replaced it, so
+        // promote it without waiting for even an in-memory actor lookup.
+        if previousLoadedKey == key, let previousImage {
+            image = previousImage
+            loadedKey = key
+            self.previousImage = nil
+            previousLoadedKey = nil
+            return
+        }
+
         if let cached = await PosterArtworkCache.shared.image(for: url, maxPixelSize: maxPixelSize) {
+            let remainingDelay = minimumSwapDelay - Date().timeIntervalSince(loadStartedAt)
+            if remainingDelay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(remainingDelay * 1_000_000_000))
+            }
             guard !Task.isCancelled, key == cacheKey else { return }
+            previousImage = image
+            previousLoadedKey = loadedKey
             image = cached
             loadedKey = key
-        } else if loadedKey != key {
-            image = nil
-            loadedKey = nil
         }
     }
 }
@@ -752,7 +800,7 @@ struct CardActionMenuOverlay: View {
                         title: inLibrary ? "Remove from library" : "Add to library",
                         systemImage: inLibrary ? "checkmark" : "plus",
                         isFocused: focused == .library,
-                        action: { inLibrary = LibraryStore.toggle(meta: meta) }
+                        action: toggleLibrary
                     )
                     .focused($focused, equals: .library)
 
@@ -791,6 +839,31 @@ struct CardActionMenuOverlay: View {
             }
         }
         .onExitCommand(perform: onDismiss)
+    }
+
+    private func toggleLibrary() {
+        guard TraktSettingsStore.librarySourceMode == .trakt else {
+            inLibrary = LibraryStore.toggle(meta: meta)
+            return
+        }
+
+        // Do not put an item into Nuvio Sync when the selected destination is
+        // Trakt. A missing/expired Trakt session simply leaves the menu state
+        // unchanged instead of creating a hidden local-only save.
+        guard TraktAuthStore.state.isAuthenticated else { return }
+
+        let desiredMembership = !inLibrary
+        inLibrary = desiredMembership
+        Task {
+            let succeeded = await TraktLibraryService.setWatchlist(
+                meta,
+                isInWatchlist: desiredMembership
+            )
+            guard !Task.isCancelled else { return }
+            if !succeeded {
+                inLibrary = !desiredMembership
+            }
+        }
     }
 }
 

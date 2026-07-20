@@ -1,0 +1,58 @@
+name: Capability request
+description: Suggest a format, API, or behavior the engine should support
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Tell us what the engine should be able to do, and what you would point it at. Concrete media and a concrete integration scenario make a request far easier to evaluate.
+
+  - type: textarea
+    id: what
+    attributes:
+      label: What should the engine do?
+      description: One or two sentences.
+      placeholder: "Route VC-1 in MPEG-TS through the software pipeline instead of failing the session."
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivating media or use case
+      description: The file, stream, or integration that needs this. ffprobe or container details help.
+      placeholder: "Older Blu-ray remuxes in my library are VC-1 in M2TS and currently will not open."
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Codec / container support
+        - Public API surface
+        - HDR / Dolby Vision
+        - Audio
+        - Performance
+        - Other
+    validations:
+      required: true
+
+  - type: input
+    id: host-app
+    attributes:
+      label: Host app / integration context
+      description: Optional. Which app or integration this is for.
+      placeholder: "My own tvOS client"
+
+  - type: dropdown
+    id: pr
+    attributes:
+      label: Would you be willing to open a PR?
+      options:
+        - "Yes"
+        - "Maybe, with guidance"
+        - "No"
+    validations:
+      required: true

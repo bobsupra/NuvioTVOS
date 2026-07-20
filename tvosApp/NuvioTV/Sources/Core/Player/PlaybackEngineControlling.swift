@@ -1,14 +1,34 @@
 import Foundation
 import CoreGraphics
 
-/// Shared surface that `PlayerViewModel` polls and drives, implemented by both
-/// the libmpv host and the AVPlayer host so Auto can switch backends.
+struct PlaybackDebugInfo: Equatable {
+    var player: String
+    var pipeline: String
+    var videoCodec: String
+    var dynamicRange: String
+    var resolution: String
+    var frameRate: String
+    var audio: String
+
+    var screenLines: [String] {
+        [
+            "PLAYER   \(player)",
+            "PIPELINE \(pipeline)",
+            "VIDEO    \(videoCodec) • \(dynamicRange)",
+            "FORMAT   \(resolution) • \(frameRate)",
+            "AUDIO    \(audio)",
+        ]
+    }
+}
+
+/// Shared surface that `PlayerViewModel` polls and drives, implemented by the
+/// AetherEngine primary host and the libmpv compatibility host.
 @MainActor
 protocol PlaybackEngineControlling: AnyObject {
     var onPlaybackSuspended: ((Int64, Int64) -> Void)? { get set }
 
-    var audioTracks: [TrackInfo] { get }
-    var subtitleTracks: [TrackInfo] { get }
+    var audioTracks: [PlaybackTrackInfo] { get }
+    var subtitleTracks: [PlaybackTrackInfo] { get }
 
     var isPlayerLoading: Bool { get }
     var isPlayerPlaying: Bool { get }
@@ -21,6 +41,7 @@ protocol PlaybackEngineControlling: AnyObject {
     var currentSpeed: Float { get }
     var currentErrorMessage: String { get }
     var videoFrameSize: CGSize { get }
+    var playbackDebugInfo: PlaybackDebugInfo { get }
 
     func loadFile(_ urlString: String)
     func playPlayback()

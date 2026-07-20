@@ -1,0 +1,29 @@
+.DS_Store
+# Match .build / Packages / .swiftpm at any depth so nested SwiftPM
+# sub-packages (e.g. Examples/DemoPlayerMac) don't accidentally commit
+# their build artifacts + checkout mirrors.
+.build/
+Packages/
+.swiftpm/
+xcuserdata/
+DerivedData/
+.netrc
+build/
+
+# DemoPlayerMac is a demo that should always build against FFmpegBuild's
+# current main HEAD (the same thing AetherEngine itself floats to). A
+# committed lock here goes stale and silently breaks the release-dmg build
+# when the engine starts importing a newly-added FFmpeg module (it pinned
+# a pre-avfilter FFmpegBuild for the 2.1.1 dmg). Let swift build resolve it
+# fresh each time instead. (The engine's own root Package.resolved stays
+# tracked, that pin is bumped deliberately.)
+Examples/DemoPlayerMac/Package.resolved
+
+# Generated test clips from Scripts/fetch-fixtures.sh + user-supplied
+# samples in Fixtures/user/. Both are local-only by design; the script
+# regenerates the synthetic clips on demand.
+Fixtures/
+
+# Internal design specs + implementation plans (superpowers flow).
+# Local-only by design; never published to the public repo.
+docs/superpowers/

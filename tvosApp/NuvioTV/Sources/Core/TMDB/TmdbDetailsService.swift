@@ -28,7 +28,11 @@ struct RelatedTitle: Identifiable, Equatable {
             id: id,
             name: name,
             description: overview,
-            posterUrl: posterURL,
+            // Trakt's related endpoint often returns the IMDb id but no usable
+            // `images` payload. Cinemeta/Metahub exposes a stable poster URL
+            // for every IMDb id, so use it immediately instead of showing an
+            // empty poster while optional metadata enrichment runs.
+            posterUrl: resolvedPosterURL,
             backgroundUrl: nil,
             logoUrl: nil,
             imdbId: id.hasPrefix("tt") ? id : nil,
@@ -49,6 +53,26 @@ struct RelatedTitle: Identifiable, Equatable {
             videos: nil,
             trailerYtIds: nil
         )
+    }
+
+    private static func cinemetaPosterURL(for id: String) -> String? {
+        let imdbID = id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? id
+        guard imdbID.hasPrefix("tt") else { return nil }
+        return "https://images.metahub.space/poster/small/\(imdbID)/img"
+    }
+
+    private var resolvedPosterURL: String? {
+        // Prefer the same stable IMDb poster host used by the primary catalog.
+        // Trakt often supplies a non-empty image path without a URL scheme,
+        // which Swift's image loader must reject.
+        if let cinemetaPosterURL = RelatedTitle.cinemetaPosterURL(for: id) {
+            return cinemetaPosterURL
+        }
+        guard let posterURL,
+              !posterURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return posterURL
     }
 }
 

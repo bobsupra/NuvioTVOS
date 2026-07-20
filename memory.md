@@ -129,6 +129,65 @@ AV1-labeled streams from selection and reject an unlabeled AV1 stream once its
 actual codec is known. Keep the physical-device renderer, codecs, and user
 cache settings unchanged.
 
+## Simulator works but physical Apple TV fails: bind async work to its profile
+
+Last updated: 2026-07-20. The Trakt fix compiles for both the simulator and the
+physical tvOS arm64 target; final behavior still requires an on-device run.
+
+### Trakt symptom and root cause
+
+Trakt device approval could briefly succeed on a physical Apple TV and then the
+UI returned to **Connect**. The simulator appeared correct. The device-code
+polling task repeatedly read and wrote `ProfileSettings.current`, which is a
+mutable global store. A profile/account refresh during that asynchronous flow
+could therefore start the login in one profile store and save or reload its
+token from another. SwiftUI's inherited `defaultAppStorage` could also differ
+from the store being consulted by the service.
+
+An additional risk was immediately forcing an OAuth token rotation after a new
+device token was issued. A failed refresh could clear an otherwise valid new
+login and produce the same Connect-again symptom.
+
+### Required fix and general rule
+
+- Any async operation that belongs to a profile must capture the exact profile
+  ID or `UserDefaults` suite when it starts. Do not repeatedly consult
+  `ProfileSettings.current` after an `await`, timer, polling loop, callback, or
+  view transition.
+- Pass that captured store through the complete operation: credentials,
+  pending device code, polling interval, token save, token read, username,
+  cached data, cancellation, logout, and error cleanup must all use it.
+- For profile-sensitive `@AppStorage` involved in the flow, initialize it with
+  `ProfileSettings.store(for: profileID)` explicitly. Recreating a view with
+  `.id(profileID)` is useful, but it does not replace explicit storage binding.
+- After device authorization, use the newly issued access token directly and
+  refresh it only when it is expiring. Do not force an immediate token refresh.
+- If a feature works in Simulator but not on a real Apple TV, inspect global
+  mutable profile state, filesystem assumptions, app lifecycle, persistence,
+  and hardware-only behavior before adding simulator-specific workarounds.
+- Never report a physical-device issue as verified from Simulator alone. Check
+  `xcrun devicectl list devices`, build the generic physical tvOS target, and
+  complete the actual on-device reproduction when the Apple TV is available.
+
+Key implementation:
+
+- `TraktAuthService` captures a `UserDefaults` store and uses it for the entire
+  OAuth lifecycle.
+- `TraktSettingsViewModel` receives the same store and keeps polling/profile
+  state bound to it.
+- `IntegrationSettingsView` explicitly binds Trakt credential `@AppStorage`
+  and its view model to `ProfileSettings.store(for: profileID)`.
+
+Physical-target compile check:
+
+```sh
+xcodebuild -workspace tvosApp/NuvioTV.xcworkspace \
+  -scheme NuvioTV \
+  -sdk appletvos \
+  -destination 'generic/platform=tvOS' \
+  CODE_SIGNING_ALLOWED=NO build
+```
+
 ## Beta release workflow
 
 Last verified: Beta 3 on 2026-07-15.

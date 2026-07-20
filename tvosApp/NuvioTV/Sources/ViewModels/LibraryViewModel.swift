@@ -13,6 +13,12 @@ public class LibraryViewModel: ObservableObject {
     /// returning restores that card instead of snapping to the top.
     public var lastFocusedItemID: String?
     private var libraryObserver: NSObjectProtocol?
+    private var traktAuthObserver: NSObjectProtocol?
+    private var traktSettingsObserver: NSObjectProtocol?
+    private var traktMutationObserver: NSObjectProtocol?
+    private var displayedSource: TraktLibrarySourceMode?
+    private var refreshGeneration = 0
+    private let repository: CatalogRepository = CinemetaCatalogRepository()
     
     public enum SortOption: String, CaseIterable, Identifiable {
         case dateAdded = "Date Added"
@@ -61,16 +67,110 @@ public class LibraryViewModel: ObservableObject {
                 self?.loadLibrary()
             }
         }
+        traktAuthObserver = NotificationCenter.default.addObserver(
+            forName: TraktAuthStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshSelectedLibrary()
+            }
+        }
+        traktSettingsObserver = NotificationCenter.default.addObserver(
+            forName: TraktSettingsStore.libraryChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshSelectedLibrary()
+            }
+        }
+        traktMutationObserver = NotificationCenter.default.addObserver(
+            forName: TraktLibraryService.mutationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let mutation = notification.object as? TraktLibraryMutation else { return }
+            Task { @MainActor in
+                self?.applyTraktMutation(mutation)
+            }
+        }
     }
 
     deinit {
-        if let libraryObserver {
-            NotificationCenter.default.removeObserver(libraryObserver)
+        for observer in [libraryObserver, traktAuthObserver, traktSettingsObserver, traktMutationObserver].compactMap({ $0 }) {
+            NotificationCenter.default.removeObserver(observer)
         }
     }
     
     public func loadLibrary() {
-        self.items = LibraryStore.items().map(\.stremioMeta)
+        guard !usesTraktLibrary else {
+            if displayedSource != .trakt {
+                displayedSource = .trakt
+                items = []
+                validateFilters()
+            }
+            return
+        }
+
+        displayedSource = .local
+        items = LibraryStore.items().map(\.stremioMeta)
+        validateFilters()
+    }
+
+    public func refreshSelectedLibrary() async {
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let profileID = LibraryStore.activeProfileId
+
+        guard usesTraktLibrary else {
+            loadLibrary()
+            return
+        }
+
+        if displayedSource != .trakt {
+            displayedSource = .trakt
+            items = []
+            validateFilters()
+        }
+
+        guard let remoteItems = await TraktLibraryService.fetchLibrary(repository: repository),
+              !Task.isCancelled,
+              generation == refreshGeneration,
+              profileID == LibraryStore.activeProfileId,
+              usesTraktLibrary else {
+            return
+        }
+
+        displayedSource = .trakt
+        items = remoteItems.map(\.stremioMeta)
+        validateFilters()
+    }
+
+    private var usesTraktLibrary: Bool {
+        TraktSettingsStore.librarySourceMode == .trakt && TraktAuthStore.state.isAuthenticated
+    }
+
+    /// The Android TV library updates its Trakt snapshot immediately after a
+    /// validated watchlist mutation. Do the same here so navigation into
+    /// Library never waits on a second network pull to reveal the title.
+    private func applyTraktMutation(_ mutation: TraktLibraryMutation) {
+        guard usesTraktLibrary else { return }
+        let item = LibraryStoreItem(meta: mutation.meta, addedAt: Date()).stremioMeta
+        if mutation.isInWatchlist {
+            items = [item] + items.filter {
+                !($0.id == item.id && $0.contentType.caseInsensitiveCompare(item.contentType) == .orderedSame)
+            }
+        } else {
+            items.removeAll {
+                $0.id == item.id && $0.contentType.caseInsensitiveCompare(item.contentType) == .orderedSame
+            }
+        }
+        displayedSource = .trakt
+        validateFilters()
+    }
+
+    private func validateFilters() {
         if let contentTypeFilter, !availableContentTypes.contains(contentTypeFilter) {
             self.contentTypeFilter = nil
         }

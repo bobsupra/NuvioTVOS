@@ -7,6 +7,17 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
+		AE10B00B /* PlaybackBackendPolicyTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00B /* PlaybackBackendPolicyTests.swift */; };
+		AE10B001 /* PlaybackTrackInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F001 /* PlaybackTrackInfo.swift */; };
+		AE10B002 /* PlaybackCacheSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F002 /* PlaybackCacheSettings.swift */; };
+		AE10B003 /* PlaybackLoadRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F003 /* PlaybackLoadRequest.swift */; };
+		AE10B004 /* PlaybackEngineState.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F004 /* PlaybackEngineState.swift */; };
+		AE10B005 /* PlaybackEngineCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F005 /* PlaybackEngineCapabilities.swift */; };
+		AE10B006 /* PlaybackBackendPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F006 /* PlaybackBackendPolicy.swift */; };
+		AE10B007 /* AetherPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F007 /* AetherPlaybackController.swift */; };
+		AE10B008 /* PlaybackSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F008 /* PlaybackSessionCoordinator.swift */; };
+		AE10B009 /* MPVPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F009 /* MPVPlaybackController.swift */; };
+		AE10B00A /* PlayerSubtitleOverlay.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00A /* PlayerSubtitleOverlay.swift */; };
 		A1L100020000000000000002 /* AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1L100010000000000000001 /* AppLanguage.swift */; };
 		A1L100040000000000000004 /* AppLanguageCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A1L100030000000000000003 /* AppLanguageCatalog.json */; };
 		C0D31072 /* ProductionBrowseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30072 /* ProductionBrowseView.swift */; };
@@ -17,6 +28,8 @@
 		C0D31060 /* StreamQualityTags.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30060 /* StreamQualityTags.swift */; };
 		T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */; };
 		7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */; };
+		AE00BF010000000000000001 /* AetherEngine in Frameworks */ = {isa = PBXBuildFile; productRef = AE00PD010000000000000001 /* AetherEngine */; };
+		AE00BF020000000000000002 /* AetherEngine in Embed Frameworks */ = {isa = PBXBuildFile; productRef = AE00PD010000000000000001 /* AetherEngine */; settings = {ATTRIBUTES = (CodeSignOnCopy, RemoveHeadersOnCopy, ); }; };
 		0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
@@ -54,10 +67,7 @@
 		C0D3101B000000000000001B /* DetailsViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001B000000000000001B /* DetailsViewModel.swift */; };
 		C0D3101D000000000000001D /* LibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001D000000000000001D /* LibraryViewModel.swift */; };
 		C0D3101E000000000000001E /* PlayerViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001E000000000000001E /* PlayerViewModel.swift */; };
-		C0D31052 /* AVPlayerEngineController.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30052 /* AVPlayerEngineController.swift */; };
 		C0D31051 /* PlaybackEngineControlling.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30051 /* PlaybackEngineControlling.swift */; };
-		C0D31050 /* DolbyVisionPlaybackPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30050 /* DolbyVisionPlaybackPolicy.swift */; };
-		C0D31053 /* DolbyVisionRemuxer.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30053 /* DolbyVisionRemuxer.swift */; };
 		C0D31054 /* PlaybackWakeLock.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30054 /* PlaybackWakeLock.swift */; };
 		C0D3101F000000000000001F /* ProfileViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3001F000000000000001F /* ProfileViewModel.swift */; };
 		C0D310200000000000000020 /* SearchViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300200000000000000020 /* SearchViewModel.swift */; };
@@ -102,6 +112,17 @@
 /* End PBXContainerItemProxy section */
 
 /* Begin PBXCopyFilesBuildPhase section */
+		AE00CP010000000000000001 /* Embed Frameworks */ = {
+			isa = PBXCopyFilesBuildPhase;
+			buildActionMask = 2147483647;
+			dstPath = "";
+			dstSubfolderSpec = 10;
+			files = (
+				AE00BF020000000000000002 /* AetherEngine in Embed Frameworks */,
+			);
+			name = "Embed Frameworks";
+			runOnlyForDeploymentPostprocessing = 0;
+		};
 		7E51000000000000000000C3 /* Embed App Extensions */ = {
 			isa = PBXCopyFilesBuildPhase;
 			buildActionMask = 2147483647;
@@ -116,6 +137,17 @@
 /* End PBXCopyFilesBuildPhase section */
 
 /* Begin PBXFileReference section */
+		AE10F00B /* PlaybackBackendPolicyTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlaybackBackendPolicyTests.swift; sourceTree = "<group>"; };
+		AE10F001 /* PlaybackTrackInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift; sourceTree = "<group>"; };
+		AE10F002 /* PlaybackCacheSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift; sourceTree = "<group>"; };
+		AE10F003 /* PlaybackLoadRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift; sourceTree = "<group>"; };
+		AE10F004 /* PlaybackEngineState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineState.swift; sourceTree = "<group>"; };
+		AE10F005 /* PlaybackEngineCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineCapabilities.swift; sourceTree = "<group>"; };
+		AE10F006 /* PlaybackBackendPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackBackendPolicy.swift; sourceTree = "<group>"; };
+		AE10F007 /* AetherPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/AetherPlaybackController.swift; sourceTree = "<group>"; };
+		AE10F008 /* PlaybackSessionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift; sourceTree = "<group>"; };
+		AE10F009 /* MPVPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/MPVPlaybackController.swift; sourceTree = "<group>"; };
+		AE10F00A /* PlayerSubtitleOverlay.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift; sourceTree = "<group>"; };
 		A1L100010000000000000001 /* AppLanguage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/AppLanguage.swift; sourceTree = "<group>"; };
 		A1L100030000000000000003 /* AppLanguageCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = NuvioTV/Resources/AppLanguageCatalog.json; sourceTree = "<group>"; };
 		C0D30072 /* ProductionBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Details/ProductionBrowseView.swift; sourceTree = "<group>"; };
@@ -166,10 +198,7 @@
 		C0D3001B000000000000001B /* DetailsViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/DetailsViewModel.swift; sourceTree = "<group>"; };
 		C0D3001D000000000000001D /* LibraryViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/LibraryViewModel.swift; sourceTree = "<group>"; };
 		C0D3001E000000000000001E /* PlayerViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/PlayerViewModel.swift; sourceTree = "<group>"; };
-		C0D30052 /* AVPlayerEngineController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/AVPlayerEngineController.swift; sourceTree = "<group>"; };
 		C0D30051 /* PlaybackEngineControlling.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineControlling.swift; sourceTree = "<group>"; };
-		C0D30050 /* DolbyVisionPlaybackPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/DolbyVisionPlaybackPolicy.swift; sourceTree = "<group>"; };
-		C0D30053 /* DolbyVisionRemuxer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/DolbyVisionRemuxer.swift; sourceTree = "<group>"; };
 		C0D30054 /* PlaybackWakeLock.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackWakeLock.swift; sourceTree = "<group>"; };
 		C0D3001F000000000000001F /* ProfileViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/ProfileViewModel.swift; sourceTree = "<group>"; };
 		C0D300200000000000000020 /* SearchViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/SearchViewModel.swift; sourceTree = "<group>"; };
@@ -212,6 +241,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */,
+				AE00BF010000000000000001 /* AetherEngine in Frameworks */,
 				0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -279,7 +309,8 @@
 				C0D3000E000000000000000E /* MetadataInfo.swift */,
 				C0D300120000000000000012 /* LibraryView.swift */,
 				C0D300130000000000000013 /* PlayerControls.swift */,
-				C0D300140000000000000014 /* PlayerView.swift */,
+								AE10F00A /* PlayerSubtitleOverlay.swift */,
+C0D300140000000000000014 /* PlayerView.swift */,
 				C0D3003B000000000000003B /* RemoteInput.swift */,
 				C0D3003C000000000000003C /* ScrubberViews.swift */,
 				C0D3003D000000000000003D /* PauseOverlayView.swift */,
@@ -293,10 +324,16 @@
 				C0D3001B000000000000001B /* DetailsViewModel.swift */,
 				C0D3001D000000000000001D /* LibraryViewModel.swift */,
 				C0D3001E000000000000001E /* PlayerViewModel.swift */,
-				C0D30052 /* AVPlayerEngineController.swift */,
+								AE10F001 /* PlaybackTrackInfo.swift */,
+				AE10F002 /* PlaybackCacheSettings.swift */,
+				AE10F003 /* PlaybackLoadRequest.swift */,
+				AE10F004 /* PlaybackEngineState.swift */,
+				AE10F005 /* PlaybackEngineCapabilities.swift */,
+				AE10F006 /* PlaybackBackendPolicy.swift */,
+				AE10F007 /* AetherPlaybackController.swift */,
+				AE10F008 /* PlaybackSessionCoordinator.swift */,
+				AE10F009 /* MPVPlaybackController.swift */,
 				C0D30051 /* PlaybackEngineControlling.swift */,
-				C0D30050 /* DolbyVisionPlaybackPolicy.swift */,
-				C0D30053 /* DolbyVisionRemuxer.swift */,
 				C0D30054 /* PlaybackWakeLock.swift */,
 				C0D3001F000000000000001F /* ProfileViewModel.swift */,
 				C0D300200000000000000020 /* SearchViewModel.swift */,
@@ -406,6 +443,7 @@
 		T0D320E200000000000000E2 /* NuvioTVTests */ = {
 			isa = PBXGroup;
 			children = (
+				AE10F00B /* PlaybackBackendPolicyTests.swift */,
 				T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */,
 				T0D300E3 /* StreamQualityTagsTests.swift */,
 			);
@@ -422,6 +460,7 @@
 				08A4A3CD28434E44B6B9DE2E /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
+				AE00CP010000000000000001 /* Embed Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				7E51000000000000000000C3 /* Embed App Extensions */,
 			);
@@ -433,6 +472,7 @@
 			name = NuvioTV;
 			packageProductDependencies = (
 				A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */,
+				AE00PD010000000000000001 /* AetherEngine */,
 			);
 			productName = NuvioTV;
 			productReference = 13B07F961A680F5B00A75B9A /* NuvioTV.app */;
@@ -504,6 +544,7 @@
 			mainGroup = 83CBB9F61A601CBA00E9B192;
 			packageReferences = (
 				F1E2D3C4B5A6F7E8D9C0B1A2 /* XCLocalSwiftPackageReference "../MPVKit" */,
+				AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */,
 			);
 			productRefGroup = 83CBBA001A601CBA00E9B192 /* Products */;
 			projectDirPath = "";
@@ -607,10 +648,17 @@
 				C0D3101B000000000000001B /* DetailsViewModel.swift in Sources */,
 				C0D3101D000000000000001D /* LibraryViewModel.swift in Sources */,
 				C0D3101E000000000000001E /* PlayerViewModel.swift in Sources */,
-				C0D31052 /* AVPlayerEngineController.swift in Sources */,
+								AE10B001 /* PlaybackTrackInfo.swift in Sources */,
+				AE10B002 /* PlaybackCacheSettings.swift in Sources */,
+				AE10B003 /* PlaybackLoadRequest.swift in Sources */,
+				AE10B004 /* PlaybackEngineState.swift in Sources */,
+				AE10B005 /* PlaybackEngineCapabilities.swift in Sources */,
+				AE10B006 /* PlaybackBackendPolicy.swift in Sources */,
+				AE10B007 /* AetherPlaybackController.swift in Sources */,
+				AE10B008 /* PlaybackSessionCoordinator.swift in Sources */,
+				AE10B009 /* MPVPlaybackController.swift in Sources */,
+				AE10B00A /* PlayerSubtitleOverlay.swift in Sources */,
 				C0D31051 /* PlaybackEngineControlling.swift in Sources */,
-				C0D31050 /* DolbyVisionPlaybackPolicy.swift in Sources */,
-				C0D31053 /* DolbyVisionRemuxer.swift in Sources */,
 				C0D31054 /* PlaybackWakeLock.swift in Sources */,
 				C0D3101F000000000000001F /* ProfileViewModel.swift in Sources */,
 				C0D310200000000000000020 /* SearchViewModel.swift in Sources */,
@@ -660,6 +708,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				AE10B00B /* PlaybackBackendPolicyTests.swift in Sources */,
 				T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */,
 				T0D310E3 /* StreamQualityTagsTests.swift in Sources */,
 			);
@@ -1015,6 +1064,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../MPVKit;
 		};
+		AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../Vendor/AetherEngine;
+		};
 /* End XCLocalSwiftPackageReference section */
 
 /* Begin XCSwiftPackageProductDependency section */
@@ -1022,6 +1075,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = F1E2D3C4B5A6F7E8D9C0B1A2 /* XCLocalSwiftPackageReference "../MPVKit" */;
 			productName = MPVKit;
+		};
+		AE00PD010000000000000001 /* AetherEngine */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */;
+			productName = AetherEngine;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

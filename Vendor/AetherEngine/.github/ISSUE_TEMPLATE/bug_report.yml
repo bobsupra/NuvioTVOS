@@ -1,0 +1,113 @@
+name: Bug report
+description: A playback, decoding, or integration bug in the engine
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting. AetherEngine bugs are usually format- or platform-specific, so the more precisely you can pin down the source media and the host environment, the faster a fix lands. For a playback bug, the source media details and any error codes are the single most useful thing you can give us.
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What did you call or do, what did you expect the engine to do, and what did it do instead?
+      placeholder: |
+        I called engine.load() on a Dolby Vision Profile 7 MKV. I expected it to play, or to fall back cleanly.
+        Instead load() threw `unsupported Dolby Vision profile 7.-1` and the host stayed on a black screen.
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: The call sequence or user actions that trigger it. A sample file, or a link to one, makes everything faster.
+      placeholder: |
+        1. Configure LoadOptions with the default audioBridgeMode
+        2. engine.load(url:) on the attached file
+        3. Observe the @Published state, or the thrown error
+    validations:
+      required: true
+
+  - type: input
+    id: engine-version
+    attributes:
+      label: AetherEngine version or commit SHA
+      description: A tag (e.g. `2.1.3`) or the pinned commit from your Package.resolved
+      placeholder: "2.1.3 / 26c46f9"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: host-app
+    attributes:
+      label: Host app
+      options:
+        - Sodalite
+        - AetherPlayer
+        - Custom / my own integration
+    validations:
+      required: true
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options:
+        - tvOS
+        - iOS
+        - macOS
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: OS version
+      placeholder: "tvOS 26.0 / macOS 15.1"
+    validations:
+      required: true
+
+  - type: input
+    id: device
+    attributes:
+      label: Device / chip
+      placeholder: "Apple TV 4K (3rd gen, 2022) / MacBook Pro M1 Pro"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: playback-path
+    attributes:
+      label: Playback path
+      description: The engine logs which path a session took at load time. Pick "Not sure / not a playback bug" if it does not apply.
+      options:
+        - Native AVPlayer
+        - Software (dav1d) host
+        - Not sure / not a playback bug
+    validations:
+      required: true
+
+  - type: textarea
+    id: media
+    attributes:
+      label: Source media (for playback bugs)
+      description: Container / video codec + profile / audio codec / resolution / HDR or Dolby Vision profile. `ffprobe` output is ideal.
+      placeholder: "MKV, HEVC Main 10, Dolby Vision Profile 8.1, 3840x2160, EAC3+JOC 5.1"
+
+  - type: textarea
+    id: errors
+    attributes:
+      label: Error codes / log lines
+      description: AVPlayer / CoreMedia / VideoToolbox codes, and any WARNING or error lines the engine printed.
+      placeholder: |
+        CoreMediaErrorDomain -12860
+        AVPlayer status .failed, error -11829
+      render: text
+
+  - type: textarea
+    id: extra
+    attributes:
+      label: Anything else
+      description: Logs, a sample file, hunches, related issues.

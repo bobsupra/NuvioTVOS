@@ -90,7 +90,48 @@ class DetailsViewModel: ObservableObject {
             uiState.companies = companies
             uiState.moreLikeThis = moreLikeThis
             uiState.comments = comments
+
+            // Trakt's related endpoint commonly omits usable artwork even with
+            // `extended=images`. Resolve those IMDb ids through Cinemeta so the
+            // row gets the same poster data as Home. Keep the initial titles on
+            // screen while these independent artwork requests finish.
+            let hydrated = await hydrateRelatedArtwork(in: moreLikeThis)
+            guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
+            uiState.moreLikeThis = hydrated
         }
+    }
+
+    private func hydrateRelatedArtwork(in items: [RelatedTitle]) async -> [RelatedTitle] {
+        var hydrated = items
+        await withTaskGroup(of: (Int, RelatedTitle).self) { group in
+            for (index, item) in items.enumerated() {
+                guard item.posterURL?.isEmpty != false else { continue }
+                group.addTask {
+                    let repository = CinemetaCatalogRepository()
+                    guard let meta = try? await repository.getMetadata(id: item.id, type: item.type) else {
+                        return (index, item)
+                    }
+                    return (
+                        index,
+                        RelatedTitle(
+                            id: meta.id,
+                            type: meta.type,
+                            name: meta.name.isEmpty ? item.name : meta.name,
+                            posterURL: meta.posterUrl ?? meta.backgroundUrl,
+                            year: meta.releaseInfo ?? meta.year.map(String.init) ?? item.year,
+                            rating: meta.rating ?? item.rating,
+                            overview: meta.description ?? item.overview
+                        )
+                    )
+                }
+            }
+
+            for await (index, item) in group {
+                guard hydrated.indices.contains(index) else { continue }
+                hydrated[index] = item
+            }
+        }
+        return hydrated
     }
 
     /// Load the playable streams for a given title/episode id.
@@ -199,7 +240,29 @@ class DetailsViewModel: ObservableObject {
 
     func toggleWatchlist() {
         guard let meta = uiState.meta else { return }
-        uiState.isInWatchlist = LibraryStore.toggle(meta: meta)
+        if TraktSettingsStore.librarySourceMode != .trakt {
+            uiState.isInWatchlist = LibraryStore.toggle(meta: meta)
+            return
+        }
+
+        // A Trakt-selected library must never silently fall back to Nuvio
+        // Sync. Without a live Trakt session, leave the state unchanged.
+        guard TraktAuthStore.state.isAuthenticated else { return }
+
+        // Keep Details responsive, then let LibraryViewModel refresh the
+        // Trakt-backed list from the notification posted after the mutation.
+        let desiredMembership = !uiState.isInWatchlist
+        uiState.isInWatchlist = desiredMembership
+        Task {
+            let succeeded = await TraktLibraryService.setWatchlist(
+                meta,
+                isInWatchlist: desiredMembership
+            )
+            guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
+            if !succeeded {
+                uiState.isInWatchlist = !desiredMembership
+            }
+        }
     }
 
     func toggleWatched() {

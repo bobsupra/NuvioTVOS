@@ -24,13 +24,10 @@ final class PlaybackClock: ObservableObject {
     @Published var wheelAngle: Double = 0
 }
 
-// MARK: - PlayerViewModel (dual-engine)
+// MARK: - PlayerViewModel (Aether + MPV)
 //
-// Default backend is libmpv (gpu-next / VideoToolbox) so Stremio/debrid streams
-// — MKV, AC3/EAC3/DTS, HEVC/AV1 — play on tvOS. AVPlayer is used when Settings
-// force it, or after Auto has packet-remuxed Dolby Vision into local fMP4 HLS
-// so the TV can engage true Dolby Vision mode. MPV stays alive as the immediate
-// HDR10/PQ fallback if the native pipeline cannot display the remux.
+// Default backend is AetherEngine (hardware or software decode). MPVKit is the
+// one-way compatibility fallback.
 
 @MainActor
 class PlayerViewModel: ObservableObject {
@@ -67,6 +64,7 @@ class PlayerViewModel: ObservableObject {
     @Published var isLoadingExternalSubtitles: Bool = false
     /// Current mpv `sub-delay`, in milliseconds. Per-session, not persisted.
     @Published var subtitleDelayMs: Int = 0
+    @Published private(set) var subtitleStyle = SubtitleStyle.current
     /// Current mpv `audio-delay`, in milliseconds. Per-session, not persisted.
     @Published var audioDelayMs: Int = 0
     /// PCM amplification in whole dB (0…10), applied as mpv software volume.
@@ -138,32 +136,27 @@ class PlayerViewModel: ObservableObject {
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
 
-    /// libmpv Metal host. PlayerView shows this when `activeEngineKind == .mpv`.
-    let playerController = MPVPlayerViewController()
-    /// AVFoundation host for native Dolby Vision (and forced AVPlayer setting).
-    let avPlayerController = AVPlayerEngineController()
+    /// Owns Aether (default) and the one-way MPV compatibility fallback.
+    let sessionCoordinator = PlaybackSessionCoordinator()
+    /// Convenience: libmpv Metal host (fallback / forced MPV).
+    var playerController: MPVPlayerViewController { sessionCoordinator.mpvController }
+    /// Aether surface host.
+    var aetherController: AetherPlaybackController { sessionCoordinator.aetherController }
     /// Which backend is driving the current (or next) stream.
-    @Published private(set) var activeEngineKind: PlayerEngineKind = .mpv
+    @Published private(set) var activeEngineKind: PlayerEngineKind = .aether
     /// Short on-screen note after engine selection (native DV vs HDR fallback).
     @Published private(set) var hdrModeToast: String?
-    @Published private(set) var isUsingNativeDolbyVision = false
-
-    private var nativeDVRemuxAllowed = false
-    private var nativeDVRemuxAttempted = false
-    private var nativeDVRemuxer: DolbyVisionRemuxer?
-    private var retiredNativeDVRemuxers: [DolbyVisionRemuxer] = []
-    private var nativeDVFailedURLs: Set<String> = []
-    private var nativeDVPlaylistURL: String?
-    private var nativeDVStartOffset: Double = 0
-    private var nativeDVWrittenSeconds: Double = 0
-    private var nativeDVOriginalDuration: Double = 0
-    private var nativeDVRemuxFinished = false
-    private var nativeDVDeferredSourceError: String?
-    private var nativeDVSourceErrorDeadline: Date?
+    #if DEBUG
+    @Published private(set) var playbackDebugInfo: PlaybackDebugInfo?
+    @Published private(set) var playbackDebugReason = ""
+    @Published private(set) var isPlaybackDebugHUDVisible = false
+    private var playbackDebugHUDBackend: PlayerEngineKind?
+    private var didShowPlaybackDebugHUDForStream = false
+    #endif
 
     /// Backend used for transport / poll — switches with `activeEngineKind`.
     private var engine: PlaybackEngineControlling {
-        activeEngineKind == .avPlayer ? avPlayerController : playerController
+        sessionCoordinator.activeEngine
     }
 
     private var pollTimer: Timer?
@@ -197,6 +190,12 @@ class PlayerViewModel: ObservableObject {
     /// instead of a transient reattach/keep-open sample that can report the
     /// title's full duration as its current position.
     private var lastStablePlaybackTime: PlayerTime?
+    /// Trakt accepts a started scrobble followed by periodic pause updates.
+    /// Keep that cadence lower than local persistence so normal playback never
+    /// produces a request every five seconds.
+    private var didStartTraktScrobble = false
+    private var lastTraktProgressReport = Date.distantPast
+    private static let traktProgressReportInterval: TimeInterval = 30
     private var controlsAutoHideSuspended = false
     private var skipIntervals: [SkipInterval] = []
     private var autoHiddenSkipIntervalId: String?
@@ -275,36 +274,35 @@ class PlayerViewModel: ObservableObject {
     private let loadTimeoutSeconds: UInt64 = 30
 
     init() {
+        sessionCoordinator.prepareControllers()
         let suspend: (Int64, Int64) -> Void = { [weak self] positionMs, durationMs in
             Task { @MainActor [weak self] in
                 self?.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
             }
         }
         playerController.onPlaybackSuspended = suspend
-        avPlayerController.onPlaybackSuspended = suspend
-        avPlayerController.onNativeVideoUnavailable = { [weak self] urlString, reason in
-            self?.fallBackToMPV(urlString: urlString, reason: reason)
-        }
-        avPlayerController.onVideoReady = { [weak self] urlString in
-            self?.nativeDolbyVisionVideoDidBecomeReady(urlString: urlString)
+        aetherController.onPlaybackSuspended = suspend
+        sessionCoordinator.onHandoffToast = { [weak self] message in
+            self?.hdrModeToast = message
+            self?.showPlayerToast(message)
+            self?.activeEngineKind = self?.sessionCoordinator.activeBackend ?? .mpv
+            #if DEBUG
+            self?.playbackDebugHUDBackend = nil
+            self?.isPlaybackDebugHUDVisible = true
+            #endif
         }
     }
 
     deinit {
-        let mpv = playerController
-        let av = avPlayerController
+        let coordinator = sessionCoordinator
         let poll = pollTimer
         let hide = controlsHideTimer
-        let remuxers = retiredNativeDVRemuxers + [nativeDVRemuxer].compactMap { $0 }
-        remuxers.forEach { $0.cancel() }
         trailerResolveTask?.cancel()
         subtitleFetchTask?.cancel()
         Task { @MainActor in
             poll?.invalidate()
             hide?.invalidate()
-            mpv.destroyPlayer()
-            av.destroyPlayer()
-            remuxers.forEach { $0.cleanup() }
+            coordinator.stopAll()
         }
     }
 
@@ -336,349 +334,102 @@ class PlayerViewModel: ObservableObject {
                         return
                     }
                     self.activeStreamURL = playbackSource.videoUrl
-                    // Trailers are ordinary progressive streams — keep MPV for
-                    // dual audio-url support.
-                    self.selectEngine(.mpv, decisionMessage: nil)
-                    self.engine.loadFile(playbackSource.videoUrl)
-                    if let audioUrl = playbackSource.audioUrl {
-                        self.engine.addAudioUrl(audioUrl)
+                    // Trailers with optional separate audio URL require MPV.
+                    guard let videoURL = URL(string: playbackSource.videoUrl) else {
+                        self.status = .error("Invalid trailer URL.")
+                        return
                     }
+                    let audioURL = playbackSource.audioUrl.flatMap(URL.init(string:))
+                    let request = PlaybackLoadRequest(
+                        videoURL: videoURL,
+                        audioURL: audioURL,
+                        externalSubtitles: [],
+                        matchContentEnabled: true,
+                        cacheProfile: PlaybackCacheProfile.fromSettings(
+                            ProfileSettings.current.string(forKey: SettingsKey.networkCache)
+                        ),
+                        assMode: .strip,
+                        streamDescription: PlaybackMarkers.trailerSubtitle
+                    )
+                    self.sessionCoordinator.load(request)
+                    self.activeEngineKind = self.sessionCoordinator.activeBackend
                     self.startPolling()
                 }
             }
             return
         }
 
-        applyEnginePolicy(
+        beginPrimaryLoad(
             for: url,
             streamName: nil,
             streamDescription: subtitle,
-            // Debrid URLs often encode the release name in the path.
             filename: url.lastPathComponent
         )
-        engine.loadFile(url.absoluteString)
-        // mpv letterboxes; fill/stretch are SwiftUI transforms on the host.
-        engine.setAspectMode(.fit)
         videoNaturalSize = .zero
         startPolling()
         configureWheelTrackingIfNeeded()
         startLoadWatchdog()
     }
 
-    /// Picks MPV vs AVPlayer from Settings + Dolby Vision policy.
-    private func applyEnginePolicy(
+    /// Aether-first policy with MPV one-way fallback. Native DV remux is disabled
+    /// while Aether owns Dolby Vision (including live P7→8.1).
+    private func beginPrimaryLoad(
         for url: URL,
         streamName: String?,
         streamDescription: String?,
         filename: String?
     ) {
-        let result = DolbyVisionPlaybackPolicy.resolve(
-            url: url,
+        let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
+        let matchContent = frameRateMode.caseInsensitiveCompare("Off") != .orderedSame
+        let request = PlaybackLoadRequest(
+            videoURL: url,
+            audioURL: nil,
+            resumePositionSeconds: pendingResumeSeconds,
+            httpHeaders: [:],
+            externalSubtitles: pendingExternalSubtitles,
+            preferredAudioLanguages: preferredAudioLanguageCodes(),
+            preferredSubtitleLanguages: preferredSubtitleLanguageCodes(),
+            matchContentEnabled: matchContent,
+            cacheProfile: PlaybackCacheProfile.fromSettings(
+                ProfileSettings.current.string(forKey: SettingsKey.networkCache)
+            ),
+            assMode: PlaybackASSMode.fromSettings(
+                ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode)
+            ),
+            autoplay: true,
+            playbackRate: playbackSpeed.rawValue,
+            subtitleDelaySeconds: Double(subtitleDelayMs) / 1_000,
+            audioDelaySeconds: Double(audioDelayMs) / 1_000,
+            audioGainDB: Double(audioAmplificationDb),
             streamName: streamName,
             streamDescription: streamDescription,
             filename: filename
         )
-        let engineSetting = ProfileSettings.current
-            .string(forKey: SettingsKey.playerEngine) ?? "Auto"
-        let normalizedSetting = engineSetting
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let isAuto = normalizedSetting != "avplayer"
-            && normalizedSetting != "mpvkit"
-            && normalizedSetting != "mpv"
-        nativeDVRemuxAllowed = isAuto && result.decision != .mpvHdrFallback
-        print("[Player] Engine policy: \(result.reason)")
-        selectEngine(result.engine, decisionMessage: DolbyVisionPlaybackPolicy.statusMessage(for: result))
-    }
-
-    private func selectEngine(_ kind: PlayerEngineKind, decisionMessage: String?) {
-        if activeEngineKind != kind {
-            // Pause the outgoing backend so two audio pipelines never run together.
-            switch activeEngineKind {
-            case .mpv: playerController.pausePlayback()
-            case .avPlayer: avPlayerController.pausePlayback()
-            }
-        }
-        activeEngineKind = kind
-        if let decisionMessage {
-            hdrModeToast = decisionMessage
-            showPlayerToast(decisionMessage)
-            Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 4_000_000_000)
-                if self?.hdrModeToast == decisionMessage {
-                    self?.hdrModeToast = nil
-                }
-            }
-        } else {
-            hdrModeToast = nil
-        }
-    }
-
-    /// AVPlayer may successfully open the container and audio track while the
-    /// Dolby Vision video track remains black. Retry that same source through
-    /// MPV so its HDR10/PQ-compatible base layer remains watchable.
-    private func fallBackToMPV(urlString: String, reason: String) {
-        if isUsingNativeDolbyVision, urlString == nativeDVPlaylistURL {
-            abandonNativeDolbyVision(reason: reason)
-            return
-        }
-
-        guard !didShutdown,
-              activeEngineKind == .avPlayer,
-              activeStreamURL == urlString else { return }
-
-        let avPosition = Double(avPlayerController.positionMs) / 1000.0
-        let resume = max(avPosition, time.current)
-        if resume > 5 {
-            pendingResumeSeconds = resume
-            didApplyResume = false
-        }
-
-        print("[Player] AVPlayer fallback: \(reason)")
-        status = .buffering
-        didAddExternalSubtitles = false
-        addedExternalSubtitleURLs.removeAll()
-        selectEngine(.mpv, decisionMessage: "Dolby Vision → HDR10/PQ (MPV fallback)")
-        playerController.loadFile(urlString)
-        playerController.setAspectMode(.fit)
-        videoNaturalSize = .zero
-        startLoadWatchdog()
-    }
-
-    /// MPV identifies the actual Dolby Vision profile after probing. For P5/P8,
-    /// keep MPV playing while a packet-only local HLS remux is prepared.
-    private func maybeStartNativeDolbyVisionRemux() {
-        guard nativeDVRemuxAllowed,
-              !nativeDVRemuxAttempted,
-              !isUsingNativeDolbyVision,
-              activeEngineKind == .mpv,
-              currentLoadStarted,
-              playerController.hasCoherentTimeSample,
-              !playerController.isPlayerLoading,
-              let sourceURL = activeStreamURL,
-              !nativeDVFailedURLs.contains(sourceURL),
-              URL(string: sourceURL)?.isFileURL != true else { return }
-        let bufferedAheadMs = playerController.bufferedMs - playerController.positionMs
-        guard bufferedAheadMs >= 2_000 || playerController.positionMs >= 5_000 else { return }
-        if let pendingResumeSeconds,
-           pendingResumeSeconds > 5,
-           abs(time.current - pendingResumeSeconds) > 5 {
-            return
-        }
-
-        let profile = playerController.dolbyVisionProfile
-        guard profile > 0 else { return }
-        nativeDVRemuxAttempted = true
-
-        guard profile == 5 || profile == 8 else {
-            print("[Player] Native DV remux skipped: profile \(profile)")
-            showPlayerToast("Dolby Vision profile \(profile) → HDR10/PQ")
-            return
-        }
-
-        #if targetEnvironment(simulator)
-        let displaySupportsDolbyVision = false
-        #else
-        let displaySupportsDolbyVision = AVPlayer.availableHDRModes.contains(.dolbyVision)
-        #endif
-        guard displaySupportsDolbyVision else {
-            print("[Player] Native DV remux skipped: display does not advertise Dolby Vision")
-            showPlayerToast("Dolby Vision unavailable on this display → HDR10/PQ")
-            return
-        }
-
-        let startAt = max(time.current - 2, 0)
-        nativeDVOriginalDuration = max(time.duration, Double(playerController.durationMs) / 1000)
-        let preferredLanguage = playerController.audioTracks
-            .first(where: \.selected)?.lang ?? ""
-        let remuxer = DolbyVisionRemuxer(
-            input: sourceURL,
-            startAt: startAt,
-            preferredAudioLanguage: preferredLanguage
+        sessionCoordinator.load(
+            request,
+            requiresMPVAudioControls: audioDelayMs != 0 || audioAmplificationDb > 0
         )
-        nativeDVRemuxer = remuxer
-
-        remuxer.onProgress = { [weak self, weak remuxer] written in
-            guard let self, let remuxer, self.nativeDVRemuxer === remuxer else { return }
-            self.nativeDVWrittenSeconds = max(self.nativeDVWrittenSeconds, written)
+        // The coordinator owns initial seek and subtitle registration on both
+        // backends; later progressive subtitle results still flow through the
+        // incremental path below.
+        didApplyResume = (request.resumePositionSeconds ?? 0) > 5
+        didAddExternalSubtitles = true
+        addedExternalSubtitleURLs.formUnion(request.externalSubtitles.map(\.url))
+        activeEngineKind = sessionCoordinator.activeBackend
+        hdrModeToast = sessionCoordinator.statusToast
+        if let toast = sessionCoordinator.statusToast {
+            showPlayerToast(toast)
         }
-        remuxer.onFinished = { [weak self, weak remuxer] in
-            guard let self, let remuxer, self.nativeDVRemuxer === remuxer else { return }
-            self.nativeDVRemuxFinished = true
-        }
-        remuxer.onReady = { [weak self, weak remuxer] playlistURL, actualStart in
-            guard let self, let remuxer, self.nativeDVRemuxer === remuxer,
-                  self.activeStreamURL == sourceURL,
-                  self.activeEngineKind == .mpv,
-                  !self.didShutdown else { return }
-            self.activateNativeDolbyVision(
-                playlistURL: playlistURL,
-                actualStart: actualStart
-            )
-        }
-        remuxer.onIneligible = { [weak self, weak remuxer] reason in
-            guard let self, let remuxer else { return }
-            self.nativeDolbyVisionRemuxFailed(
-                reason: reason,
-                sourceURL: sourceURL,
-                remuxer: remuxer
-            )
-        }
-        remuxer.onError = { [weak self, weak remuxer] reason in
-            guard let self, let remuxer else { return }
-            self.nativeDolbyVisionRemuxFailed(
-                reason: reason,
-                sourceURL: sourceURL,
-                remuxer: remuxer
-            )
-        }
-
-        print("[Player] Preparing native Dolby Vision P\(profile) from \(startAt)s")
-        remuxer.start()
+        print("[Player] Engine policy: \(sessionCoordinator.lastPolicyReason)")
     }
 
-    private func activateNativeDolbyVision(playlistURL: URL, actualStart: Double) {
-        let sourcePosition = max(time.current, actualStart)
-        nativeDVStartOffset = actualStart
-        nativeDVPlaylistURL = playlistURL.absoluteString
-        nativeDVDeferredSourceError = nil
-        nativeDVSourceErrorDeadline = nil
-        isUsingNativeDolbyVision = true
-
-        print("[Player] Native DV playlist ready at source t=\(actualStart)s")
-        status = .buffering
-        playerController.suspendDisplayCriteriaForNativePlayback()
-        selectEngine(.avPlayer, decisionMessage: nil)
-        avPlayerController.loadFile(playlistURL.absoluteString)
-        avPlayerController.seekToMs(Int64(max(sourcePosition - actualStart, 0) * 1000))
-        avPlayerController.setAspectMode(.fit)
-        videoNaturalSize = .zero
+    private func preferredAudioLanguageCodes() -> [String] {
+        SubtitleLanguagePreferences.preferredAudioLanguage().map { [$0] } ?? []
     }
 
-    private func nativeDolbyVisionVideoDidBecomeReady(urlString: String) {
-        guard isUsingNativeDolbyVision, urlString == nativeDVPlaylistURL else { return }
-        let message = "Native Dolby Vision"
-        hdrModeToast = message
-        showPlayerToast(message)
-    }
-
-    private func nativeDolbyVisionRemuxFailed(
-        reason: String,
-        sourceURL: String,
-        remuxer: DolbyVisionRemuxer
-    ) {
-        guard nativeDVRemuxer === remuxer, activeStreamURL == sourceURL else { return }
-        print("[Player] Native DV remux unavailable: \(reason)")
-        nativeDVFailedURLs.insert(sourceURL)
-        nativeDVDeferredSourceError = nil
-        nativeDVSourceErrorDeadline = nil
-        if isUsingNativeDolbyVision {
-            abandonNativeDolbyVision(reason: reason)
-            return
-        }
-
-        remuxer.cancel()
-        retiredNativeDVRemuxers.append(remuxer)
-        nativeDVRemuxer = nil
-        showPlayerToast("Native Dolby Vision unavailable → HDR10/PQ")
-    }
-
-    private func abandonNativeDolbyVision(
-        reason: String?,
-        resumeAt: Double? = nil,
-        allowRetry: Bool = false
-    ) {
-        guard !didShutdown, isUsingNativeDolbyVision else { return }
-
-        let nativePosition = nativeDVStartOffset
-            + Double(avPlayerController.positionMs) / 1000
-        let resume = max(resumeAt ?? max(nativePosition, time.current), 0)
-        if !allowRetry, let sourceURL = activeStreamURL {
-            nativeDVFailedURLs.insert(sourceURL)
-        }
-
-        avPlayerController.pausePlayback()
-        if let remuxer = nativeDVRemuxer {
-            remuxer.cancel()
-            retiredNativeDVRemuxers.append(remuxer)
-        }
-        nativeDVRemuxer = nil
-        nativeDVPlaylistURL = nil
-        nativeDVStartOffset = 0
-        nativeDVWrittenSeconds = 0
-        nativeDVRemuxFinished = false
-        nativeDVDeferredSourceError = nil
-        nativeDVSourceErrorDeadline = nil
-        isUsingNativeDolbyVision = false
-        nativeDVRemuxAttempted = !allowRetry
-
-        if let reason {
-            print("[Player] Native DV fallback to retained MPV stream: \(reason)")
-        }
-        selectEngine(
-            .mpv,
-            decisionMessage: reason == nil
-                ? nil
-                : "Native Dolby Vision unavailable → HDR10/PQ"
-        )
-        playerController.restoreDisplayCriteriaAfterNativePlayback()
-        playerController.seekToMs(Int64(resume * 1000))
-        playerController.playPlayback()
-        status = .buffering
-    }
-
-    private func resetNativeDolbyVisionSession() {
-        if isUsingNativeDolbyVision {
-            avPlayerController.pausePlayback()
-        }
-        if let remuxer = nativeDVRemuxer {
-            remuxer.cancel()
-            retiredNativeDVRemuxers.append(remuxer)
-        }
-        nativeDVRemuxer = nil
-        nativeDVPlaylistURL = nil
-        nativeDVStartOffset = 0
-        nativeDVWrittenSeconds = 0
-        nativeDVOriginalDuration = 0
-        nativeDVRemuxFinished = false
-        nativeDVDeferredSourceError = nil
-        nativeDVSourceErrorDeadline = nil
-        nativeDVRemuxAllowed = false
-        nativeDVRemuxAttempted = false
-        isUsingNativeDolbyVision = false
-    }
-
-    /// A second read of some debrid URLs can make MPV's original connection
-    /// close while the packet-copy remux is already producing valid media.
-    /// Give that remux a short chance to become ready before declaring the
-    /// original URL dead and cycling through every source.
-    private func shouldDeferSourceFailureForNativeDolbyVision(_ message: String) -> Bool {
-        guard activeEngineKind == .mpv,
-              !isUsingNativeDolbyVision,
-              nativeDVRemuxer != nil else { return false }
-
-        if nativeDVDeferredSourceError == nil {
-            nativeDVDeferredSourceError = message
-            nativeDVSourceErrorDeadline = Date().addingTimeInterval(15)
-            print("[Player] Deferring MPV source error while native DV remux finishes: \(message)")
-        }
-
-        if let deadline = nativeDVSourceErrorDeadline, Date() < deadline {
-            return true
-        }
-
-        print("[Player] Native DV remux did not recover before the source-error deadline")
-        if let remuxer = nativeDVRemuxer {
-            remuxer.cancel()
-            retiredNativeDVRemuxers.append(remuxer)
-        }
-        if let sourceURL = activeStreamURL {
-            nativeDVFailedURLs.insert(sourceURL)
-        }
-        nativeDVRemuxer = nil
-        nativeDVDeferredSourceError = nil
-        nativeDVSourceErrorDeadline = nil
-        return false
+    private func preferredSubtitleLanguageCodes() -> [String] {
+        guard SubtitleLanguagePreferences.smartMatchingEnabled() else { return [] }
+        return SubtitleLanguagePreferences.orderedFromDefaults()
     }
 
     /// Applies all per-stream state for a title/episode. Shared by the initial
@@ -686,7 +437,21 @@ class PlayerViewModel: ObservableObject {
     /// advance, so both paths reset resume/track/subtitle state identically.
     private func applyStreamState(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle], resumeFrom: Double?) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
-        resetNativeDolbyVisionSession()
+        #if DEBUG
+        playbackDebugInfo = PlaybackDebugInfo(
+            player: "Selecting player…",
+            pipeline: "Starting",
+            videoCodec: "Detecting",
+            dynamicRange: "Detecting",
+            resolution: "Detecting",
+            frameRate: "Detecting",
+            audio: "Detecting"
+        )
+        playbackDebugReason = "Waiting for playback metadata"
+        isPlaybackDebugHUDVisible = true
+        playbackDebugHUDBackend = nil
+        didShowPlaybackDebugHUDForStream = false
+        #endif
         subtitleFetchTask?.cancel()
         subtitleFetchTask = nil
         isLoadingExternalSubtitles = false
@@ -719,6 +484,8 @@ class PlayerViewModel: ObservableObject {
         self.pendingResumeSeconds = isTrailerPlayback ? nil : resumeFrom
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
+        self.didStartTraktScrobble = false
+        self.lastTraktProgressReport = .distantPast
         self.expectedDurationSeconds = isTrailerPlayback ? nil : Self.expectedDuration(for: meta)
         self.didDetectReplacementStream = false
         self.replacementStreamHits = 0
@@ -987,20 +754,27 @@ class PlayerViewModel: ObservableObject {
         isAdvancingEpisode = true
         nextEpisodeCountdown = nil
 
-        // Mark the finishing episode watched, then roll Continue Watching over to
-        // the next episode locally (like the phone) instead of removing the row.
-        // This keeps the series visible as "Next Up" even if the next stream fails
-        // to resolve or the user backs out before its own progress saves — the
-        // bug where a finished episode made the whole series vanish from Home.
+        // Mark the finishing episode watched. With Trakt selected its scrobble
+        // history produces the remote Next Up entry; Nuvio Sync keeps the
+        // existing local rollover behavior.
         if let activeMeta {
             markWatchedIfNeeded()
-            ContinueWatchingStore.saveUpNext(
-                meta: activeMeta,
-                duration: time.duration,
-                season: next.season,
-                episode: next.episode,
-                released: next.released
-            )
+            if usesTraktProgress {
+                reportTraktProgress(
+                    meta: activeMeta,
+                    playbackTime: time,
+                    action: .stop,
+                    force: true
+                )
+            } else {
+                ContinueWatchingStore.saveUpNext(
+                    meta: activeMeta,
+                    duration: time.duration,
+                    season: next.season,
+                    episode: next.episode,
+                    released: next.released
+                )
+            }
         }
 
         Task { @MainActor in
@@ -1046,14 +820,12 @@ class PlayerViewModel: ObservableObject {
         isSwitchingSource = false
         showControls = false
 
-        applyEnginePolicy(
+        beginPrimaryLoad(
             for: prepared.url,
             streamName: prepared.streamName,
             streamDescription: prepared.streamDescription ?? prepared.subtitleLine,
             filename: prepared.filename
         )
-        engine.loadFile(prepared.url.absoluteString)
-        engine.setAspectMode(.fit)
         videoNaturalSize = .zero
         if pollTimer == nil { startPolling() }
         startLoadWatchdog()
@@ -1186,6 +958,32 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    #if DEBUG
+    private func updatePlaybackDebugHUD(from controller: PlaybackEngineControlling) {
+        let info = controller.playbackDebugInfo
+        if playbackDebugInfo != info {
+            playbackDebugInfo = info
+        }
+        playbackDebugReason = sessionCoordinator.lastPolicyReason
+        isPlaybackDebugHUDVisible = true
+
+        let playbackStarted = controller.isPlayerPlaying
+            || controller.hasCoherentTimeSample
+            || (status == .paused && !controller.isPlayerLoading)
+        guard playbackStarted else { return }
+
+        let backendChanged = playbackDebugHUDBackend != activeEngineKind
+        guard backendChanged || !didShowPlaybackDebugHUDForStream else { return }
+
+        playbackDebugHUDBackend = activeEngineKind
+        didShowPlaybackDebugHUDForStream = true
+        playbackDebugReason = sessionCoordinator.lastPolicyReason
+        isPlaybackDebugHUDVisible = true
+
+        print("[PlaybackDebug] \(([info.screenLines, ["POLICY   \(playbackDebugReason)"]].flatMap { $0 }).joined(separator: " | "))")
+    }
+    #endif
+
     // MARK: - Polling (mirrors MPV state into the published properties)
 
     private func startPolling() {
@@ -1201,18 +999,13 @@ class PlayerViewModel: ObservableObject {
         let sampledEngineKind = activeEngineKind
         let c = engine
         c.refreshPlaybackState()
-        // An AVPlayer error callback can synchronously restore MPV while the
-        // old controller is being refreshed. Discard that stale AV sample.
+        sessionCoordinator.refreshHandoffState()
+        // A backend handoff may occur while state is refreshed. Discard a stale sample.
         guard activeEngineKind == sampledEngineKind else { return }
 
         let rawCurrent = Double(c.positionMs) / 1000.0
         let rawDuration = Double(c.durationMs) / 1000.0
-        let latestTime = PlayerTime(
-            current: isUsingNativeDolbyVision ? nativeDVStartOffset + rawCurrent : rawCurrent,
-            duration: isUsingNativeDolbyVision
-                ? max(nativeDVOriginalDuration, nativeDVStartOffset + rawDuration)
-                : rawDuration
-        )
+        let latestTime = PlayerTime(current: rawCurrent, duration: rawDuration)
         if c.hasCoherentTimeSample,
            !c.isPlayerLoading,
            !c.isAtEndOfFile,
@@ -1239,10 +1032,7 @@ class PlayerViewModel: ObservableObject {
             // the coarser `time` publication is throttled by the settings panel.
             if clock.position != latestTime.current { clock.position = latestTime.current }
             if clock.duration != latestTime.duration { clock.duration = latestTime.duration }
-            let rawBufferedSeconds = Double(c.bufferedMs) / 1000.0
-            let bufferedSeconds = isUsingNativeDolbyVision
-                ? min(nativeDVStartOffset + rawBufferedSeconds, latestTime.duration)
-                : rawBufferedSeconds
+            let bufferedSeconds = Double(c.bufferedMs) / 1000.0
             if clock.buffered != bufferedSeconds { clock.buffered = bufferedSeconds }
         }
 
@@ -1259,12 +1049,10 @@ class PlayerViewModel: ObservableObject {
         // stream's transient ended/loading state so nothing flickers or re-fires.
         if isAdvanceInFlight { return }
 
-        if !isUsingNativeDolbyVision,
-           subtitle != PlaybackMarkers.trailerSubtitle,
+        if subtitle != PlaybackMarkers.trailerSubtitle,
            detectReplacementStream(c) { return }
 
         applyPendingResumeIfNeeded()
-        maybeStartNativeDolbyVisionRemux()
         addPendingExternalSubtitlesIfNeeded()
         updateSkipIntervalState()
 
@@ -1284,7 +1072,14 @@ class PlayerViewModel: ObservableObject {
             if let activeMeta, subtitle != PlaybackMarkers.trailerSubtitle,
                time.duration >= 60, time.current / time.duration >= 0.85 {
                 markWatchedIfNeeded()
-                if let next = nextEpisode {
+                if usesTraktProgress {
+                    reportTraktProgress(
+                        meta: activeMeta,
+                        playbackTime: time,
+                        action: .stop,
+                        force: true
+                    )
+                } else if let next = nextEpisode {
                     // Series with a follow-up: roll Continue Watching over to the
                     // next episode so it shows as "Next Up" instead of vanishing.
                     ContinueWatchingStore.save(
@@ -1310,10 +1105,6 @@ class PlayerViewModel: ObservableObject {
 
         // mpv hard-failed this source — try the next one before surfacing UI.
         if !c.currentErrorMessage.isEmpty, !isFailingOver, !isReloadingStream {
-            if shouldDeferSourceFailureForNativeDolbyVision(c.currentErrorMessage) {
-                if status != .buffering { status = .buffering }
-                return
-            }
             if let url = activeStreamURL { failedStreamURLs.insert(url) }
             attemptFailover(
                 reason: c.currentErrorMessage,
@@ -1337,6 +1128,10 @@ class PlayerViewModel: ObservableObject {
             latestStatus = .paused
         }
         if status != latestStatus { status = latestStatus }
+
+        #if DEBUG
+        updatePlaybackDebugHUD(from: c)
+        #endif
 
         // First real frames/audio — disarm the load watchdog.
         if status == .playing || (status == .paused && time.duration > 0 && !c.isPlayerLoading) {
@@ -1478,16 +1273,9 @@ class PlayerViewModel: ObservableObject {
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = nil
         playerController.pausePlayback()
-        avPlayerController.pausePlayback()
-        let remuxers = retiredNativeDVRemuxers + [nativeDVRemuxer].compactMap { $0 }
-        remuxers.forEach { $0.cancel() }
-        nativeDVRemuxer = nil
-        retiredNativeDVRemuxers.removeAll()
         saveProgress(force: true)
-        // Leave both engines destroyed so a re-entry cannot resume a ghost pipeline.
+        // Leave the fallback host destroyed so re-entry cannot resume a ghost pipeline.
         playerController.destroyPlayer()
-        avPlayerController.destroyPlayer()
-        remuxers.forEach { $0.cleanup() }
         status = .idle
     }
 
@@ -1504,27 +1292,7 @@ class PlayerViewModel: ObservableObject {
         let target = duration > 0
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
-        if isUsingNativeDolbyVision {
-            let availableEnd = nativeDVStartOffset + nativeDVWrittenSeconds
-            let isInWrittenWindow = target >= nativeDVStartOffset
-                && (nativeDVRemuxFinished || target <= max(availableEnd - 0.5, nativeDVStartOffset))
-            if isInWrittenWindow {
-                avPlayerController.seekToMs(
-                    Int64(max(target - nativeDVStartOffset, 0) * 1000)
-                )
-            } else {
-                // The local EVENT playlist does not contain this source time.
-                // Resume instantly through the retained MPV item; the next poll
-                // starts a fresh remux around the requested position.
-                abandonNativeDolbyVision(
-                    reason: nil,
-                    resumeAt: target,
-                    allowRetry: true
-                )
-            }
-        } else {
-            engine.seekToMs(Int64(target * 1000))
-        }
+        engine.seekToMs(Int64(target * 1000))
         // Instant UI feedback while mpv catches up.
         clock.position = target
         var snapshot = time
@@ -1537,12 +1305,8 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
-        let sourcePositionMs = isUsingNativeDolbyVision
-            ? Int64(nativeDVStartOffset * 1000) + positionMs
-            : positionMs
-        let sourceDurationMs = isUsingNativeDolbyVision && nativeDVOriginalDuration > 0
-            ? Int64(nativeDVOriginalDuration * 1000)
-            : durationMs
+        let sourcePositionMs = positionMs
+        let sourceDurationMs = durationMs
         guard !didShutdown,
               sourceDurationMs > 0,
               sourcePositionMs >= 0,
@@ -2016,10 +1780,12 @@ class PlayerViewModel: ObservableObject {
 
     func setSpeed(_ speed: PlaybackSpeed) {
         playbackSpeed = speed
+        sessionCoordinator.updatePlaybackRate(speed.rawValue)
         engine.setSpeed(speed.rawValue)
     }
 
     func applySubtitleStyle() {
+        subtitleStyle = SubtitleStyle.current
         engine.applySubtitleStyle()
     }
 
@@ -2027,20 +1793,43 @@ class PlayerViewModel: ObservableObject {
     func setSubtitleDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -30_000), 30_000)
         subtitleDelayMs = clamped
+        sessionCoordinator.updateSubtitleDelay(Double(clamped) / 1_000)
         engine.setSubtitleDelay(Double(clamped) / 1000.0)
     }
 
     /// Shifts audio timing; positive delays the audio.
+    /// Non-zero delay requires MPV (Aether has no public audio-delay API).
     func setAudioDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -3_000), 3_000)
         audioDelayMs = clamped
+        sessionCoordinator.updateAudioDelay(Double(clamped) / 1_000)
+        if activeEngineKind == .aether, clamped != 0 {
+            sessionCoordinator.handoffToMPV(
+                reason: "Audio delay requires MPVKit",
+                resumeSeconds: nil
+            )
+            activeEngineKind = sessionCoordinator.activeBackend
+            hdrModeToast = "Compatibility player (audio delay)"
+            showPlayerToast("Compatibility player (audio delay)")
+        }
         engine.setAudioDelay(Double(clamped) / 1000.0)
     }
 
     /// PCM amplification in whole dB (0…10).
+    /// Amplification above 0 dB requires MPV (Aether has no public gain API).
     func setAudioAmplificationDb(_ db: Int) {
         let clamped = min(max(db, 0), 10)
         audioAmplificationDb = clamped
+        sessionCoordinator.updateAudioGain(Double(clamped))
+        if activeEngineKind == .aether, clamped > 0 {
+            sessionCoordinator.handoffToMPV(
+                reason: "Audio amplification requires MPVKit",
+                resumeSeconds: nil
+            )
+            activeEngineKind = sessionCoordinator.activeBackend
+            hdrModeToast = "Compatibility player (audio boost)"
+            showPlayerToast("Compatibility player (audio boost)")
+        }
         engine.setAudioVolumeGain(dB: Double(clamped))
     }
 
@@ -2604,12 +2393,22 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveProgressIfNeeded() {
-        guard Date().timeIntervalSince(lastProgressSave) >= 5 else { return }
+        // Start a Trakt scrobble promptly so its remote Continue Watching feed
+        // has an entry before the user leaves the player. Subsequent saves keep
+        // the normal cadence (and Trakt's separate 30-second report cadence).
+        let interval: TimeInterval = usesTraktProgress && !didStartTraktScrobble ? 1 : 5
+        guard Date().timeIntervalSince(lastProgressSave) >= interval else { return }
         saveProgress(force: false)
     }
 
     private func saveProgress(force: Bool) {
+        // Never persist progress during an Aether→MPV handoff.
+        if sessionCoordinator.isProgressSaveSuspended { return }
         let progressTime = force ? (lastStablePlaybackTime ?? time) : time
+        // Nuvio Sync retains the 10-second accidental-playback safeguard. A
+        // Trakt start scrobble is the source of its Continue Watching row, so
+        // send it once playback has genuinely begun instead of waiting 10+ s.
+        let minimumProgressSeconds: Double = usesTraktProgress ? 1 : 10
         guard let activeMeta,
               let activeStreamURL,
               progressTime.current.isFinite,
@@ -2619,38 +2418,96 @@ class PlayerViewModel: ObservableObject {
               progressTime.current < progressTime.duration,
               subtitle != PlaybackMarkers.trailerSubtitle,
               !loadedStreamLooksLikeReplacement(),
-              force || progressTime.current >= 10 else {
+              force || progressTime.current >= minimumProgressSeconds else {
             return
         }
 
         if shouldSaveNextUpProgress(at: progressTime), let nextEpisode {
             markWatchedIfNeeded()
-            ContinueWatchingStore.saveUpNext(
-                meta: activeMeta,
-                duration: progressTime.duration,
-                season: nextEpisode.season,
-                episode: nextEpisode.episode,
-                released: nextEpisode.released
-            )
+            if usesTraktProgress {
+                reportTraktProgress(
+                    meta: activeMeta,
+                    playbackTime: progressTime,
+                    action: .stop,
+                    force: true
+                )
+            } else {
+                ContinueWatchingStore.saveUpNext(
+                    meta: activeMeta,
+                    duration: progressTime.duration,
+                    season: nextEpisode.season,
+                    episode: nextEpisode.episode,
+                    released: nextEpisode.released
+                )
+            }
             lastProgressSave = Date()
             return
         }
 
         let season = resolvedEpisodeNumbers?.season
         let episode = resolvedEpisodeNumbers?.episode
-        ContinueWatchingStore.save(
-            meta: activeMeta,
-            streamUrl: activeStreamURL,
-            position: progressTime.current,
-            duration: progressTime.duration,
-            season: season,
-            episode: episode
-        )
+        if usesTraktProgress {
+            reportTraktProgress(
+                meta: activeMeta,
+                playbackTime: progressTime,
+                action: nil,
+                force: force
+            )
+        } else {
+            ContinueWatchingStore.save(
+                meta: activeMeta,
+                streamUrl: activeStreamURL,
+                position: progressTime.current,
+                duration: progressTime.duration,
+                season: season,
+                episode: episode
+            )
+        }
         lastProgressSave = Date()
 
         // Ending start / 92% — checkmark without sitting through the credits.
         if shouldMarkAsWatched(at: progressTime) {
             markWatchedIfNeeded()
+        }
+    }
+
+    private var usesTraktProgress: Bool {
+        TraktSettingsStore.watchProgressSource == .trakt &&
+            TraktAuthStore.state.isAuthenticated
+    }
+
+    private func reportTraktProgress(
+        meta: NuvioMeta,
+        playbackTime: PlayerTime,
+        action: TraktScrobbleAction?,
+        force: Bool
+    ) {
+        guard playbackTime.current.isFinite,
+              playbackTime.duration.isFinite,
+              playbackTime.current > 0,
+              playbackTime.duration > 0 else {
+            return
+        }
+
+        let now = Date()
+        guard force || now.timeIntervalSince(lastTraktProgressReport) >= Self.traktProgressReportInterval else {
+            return
+        }
+
+        let scrobbleAction = action ?? (didStartTraktScrobble ? .pause : .start)
+        didStartTraktScrobble = true
+        lastTraktProgressReport = now
+        let episodeNumbers = resolvedEpisodeNumbers
+
+        Task {
+            await TraktProgressService.reportPlayback(
+                meta: meta,
+                position: playbackTime.current,
+                duration: playbackTime.duration,
+                season: episodeNumbers?.season,
+                episode: episodeNumbers?.episode,
+                action: scrobbleAction
+            )
         }
     }
 
@@ -2950,1315 +2807,5 @@ private enum PlayerTrackSelectionStore {
             return
         }
         ProfileSettings.current.set(json, forKey: SettingsKey.playbackTrackSelections)
-    }
-}
-
-// MARK: - Track Info
-
-struct TrackInfo {
-    let index: Int
-    let id: Int
-    let type: String
-    let title: String
-    let lang: String
-    let selected: Bool
-    /// mpv `external-filename` — the URL a `sub-add`ed track was loaded from,
-    /// empty for tracks embedded in the container.
-    let externalFilename: String
-    /// Localized language name for audio cards ("Russian"), empty for subs.
-    var languageName: String = ""
-    /// Technical summary for audio cards ("AC-3 | 6 ch | 48 kHz"), empty for subs.
-    var detail: String = ""
-}
-
-// MARK: - Network buffer sizing
-
-/// libmpv network-cache sizes, driven by Settings → Playback → Network Cache.
-/// `forwardBuffer` is how far ahead mpv prefetches ("preload"); `backBuffer`
-/// keeps already-played data resident for instant backward seeks. Values are
-/// libmpv bytesize strings (e.g. `"128MiB"`).
-///
-/// Caps are intentionally modest on tvOS. Apple TV often has only 2–4 GB RAM
-/// total; demuxer cache + decode surfaces + Metal/Vulkan can jetsam the app
-/// (bug type 298 / `per-process-limit`) once a process approaches ~2 GB.
-/// Older defaults (Auto ≈ 512 MiB–1 GiB forward alone) filled aggressively on
-/// debrid/4K hosts and caused frequent foreground kills during long watches.
-struct PlaybackCacheSettings {
-    let forwardBuffer: String
-    let backBuffer: String
-
-    static var current: PlaybackCacheSettings {
-        switch ProfileSettings.current.string(forKey: SettingsKey.networkCache) ?? "Auto" {
-        case "Small", "Conservative":
-            // Minimal readahead — prefer stability over seek/buffer comfort.
-            return PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
-        case "Medium":
-            return PlaybackCacheSettings(forwardBuffer: "128MiB", backBuffer: "32MiB")
-        case "Large":
-            // Still well under previous 1 GiB default; enough for bursty hosts.
-            return PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
-        case "Max":
-            // High-RAM Apple TV only. Still capped to limit jetsam risk.
-            return PlaybackCacheSettings(forwardBuffer: "512MiB", backBuffer: "96MiB")
-        default:
-            return auto
-        }
-    }
-
-    /// Ceiling scaled to total device RAM (`physicalMemory` is bytes).
-    /// Prefer staying far below jetsam: demuxer is only one slice of peak RSS.
-    /// > 3.5 GB (newer 4K) → 192/48, ~3 GB (common 4K) → 128/32, ≤ 2.5 GB (HD) → 64/16.
-    private static var auto: PlaybackCacheSettings {
-        let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
-        if gib > 3.5 {
-            return PlaybackCacheSettings(forwardBuffer: "192MiB", backBuffer: "48MiB")
-        } else if gib > 2.5 {
-            return PlaybackCacheSettings(forwardBuffer: "128MiB", backBuffer: "32MiB")
-        } else {
-            return PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
-        }
-    }
-}
-
-// MARK: - MPV Player View Controller (tvOS)
-//
-// Self-contained libmpv host. Ported from the iOS bridge, with the Kotlin/
-// Compose plumbing and iOS-only UIViewController overrides (home indicator,
-// status-bar, screen-edge gestures — none exist on tvOS) removed.
-
-final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling {
-    /// Called after a coherent position is captured but before tvOS suspends
-    /// the player. PlayerViewModel uses it for a durable lifecycle save.
-    var onPlaybackSuspended: ((Int64, Int64) -> Void)?
-
-
-    private static let defaultAudioOutput = "avfoundation"
-
-    private let errorStateLock = NSLock()
-    private var metalLayer = MPVMetalLayer()
-    private var lastAppliedDrawableSize: CGSize = .zero
-    private var pendingURL: String?
-    private var pendingAudioURL: String?
-    private var mpv: OpaquePointer?
-    private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
-    private var recentPlaybackLogs: [String] = []
-
-    // Cached track lists
-    var audioTracks: [TrackInfo] = []
-    var subtitleTracks: [TrackInfo] = []
-
-    // State (polled from the view model every 250ms)
-    var isPlayerLoading: Bool = true
-    var isPlayerPlaying: Bool = false
-    var isPlayerEnded: Bool = false
-    private(set) var isAtEndOfFile: Bool = false
-    private(set) var hasCoherentTimeSample: Bool = false
-    var durationMs: Int64 = 0
-    var positionMs: Int64 = 0
-    var bufferedMs: Int64 = 0
-    var currentSpeed: Float = 1.0
-    var currentErrorMessage: String {
-        errorStateLock.lock(); defer { errorStateLock.unlock() }
-        return _currentErrorMessage ?? ""
-    }
-    private var _currentErrorMessage: String?
-    private var _didReachCleanEndOfFile = false
-    private var didReachCleanEndOfFile: Bool {
-        errorStateLock.lock(); defer { errorStateLock.unlock() }
-        return _didReachCleanEndOfFile
-    }
-
-    // tvOS detaches video while another app is frontmost. Freeze the last
-    // coherent time until MPV has reattached and sought back to it; otherwise
-    // keep-open can briefly expose its last frame as time-pos == duration.
-    private var isApplicationBackgrounded = false
-    private var wasPlayingBeforeBackground = false
-    private var lifecyclePositionMs: Int64?
-    private var lifecycleDurationMs: Int64?
-    /// Independent of the UI-facing position, which MPV can overwrite with the
-    /// final frame just before tvOS delivers didEnterBackground.
-    private var lastVerifiedPositionMs: Int64?
-    private var lastVerifiedDurationMs: Int64?
-    private var lastVerifiedWasPlaying = false
-    private var foregroundRestoreTargetMs: Int64?
-    private var foregroundRestoreDeadline: Date?
-    private var lifecycleRestoreFailed = false
-
-    // MARK: - Lifecycle
-
-    override func viewDidLoad() {
-        super.viewDidLoad()
-        view.backgroundColor = .black
-        view.layer.masksToBounds = true
-
-        // `.resize` lets mpv own letterboxing/cropping via panscan/keepaspect.
-        // `.resizeAspect` would re-letterbox after mpv already rendered.
-        metalLayer.contentsGravity = .resize
-        metalLayer.contentsScale = UIScreen.main.nativeScale
-        metalLayer.framebufferOnly = true
-        metalLayer.backgroundColor = UIColor.black.cgColor
-        view.layer.addSublayer(metalLayer)
-        layoutMetalLayer()
-
-        setupMpv()
-        setupNotifications()
-    }
-
-    override func viewDidLayoutSubviews() {
-        super.viewDidLayoutSubviews()
-        layoutMetalLayer()
-        attemptStartPendingLoad()
-    }
-
-    override func viewDidAppear(_ animated: Bool) {
-        super.viewDidAppear(animated)
-        attemptStartPendingLoad()
-    }
-
-    private func layoutMetalLayer() {
-        let bounds = view.bounds
-        guard bounds.width > 1, bounds.height > 1 else { return }
-
-        let scale = UIScreen.main.nativeScale
-        let drawableSize = CGSize(
-            width: (bounds.width * scale).rounded(.toNearestOrAwayFromZero),
-            height: (bounds.height * scale).rounded(.toNearestOrAwayFromZero)
-        )
-
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        metalLayer.contentsScale = scale
-        metalLayer.frame = CGRect(origin: .zero, size: bounds.size)
-        if drawableSize != lastAppliedDrawableSize {
-            metalLayer.drawableSize = drawableSize
-            lastAppliedDrawableSize = drawableSize
-        }
-        CATransaction.commit()
-    }
-
-    // MARK: - MPV Setup
-
-    private func setupMpv() {
-        mpv = mpv_create()
-        guard mpv != nil else {
-            print("[MPV] Failed to create mpv instance")
-            return
-        }
-
-        checkError(mpv_request_log_messages(mpv, "warn"))
-
-        checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &metalLayer))
-        checkError(mpv_set_option_string(mpv, "vo", "gpu-next"))
-        checkError(mpv_set_option_string(mpv, "gpu-api", "vulkan"))
-        checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))
-        checkError(mpv_set_option_string(mpv, "hwdec", "videotoolbox"))
-        checkError(mpv_set_option_string(mpv, "ao", Self.defaultAudioOutput))
-        // AVSampleBufferAudioRenderer follows tvOS's active output route without
-        // using the failing RemoteIO callback from MPV's AudioUnit backend.
-        checkError(mpv_set_option_string(mpv, "audio-channels", "auto-safe"))
-        // AVFoundation accepts interleaved PCM; packed float preserves decoded
-        // precision while supporting route-selected stereo or multichannel audio.
-        checkError(mpv_set_option_string(mpv, "audio-format", "float"))
-        // Headroom for the Audio → Amplification control (+10 dB ≈ 316%).
-        checkError(mpv_set_option_string(mpv, "volume-max", "400"))
-        // Do not silently replace a failed audio renderer with `ao=null` and
-        // continue as video-only playback.
-        checkError(mpv_set_option_string(mpv, "audio-fallback-to-null", "no"))
-
-        // Network buffering. Byte caps (Settings → Playback → Network Cache)
-        // are the hard limit; keep time windows modest so we do not encourage
-        // filling multi‑hundred‑MB demuxer caches on every debrid stream.
-        #if targetEnvironment(simulator)
-        // MoltenVK's tvOS simulator PBO path allocates every uploaded video
-        // frame through MTLSim XPC and can trap in `_xpc_api_misuse` for real
-        // streams. Keep the simulator light and allow VideoToolbox's Metal
-        // texture interop; physical Apple TV keeps the user's cache setting.
-        let cache = PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
-        #else
-        let cache = PlaybackCacheSettings.current
-        #endif
-        checkError(mpv_set_option_string(mpv, "cache", "yes"))
-        // ~2 minutes of readahead intent; demuxer-max-bytes still hard-caps RAM.
-        checkError(mpv_set_option_string(mpv, "cache-secs", "120"))
-        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "120"))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer))
-        checkError(mpv_set_option_string(mpv, "vulkan-swap-mode", "fifo"))
-        checkError(mpv_set_option_string(mpv, "vulkan-queue-count", "1"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-compute", "no"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-transfer", "no"))
-        #if targetEnvironment(simulator)
-        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "no"))
-        #else
-        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "yes"))
-        #endif
-        checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
-        if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
-           let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
-            checkError(mpv_set_option_string(mpv, "alang", alang))
-        }
-        let preferredSubtitleLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
-        let shouldStrictlyMatchSubtitles = SubtitleLanguagePreferences.smartMatchingEnabled() &&
-            !preferredSubtitleLanguages.isEmpty
-        if let slang = SubtitleLanguagePreferences.mpvLanguageList(for: preferredSubtitleLanguages) {
-            checkError(mpv_set_option_string(mpv, "slang", slang))
-        }
-        checkError(mpv_set_option_string(mpv, "subs-match-os-language", shouldStrictlyMatchSubtitles ? "no" : "yes"))
-        checkError(mpv_set_option_string(mpv, "subs-fallback", shouldStrictlyMatchSubtitles ? "no" : "yes"))
-        // ASS/SSA override: Strip (default) flattens styling into app subtitle
-        // style so top-aligned dialogue stays in the safe area; Scale keeps
-        // layout with size adjust; Force applies style more aggressively.
-        let assMode = (ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode) ?? "Strip")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-            .lowercased()
-        let assOverride: String
-        switch assMode {
-        case "scale": assOverride = "scale"
-        case "force": assOverride = "force"
-        default: assOverride = "strip"
-        }
-        checkError(mpv_set_option_string(mpv, "sub-ass-override", assOverride))
-        checkError(mpv_set_option_string(mpv, "sub-use-margins", "yes"))
-        checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", "yes"))
-        checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
-        checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
-        checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))
-        #if targetEnvironment(simulator)
-        checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "no"))
-        #else
-        checkError(mpv_set_option_string(mpv, "hdr-compute-peak", "yes"))
-        #endif
-        checkError(mpv_set_option_string(mpv, "target-prim", "auto"))
-        checkError(mpv_set_option_string(mpv, "target-trc", "auto"))
-
-        checkError(mpv_initialize(mpv))
-        applySubtitleStyle()
-
-        mpv_observe_property(mpv, 0, "pause", MPV_FORMAT_FLAG)
-        mpv_observe_property(mpv, 0, "paused-for-cache", MPV_FORMAT_FLAG)
-        mpv_observe_property(mpv, 0, "core-idle", MPV_FORMAT_FLAG)
-        mpv_observe_property(mpv, 0, "eof-reached", MPV_FORMAT_FLAG)
-        mpv_observe_property(mpv, 0, "seeking", MPV_FORMAT_FLAG)
-        mpv_observe_property(mpv, 0, "track-list/count", MPV_FORMAT_INT64)
-        // Selecting a different audio/subtitle track leaves the track *count*
-        // unchanged, so those alone wouldn't refresh the cached track list and
-        // the panel's checkmark would snap back to the old track. Observing the
-        // active ids (they can be "no"/"auto", hence STRING) fires a refresh the
-        // moment a selection actually changes. See `refreshTracks`.
-        mpv_observe_property(mpv, 0, "aid", MPV_FORMAT_STRING)
-        mpv_observe_property(mpv, 0, "sid", MPV_FORMAT_STRING)
-
-        mpv_set_wakeup_callback(mpv, { ctx in
-            let vc = unsafeBitCast(ctx, to: MPVPlayerViewController.self)
-            vc.readEvents()
-        }, UnsafeMutableRawPointer(Unmanaged.passUnretained(self).toOpaque()))
-    }
-
-    private func setupNotifications() {
-        NotificationCenter.default.addObserver(self, selector: #selector(enterBackground),
-                                               name: UIApplication.didEnterBackgroundNotification, object: nil)
-        NotificationCenter.default.addObserver(self, selector: #selector(enterForeground),
-                                               name: UIApplication.willEnterForegroundNotification, object: nil)
-    }
-
-    @objc private func enterBackground() {
-        guard mpv != nil else { return }
-        let sampledDurationMs = milliseconds(from: readDoubleProperty("duration")) ?? durationMs
-        let sampledPositionMs = milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
-        let verifiedPositionMs = lastVerifiedPositionMs ?? positionMs
-        let verifiedDurationMs = lastVerifiedDurationMs ?? durationMs
-        let referenceDurationMs = max(sampledDurationMs, verifiedDurationMs)
-
-        // The UI-facing position can already contain MPV's bogus final-frame
-        // value by this point. Compare against the independent verified sample.
-        let jumpedToEnd = referenceDurationMs >= 60_000
-            && sampledPositionMs >= referenceDurationMs - 5_000
-            && verifiedPositionMs < referenceDurationMs * 85 / 100
-            && sampledPositionMs - verifiedPositionMs > 30_000
-        let safePositionMs = max(0, jumpedToEnd ? verifiedPositionMs : sampledPositionMs)
-
-        let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
-        wasPlayingBeforeBackground = mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)
-        lifecyclePositionMs = safePositionMs
-        lifecycleDurationMs = max(referenceDurationMs, durationMs)
-        foregroundRestoreTargetMs = nil
-        foregroundRestoreDeadline = nil
-        lifecycleRestoreFailed = false
-        isApplicationBackgrounded = true
-        clearCleanEndState()
-        pausePlayback()
-        setStringProperty("vid", "no")
-        publishLifecycleSnapshot()
-        onPlaybackSuspended?(safePositionMs, lifecycleDurationMs ?? 0)
-    }
-
-    @objc private func enterForeground() {
-        guard mpv != nil else { return }
-        let shouldResume = wasPlayingBeforeBackground
-        setStringProperty("vid", "auto")
-        clearCleanEndState()
-
-        if let target = lifecyclePositionMs {
-            foregroundRestoreTargetMs = target
-            foregroundRestoreDeadline = Date().addingTimeInterval(4)
-            let rawPositionMs = milliseconds(from: readDoubleProperty("time-pos"))
-            if rawPositionMs == nil
-                || abs((rawPositionMs ?? target) - target) > 1_500
-                || getFlag("eof-reached") {
-                seekToMs(target)
-            }
-        }
-
-        isApplicationBackgrounded = false
-        if shouldResume {
-            playPlayback()
-        } else {
-            // Preserve an explicit user pause across app switching.
-            pausePlayback()
-        }
-    }
-
-    private func publishLifecycleSnapshot() {
-        if let duration = lifecycleDurationMs, duration > 0 {
-            durationMs = duration
-        }
-        if let position = lifecyclePositionMs {
-            positionMs = position
-            bufferedMs = max(bufferedMs, position)
-        }
-        hasCoherentTimeSample = durationMs > 0 && positionMs >= 0 && positionMs < durationMs
-        isAtEndOfFile = false
-        isPlayerLoading = false
-        isPlayerPlaying = false
-        isPlayerEnded = false
-    }
-
-    // MARK: - Playback API
-
-    func loadFile(_ urlString: String) {
-        pendingURL = urlString
-        if Thread.isMainThread {
-            attemptStartPendingLoad()
-        } else {
-            DispatchQueue.main.async { [weak self] in self?.attemptStartPendingLoad() }
-        }
-    }
-
-    private func attemptStartPendingLoad() {
-        guard let url = pendingURL, mpv != nil else { return }
-        guard isViewLoaded, view.bounds.width > 1, view.bounds.height > 1 else { return }
-        pendingURL = nil
-        lifecyclePositionMs = nil
-        lifecycleDurationMs = nil
-        lastVerifiedPositionMs = nil
-        lastVerifiedDurationMs = nil
-        lastVerifiedWasPlaying = false
-        foregroundRestoreTargetMs = nil
-        foregroundRestoreDeadline = nil
-        lifecycleRestoreFailed = false
-        hasCoherentTimeSample = false
-        isAtEndOfFile = false
-        layoutMetalLayer()
-        clearPlaybackError()
-        resetDisplayCriteriaProbe()
-        // Do not leave the prior title's HDR criteria active while this file
-        // is loading. The new stream's own VIDEO_RECONFIG will apply fresh
-        // criteria once its color parameters are known.
-        clearDisplayCriteria()
-        isPlayerLoading = true
-        isPlayerEnded = false
-        command("loadfile", args: [url, "replace"])
-        setAspectMode(.fit)
-    }
-
-    func playPlayback() {
-        guard mpv != nil else { return }
-        lastVerifiedWasPlaying = true
-        setFlag("pause", false)
-    }
-
-    func pausePlayback() {
-        guard mpv != nil else { return }
-        lastVerifiedWasPlaying = false
-        setFlag("pause", true)
-    }
-
-    func seekToMs(_ ms: Int64) {
-        guard mpv != nil else { return }
-        rememberExplicitSeek(to: ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute"])
-    }
-
-    func seekByMs(_ ms: Int64) {
-        guard mpv != nil else { return }
-        rememberExplicitSeek(to: positionMs + ms)
-        command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "relative"])
-    }
-
-    private func rememberExplicitSeek(to requestedMs: Int64) {
-        let upperBound = durationMs > 0 ? max(durationMs - 1, 0) : Int64.max
-        lastVerifiedPositionMs = min(max(requestedMs, 0), upperBound)
-        if durationMs > 0 {
-            lastVerifiedDurationMs = durationMs
-        }
-    }
-
-    func setSpeed(_ speed: Float) {
-        guard mpv != nil else { return }
-        var s = Double(speed)
-        mpv_set_property(mpv, "speed", MPV_FORMAT_DOUBLE, &s)
-    }
-
-    /// Decoded video dimensions (0 until the first frame reports params).
-    var videoFrameSize: CGSize {
-        let w = getInt("video-params/w")
-        let h = getInt("video-params/h")
-        guard w > 1, h > 1 else { return .zero }
-        return CGSize(width: w, height: h)
-    }
-
-    /// Actual profile parsed by FFmpeg from the selected HEVC track.
-    var dolbyVisionProfile: Int {
-        getInt("current-tracks/video/dolby-vision-profile")
-    }
-
-    /// AVPlayer must own the window's dynamic-range request while it presents
-    /// the local Dolby Vision playlist.
-    func suspendDisplayCriteriaForNativePlayback() {
-        clearDisplayCriteria()
-    }
-
-    func restoreDisplayCriteriaAfterNativePlayback() {
-        resetDisplayCriteriaProbe()
-        scheduleDisplayCriteriaProbe()
-    }
-
-    /// Keep mpv in letterbox FIT. Fill/stretch are SwiftUI scaleEffect on the host.
-    func setAspectMode(_ mode: PlayerAspectMode) {
-        guard mpv != nil else { return }
-        setDoubleProperty("video-zoom", 0)
-        setDoubleProperty("video-pan-x", 0)
-        setDoubleProperty("video-pan-y", 0)
-        setDoubleProperty("panscan", 0)
-        setFlag("keepaspect", true)
-        setStringProperty("video-unscaled", "no")
-        metalLayer.contentsGravity = .resize
-        _ = mode
-    }
-
-    func setMuted(_ muted: Bool) {
-        guard mpv != nil else { return }
-        setFlag("mute", muted)
-    }
-
-    /// mpv `sub-delay`, in seconds; positive shows captions later.
-    func setSubtitleDelay(_ seconds: Double) {
-        guard mpv != nil else { return }
-        var value = seconds
-        mpv_set_property(mpv, "sub-delay", MPV_FORMAT_DOUBLE, &value)
-    }
-
-    /// mpv `audio-delay`, in seconds; positive delays the audio.
-    func setAudioDelay(_ seconds: Double) {
-        guard mpv != nil else { return }
-        var value = seconds
-        mpv_set_property(mpv, "audio-delay", MPV_FORMAT_DOUBLE, &value)
-    }
-
-    /// PCM software amplification, expressed in dB. mpv's `volume` is a linear
-    /// percentage (100 = unchanged), so convert: percent = 10^(dB/20) · 100.
-    /// `volume-max` is raised at init so the full +10 dB (~316%) is allowed.
-    func setAudioVolumeGain(dB: Double) {
-        guard mpv != nil else { return }
-        var value = pow(10.0, dB / 20.0) * 100.0
-        mpv_set_property(mpv, "volume", MPV_FORMAT_DOUBLE, &value)
-    }
-
-    // MARK: - Track selection
-
-    func selectAudio(_ trackId: Int) {
-        guard mpv != nil else { return }
-        var id = Int64(trackId)
-        mpv_set_property(mpv, "aid", MPV_FORMAT_INT64, &id)
-    }
-
-    func selectSubtitle(_ trackId: Int) {
-        guard mpv != nil else { return }
-        if trackId < 0 {
-            setStringProperty("sid", "no")
-        } else {
-            var id = Int64(trackId)
-            mpv_set_property(mpv, "sid", MPV_FORMAT_INT64, &id)
-        }
-    }
-
-    func addSubtitle(_ subtitle: NuvioSubtitle, select: Bool) {
-        guard mpv != nil else { return }
-        command("sub-add", args: [
-            subtitle.url,
-            select ? "select" : "auto",
-            subtitle.label ?? "",
-            subtitle.language
-        ])
-    }
-
-    func addAudioUrl(_ url: String) {
-        pendingAudioURL = url
-        guard mpv != nil, !isPlayerLoading else { return }
-        attachPendingAudioIfNeeded()
-    }
-
-    private func attachPendingAudioIfNeeded() {
-        guard let url = pendingAudioURL else { return }
-        pendingAudioURL = nil
-        command("audio-add", args: [url, "select"])
-    }
-
-    /// Pushes the user's saved subtitle appearance (Settings → Subtitle Style)
-    /// into libmpv. Safe to call repeatedly — invoked once after init and again
-    /// on every FILE_LOADED so the styling lands on each track that gets parsed.
-    func applySubtitleStyle() {
-        guard mpv != nil else { return }
-        let style = SubtitleStyle.current
-        setStringProperty("sub-scale", String(format: "%.3f", style.subScale))
-        setStringProperty("sub-bold", style.bold ? "yes" : "no")
-        setStringProperty("sub-outline-size", String(format: "%.3f", style.subOutlineSize))
-        setStringProperty("sub-margin-y", String(style.subMarginY))
-        setStringProperty("sub-margin-x", String(style.subMarginX))
-        setStringProperty("sub-spacing", String(style.subSpacing))
-        setStringProperty("sub-shadow-offset", "0")
-        setStringProperty("sub-border-style", "outline-and-shadow")
-        setStringProperty("sub-color", style.subColor)
-        setStringProperty("sub-outline-color", style.subOutlineColor)
-    }
-
-    func destroyPlayer() {
-        NotificationCenter.default.removeObserver(self)
-        pendingURL = nil
-        clearDisplayCriteria()
-        clearPlaybackError()
-        guard let ctx = mpv else { return }
-        mpv = nil  // nil first so the event loop stops reading
-        mpv_terminate_destroy(ctx)
-    }
-
-    // MARK: - State Update
-
-    /// Lightweight state refresh — called by the view model poll (every 250ms).
-    func refreshPlaybackState() {
-        guard mpv != nil else { return }
-        if isApplicationBackgrounded || lifecycleRestoreFailed {
-            publishLifecycleSnapshot()
-            return
-        }
-
-        let duration = readDoubleProperty("duration")
-        let position = readDoubleProperty("time-pos")
-        let cached = readDoubleProperty("demuxer-cache-time") ?? 0
-        let speed = getDouble("speed")
-        let paused = getFlag("pause")
-        let eofReached = getFlag("eof-reached")
-        let idle = getFlag("core-idle")
-        let seeking = getFlag("seeking")
-        let bufferingCache = getFlag("paused-for-cache")
-
-        isAtEndOfFile = eofReached
-
-        if let target = foregroundRestoreTargetMs {
-            let sampledPositionMs = milliseconds(from: position)
-            let restored = duration != nil
-                && sampledPositionMs != nil
-                && abs((sampledPositionMs ?? target) - target) <= 5_000
-                && !eofReached
-
-            if !restored {
-                if let deadline = foregroundRestoreDeadline, Date() < deadline {
-                    clearCleanEndState()
-                    seekToMs(target)
-                    publishLifecycleSnapshot()
-                    return
-                }
-
-                // Never turn a failed lifecycle reattach into a completed
-                // watch. Keep the verified snapshot and surface an error.
-                setPlaybackError("Playback could not resume after returning to Nuvio.")
-                lifecycleRestoreFailed = true
-                publishLifecycleSnapshot()
-                return
-            }
-
-            foregroundRestoreTargetMs = nil
-            foregroundRestoreDeadline = nil
-            lifecyclePositionMs = nil
-            lifecycleDurationMs = nil
-        }
-
-        hasCoherentTimeSample = duration != nil && position != nil
-
-        isPlayerLoading = (idle && !paused && !eofReached) || seeking || bufferingCache
-        isPlayerPlaying = !paused && !idle && !eofReached
-        // Accept completion only after MPV's END_FILE event explicitly reports
-        // EOF. The eof-reached property can race ahead of an END_FILE error.
-        isPlayerEnded = eofReached
-            && didReachCleanEndOfFile
-            && currentErrorMessage.isEmpty
-            && hasCoherentTimeSample
-
-        if let durationMs = milliseconds(from: duration),
-           let positionMs = milliseconds(from: position) {
-            let cachedMs = milliseconds(from: cached) ?? 0
-            let previousPositionMs = lastVerifiedPositionMs
-            let referenceDurationMs = max(durationMs, lastVerifiedDurationMs ?? 0)
-            let implausibleEndJump = referenceDurationMs >= 60_000
-                && positionMs >= referenceDurationMs - 5_000
-                && (previousPositionMs ?? positionMs) < referenceDurationMs * 85 / 100
-                && positionMs - (previousPositionMs ?? positionMs) > 30_000
-
-            if implausibleEndJump, let previousPositionMs {
-                lifecyclePositionMs = previousPositionMs
-                lifecycleDurationMs = referenceDurationMs
-                foregroundRestoreTargetMs = previousPositionMs
-                foregroundRestoreDeadline = Date().addingTimeInterval(4)
-                clearCleanEndState()
-                seekToMs(previousPositionMs)
-                publishLifecycleSnapshot()
-                return
-            }
-
-            if !eofReached,
-               positionMs >= 0,
-               positionMs < durationMs,
-               !implausibleEndJump {
-                lastVerifiedPositionMs = positionMs
-                lastVerifiedDurationMs = durationMs
-                lastVerifiedWasPlaying = !paused && !idle
-            }
-            self.durationMs = durationMs
-            self.positionMs = max(positionMs, 0)
-            self.bufferedMs = max(positionMs + cachedMs, 0)
-        }
-        currentSpeed = Float(speed > 0 ? speed : 1.0)
-    }
-
-    func updateState() {
-        refreshPlaybackState()
-        refreshTracks()
-    }
-
-    private func refreshTracks() {
-        guard mpv != nil else { return }
-        var audio = [TrackInfo]()
-        var subs = [TrackInfo]()
-        let count = getInt("track-list/count")
-        var audioIdx = 0
-        var subIdx = 0
-
-        for i in 0..<count {
-            let type = getString("track-list/\(i)/type") ?? ""
-            let id = getInt("track-list/\(i)/id")
-            let title = getTrackString(i, "title")
-            let lang = getTrackString(i, "lang")
-            let codec = getTrackString(i, "codec")
-            let channelCount = getInt("track-list/\(i)/demux-channel-count")
-            let selected = getFlag("track-list/\(i)/selected")
-            let externalFilename = getTrackString(i, "external-filename")
-
-            if type == "audio" {
-                let sampleRate = getInt("track-list/\(i)/demux-samplerate")
-                let languageName = Self.localizedLanguageName(lang)
-                let display = Self.audioTrackName(title: title, languageName: languageName,
-                                                  codec: codec, channelCount: channelCount,
-                                                  fallback: "Track \(audioIdx + 1)")
-                let detail = Self.audioTrackDetail(codec: codec, channels: channelCount, sampleRate: sampleRate)
-                audio.append(TrackInfo(index: audioIdx, id: id, type: type, title: display, lang: lang,
-                                       selected: selected, externalFilename: externalFilename,
-                                       languageName: languageName, detail: detail))
-                audioIdx += 1
-            } else if type == "sub" {
-                let display = trackTitle(title: title, lang: lang, codec: codec,
-                                         channelCount: 0, fallback: "Subtitle \(subIdx + 1)")
-                subs.append(TrackInfo(index: subIdx, id: id, type: type, title: display, lang: lang,
-                                      selected: selected, externalFilename: externalFilename))
-                subIdx += 1
-            }
-        }
-        audioTracks = audio
-        subtitleTracks = subs
-    }
-
-    private func getTrackString(_ index: Int, _ field: String) -> String {
-        (getString("track-list/\(index)/\(field)") ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    private func trackTitle(title: String, lang: String, codec: String,
-                            channelCount: Int, fallback: String) -> String {
-        let base: String
-        if !title.isEmpty {
-            base = title
-        } else if !lang.isEmpty {
-            base = Locale.current.localizedString(forLanguageCode: lang) ?? lang
-        } else {
-            base = fallback
-        }
-        var details: [String] = []
-        if channelCount == 2 { details.append("Stereo") }
-        else if channelCount == 6 { details.append("5.1") }
-        else if channelCount == 8 { details.append("7.1") }
-        else if channelCount > 0 { details.append("\(channelCount)ch") }
-        if !codec.isEmpty { details.append(codec.uppercased()) }
-        let filtered = details.filter { !base.localizedCaseInsensitiveContains($0) }
-        return filtered.isEmpty ? base : "\(base) (\(filtered.joined(separator: ", ")))"
-    }
-
-    /// Audio card title: the track's own name (or language) with a codec +
-    /// channel-layout summary in parens — "LostFilm (AC-3 Stereo)".
-    private static func audioTrackName(title: String, languageName: String,
-                                       codec: String, channelCount: Int, fallback: String) -> String {
-        let base: String
-        if !title.isEmpty { base = title }
-        else if !languageName.isEmpty { base = languageName }
-        else { base = fallback }
-
-        let summary = [prettyCodec(codec), channelLayout(channelCount)]
-            .filter { !$0.isEmpty }
-            .joined(separator: " ")
-        return summary.isEmpty ? base : "\(base) (\(summary))"
-    }
-
-    /// Audio card detail line — "AC-3 | 6 ch | 48 kHz". Omits missing pieces.
-    private static func audioTrackDetail(codec: String, channels: Int, sampleRate: Int) -> String {
-        var parts: [String] = []
-        let pretty = prettyCodec(codec)
-        if !pretty.isEmpty { parts.append(pretty) }
-        if channels > 0 { parts.append("\(channels) ch") }
-        if sampleRate > 0 { parts.append("\(Int((Double(sampleRate) / 1000.0).rounded())) kHz") }
-        return parts.joined(separator: " | ")
-    }
-
-    private static func localizedLanguageName(_ lang: String) -> String {
-        let trimmed = lang.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return "" }
-        if let name = Locale.current.localizedString(forLanguageCode: trimmed.lowercased()) {
-            return name.prefix(1).uppercased() + name.dropFirst()
-        }
-        return trimmed.prefix(1).uppercased() + trimmed.dropFirst()
-    }
-
-    /// Human channel layout name; falls back to a raw count.
-    private static func channelLayout(_ count: Int) -> String {
-        switch count {
-        case 1: return "Mono"
-        case 2: return "Stereo"
-        case 6: return "5.1"
-        case 8: return "7.1"
-        case let n where n > 0: return "\(n)ch"
-        default: return ""
-        }
-    }
-
-    /// Displays common audio codecs the way listeners recognize them.
-    private static func prettyCodec(_ codec: String) -> String {
-        switch codec.lowercased() {
-        case "ac3": return "AC-3"
-        case "eac3": return "E-AC-3"
-        case "dts": return "DTS"
-        case "dts-hd", "dtshd": return "DTS-HD"
-        case "truehd": return "TrueHD"
-        case "aac": return "AAC"
-        case "flac": return "FLAC"
-        case "opus": return "Opus"
-        case "vorbis": return "Vorbis"
-        case "mp3": return "MP3"
-        case "pcm", "pcm_s16le", "pcm_s24le": return "PCM"
-        case "": return ""
-        default: return codec.uppercased()
-        }
-    }
-
-    // MARK: - Display mode matching (frame rate + HDR)
-    //
-    // tvOS never switches the HDMI output to HDR just because a Metal layer
-    // renders PQ/HLG content — only AVFoundation players get that for free.
-    // When "Match Content → Dynamic Range" is enabled on the Apple TV, apps
-    // must request the switch through AVDisplayManager. tvOS 17 added a public
-    // AVDisplayCriteria initializer, so build a format description carrying the
-    // stream's color tags and hand it to the window. SDR streams must go through
-    // the same path when Nuvio's Frame Rate Matching setting is enabled; gating
-    // criteria on HDR alone leaves 23.976/24 fps SDR video juddering at 60 Hz.
-
-    /// `-[UIWindow avDisplayManager]` is an ObjC *category* from AVKit: calling
-    /// it creates no link-time symbol reference, so the linker drops AVKit from
-    /// the binary and the selector doesn't exist at runtime (crashed on device
-    /// with "unrecognized selector"). Referencing a real AVKit class forces the
-    /// framework to be linked and loaded.
-    private static let avKitLinkAnchor: AnyClass = AVDisplayManager.self
-
-    /// The window we last set criteria on; doubles as the "criteria active" flag.
-    private weak var displayCriteriaWindow: UIWindow?
-    /// Criteria are applied at most once per loaded file (reset in
-    /// `attemptStartPendingLoad`). Re-running on every VIDEO_RECONFIG would
-    /// re-trigger HDMI mode switches — including the RECONFIG our own
-    /// detach/reattach dance produces.
-    private var didApplyDisplayCriteria = false
-    /// True while the HDMI mode switch is settling and video is detached.
-    private var isDisplaySwitchInFlight = false
-    /// `VIDEO_RECONFIG` may arrive before SwiftUI has attached this controller
-    /// to a window, or before MPV has populated the stream dimensions. Keep a
-    /// short, coalesced probe alive for those races so HDR does not silently
-    /// stay in SDR on a physical Apple TV.
-    private var displayCriteriaProbeGeneration = 0
-    private var displayCriteriaProbeAttempts = 0
-    private var isDisplayCriteriaProbeScheduled = false
-    private static let maximumDisplayCriteriaProbeAttempts = 15
-
-    private enum DisplayCriteriaUpdateResult {
-        case appliedOrAlreadyActive
-        case retry
-        case finished
-    }
-
-    private func resetDisplayCriteriaProbe() {
-        displayCriteriaProbeGeneration &+= 1
-        displayCriteriaProbeAttempts = 0
-        isDisplayCriteriaProbeScheduled = false
-    }
-
-    private func scheduleDisplayCriteriaProbe(after delay: TimeInterval = 0) {
-        #if !targetEnvironment(simulator)
-        guard mpv != nil,
-              !didApplyDisplayCriteria,
-              !isDisplaySwitchInFlight,
-              !isDisplayCriteriaProbeScheduled else { return }
-
-        let generation = displayCriteriaProbeGeneration
-        isDisplayCriteriaProbeScheduled = true
-        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
-            guard let self, generation == self.displayCriteriaProbeGeneration else { return }
-            self.isDisplayCriteriaProbeScheduled = false
-            self.probeDisplayCriteria(generation: generation)
-        }
-        #endif
-    }
-
-    private func probeDisplayCriteria(generation: Int) {
-        #if !targetEnvironment(simulator)
-        guard generation == displayCriteriaProbeGeneration else { return }
-
-        switch updateDisplayCriteria() {
-        case .retry:
-            guard displayCriteriaProbeAttempts < Self.maximumDisplayCriteriaProbeAttempts else {
-                print("[MPV] HDR display switch skipped: video parameters did not become ready")
-                return
-            }
-            displayCriteriaProbeAttempts += 1
-            scheduleDisplayCriteriaProbe(after: 0.2)
-        case .appliedOrAlreadyActive, .finished:
-            break
-        }
-        #endif
-    }
-
-    private func updateDisplayCriteria() -> DisplayCriteriaUpdateResult {
-        // AVDisplayManager isn't in the simulator SDK (there's no HDMI output
-        // to switch); this whole path is device-only.
-        #if !targetEnvironment(simulator)
-        guard #available(tvOS 17.0, *) else { return .finished }
-        guard mpv != nil, !isDisplaySwitchInFlight else { return .finished }
-
-        let gamma = (getString("video-params/gamma") ?? "").lowercased()
-        let primaries = (getString("video-params/primaries") ?? "").lowercased()
-        // Dolby Vision Profile 5 can initially present as BT.709 rather than
-        // PQ in video-params. Read the selected track's container metadata
-        // before the HDR gate so it is not incorrectly dismissed as SDR.
-        let dolbyVisionProfile = getInt("current-tracks/video/dolby-vision-profile")
-        let dolbyVisionLevel = getInt("current-tracks/video/dolby-vision-level")
-        let isDolbyVision = dolbyVisionProfile > 0
-
-        // No video attached (e.g. our own `vid=no`, or backgrounding): leave
-        // whatever criteria are in place alone.
-        guard !gamma.isEmpty || !primaries.isEmpty else { return .retry }
-
-        // MPV/FFmpeg have used both concise ("pq" / "hlg") and standards
-        // names (ST 2084 / ARIB B-67) for the same transfer functions.
-        let isHLG = gamma.contains("hlg") || gamma.contains("b67") || gamma.contains("arib")
-        let isPQ = gamma.contains("pq") || gamma.contains("2084")
-        let isHDR = isDolbyVision || isPQ || isHLG || primaries.contains("2020")
-        let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
-        let shouldMatchFrameRate = frameRateMode.caseInsensitiveCompare("Off") != .orderedSame
-        guard isHDR || shouldMatchFrameRate else {
-            clearDisplayCriteria()
-            return .finished
-        }
-        guard !didApplyDisplayCriteria else { return .appliedOrAlreadyActive }
-        guard let window = view.window else { return .retry }
-        // Skip (SDR playback, no crash) rather than abort if the category is
-        // ever missing again — e.g. a future tvOS removing it.
-        _ = Self.avKitLinkAnchor
-        guard window.responds(to: NSSelectorFromString("avDisplayManager")) else {
-            print("[MPV] AVDisplayManager unavailable; HDR display switch skipped")
-            return .finished
-        }
-
-        let width = getInt("video-params/w")
-        let height = getInt("video-params/h")
-        guard width > 0, height > 0 else { return .retry }
-
-        var fps = getDouble("container-fps")
-        if fps <= 0 { fps = getDouble("estimated-vf-fps") }
-        if fps <= 0 { fps = 23.976 }
-
-        // `video-format` is the decoded pixel format, not the encoded stream
-        // codec. Use the selected track so AV1 HDR is not described as HEVC.
-        let videoCodec = (getString("current-tracks/video/codec") ?? "").lowercased()
-        let codecType: CMVideoCodecType
-        switch videoCodec {
-        case "h264": codecType = kCMVideoCodecType_H264
-        case "av1": codecType = kCMVideoCodecType_AV1
-        default: codecType = kCMVideoCodecType_HEVC
-        }
-
-        let extensions: [CFString: Any]
-        if isHDR {
-            let transfer: CFString = isHLG
-                ? kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG
-                : kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ
-            extensions = [
-                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_2020,
-                kCMFormatDescriptionExtension_TransferFunction: transfer,
-                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_2020,
-            ]
-        } else {
-            extensions = [
-                kCMFormatDescriptionExtension_ColorPrimaries: kCMFormatDescriptionColorPrimaries_ITU_R_709_2,
-                kCMFormatDescriptionExtension_TransferFunction: kCMFormatDescriptionTransferFunction_ITU_R_709_2,
-                kCMFormatDescriptionExtension_YCbCrMatrix: kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2,
-            ]
-        }
-
-        var formatDescription: CMVideoFormatDescription?
-        let status = CMVideoFormatDescriptionCreate(
-            allocator: kCFAllocatorDefault,
-            codecType: codecType,
-            width: Int32(width),
-            height: Int32(height),
-            extensions: extensions as CFDictionary,
-            formatDescriptionOut: &formatDescription
-        )
-        guard status == noErr, let formatDescription else {
-            print("[MPV] Failed to build HDR format description (\(status))")
-            return .finished
-        }
-
-        // This is parsed from the stream itself, unlike a source title such as
-        // "4K WEBRip". Dolby Vision needs its per-frame metadata delivered by
-        // the decoder/output path; the MPV Metal renderer cannot manufacture
-        // that metadata for AVDisplayManager, so its compatible HDR10/PQ base
-        // layer is requested here instead. The log makes the exact profile
-        // visible on-device without incorrectly claiming a Dolby Vision output.
-        let sourceRange: String
-        // Honest labeling: MPV cannot emit native Dolby Vision over HDMI —
-        // this path is the Android-equivalent STRIP_TO_HDR10 / PQ fallback.
-        if isDolbyVision {
-            sourceRange = "Dolby Vision profile \(dolbyVisionProfile), level \(dolbyVisionLevel) → HDR10/PQ (not native DV)"
-        } else if isHLG {
-            sourceRange = "HLG"
-        } else if isHDR {
-            sourceRange = "HDR10/PQ"
-        } else {
-            sourceRange = "SDR"
-        }
-        if isHDR {
-            let targetTRC = isHLG ? "hlg" : "pq"
-            // Keep the renderer's output colorimetry identical to the format
-            // description sent to tvOS. Leaving these on `auto` can adapt a wide
-            // gamut source to BT.709 and then have the TV interpret it as BT.2020,
-            // which exaggerates reds, oranges, and skin tones.
-            setStringProperty("target-prim", "bt.2020")
-            setStringProperty("target-trc", targetTRC)
-        } else {
-            setStringProperty("target-prim", "auto")
-            setStringProperty("target-trc", "auto")
-        }
-        print("[MPV] Display request: \(sourceRange); frameRateMode=\(frameRateMode), codec=\(videoCodec.isEmpty ? "unknown" : videoCodec), gamma=\(gamma), primaries=\(primaries), \(width)x\(height) @ \(fps)fps")
-
-        // The HDMI mode switch tears down and rebuilds the display pipeline.
-        // Presenting Vulkan frames into the CAMetalLayer while that happens
-        // crashes MoltenVK, so idle mpv's video chain first (the same
-        // detach/reattach the background/foreground path already survives),
-        // request the switch, and only reattach once the switch has settled.
-        didApplyDisplayCriteria = true
-        isDisplaySwitchInFlight = true
-        setStringProperty("vid", "no")
-
-        let manager = window.avDisplayManager
-        manager.preferredDisplayCriteria = AVDisplayCriteria(
-            refreshRate: Float(fps),
-            formatDescription: formatDescription
-        )
-        displayCriteriaWindow = window
-
-        // Give the switch a beat to start before polling for completion.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            self?.reattachVideoWhenDisplaySettled(manager, attemptsLeft: 16)
-        }
-        return .appliedOrAlreadyActive
-        #else
-        return .finished
-        #endif
-    }
-
-    #if !targetEnvironment(simulator)
-    private func reattachVideoWhenDisplaySettled(_ manager: AVDisplayManager, attemptsLeft: Int) {
-        guard mpv != nil else {
-            isDisplaySwitchInFlight = false
-            return
-        }
-        if manager.isDisplayModeSwitchInProgress && attemptsLeft > 0 {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.25) { [weak self] in
-                self?.reattachVideoWhenDisplaySettled(manager, attemptsLeft: attemptsLeft - 1)
-            }
-            return
-        }
-        isDisplaySwitchInFlight = false
-        setStringProperty("vid", "auto")
-    }
-    #endif
-
-    private func clearDisplayCriteria() {
-        #if !targetEnvironment(simulator)
-        displayCriteriaWindow?.avDisplayManager.preferredDisplayCriteria = nil
-        displayCriteriaWindow = nil
-        didApplyDisplayCriteria = false
-        if mpv != nil {
-            setStringProperty("target-prim", "auto")
-            setStringProperty("target-trc", "auto")
-        }
-        #endif
-    }
-
-    // MARK: - Error tracking
-
-    private func clearPlaybackError() {
-        errorStateLock.lock()
-        recentPlaybackLogs.removeAll(keepingCapacity: true)
-        _currentErrorMessage = nil
-        _didReachCleanEndOfFile = false
-        errorStateLock.unlock()
-    }
-
-    private func clearCleanEndState() {
-        errorStateLock.lock()
-        _didReachCleanEndOfFile = false
-        errorStateLock.unlock()
-    }
-
-    private func setCleanEndState(_ reachedEOF: Bool) {
-        errorStateLock.lock()
-        _didReachCleanEndOfFile = reachedEOF
-        errorStateLock.unlock()
-    }
-
-    private func appendPlaybackLog(prefix: String, level: String, text: String) {
-        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return }
-        guard level == "warn" || level == "error" || level == "fatal" else { return }
-        errorStateLock.lock()
-        recentPlaybackLogs.append("[\(prefix)] \(trimmed)")
-        if recentPlaybackLogs.count > 4 {
-            recentPlaybackLogs.removeFirst(recentPlaybackLogs.count - 4)
-        }
-        errorStateLock.unlock()
-    }
-
-    private func setPlaybackError(_ fallback: String) {
-        let trimmedFallback = fallback.trimmingCharacters(in: .whitespacesAndNewlines)
-        errorStateLock.lock()
-        _didReachCleanEndOfFile = false
-        var parts = recentPlaybackLogs.suffix(3)
-        if !trimmedFallback.isEmpty && !parts.contains(trimmedFallback) {
-            parts.append(trimmedFallback)
-        }
-        _currentErrorMessage = parts.isEmpty ? "Unable to play this stream." : parts.joined(separator: "\n")
-        errorStateLock.unlock()
-    }
-
-    // MARK: - Event Loop
-
-    private func readEvents() {
-        eventQueue.async { [weak self] in
-            guard let self, let mpv = self.mpv else { return }
-            while true {
-                let event = mpv_wait_event(mpv, 0)
-                guard let eventPtr = event else { break }
-                if eventPtr.pointee.event_id == MPV_EVENT_NONE { break }
-
-                switch eventPtr.pointee.event_id {
-                case MPV_EVENT_PROPERTY_CHANGE:
-                    DispatchQueue.main.async { self.updateState() }
-                case MPV_EVENT_START_FILE:
-                    self.clearPlaybackError()
-                case MPV_EVENT_FILE_LOADED:
-                    DispatchQueue.main.async {
-                        self.clearPlaybackError()
-                        guard !self.rejectUnsupportedSimulatorCodecIfNeeded() else { return }
-                        self.isPlayerLoading = false
-                        self.attachPendingAudioIfNeeded()
-                        self.applySubtitleStyle()
-                        self.setAspectMode(.fit)
-                        self.updateState()
-                        self.resetDisplayCriteriaProbe()
-                        self.scheduleDisplayCriteriaProbe()
-                    }
-                case MPV_EVENT_VIDEO_RECONFIG:
-                    // Fires once decode starts and whenever the video params
-                    // change — the earliest point video-params/* is reliable.
-                    // A short retry covers the race where it fires before the
-                    // view is attached to a UIWindow on physical Apple TV.
-                    DispatchQueue.main.async { self.scheduleDisplayCriteriaProbe() }
-                case MPV_EVENT_END_FILE:
-                    if let data = eventPtr.pointee.data {
-                        let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
-                        if endFile.reason == MPV_END_FILE_REASON_EOF {
-                            self.setCleanEndState(true)
-                        } else if endFile.reason == MPV_END_FILE_REASON_ERROR {
-                            let errorText = String(cString: mpv_error_string(endFile.error))
-                            self.setPlaybackError("[mpv] \(errorText)")
-                            print("[MPV] End file error: \(errorText)")
-                        } else {
-                            self.setCleanEndState(false)
-                        }
-                    }
-                case MPV_EVENT_SHUTDOWN:
-                    return
-                case MPV_EVENT_LOG_MESSAGE:
-                    if let msg = UnsafeMutablePointer<mpv_event_log_message>(OpaquePointer(eventPtr.pointee.data)) {
-                        let prefix = String(cString: msg.pointee.prefix!)
-                        let level = String(cString: msg.pointee.level!)
-                        let text = String(cString: msg.pointee.text!)
-                        self.appendPlaybackLog(prefix: prefix, level: level, text: text)
-                        print("[MPV][\(prefix)] \(level): \(text)", terminator: "")
-                    }
-                default:
-                    break
-                }
-            }
-        }
-    }
-
-    /// MoltenVK on the tvOS simulator can eventually trap while uploading an
-    /// AV1 software-decoded frame through MTLSim shared memory. Stream labels
-    /// are filtered before selection, but this verifies the actual container
-    /// codec as a final safety net for unlabeled direct URLs.
-    private func rejectUnsupportedSimulatorCodecIfNeeded() -> Bool {
-        #if targetEnvironment(simulator)
-        let codec = (getString("current-tracks/video/codec") ?? "").lowercased()
-        guard codec == "av1" || codec == "av01" else { return false }
-
-        setStringProperty("vid", "no")
-        command("stop", checkForErrors: false)
-        setPlaybackError("AV1 playback is unavailable in the Apple TV Simulator. Choose an H.264 or HEVC stream.")
-        isPlayerLoading = false
-        isPlayerPlaying = false
-        isPlayerEnded = false
-        return true
-        #else
-        return false
-        #endif
-    }
-
-    // MARK: - MPV Helpers
-
-    private func command(_ command: String, args: [String?] = [], checkForErrors: Bool = true) {
-        guard mpv != nil else { return }
-        var cargs = makeCArgs(command, args).map { $0.flatMap { UnsafePointer<CChar>(strdup($0)) } }
-        defer { for ptr in cargs where ptr != nil { free(UnsafeMutablePointer(mutating: ptr!)) } }
-        let ret = mpv_command(mpv, &cargs)
-        if checkForErrors { checkError(ret) }
-    }
-
-    private func makeCArgs(_ command: String, _ args: [String?]) -> [String?] {
-        var strArgs = args
-        strArgs.insert(command, at: 0)
-        strArgs.append(nil)
-        return strArgs
-    }
-
-    private func readDoubleProperty(_ name: String) -> Double? {
-        guard mpv != nil else { return nil }
-        var data = Double()
-        let result = mpv_get_property(mpv, name, MPV_FORMAT_DOUBLE, &data)
-        guard result >= 0, data.isFinite else { return nil }
-        return data
-    }
-
-    private func getDouble(_ name: String) -> Double {
-        readDoubleProperty(name) ?? 0
-    }
-
-    private func milliseconds(from seconds: Double?) -> Int64? {
-        guard let seconds,
-              seconds.isFinite,
-              seconds >= 0,
-              seconds <= Double(Int64.max) / 1000 else { return nil }
-        return Int64(seconds * 1000)
-    }
-
-    private func getString(_ name: String) -> String? {
-        guard mpv != nil else { return nil }
-        let cstr = mpv_get_property_string(mpv, name)
-        let str: String? = cstr == nil ? nil : String(cString: cstr!)
-        mpv_free(cstr)
-        return str
-    }
-
-    private func getFlag(_ name: String) -> Bool {
-        guard mpv != nil else { return false }
-        var data = Int64()
-        mpv_get_property(mpv, name, MPV_FORMAT_FLAG, &data)
-        return data > 0
-    }
-
-    private func setFlag(_ name: String, _ flag: Bool) {
-        guard mpv != nil else { return }
-        var data: Int = flag ? 1 : 0
-        mpv_set_property(mpv, name, MPV_FORMAT_FLAG, &data)
-    }
-
-    private func setStringProperty(_ name: String, _ value: String) {
-        guard mpv != nil else { return }
-        checkError(mpv_set_property_string(mpv, name, value))
-    }
-
-    private func setDoubleProperty(_ name: String, _ value: Double) {
-        guard mpv != nil else { return }
-        var data = value
-        checkError(mpv_set_property(mpv, name, MPV_FORMAT_DOUBLE, &data))
-    }
-
-    private func getInt(_ name: String) -> Int {
-        guard mpv != nil else { return 0 }
-        var data = Int64()
-        mpv_get_property(mpv, name, MPV_FORMAT_INT64, &data)
-        return Int(data)
-    }
-
-    private func checkError(_ status: CInt) {
-        if status < 0 {
-            print("[MPV] API error: \(String(cString: mpv_error_string(status)))")
-        }
-    }
-}
-
-// MARK: - Metal Layer
-
-final class MPVMetalLayer: CAMetalLayer {
-    override var drawableSize: CGSize {
-        get { super.drawableSize }
-        set {
-            if Int(newValue.width) > 1 && Int(newValue.height) > 1 {
-                super.drawableSize = newValue
-            }
-        }
     }
 }

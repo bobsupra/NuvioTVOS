@@ -19,7 +19,7 @@ struct TraktCommentReview: Identifiable, Equatable {
 }
 
 /// Trakt comments + related titles for the details page.
-/// Uses the Nuvio Trakt proxy (client id stays server-side) when the user is linked.
+/// Calls Trakt directly with the API credentials entered in Settings.
 enum TraktDetailsService {
     private static let pageLimit = 5
 
@@ -36,7 +36,7 @@ enum TraktDetailsService {
         guard isAuthenticated, commentsEnabled else { return [] }
         guard let path = await resolvePath(for: meta) else { return [] }
         let route = "\(path.endpoint)/\(path.pathId)/comments/likes?page=1&limit=\(pageLimit)"
-        guard let data = await proxyGET(route: route) else { return [] }
+        guard let data = await traktGET(route: route) else { return [] }
 
         guard let dtos = try? JSONDecoder().decode([TraktCommentDTO].self, from: data) else {
             return []
@@ -50,7 +50,7 @@ enum TraktDetailsService {
         guard TraktSettingsStore.moreLikeThisSource == .trakt else { return [] }
         guard let path = await resolvePath(for: meta) else { return [] }
         let route = "\(path.endpoint)/\(path.pathId)/related?extended=full,images"
-        guard let data = await proxyGET(route: route) else { return [] }
+        guard let data = await traktGET(route: route) else { return [] }
 
         if path.endpoint == "movies",
            let movies = try? JSONDecoder().decode([TraktRelatedMovieDTO].self, from: data) {
@@ -96,7 +96,7 @@ enum TraktDetailsService {
 
     private static func searchImdbViaTrakt(tmdbId: Int, type: String) async -> String? {
         let route = "search/tmdb/\(tmdbId)?type=\(type)"
-        guard let data = await proxyGET(route: route),
+        guard let data = await traktGET(route: route),
               let results = try? JSONDecoder().decode([TraktSearchResultDTO].self, from: data) else {
             return nil
         }
@@ -113,7 +113,7 @@ enum TraktDetailsService {
 
     private static func searchSlugViaTrakt(tmdbId: Int, type: String) async -> String? {
         let route = "search/tmdb/\(tmdbId)?type=\(type)"
-        guard let data = await proxyGET(route: route),
+        guard let data = await traktGET(route: route),
               let results = try? JSONDecoder().decode([TraktSearchResultDTO].self, from: data) else {
             return nil
         }
@@ -124,20 +124,25 @@ enum TraktDetailsService {
         return nil
     }
 
-    // MARK: - Proxy
+    // MARK: - Trakt API
 
-    private static func proxyGET(route: String) async -> Data? {
-        guard TraktConfig.proxyConfigured else { return nil }
-        guard let token = TraktAuthStore.state.accessToken, !token.isEmpty else { return nil }
+    private static func traktGET(route: String) async -> Data? {
+        guard TraktConfig.isConfigured else { return nil }
+        let authService = TraktAuthService()
+        guard await authService.refreshTokenIfNeeded(),
+              let token = TraktAuthStore.state.accessToken,
+              !token.isEmpty else { return nil }
 
-        let base = TraktConfig.proxyURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        let base = TraktConfig.apiBaseURL.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
         guard let url = URL(string: "\(base)/\(route)") else { return nil }
 
         var request = URLRequest(url: url)
         request.httpMethod = "GET"
-        request.setValue(token, forHTTPHeaderField: "X-Trakt-Access-Token")
-        request.setValue(AuthConfig.apiKey, forHTTPHeaderField: "apikey")
-        request.setValue("Bearer \(AuthConfig.apiKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(TraktConfig.userAgent, forHTTPHeaderField: "User-Agent")
+        request.setValue(TraktConfig.clientID, forHTTPHeaderField: "trakt-api-key")
+        request.setValue("2", forHTTPHeaderField: "trakt-api-version")
+        request.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         request.timeoutInterval = 15
 
         do {
@@ -230,7 +235,7 @@ private struct TraktRelatedMovieDTO: Decodable {
             id: id,
             type: "movie",
             name: name,
-            posterURL: images?.poster?.first ?? images?.fanart?.first,
+            posterURL: (images?.poster?.first ?? images?.fanart?.first)?.normalizedTraktImageURL,
             year: year.map(String.init),
             rating: nil,
             overview: overview
@@ -256,7 +261,7 @@ private struct TraktRelatedShowDTO: Decodable {
             id: id,
             type: "series",
             name: name,
-            posterURL: images?.poster?.first ?? images?.fanart?.first,
+            posterURL: (images?.poster?.first ?? images?.fanart?.first)?.normalizedTraktImageURL,
             year: year.map(String.init),
             rating: nil,
             overview: overview
@@ -273,5 +278,20 @@ private extension String {
     var nilIfEmpty: String? {
         let t = trimmingCharacters(in: .whitespacesAndNewlines)
         return t.isEmpty ? nil : t
+    }
+
+    /// Trakt image fields may contain `walter.trakt.tv/...` or `//...` rather
+    /// than an absolute URL. Android normalizes those paths before rendering;
+    /// do the same on tvOS.
+    var normalizedTraktImageURL: String? {
+        let value = trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !value.isEmpty else { return nil }
+        if value.lowercased().hasPrefix("https://") { return value }
+        if value.lowercased().hasPrefix("http://") {
+            return "https://\(value.dropFirst("http://".count))"
+        }
+        if value.hasPrefix("//") { return "https:\(value)" }
+        if value.lowercased().contains("trakt.tv/") { return "https://\(value)" }
+        return value
     }
 }

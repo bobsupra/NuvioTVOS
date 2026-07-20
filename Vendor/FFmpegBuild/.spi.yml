@@ -1,0 +1,9 @@
+version: 1
+builder:
+  configs:
+    - platform: ios
+      scheme: FFmpegBuild
+    - platform: tvos
+      scheme: FFmpegBuild
+    - platform: macos
+      scheme: FFmpegBuild

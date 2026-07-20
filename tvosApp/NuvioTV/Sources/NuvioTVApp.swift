@@ -595,6 +595,7 @@ struct ContentView: View {
 
             if case .details(let contentId, let contentType) = activeScreen {
                 detailsScreen(contentId: contentId, contentType: contentType)
+                    .id("\(contentType):\(contentId)")
                     .transition(.opacity)
                     .zIndex(1)
             }
@@ -1458,6 +1459,7 @@ private struct TVMainTabView: View {
                 onResumePlayback: onResumePlayback,
                 onLongPressCard: onLongPressCard
             )
+                .id(activeProfile?.id ?? "none")
                 .tabItem {
                     Label(TVTab.home.title, systemImage: TVTab.home.symbol)
                 }
@@ -1475,6 +1477,7 @@ private struct TVMainTabView: View {
                 .tag(TVTab.search)
 
             LibraryView(viewModel: libraryViewModel, onContentClick: onNavigateToDetails, onLongPress: onLongPressCard, onOpenCloudLibrary: onOpenCloudLibrary)
+                .id(activeProfile?.id ?? "none")
                 .tabItem {
                     Label(TVTab.library.title, systemImage: TVTab.library.symbol)
                 }
@@ -1736,6 +1739,8 @@ struct TVHomeView: View {
     @State private var rowScrollStore = TVHomeRowScrollStore()
     @State private var addonReloadTask: Task<Void, Never>?
     @State private var continueWatching: [ContinueWatchingItem] = []
+    @State private var displayedProgressSource: TraktWatchProgressSource?
+    @State private var continueWatchingRefreshGeneration = 0
     @State private var watchedTitleKeys: Set<String> = []
     @State private var errorMessage: String?
     @State private var didRequestInitialCardFocus = false
@@ -2004,6 +2009,9 @@ struct TVHomeView: View {
             await load()
             await ContinueWatchingStore.refreshMissingEpisodeDetails()
         }
+        .task {
+            await refreshContinueWatchingFromSelectedSource()
+        }
         .onAppear {
             // Classic was never a distinct layout; collapse legacy values to Modern.
             if homeLayout == "Classic" { homeLayout = "Modern" }
@@ -2015,6 +2023,12 @@ struct TVHomeView: View {
         // changes (progress saved during playback, item finished/removed).
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification)) { _ in
             refreshContinueWatching()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification)) { _ in
+            Task { await refreshContinueWatchingFromSelectedSource() }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification)) { _ in
+            Task { await refreshContinueWatchingFromSelectedSource() }
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
             refreshWatchedTitles()
@@ -2053,6 +2067,7 @@ struct TVHomeView: View {
         .onDisappear {
             focusWork.cancelAll()
             addonReloadTask?.cancel()
+            continueWatchingRefreshGeneration &+= 1
         }
         .onChange(of: isLoading) { loading in
             if loading {
@@ -2669,7 +2684,42 @@ struct TVHomeView: View {
     }
 
     private func refreshContinueWatching() {
+        guard !usesTraktProgress else {
+            if displayedProgressSource != .trakt {
+                continueWatching = []
+                displayedProgressSource = .trakt
+            }
+            return
+        }
         continueWatching = ContinueWatchingStore.items().filter { isVisible($0.meta) }
+        displayedProgressSource = .nuvioSync
+    }
+
+    @MainActor
+    private func refreshContinueWatchingFromSelectedSource() async {
+        continueWatchingRefreshGeneration &+= 1
+        let generation = continueWatchingRefreshGeneration
+        let profileID = ContinueWatchingStore.activeProfileId
+
+        refreshContinueWatching()
+        guard usesTraktProgress else { return }
+
+        let items = await TraktProgressService.fetchContinueWatching(repository: repository)
+        guard !Task.isCancelled,
+              generation == continueWatchingRefreshGeneration,
+              profileID == ContinueWatchingStore.activeProfileId,
+              usesTraktProgress,
+              let items else { return }
+        continueWatching = items.filter { isVisible($0.meta) }
+        displayedProgressSource = .trakt
+    }
+
+    private var selectedProgressSource: TraktWatchProgressSource {
+        TraktSettingsStore.watchProgressSource
+    }
+
+    private var usesTraktProgress: Bool {
+        selectedProgressSource == .trakt && TraktAuthStore.state.isAuthenticated
     }
 
     private func refreshWatchedTitles() {
@@ -3657,7 +3707,11 @@ private enum CollectionFolderGridMetrics {
 private struct CollectionFolderCatalogRow: Identifiable {
     let id: String
     let title: String
-    let items: [NuvioMeta]
+    let source: NuvioCollectionCatalogSource
+    var items: [NuvioMeta]
+    var nextSkip: Int
+    var hasMore: Bool
+    var isLoadingMore: Bool = false
 }
 
 /// Full-screen folder browser. Honors collection `viewMode`:
@@ -3680,6 +3734,8 @@ struct CollectionFolderBrowseView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+
+    private let pageSize = 40
 
     private var usesRows: Bool { folder.viewMode.usesCatalogRows }
 
@@ -3842,8 +3898,12 @@ struct CollectionFolderBrowseView: View {
                                 id: row.id,
                                 title: row.title,
                                 items: row.items,
+                                isLoadingMore: row.isLoadingMore,
                                 layoutMode: homeLayout,
                                 showPosterLabels: posterLabels,
+                                onApproachEnd: { item in
+                                    loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
+                                },
                                 onSelect: onSelect
                             )
                         }
@@ -3866,11 +3926,22 @@ struct CollectionFolderBrowseView: View {
                     ) {
                         onSelect(item)
                     }
+                    .onAppear {
+                        loadMoreGridIfNeeded(currentItem: item)
+                    }
                 }
             }
             .padding(.top, 16)
             .padding(.horizontal, 60)
-            .padding(.bottom, 60)
+
+            if isGridLoadingMore {
+                ProgressView()
+                    .tint(.white)
+                    .padding(.vertical, 28)
+                    .frame(maxWidth: .infinity)
+            }
+
+            Color.clear.frame(height: 60)
         }
         .focusSection()
         .defaultFocusIfAvailable($focusedItemID, displayedGridItems.first?.id)
@@ -3895,12 +3966,24 @@ struct CollectionFolderBrowseView: View {
         var all: [NuvioMeta] = []
         var seen = Set<String>()
         for source in sources {
-            let resolved = await repository.getCollectionFolderItems(sources: [source], limit: 40)
+            guard let page = try? await repository.browseCatalog(
+                addonId: source.addonId,
+                contentType: source.type,
+                catalogId: source.catalogId,
+                skip: 0,
+                genre: source.genre
+            ) else { continue }
+            let batch = Array(page.items.prefix(pageSize))
+            var sourceIds = Set<String>()
+            let resolved = batch.filter { sourceIds.insert($0.id).inserted }
             rows.append(
                 CollectionFolderCatalogRow(
                     id: Self.sourceKey(source),
                     title: Self.sourceLabel(source),
-                    items: resolved
+                    source: source,
+                    items: resolved,
+                    nextSkip: batch.count,
+                    hasMore: page.hasMore && !batch.isEmpty
                 )
             )
             for meta in resolved where seen.insert(meta.id).inserted {
@@ -3910,6 +3993,77 @@ struct CollectionFolderBrowseView: View {
         catalogRows = rows.filter { !$0.items.isEmpty }
         items = all
         isLoading = false
+    }
+
+    private var isGridLoadingMore: Bool {
+        if folder.showAllTab, !tabLabels.isEmpty, selectedTabIndex == 0 {
+            return catalogRows.contains(where: \.isLoadingMore)
+        }
+        guard let rowId = selectedGridRowId else { return false }
+        return catalogRows.first(where: { $0.id == rowId })?.isLoadingMore == true
+    }
+
+    private var selectedGridRowId: String? {
+        guard !usesRows, !tabLabels.isEmpty else { return catalogRows.first?.id }
+        if folder.showAllTab, selectedTabIndex == 0 { return nil }
+        let sourceIndex = folder.showAllTab ? selectedTabIndex - 1 : selectedTabIndex
+        guard folder.sources.indices.contains(sourceIndex) else { return nil }
+        return Self.sourceKey(folder.sources[sourceIndex])
+    }
+
+    private func loadMoreGridIfNeeded(currentItem: NuvioMeta) {
+        guard displayedGridItems.suffix(8).contains(where: { $0.id == currentItem.id }) else { return }
+
+        if folder.showAllTab, !tabLabels.isEmpty, selectedTabIndex == 0 {
+            for row in catalogRows where row.hasMore && !row.isLoadingMore {
+                loadMoreSource(rowId: row.id)
+            }
+        } else if let rowId = selectedGridRowId {
+            loadMoreSource(rowId: rowId)
+        }
+    }
+
+    private func loadMoreRowIfNeeded(rowId: String, currentItem: NuvioMeta) {
+        guard let row = catalogRows.first(where: { $0.id == rowId }),
+              row.items.suffix(8).contains(where: { $0.id == currentItem.id }) else { return }
+        loadMoreSource(rowId: rowId)
+    }
+
+    private func loadMoreSource(rowId: String) {
+        guard let rowIndex = catalogRows.firstIndex(where: { $0.id == rowId }),
+              catalogRows[rowIndex].hasMore,
+              !catalogRows[rowIndex].isLoadingMore else { return }
+
+        let source = catalogRows[rowIndex].source
+        let requestedSkip = catalogRows[rowIndex].nextSkip
+        catalogRows[rowIndex].isLoadingMore = true
+
+        Task { @MainActor in
+            do {
+                let page = try await repository.browseCatalog(
+                    addonId: source.addonId,
+                    contentType: source.type,
+                    catalogId: source.catalogId,
+                    skip: requestedSkip,
+                    genre: source.genre
+                )
+                guard let latestIndex = catalogRows.firstIndex(where: { $0.id == rowId }) else { return }
+
+                let batch = Array(page.items.prefix(pageSize))
+                var existingRowIds = Set(catalogRows[latestIndex].items.map(\.id))
+                let newItems = batch.filter { existingRowIds.insert($0.id).inserted }
+                catalogRows[latestIndex].items.append(contentsOf: newItems)
+                catalogRows[latestIndex].nextSkip = requestedSkip + batch.count
+                catalogRows[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
+                catalogRows[latestIndex].isLoadingMore = false
+
+                var existingAllIds = Set(items.map(\.id))
+                items.append(contentsOf: newItems.filter { existingAllIds.insert($0.id).inserted })
+            } catch {
+                guard let latestIndex = catalogRows.firstIndex(where: { $0.id == rowId }) else { return }
+                catalogRows[latestIndex].isLoadingMore = false
+            }
+        }
     }
 
     private static func sourceKey(_ source: NuvioCollectionCatalogSource) -> String {
@@ -3935,8 +4089,10 @@ private struct CollectionFolderHomeStyleRow: View {
     let id: String
     let title: String
     let items: [NuvioMeta]
+    var isLoadingMore: Bool = false
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
+    let onApproachEnd: (NuvioMeta) -> Void
     let onSelect: (NuvioMeta) -> Void
 
     /// Stable row id so composite card keys stay unique across strips.
@@ -4003,6 +4159,7 @@ private struct CollectionFolderHomeStyleRow: View {
                                 }
                             }
                             landscapeFocusedId = cardKey
+                            onApproachEnd(focused)
                         },
                         onBlur: { blurred in
                             let key = "\(rowId)\u{1}\(blurred.id)"
@@ -4017,6 +4174,12 @@ private struct CollectionFolderHomeStyleRow: View {
                     ) {
                         onSelect(item)
                     }
+                }
+
+                if isLoadingMore {
+                    ProgressView()
+                        .tint(.white)
+                        .frame(width: posterWidth, height: rowHomeLayout == "Compact" ? 255 : 315)
                 }
             }
             .padding(.vertical, TVHomeLayout.stripVerticalPadding)

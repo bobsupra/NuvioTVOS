@@ -1947,6 +1947,7 @@ fileprivate final class NuvioAPIClient {
             // Sync policy is device-local. Exporting it lets a temporary test
             // or another TV disable account progress pulls everywhere.
             guard key != SettingsKey.accountSyncWatchState else { return }
+            guard !SettingsKey.deviceLocal.contains(key) else { return }
             guard let value = defaults.object(forKey: key),
                   let encoded = Self.encodeSettingValue(value) else {
                 return
@@ -1960,6 +1961,7 @@ fileprivate final class NuvioAPIClient {
         let defaults = ProfileSettings.store(for: localProfileId)
         SettingsKey.all.forEach { key in
             guard key != SettingsKey.accountSyncWatchState else { return }
+            guard !SettingsKey.deviceLocal.contains(key) else { return }
             guard let encoded = remote[key] as? [String: Any],
                   let value = Self.decodeSettingValue(encoded) else {
                 return

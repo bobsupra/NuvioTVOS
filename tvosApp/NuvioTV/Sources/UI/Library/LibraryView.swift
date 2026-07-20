@@ -189,6 +189,9 @@ public struct LibraryView: View {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
         }
+        .task {
+            await viewModel.refreshSelectedLibrary()
+        }
     }
 
     private func restoreOverlayFocus(to target: String, generation: Int) {

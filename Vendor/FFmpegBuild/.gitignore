@@ -1,0 +1,11 @@
+.DS_Store
+/.build
+/build
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/
+.netrc
+
+# Local-only design specs and plans (never pushed to the public repo)
+docs/superpowers/

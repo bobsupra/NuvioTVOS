@@ -9,7 +9,7 @@
   <p>
     A native Apple TV port of Nuvio, forked from the mobile app so the living-room experience can be developed independently.
     <br />
-    SwiftUI tvOS shell - Stremio-compatible catalogs - AVPlayer / MPVKit playback
+    SwiftUI tvOS shell - Stremio-compatible catalogs - AetherEngine / MPVKit playback
   </p>
 
   <p>
@@ -63,7 +63,7 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - Long-press quick actions for poster cards, including details, library toggle, and watched toggle.
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
 - tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
-- Dual playback stack (AVPlayer / MPVKit) with tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
+- AetherEngine-first playback with one-way MPVKit compatibility fallback, tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
 - Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).
 
