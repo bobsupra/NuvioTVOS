@@ -25,15 +25,15 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.2 (build 43)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.3 (build 44)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.2) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.3) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.2/NuvioTV-3.1.2-unsigned-release.ipa)
+[NuvioTV-3.1.3-unsigned-debug.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.3/NuvioTV-3.1.3-unsigned-debug.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-Beta 3.1.2 fixes and improves:
+Beta 3.1.3 fixes and improves:
 
 - Adds an in-app language picker with System default and 34 supported UI languages.
 - Completes Settings localization across all supported languages, including categories, nested pages, dialogs, descriptions, actions, and option values.
