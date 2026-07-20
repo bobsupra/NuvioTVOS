@@ -33,16 +33,28 @@ The tree currently targets **version 3.1.3 (build 44)** (`tvosApp/NuvioTV/Info.p
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-Beta 3.1.3 fixes and improves:
+### New in Beta 3.1.3
 
-- Adds an in-app language picker with System default and 34 supported UI languages.
-- Completes Settings localization across all supported languages, including categories, nested pages, dialogs, descriptions, actions, and option values.
-- Keeps the selected app language profile-scoped and applies language, locale, and layout changes immediately without restarting the app.
-- Improves title details with richer TMDB and Trakt metadata plus production, company, network, cast, and crew browsing.
-- Improves stream quality labeling and selection while preserving the playback, Dolby Vision, debrid, and add-on resilience work from Beta 3.1.1.
-- Refines profile PIN, account synchronization, discovery, search, library, and metadata behavior throughout the tvOS app.
+- Replaces the legacy AVPlayer player engine with AetherEngine as the primary playback backend. MPVKit remains available as a one-way compatibility fallback and can still be selected explicitly for diagnostics.
+- Bundles AetherEngine and MPVKit safely in the same app by using namespaced Aether FFmpeg frameworks alongside MPVKit's FFmpeg stack.
+- Preserves the playback features that require MPVKit, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
+- Adds Aether subtitle presentation for plain text, styled text, and PGS bitmap subtitles.
+- Adds profile-switch safety to account sync: stale remote pulls are cancelled before they can apply data to the newly selected profile.
 
-Availability of streams still depends on configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured. The Apple TV Simulator still cannot play AV1. ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
+### Trakt sign-in with your own API app
+
+Beta 3.1.3 adds Trakt device login with user-provided API credentials. This is useful when you want to use your own Trakt application instead of relying on shared app credentials.
+
+1. Create an application at [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications).
+2. Set its redirect URI to `urn:ietf:wg:oauth:2.0:oob`.
+3. On Apple TV, go to **Settings → Integrations → Trakt**, then enter the Trakt Client ID and Client Secret.
+4. Choose **Connect with Trakt**, scan the QR code or enter its code at `trakt.tv/activate`, and approve the connection.
+
+The Client ID and Client Secret are stored only on that Apple TV; they are deliberately excluded from Nuvio account/profile sync. Changing either credential disconnects the old Trakt session so it cannot be reused with a different application.
+
+### Notes
+
+The release IPA is unsigned and must be signed by a compatible tvOS development or sideloading workflow before installation. Stream availability still depends on configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured. The Apple TV Simulator cannot play AV1. ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
 
 ## About
 
@@ -63,6 +75,7 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - Long-press quick actions for poster cards, including details, library toggle, and watched toggle.
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
 - tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
+- Trakt device-code login using a user-provided Client ID and Client Secret, stored locally on the Apple TV.
 - AetherEngine-first playback with one-way MPVKit compatibility fallback, tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
 - Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).
