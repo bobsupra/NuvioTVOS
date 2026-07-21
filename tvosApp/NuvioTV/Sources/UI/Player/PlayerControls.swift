@@ -78,11 +78,13 @@ struct PlayerControls: View {
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
             viewModel.isTimelineFocused = (newControl == .timeline)
-            // Navigating transport should not race the auto-hide timer; keep
-            // chrome up while any control row item (not timeline) is focused.
-            if let newControl, newControl != .timeline {
+            // Keep chrome pinned while browsing buttons that open another
+            // panel. Play/Pause behaves like the timeline and may auto-hide.
+            if let newControl,
+               newControl != .timeline,
+               newControl != .play {
                 viewModel.setControlsAutoHideSuspended(true)
-            } else if newControl == .timeline {
+            } else if newControl == .timeline || newControl == .play {
                 viewModel.setControlsAutoHideSuspended(false)
                 if viewModel.status == .playing {
                     viewModel.scheduleControlsHide()
@@ -92,9 +94,6 @@ struct PlayerControls: View {
         .onDisappear {
             viewModel.isTimelineFocused = false
             viewModel.setControlsAutoHideSuspended(false)
-        }
-        .onMoveCommand { direction in
-            handleMove(direction)
         }
     }
 
@@ -117,45 +116,62 @@ struct PlayerControls: View {
         return order
     }
 
-    private func handleMove(_ direction: MoveCommandDirection) {
+    /// Settings-style flash prevention: while the progress bar owns focus, only
+    /// Play stays focusable in the transport row. tvOS spatial focus lands on the
+    /// geometric nearest *focusable* control — with a single candidate it goes
+    /// straight to Play, so Episodes/Sources never receive a one-frame flash.
+    /// Once any transport button is focused, every visible button is focusable
+    /// again so left/right still walks the full row.
+    private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
+        guard controlsInteractable else { return false }
+        if focusedControl == .timeline || focusedControl == nil {
+            return key == .play
+        }
+        return true
+    }
+
+    private func moveFocus(to control: PlayerControlFocus) {
+        // tvOS often applies spatial focus *before* `onMoveCommand` runs (and
+        // may also apply it after). Force the intended control now and re-assert
+        // on the next runloop so native geometry cannot keep a wrong target
+        // (e.g. play → settings skipping streams).
+        focusedControl = control
+        DispatchQueue.main.async {
+            focusedControl = control
+        }
+    }
+
+    /// Navigate from the control that *received* the move — not `focusedControl`,
+    /// which may already have been updated by the spatial focus engine.
+    private func handleMove(_ direction: MoveCommandDirection, from origin: PlayerControlFocus) {
         guard !isSkipSegmentFocused, !isNextEpisodeFocused else { return }
         guard controlsInteractable else { return }
 
         switch direction {
         case .up:
-            if focusedControl == .timeline {
-                if viewModel.showSkipSegmentCard {
-                    focusedControl = nil
-                    DispatchQueue.main.async { onFocusSkipSegment() }
-                } else if viewModel.showNextEpisodeCard {
-                    focusedControl = nil
-                    DispatchQueue.main.async { onFocusNextEpisode() }
-                } else {
-                    focusedControl = .play
-                }
+            if origin == .timeline {
+                moveFocus(to: .play)
             }
         case .down:
-            if focusedControl != .timeline {
-                focusedControl = .timeline
+            if origin != .timeline {
+                moveFocus(to: .timeline)
             }
         case .left:
-            if focusedControl == .timeline {
+            if origin == .timeline {
                 viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
                 // Keep focus pinned while seeking / hold-to-seek.
-                focusedControl = .timeline
-            } else if let current = focusedControl,
-                      let index = transportFocusOrder.firstIndex(of: current),
+                moveFocus(to: .timeline)
+            } else if let index = transportFocusOrder.firstIndex(of: origin),
                       index > 0 {
-                focusedControl = transportFocusOrder[index - 1]
+                moveFocus(to: transportFocusOrder[index - 1])
             }
         case .right:
-            if focusedControl == .timeline {
+            if origin == .timeline {
                 viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
-                focusedControl = .timeline
-            } else if let current = focusedControl,
-                      let index = transportFocusOrder.firstIndex(of: current),
+                moveFocus(to: .timeline)
+            } else if let index = transportFocusOrder.firstIndex(of: origin),
                       index < transportFocusOrder.count - 1 {
-                focusedControl = transportFocusOrder[index + 1]
+                moveFocus(to: transportFocusOrder[index + 1])
             }
         default:
             break
@@ -266,7 +282,6 @@ struct PlayerControls: View {
             .id("settings_button")
         }
         .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
-        .disabled(!controlsInteractable)
     }
 
     private func glassIconButton<Icon: View>(
@@ -282,6 +297,10 @@ struct PlayerControls: View {
         // `.focusable(...)` on the Button — toggling that when focus leaves the
         // timeline (or moves settings → play) can leave the control visually
         // focused while Select no longer activates the action.
+        //
+        // Mirror Settings category pills: `.disabled` removes a button from the
+        // spatial focus graph without changing appearance (PosterCardButtonStyle
+        // ignores isEnabled). That prevents the Episodes flash on up-from-timeline.
         Button {
             focusedControl = focusKey
             action()
@@ -304,7 +323,14 @@ struct PlayerControls: View {
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedControl, equals: focusKey)
+        .disabled(!isTransportButtonFocusable(focusKey))
         .focusEffectDisabledIfAvailable()
+        .onMoveCommand { direction in
+            // Route from this button's key so a native spatial jump across the
+            // row Spacer cannot make us advance from the wrong origin (which
+            // skipped sources / never returned up-to-play).
+            handleMove(direction, from: focusKey)
+        }
         .scaleEffect(isFocused ? 1.06 : 1.0)
         .animation(.easeOut(duration: 0.14), value: isFocused)
     }
@@ -352,8 +378,9 @@ struct PlayerControls: View {
         .onTapGesture { viewModel.beginScrub() }
         .onMoveCommand { direction in
             // Timeline owns move while focused so hold-to-seek cannot promote
-            // focus onto the transport buttons.
-            handleMove(direction)
+            // focus onto the transport buttons. Always route from `.timeline`
+            // even if spatial focus already hopped to a transport button.
+            handleMove(direction, from: .timeline)
         }
         .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
@@ -1322,15 +1349,18 @@ struct PlayerSettingsPanel: View {
     }
 
     private var audioAdjustmentsColumn: some View {
-        VStack(alignment: .leading, spacing: 34) {
+        let aetherAudioAdjustmentsUnavailable = viewModel.activeEngineKind == .aether
+        return VStack(alignment: .leading, spacing: 34) {
             audioStepper(
                 title: "Audio Delay",
                 value: String(format: "%.3fs", Double(viewModel.audioDelayMs) / 1000.0),
-                caption: "Range: -3.00s to 3.00s",
+                caption: aetherAudioAdjustmentsUnavailable
+                    ? "Unavailable with Aether"
+                    : "Range: -3.00s to 3.00s",
                 minusKey: .delayMinus,
                 plusKey: .delayPlus,
-                minusDisabled: viewModel.audioDelayMs <= -3000,
-                plusDisabled: viewModel.audioDelayMs >= 3000,
+                minusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioDelayMs <= -3000,
+                plusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioDelayMs >= 3000,
                 onMinus: { viewModel.setAudioDelayMs(viewModel.audioDelayMs - 50) },
                 onPlus: { viewModel.setAudioDelayMs(viewModel.audioDelayMs + 50) }
             )
@@ -1338,11 +1368,13 @@ struct PlayerSettingsPanel: View {
             audioStepper(
                 title: "Amplification (PCM)",
                 value: "\(viewModel.audioAmplificationDb) dB",
-                caption: "Range: 0 dB to 10 dB",
+                caption: aetherAudioAdjustmentsUnavailable
+                    ? "Unavailable with Aether"
+                    : "Range: 0 dB to 10 dB",
                 minusKey: .ampMinus,
                 plusKey: .ampPlus,
-                minusDisabled: viewModel.audioAmplificationDb <= 0,
-                plusDisabled: viewModel.audioAmplificationDb >= 10,
+                minusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioAmplificationDb <= 0,
+                plusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioAmplificationDb >= 10,
                 onMinus: { viewModel.setAudioAmplificationDb(viewModel.audioAmplificationDb - 1) },
                 onPlus: { viewModel.setAudioAmplificationDb(viewModel.audioAmplificationDb + 1) }
             )

@@ -1971,6 +1971,16 @@ enum WatchedStore {
         if season == nil, episode == nil {
             ContinueWatchingStore.remove(metaId: meta.id)
         }
+        let traktStore = ProfileSettings.current
+        Task {
+            _ = await TraktHistoryService.setWatched(
+                meta,
+                season: season,
+                episode: episode,
+                isWatched: true,
+                store: traktStore
+            )
+        }
         return true
     }
 
@@ -1979,13 +1989,29 @@ enum WatchedStore {
     /// mark right back. Tombstone is written only after the local list saves.
     @discardableResult
     static func remove(metaId: String, type: String) -> Bool {
-        let updated = items().filter {
+        let currentItems = items()
+        let removed = currentItems.first {
+            $0.meta.id == metaId
+                && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
+                && $0.season == nil && $0.episode == nil
+        }
+        let updated = currentItems.filter {
             !($0.meta.id == metaId
                 && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
                 && $0.season == nil && $0.episode == nil)
         }
         guard persist(updated) else { return false }
         addTombstone(metaId: metaId, season: nil, episode: nil)
+        if let removed {
+            let traktStore = ProfileSettings.current
+            Task {
+                _ = await TraktHistoryService.setWatched(
+                    removed.meta,
+                    isWatched: false,
+                    store: traktStore
+                )
+            }
+        }
         return true
     }
 

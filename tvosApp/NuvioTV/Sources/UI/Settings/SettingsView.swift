@@ -2450,7 +2450,7 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
                             subtitle: L10n.string(
                                 "tvos_settings_refresh_trakt_user_info_and_cached_stats",
-                                fallback: "Refresh Trakt user info and cached stats"
+                                fallback: "Refresh Trakt watch progress, user info, and cached stats"
                             ),
                             value: viewModel.isLoading
                                 ? L10n.string("tvos_settings_syncing", fallback: "Syncing")

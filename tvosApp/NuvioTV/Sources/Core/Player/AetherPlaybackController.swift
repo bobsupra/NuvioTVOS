@@ -4,6 +4,68 @@ import AVFoundation
 import Combine
 import AetherEngine
 
+/// High-frequency state observed only by the subtitle overlay. Keeping it
+/// separate prevents Aether's 10 Hz presentation clock from rebuilding the
+/// whole player screen while still making cue changes immediately visible.
+@MainActor
+final class AetherSubtitleOverlayState: ObservableObject {
+    @Published private(set) var cues: [SubtitleCue] = []
+    @Published private(set) var sourceTime: Double = 0
+
+    func updateCues(_ cues: [SubtitleCue]) {
+        self.cues = cues
+    }
+
+    func updateSourceTime(_ seconds: Double) {
+        sourceTime = seconds.isFinite ? max(0, seconds) : 0
+    }
+
+    func reset() {
+        cues = []
+        sourceTime = 0
+    }
+}
+
+@MainActor
+enum AetherExternalSubtitleIdentity {
+    static func accepted(
+        _ subtitles: [NuvioSubtitle]
+    ) -> [(subtitle: NuvioSubtitle, url: URL)] {
+        subtitles.compactMap { subtitle in
+            guard !subtitle.url.isEmpty, let url = URL(string: subtitle.url) else { return nil }
+            return (subtitle, url)
+        }
+    }
+}
+
+@MainActor
+struct AetherExternalSubtitleRegistration {
+    let tracks: [ExternalSubtitleTrack]
+    let urlsByTrackID: [Int: String]
+
+    static func make(
+        subtitles: [NuvioSubtitle],
+        httpHeaders: [String: String]
+    ) -> AetherExternalSubtitleRegistration {
+        var tracks: [ExternalSubtitleTrack] = []
+        var urlsByTrackID: [Int: String] = [:]
+        for (subtitle, url) in AetherExternalSubtitleIdentity.accepted(subtitles) {
+            let language = subtitle.language
+            let id = AetherEngine.externalSubtitleTrackIDBase + tracks.count
+            tracks.append(
+                ExternalSubtitleTrack(
+                    url: url,
+                    name: subtitle.label ?? (language.isEmpty ? nil : language),
+                    language: language.isEmpty ? nil : language,
+                    httpHeaders: httpHeaders.isEmpty ? nil : httpHeaders
+                )
+            )
+            urlsByTrackID[id] = subtitle.url
+        }
+        return AetherExternalSubtitleRegistration(tracks: tracks, urlsByTrackID: urlsByTrackID)
+    }
+}
+
 /// Long-lived wrapper around a single `AetherEngine` instance (reused across titles).
 @MainActor
 final class AetherPlaybackController: UIViewController, PlaybackEngineControlling {
@@ -13,13 +75,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     let engine: AetherEngine
     let playerView = AetherPlayerView()
+    let subtitleOverlayState = AetherSubtitleOverlayState()
 
     private var cancellables = Set<AnyCancellable>()
     private var loadGeneration: UInt64 = 0
     private var lastKnownPositionMs: Int64 = 0
     private var lastKnownDurationMs: Int64 = 0
     private var lastKnownSourceTimeSeconds: Double = 0
-    private var pendingExternalSubtitles: [NuvioSubtitle] = []
     private var externalSubtitleURLsByTrackID: [Int: String] = [:]
     private var currentHTTPHeaders: [String: String] = [:]
     private var didReportTerminalError = false
@@ -138,6 +200,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
             .store(in: &cancellables)
 
+        engine.clock.$sourceTime
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] sourceTime in
+                self?.subtitleOverlayState.updateSourceTime(sourceTime)
+            }
+            .store(in: &cancellables)
+
         engine.$audioTracks
             .receive(on: DispatchQueue.main)
             .sink { [weak self] tracks in
@@ -156,6 +225,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             .receive(on: DispatchQueue.main)
             .sink { [weak self] cues in
                 self?.subtitleCues = cues
+                self?.subtitleOverlayState.updateCues(cues)
             }
             .store(in: &cancellables)
 
@@ -230,11 +300,25 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             lastKnownDurationMs = durationMs
         }
         if engine.sourceVideoWidth > 0, engine.sourceVideoHeight > 0 {
-            videoFrameSize = CGSize(
-                width: CGFloat(engine.sourceVideoWidth),
-                height: CGFloat(engine.sourceVideoHeight)
+            videoFrameSize = Self.displayVideoSize(
+                codedWidth: engine.sourceVideoWidth,
+                codedHeight: engine.sourceVideoHeight,
+                pixelAspectRatio: engine.sourceVideoPixelAspectRatio
             )
         }
+    }
+
+    static func displayVideoSize(
+        codedWidth: Int32,
+        codedHeight: Int32,
+        pixelAspectRatio: Double
+    ) -> CGSize {
+        guard codedWidth > 0, codedHeight > 0 else { return .zero }
+        let ratio = pixelAspectRatio.isFinite && pixelAspectRatio > 0 ? pixelAspectRatio : 1
+        return CGSize(
+            width: CGFloat(codedWidth) * CGFloat(ratio),
+            height: CGFloat(codedHeight)
+        )
     }
 
     private func mapAudioTracks(_ tracks: [TrackInfo]) {
@@ -257,10 +341,6 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     private func mapSubtitleTracks(_ tracks: [TrackInfo]) {
         let active = engine.activeSubtitleTrackIndex
-        let externalTracks = tracks.filter(\.isExternal)
-        for (track, subtitle) in zip(externalTracks, pendingExternalSubtitles) {
-            externalSubtitleURLsByTrackID[track.id] = subtitle.url
-        }
         subtitleTracks = tracks.enumerated().map { offset, t in
             PlaybackTrackInfo(
                 index: offset,
@@ -270,6 +350,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 lang: t.language ?? "",
                 selected: active == t.id,
                 externalFilename: t.isExternal ? (externalSubtitleURLsByTrackID[t.id] ?? "") : "",
+                isNativelyRenderedSubtitle: t.isNativelyRenderedSubtitle,
                 languageName: t.language ?? "",
                 detail: t.codec
             )
@@ -298,8 +379,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         hasCoherentTimeSample = false
         currentErrorMessage = ""
         sourceProbe = nil
-        pendingExternalSubtitles = request.externalSubtitles
-        externalSubtitleURLsByTrackID = [:]
+        let externalRegistration = AetherExternalSubtitleRegistration.make(
+            subtitles: request.externalSubtitles,
+            httpHeaders: request.httpHeaders
+        )
+        externalSubtitleURLsByTrackID = externalRegistration.urlsByTrackID
         currentHTTPHeaders = request.httpHeaders
         lastKnownPositionMs = 0
         lastKnownDurationMs = 0
@@ -312,6 +396,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         audioTracks = []
         subtitleTracks = []
         subtitleCues = []
+        subtitleOverlayState.reset()
+        videoFrameSize = .zero
 
         let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
         let matchContent = request.matchContentEnabled
@@ -325,17 +411,6 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 || AVPlayer.availableHDRModes.contains(.dolbyVision)
         }
 
-        let external: [ExternalSubtitleTrack] = request.externalSubtitles.compactMap { sub in
-            guard let url = URL(string: sub.url) else { return nil }
-            let lang = sub.language
-            return ExternalSubtitleTrack(
-                url: url,
-                name: sub.label ?? (lang.isEmpty ? nil : lang),
-                language: lang.isEmpty ? nil : lang,
-                httpHeaders: request.httpHeaders.isEmpty ? nil : request.httpHeaders
-            )
-        }
-
         let options = LoadOptions(
             httpHeaders: request.httpHeaders,
             matchContentEnabled: matchContent,
@@ -345,7 +420,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             prepareNativeSubtitles: false,
             preferredAudioLanguages: request.preferredAudioLanguages,
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
-            externalSubtitles: external,
+            externalSubtitles: externalRegistration.tracks,
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments,
             autoplay: request.autoplay
         )
@@ -465,9 +540,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         )
         let info = engine.addExternalSubtitleTrack(track)
         externalSubtitleURLsByTrackID[info.id] = subtitle.url
-        if !pendingExternalSubtitles.contains(where: { $0.url == subtitle.url }) {
-            pendingExternalSubtitles.append(subtitle)
-        }
+        // @Published fires while registration is in progress, before the URL
+        // association above exists. Remap once identity metadata is complete.
+        mapSubtitleTracks(engine.subtitleTracks)
         if select {
             engine.selectSubtitleTrack(index: info.id)
         }
@@ -486,6 +561,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         loadGeneration += 1
         engine.stop(resetDisplayCriteria: true)
         subtitleCues = []
+        subtitleOverlayState.reset()
         audioTracks = []
         subtitleTracks = []
         isPlayerLoading = false
@@ -499,6 +575,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         positionMs = 0
         durationMs = 0
         bufferedMs = 0
+        videoFrameSize = .zero
         externalSubtitleURLsByTrackID = [:]
         currentHTTPHeaders = [:]
         currentErrorMessage = ""

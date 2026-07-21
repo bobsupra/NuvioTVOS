@@ -313,14 +313,18 @@ enum TraktSettingsStore {
 
     static var watchProgressSource: TraktWatchProgressSource {
         get {
-            let raw = ProfileSettings.current.string(forKey: SettingsKey.traktWatchProgressSource)
-            return TraktWatchProgressSource(rawValue: raw ?? "") ?? TraktDefaults.watchProgressSource
+            watchProgressSource(in: ProfileSettings.current)
         }
         set {
             guard newValue != watchProgressSource else { return }
             ProfileSettings.current.set(newValue.rawValue, forKey: SettingsKey.traktWatchProgressSource)
             NotificationCenter.default.post(name: continueWatchingChangedNotification, object: nil)
         }
+    }
+
+    static func watchProgressSource(in defaults: UserDefaults) -> TraktWatchProgressSource {
+        let raw = defaults.string(forKey: SettingsKey.traktWatchProgressSource)
+        return TraktWatchProgressSource(rawValue: raw ?? "") ?? TraktDefaults.watchProgressSource
     }
 
     static var librarySourceMode: TraktLibrarySourceMode {
@@ -774,7 +778,7 @@ enum TraktScrobbleAction: String {
 }
 
 struct TraktProgressService {
-    private static let completionPercent = 92.0
+    private static let completionPercent = 90.0
     private static let maxItems = 20
 
     static func fetchContinueWatching(
@@ -866,10 +870,11 @@ struct TraktProgressService {
         duration: Double,
         season: Int?,
         episode: Int?,
-        action: TraktScrobbleAction
+        action: TraktScrobbleAction,
+        store: UserDefaults = ProfileSettings.current
     ) async -> Bool {
-        guard TraktSettingsStore.watchProgressSource == .trakt,
-              TraktAuthStore.state.isAuthenticated,
+        guard TraktSettingsStore.watchProgressSource(in: store) == .trakt,
+              TraktAuthStore.state(in: store).isAuthenticated(in: store),
               position.isFinite,
               duration.isFinite,
               duration > 0,
@@ -897,7 +902,7 @@ struct TraktProgressService {
         }
 
         do {
-            try await TraktAuthService().authorizedPostEmpty(
+            try await TraktAuthService(store: store).authorizedPostEmpty(
                 path: "scrobble/\(action.rawValue)",
                 body: request
             )
@@ -1141,6 +1146,158 @@ struct TraktProgressService {
         }
         return max(first * 60, 60)
     }
+}
+
+// MARK: - Watched history
+
+/// Mirrors durable local watched/unwatched mutations to Trakt history. This is
+/// intentionally independent of the selected Continue Watching source: a
+/// connected Trakt account should receive an explicit watched action even when
+/// resume points are kept in Nuvio Sync.
+struct TraktHistoryService {
+    static func setWatched(
+        _ meta: NuvioMeta,
+        season: Int? = nil,
+        episode: Int? = nil,
+        isWatched: Bool,
+        store: UserDefaults = ProfileSettings.current
+    ) async -> Bool {
+        guard TraktAuthStore.state(in: store).isAuthenticated(in: store),
+              let mutation = mutation(
+                for: meta,
+                season: season,
+                episode: episode,
+                watchedAt: isWatched ? iso8601Now() : nil
+              ) else {
+            return false
+        }
+
+        do {
+            try await TraktAuthService(store: store).authorizedPostEmpty(
+                path: isWatched ? "sync/history" : "sync/history/remove",
+                body: mutation
+            )
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
+            return true
+        } catch {
+            return false
+        }
+    }
+
+    private static func mutation(
+        for meta: NuvioMeta,
+        season: Int?,
+        episode: Int?,
+        watchedAt: String?
+    ) -> TraktHistoryMutation? {
+        let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
+        let ids = TraktHistoryIDs(
+            trakt: meta.id.hasPrefix("trakt:") ? Int(meta.id.dropFirst("trakt:".count)) : nil,
+            imdb: meta.imdbId ?? (firstIDComponent.hasPrefix("tt") ? firstIDComponent : nil),
+            tmdb: meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
+                ? Int(meta.id.dropFirst("tmdb:".count))
+                : nil)
+        )
+        guard ids.trakt != nil || ids.imdb != nil || ids.tmdb != nil else { return nil }
+
+        if meta.isSeries {
+            let seasons: [TraktHistorySeason]?
+            if let season, let episode {
+                seasons = [
+                    TraktHistorySeason(
+                        number: season,
+                        episodes: [TraktHistoryEpisode(number: episode, watchedAt: watchedAt)]
+                    )
+                ]
+            } else {
+                seasons = nil
+            }
+            return TraktHistoryMutation(
+                movies: nil,
+                shows: [
+                    TraktHistoryShow(
+                        title: meta.name,
+                        year: meta.year,
+                        ids: ids,
+                        watchedAt: watchedAt,
+                        seasons: seasons
+                    )
+                ]
+            )
+        }
+
+        return TraktHistoryMutation(
+            movies: [
+                TraktHistoryMovie(
+                    title: meta.name,
+                    year: meta.year,
+                    ids: ids,
+                    watchedAt: watchedAt
+                )
+            ],
+            shows: nil
+        )
+    }
+
+    private static func iso8601Now() -> String {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.string(from: Date())
+    }
+}
+
+private struct TraktHistoryMutation: Encodable {
+    let movies: [TraktHistoryMovie]?
+    let shows: [TraktHistoryShow]?
+}
+
+private struct TraktHistoryMovie: Encodable {
+    let title: String
+    let year: Int?
+    let ids: TraktHistoryIDs
+    let watchedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case title, year, ids
+        case watchedAt = "watched_at"
+    }
+}
+
+private struct TraktHistoryShow: Encodable {
+    let title: String
+    let year: Int?
+    let ids: TraktHistoryIDs
+    let watchedAt: String?
+    let seasons: [TraktHistorySeason]?
+
+    enum CodingKeys: String, CodingKey {
+        case title, year, ids, seasons
+        case watchedAt = "watched_at"
+    }
+}
+
+private struct TraktHistorySeason: Encodable {
+    let number: Int
+    let episodes: [TraktHistoryEpisode]
+}
+
+private struct TraktHistoryEpisode: Encodable {
+    let number: Int
+    let watchedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case number
+        case watchedAt = "watched_at"
+    }
+}
+
+private struct TraktHistoryIDs: Encodable {
+    let trakt: Int?
+    let imdb: String?
+    let tmdb: Int?
 }
 
 private struct TraktProgressSeed {
@@ -1687,6 +1844,14 @@ final class TraktSettingsViewModel: ObservableObject {
         errorMessage = nil
         Task {
             _ = await service.refreshTokenIfNeeded()
+            // Match Android TV's Sync Now sequence: refresh the Trakt progress
+            // repository before updating account details and cached stats. Home
+            // owns the tvOS progress snapshot, so its change notification is the
+            // equivalent refresh signal here.
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
             _ = await service.fetchUserSettings()
             if let stats = await service.fetchUserStats() {
                 TraktAuthStore.saveCachedStats(stats, store: store)

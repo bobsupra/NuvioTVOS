@@ -4,8 +4,7 @@ import AetherEngine
 /// Host-rendered subtitle layer for Aether sessions.
 /// Placed above the video surface and below transport controls.
 struct PlayerSubtitleOverlay: View {
-    let cues: [SubtitleCue]
-    let sourceTime: Double
+    @ObservedObject var playback: AetherSubtitleOverlayState
     let subtitleDelaySeconds: Double
     let videoNaturalSize: CGSize
     let aspectMode: PlayerAspectMode
@@ -23,11 +22,11 @@ struct PlayerSubtitleOverlay: View {
     private var fontWeight: Font.Weight { style.bold ? .bold : .regular }
 
     private var evaluationTime: Double {
-        sourceTime - subtitleDelaySeconds
+        playback.sourceTime - subtitleDelaySeconds
     }
 
     private var activeCues: [SubtitleCue] {
-        cues.filter { cue in
+        playback.cues.filter { cue in
             evaluationTime >= cue.startTime && evaluationTime <= cue.endTime
         }
     }
@@ -105,14 +104,13 @@ struct PlayerSubtitleOverlay: View {
     }
 
     private func outlinedRichText(_ runs: [SubtitleTextRun]) -> some View {
-        HStack(spacing: 0) {
-            ForEach(Array(runs.enumerated()), id: \.offset) { _, run in
-                Text(run.text)
-                    .font(.system(size: textSize, weight: fontWeight))
-                    .foregroundStyle(runColor(run).opacity(textOpacity))
-                    .tracking(CGFloat(style.letterSpacing))
-            }
+        runs.reduce(Text("")) { text, run in
+            text + Text(run.text)
+                .font(.system(size: textSize, weight: fontWeight))
+                .foregroundColor(runColor(run).opacity(textOpacity))
+                .tracking(CGFloat(style.letterSpacing))
         }
+        .multilineTextAlignment(.center)
         .subtitleOutline(color: outlineColor, width: outlineWidth)
     }
 

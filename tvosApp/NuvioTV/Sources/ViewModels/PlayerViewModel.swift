@@ -194,6 +194,7 @@ class PlayerViewModel: ObservableObject {
     /// Keep that cadence lower than local persistence so normal playback never
     /// produces a request every five seconds.
     private var didStartTraktScrobble = false
+    private var didQueueTraktStop = false
     private var lastTraktProgressReport = Date.distantPast
     private static let traktProgressReportInterval: TimeInterval = 30
     private var controlsAutoHideSuspended = false
@@ -485,6 +486,7 @@ class PlayerViewModel: ObservableObject {
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
         self.didStartTraktScrobble = false
+        self.didQueueTraktStop = false
         self.lastTraktProgressReport = .distantPast
         self.expectedDurationSeconds = isTrailerPlayback ? nil : Self.expectedDuration(for: meta)
         self.didDetectReplacementStream = false
@@ -1174,19 +1176,27 @@ class PlayerViewModel: ObservableObject {
         var subs = c.subtitleTracks.map {
             SubtitleTrack(id: "\($0.id)", name: $0.title,
                           language: $0.lang, isSelected: $0.selected,
-                          externalFilename: $0.externalFilename)
+                          externalFilename: $0.externalFilename,
+                          isNativelyRenderedSubtitle: $0.isNativelyRenderedSubtitle)
         }
         let anySelected = subs.contains { $0.isSelected }
         subs.insert(SubtitleTrack(id: "off", name: "Off", language: "",
                                   isSelected: !anySelected), at: 0)
         if subtitles != subs { subtitles = subs }
         applySavedTrackSelectionsIfNeeded()
+        guard c === engine else { return }
         applyAudioPreferenceIfNeeded()
         applySubtitlePreferenceIfNeeded()
+        guard c === engine else { return }
         if let selectedURL = pendingSelectedExternalSubtitleURL,
            let selectedTrack = subtitles.first(where: { $0.externalFilename == selectedURL }) {
             selectSubtitle(selectedTrack, persist: false)
             pendingSelectedExternalSubtitleURL = nil
+        }
+        if let selectedNativeTrack = subtitles.first(where: {
+            $0.isSelected && $0.isNativelyRenderedSubtitle
+        }) {
+            handoffForNativelyRenderedSubtitle(selectedNativeTrack, persist: false)
         }
     }
 
@@ -1301,6 +1311,11 @@ class PlayerViewModel: ObservableObject {
             snapshot.duration = clock.duration
         }
         time = snapshot
+        // A committed seek is explicit user intent and is a safer forced-save
+        // checkpoint than the pre-seek sample. Without this, leaving while the
+        // backend was settling wrote the old Trakt position back (for example,
+        // 32 minutes remaining after seeking to 5 minutes remaining).
+        lastStablePlaybackTime = snapshot
         if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
     }
 
@@ -1798,44 +1813,47 @@ class PlayerViewModel: ObservableObject {
     }
 
     /// Shifts audio timing; positive delays the audio.
-    /// Non-zero delay requires MPV (Aether has no public audio-delay API).
+    /// Aether has no public audio-delay API, so the control is disabled and
+    /// this guard prevents non-UI callers from touching the unsupported path.
     func setAudioDelayMs(_ ms: Int) {
+        guard activeEngineKind != .aether else {
+            if audioDelayMs != 0 {
+                audioDelayMs = 0
+                sessionCoordinator.updateAudioDelay(0)
+            }
+            return
+        }
         let clamped = min(max(ms, -3_000), 3_000)
         audioDelayMs = clamped
         sessionCoordinator.updateAudioDelay(Double(clamped) / 1_000)
-        if activeEngineKind == .aether, clamped != 0 {
-            sessionCoordinator.handoffToMPV(
-                reason: "Audio delay requires MPVKit",
-                resumeSeconds: nil
-            )
-            activeEngineKind = sessionCoordinator.activeBackend
-            hdrModeToast = "Compatibility player (audio delay)"
-            showPlayerToast("Compatibility player (audio delay)")
-        }
         engine.setAudioDelay(Double(clamped) / 1000.0)
     }
 
     /// PCM amplification in whole dB (0…10).
-    /// Amplification above 0 dB requires MPV (Aether has no public gain API).
+    /// Aether has no public gain API, so the control is disabled and this guard
+    /// prevents non-UI callers from touching the unsupported path.
     func setAudioAmplificationDb(_ db: Int) {
+        guard activeEngineKind != .aether else {
+            if audioAmplificationDb != 0 {
+                audioAmplificationDb = 0
+                sessionCoordinator.updateAudioGain(0)
+            }
+            return
+        }
         let clamped = min(max(db, 0), 10)
         audioAmplificationDb = clamped
         sessionCoordinator.updateAudioGain(Double(clamped))
-        if activeEngineKind == .aether, clamped > 0 {
-            sessionCoordinator.handoffToMPV(
-                reason: "Audio amplification requires MPVKit",
-                resumeSeconds: nil
-            )
-            activeEngineKind = sessionCoordinator.activeBackend
-            hdrModeToast = "Compatibility player (audio boost)"
-            showPlayerToast("Compatibility player (audio boost)")
-        }
         engine.setAudioVolumeGain(dB: Double(clamped))
     }
 
     // MARK: - Track selection
 
     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
+        if track.isNativelyRenderedSubtitle,
+           handoffForNativelyRenderedSubtitle(track, persist: persist) {
+            subtitles = subtitles.map { var item = $0; item.isSelected = (item.id == track.id); return item }
+            return
+        }
         if track.id == "off" {
             engine.selectSubtitle(-1)
         } else if let id = Int(track.id) {
@@ -1848,6 +1866,37 @@ class PlayerViewModel: ObservableObject {
             didApplySubtitlePreference = true
             hasExplicitSubtitleSelection = true
         }
+    }
+
+    /// AVPlayer's remote-HLS legible renderer does not expose Nuvio's timing or
+    /// appearance controls. Preserve the requested track metadata and move the
+    /// active session to the renderer that implements those controls.
+    @discardableResult
+    private func handoffForNativelyRenderedSubtitle(
+        _ track: SubtitleTrack,
+        persist: Bool
+    ) -> Bool {
+        guard activeEngineKind == .aether, track.isNativelyRenderedSubtitle else { return false }
+
+        let stagedSubtitle = Self.trackSelection(for: track)
+        var stagedSelection = pendingTrackSelection ?? PlayerTrackSelection()
+        stagedSelection.subtitle = stagedSubtitle
+        pendingTrackSelection = stagedSelection
+        didApplySavedSubtitleSelection = false
+        didApplySubtitlePreference = true
+        if persist {
+            saveSubtitleSelection(track)
+            hasExplicitSubtitleSelection = true
+        }
+
+        sessionCoordinator.handoffToMPV(
+            reason: "Native HLS subtitles require Nuvio's compatibility renderer",
+            resumeSeconds: nil
+        )
+        activeEngineKind = sessionCoordinator.activeBackend
+        hdrModeToast = "Compatibility player (subtitle controls)"
+        showPlayerToast("Compatibility player (subtitle controls)")
+        return true
     }
 
     /// Selects an external subtitle from the panel: if mpv already loaded this
@@ -2036,11 +2085,17 @@ class PlayerViewModel: ObservableObject {
 
     private func saveSubtitleSelection(_ track: SubtitleTrack) {
         guard let activeTrackSelectionKey else { return }
-        let selection: PlayerTrackSelection.Subtitle
+        PlayerTrackSelectionStore.saveSubtitle(
+            Self.trackSelection(for: track),
+            for: activeTrackSelectionKey
+        )
+    }
+
+    private static func trackSelection(for track: SubtitleTrack) -> PlayerTrackSelection.Subtitle {
         if track.id == "off" {
-            selection = PlayerTrackSelection.Subtitle(kind: .off)
+            return PlayerTrackSelection.Subtitle(kind: .off)
         } else if !track.externalFilename.isEmpty {
-            selection = PlayerTrackSelection.Subtitle(
+            return PlayerTrackSelection.Subtitle(
                 kind: .external,
                 id: track.id,
                 name: track.name,
@@ -2048,14 +2103,13 @@ class PlayerViewModel: ObservableObject {
                 externalURL: track.externalFilename
             )
         } else {
-            selection = PlayerTrackSelection.Subtitle(
+            return PlayerTrackSelection.Subtitle(
                 kind: .embedded,
                 id: track.id,
                 name: track.name,
                 language: track.language
             )
         }
-        PlayerTrackSelectionStore.saveSubtitle(selection, for: activeTrackSelectionKey)
     }
 
     private func saveSubtitleSelection(_ subtitle: NuvioSubtitle) {
@@ -2446,12 +2500,13 @@ class PlayerViewModel: ObservableObject {
 
         let season = resolvedEpisodeNumbers?.season
         let episode = resolvedEpisodeNumbers?.episode
+        let completesPlayback = shouldMarkAsWatched(at: progressTime)
         if usesTraktProgress {
             reportTraktProgress(
                 meta: activeMeta,
                 playbackTime: progressTime,
-                action: nil,
-                force: force
+                action: completesPlayback ? .stop : nil,
+                force: force || completesPlayback
             )
         } else {
             ContinueWatchingStore.save(
@@ -2465,8 +2520,8 @@ class PlayerViewModel: ObservableObject {
         }
         lastProgressSave = Date()
 
-        // Ending start / 92% — checkmark without sitting through the credits.
-        if shouldMarkAsWatched(at: progressTime) {
+        // Ending start / 90% — checkmark without sitting through the credits.
+        if completesPlayback {
             markWatchedIfNeeded()
         }
     }
@@ -2495,19 +2550,26 @@ class PlayerViewModel: ObservableObject {
         }
 
         let scrobbleAction = action ?? (didStartTraktScrobble ? .pause : .start)
+        if scrobbleAction == .stop, didQueueTraktStop { return }
         didStartTraktScrobble = true
+        if scrobbleAction == .stop { didQueueTraktStop = true }
         lastTraktProgressReport = now
         let episodeNumbers = resolvedEpisodeNumbers
+        let traktStore = ProfileSettings.current
 
-        Task {
-            await TraktProgressService.reportPlayback(
+        Task { [weak self] in
+            let succeeded = await TraktProgressService.reportPlayback(
                 meta: meta,
                 position: playbackTime.current,
                 duration: playbackTime.duration,
                 season: episodeNumbers?.season,
                 episode: episodeNumbers?.episode,
-                action: scrobbleAction
+                action: scrobbleAction,
+                store: traktStore
             )
+            if scrobbleAction == .stop, !succeeded {
+                self?.didQueueTraktStop = false
+            }
         }
     }
 
@@ -2534,7 +2596,7 @@ class PlayerViewModel: ObservableObject {
            playbackTime.current >= max(ending.startTime - Self.skipSegmentStartLead, 0) {
             return true
         }
-        return playbackTime.current / playbackTime.duration >= 0.92
+        return playbackTime.current / playbackTime.duration >= 0.90
     }
 
     private var nextEpisodeIsPlayable: Bool {

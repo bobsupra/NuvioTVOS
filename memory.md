@@ -188,6 +188,71 @@ xcodebuild -workspace tvosApp/NuvioTV.xcworkspace \
   CODE_SIGNING_ALLOWED=NO build
 ```
 
+## Player chrome focus (progress bar ↔ transport row)
+
+Last updated: 2026-07-20. Applies to `tvosApp/NuvioTV/Sources/UI/Player/PlayerControls.swift`.
+Same pattern as Settings category pills in `SettingsView` (`categoryGrid`).
+
+### Symptoms
+
+- Up from the progress bar did not land on Play, or briefly flashed Episodes /
+  Streams / Settings first, then jumped to Play.
+- Right from Play skipped the Streams (sources) button and landed on Settings.
+
+### Root cause
+
+tvOS applies **spatial focus before** `onMoveCommand` runs. Reading
+`focusedControl` inside the move handler is already wrong: the engine may have
+jumped across the large transport-row `Spacer` to the geometric nearest button
+(often Episodes or Settings).
+
+Re-assigning focus after the fact can still **flash** the wrong button for a
+frame if that button was focusable during the spatial hop.
+
+### Required invariants (do not regress)
+
+1. **Route moves from the origin that received the command**, not from the
+   post-spatial `focusedControl`:
+   - Timeline `.onMoveCommand` → `handleMove(direction, from: .timeline)`
+   - Each transport button → `handleMove(direction, from: focusKey)`
+2. **Up from timeline always goes to Play.** Down from any transport button
+   always goes to the timeline.
+3. **Left/right on the transport row** walk `transportFocusOrder`:
+   `play → episodes? → sources? → settings` (only include panels that are shown).
+4. **Left/right on the timeline** nudge seek and keep timeline focus (hold-to-seek
+   must not promote focus onto buttons).
+5. **Flash prevention (Settings-style):** while the timeline owns focus (or focus
+   is nil), only Play is focusable in the transport row. Other transport buttons
+   use `.disabled(!isTransportButtonFocusable(key))` so they leave the spatial
+   graph. With a single upward candidate, spatial focus lands on Play with no
+   intermediate flash. Once any transport button is focused, every visible
+   transport button is focusable again so left/right still work.
+6. Use `.disabled` for focusability, **not** toggling `.focusable(...)` on the
+   Button — that previously left Select dead. `PosterCardButtonStyle` ignores
+   `isEnabled`, so disabled pills look the same.
+7. `moveFocus(to:)` sets `focusedControl` immediately **and** re-asserts on the
+   next main-queue turn so a late spatial update cannot keep the wrong target.
+8. Do not gate transport/timeline focusability on `focusedControl != .timeline`
+   in a way that unmounts buttons mid-row; Select and panel return depend on
+   stable `.focused($focusedControl, equals:)` identities.
+
+### Key code
+
+- `PlayerControls` — `transportFocusOrder`, `isTransportButtonFocusable`,
+  `moveFocus`, `handleMove(from:)`, `glassIconButton`, `timelineBar`
+- Settings analogue: `SettingsView.categoryGrid` — only the open category pill
+  stays focusable while focus is in the detail pane (`isFocusable =
+  isSelectedCategory || focusedCategory != nil`)
+
+### Manual check
+
+1. Reveal player chrome; default focus on the progress bar.
+2. Press **up** → focus lands on **Play** with no Episodes/Streams flash.
+3. Press **right** repeatedly → Play → Episodes (if series) → Streams → Settings.
+4. Press **left** back through the same order; **down** from any button returns
+   to the progress bar.
+5. On the bar, left/right still seek; hold left/right still hold-to-seek.
+
 ## Beta release workflow
 
 Last verified: Beta 3 on 2026-07-15.

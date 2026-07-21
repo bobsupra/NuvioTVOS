@@ -440,7 +440,12 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
     public let isExternal: Bool
 
-    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false) {
+    /// True when the playback backend, rather than `subtitleCues`, renders this
+    /// track. Hosts that require custom timing or styling can use a compatible
+    /// renderer instead of presenting controls that cannot affect the track.
+    public let isNativelyRenderedSubtitle: Bool
+
+    public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false) {
         self.id = id
         self.name = name
         self.codec = codec
@@ -454,6 +459,7 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
         self.isAtmos = isAtmos
         self.assHeader = assHeader
         self.isExternal = isExternal
+        self.isNativelyRenderedSubtitle = isNativelyRenderedSubtitle
     }
 }
 

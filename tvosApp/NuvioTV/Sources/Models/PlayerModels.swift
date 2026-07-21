@@ -18,6 +18,7 @@ struct SubtitleTrack: Identifiable, Equatable {
     /// stream. Lets the subtitle panel tell external tracks apart and map them
     /// back to the `NuvioSubtitle` they were added from.
     var externalFilename: String = ""
+    var isNativelyRenderedSubtitle: Bool = false
 }
 
 struct AudioTrack: Identifiable, Equatable {

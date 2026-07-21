@@ -77,6 +77,7 @@ struct RemoteHLSMediaSelectionTests {
         #expect(tracks[0].codec == "webvtt")
         #expect(tracks[0].isDefault)
         #expect(!tracks[0].isExternal)
+        #expect(tracks[0].isNativelyRenderedSubtitle)
     }
 
     @Test("Forced and SDH characteristics map to the TrackInfo dispositions")

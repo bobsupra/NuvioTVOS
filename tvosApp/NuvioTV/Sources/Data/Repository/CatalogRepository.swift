@@ -13,6 +13,10 @@ protocol CatalogRepository {
     /// Get catalogs for home screen
     func getHomeCatalogs() async throws -> [NuvioCatalog]
 
+    /// True when the latest Home request returned usable rows but one or more
+    /// expected sources failed. Home uses this to replace a partial cache once.
+    var homeCatalogLoadWasPartial: Bool { get }
+
     /// Get metadata for a specific content item. `type` ("movie"/"series") is
     /// carried from the catalog item so the correct meta endpoint is queried —
     /// series ids have no reliable marker to guess from.
@@ -78,6 +82,8 @@ protocol CatalogRepository {
 }
 
 extension CatalogRepository {
+    var homeCatalogLoadWasPartial: Bool { false }
+
     func browseCatalog(
         addonId: String?,
         contentType: String,
@@ -141,6 +147,7 @@ struct StreamAddonPreference: Codable, Equatable {
 /// Live Cinemeta-backed catalog and metadata repository for the tvOS app.
 final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
+    private(set) var homeCatalogLoadWasPartial = false
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private var cachedMetaById: [String: NuvioMeta] = [:]
     private let builtInSubtitleAddons = [
@@ -165,9 +172,60 @@ final class CinemetaCatalogRepository: CatalogRepository {
             ("series_rating", "Top Rated - Series", "series", "imdbRating")
         ]
 
+        // Load the independent Cinemeta rows concurrently. Previously one
+        // transient failure aborted the complete Home request, leaving the
+        // screen empty until switching profiles happened to start it again.
+        var pages = Array<[NuvioMeta]?>(repeating: nil, count: specs.count)
+        await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
+            for (index, spec) in specs.enumerated() {
+                group.addTask {
+                    let page = try? await self.fetchCatalog(
+                        type: spec.type,
+                        catalogId: spec.catalogId,
+                        skip: nil,
+                        search: nil,
+                        genre: nil
+                    )
+                    return (index, page?.isEmpty == false ? page : nil)
+                }
+            }
+            for await (index, page) in group {
+                pages[index] = page
+            }
+        }
+        try Task.checkCancellation()
+
+        // Retry only missing rows once after a short backoff. Successful rows
+        // remain usable and are never discarded because a sibling host request
+        // failed.
+        let missing = pages.indices.filter { pages[$0] == nil }
+        if !missing.isEmpty {
+            try await Task.sleep(nanoseconds: 600_000_000)
+            try Task.checkCancellation()
+            await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
+                for index in missing {
+                    let spec = specs[index]
+                    group.addTask {
+                        let page = try? await self.fetchCatalog(
+                            type: spec.type,
+                            catalogId: spec.catalogId,
+                            skip: nil,
+                            search: nil,
+                            genre: nil
+                        )
+                        return (index, page?.isEmpty == false ? page : nil)
+                    }
+                }
+                for await (index, page) in group where page != nil {
+                    pages[index] = page
+                }
+            }
+            try Task.checkCancellation()
+        }
+
         var catalogs: [NuvioCatalog] = []
-        for spec in specs {
-            let page = try await fetchCatalog(type: spec.type, catalogId: spec.catalogId, skip: nil, search: nil, genre: nil)
+        for (index, spec) in specs.enumerated() {
+            guard let page = pages[index] else { continue }
             page.forEach { cachedMetaById[$0.id] = $0 }
             catalogs.append(
                 NuvioCatalog(
@@ -180,7 +238,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 )
             )
         }
-        catalogs.append(contentsOf: await addonHomeCatalogs())
+        let addonResult = await addonHomeCatalogs()
+        try Task.checkCancellation()
+        catalogs.append(contentsOf: addonResult.catalogs)
+        homeCatalogLoadWasPartial = pages.contains(where: { $0 == nil }) || addonResult.hadFailures
+        guard !catalogs.isEmpty else { throw URLError(.cannotLoadFromNetwork) }
         return catalogs
     }
 
@@ -189,18 +251,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// custom catalogs — Marvel, actors, lists — that belong on Home. Search-
     /// only catalogs and ones needing unsupported extras are skipped; a
     /// required genre is satisfied with the catalog's first declared option.
-    private func addonHomeCatalogs() async -> [NuvioCatalog] {
+    private func addonHomeCatalogs() async -> (catalogs: [NuvioCatalog], hadFailures: Bool) {
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
         let maxRows = 24
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
+        var hadFailures = false
         Self.homeAddonFetchDiagnostic = "loading"
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
+            guard !Task.isCancelled else { break }
             guard catalogs.count < maxRows else { break }
             guard let manifest = await manifest(for: manifestURL) else {
+                guard !Task.isCancelled else { break }
+                hadFailures = true
                 reports.append("\(manifestURL.host ?? "unknown"): manifest failed")
                 continue
             }
@@ -223,6 +289,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             var loadedForManifest = 0
             var failedForManifest = 0
             for catalog in eligible.prefix(remaining) {
+                guard !Task.isCancelled else { break }
                 do {
                     var path = "catalog/\(catalog.type)/\(catalog.id)"
                     let catalogGenre = catalog.requiresGenre ? catalog.firstGenreOption : nil
@@ -236,6 +303,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     )
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
                     guard !items.isEmpty else {
+                        hadFailures = true
                         failedForManifest += 1
                         continue
                     }
@@ -255,6 +323,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     )
                     loadedForManifest += 1
                 } catch {
+                    guard !Task.isCancelled else { break }
+                    hadFailures = true
                     failedForManifest += 1
                 }
             }
@@ -279,7 +349,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 }
                 .map(\.element)
         }
-        return catalogs
+        return (catalogs, hadFailures)
     }
 
     /// Maps an add-on catalog's tvOS id (`addon_<addonId>_<type>_<catalogId>`)

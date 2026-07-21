@@ -150,4 +150,41 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(PlaybackCacheProfile.large.aetherForwardBufferSegments, 30)
         XCTAssertEqual(PlaybackCacheProfile.max.aetherForwardBufferSegments, 60)
     }
+
+    @MainActor
+    func testAetherExternalSubtitleIdentityKeepsOrderWhenOneIsRejected() {
+        let english = NuvioSubtitle(
+            url: "https://cdn.example/en.srt", language: "en", label: "English"
+        )
+        let norwegian = NuvioSubtitle(
+            url: "https://cdn.example/no.srt", language: "no", label: "Norsk"
+        )
+
+        let accepted = AetherExternalSubtitleIdentity.accepted(
+            [NuvioSubtitle(url: "", language: "", label: nil), english, norwegian]
+        )
+
+        XCTAssertEqual(accepted.map(\.subtitle.url), [english.url, norwegian.url])
+        XCTAssertEqual(accepted.map(\.url.absoluteString), [english.url, norwegian.url])
+    }
+
+    @MainActor
+    func testAetherOverlayStatePublishesClockIndependently() {
+        let state = AetherSubtitleOverlayState()
+        state.updateSourceTime(12.5)
+
+        XCTAssertEqual(state.sourceTime, 12.5)
+    }
+
+    @MainActor
+    func testAetherDisplaySizeAppliesAnamorphicPixelAspectRatio() {
+        let size = AetherPlaybackController.displayVideoSize(
+            codedWidth: 720,
+            codedHeight: 576,
+            pixelAspectRatio: 64.0 / 45.0
+        )
+
+        XCTAssertEqual(size.width, 1024, accuracy: 0.001)
+        XCTAssertEqual(size.height, 576, accuracy: 0.001)
+    }
 }

@@ -1829,7 +1829,12 @@ struct TVHomeView: View {
                             requestLoadingFocus()
                         }
                 } else if let errorMessage, store.sections.isEmpty && continueWatching.isEmpty {
-                    TVErrorView(message: errorMessage)
+                    TVErrorView(message: errorMessage) {
+                        addonReloadTask?.cancel()
+                        addonReloadTask = Task { @MainActor in
+                            await loadWithAutomaticRetry()
+                        }
+                    }
                 } else {
                     // Header Hero Meta block (static, outside the rows). Folder
                     // focus swaps poster meta for emoji + folder title (browse-style).
@@ -2006,7 +2011,7 @@ struct TVHomeView: View {
 
         }
         .task {
-            await load()
+            await loadWithAutomaticRetry()
             await ContinueWatchingStore.refreshMissingEpisodeDetails()
         }
         .task {
@@ -2325,6 +2330,37 @@ struct TVHomeView: View {
     }
 
     @MainActor
+    private func loadWithAutomaticRetry() async {
+        let maximumAttempts = 3
+        for attempt in 0..<maximumAttempts {
+            await load()
+            guard !Task.isCancelled else { return }
+            if store.hasLoaded {
+                // Add-on rows are best-effort, so a partial response is still
+                // useful. Keep it visible, wait briefly, then replace the tree
+                // once instead of caching the omission for the whole session.
+                guard repository.homeCatalogLoadWasPartial else { return }
+                do {
+                    try await Task.sleep(nanoseconds: 2_000_000_000)
+                } catch {
+                    return
+                }
+                await reloadHomeForAddonChange()
+                return
+            }
+            guard attempt < maximumAttempts - 1 else { return }
+
+            do {
+                try await Task.sleep(
+                    nanoseconds: UInt64(attempt + 1) * 1_000_000_000
+                )
+            } catch {
+                return
+            }
+        }
+    }
+
+    @MainActor
     private func load() async {
         // Progress is local/account-synced state and does not depend on the
         // catalog network request below. Publish it first so Home is useful
@@ -2410,6 +2446,8 @@ struct TVHomeView: View {
             didRequestInitialCardFocus = false
             shouldRestoreHomeFocus = false
             isLoading = false
+        } catch is CancellationError {
+            isLoading = false
         } catch {
             errorMessage = error.localizedDescription
             isLoading = false
@@ -2443,10 +2481,16 @@ struct TVHomeView: View {
         // Keep the last successful rows mounted while the replacement tree is
         // fetched. A slow/dead add-on must never blank Home or hide Continue
         // Watching; `load()` swaps in the new tree only after it completes.
+        let hadUsableSections = !store.sections.isEmpty
         store.hasLoaded = false
         isLoading = true
         errorMessage = nil
         await load()
+        // A failed replacement must not invalidate the rows it deliberately
+        // kept mounted. They remain the last known-good Home cache.
+        if !store.hasLoaded && hadUsableSections {
+            store.hasLoaded = true
+        }
     }
 
     /// Builds one Home row per synced collection with emoji/folder cards.
@@ -4373,6 +4417,7 @@ private struct TVLoadingView: View {
 
 private struct TVErrorView: View {
     let message: String
+    let onRetry: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
@@ -4381,6 +4426,8 @@ private struct TVErrorView: View {
             Text(message)
                 .font(.title3)
                 .foregroundColor(.white.opacity(0.68))
+            Button("Retry", action: onRetry)
+                .buttonStyle(.borderedProminent)
         }
         .foregroundColor(.white)
         .padding(.leading, TVLayout.contentLeading)

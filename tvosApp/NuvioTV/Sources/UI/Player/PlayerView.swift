@@ -57,8 +57,7 @@ struct PlayerView: View {
             // Host subtitle overlay for Aether (MPV renders its own subs).
             if viewModel.activeEngineKind == .aether {
                 PlayerSubtitleOverlay(
-                    cues: viewModel.aetherController.subtitleCues,
-                    sourceTime: viewModel.aetherController.sourceTimeSeconds,
+                    playback: viewModel.aetherController.subtitleOverlayState,
                     subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
                     videoNaturalSize: viewModel.videoNaturalSize,
                     aspectMode: viewModel.aspectMode,
@@ -503,7 +502,6 @@ struct PlayerView: View {
                 viewModel.hidePeek()
                 return
             }
-            remoteInputFocused = false
             onBack()
         }
     }

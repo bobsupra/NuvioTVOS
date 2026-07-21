@@ -785,6 +785,9 @@ public final class AetherEngine: ObservableObject {
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
     public private(set) var sourceVideoWidth: Int32 = 0
     public private(set) var sourceVideoHeight: Int32 = 0
+    /// Display-width multiplier for non-square source pixels. Hosts use this
+    /// with the coded dimensions when positioning overlays over anamorphic video.
+    public private(set) var sourceVideoPixelAspectRatio: Double = 1
 
     /// MKV font attachments from the probe. Hosts write these to disk for ASS renderer font config (AetherEngine#30).
     /// Not @Published and not in SourceProbe: payloads are 10-30 MB and only playback hosts need them.
@@ -1644,6 +1647,7 @@ public final class AetherEngine: ObservableObject {
         sourceVideoBitrate = 0
         sourceVideoWidth = 0
         sourceVideoHeight = 0
+        sourceVideoPixelAspectRatio = 1
 
         // #114: guarantee the AVAudioSession category is declared (off-main, from init) before any branch
         // below can activate the session: AVKit on the native/remote-HLS paths, activateRendererAudioSession()
@@ -1724,6 +1728,12 @@ public final class AetherEngine: ObservableObject {
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
                 sourceVideoWidth = stream.pointee.codecpar.pointee.width
                 sourceVideoHeight = stream.pointee.codecpar.pointee.height
+                let streamSAR = stream.pointee.sample_aspect_ratio
+                let codecSAR = stream.pointee.codecpar.pointee.sample_aspect_ratio
+                let sar = (streamSAR.num > 0 && streamSAR.den > 0) ? streamSAR : codecSAR
+                if sar.num > 0, sar.den > 0 {
+                    sourceVideoPixelAspectRatio = Double(sar.num) / Double(sar.den)
+                }
                 detectedVideoBitrate = probe.declaredBitrate(stream: stream)
                 lastDetectedVideoCodec = detectedCodecID
             }
@@ -2620,6 +2630,7 @@ public final class AetherEngine: ObservableObject {
         sourceVideoBitrate = 0
         sourceVideoWidth = 0
         sourceVideoHeight = 0
+        sourceVideoPixelAspectRatio = 1
         pendingExternalMetadata = []
         // Clear loadedURL on public stop() so reloadAtCurrentPosition can't resurrect the URL after dismissal
         // and selectSubtitleTrack can't spawn a side demuxer against a stopped session.
