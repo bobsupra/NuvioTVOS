@@ -25,25 +25,29 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.3 (build 44)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.4 (build 45)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.3) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.4](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.4) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.3-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.3/NuvioTV-3.1.3-unsigned-release.ipa)
+[NuvioTV-3.1.4-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.4/NuvioTV-3.1.4-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.3
+### New in Beta 3.1.4
 
-- Replaces the legacy AVPlayer player engine with AetherEngine as the primary playback backend. MPVKit remains available as a one-way compatibility fallback and can still be selected explicitly for diagnostics.
-- Bundles AetherEngine and MPVKit safely in the same app by using namespaced Aether FFmpeg frameworks alongside MPVKit's FFmpeg stack.
-- Preserves the playback features that require MPVKit, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
-- Adds Aether subtitle presentation for plain text, styled text, and PGS bitmap subtitles.
-- Adds profile-switch safety to account sync: stale remote pulls are cancelled before they can apply data to the newly selected profile.
+- Improves the new AetherEngine player with more predictable Siri Remote focus, timeline-to-transport navigation, seeking, and playback state updates.
+- Improves embedded and external subtitle discovery, selection, rendering, and timing. Native HLS subtitles can hand off to the compatibility player when Nuvio subtitle appearance controls are needed.
+- Fixes Trakt progress after fast-forwarding, marks playback watched at 90%, mirrors manual watched/unwatched actions to Trakt history, and makes **Sync Now** refresh watch progress like Android TV.
+- Makes Home catalogs resilient to partial provider failures, retries missing catalogs, and refreshes incomplete results without requiring a profile switch.
+- Keeps Trakt and catalog refresh work scoped to the active profile so stale results cannot overwrite a newly selected profile.
+
+### The new player
+
+Nuvio now uses **AetherEngine** as its primary built-in player instead of the legacy AVPlayer implementation. It supports tvOS-native playback controls, precise seeking and resume, embedded and add-on subtitles, styled text and PGS bitmap subtitles, saved audio/subtitle selections, and automatic frame-rate matching. **MPVKit** remains available as a one-way compatibility fallback for streams or controls that AetherEngine cannot currently handle, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
 
 ### Trakt sign-in with your own API app
 
-Beta 3.1.3 adds Trakt device login with user-provided API credentials. This is useful when you want to use your own Trakt application instead of relying on shared app credentials.
+Nuvio supports Trakt device login with user-provided API credentials. This is useful when you want to use your own Trakt application instead of relying on shared app credentials.
 
 1. Create an application at [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications).
 2. Set its redirect URI to `urn:ietf:wg:oauth:2.0:oob`.
@@ -76,7 +80,7 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
 - tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
 - Trakt device-code login using a user-provided Client ID and Client Secret, stored locally on the Apple TV.
-- AetherEngine-first playback with one-way MPVKit compatibility fallback, tvOS remote input, skip controls, saved audio/subtitle selections, idle-timer handling, and resume support.
+- New AetherEngine-first player with Siri Remote controls, precise seeking and resume, embedded/add-on subtitle support, saved track selections, frame-rate matching, and a one-way MPVKit compatibility fallback.
 - Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).
 
