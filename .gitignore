@@ -31,6 +31,9 @@ tools
 AGENTS.md
 server
 
+# Local Android TV reference checkout; this tvOS repository does not track it
+/NuvioTVandroid/
+
 # Built IPAs are distributed via GitHub Releases, not committed
 *.ipa
 build-ipa/

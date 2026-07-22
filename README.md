@@ -111,7 +111,7 @@ Known areas that still need work:
 - Top Shelf, debrid resolving, and Cloud Library still need more real-device validation across accounts/providers.
 - If login still returns to the Apple TV Home screen on a real device, please send the device console or crash log.
 
-The Android TV version is the main UX reference for this port. Before changing navigation, focus behavior, scrolling, player controls, layout settings, or core interaction patterns, run the Android TV app in an emulator and feel how that version behaves. The tvOS version does not need to be a pixel-for-pixel clone, but it should preserve the things that make the Android TV app work well on a couch/remote interface.
+The tvOS app is developed independently around Apple TV conventions, Siri Remote navigation, and real-device feedback. The optional local `NuvioTVandroid/` reference checkout is intentionally excluded from this repository and is not required to build or contribute to the tvOS app.
 
 Useful new features are welcome. For large UI redesigns or major experience changes, please open a discussion or vote first so contributors can agree on direction before the app moves away from the current TV design.
 
