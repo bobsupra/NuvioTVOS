@@ -188,3 +188,200 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(size.height, 576, accuracy: 0.001)
     }
 }
+
+final class WatchedIdentityPolicyTests: XCTestCase {
+    func testMatchesCatalogAndTraktItemsAcrossIMDbAndTMDBAliases() {
+        let catalog = makeMeta(id: "tmdb:94997", imdbId: "tt11198330", tmdbId: 94997)
+        let trakt = makeMeta(id: "tt11198330", imdbId: "tt11198330", tmdbId: 94997)
+
+        XCTAssertTrue(WatchedStore.sameContent(catalog, trakt))
+    }
+
+    func testDoesNotMatchDifferentTitlesThatShareAType() {
+        let first = makeMeta(id: "tmdb:1", imdbId: nil, tmdbId: 1)
+        let second = makeMeta(id: "tmdb:2", imdbId: nil, tmdbId: 2)
+
+        XCTAssertFalse(WatchedStore.sameContent(first, second))
+    }
+
+    func testTraktSnapshotDoesNotDeleteWholeSeriesMarker() {
+        let series = makeMeta(id: "tt11198330", imdbId: "tt11198330", tmdbId: 94997)
+        let wholeSeries = WatchedStoreItem(meta: series, watchedAt: Date())
+        let episode = WatchedStoreItem(meta: series, watchedAt: Date(), season: 3, episode: 4)
+        let movie = WatchedStoreItem(
+            meta: makeMeta(id: "tt0133093", imdbId: "tt0133093", tmdbId: 603, type: "movie"),
+            watchedAt: Date()
+        )
+
+        XCTAssertFalse(WatchedStore.isRepresentedByTraktSnapshot(wholeSeries))
+        XCTAssertTrue(WatchedStore.isRepresentedByTraktSnapshot(episode))
+        XCTAssertTrue(WatchedStore.isRepresentedByTraktSnapshot(movie))
+    }
+
+    private func makeMeta(
+        id: String,
+        imdbId: String?,
+        tmdbId: Int?,
+        type: String = "series"
+    ) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: "Test",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            type: type,
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        )
+    }
+}
+
+final class EpisodeResumeIsolationTests: XCTestCase {
+    private let profileId = "episode-resume-isolation-tests"
+
+    override func setUp() {
+        super.setUp()
+        ContinueWatchingStore.eraseAllProfiles()
+        WatchedStore.eraseAllProfiles()
+        ContinueWatchingStore.setActiveProfile(profileId)
+        WatchedStore.setActiveProfile(profileId)
+    }
+
+    override func tearDown() {
+        ContinueWatchingStore.eraseAllProfiles()
+        WatchedStore.eraseAllProfiles()
+        super.tearDown()
+    }
+
+    func testEachEpisodeKeepsItsOwnResumePoint() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e02.mkv",
+            position: 480,
+            duration: 3_000,
+            season: 1,
+            episode: 2,
+            episodeId: "tt-test:1:2"
+        )
+
+        XCTAssertEqual(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 1, episodeId: "tt-test:1:1"
+            ),
+            360
+        )
+        XCTAssertEqual(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 2, episodeId: "tt-test:1:2"
+            ),
+            480
+        )
+        XCTAssertNil(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 3, episodeId: "tt-test:1:3"
+            )
+        )
+    }
+
+    func testWatchedEpisodeDoesNotResumeOlderProgress() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 1, episode: 1))
+
+        XCTAssertNil(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 1, episodeId: "tt-test:1:1"
+            )
+        )
+    }
+
+    func testOlderRemoteProgressCannotOverwriteNewerEpisodeResume() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+        let staleRemote = ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 120,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -3_600),
+            season: 1,
+            episode: 1
+        )
+
+        XCTAssertTrue(ContinueWatchingStore.mergeRemote([staleRemote]))
+        XCTAssertEqual(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 1, episodeId: "tt-test:1:1"
+            ),
+            360
+        )
+    }
+
+    private func makeSeries() -> NuvioMeta {
+        NuvioMeta(
+            id: "tt-test",
+            name: "Test Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt-test",
+            tmdbId: 123,
+            type: "series",
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: [
+                NuvioVideo(id: "tt-test:1:1", title: "One", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+                NuvioVideo(id: "tt-test:1:2", title: "Two", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil),
+            ]
+        )
+    }
+}

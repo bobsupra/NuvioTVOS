@@ -670,6 +670,22 @@ enum ContinueWatchingStore {
     private static let baseKey = "nuvio.tv.continueWatching.items"
     private static let storageDirectoryName = "nuvio-continue-watching"
     private static let maxItems = 20
+    private static let maxEpisodeResumePoints = 200
+
+    /// Continue Watching intentionally keeps one visible row per show. Resume
+    /// points cannot share that shape: each episode needs an independent key or
+    /// the show's latest row leaks into a different episode.
+    private struct EpisodeResumePoint: Codable {
+        let metaId: String
+        let imdbId: String?
+        let tmdbId: Int?
+        let season: Int
+        let episode: Int
+        let episodeId: String?
+        let position: Double
+        let duration: Double
+        let updatedAt: Date
+    }
 
     /// Last durable-storage result, suitable for the on-screen sync diagnostic.
     static private(set) var persistenceDiagnostic = "not attempted"
@@ -719,6 +735,10 @@ enum ContinueWatchingStore {
         return "\(baseKey).\(id)"
     }
 
+    private static var episodeResumeStorageKey: String {
+        "\(storageKey).episodeResumePoints.v1"
+    }
+
     static func items() -> [ContinueWatchingItem] {
         guard let data = data(for: storageKey) else {
             return []
@@ -740,6 +760,54 @@ enum ContinueWatchingStore {
 
     static func item(for metaId: String) -> ContinueWatchingItem? {
         items().first { $0.meta.id == metaId }
+    }
+
+    /// Exact per-episode resume lookup. A series request never falls back to
+    /// the show's latest Continue Watching row unless that row identifies the
+    /// same season and episode.
+    static func resumePosition(
+        for meta: NuvioMeta,
+        season: Int?,
+        episode: Int?,
+        episodeId: String? = nil
+    ) -> Double? {
+        guard meta.isSeries else { return item(for: meta.id)?.resumePosition }
+        guard let season, let episode else { return nil }
+        let watchedAt = WatchedStore.items().first {
+            WatchedStore.sameContent($0.meta, meta)
+                && $0.season == season && $0.episode == episode
+        }?.watchedAt
+
+        if let point = episodeResumePoints().first(where: {
+            resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
+        }) {
+            if let watchedAt, watchedAt >= point.updatedAt { return nil }
+            return clampedResume(position: point.position, duration: point.duration)
+        }
+
+        // Migration path for progress written before the per-episode ledger.
+        guard let legacy = items().first(where: {
+            guard $0.meta.id == meta.id, !$0.isUpNextEntry else { return false }
+            if let storedSeason = $0.season, let storedEpisode = $0.episode {
+                return storedSeason == season && storedEpisode == episode
+            }
+            return EpisodeTagResolver.episodeNumbers(in: $0.streamUrl).map {
+                $0.season == season && $0.episode == episode
+            } ?? false
+        }) else {
+            return nil
+        }
+        if let watchedAt, watchedAt >= legacy.lastWatchedAt { return nil }
+        saveEpisodeResumePoint(
+            meta: meta,
+            season: season,
+            episode: episode,
+            episodeId: episodeId,
+            position: legacy.position,
+            duration: legacy.duration,
+            updatedAt: legacy.lastWatchedAt
+        )
+        return legacy.resumePosition
     }
 
     /// Read-only storage diagnostics for the on-screen Home failure panel.
@@ -802,7 +870,15 @@ enum ContinueWatchingStore {
         }
     }
 
-    static func save(meta: NuvioMeta, streamUrl: String, position: Double, duration: Double, season: Int? = nil, episode: Int? = nil) {
+    static func save(
+        meta: NuvioMeta,
+        streamUrl: String,
+        position: Double,
+        duration: Double,
+        season: Int? = nil,
+        episode: Int? = nil,
+        episodeId: String? = nil
+    ) {
         // A temporarily unavailable MPV time-pos must not erase a valid resume
         // point. Only a coherent, started sample is allowed to replace/remove
         // existing progress.
@@ -811,8 +887,23 @@ enum ContinueWatchingStore {
               position > 0,
               duration >= 60 else { return }
         guard shouldKeep(position: position, duration: duration) else {
+            if let season, let episode {
+                removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
+            }
             remove(metaId: meta.id)
             return
+        }
+
+        if meta.isSeries, let season, let episode {
+            saveEpisodeResumePoint(
+                meta: meta,
+                season: season,
+                episode: episode,
+                episodeId: episodeId,
+                position: position,
+                duration: duration,
+                updatedAt: Date()
+            )
         }
 
         // A save that doesn't know its episode (resume paths that only carry a
@@ -905,6 +996,31 @@ enum ContinueWatchingStore {
         persist(items().filter { $0.meta.id != metaId })
     }
 
+    /// Removes resume rows that are older than a durable watched mark. Episode
+    /// marks only remove the matching episode; a later rewatch/progress update
+    /// wins by timestamp and remains visible.
+    static func removeWatched(_ watchedItems: [WatchedStoreItem]) {
+        guard !watchedItems.isEmpty else { return }
+        removeEpisodeResumePoints(watchedItems: watchedItems)
+        let current = items()
+        let remaining = current.filter { progress in
+            !watchedItems.contains { watched in
+                guard WatchedStore.sameContent(watched.meta, progress.meta),
+                      watched.watchedAt >= progress.lastWatchedAt else {
+                    return false
+                }
+                if progress.meta.isSeries {
+                    guard let progressEpisode = progress.episodeNumbers else { return false }
+                    return watched.season == progressEpisode.season
+                        && watched.episode == progressEpisode.episode
+                }
+                return watched.season == nil && watched.episode == nil
+            }
+        }
+        guard remaining.count != current.count else { return }
+        persist(remaining)
+    }
+
     @discardableResult
     static func mergeRemote(_ remoteItems: [ContinueWatchingItem]) -> Bool {
         guard !remoteItems.isEmpty else { return true }
@@ -918,7 +1034,36 @@ enum ContinueWatchingStore {
                 byId[item.meta.id] = item
             }
         }
-        return persist(Array(byId.values).sorted { $0.lastWatchedAt > $1.lastWatchedAt }.prefix(maxItems).map { $0 })
+        let merged = Array(byId.values)
+            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+            .prefix(maxItems)
+            .map { $0 }
+        guard persist(merged) else { return false }
+        remoteItems.forEach { item in
+            guard item.meta.isSeries,
+                  !item.isUpNextEntry,
+                  let season = item.season,
+                  let episode = item.episode,
+                  shouldKeep(position: item.position, duration: item.duration) else {
+                return
+            }
+            let episodeId = item.meta.videos?.first {
+                $0.season == season && $0.episode == episode
+            }?.id
+            saveEpisodeResumePoint(
+                meta: item.meta,
+                season: season,
+                episode: episode,
+                episodeId: episodeId,
+                position: item.position,
+                duration: item.duration,
+                updatedAt: item.lastWatchedAt
+            )
+        }
+        // A Nuvio Sync progress pull can arrive after the watched pull and
+        // otherwise resurrect an episode that Trakt/local history just marked.
+        removeWatched(WatchedStore.items())
+        return true
     }
 
     static func replaceAll(_ newItems: [ContinueWatchingItem]) {
@@ -931,6 +1076,99 @@ enum ContinueWatchingStore {
         guard duration >= 60, position > 0 else { return false }
         let remaining = duration - position
         return remaining >= 60 && (position / duration) < 0.92
+    }
+
+    private static func episodeResumePoints() -> [EpisodeResumePoint] {
+        guard let data = UserDefaults.standard.data(forKey: episodeResumeStorageKey),
+              let decoded = try? makeDecoder().decode([EpisodeResumePoint].self, from: data) else {
+            return []
+        }
+        return decoded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private static func saveEpisodeResumePoint(
+        meta: NuvioMeta,
+        season: Int,
+        episode: Int,
+        episodeId: String?,
+        position: Double,
+        duration: Double,
+        updatedAt: Date
+    ) {
+        guard position > 5 else { return }
+        guard shouldKeep(position: position, duration: duration) else {
+            removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
+            return
+        }
+        let current = episodeResumePoints()
+        if let existing = current.first(where: {
+            resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
+        }), existing.updatedAt > updatedAt {
+            return
+        }
+        let point = EpisodeResumePoint(
+            metaId: meta.id,
+            imdbId: meta.imdbId,
+            tmdbId: meta.tmdbId,
+            season: season,
+            episode: episode,
+            episodeId: episodeId,
+            position: position,
+            duration: duration,
+            updatedAt: updatedAt
+        )
+        let updated = ([point] + current.filter {
+            !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
+        }).prefix(maxEpisodeResumePoints)
+        guard let data = try? makeEncoder().encode(Array(updated)) else { return }
+        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+    }
+
+    private static func removeEpisodeResumePoint(meta: NuvioMeta, season: Int, episode: Int) {
+        let current = episodeResumePoints()
+        let remaining = current.filter {
+            !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: nil)
+        }
+        guard remaining.count != current.count,
+              let data = try? makeEncoder().encode(remaining) else { return }
+        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+    }
+
+    private static func removeEpisodeResumePoints(watchedItems: [WatchedStoreItem]) {
+        let current = episodeResumePoints()
+        let remaining = current.filter { point in
+            !watchedItems.contains { watched in
+                guard let season = watched.season, let episode = watched.episode,
+                      watched.watchedAt >= point.updatedAt else { return false }
+                return resumePoint(point, matches: watched.meta, season: season, episode: episode, episodeId: nil)
+            }
+        }
+        guard remaining.count != current.count,
+              let data = try? makeEncoder().encode(remaining) else { return }
+        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+    }
+
+    private static func resumePoint(
+        _ point: EpisodeResumePoint,
+        matches meta: NuvioMeta,
+        season: Int,
+        episode: Int,
+        episodeId: String?
+    ) -> Bool {
+        guard point.season == season, point.episode == episode else { return false }
+        let sameShow = point.metaId == meta.id
+            || (point.imdbId != nil && point.imdbId == meta.imdbId)
+            || (point.tmdbId != nil && point.tmdbId == meta.tmdbId)
+        guard sameShow else { return false }
+        if let episodeId, let storedEpisodeId = point.episodeId {
+            return storedEpisodeId == episodeId
+        }
+        return true
+    }
+
+    private static func clampedResume(position: Double, duration: Double) -> Double? {
+        guard position > 5, shouldKeep(position: position, duration: duration) else { return nil }
+        return max(0, min(position, max(duration - 5, 0)))
     }
 
     @discardableResult
@@ -1891,8 +2129,10 @@ enum WatchedStore {
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
-    private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+    private static var storageKey: String { storageKey(for: activeProfileId) }
+
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
     }
 
@@ -1914,21 +2154,49 @@ enum WatchedStore {
     /// finished episode doesn't checkmark the whole series poster.
     static func contains(metaId: String, type: String) -> Bool {
         items().contains {
-            $0.meta.id == metaId
+            $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
                 && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
                 && $0.season == nil && $0.episode == nil
         }
     }
 
+    static func contains(meta: NuvioMeta) -> Bool {
+        items().contains {
+            sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil
+        }
+    }
+
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {
-        items().contains { $0.meta.id == metaId && $0.season == season && $0.episode == episode }
+        items().contains {
+            $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
+                && $0.season == season && $0.episode == episode
+        }
+    }
+
+    static func containsEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
+        items().contains {
+            sameContent($0.meta, meta) && $0.season == season && $0.episode == episode
+        }
     }
 
     /// "season:episode" keys of every watched episode of a series, for the
     /// Details episode strip.
     static func watchedEpisodeKeys(metaId: String) -> Set<String> {
         Set(items().compactMap { item in
-            guard item.meta.id == metaId, let season = item.season, let episode = item.episode else {
+            guard item.meta.id.caseInsensitiveCompare(metaId) == .orderedSame,
+                  let season = item.season,
+                  let episode = item.episode else {
+                return nil
+            }
+            return "\(season):\(episode)"
+        })
+    }
+
+    static func watchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
+        Set(items().compactMap { item in
+            guard sameContent(item.meta, meta),
+                  let season = item.season,
+                  let episode = item.episode else {
                 return nil
             }
             return "\(season):\(episode)"
@@ -1940,12 +2208,24 @@ enum WatchedStore {
     /// a failed device write keeps the prior state.
     @discardableResult
     static func toggle(meta: NuvioMeta) -> Bool {
-        if contains(metaId: meta.id, type: meta.type) {
-            remove(metaId: meta.id, type: meta.type)
+        if contains(meta: meta) {
+            remove(meta: meta)
         } else {
             markWatched(meta)
         }
-        return contains(metaId: meta.id, type: meta.type)
+        return contains(meta: meta)
+    }
+
+    /// Episode equivalent of the working movie/title toggle. It uses the same
+    /// durable local store and Trakt mutation path as playback completion.
+    @discardableResult
+    static func toggleEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
+        if containsEpisode(meta: meta, season: season, episode: episode) {
+            removeEpisode(meta: meta, season: season, episode: episode)
+        } else {
+            markWatched(meta, season: season, episode: episode)
+        }
+        return containsEpisode(meta: meta, season: season, episode: episode)
     }
 
     @discardableResult
@@ -1957,30 +2237,53 @@ enum WatchedStore {
             episode: episode
         )
         let updated = [item] + items().filter {
-            !($0.meta.id == meta.id
-                && $0.meta.type.caseInsensitiveCompare(meta.type) == .orderedSame
+            !(sameContent($0.meta, meta)
                 && $0.season == season && $0.episode == episode)
         }
         guard persist(updated) else { return false }
         // The mark is durable now, so it is safe to cancel any pending remote
         // delete. A failed watched-list write must leave that protection intact.
-        clearTombstone(metaId: meta.id, season: season, episode: episode)
+        clearTombstone(meta: meta, season: season, episode: episode)
 
         // Only clear Continue Watching after the watched mark is durable, so a
         // failed write does not drop resume progress with nothing to replace it.
-        if season == nil, episode == nil {
-            ContinueWatchingStore.remove(metaId: meta.id)
-        }
+        ContinueWatchingStore.removeWatched([item])
         let traktStore = ProfileSettings.current
-        Task {
-            _ = await TraktHistoryService.setWatched(
-                meta,
+        if TraktAuthStore.state(in: traktStore).isAuthenticated(in: traktStore) {
+            let profileId = activeProfileId
+            _ = enqueuePendingTraktMutation(
+                meta: meta,
                 season: season,
                 episode: episode,
                 isWatched: true,
-                store: traktStore
+                profileId: profileId
             )
+            Task {
+                _ = await TraktHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: true,
+                    store: traktStore
+                )
+            }
         }
+        return true
+    }
+
+    @discardableResult
+    static func remove(meta: NuvioMeta) -> Bool {
+        let currentItems = items()
+        let removed = currentItems.first {
+            sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil
+        }
+        let updated = currentItems.filter {
+            !(sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil)
+        }
+        guard persist(updated) else { return false }
+        let removedMeta = removed?.meta ?? meta.persistenceSnapshot
+        addTombstone(meta: removedMeta, season: nil, episode: nil)
+        enqueueTraktRemovalIfConnected(meta: removedMeta, season: nil, episode: nil)
         return true
     }
 
@@ -2001,18 +2304,49 @@ enum WatchedStore {
                 && $0.season == nil && $0.episode == nil)
         }
         guard persist(updated) else { return false }
-        addTombstone(metaId: metaId, season: nil, episode: nil)
-        if let removed {
-            let traktStore = ProfileSettings.current
-            Task {
-                _ = await TraktHistoryService.setWatched(
-                    removed.meta,
-                    isWatched: false,
-                    store: traktStore
-                )
-            }
-        }
+        guard let removed else { return true }
+        addTombstone(meta: removed.meta, season: nil, episode: nil)
+        enqueueTraktRemovalIfConnected(meta: removed.meta, season: nil, episode: nil)
         return true
+    }
+
+    @discardableResult
+    private static func removeEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
+        let currentItems = items()
+        let updated = currentItems.filter {
+            !(sameContent($0.meta, meta)
+                && $0.season == season && $0.episode == episode)
+        }
+        guard persist(updated) else { return false }
+        addTombstone(meta: meta, season: season, episode: episode)
+        enqueueTraktRemovalIfConnected(meta: meta, season: season, episode: episode)
+        return true
+    }
+
+    private static func enqueueTraktRemovalIfConnected(
+        meta: NuvioMeta,
+        season: Int?,
+        episode: Int?
+    ) {
+        let traktStore = ProfileSettings.current
+        guard TraktAuthStore.state(in: traktStore).isAuthenticated(in: traktStore) else { return }
+        let profileId = activeProfileId
+        _ = enqueuePendingTraktMutation(
+            meta: meta,
+            season: season,
+            episode: episode,
+            isWatched: false,
+            profileId: profileId
+        )
+        Task {
+            _ = await TraktHistoryService.setWatched(
+                meta,
+                season: season,
+                episode: episode,
+                isWatched: false,
+                store: traktStore
+            )
+        }
     }
 
     /// Merges a FULL remote snapshot. Tombstones (locally removed marks) block
@@ -2020,41 +2354,235 @@ enum WatchedStore {
     /// gone from the server — the pushed delete is best-effort, so the pull is
     /// the confirmation. A newer re-watch on another device supersedes one.
     @discardableResult
-    static func mergeRemote(_ remoteItems: [WatchedStoreItem]) -> Bool {
+    static func mergeRemote(
+        _ remoteItems: [WatchedStoreItem],
+        confirmsTombstoneDeletions: Bool = true
+    ) -> Bool {
         let removedMarks = tombstones()
         guard !remoteItems.isEmpty || !removedMarks.isEmpty else { return true }
 
         let stillBlocking = removedMarks.filter { tombstone in
-            remoteItems.contains {
-                $0.meta.id == tombstone.metaId && $0.season == tombstone.season
-                    && $0.episode == tombstone.episode && $0.watchedAt <= tombstone.removedAt
+            let matchingRemote = remoteItems.first {
+                tombstoneMatches(tombstone, item: $0)
             }
+            if confirmsTombstoneDeletions {
+                guard let matchingRemote else { return false }
+                return matchingRemote.watchedAt <= tombstone.removedAt
+            }
+            // A Trakt snapshot cannot confirm that the separate Nuvio backend
+            // applied its delete. Keep the tombstone unless Trakt contains a
+            // genuinely newer re-watch.
+            return matchingRemote == nil || matchingRemote!.watchedAt <= tombstone.removedAt
         }
         if stillBlocking.count != removedMarks.count {
             _ = persistTombstones(stillBlocking)
         }
 
         let accepted = remoteItems.filter { item in
-            !stillBlocking.contains {
-                $0.metaId == item.meta.id && $0.season == item.season && $0.episode == item.episode
-            }
+            !stillBlocking.contains { tombstoneMatches($0, item: item) }
         }
 
-        var byKey: [String: WatchedStoreItem] = [:]
+        var merged: [WatchedStoreItem] = []
         (items() + accepted).forEach { item in
-            let key = item.id.lowercased()
-            let existing = byKey[key]
-            if existing == nil || item.watchedAt > existing!.watchedAt {
-                byKey[key] = item
+            if let index = merged.firstIndex(where: { sameWatchedIdentity($0, item) }) {
+                if item.watchedAt > merged[index].watchedAt {
+                    merged[index] = item
+                }
+            } else {
+                merged.append(item)
             }
         }
-        return persist(Array(byKey.values).sorted { $0.watchedAt > $1.watchedAt })
+        merged.sort { $0.watchedAt > $1.watchedAt }
+        guard persist(merged) else { return false }
+        ContinueWatchingStore.removeWatched(merged)
+        return true
+    }
+
+    /// Applies Trakt as the authoritative watched snapshot. Local marks created
+    /// after this request began are preserved; older Trakt-addressable marks
+    /// absent from the snapshot become tombstones so a later Nuvio pull cannot
+    /// resurrect them.
+    @discardableResult
+    static func reconcileTraktSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        syncStartedAt: Date
+    ) -> Bool {
+        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
+
+        let remoteKeys = Set(remoteItems.flatMap(traktIdentityKeys))
+        let pendingMarks = pendingTraktMutations().filter(\.isWatched)
+        let current = items()
+        let obsolete = current.filter { item in
+            guard item.watchedAt <= syncStartedAt,
+                  isRepresentedByTraktSnapshot(item) else { return false }
+            let keys = traktIdentityKeys(item)
+            guard keys.isDisjoint(with: remoteKeys) else { return false }
+            return !pendingMarks.contains { pendingMatches($0, item: item) }
+        }
+        if !obsolete.isEmpty {
+            let obsoleteIDs = Set(obsolete.map(\.id))
+            guard persist(current.filter { !obsoleteIDs.contains($0.id) }) else { return false }
+            obsolete.forEach {
+                addTombstone(meta: $0.meta, season: $0.season, episode: $0.episode)
+            }
+        }
+        confirmPendingTraktMutations(against: remoteItems)
+        return true
+    }
+
+    static func sameContent(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
+        guard normalizedType(lhs.type) == normalizedType(rhs.type) else { return false }
+        return !contentIdentityKeys(for: lhs).isDisjoint(with: contentIdentityKeys(for: rhs))
+    }
+
+    static func isRepresentedByTraktSnapshot(_ item: WatchedStoreItem) -> Bool {
+        // Trakt represents a watched show as episode rows, not as a distinct
+        // whole-series row. Keep the local title-level marker while reconciling
+        // the episode history that Trakt can actually describe.
+        if normalizedType(item.meta.type) == "series",
+           item.season == nil,
+           item.episode == nil { return false }
+        return !traktIdentityKeys(item).isEmpty
+    }
+
+    private static func sameWatchedIdentity(_ lhs: WatchedStoreItem, _ rhs: WatchedStoreItem) -> Bool {
+        sameContent(lhs.meta, rhs.meta) && lhs.season == rhs.season && lhs.episode == rhs.episode
+    }
+
+    private static func contentIdentityKeys(for meta: NuvioMeta) -> Set<String> {
+        contentIdentityKeys(metaId: meta.id, imdbId: meta.imdbId, tmdbId: meta.tmdbId)
+    }
+
+    private static func contentIdentityKeys(
+        metaId: String,
+        imdbId: String?,
+        tmdbId: Int?
+    ) -> Set<String> {
+        var keys: Set<String> = []
+        let rawID = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if !rawID.isEmpty {
+            if rawID.hasPrefix("tt") {
+                keys.insert("imdb:\(rawID)")
+            } else if rawID.hasPrefix("tmdb:") || rawID.hasPrefix("trakt:") {
+                keys.insert(rawID)
+            } else {
+                keys.insert("id:\(rawID)")
+            }
+        }
+        if let imdb = imdbId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+           !imdb.isEmpty {
+            keys.insert("imdb:\(imdb)")
+        }
+        if let tmdbId {
+            keys.insert("tmdb:\(tmdbId)")
+        }
+        return keys
+    }
+
+    private static func normalizedType(_ type: String) -> String {
+        switch type.lowercased() {
+        case "series", "tv", "show", "tvshow": return "series"
+        default: return type.lowercased()
+        }
+    }
+
+    private static func traktIdentityKeys(_ item: WatchedStoreItem) -> Set<String> {
+        Set(contentIdentityKeys(for: item.meta).map {
+            "\($0)|\(item.season.map(String.init) ?? "-")|\(item.episode.map(String.init) ?? "-")"
+        })
+    }
+
+    // MARK: Pending Trakt mutations
+
+    struct PendingTraktMutation: Codable, Identifiable {
+        let id: String
+        let meta: NuvioMeta
+        let season: Int?
+        let episode: Int?
+        let isWatched: Bool
+        let changedAt: Date
+    }
+
+    private static func pendingTraktStorageKey(for profileId: String?) -> String {
+        "\(storageKey(for: profileId)).pendingTrakt"
+    }
+
+    static func pendingTraktMutations(profileId: String? = activeProfileId) -> [PendingTraktMutation] {
+        guard let data = readData(forKey: pendingTraktStorageKey(for: profileId)),
+              let decoded = try? makeDecoder().decode([PendingTraktMutation].self, from: data) else {
+            return []
+        }
+        return decoded.sorted { $0.changedAt < $1.changedAt }
+    }
+
+    @discardableResult
+    private static func enqueuePendingTraktMutation(
+        meta: NuvioMeta,
+        season: Int?,
+        episode: Int?,
+        isWatched: Bool,
+        profileId: String?
+    ) -> Bool {
+        let entry = PendingTraktMutation(
+            id: UUID().uuidString,
+            meta: meta.persistenceSnapshot,
+            season: season,
+            episode: episode,
+            isWatched: isWatched,
+            changedAt: Date()
+        )
+        let updated = pendingTraktMutations(profileId: profileId).filter {
+            !(sameContent($0.meta, meta) && $0.season == season && $0.episode == episode)
+        } + [entry]
+        return persistPendingTraktMutations(updated, profileId: profileId)
+    }
+
+    private static func confirmPendingTraktMutations(against remoteItems: [WatchedStoreItem]) {
+        let pending = pendingTraktMutations()
+        guard !pending.isEmpty else { return }
+        let remaining = pending.filter { mutation in
+            let existsRemotely = remoteItems.contains { pendingMatches(mutation, item: $0) }
+            return mutation.isWatched ? !existsRemotely : existsRemotely
+        }
+        guard remaining.count != pending.count else { return }
+        _ = persistPendingTraktMutations(remaining, profileId: activeProfileId)
+    }
+
+    private static func pendingMatches(
+        _ pending: PendingTraktMutation,
+        item: WatchedStoreItem
+    ) -> Bool {
+        guard sameContent(pending.meta, item.meta) else { return false }
+        if normalizedType(pending.meta.type) == "series",
+           pending.season == nil,
+           pending.episode == nil {
+            return true
+        }
+        return pending.season == item.season && pending.episode == item.episode
+    }
+
+    @discardableResult
+    private static func persistPendingTraktMutations(
+        _ entries: [PendingTraktMutation],
+        profileId: String?
+    ) -> Bool {
+        guard let data = try? makeEncoder().encode(entries) else { return false }
+        return writeData(data, forKey: pendingTraktStorageKey(for: profileId), verify: { payload in
+            _ = try makeDecoder().decode([PendingTraktMutation].self, from: payload)
+        })
+    }
+
+    static func clearPendingTraktMutations(profileId: String?) {
+        _ = persistPendingTraktMutations([], profileId: profileId)
     }
 
     // MARK: Tombstones — locally deleted marks awaiting remote deletion
 
     struct Tombstone: Codable, Equatable {
         let metaId: String
+        let contentType: String?
+        let imdbId: String?
+        let tmdbId: Int?
         let season: Int?
         let episode: Int?
         let removedAt: Date
@@ -2073,18 +2601,51 @@ enum WatchedStore {
         return decoded
     }
 
-    private static func addTombstone(metaId: String, season: Int?, episode: Int?) {
-        let entry = Tombstone(metaId: metaId, season: season, episode: episode, removedAt: Date())
+    private static func addTombstone(meta: NuvioMeta, season: Int?, episode: Int?) {
+        let entry = Tombstone(
+            metaId: meta.id,
+            contentType: meta.type,
+            imdbId: meta.imdbId,
+            tmdbId: meta.tmdbId,
+            season: season,
+            episode: episode,
+            removedAt: Date()
+        )
         let updated = tombstones().filter {
-            !($0.metaId == metaId && $0.season == season && $0.episode == episode)
+            !(tombstoneContentMatches($0, meta: meta)
+                && $0.season == season && $0.episode == episode)
         } + [entry]
         _ = persistTombstones(updated)
     }
 
-    private static func clearTombstone(metaId: String, season: Int?, episode: Int?) {
+    private static func clearTombstone(meta: NuvioMeta, season: Int?, episode: Int?) {
         _ = persistTombstones(tombstones().filter {
-            !($0.metaId == metaId && $0.season == season && $0.episode == episode)
+            !(tombstoneContentMatches($0, meta: meta)
+                && $0.season == season && $0.episode == episode)
         })
+    }
+
+    private static func tombstoneMatches(_ tombstone: Tombstone, item: WatchedStoreItem) -> Bool {
+        guard tombstoneContentMatches(tombstone, meta: item.meta) else { return false }
+        if normalizedType(tombstone.contentType ?? item.meta.type) == "series",
+           tombstone.season == nil,
+           tombstone.episode == nil {
+            return true
+        }
+        return tombstone.season == item.season && tombstone.episode == item.episode
+    }
+
+    private static func tombstoneContentMatches(_ tombstone: Tombstone, meta: NuvioMeta) -> Bool {
+        if let contentType = tombstone.contentType,
+           normalizedType(contentType) != normalizedType(meta.type) {
+            return false
+        }
+        let tombstoneKeys = contentIdentityKeys(
+            metaId: tombstone.metaId,
+            imdbId: tombstone.imdbId,
+            tmdbId: tombstone.tmdbId
+        )
+        return !tombstoneKeys.isDisjoint(with: contentIdentityKeys(for: meta))
     }
 
     /// Called after the remote rows were deleted successfully.

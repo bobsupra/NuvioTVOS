@@ -1421,7 +1421,8 @@ struct TvDetailsContent: View {
     var body: some View {
         if let meta = uiState.meta {
             let episodes = sortedEpisodes(meta)
-            let playTarget = playTarget(for: meta, episodes: episodes)
+            let continueItem = currentContinueWatchingItem(for: meta)
+            let playTarget = playTarget(for: meta, episodes: episodes, continueItem: continueItem)
 
             GeometryReader { proxy in
                 ZStack(alignment: .topLeading) {
@@ -1475,10 +1476,10 @@ struct TvDetailsContent: View {
 
                                 if !episodes.isEmpty {
                                     TvDetailsEpisodes(
-                                        metaId: meta.id,
+                                        meta: meta,
                                         episodes: episodes,
                                         seriesRating: meta.rating,
-                                        continueItem: ContinueWatchingStore.item(for: meta.id),
+                                        continueItem: continueItem,
                                         onFocus: {
                                             withAnimation(.easeOut(duration: 0.24)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
@@ -1594,9 +1595,11 @@ struct TvDetailsContent: View {
     /// Primary-button target: resume the in-progress episode, advance to the
     /// next one after a finished episode, or start from the first playable one.
     /// Movies have no episode; the label alone flips between Play and Resume.
-    private func playTarget(for meta: NuvioMeta, episodes: [NuvioVideo]) -> (episode: NuvioVideo?, label: String, isPlayable: Bool) {
-        let continueItem = ContinueWatchingStore.item(for: meta.id)
-
+    private func playTarget(
+        for meta: NuvioMeta,
+        episodes: [NuvioVideo],
+        continueItem: ContinueWatchingItem?
+    ) -> (episode: NuvioVideo?, label: String, isPlayable: Bool) {
         guard !episodes.isEmpty else {
             return (nil, continueItem == nil ? "Play" : "Resume", true)
         }
@@ -1614,7 +1617,7 @@ struct TvDetailsContent: View {
 
         // No progress entry (e.g. the episode just finished): continue with the
         // first episode that hasn't been watched yet.
-        let watched = WatchedStore.watchedEpisodeKeys(metaId: meta.id)
+        let watched = WatchedStore.watchedEpisodeKeys(meta: meta)
         if !watched.isEmpty,
            let next = episodes.first(where: { $0.season > 0 && !watched.contains("\($0.season):\($0.episode)") }) {
             return (next, "Next S\(next.season) E\(next.episode)", true)
@@ -1622,6 +1625,14 @@ struct TvDetailsContent: View {
 
         let first = firstPlayableEpisode(episodes)
         return (first, first.map { "Play S\($0.season) E\($0.episode)" } ?? "Play", true)
+    }
+
+    private func currentContinueWatchingItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
+        if TraktSettingsStore.watchProgressSource == .trakt,
+           TraktAuthStore.state.isAuthenticated {
+            return TraktProgressService.currentContinueWatchingItem(for: meta)
+        }
+        return ContinueWatchingStore.item(for: meta.id)
     }
 
     private func seasonSortKey(_ season: Int) -> Int {
@@ -2423,7 +2434,7 @@ private struct TvDetailsPersonCard: View {
 // MARK: - Series episodes
 
 private struct TvDetailsEpisodes: View {
-    let metaId: String
+    let meta: NuvioMeta
     let episodes: [NuvioVideo]
     let seriesRating: Double?
     let continueItem: ContinueWatchingItem?
@@ -2436,21 +2447,21 @@ private struct TvDetailsEpisodes: View {
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
 
     init(
-        metaId: String,
+        meta: NuvioMeta,
         episodes: [NuvioVideo],
         seriesRating: Double?,
         continueItem: ContinueWatchingItem?,
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void
     ) {
-        self.metaId = metaId
+        self.meta = meta
         self.episodes = episodes
         self.seriesRating = seriesRating
         self.continueItem = continueItem
         self.onFocus = onFocus
         self.onSelect = onSelect
         _selectedSeason = State(initialValue: Self.defaultSeason(episodes))
-        _watchedEpisodeKeys = State(initialValue: WatchedStore.watchedEpisodeKeys(metaId: metaId))
+        _watchedEpisodeKeys = State(initialValue: WatchedStore.watchedEpisodeKeys(meta: meta))
     }
 
     var body: some View {
@@ -2459,7 +2470,7 @@ private struct TvDetailsEpisodes: View {
             episodeCardStrip
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
-            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(metaId: metaId)
+            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
         }
     }
 
@@ -2480,6 +2491,13 @@ private struct TvDetailsEpisodes: View {
                                 episodeScrollIndex = index
                             }
                             onFocus()
+                        },
+                        onToggleWatched: {
+                            _ = WatchedStore.toggleEpisode(
+                                meta: meta,
+                                season: video.season,
+                                episode: video.episode
+                            )
                         },
                         action: { onSelect(video) }
                     )
@@ -2614,17 +2632,20 @@ private struct TvEpisodeCard: View {
     let continueProgress: Double?
     let isWatched: Bool
     let onFocus: () -> Void
+    let onToggleWatched: () -> Void
     let action: () -> Void
 
     @FocusState private var isFocused: Bool
+    @FocusState private var isWatchedControlFocused: Bool
 
     private let cardWidth: CGFloat = TvEpisodeCardLayout.width
     private let thumbHeight: CGFloat = 300
     private let cardHeight: CGFloat = TvEpisodeCardLayout.height
 
     var body: some View {
-        Button(action: action) {
-            ZStack(alignment: .bottomLeading) {
+        ZStack(alignment: .topTrailing) {
+            Button(action: action) {
+                ZStack(alignment: .bottomLeading) {
                 episodeArtwork
 
                 LinearGradient(
@@ -2683,51 +2704,64 @@ private struct TvEpisodeCard: View {
                 .padding(EdgeInsets(top: 24, leading: 24, bottom: continueProgress == nil ? 24 : 44, trailing: 24))
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
 
-                continueProgressOverlay
-
-                if isWatched {
-                    watchedBadge
-                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
+                    continueProgressOverlay
+                }
+                .frame(width: cardWidth, height: cardHeight)
+                .background(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .fill(isFocused ? Color(white: 0.17) : Color.tvCard)
+                )
+                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
+                )
+                .shadow(color: .black.opacity(isFocused ? 0.4 : 0.16), radius: isFocused ? 26 : 10, y: 12)
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+            .scaleEffect(isFocused ? 1.05 : 1)
+            .animation(.easeOut(duration: 0.14), value: isFocused)
+            .onChange(of: isFocused) { focused in
+                if focused { onFocus() }
+            }
+            .contextMenu {
+                Button(action: onToggleWatched) {
+                    Label(
+                        isWatched ? "Mark as unwatched" : "Mark as watched",
+                        systemImage: isWatched ? "eye.slash.fill" : "eye.fill"
+                    )
                 }
             }
-            .frame(width: cardWidth, height: cardHeight)
-            .background(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .fill(isFocused ? Color(white: 0.17) : Color.tvCard)
-            )
-            .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
-            .overlay(
-                RoundedRectangle(cornerRadius: 24, style: .continuous)
-                    .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
-            )
-            .shadow(color: .black.opacity(isFocused ? 0.4 : 0.16), radius: isFocused ? 26 : 10, y: 12)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
-        .focusEffectDisabledIfAvailable()
-        .scaleEffect(isFocused ? 1.05 : 1)
-        .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
-            if focused { onFocus() }
-        }
-    }
 
-    /// Same green check as the poster-grid watched badge, scaled for the card.
-    private var watchedBadge: some View {
-        Image(systemName: "checkmark")
-            .font(.system(size: 18, weight: .bold))
-            .foregroundColor(.white)
-            .frame(width: 38, height: 38)
-            .background(
-                Circle()
-                    .fill(Color(red: 0.10, green: 0.68, blue: 0.34))
-            )
-            .overlay(
-                Circle()
-                    .stroke(Color.white.opacity(0.45), lineWidth: 1)
-            )
-            .shadow(color: .black.opacity(0.35), radius: 8, y: 3)
-            .padding(16)
+            Button(action: onToggleWatched) {
+                Image(systemName: isWatched ? "eye.fill" : "eye.slash.fill")
+                    .font(.system(size: 24, weight: .bold))
+                    .foregroundColor(isWatchedControlFocused ? .black : .white)
+                    .frame(width: 58, height: 58)
+                    .background(
+                        Circle().fill(
+                            isWatchedControlFocused
+                                ? Color.white
+                                : (isWatched
+                                    ? Color(red: 0.10, green: 0.68, blue: 0.34)
+                                    : Color.black.opacity(0.62))
+                        )
+                    )
+                    .overlay(Circle().stroke(Color.white.opacity(0.38), lineWidth: 1))
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isWatchedControlFocused)
+            .focusEffectDisabledIfAvailable()
+            .scaleEffect(isWatchedControlFocused ? 1.12 : 1)
+            .animation(.easeOut(duration: 0.14), value: isWatchedControlFocused)
+            .accessibilityLabel(isWatched ? "Mark episode as unwatched" : "Mark episode as watched")
+            .padding(18)
+            .onChange(of: isWatchedControlFocused) { focused in
+                if focused { onFocus() }
+            }
+        }
     }
 
     private var episodeArtwork: some View {

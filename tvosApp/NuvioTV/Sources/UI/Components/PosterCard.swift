@@ -144,7 +144,7 @@ struct PosterCard: View {
                             WatchedCheckmarkIcon()
                         }
                     } else {
-                        WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                        WatchedCheckmarkBadge(meta: meta)
                     }
                 }
             }
@@ -631,9 +631,24 @@ private struct WatchedCheckmarkIcon: View {
 struct WatchedCheckmarkBadge: View {
     let metaId: String
     let type: String
+    let meta: NuvioMeta?
     var size: CGFloat = 38
 
     @State private var isWatched = false
+
+    init(metaId: String, type: String, size: CGFloat = 38) {
+        self.metaId = metaId
+        self.type = type
+        self.meta = nil
+        self.size = size
+    }
+
+    init(meta: NuvioMeta, size: CGFloat = 38) {
+        self.metaId = meta.id
+        self.type = meta.type
+        self.meta = meta
+        self.size = size
+    }
 
     var body: some View {
         Group {
@@ -651,7 +666,8 @@ struct WatchedCheckmarkBadge: View {
         // Series watched state lives on the episode cards inside Details; the
         // poster badge is movies-only.
         let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
-        isWatched = !isSeries && WatchedStore.contains(metaId: metaId, type: type)
+        isWatched = !isSeries && (meta.map { WatchedStore.contains(meta: $0) }
+            ?? WatchedStore.contains(metaId: metaId, type: type))
     }
 }
 
@@ -824,7 +840,7 @@ struct CardActionMenuOverlay: View {
         }
         .onAppear {
             inLibrary = LibraryStore.contains(metaId: meta.id, type: meta.type)
-            isWatched = WatchedStore.contains(metaId: meta.id, type: meta.type)
+            isWatched = WatchedStore.contains(meta: meta)
             // Seed focus on the first action once the overlay has taken over from
             // the (fading, unfocusable) tab view behind it.
             DispatchQueue.main.async { focused = .details }

@@ -612,10 +612,7 @@ struct SkipSegmentOverlay: View {
     }
 
     private var detailText: String {
-        if let countdown {
-            return "Hides in \(countdown)s"
-        }
-        return PlayerTime.formatted(time: interval.endTime - interval.startTime)
+        return "Ends at \(PlayerTime.formatted(time: interval.endTime))"
     }
 }
 

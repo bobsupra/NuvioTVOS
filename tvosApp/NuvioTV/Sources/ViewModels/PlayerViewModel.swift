@@ -178,6 +178,9 @@ class PlayerViewModel: ObservableObject {
     private var subtitleFetchTask: Task<Void, Never>?
     private var activeTrackSelectionKey: String?
     private var pendingTrackSelection: PlayerTrackSelection?
+    /// The latest explicit audio/subtitle choice for this player session. Unlike
+    /// the persistent per-episode entry, this follows seamless episode advances.
+    private var sessionTrackSelection: PlayerTrackSelection?
     private var didApplySavedAudioSelection = false
     private var didApplySavedSubtitleSelection = false
     private var didApplyAudioPreference = false
@@ -190,16 +193,25 @@ class PlayerViewModel: ObservableObject {
     /// instead of a transient reattach/keep-open sample that can report the
     /// title's full duration as its current position.
     private var lastStablePlaybackTime: PlayerTime?
+    /// A backend can briefly keep publishing its pre-seek timestamp after an
+    /// explicit skip. Keep the user's landing point authoritative until the
+    /// backend confirms it (or the short settling window expires).
+    private var explicitSeekProgressCheckpoint: (time: PlayerTime, createdAt: Date)?
+    private static let explicitSeekSettleWindow: TimeInterval = 5
     /// Trakt accepts a started scrobble followed by periodic pause updates.
     /// Keep that cadence lower than local persistence so normal playback never
     /// produces a request every five seconds.
     private var didStartTraktScrobble = false
     private var didQueueTraktStop = false
     private var lastTraktProgressReport = Date.distantPast
+    private var traktProgressTask: Task<Void, Never>?
     private static let traktProgressReportInterval: TimeInterval = 30
     private var controlsAutoHideSuspended = false
     private var skipIntervals: [SkipInterval] = []
     private var autoHiddenSkipIntervalId: String?
+    /// Segments the user skipped during this playback item. Keep these hidden
+    /// even while the asynchronous seek is still reporting the old position.
+    private var dismissedSkipIntervalIds: Set<String> = []
     private var skipSegmentAutoHideDeadline: Date?
     private var skipIntervalLoadTask: Task<Void, Never>?
     private static let skipSegmentAutoHideSeconds = 5
@@ -309,6 +321,7 @@ class PlayerViewModel: ObservableObject {
 
     func load(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle] = [], resumeFrom: Double?) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
+        if !hasLoaded { sessionTrackSelection = nil }
         applyStreamState(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
         guard !hasLoaded else { return }
         hasLoaded = true
@@ -436,7 +449,14 @@ class PlayerViewModel: ObservableObject {
     /// Applies all per-stream state for a title/episode. Shared by the initial
     /// `load` and the in-place `replaceStream` used for a seamless next-episode
     /// advance, so both paths reset resume/track/subtitle state identically.
-    private func applyStreamState(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle], resumeFrom: Double?) {
+    private func applyStreamState(
+        url: URL,
+        meta: NuvioMeta,
+        subtitle: String,
+        externalSubtitles: [NuvioSubtitle],
+        resumeFrom: Double?,
+        preserveSessionPreferences: Bool = false
+    ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         #if DEBUG
         playbackDebugInfo = PlaybackDebugInfo(
@@ -480,11 +500,18 @@ class PlayerViewModel: ObservableObject {
             ? nil
             : PlayerTrackSelectionStore.key(meta: meta, episode: self.activeEpisodeNumbers)
         let savedSelection = selectionKey.flatMap { PlayerTrackSelectionStore.selection(for: $0) }
+        if sessionTrackSelection == nil { sessionTrackSelection = savedSelection }
+        let effectiveSelection = Self.effectiveTrackSelection(
+            stored: savedSelection,
+            session: sessionTrackSelection,
+            externalSubtitles: externalSubtitles
+        )
         self.activeTrackSelectionKey = selectionKey
-        self.pendingTrackSelection = savedSelection
+        self.pendingTrackSelection = effectiveSelection
         self.pendingResumeSeconds = isTrailerPlayback ? nil : resumeFrom
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
+        self.explicitSeekProgressCheckpoint = nil
         self.didStartTraktScrobble = false
         self.didQueueTraktStop = false
         self.lastTraktProgressReport = .distantPast
@@ -494,28 +521,31 @@ class PlayerViewModel: ObservableObject {
         // The full list stays browsable in the subtitle panel; only smart-matched
         // ones are eagerly loaded into mpv (loading all would fetch dozens of files).
         self.availableExternalSubtitles = isTrailerPlayback ? [] : externalSubtitles
-        let smartMatched = isTrailerPlayback || savedSelection?.subtitle != nil
+        let smartMatched = isTrailerPlayback || effectiveSelection?.subtitle != nil
             ? []
             : Self.smartMatchedSubtitles(in: externalSubtitles)
         self.pendingExternalSubtitles = Self.subtitlesToPreload(
             smartMatched: smartMatched,
-            savedSelection: savedSelection,
+            savedSelection: effectiveSelection,
             availableExternalSubtitles: externalSubtitles
         )
         self.didAddExternalSubtitles = pendingExternalSubtitles.isEmpty
         self.addedExternalSubtitleURLs = []
         self.pendingSelectedExternalSubtitleURL = nil
-        self.subtitleDelayMs = 0
-        self.audioDelayMs = 0
-        self.audioAmplificationDb = 0
+        if !preserveSessionPreferences {
+            self.subtitleDelayMs = 0
+            self.audioDelayMs = 0
+            self.audioAmplificationDb = 0
+        }
         self.skipIntervals = []
         self.activeSkipInterval = nil
         self.skipSegmentCountdown = nil
         self.autoHiddenSkipIntervalId = nil
+        self.dismissedSkipIntervalIds = []
         self.skipSegmentAutoHideDeadline = nil
         self.skipIntervalLoadTask?.cancel()
-        self.didApplySavedAudioSelection = savedSelection?.audio == nil
-        self.didApplySavedSubtitleSelection = savedSelection?.subtitle == nil
+        self.didApplySavedAudioSelection = effectiveSelection?.audio == nil
+        self.didApplySavedSubtitleSelection = effectiveSelection?.subtitle == nil
         self.didApplyAudioPreference = false
         self.didApplySubtitlePreference = false
         self.hasExplicitSubtitleSelection = false
@@ -665,6 +695,8 @@ class PlayerViewModel: ObservableObject {
         }
 
         let imdbId = meta.imdbId ?? meta.id
+        let expectedMetaId = meta.id
+        let expectedEpisode = episodeNumbers
         skipIntervalLoadTask = Task { [weak self] in
             let intervals = await IntroDBSkipService.shared.intervals(
                 imdbId: imdbId,
@@ -672,7 +704,13 @@ class PlayerViewModel: ObservableObject {
                 episode: episodeNumbers.episode
             )
             await MainActor.run {
-                guard let self else { return }
+                guard let self,
+                      !Task.isCancelled,
+                      self.activeMeta?.id == expectedMetaId,
+                      self.activeEpisodeNumbers?.season == expectedEpisode.season,
+                      self.activeEpisodeNumbers?.episode == expectedEpisode.episode else {
+                    return
+                }
                 self.skipIntervals = intervals
                 self.updateSkipIntervalState()
             }
@@ -695,6 +733,16 @@ class PlayerViewModel: ObservableObject {
         }
 
         guard let interval else {
+            if activeSkipInterval != nil { activeSkipInterval = nil }
+            if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
+            skipSegmentAutoHideDeadline = nil
+            return
+        }
+
+        // A skip command is asynchronous. Polling can still observe the old
+        // playhead for a few ticks, but a deliberately skipped segment must not
+        // be armed again during this playback session.
+        if dismissedSkipIntervalIds.contains(interval.id) {
             if activeSkipInterval != nil { activeSkipInterval = nil }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
@@ -806,7 +854,8 @@ class PlayerViewModel: ObservableObject {
             meta: meta,
             subtitle: prepared.subtitleLine,
             externalSubtitles: prepared.subtitles,
-            resumeFrom: resumeFrom
+            resumeFrom: resumeFrom,
+            preserveSessionPreferences: true
         )
         if let episode {
             currentEpisodeVideo = episode
@@ -892,6 +941,21 @@ class PlayerViewModel: ObservableObject {
 
     // MARK: Automatic source failover
 
+    private var storedResumePositionForActiveItem: Double? {
+        guard let meta = activeMeta else { return nil }
+        if meta.isSeries {
+            let numbers = resolvedEpisodeNumbers
+            return ContinueWatchingStore.resumePosition(
+                for: meta,
+                season: numbers?.season,
+                episode: numbers?.episode,
+                episodeId: currentEpisodeVideo?.id
+            )
+        }
+        guard !WatchedStore.contains(meta: meta) else { return nil }
+        return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+    }
+
     /// A stream died or never started. Remember the position, pick the next
     /// viable source (excluding failed URLs), and switch silently. The error
     /// overlay only appears when every candidate is exhausted.
@@ -927,7 +991,7 @@ class PlayerViewModel: ObservableObject {
         // Prefer the last stable position (slate/error ticks can lie).
         let resume = lastStablePlaybackTime?.current
             ?? (time.current > 5 ? time.current : nil)
-            ?? activeMeta.flatMap { ContinueWatchingStore.item(for: $0.id)?.resumePosition }
+            ?? storedResumePositionForActiveItem
 
         let excluded = Array(failedStreamURLs)
         Task { @MainActor [weak self] in
@@ -1008,13 +1072,23 @@ class PlayerViewModel: ObservableObject {
         let rawCurrent = Double(c.positionMs) / 1000.0
         let rawDuration = Double(c.durationMs) / 1000.0
         let latestTime = PlayerTime(current: rawCurrent, duration: rawDuration)
+        let isPreSeekSettlingSample: Bool = {
+            guard let checkpoint = explicitSeekProgressCheckpoint else { return false }
+            let seekConfirmed = abs(latestTime.current - checkpoint.time.current) <= 2
+            let protectionExpired = Date().timeIntervalSince(checkpoint.createdAt)
+                >= Self.explicitSeekSettleWindow
+            return !seekConfirmed && !protectionExpired
+        }()
         if c.hasCoherentTimeSample,
            !c.isPlayerLoading,
            !c.isAtEndOfFile,
            latestTime.duration > 0,
            latestTime.current >= 0,
            latestTime.current < latestTime.duration {
-            lastStablePlaybackTime = latestTime
+            if !isPreSeekSettlingSample {
+                explicitSeekProgressCheckpoint = nil
+                lastStablePlaybackTime = latestTime
+            }
         }
         // The settings panel does not display playback time. Publish at most
         // once per displayed second while it is open, while the controller is
@@ -1023,6 +1097,7 @@ class PlayerViewModel: ObservableObject {
         // sample incoherent while its numeric properties still contain the old
         // file's final position. Do not republish that stale timeline.
         if c.hasCoherentTimeSample,
+           !isPreSeekSettlingSample,
            latestTime.duration > 0,
            latestTime.current >= 0,
            latestTime.current < latestTime.duration,
@@ -1090,7 +1165,8 @@ class PlayerViewModel: ObservableObject {
                         position: 1,
                         duration: max(time.duration, 120),
                         season: next.season,
-                        episode: next.episode
+                        episode: next.episode,
+                        episodeId: next.id
                     )
                 } else {
                     // Movie or final episode: nothing left to continue.
@@ -1316,6 +1392,7 @@ class PlayerViewModel: ObservableObject {
         // backend was settling wrote the old Trakt position back (for example,
         // 32 minutes remaining after seeking to 5 minutes remaining).
         lastStablePlaybackTime = snapshot
+        explicitSeekProgressCheckpoint = (snapshot, Date())
         if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
     }
 
@@ -1339,6 +1416,7 @@ class PlayerViewModel: ObservableObject {
 
     func skipActiveInterval() {
         guard let interval = activeSkipInterval else { return }
+        dismissedSkipIntervalIds.insert(interval.id)
         autoHiddenSkipIntervalId = interval.id
         skipSegmentCountdown = nil
         skipSegmentAutoHideDeadline = nil
@@ -2071,24 +2149,22 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveAudioSelection(_ track: AudioTrack) {
-        guard let activeTrackSelectionKey else { return }
-        PlayerTrackSelectionStore.saveAudio(
-            PlayerTrackSelection.Audio(
-                id: track.id,
-                name: track.name,
-                language: track.language,
-                languageName: track.languageName
-            ),
-            for: activeTrackSelectionKey
+        let audio = PlayerTrackSelection.Audio(
+            id: track.id,
+            name: track.name,
+            language: track.language,
+            languageName: track.languageName
         )
+        rememberSessionAudio(audio)
+        guard let activeTrackSelectionKey else { return }
+        PlayerTrackSelectionStore.saveAudio(audio, for: activeTrackSelectionKey)
     }
 
     private func saveSubtitleSelection(_ track: SubtitleTrack) {
+        let subtitle = Self.trackSelection(for: track)
+        rememberSessionSubtitle(subtitle)
         guard let activeTrackSelectionKey else { return }
-        PlayerTrackSelectionStore.saveSubtitle(
-            Self.trackSelection(for: track),
-            for: activeTrackSelectionKey
-        )
+        PlayerTrackSelectionStore.saveSubtitle(subtitle, for: activeTrackSelectionKey)
     }
 
     private static func trackSelection(for track: SubtitleTrack) -> PlayerTrackSelection.Subtitle {
@@ -2113,20 +2189,97 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveSubtitleSelection(_ subtitle: NuvioSubtitle) {
-        guard let activeTrackSelectionKey else { return }
-        PlayerTrackSelectionStore.saveSubtitle(
-            PlayerTrackSelection.Subtitle(
-                kind: .external,
-                name: subtitle.label,
-                language: subtitle.language,
-                externalURL: subtitle.url
-            ),
-            for: activeTrackSelectionKey
+        let selection = PlayerTrackSelection.Subtitle(
+            kind: .external,
+            name: subtitle.label,
+            language: subtitle.language,
+            externalURL: subtitle.url
         )
+        rememberSessionSubtitle(selection)
+        guard let activeTrackSelectionKey else { return }
+        PlayerTrackSelectionStore.saveSubtitle(selection, for: activeTrackSelectionKey)
+    }
+
+    private func rememberSessionAudio(_ audio: PlayerTrackSelection.Audio) {
+        var selection = sessionTrackSelection ?? pendingTrackSelection ?? PlayerTrackSelection()
+        selection.audio = audio
+        selection.updatedAt = Date()
+        sessionTrackSelection = selection
+        pendingTrackSelection = selection
+    }
+
+    private func rememberSessionSubtitle(_ subtitle: PlayerTrackSelection.Subtitle) {
+        var selection = sessionTrackSelection ?? pendingTrackSelection ?? PlayerTrackSelection()
+        selection.subtitle = subtitle
+        selection.updatedAt = Date()
+        sessionTrackSelection = selection
+        pendingTrackSelection = selection
+    }
+
+    private static func effectiveTrackSelection(
+        stored: PlayerTrackSelection?,
+        session: PlayerTrackSelection?,
+        externalSubtitles: [NuvioSubtitle]
+    ) -> PlayerTrackSelection? {
+        guard stored != nil || session != nil else { return nil }
+        var effective = stored ?? PlayerTrackSelection()
+        if let audio = session?.audio { effective.audio = audio }
+        if let subtitle = session?.subtitle {
+            switch subtitle.kind {
+            case .off, .embedded:
+                effective.subtitle = subtitle
+            case .external:
+                // External URLs are episode-specific. Carry the user's language
+                // and label choice, then bind it to this episode's matching URL.
+                if let match = matchingExternalSubtitle(
+                    for: subtitle,
+                    in: externalSubtitles
+                ) {
+                    effective.subtitle = PlayerTrackSelection.Subtitle(
+                        kind: .external,
+                        name: match.label,
+                        language: match.language,
+                        externalURL: match.url
+                    )
+                }
+            }
+        }
+        return effective.audio == nil && effective.subtitle == nil ? nil : effective
+    }
+
+    private static func matchingExternalSubtitle(
+        for selection: PlayerTrackSelection.Subtitle,
+        in subtitles: [NuvioSubtitle]
+    ) -> NuvioSubtitle? {
+        if let url = selection.externalURL,
+           let exact = subtitles.first(where: { $0.url == url }) {
+            return exact
+        }
+        if let match = subtitles.first(where: {
+            sameTrackText($0.label, selection.name) &&
+            sameTrackText($0.language, selection.language)
+        }) {
+            return match
+        }
+        if let language = selection.language, !language.isEmpty,
+           let match = subtitles.first(where: { sameTrackText($0.language, language) }) {
+            return match
+        }
+        if let name = selection.name, !name.isEmpty {
+            return subtitles.first(where: { sameTrackText($0.label, name) })
+        }
+        return nil
     }
 
     private func matchingAudioTrack(for saved: PlayerTrackSelection.Audio) -> AudioTrack? {
-        if let track = audioTracks.first(where: { $0.id == saved.id }) { return track }
+        if let track = audioTracks.first(where: { track in
+            guard track.id == saved.id else { return false }
+            let hasMetadata = !saved.name.isEmpty || !saved.language.isEmpty || !saved.languageName.isEmpty
+            return !hasMetadata ||
+                Self.sameTrackText(track.name, saved.name) ||
+                Self.sameTrackText(track.language, saved.language) ||
+                Self.sameTrackText(track.languageName, saved.languageName)
+        }) { return track }
         if let track = audioTracks.first(where: {
             Self.sameTrackText($0.name, saved.name) &&
             Self.sameTrackText($0.language, saved.language)
@@ -2149,7 +2302,13 @@ class PlayerViewModel: ObservableObject {
     private func matchingEmbeddedSubtitleTrack(for saved: PlayerTrackSelection.Subtitle) -> SubtitleTrack? {
         let candidates = subtitles.filter { $0.id != "off" && $0.externalFilename.isEmpty }
         if let id = saved.id,
-           let track = candidates.first(where: { $0.id == id }) {
+           let track = candidates.first(where: { track in
+               guard track.id == id else { return false }
+               let hasMetadata = !(saved.name ?? "").isEmpty || !(saved.language ?? "").isEmpty
+               return !hasMetadata ||
+                   Self.sameTrackText(track.name, saved.name) ||
+                   Self.sameTrackText(track.language, saved.language)
+           }) {
             return track
         }
         if let track = candidates.first(where: {
@@ -2256,8 +2415,8 @@ class PlayerViewModel: ObservableObject {
         showSettingsPanel = false
         controlsHideTimer?.invalidate()
         controlsAutoHideSuspended = true
-        showControls = false
         sidePanel = panel
+        showControls = false
         if panel == .sources {
             loadSourcesIfNeeded(force: true)
         }
@@ -2458,7 +2617,12 @@ class PlayerViewModel: ObservableObject {
     private func saveProgress(force: Bool) {
         // Never persist progress during an Aether→MPV handoff.
         if sessionCoordinator.isProgressSaveSuspended { return }
-        let progressTime = force ? (lastStablePlaybackTime ?? time) : time
+        let checkpointTime = explicitSeekProgressCheckpoint.flatMap { checkpoint in
+            Date().timeIntervalSince(checkpoint.createdAt) < Self.explicitSeekSettleWindow
+                ? checkpoint.time
+                : nil
+        }
+        let progressTime = checkpointTime ?? (force ? (lastStablePlaybackTime ?? time) : time)
         // Nuvio Sync retains the 10-second accidental-playback safeguard. A
         // Trakt start scrobble is the source of its Continue Watching row, so
         // send it once playback has genuinely begun instead of waiting 10+ s.
@@ -2515,7 +2679,8 @@ class PlayerViewModel: ObservableObject {
                 position: progressTime.current,
                 duration: progressTime.duration,
                 season: season,
-                episode: episode
+                episode: episode,
+                episodeId: currentEpisodeVideo?.id
             )
         }
         lastProgressSave = Date()
@@ -2557,7 +2722,19 @@ class PlayerViewModel: ObservableObject {
         let episodeNumbers = resolvedEpisodeNumbers
         let traktStore = ProfileSettings.current
 
-        Task { [weak self] in
+        TraktProgressService.recordLocalPlayback(
+            meta: meta,
+            position: playbackTime.current,
+            duration: playbackTime.duration,
+            season: episodeNumbers?.season,
+            episode: episodeNumbers?.episode,
+            notify: force
+        )
+
+        let previousTask = traktProgressTask
+        traktProgressTask = Task { [weak self] in
+            await previousTask?.value
+            guard !Task.isCancelled else { return }
             let succeeded = await TraktProgressService.reportPlayback(
                 meta: meta,
                 position: playbackTime.current,
@@ -2623,14 +2800,14 @@ class PlayerViewModel: ObservableObject {
         let season = numbers?.season
         let episode = numbers?.episode
         if let season, let episode {
-            guard !WatchedStore.containsEpisode(metaId: activeMeta.id, season: season, episode: episode) else {
+            guard !WatchedStore.containsEpisode(meta: activeMeta, season: season, episode: episode) else {
                 return
             }
         } else {
             // Series without resolved S/E must not write a whole-title mark —
             // that would checkmark the poster but never the episode card.
             if activeMeta.isSeries { return }
-            guard !WatchedStore.contains(metaId: activeMeta.id, type: activeMeta.type) else { return }
+            guard !WatchedStore.contains(meta: activeMeta) else { return }
         }
         WatchedStore.markWatched(activeMeta, season: season, episode: episode)
     }

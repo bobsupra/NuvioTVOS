@@ -9,6 +9,7 @@ struct StreamQualityTags: Equatable, Codable {
     var isAtmos: Bool = false
     var isCached: Bool = false
     var bingeGroup: String? = nil
+    var addonName: String? = nil
 
     var hasVisualPreference: Bool { isDolbyVision || isHDR }
     var hasAudioPreference: Bool { isAtmos }
@@ -19,6 +20,7 @@ struct StreamQualityTags: Equatable, Codable {
         filename: String? = nil,
         url: String? = nil,
         bingeGroup: String? = nil,
+        addonName: String? = nil,
         isCachedHint: Bool? = nil
     ) -> StreamQualityTags {
         let text = [name, description, filename, url]
@@ -47,6 +49,9 @@ struct StreamQualityTags: Equatable, Codable {
         if let bingeGroup, !bingeGroup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             tags.bingeGroup = bingeGroup.trimmingCharacters(in: .whitespacesAndNewlines)
         }
+        if let addonName, !addonName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            tags.addonName = addonName.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
         return tags
     }
 
@@ -57,6 +62,7 @@ struct StreamQualityTags: Equatable, Codable {
             filename: stream.filename,
             url: stream.url,
             bingeGroup: stream.bingeGroup,
+            addonName: stream.addonName,
             isCachedHint: stream.isCached
         )
     }
@@ -66,8 +72,17 @@ struct StreamQualityTags: Equatable, Codable {
         var score = 0
         if let preferredGroup = preferred.bingeGroup,
            let group = bingeGroup,
-           preferredGroup == group {
-            score += 200_000
+           preferredGroup.compare(group, options: .caseInsensitive) == .orderedSame {
+            // Stremio defines bingeGroup specifically for matching the same
+            // release across episodes. It must dominate general quality ranking.
+            score += 500_000
+        }
+        if let preferredAddon = preferred.addonName,
+           let addon = addonName,
+           preferredAddon.compare(addon, options: .caseInsensitive) == .orderedSame {
+            // If an add-on does not expose bingeGroup, remain on the provider the
+            // user selected before falling back to the global smart ordering.
+            score += 250_000
         }
         if preferred.isDolbyVision, isDolbyVision { score += 80_000 }
         else if preferred.isHDR, isHDR { score += 50_000 }

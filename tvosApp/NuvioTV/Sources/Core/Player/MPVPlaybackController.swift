@@ -49,6 +49,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var pendingURL: String?
     private var pendingAudioURL: String?
     private var pendingLoadConfiguration: MPVLoadConfiguration?
+    /// Physical Apple TV can blank HDMI while matching frame rate / dynamic
+    /// range. Keep the file paused until that switch finishes so playback time
+    /// cannot advance behind the black screen.
+    private var startupDisplayGateActive = false
+    private var pendingAutoplayAfterDisplayGate = false
     private var mpv: OpaquePointer?
     private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
     private var recentPlaybackLogs: [String] = []
@@ -380,6 +385,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         lifecycleRestoreFailed = false
         hasCoherentTimeSample = false
         isAtEndOfFile = false
+        startupDisplayGateActive = false
+        pendingAutoplayAfterDisplayGate = false
         layoutMetalLayer()
         clearPlaybackError()
         resetDisplayCriteriaProbe()
@@ -620,11 +627,21 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         if let resumeMs = configuration.resumePositionMs, resumeMs > 1_000 {
             seekToMs(resumeMs)
         }
-        if configuration.autoplay {
-            playPlayback()
-        } else {
+        if !configuration.autoplay {
             pausePlayback()
+            return
         }
+
+        #if targetEnvironment(simulator)
+        playPlayback()
+        #else
+        // VIDEO_RECONFIG supplies the stream's real color and frame-rate
+        // metadata. The display probe below applies it, waits for HDMI to
+        // settle, reattaches video, and then releases this autoplay gate.
+        pendingAutoplayAfterDisplayGate = true
+        startupDisplayGateActive = true
+        pausePlayback()
+        #endif
     }
 
     /// Pushes the user's saved subtitle appearance (Settings → Subtitle Style)
@@ -649,6 +666,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         NotificationCenter.default.removeObserver(self)
         pendingURL = nil
         pendingLoadConfiguration = nil
+        startupDisplayGateActive = false
+        pendingAutoplayAfterDisplayGate = false
         clearDisplayCriteria()
         clearPlaybackError()
         guard let ctx = mpv else { return }
@@ -709,7 +728,10 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
         hasCoherentTimeSample = duration != nil && position != nil
 
-        isPlayerLoading = (idle && !paused && !eofReached) || seeking || bufferingCache
+        isPlayerLoading = startupDisplayGateActive
+            || (idle && !paused && !eofReached)
+            || seeking
+            || bufferingCache
         isPlayerPlaying = !paused && !idle && !eofReached
         // Accept completion only after MPV's END_FILE event explicitly reports
         // EOF. The eof-reached property can race ahead of an END_FILE error.
@@ -963,14 +985,37 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         case .retry:
             guard displayCriteriaProbeAttempts < Self.maximumDisplayCriteriaProbeAttempts else {
                 print("[MPV] HDR display switch skipped: video parameters did not become ready")
+                finishStartupDisplayGate()
                 return
             }
             displayCriteriaProbeAttempts += 1
             scheduleDisplayCriteriaProbe(after: 0.2)
-        case .appliedOrAlreadyActive, .finished:
-            break
+        case .appliedOrAlreadyActive:
+            if !isDisplaySwitchInFlight {
+                finishStartupDisplayGate()
+            }
+        case .finished:
+            finishStartupDisplayGate()
         }
         #endif
+    }
+
+    private func finishStartupDisplayGate(after delay: TimeInterval = 0) {
+        guard startupDisplayGateActive else { return }
+        let generation = displayCriteriaProbeGeneration
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self,
+                  self.mpv != nil,
+                  generation == self.displayCriteriaProbeGeneration,
+                  self.startupDisplayGateActive else { return }
+            self.startupDisplayGateActive = false
+            let shouldPlay = self.pendingAutoplayAfterDisplayGate
+            self.pendingAutoplayAfterDisplayGate = false
+            if shouldPlay {
+                self.playPlayback()
+            }
+            self.updateState()
+        }
     }
 
     private func updateDisplayCriteria() -> DisplayCriteriaUpdateResult {
@@ -1136,6 +1181,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         }
         isDisplaySwitchInFlight = false
         setStringProperty("vid", "auto")
+        // Let the reattached video output configure and present its paused
+        // landing frame before transport starts. HDMI is already settled here.
+        finishStartupDisplayGate(after: 0.2)
     }
     #endif
 

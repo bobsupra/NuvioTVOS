@@ -70,6 +70,7 @@ struct PlayerView: View {
             RemoteTouchCatcher(
                 isActive: {
                     !viewModel.showSettingsPanel
+                        && viewModel.sidePanel == nil
                         && (viewModel.isScrubbing
                             || (!viewModel.showControls && !viewModel.showNextEpisodeCard))
                 },
@@ -86,6 +87,7 @@ struct PlayerView: View {
                 // a focused progress bar owns the focus engine — hide chrome to
                 // hold-seek.)
                 isActive: !viewModel.showSettingsPanel
+                    && viewModel.sidePanel == nil
                     && !viewModel.isScrubbing
                     && (!viewModel.showControls || viewModel.isTimelineFocused),
                 onBeginBackward: { viewModel.beginRepeatingSkipBackward() },
@@ -179,6 +181,7 @@ struct PlayerView: View {
                         && !viewModel.showNextEpisodeCard
                         && !viewModel.showSkipSegmentCard
                         && !viewModel.showSettingsPanel
+                        && viewModel.sidePanel == nil
                 )
                 .focused($remoteInputFocused)
                 .onTapGesture {
@@ -385,6 +388,12 @@ struct PlayerView: View {
             }
         }
         .onChange(of: viewModel.showControls) { isVisible in
+            if viewModel.sidePanel != nil {
+                remoteInputFocused = false
+                nextEpisodeFocused = false
+                skipSegmentFocused = false
+                return
+            }
             if isVisible, !viewModel.isScrubbing, !viewModel.showPauseOverlay {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
@@ -397,6 +406,13 @@ struct PlayerView: View {
                 focusSkipSegment()
             } else {
                 focusRemoteInput()
+            }
+        }
+        .onChange(of: viewModel.sidePanel) { panel in
+            if panel != nil {
+                remoteInputFocused = false
+                nextEpisodeFocused = false
+                skipSegmentFocused = false
             }
         }
         .onChange(of: viewModel.showPauseOverlay) { visible in
@@ -440,6 +456,10 @@ struct PlayerView: View {
             viewModel.togglePlayPause()
         }
         .onMoveCommand { direction in
+            // The Episodes/Sources sheet exclusively owns directional input.
+            // Do not let list navigation also seek or reveal player controls.
+            guard viewModel.sidePanel == nil else { return }
+
             // Trackpad swipes also emit move commands; the pan recognizer sets
             // moveSuppressed so a swipe does not double-fire as a skip.
             if viewModel.moveSuppressed { return }

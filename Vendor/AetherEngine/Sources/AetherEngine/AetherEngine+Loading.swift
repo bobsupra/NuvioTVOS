@@ -232,10 +232,13 @@ extension AetherEngine {
         // Selection routes back through `selectSubtitleTrack(index:)` / `clearSubtitle()`.
         publishRemoteHLSSubtitleTracks(host: host)
 
-        // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
+        // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content. Wait for its display-mode handshake before transport starts; otherwise direct HLS can advance behind the television's black HDMI transition.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.
         // #124: a paused mount skips the self-start; the wired isReady waypoint settles .loading -> .paused.
         if Self.loadPerformsAutostart(options) {
+            if options.matchContentEnabled {
+                await displayCriteria.waitForSwitch()
+            }
             host.play()
         }
         startMemoryProbe()

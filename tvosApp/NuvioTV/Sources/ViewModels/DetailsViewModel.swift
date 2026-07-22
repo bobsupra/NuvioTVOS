@@ -36,7 +36,7 @@ class DetailsViewModel: ObservableObject {
                 let meta = try await repository.getMetadata(id: id, type: type)
                 uiState.meta = meta
                 uiState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
-                uiState.isWatched = WatchedStore.contains(metaId: meta.id, type: meta.type)
+                uiState.isWatched = WatchedStore.contains(meta: meta)
                 uiState.isLoading = false
 
                 // Movies stream off the title id; series stream per episode, loaded

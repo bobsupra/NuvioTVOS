@@ -25,21 +25,23 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.4 (build 45)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.5 (build 46)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.4](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.4) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.5](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.5) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.4-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.4/NuvioTV-3.1.4-unsigned-release.ipa)
+[NuvioTV-3.1.5-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.5/NuvioTV-3.1.5-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.4
+### New in Beta 3.1.5
 
-- Improves the new AetherEngine player with more predictable Siri Remote focus, timeline-to-transport navigation, seeking, and playback state updates.
-- Improves embedded and external subtitle discovery, selection, rendering, and timing. Native HLS subtitles can hand off to the compatibility player when Nuvio subtitle appearance controls are needed.
-- Fixes Trakt progress after fast-forwarding, marks playback watched at 90%, mirrors manual watched/unwatched actions to Trakt history, and makes **Sync Now** refresh watch progress like Android TV.
-- Makes Home catalogs resilient to partial provider failures, retries missing catalogs, and refreshes incomplete results without requiring a profile switch.
-- Keeps Trakt and catalog refresh work scoped to the active profile so stale results cannot overwrite a newly selected profile.
+- Makes Trakt the authoritative watched-history source whenever it is connected. Startup and **Sync Now** import complete movie and episode history, reconcile timestamps and provider IDs, and prevent stale Nuvio Sync data from restoring older watched states.
+- Fixes episode resume isolation and immediate persistence. Each episode now owns its resume point, a completed episode does not inherit another episode's position, and a seek followed by an immediate exit resumes from the new position across Home, details, and stream-selection paths.
+- Adds working watched/unwatched eye controls and long-press actions to episode cards, with immediate local UI updates, Continue Watching cleanup, durable retry, and Trakt mirroring.
+- Keeps the manually selected release/provider for the next episode when a matching source exists and carries the current audio, subtitle, subtitle delay, audio delay, and amplification choices through seamless episode advances.
+- Improves Intro, Recap, and Ending skip cards: skipped segments stay dismissed for the playback session, stale episode results are ignored, and the secondary label now shows the segment's end timestamp.
+- Redesigns the Episodes and Sources panels with right-aligned liquid-glass chrome, unclipped multi-line metadata, stable list focus, and isolated remote input so navigating a panel cannot seek or wake the player controls underneath it.
+- Holds playback at the exact start or resume position while Apple TV completes frame-rate or HDR/Dolby Vision display switching, preventing content from advancing behind the temporary HDMI black screen.
 
 ### The new player
 

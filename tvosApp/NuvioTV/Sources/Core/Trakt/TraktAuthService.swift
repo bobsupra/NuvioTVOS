@@ -777,9 +777,97 @@ enum TraktScrobbleAction: String {
     case stop
 }
 
+@MainActor
 struct TraktProgressService {
     private static let completionPercent = 90.0
     private static let maxItems = 20
+    private static let localCheckpointLifetime: TimeInterval = 10 * 60
+
+    private struct LocalPlaybackCheckpoint {
+        let profileId: String?
+        let item: ContinueWatchingItem
+    }
+
+    private struct ContinueWatchingSnapshot {
+        let profileId: String?
+        let items: [ContinueWatchingItem]
+    }
+
+    /// Optimistic positions bridge the short interval between leaving playback
+    /// and Trakt returning the newly-scrobbled timestamp from `sync/playback`.
+    /// They are deliberately separate from ContinueWatchingStore so choosing
+    /// Trakt never contaminates Nuvio Sync's independent progress ledger.
+    private static var localPlaybackCheckpoints: [LocalPlaybackCheckpoint] = []
+    /// Last list handed to Home for each profile. Details and an already-rendered
+    /// Home card use this synchronously, avoiding a stale resume position while
+    /// a replacement Trakt fetch is still in flight.
+    private static var continueWatchingSnapshots: [ContinueWatchingSnapshot] = []
+
+    static func currentContinueWatchingItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
+        pruneExpiredLocalCheckpoints()
+        let profileId = ContinueWatchingStore.activeProfileId
+        if let local = localPlaybackCheckpoints.first(where: {
+            $0.profileId == profileId && WatchedStore.sameContent($0.item.meta, meta)
+        })?.item {
+            return local
+        }
+        return continueWatchingSnapshots.first(where: { $0.profileId == profileId })?
+            .items.first(where: { WatchedStore.sameContent($0.meta, meta) })
+    }
+
+    static func recordLocalPlayback(
+        meta: NuvioMeta,
+        position: Double,
+        duration: Double,
+        season: Int?,
+        episode: Int?,
+        notify: Bool
+    ) {
+        guard position.isFinite,
+              duration.isFinite,
+              position > 0,
+              duration > 0 else { return }
+
+        let profileId = ContinueWatchingStore.activeProfileId
+        localPlaybackCheckpoints.removeAll {
+            $0.profileId == profileId && WatchedStore.sameContent($0.item.meta, meta)
+        }
+
+        let progressPercent = position / duration * 100
+        if progressPercent < completionPercent {
+            let video = meta.videos?.first {
+                $0.season == season && $0.episode == episode
+            }
+            localPlaybackCheckpoints.append(
+                LocalPlaybackCheckpoint(
+                    profileId: profileId,
+                    item: ContinueWatchingItem(
+                        meta: meta,
+                        streamUrl: "",
+                        position: position,
+                        duration: duration,
+                        lastWatchedAt: Date(),
+                        season: season,
+                        episode: episode,
+                        released: video?.released,
+                        episodeTitleOverride: video?.title,
+                        episodeOverviewOverride: video?.overview,
+                        episodeThumbnailOverride: video?.thumbnail,
+                        isUpNext: false
+                    )
+                )
+            )
+        } else {
+            removeFromContinueWatchingSnapshot(meta: meta, profileId: profileId)
+        }
+
+        if notify {
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
+        }
+    }
 
     static func fetchContinueWatching(
         repository: CatalogRepository
@@ -858,7 +946,80 @@ struct TraktProgressService {
                 items.append(item)
             }
         }
-        return items
+        let mergedItems = mergingLocalPlaybackCheckpoints(into: items)
+        replaceContinueWatchingSnapshot(mergedItems)
+        return mergedItems
+    }
+
+    private static func mergingLocalPlaybackCheckpoints(
+        into remoteItems: [ContinueWatchingItem]
+    ) -> [ContinueWatchingItem] {
+        pruneExpiredLocalCheckpoints()
+
+        let profileId = ContinueWatchingStore.activeProfileId
+        let checkpoints = localPlaybackCheckpoints.filter { $0.profileId == profileId }
+        var merged = remoteItems
+        var confirmedItems: [ContinueWatchingItem] = []
+
+        for checkpoint in checkpoints {
+            let local = checkpoint.item
+            if let index = merged.firstIndex(where: { WatchedStore.sameContent($0.meta, local.meta) }) {
+                let remote = merged[index]
+                let sameEpisode = remote.season == local.season && remote.episode == local.episode
+                let remoteCaughtUp = sameEpisode && abs(remote.position - local.position) <= 2
+                let remoteIsNewer = remote.lastWatchedAt
+                    > local.lastWatchedAt.addingTimeInterval(1)
+                if remoteCaughtUp || remoteIsNewer {
+                    confirmedItems.append(local)
+                } else {
+                    merged[index] = local
+                }
+            } else {
+                merged.append(local)
+            }
+        }
+
+        if !confirmedItems.isEmpty {
+            localPlaybackCheckpoints.removeAll { checkpoint in
+                checkpoint.profileId == profileId && confirmedItems.contains { confirmed in
+                    WatchedStore.sameContent(checkpoint.item.meta, confirmed.meta)
+                }
+            }
+        }
+
+        return Array(
+            merged
+                .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+                .prefix(maxItems)
+        )
+    }
+
+    private static func pruneExpiredLocalCheckpoints() {
+        let now = Date()
+        localPlaybackCheckpoints.removeAll {
+            now.timeIntervalSince($0.item.lastWatchedAt) > localCheckpointLifetime
+        }
+    }
+
+    private static func replaceContinueWatchingSnapshot(_ items: [ContinueWatchingItem]) {
+        let profileId = ContinueWatchingStore.activeProfileId
+        continueWatchingSnapshots.removeAll { $0.profileId == profileId }
+        continueWatchingSnapshots.append(
+            ContinueWatchingSnapshot(profileId: profileId, items: items)
+        )
+    }
+
+    private static func removeFromContinueWatchingSnapshot(meta: NuvioMeta, profileId: String?) {
+        guard let index = continueWatchingSnapshots.firstIndex(where: { $0.profileId == profileId }) else {
+            return
+        }
+        let remaining = continueWatchingSnapshots[index].items.filter {
+            !WatchedStore.sameContent($0.meta, meta)
+        }
+        continueWatchingSnapshots[index] = ContinueWatchingSnapshot(
+            profileId: profileId,
+            items: remaining
+        )
     }
 
     /// Writes the current player position to the same Trakt playback feed that
@@ -1155,12 +1316,100 @@ struct TraktProgressService {
 /// connected Trakt account should receive an explicit watched action even when
 /// resume points are kept in Nuvio Sync.
 struct TraktHistoryService {
+    /// Pulls Trakt's complete watched snapshot into the durable store used by
+    /// Details, episode cards, Continue Watching reconciliation, and Nuvio
+    /// Sync. This runs whenever Trakt is connected, independently of which
+    /// provider is selected for resume progress.
+    @MainActor
+    static func syncWatchedHistory(
+        store: UserDefaults = ProfileSettings.current
+    ) async -> Bool {
+        guard TraktAuthStore.state(in: store).isAuthenticated(in: store) else { return false }
+
+        let targetProfileId = WatchedStore.activeProfileId
+        let service = TraktAuthService(store: store)
+        guard await service.refreshTokenIfNeeded() else { return false }
+
+        // Local changes are durable until a complete pull confirms them. Retry
+        // them before fetching so a transient POST failure cannot be mistaken
+        // for an authoritative remote removal.
+        for pending in WatchedStore.pendingTraktMutations(profileId: targetProfileId) {
+            guard WatchedStore.activeProfileId == targetProfileId else { return false }
+            _ = await setWatched(
+                pending.meta,
+                season: pending.season,
+                episode: pending.episode,
+                isWatched: pending.isWatched,
+                store: store,
+                notifyChange: false
+            )
+        }
+        let syncStartedAt = Date()
+
+        var receivedResponse = false
+        var receivedCompleteSnapshot = true
+        var remoteItems: [WatchedStoreItem] = []
+
+        if let movies: [TraktWatchedMovieDTO] = try? await service.authorizedGet(
+            path: "sync/watched/movies"
+        ) {
+            receivedResponse = true
+            remoteItems.append(contentsOf: movies.compactMap(watchedMovie))
+        } else {
+            receivedCompleteSnapshot = false
+        }
+
+        if let shows: [TraktWatchedShowDTO] = try? await service.authorizedGet(
+            path: "sync/watched/shows"
+        ) {
+            receivedResponse = true
+            var needsHistoryFallback = false
+            for show in shows {
+                if show.seasons.orEmpty.isEmpty {
+                    needsHistoryFallback = true
+                } else if let episodes = watchedEpisodes(show) {
+                    remoteItems.append(contentsOf: episodes)
+                } else {
+                    receivedCompleteSnapshot = false
+                }
+            }
+
+            if needsHistoryFallback {
+                if let historyItems = await fetchCompleteEpisodeHistory(using: service) {
+                    remoteItems.append(contentsOf: historyItems)
+                } else {
+                    receivedCompleteSnapshot = false
+                }
+            }
+        } else {
+            receivedCompleteSnapshot = false
+        }
+
+        guard receivedResponse else { return false }
+        // Network requests above can outlive the profile that initiated them.
+        // Never apply one profile's Trakt account to another profile's store.
+        guard WatchedStore.activeProfileId == targetProfileId else { return false }
+        guard receivedCompleteSnapshot else {
+            // A partial response is still useful for importing new marks, but
+            // absence is authoritative only when both Trakt collections loaded.
+            return WatchedStore.mergeRemote(
+                remoteItems,
+                confirmsTombstoneDeletions: false
+            )
+        }
+        return WatchedStore.reconcileTraktSnapshot(
+            remoteItems,
+            syncStartedAt: syncStartedAt
+        )
+    }
+
     static func setWatched(
         _ meta: NuvioMeta,
         season: Int? = nil,
         episode: Int? = nil,
         isWatched: Bool,
-        store: UserDefaults = ProfileSettings.current
+        store: UserDefaults = ProfileSettings.current,
+        notifyChange: Bool = true
     ) async -> Bool {
         guard TraktAuthStore.state(in: store).isAuthenticated(in: store),
               let mutation = mutation(
@@ -1177,10 +1426,12 @@ struct TraktHistoryService {
                 path: isWatched ? "sync/history" : "sync/history/remove",
                 body: mutation
             )
-            NotificationCenter.default.post(
-                name: TraktSettingsStore.continueWatchingChangedNotification,
-                object: nil
-            )
+            if notifyChange {
+                NotificationCenter.default.post(
+                    name: TraktSettingsStore.continueWatchingChangedNotification,
+                    object: nil
+                )
+            }
             return true
         } catch {
             return false
@@ -1246,6 +1497,126 @@ struct TraktHistoryService {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime]
         return formatter.string(from: Date())
+    }
+
+    private static func watchedMovie(_ item: TraktWatchedMovieDTO) -> WatchedStoreItem? {
+        guard let movie = item.movie,
+              let contentID = historyContentID(from: movie.ids) else { return nil }
+        return WatchedStoreItem(
+            meta: historyMeta(from: movie, contentID: contentID, type: "movie"),
+            watchedAt: historyDate(item.lastWatchedAt) ?? .distantPast
+        )
+    }
+
+    private static func watchedEpisodes(_ item: TraktWatchedShowDTO) -> [WatchedStoreItem]? {
+        guard let show = item.show,
+              let contentID = historyContentID(from: show.ids),
+              let seasons = item.seasons,
+              !seasons.isEmpty else { return nil }
+        let meta = historyMeta(from: show, contentID: contentID, type: "series")
+        var watched: [WatchedStoreItem] = []
+        for season in seasons {
+            guard let seasonNumber = season.number,
+                  seasonNumber >= 0,
+                  let episodes = season.episodes else { return nil }
+            for episode in episodes {
+                guard let episodeNumber = episode.number, episodeNumber > 0 else { return nil }
+                guard (episode.plays ?? 1) > 0 else { continue }
+                watched.append(
+                    WatchedStoreItem(
+                        meta: meta,
+                        watchedAt: historyDate(episode.lastWatchedAt ?? item.lastWatchedAt) ?? .distantPast,
+                        season: seasonNumber,
+                        episode: episodeNumber
+                    )
+                )
+            }
+        }
+        return watched
+    }
+
+    private static func fetchCompleteEpisodeHistory(
+        using service: TraktAuthService
+    ) async -> [WatchedStoreItem]? {
+        let pageSize = 100
+        var page = 1
+        var watched: [WatchedStoreItem] = []
+
+        while true {
+            guard let historyPage: [TraktEpisodeHistoryDTO] = try? await service.authorizedGet(
+                path: "users/me/history/episodes?page=\(page)&limit=\(pageSize)"
+            ) else { return nil }
+
+            let converted = historyPage.compactMap(watchedEpisode)
+            // A row we cannot identify makes absence unsafe as a deletion signal.
+            guard converted.count == historyPage.count else { return nil }
+            watched.append(contentsOf: converted)
+            guard historyPage.count == pageSize else { return watched }
+            page += 1
+        }
+    }
+
+    private static func watchedEpisode(_ item: TraktEpisodeHistoryDTO) -> WatchedStoreItem? {
+        guard let show = item.show,
+              let episode = item.episode,
+              let seasonNumber = episode.season,
+              let episodeNumber = episode.number,
+              seasonNumber >= 0,
+              episodeNumber > 0,
+              let contentID = historyContentID(from: show.ids) else { return nil }
+        return WatchedStoreItem(
+            meta: historyMeta(from: show, contentID: contentID, type: "series"),
+            watchedAt: historyDate(item.watchedAt) ?? .distantPast,
+            season: seasonNumber,
+            episode: episodeNumber
+        )
+    }
+
+    private static func historyMeta(
+        from media: TraktProgressMediaDTO,
+        contentID: String,
+        type: String
+    ) -> NuvioMeta {
+        NuvioMeta(
+            id: contentID,
+            name: media.title ?? contentID,
+            description: media.overview,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: media.ids?.imdb,
+            tmdbId: media.ids?.tmdb,
+            type: type,
+            year: media.year,
+            genres: media.genres,
+            rating: media.rating,
+            releaseInfo: media.year.map(String.init),
+            runtime: media.runtime.map { "\($0) min" },
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        ).persistenceSnapshot
+    }
+
+    private static func historyContentID(from ids: TraktProgressIDsDTO?) -> String? {
+        if let imdb = ids?.imdb?.trimmingCharacters(in: .whitespacesAndNewlines), !imdb.isEmpty {
+            return imdb
+        }
+        if let tmdb = ids?.tmdb { return "tmdb:\(tmdb)" }
+        if let trakt = ids?.trakt { return "trakt:\(trakt)" }
+        return nil
+    }
+
+    private static func historyDate(_ value: String?) -> Date? {
+        guard let value, !value.isEmpty else { return nil }
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) { return date }
+        formatter.formatOptions = [.withInternetDateTime]
+        return formatter.date(from: value)
     }
 }
 
@@ -1383,6 +1754,16 @@ private struct TraktWatchedShowDTO: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case show, seasons
+        case lastWatchedAt = "last_watched_at"
+    }
+}
+
+private struct TraktWatchedMovieDTO: Decodable {
+    let lastWatchedAt: String?
+    let movie: TraktProgressMediaDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case movie
         case lastWatchedAt = "last_watched_at"
     }
 }
@@ -1827,8 +2208,10 @@ final class TraktSettingsViewModel: ObservableObject {
     func disconnect() {
         pollTask?.cancel()
         isLoading = true
+        let profileId = WatchedStore.activeProfileId
         Task {
             await service.revokeAndLogout()
+            WatchedStore.clearPendingTraktMutations(profileId: profileId)
             isLoading = false
             statusMessage = "Disconnected from Trakt."
             connectedStats = nil
@@ -1844,6 +2227,7 @@ final class TraktSettingsViewModel: ObservableObject {
         errorMessage = nil
         Task {
             _ = await service.refreshTokenIfNeeded()
+            let historySynced = await TraktHistoryService.syncWatchedHistory(store: store)
             // Match Android TV's Sync Now sequence: refresh the Trakt progress
             // repository before updating account details and cached stats. Home
             // owns the tvOS progress snapshot, so its change notification is the
@@ -1859,7 +2243,9 @@ final class TraktSettingsViewModel: ObservableObject {
             }
             isStatsLoading = false
             isLoading = false
-            statusMessage = "Trakt sync completed."
+            statusMessage = historySynced
+                ? "Trakt sync completed."
+                : "Trakt account refreshed, but watched history could not be imported."
             reload()
         }
     }

@@ -323,7 +323,7 @@ private struct DiscoverCard: View {
                 .frame(width: DiscoverGridMetrics.posterWidth, height: DiscoverGridMetrics.posterHeight)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .overlay(alignment: .topTrailing) {
-                    WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                    WatchedCheckmarkBadge(meta: meta)
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: 16, style: .continuous)

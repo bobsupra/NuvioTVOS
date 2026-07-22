@@ -15,10 +15,12 @@ struct PlayerSidePanelChrome<Content: View>: View {
     var onExit: () -> Void = {}
     @ViewBuilder var content: Content
 
+    private let panelCornerRadius: CGFloat = 34
+
     var body: some View {
         HStack(spacing: 0) {
             LinearGradient(
-                colors: [.clear, .black.opacity(0.55)],
+                colors: [.clear, .black.opacity(0.3)],
                 startPoint: .leading,
                 endPoint: .trailing
             )
@@ -28,18 +30,29 @@ struct PlayerSidePanelChrome<Content: View>: View {
                 Text(title)
                     .font(.system(size: 34, weight: .bold))
                     .foregroundStyle(.white)
-                    .padding(.top, 56)
 
                 content
-
-                Spacer(minLength: 32)
+                    .frame(maxHeight: .infinity)
             }
-            .padding(.horizontal, 28)
-            .frame(width: 640, alignment: .leading)
-            .frame(maxHeight: .infinity)
-            .background(Color.black.opacity(0.92))
+            .padding(28)
+            .frame(width: 640, alignment: .topLeading)
+            .frame(maxHeight: .infinity, alignment: .topLeading)
+            .background {
+                RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                    .fill(Color.black.opacity(0.22))
+                    .glassRoundedRect(cornerRadius: panelCornerRadius)
+            }
+            .overlay {
+                RoundedRectangle(cornerRadius: panelCornerRadius, style: .continuous)
+                    .strokeBorder(Color.white.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.4), radius: 28, x: -8, y: 0)
+            .padding(.vertical, 32)
+            .padding(.trailing, 12)
         }
-        .ignoresSafeArea()
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .background(Color.black.opacity(0.1).ignoresSafeArea())
+        .ignoresSafeArea(edges: .trailing)
         .transition(.move(edge: .trailing).combined(with: .opacity))
         .onExitCommand(perform: onExit)
     }
@@ -60,14 +73,17 @@ struct PlayerPanelRow: View {
                 Text(title)
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(isFocused ? .black : .white)
-                    .lineLimit(2)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
                 if let subtitle, !subtitle.isEmpty {
                     Text(subtitle)
                         .font(.system(size: 18, weight: .medium))
                         .foregroundStyle(isFocused ? .black.opacity(0.55) : .white.opacity(0.55))
-                        .lineLimit(2)
+                        .lineLimit(4)
+                        .fixedSize(horizontal: false, vertical: true)
                 }
             }
+            .layoutPriority(1)
             Spacer(minLength: 8)
             if let trailing, !trailing.isEmpty {
                 Text(trailing)
@@ -78,6 +94,7 @@ struct PlayerPanelRow: View {
                     .background(
                         Capsule().fill(isFocused ? Color.black.opacity(0.08) : Color.white.opacity(0.12))
                     )
+                    .fixedSize()
             }
             if selected {
                 Image(systemName: "checkmark")
@@ -120,6 +137,7 @@ struct PlayerEpisodesPanel: View {
                             )
                         }
                         .buttonStyle(PosterCardButtonStyle())
+                        .focusEffectDisabledIfAvailable()
                         .focused($focusedID, equals: "empty")
                     } else {
                         ForEach(episodes) { episode in
@@ -130,11 +148,13 @@ struct PlayerEpisodesPanel: View {
                                 episodeRow(episode, isCurrent: isCurrent, isFocused: focusedID == episode.id)
                             }
                             .buttonStyle(PosterCardButtonStyle())
+                            .focusEffectDisabledIfAvailable()
                             .focused($focusedID, equals: episode.id)
                         }
                     }
                 }
-                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 12)
             }
             .focusSection()
         }
@@ -171,13 +191,15 @@ struct PlayerEpisodesPanel: View {
                 Text(episode.title)
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundStyle(isFocused ? .black : .white)
-                    .lineLimit(2)
+                    .lineLimit(3)
+                    .fixedSize(horizontal: false, vertical: true)
                 if isCurrent {
                     Text("Now Playing")
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(isFocused ? .black.opacity(0.65) : .white.opacity(0.75))
                 }
             }
+            .layoutPriority(1)
             Spacer(minLength: 4)
             if isCurrent {
                 Image(systemName: "checkmark")
@@ -229,6 +251,7 @@ struct PlayerSourcesPanel: View {
                             )
                         }
                         .buttonStyle(PosterCardButtonStyle())
+                        .focusEffectDisabledIfAvailable()
                         .focused($focusedID, equals: "empty")
                     } else {
                         ForEach(viewModel.availableSources, id: \.id) { stream in
@@ -245,22 +268,35 @@ struct PlayerSourcesPanel: View {
                                 )
                             }
                             .buttonStyle(PosterCardButtonStyle())
+                            .focusEffectDisabledIfAvailable()
                             .focused($focusedID, equals: stream.id)
                         }
                     }
                 }
-                .padding(.vertical, 8)
+                .padding(.horizontal, 10)
+                .padding(.vertical, 12)
             }
             .focusSection()
         }
         .onAppear {
             viewModel.loadSourcesIfNeeded()
-            DispatchQueue.main.async {
-                if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
-                    focusedID = current.id
-                } else {
-                    focusedID = viewModel.availableSources.first?.id
-                }
+            requestSourceFocus()
+        }
+        .onChange(of: viewModel.availableSources.map(\.id)) { sourceIDs in
+            guard !sourceIDs.isEmpty,
+                  focusedID == nil || !sourceIDs.contains(focusedID ?? "") else {
+                return
+            }
+            requestSourceFocus()
+        }
+    }
+
+    private func requestSourceFocus() {
+        DispatchQueue.main.async {
+            if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
+                focusedID = current.id
+            } else {
+                focusedID = viewModel.availableSources.first?.id
             }
         }
     }

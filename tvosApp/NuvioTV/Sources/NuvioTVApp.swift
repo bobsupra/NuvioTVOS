@@ -439,6 +439,66 @@ struct ContentView: View {
         return (sorted, current)
     }
 
+    private static func resumePosition(for item: ContinueWatchingItem) -> Double? {
+        let currentItem: ContinueWatchingItem
+        if TraktSettingsStore.watchProgressSource == .trakt,
+           TraktAuthStore.state.isAuthenticated,
+           let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta) {
+            currentItem = latest
+        } else {
+            currentItem = item
+        }
+
+        if currentItem.meta.isSeries {
+            // A Trakt card already carries the exact remote episode position.
+            // Looking it up in Nuvio Sync's separate episode ledger can return
+            // an older checkpoint for the same episode (or no checkpoint at
+            // all), so never cross the two progress sources here.
+            if TraktSettingsStore.watchProgressSource == .trakt,
+               TraktAuthStore.state.isAuthenticated {
+                return currentItem.isUpNextEntry ? nil : currentItem.resumePosition
+            }
+            guard let numbers = currentItem.episodeNumbers else { return nil }
+            let episodeId = currentItem.meta.videos?.first {
+                $0.season == numbers.season && $0.episode == numbers.episode
+            }?.id
+            return ContinueWatchingStore.resumePosition(
+                for: currentItem.meta,
+                season: numbers.season,
+                episode: numbers.episode,
+                episodeId: episodeId
+            )
+        }
+        guard !WatchedStore.contains(meta: currentItem.meta) else { return nil }
+        return currentItem.resumePosition
+    }
+
+    private static func resumePosition(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
+        if TraktSettingsStore.watchProgressSource == .trakt,
+           TraktAuthStore.state.isAuthenticated {
+            guard let item = TraktProgressService.currentContinueWatchingItem(for: meta),
+                  !item.isUpNextEntry else { return nil }
+            if meta.isSeries {
+                guard let episode,
+                      item.season == episode.season,
+                      item.episode == episode.episode else { return nil }
+            }
+            return item.resumePosition
+        }
+
+        if meta.isSeries {
+            guard let episode else { return nil }
+            return ContinueWatchingStore.resumePosition(
+                for: meta,
+                season: episode.season,
+                episode: episode.episode,
+                episodeId: episode.id
+            )
+        }
+        guard !WatchedStore.contains(meta: meta) else { return nil }
+        return ContinueWatchingStore.item(for: meta.id)?.resumePosition
+    }
+
     private static func seasonSortKey(_ season: Int) -> Int {
         season <= 0 ? Int.max : season
     }
@@ -451,6 +511,10 @@ struct ContentView: View {
         continueWatchingPlaybackTask = nil
         isResolvingContinueWatchingStream = false
 
+        let item = TraktSettingsStore.watchProgressSource == .trakt
+            && TraktAuthStore.state.isAuthenticated
+            ? (TraktProgressService.currentContinueWatchingItem(for: item.meta) ?? item)
+            : item
         let context = Self.episodeContext(for: item)
         playbackEpisodes = context.episodes
         playbackCurrentEpisode = context.current
@@ -462,7 +526,7 @@ struct ContentView: View {
                 meta: item.meta,
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
-                resumeFrom: item.resumePosition
+                resumeFrom: Self.resumePosition(for: item)
             )
             return
         }
@@ -499,7 +563,7 @@ struct ContentView: View {
                     meta: item.meta,
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
-                    resumeFrom: item.resumePosition
+                    resumeFrom: Self.resumePosition(for: item)
                 )
             } else {
                 // Keep the manual picker available when no add-on returns a
@@ -806,7 +870,7 @@ struct ContentView: View {
                         meta: meta,
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
-                        resumeFrom: isTrailer ? nil : ContinueWatchingStore.item(for: meta.id)?.resumePosition,
+                        resumeFrom: isTrailer ? nil : Self.resumePosition(for: meta, episode: currentEpisode),
                         origin: .details
                     )
                 }
@@ -987,6 +1051,7 @@ struct ContentView: View {
         let store = ProfileSettings.store(for: profileId)
         let debrid = DebridResolver(store: store)
         let (season, episode) = seasonEpisode(fromContentId: contentId)
+        let metaIdForTags = contentId.split(separator: ":").first.map(String.init) ?? contentId
 
         if stream.isDebridResolvable {
             guard case let .success(url, _, _)? = await debrid.resolvedURL(
@@ -994,6 +1059,11 @@ struct ContentView: View {
                 season: season,
                 episode: episode
             ) else { return nil }
+            LastStreamQualityStore.save(
+                metaId: metaIdForTags,
+                stream: stream,
+                profileId: profileId
+            )
             return PreparedNextStream(
                 url: url,
                 subtitleLine: subtitleLine,
@@ -1005,6 +1075,11 @@ struct ContentView: View {
         }
 
         guard let urlString = stream.url, let url = URL(string: urlString) else { return nil }
+        LastStreamQualityStore.save(
+            metaId: metaIdForTags,
+            stream: stream,
+            profileId: profileId
+        )
         return PreparedNextStream(
             url: url,
             subtitleLine: subtitleLine,
@@ -2745,6 +2820,13 @@ struct TVHomeView: View {
         let generation = continueWatchingRefreshGeneration
         let profileID = ContinueWatchingStore.activeProfileId
 
+        // Watched history is authoritative whenever Trakt is connected, even
+        // when the user keeps resume progress in Nuvio Sync.
+        if TraktAuthStore.state.isAuthenticated {
+            let traktStore = ProfileSettings.current
+            _ = await TraktHistoryService.syncWatchedHistory(store: traktStore)
+        }
+
         refreshContinueWatching()
         guard usesTraktProgress else { return }
 
@@ -4279,7 +4361,7 @@ private struct CollectionFolderResultCard: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
                 .overlay(alignment: .topTrailing) {
-                    WatchedCheckmarkBadge(metaId: meta.id, type: meta.type)
+                    WatchedCheckmarkBadge(meta: meta)
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)

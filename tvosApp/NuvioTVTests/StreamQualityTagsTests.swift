@@ -75,6 +75,40 @@ final class StreamQualityTagsTests: XCTestCase {
         XCTAssertEqual(best?.id, dv.id)
     }
 
+    func testSmartSelectorKeepsManuallyChosenBingeSourceForNextEpisode() {
+        let selected = NuvioStream(
+            url: "https://fusion.example/show.s01e01.mkv",
+            name: "1080p WEB-DL",
+            description: "6.6 GB",
+            addonName: "Fusion",
+            bingeGroup: "web-rawr"
+        )
+        let oldDefault = NuvioStream(
+            url: "https://hawk.example/show.s01e02.mkv",
+            name: "1080p WEB-DL",
+            description: "7 GB",
+            addonName: "Hawk",
+            bingeGroup: "web-other"
+        )
+        let continuation = NuvioStream(
+            url: "https://fusion.example/show.s01e02.mkv",
+            name: "1080p WEB-DL",
+            description: "6.4 GB",
+            addonName: "Fusion",
+            bingeGroup: "web-rawr"
+        )
+
+        let best = SmartPlaybackSelector.bestStream(
+            from: [oldDefault, continuation],
+            qualityPreference: "Highest",
+            subtitleLanguages: [],
+            shouldMatchSubtitles: false,
+            preferredTags: StreamQualityTags.parse(stream: selected)
+        )
+
+        XCTAssertEqual(best?.id, continuation.id)
+    }
+
     func testCachedOnlyFilter() {
         let cached = NuvioStream(
             url: "https://cdn.example/c.mkv",

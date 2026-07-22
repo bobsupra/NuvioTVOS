@@ -186,13 +186,10 @@ final class DisplayCriteriaController {
         guard let window = resolveWindow() else { return }
         let displayManager = window.avDisplayManager
         let screen = window.screen
-
-        // Fast exit: panel already in HDR (headroom already raised, e.g. a prior
-        // HDR/DV session left it there).
-        if screen.currentEDRHeadroom > 1.001 {
-            EngineLog.emit("[DisplayCriteria] no switch needed (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) at entry)", category: .engine)
-            return
-        }
+        // HDR headroom only describes dynamic range. A panel that is already in
+        // HDR may still be changing from the UI's 60 Hz mode to the video's
+        // 23.976/24 Hz mode, so it must not release playback by itself.
+        let enteredWithHDR = screen.currentEDRHeadroom > 1.001
 
         // Observe the OS mode-switch notifications. Start marks the HDMI handshake
         // beginning, more reliable than polling `isDisplayModeSwitchInProgress`,
@@ -220,7 +217,7 @@ final class DisplayCriteriaController {
         // AVPlayer error on DV Profile 8.1.
         var sawSwitchStart = false
         for _ in 0..<100 {
-            if switchEnded.fired || screen.currentEDRHeadroom > 1.001 {
+            if switchEnded.fired || (!enteredWithHDR && screen.currentEDRHeadroom > 1.001) {
                 EngineLog.emit("[DisplayCriteria] settled during start phase (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                 return
             }
@@ -250,7 +247,7 @@ final class DisplayCriteriaController {
                 EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (~\(elapsed)ms)", category: .engine)
                 return
             }
-            if screen.currentEDRHeadroom > 1.001 {
+            if !enteredWithHDR && screen.currentEDRHeadroom > 1.001 {
                 EngineLog.emit("[DisplayCriteria] switch settled via EDR (~\(elapsed)ms, headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                 return
             }
