@@ -25,23 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.5 (build 46)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.6 (build 47)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.5](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.5) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.6) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.5-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.5/NuvioTV-3.1.5-unsigned-release.ipa)
+[NuvioTV-3.1.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.6/NuvioTV-3.1.6-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.5
+### New in Beta 3.1.6
 
-- Makes Trakt the authoritative watched-history source whenever it is connected. Startup and **Sync Now** import complete movie and episode history, reconcile timestamps and provider IDs, and prevent stale Nuvio Sync data from restoring older watched states.
-- Fixes episode resume isolation and immediate persistence. Each episode now owns its resume point, a completed episode does not inherit another episode's position, and a seek followed by an immediate exit resumes from the new position across Home, details, and stream-selection paths.
-- Adds working watched/unwatched eye controls and long-press actions to episode cards, with immediate local UI updates, Continue Watching cleanup, durable retry, and Trakt mirroring.
-- Keeps the manually selected release/provider for the next episode when a matching source exists and carries the current audio, subtitle, subtitle delay, audio delay, and amplification choices through seamless episode advances.
-- Improves Intro, Recap, and Ending skip cards: skipped segments stay dismissed for the playback session, stale episode results are ignored, and the secondary label now shows the segment's end timestamp.
-- Redesigns the Episodes and Sources panels with right-aligned liquid-glass chrome, unclipped multi-line metadata, stable list focus, and isolated remote input so navigating a panel cannot seek or wake the player controls underneath it.
-- Holds playback at the exact start or resume position while Apple TV completes frame-rate or HDR/Dolby Vision display switching, preventing content from advancing behind the temporary HDMI black screen.
+- Adds **Grid View** to Home: every catalog receives a six-column, three-row poster preview with a dedicated **See All** tile and a full paginated catalog browser.
+- Adds an automatic Grid View hero slideshow and lets you choose which Home catalogs supply its featured titles from Settings → Layout & Discovery.
+- Loads Home progressively so synced collections and built-in catalogs appear first while slower add-on catalogs arrive without blocking the screen.
+- Removes the old Home catalog-row limit, retries missing add-on rows, and keeps metadata caching thread-safe during progressive updates.
+- Makes large watched-history merges and Continue Watching cleanup substantially faster by indexing media identities and newest watched timestamps.
+- Adds a 10,000-item watched-history regression test to protect startup and sync performance.
 
 ### The new player
 
