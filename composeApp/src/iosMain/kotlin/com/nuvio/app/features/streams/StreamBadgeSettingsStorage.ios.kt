@@ -1,5 +1,6 @@
 package com.nuvio.app.features.streams
 
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
 import com.nuvio.app.core.sync.decodeSyncBoolean
 import com.nuvio.app.core.sync.decodeSyncString
@@ -43,17 +44,24 @@ actual object StreamBadgeSettingsStorage {
     }
 
     actual fun loadLegacyDebridStreamBadgeRules(): String? =
-        loadString(legacyDebridStreamBadgeRulesKey)
+        AppleFileStringStorage.load(ProfileScopedKey.of(legacyDebridStreamBadgeRulesKey))
 
     actual fun clearLegacyDebridStreamBadgeRules() {
-        NSUserDefaults.standardUserDefaults.removeObjectForKey(ProfileScopedKey.of(legacyDebridStreamBadgeRulesKey))
+        AppleFileStringStorage.remove(ProfileScopedKey.of(legacyDebridStreamBadgeRulesKey))
     }
 
-    private fun loadString(key: String): String? =
+    private fun loadString(key: String): String? = if (key == streamBadgeRulesKey) {
+        AppleFileStringStorage.load(ProfileScopedKey.of(key))
+    } else {
         NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(key))
+    }
 
     private fun saveString(key: String, value: String) {
-        NSUserDefaults.standardUserDefaults.setObject(value, forKey = ProfileScopedKey.of(key))
+        if (key == streamBadgeRulesKey) {
+            AppleFileStringStorage.save(ProfileScopedKey.of(key), value)
+        } else {
+            NSUserDefaults.standardUserDefaults.setObject(value, forKey = ProfileScopedKey.of(key))
+        }
     }
 
     private fun loadBoolean(key: String): Boolean? {
@@ -77,7 +85,8 @@ actual object StreamBadgeSettingsStorage {
     }
 
     actual fun replaceFromSyncPayload(payload: JsonObject) {
-        syncKeys.forEach { key ->
+        AppleFileStringStorage.remove(ProfileScopedKey.of(streamBadgeRulesKey))
+        syncKeys.filterNot { it == streamBadgeRulesKey }.forEach { key ->
             NSUserDefaults.standardUserDefaults.removeObjectForKey(ProfileScopedKey.of(key))
         }
 

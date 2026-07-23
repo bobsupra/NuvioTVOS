@@ -1799,6 +1799,7 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
 
     @State private var isLoading = true
@@ -1833,6 +1834,9 @@ struct TVHomeView: View {
     /// Measured height per section id (collection vs catalog rows differ).
     @State private var measuredRowHeights: [String: CGFloat] = [:]
     @State private var verticalOffset: CGFloat = 0
+    @State private var browsingSection: TVHomeSection?
+    @State private var gridHeroIndex = 0
+    @State private var didRequestInitialGridHeroFocus = false
     @FocusState private var isLoadingFocusActive: Bool
     @FocusState private var focusedCardID: String?
 
@@ -1844,7 +1848,9 @@ struct TVHomeView: View {
             // Collection folder heroes: top-trailing crop (Android TopEnd) so
             // portrait hero art isn't center-cropped with the subject too high.
             CrossfadingBackdrop(
-                url: homeBackdropURL,
+                // Android Grid Home owns a contained 400pt hero backdrop. Keep
+                // the full-screen backdrop for Modern/Compact only.
+                url: homeLayout == "Grid View" ? nil : homeBackdropURL,
                 placeholder: Color.nuvioBackground(amoled: amoled, body: bodyColor),
                 alignment: focusedCollectionFolder != nil ? .topTrailing : .center
             )
@@ -1913,7 +1919,7 @@ struct TVHomeView: View {
                 } else {
                     // Header Hero Meta block (static, outside the rows). Folder
                     // focus swaps poster meta for emoji + folder title (browse-style).
-                    if heroEnabled {
+                    if heroEnabled && homeLayout != "Grid View" {
                         if let folder = focusedCollectionFolder {
                             TVCollectionFolderHeroView(folder: folder)
                         } else if let heroMeta = visibleFocusedMeta ?? visibleHero {
@@ -1931,6 +1937,9 @@ struct TVHomeView: View {
                     // while the focused row plus its neighbours stay focusable.
                     GeometryReader { proxy in
                         let sections = visibleSections.filter(\.hasContent)
+                        if homeLayout == "Grid View" {
+                            homeGrid(sections: sections)
+                        } else {
                         // Same cadence as the gap under the hero (see TVHeroView
                         // bottom padding + this top padding) so the first section
                         // title does not sit farther from the hero title than
@@ -2055,6 +2064,7 @@ struct TVHomeView: View {
                         .frame(width: proxy.size.width, alignment: .topLeading)
                         .offset(y: verticalOffset)
                         .animation(smoothFocus ? TVHomeLayout.scrollSpring : nil, value: verticalOffset)
+                        }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
                     .clipShape(VerticalEdgeClip())
@@ -2181,6 +2191,136 @@ struct TVHomeView: View {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
         }
+        .fullScreenCover(item: $browsingSection) { section in
+            TVHomeCatalogBrowseView(
+                section: section,
+                repository: repository,
+                watchedTitleKeys: watchedTitleKeys,
+                onDismiss: { browsingSection = nil },
+                onSelect: { meta in
+                    browsingSection = nil
+                    DispatchQueue.main.async {
+                        onNavigateToDetails(meta.id, meta.type)
+                    }
+                },
+                onLongPress: onLongPressCard
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func homeGrid(sections: [TVHomeSection]) -> some View {
+        ScrollView(.vertical) {
+            LazyVStack(alignment: .leading, spacing: TVHomeGridLayout.sectionSpacing) {
+                if heroEnabled && !gridHeroItems.isEmpty {
+                    TVGridHeroSlideshowView(
+                        items: gridHeroItems,
+                        selectedIndex: $gridHeroIndex,
+                        shouldRequestInitialFocus: store.lastFocusedCardID == nil
+                            && !didRequestInitialCardFocus
+                            && !didRequestInitialGridHeroFocus,
+                        onInitialFocusRequested: {
+                            didRequestInitialGridHeroFocus = true
+                            didRequestInitialCardFocus = true
+                        }
+                    ) { selectedMeta in
+                        onNavigateToDetails(selectedMeta.id, selectedMeta.type)
+                    }
+                }
+
+                ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
+                    if !section.collectionFolders.isEmpty {
+                        TVCollectionFolderRow(
+                            id: section.id,
+                            title: section.title,
+                            folders: section.collectionFolders,
+                            initialScrollIndex: rowScrollStore.index(for: section.id),
+                            onScrollIndexChange: { rowScrollStore.setIndex($0, for: section.id) },
+                            initialFocusCardKey: initialFocusCardKey,
+                            externalFocus: $focusedCardID,
+                            restrictFocusToCardKey: overlayRestoreCardID,
+                            onInitialFocusRequested: { didRequestInitialCardFocus = true },
+                            onFocus: { folder in
+                                focusedRowIndex = index
+                                focusedSectionId = section.id
+                                overlayRestoreCardID = nil
+                                focusedCardID = "\(section.id)\u{1}\(folder.id)"
+                                settleFolderFocus(folder, in: section.id)
+                            },
+                            onSelect: { folder in
+                                overlayRestoreCardID = "\(section.id)\u{1}\(folder.id)"
+                                onOpenCollectionFolder(folder, section.title)
+                            }
+                        )
+                    } else if section.id == TVHomeSection.continueWatchingId {
+                        TVCatalogRow(
+                            id: section.id,
+                            title: section.title,
+                            items: section.items,
+                            progressByItemId: continueWatchingByMetaId,
+                            watchedTitleKeys: watchedTitleKeys,
+                            initialScrollIndex: rowScrollStore.index(for: section.id),
+                            onScrollIndexChange: { rowScrollStore.setIndex($0, for: section.id) },
+                            initialFocusCardKey: initialFocusCardKey,
+                            landscapeFocusedId: nil,
+                            externalFocus: $focusedCardID,
+                            restrictFocusToCardKey: overlayRestoreCardID,
+                            onInitialFocusRequested: { didRequestInitialCardFocus = true },
+                            onFocus: { meta in
+                                focusedRowIndex = index
+                                focusedSectionId = section.id
+                                focusedCardID = "\(section.id)\u{1}\(meta.id)"
+                                settleCatalogFocus(on: meta, in: section.id)
+                            },
+                            onBlur: { _ in },
+                            onApproachEnd: { _ in },
+                            onSelect: { meta in
+                                if let item = continueWatchingByMetaId[meta.id] {
+                                    onResumePlayback(item)
+                                }
+                            },
+                            onLongPress: onLongPressCard
+                        )
+                    } else {
+                        TVHomeCatalogGridSection(
+                            section: section,
+                            watchedTitleKeys: watchedTitleKeys,
+                            initialFocusCardKey: initialFocusCardKey,
+                            externalFocus: $focusedCardID,
+                            restrictFocusToCardKey: overlayRestoreCardID,
+                            onInitialFocusRequested: { didRequestInitialCardFocus = true },
+                            onFocus: { meta in
+                                focusedRowIndex = index
+                                focusedSectionId = section.id
+                                focusedCardID = "\(section.id)\u{1}\(meta.id)"
+                                settleCatalogFocus(on: meta, in: section.id)
+                            },
+                            onSelect: { meta in
+                                overlayRestoreCardID = "\(section.id)\u{1}\(meta.id)"
+                                onNavigateToDetails(meta.id, meta.type)
+                            },
+                            onLongPress: onLongPressCard,
+                            onSeeAllFocus: {
+                                focusedRowIndex = index
+                                focusedSectionId = section.id
+                                focusedCardID = "\(section.id)\u{1}\(TVHomeGridLayout.seeAllID)"
+                            },
+                            onSeeAll: { browsingSection = section }
+                        )
+                    }
+                }
+            }
+            // The six-column grids have a narrower intrinsic width than the
+            // screen. Without this, LazyVStack proposes that width to the hero
+            // too, leaving an empty strip along the trailing edge.
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(
+                .top,
+                heroEnabled && !gridHeroItems.isEmpty ? 0 : TVHomeLayout.rowsTopPadding
+            )
+            .padding(.bottom, 80)
+        }
+        .scrollIndicators(.hidden)
     }
 
     /// Nudges focus back to `target` after an overlay dismissal, in case the
@@ -2341,6 +2481,43 @@ struct TVHomeView: View {
         return focusedMeta
     }
 
+    /// Featured titles for Grid View's automatic hero. Start with one item from
+    /// each catalog for variety, then fill any remaining carousel slots from
+    /// the catalog order without duplicates.
+    private var gridHeroItems: [NuvioMeta] {
+        let catalogSections = visibleSections.filter {
+            $0.id != TVHomeSection.continueWatchingId && $0.collectionFolders.isEmpty
+        }
+        let selectedIDs = (try? JSONDecoder().decode([String].self, from: heroCatalogsData)) ?? []
+        let selectedSet = Set(selectedIDs)
+        let selectedSections = catalogSections.filter { selectedSet.contains($0.id) }
+        // Empty is the default "all catalogs" state. If saved catalogs are no
+        // longer available, also fall back to all rows instead of losing Hero.
+        let heroSections = selectedSet.isEmpty || selectedSections.isEmpty
+            ? catalogSections
+            : selectedSections
+        var seen: Set<String> = []
+        var result: [NuvioMeta] = []
+
+        func appendIfNeeded(_ item: NuvioMeta) {
+            let key = "\(item.type.lowercased())\u{1f}\(item.id)"
+            guard seen.insert(key).inserted else { return }
+            result.append(item)
+        }
+
+        for section in heroSections {
+            if let first = section.items.first { appendIfNeeded(first) }
+            if result.count == TVHomeGridLayout.heroPageLimit { return result }
+        }
+        for section in heroSections {
+            for item in section.items {
+                appendIfNeeded(item)
+                if result.count == TVHomeGridLayout.heroPageLimit { return result }
+            }
+        }
+        return result
+    }
+
     private func landscapeFocusedId(for sectionId: String) -> String? {
         guard let landscapeFocusedId,
               landscapeFocusedId.hasPrefix("\(sectionId)\u{1}") else {
@@ -2456,77 +2633,143 @@ struct TVHomeView: View {
         isLoading = true
         errorMessage = nil
 
+        // Collections are already local once account sync applies them. Publish
+        // their folder rows before starting provider requests so a slow catalog
+        // host cannot hold the user's collections off Home.
+        let collectionSections = await loadCollectionSections()
+        let previouslyLoadedCatalogSections = store.sections.filter { !$0.isCollectionRow }
+        publishHomeSections(
+            catalogSections: previouslyLoadedCatalogSections,
+            collectionSections: collectionSections,
+            resetFocusIfEmpty: true
+        )
+
         do {
-            let catalogs = try await repository.getHomeCatalogs()
-            var loadedSections: [TVHomeSection] = []
-
-            for catalog in catalogs {
-                let items: [NuvioMeta]
-                let pendingItems: [NuvioMeta]
-                let nextSkip: Int
-                if let catalogItems = catalog.items {
-                    items = Array(catalogItems.prefix(18))
-                    pendingItems = Array(catalogItems.dropFirst(items.count))
-                    // The add-on already returned these records, even though
-                    // Home reveals them in smaller UI batches.
-                    nextSkip = catalogItems.count
-                } else {
-                    var resolvedItems: [NuvioMeta] = []
-                    for id in catalog.itemIds.prefix(18) {
-                        if let meta = try? await repository.getMetadata(id: id, type: catalog.contentType ?? "movie") {
-                            resolvedItems.append(meta)
-                        }
-                    }
-                    items = resolvedItems
-                    pendingItems = []
-                    nextSkip = items.count
+            var receivedCatalogUpdate = false
+            var latestCatalogSections: [TVHomeSection] = []
+            for try await catalogs in repository.homeCatalogsProgressively() {
+                try Task.checkCancellation()
+                let catalogSections = await makeHomeCatalogSections(from: catalogs)
+                try Task.checkCancellation()
+                latestCatalogSections = catalogSections
+                receivedCatalogUpdate = receivedCatalogUpdate || !catalogSections.isEmpty
+                let loadedIds = Set(catalogSections.map(\.id))
+                let retainedPrevious = previouslyLoadedCatalogSections.filter {
+                    !loadedIds.contains($0.id)
                 }
-
-                let canRequestMore = catalog.contentType != nil && catalog.catalogId != nil
-
-                loadedSections.append(
-                    TVHomeSection(
-                        id: catalog.id,
-                        title: catalog.name,
-                        items: items,
-                        contentType: catalog.contentType,
-                        catalogId: catalog.catalogId,
-                        addonId: catalog.addonId,
-                        catalogGenre: catalog.catalogGenre,
-                        pendingItems: pendingItems,
-                        nextSkip: nextSkip,
-                        hasMore: !items.isEmpty && (!pendingItems.isEmpty || canRequestMore)
-                    )
+                publishHomeSections(
+                    // Keep the previous successful tree while this replacement
+                    // is still arriving, then publish the exact final result
+                    // below. Late rows append without making earlier rows flash.
+                    catalogSections: catalogSections + retainedPrevious,
+                    collectionSections: collectionSections,
+                    resetFocusIfEmpty: true
                 )
             }
-
-            let collectionSections = await loadCollectionSections()
-            let pinned = collectionSections.filter(\.isPinnedCollection)
-            let unpinned = collectionSections.filter { !$0.isPinnedCollection }
-            let composed = TVHomeCatalogOrder.apply(to: pinned + loadedSections + unpinned)
-            TVHomeCatalogOrder.writeSnapshot(composed)
-            store.sections = composed
-            store.hero = store.sections.first?.items.first
-            store.lastFocusedCardID = nil
+            guard receivedCatalogUpdate || !collectionSections.isEmpty else {
+                throw URLError(.cannotLoadFromNetwork)
+            }
+            publishHomeSections(
+                catalogSections: receivedCatalogUpdate
+                    ? latestCatalogSections
+                    : previouslyLoadedCatalogSections,
+                collectionSections: collectionSections,
+                resetFocusIfEmpty: true
+            )
             store.hasLoaded = true
             refreshContinueWatching()
             refreshWatchedTitles()
-            focusedMeta = store.sections.first?.items.first
-            focusedSectionId = nil
-            focusedCollectionFolder = nil
-            focusWork.pendingFocusedMeta = focusedMeta
-            // Keep folder-hero state clear until a folder card is focused.
-            landscapeFocusedId = nil
-            focusWork.pendingLandscapeFocusedId = nil
-            didRequestInitialCardFocus = false
-            shouldRestoreHomeFocus = false
             isLoading = false
         } catch is CancellationError {
             isLoading = false
         } catch {
             errorMessage = error.localizedDescription
+            // Synced collections or progressively loaded catalogs remain useful
+            // even if another provider failed after they were published.
+            if !store.sections.isEmpty {
+                store.hasLoaded = true
+            }
             isLoading = false
         }
+    }
+
+    @MainActor
+    private func makeHomeCatalogSections(from catalogs: [NuvioCatalog]) async -> [TVHomeSection] {
+        var loadedSections: [TVHomeSection] = []
+        loadedSections.reserveCapacity(catalogs.count)
+
+        for catalog in catalogs {
+            guard !Task.isCancelled else { return loadedSections }
+            let items: [NuvioMeta]
+            let pendingItems: [NuvioMeta]
+            let nextSkip: Int
+            if let catalogItems = catalog.items {
+                items = Array(catalogItems.prefix(18))
+                pendingItems = Array(catalogItems.dropFirst(items.count))
+                // The add-on already returned these records, even though Home
+                // reveals them in smaller UI batches.
+                nextSkip = catalogItems.count
+            } else {
+                var resolvedItems: [NuvioMeta] = []
+                for id in catalog.itemIds.prefix(18) {
+                    if let meta = try? await repository.getMetadata(
+                        id: id,
+                        type: catalog.contentType ?? "movie"
+                    ) {
+                        resolvedItems.append(meta)
+                    }
+                }
+                items = resolvedItems
+                pendingItems = []
+                nextSkip = items.count
+            }
+
+            let canRequestMore = catalog.contentType != nil && catalog.catalogId != nil
+            loadedSections.append(
+                TVHomeSection(
+                    id: catalog.id,
+                    title: catalog.name,
+                    items: items,
+                    contentType: catalog.contentType,
+                    catalogId: catalog.catalogId,
+                    addonId: catalog.addonId,
+                    catalogGenre: catalog.catalogGenre,
+                    pendingItems: pendingItems,
+                    nextSkip: nextSkip,
+                    hasMore: !items.isEmpty && (!pendingItems.isEmpty || canRequestMore)
+                )
+            )
+        }
+        return loadedSections
+    }
+
+    @MainActor
+    private func publishHomeSections(
+        catalogSections: [TVHomeSection],
+        collectionSections: [TVHomeSection],
+        resetFocusIfEmpty: Bool
+    ) {
+        let pinned = collectionSections.filter(\.isPinnedCollection)
+        let unpinned = collectionSections.filter { !$0.isPinnedCollection }
+        let composed = TVHomeCatalogOrder.apply(to: pinned + catalogSections + unpinned)
+        guard !composed.isEmpty else { return }
+
+        let wasEmpty = store.sections.isEmpty
+        TVHomeCatalogOrder.writeSnapshot(composed)
+        store.sections = composed
+        store.hero = composed.lazy.compactMap { $0.items.first }.first
+
+        guard wasEmpty && resetFocusIfEmpty else { return }
+        store.lastFocusedCardID = nil
+        focusedMeta = store.hero
+        focusedSectionId = nil
+        focusedCollectionFolder = nil
+        focusWork.pendingFocusedMeta = focusedMeta
+        // Keep folder-hero state clear until a folder card is focused.
+        landscapeFocusedId = nil
+        focusWork.pendingLandscapeFocusedId = nil
+        didRequestInitialCardFocus = false
+        shouldRestoreHomeFocus = false
     }
 
     @MainActor
@@ -3148,6 +3391,190 @@ private struct TVHeroView: View {
     }
 }
 
+/// Grid View's featured carousel, matching Android TV's `HeroCarousel`: a
+/// large near-full-screen banner, local backdrop/gradients, remote paging, Select to
+/// open details, and auto-advance only while the hero is not focused.
+private struct TVGridHeroSlideshowView: View {
+    let items: [NuvioMeta]
+    @Binding var selectedIndex: Int
+    let shouldRequestInitialFocus: Bool
+    let onInitialFocusRequested: () -> Void
+    let onSelect: (NuvioMeta) -> Void
+
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @FocusState private var isFocused: Bool
+
+    private var index: Int {
+        guard !items.isEmpty else { return 0 }
+        return min(max(selectedIndex, 0), items.count - 1)
+    }
+
+    private var activeItem: NuvioMeta? { items.indices.contains(index) ? items[index] : nil }
+
+    var body: some View {
+        ZStack(alignment: .bottom) {
+            if let activeItem {
+                let background = Color.nuvioBackground(amoled: amoled, body: bodyColor)
+
+                CrossfadingBackdrop(
+                    url: activeItem.backgroundUrl ?? activeItem.posterUrl,
+                    placeholder: background,
+                    alignment: .top
+                )
+
+                LinearGradient(
+                    stops: [
+                        .init(color: background.opacity(0.98), location: 0),
+                        .init(color: background.opacity(0.88), location: 0.16),
+                        .init(color: background.opacity(0.56), location: 0.34),
+                        .init(color: background.opacity(0.20), location: 0.56),
+                        .init(color: .clear, location: 0.72)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.30),
+                        .init(color: background.opacity(0.50), location: 0.60),
+                        .init(color: background.opacity(0.85), location: 0.80),
+                        .init(color: background, location: 1)
+                    ],
+                    startPoint: .top,
+                    endPoint: .bottom
+                )
+
+                gridHeroContent(activeItem)
+                    .id(activeItem.id)
+                    .transition(.opacity)
+            }
+
+            if items.count > 1 {
+                HStack(spacing: 12) {
+                    ForEach(items.indices, id: \.self) { dotIndex in
+                        Capsule()
+                            .fill(indicatorColor(for: dotIndex))
+                            .frame(
+                                width: dotIndex == index ? (isFocused ? 48 : 36) : 18,
+                                height: isFocused && dotIndex == index ? 6 : 4
+                            )
+                    }
+                }
+                .animation(.easeInOut(duration: 0.30), value: index)
+                .padding(.bottom, 24)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        // Match the tall Android Grid hero. Besides giving the design the same
+        // visual weight, this keeps 16:9 artwork from being vertically cropped
+        // into an ultra-wide 5:1 strip where the subject disappears.
+        .frame(height: 820)
+        .clipped()
+        .contentShape(Rectangle())
+        .focusable(true)
+        .focusEffectDisabledIfAvailable()
+        .focused($isFocused)
+        .onAppear {
+            guard shouldRequestInitialFocus else { return }
+            onInitialFocusRequested()
+            DispatchQueue.main.async { isFocused = true }
+        }
+        .onTapGesture {
+            if let activeItem { onSelect(activeItem) }
+        }
+        .onMoveCommand { direction in
+            switch direction {
+            case .left where index > 0:
+                setIndex(index - 1)
+            case .right where index < items.count - 1:
+                setIndex(index + 1)
+            default:
+                break
+            }
+        }
+        .task(id: "\(items.map(\.id).joined(separator: "|"))|\(isFocused)") {
+            guard items.count > 1 else { return }
+            // Android lets the initial GPU/image work settle for 20 seconds,
+            // then checks for the next unfocused advance every 10 seconds.
+            try? await Task.sleep(nanoseconds: 20_000_000_000)
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 10_000_000_000)
+                guard !Task.isCancelled else { return }
+                if !isFocused { setIndex((index + 1) % items.count) }
+            }
+        }
+        .onChange(of: items.count) { _, count in
+            if count == 0 { selectedIndex = 0 }
+            else if selectedIndex >= count { selectedIndex = count - 1 }
+        }
+    }
+
+    @ViewBuilder
+    private func gridHeroContent(_ item: NuvioMeta) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            if let logoURL = item.logoUrl, !logoURL.isEmpty {
+                CachedHeroLogo(url: logoURL, title: item.name)
+                    .frame(maxHeight: 80, alignment: .leading)
+            } else {
+                Text(item.name)
+                    .font(.custom("Inter-Bold", size: 46))
+                    .foregroundColor(.white)
+                    .lineLimit(2)
+            }
+
+            HStack(spacing: 18) {
+                if let rating = item.rating {
+                    Text(String(format: "IMDb %.1f", rating))
+                }
+                if let year = item.year {
+                    Text(String(year))
+                }
+            }
+            .font(.custom("Inter-SemiBold", size: 21))
+            .foregroundColor(.white.opacity(0.80))
+
+            if let genres = item.genres, !genres.isEmpty {
+                HStack(spacing: 10) {
+                    ForEach(Array(genres.prefix(3)), id: \.self) { genre in
+                        Text(genre)
+                            .font(.custom("Inter-Medium", size: 18))
+                            .foregroundColor(.white.opacity(0.72))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 6)
+                            .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
+                    }
+                }
+            }
+
+            if let description = item.description, !description.isEmpty {
+                Text(description)
+                    .font(.custom("Inter-Regular", size: 21))
+                    .foregroundColor(.white.opacity(0.72))
+                    .lineLimit(2)
+                    .lineSpacing(2)
+            }
+        }
+        .frame(maxWidth: 860, alignment: .leading)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
+        .padding(.leading, TVLayout.rowLeading)
+        .padding(.trailing, TVLayout.rowLeading)
+        .padding(.bottom, 58)
+    }
+
+    private func indicatorColor(for dotIndex: Int) -> Color {
+        if dotIndex == index { return AppFocusOutline.color }
+        return isFocused ? AppFocusOutline.color.opacity(0.40) : Color.white.opacity(0.30)
+    }
+
+    private func setIndex(_ newIndex: Int) {
+        withAnimation(.easeInOut(duration: 0.30)) {
+            selectedIndex = newIndex
+        }
+    }
+}
+
 private struct CachedHeroLogo: View {
     let url: String
     let title: String
@@ -3394,6 +3821,321 @@ private struct TVCatalogRow: View {
             .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: landscapeFocusedId)
         }
         .frame(height: stripHeight)
+    }
+}
+
+private enum TVHomeGridLayout {
+    static let columns = 6
+    static let rows = 3
+    static let previewItemCount = columns * rows - 1
+    static let posterWidth: CGFloat = 210
+    static let posterHeight: CGFloat = 315
+    static let itemSpacing: CGFloat = 28
+    static let sectionSpacing: CGFloat = 54
+    static let heroPageLimit = 7
+    static let seeAllID = "__see_all__"
+
+    static var gridColumns: [GridItem] {
+        Array(
+            repeating: GridItem(.fixed(posterWidth), spacing: itemSpacing, alignment: .top),
+            count: columns
+        )
+    }
+
+    static func isWatched(_ item: NuvioMeta, watchedTitleKeys: Set<String>) -> Bool {
+        let type = item.type.lowercased()
+        guard !["series", "tv", "show", "tvshow"].contains(type) else { return false }
+        return watchedTitleKeys.contains("\(type)\u{1f}\(item.id)")
+    }
+}
+
+/// Three-row Home preview used by the Grid View layout. Every catalog keeps its
+/// existing order and title; only its presentation changes to the same 210×315
+/// poster geometry used by Search and Library. The eighteenth cell is reserved
+/// for See All, so each preview remains exactly six columns by three rows.
+private struct TVHomeCatalogGridSection: View {
+    let section: TVHomeSection
+    let watchedTitleKeys: Set<String>
+    let initialFocusCardKey: String?
+    var externalFocus: FocusState<String?>.Binding? = nil
+    var restrictFocusToCardKey: String? = nil
+    let onInitialFocusRequested: () -> Void
+    let onFocus: (NuvioMeta) -> Void
+    let onSelect: (NuvioMeta) -> Void
+    var onLongPress: ((NuvioMeta) -> Void)? = nil
+    let onSeeAllFocus: () -> Void
+    let onSeeAll: () -> Void
+
+    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var previewItems: [NuvioMeta] {
+        Array(section.items.prefix(TVHomeGridLayout.previewItemCount))
+    }
+
+    private var seeAllKey: String {
+        "\(section.id)\u{1}\(TVHomeGridLayout.seeAllID)"
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            Text(section.title)
+                .font(.custom("Inter-Bold", size: 30))
+                .foregroundColor(.white)
+
+            LazyVGrid(
+                columns: TVHomeGridLayout.gridColumns,
+                alignment: .leading,
+                spacing: TVHomeGridLayout.itemSpacing
+            ) {
+                ForEach(previewItems) { item in
+                    let cardKey = "\(section.id)\u{1}\(item.id)"
+                    let shouldRequestInitialFocus = cardKey == initialFocusCardKey
+                    PosterCard(
+                        meta: item,
+                        shouldRequestInitialFocus: shouldRequestInitialFocus,
+                        onInitialFocusRequested: shouldRequestInitialFocus ? onInitialFocusRequested : nil,
+                        onFocus: { onFocus($0) },
+                        externalFocus: externalFocus,
+                        externalFocusValue: cardKey,
+                        onLongPress: onLongPress,
+                        layoutMode: "Modern",
+                        showPosterLabels: posterLabels,
+                        smoothFocusAnimations: smoothFocus,
+                        focusHighlighterEnabled: focusHighlighter,
+                        retainFocusAppearance: restrictFocusToCardKey == cardKey,
+                        isWatched: TVHomeGridLayout.isWatched(item, watchedTitleKeys: watchedTitleKeys)
+                    ) {
+                        onSelect(item)
+                    }
+                    .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
+                }
+
+                TVHomeSeeAllCard(
+                    title: section.title,
+                    externalFocus: externalFocus,
+                    externalFocusValue: seeAllKey,
+                    retainFocusAppearance: restrictFocusToCardKey == seeAllKey,
+                    onFocus: onSeeAllFocus,
+                    action: onSeeAll
+                )
+                .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != seeAllKey)
+            }
+        }
+        .padding(.horizontal, TVLayout.rowLeading)
+    }
+}
+
+private struct TVHomeSeeAllCard: View {
+    let title: String
+    var externalFocus: FocusState<String?>.Binding? = nil
+    let externalFocusValue: String
+    var retainFocusAppearance = false
+    let onFocus: () -> Void
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var showsFocusedAppearance: Bool { isFocused || retainFocusAppearance }
+
+    var body: some View {
+        Button(action: action) {
+            ZStack {
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color.white.opacity(showsFocusedAppearance ? 0.16 : 0.08))
+
+                VStack(spacing: 18) {
+                    Image(systemName: "rectangle.grid.3x2.fill")
+                        .font(.system(size: 48, weight: .medium))
+                    Text(L10n.string("action_see_all", fallback: "See All"))
+                        .font(.system(size: 24, weight: .bold))
+                    Text(title)
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.white.opacity(0.58))
+                        .lineLimit(2)
+                        .multilineTextAlignment(.center)
+                        .padding(.horizontal, 12)
+                }
+                .foregroundColor(.white)
+            }
+            .frame(width: TVHomeGridLayout.posterWidth, height: TVHomeGridLayout.posterHeight)
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(
+                        showsFocusedAppearance ? AppFocusOutline.color : Color.white.opacity(0.12),
+                        lineWidth: showsFocusedAppearance
+                            ? (focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
+                            : 1
+                    )
+            )
+            .scaleEffect(showsFocusedAppearance ? 1.06 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue))
+        .focusEffectDisabledIfAvailable()
+        .onChange(of: isFocused) { focused in
+            if focused { onFocus() }
+        }
+        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
+    }
+}
+
+/// Full catalog reached from a Home grid's See All tile. It starts with the
+/// already-loaded Home items and continues through pending/network pages as the
+/// viewer approaches the end, avoiding a duplicate first-page request.
+private struct TVHomeCatalogBrowseView: View {
+    let section: TVHomeSection
+    let repository: CatalogRepository
+    let watchedTitleKeys: Set<String>
+    let onDismiss: () -> Void
+    let onSelect: (NuvioMeta) -> Void
+    var onLongPress: ((NuvioMeta) -> Void)? = nil
+
+    @State private var items: [NuvioMeta]
+    @State private var pendingItems: [NuvioMeta]
+    @State private var nextSkip: Int
+    @State private var hasMore: Bool
+    @State private var isLoadingMore = false
+    @FocusState private var focusedItemID: String?
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    init(
+        section: TVHomeSection,
+        repository: CatalogRepository,
+        watchedTitleKeys: Set<String>,
+        onDismiss: @escaping () -> Void,
+        onSelect: @escaping (NuvioMeta) -> Void,
+        onLongPress: ((NuvioMeta) -> Void)?
+    ) {
+        self.section = section
+        self.repository = repository
+        self.watchedTitleKeys = watchedTitleKeys
+        self.onDismiss = onDismiss
+        self.onSelect = onSelect
+        self.onLongPress = onLongPress
+        _items = State(initialValue: section.items)
+        _pendingItems = State(initialValue: section.pendingItems)
+        _nextSkip = State(initialValue: section.nextSkip ?? section.items.count)
+        _hasMore = State(initialValue: section.hasMore || !section.pendingItems.isEmpty)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text(section.title)
+                        .font(.system(size: 42, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                    Text("1 catalog")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.55))
+                }
+                .padding(.horizontal, 60)
+                .padding(.top, 48)
+
+                ScrollView(.vertical) {
+                    LazyVGrid(
+                        columns: [GridItem(
+                            .adaptive(
+                                minimum: CollectionFolderGridMetrics.posterWidth,
+                                maximum: CollectionFolderGridMetrics.posterWidth
+                            ),
+                            spacing: CollectionFolderGridMetrics.posterGap,
+                            alignment: .top
+                        )],
+                        alignment: .leading,
+                        spacing: CollectionFolderGridMetrics.posterGap
+                    ) {
+                        ForEach(items) { item in
+                            CollectionFolderResultCard(
+                                meta: item,
+                                externalFocus: $focusedItemID
+                            ) {
+                                onSelect(item)
+                            }
+                            .onAppear {
+                                loadMoreIfNeeded(currentItem: item)
+                            }
+                        }
+
+                        if isLoadingMore {
+                            ProgressView()
+                                .tint(.white)
+                                .scaleEffect(1.25)
+                                .frame(
+                                    width: CollectionFolderGridMetrics.posterWidth,
+                                    height: CollectionFolderGridMetrics.posterHeight
+                                )
+                        }
+                    }
+                    .padding(.top, 16)
+                    .padding(.horizontal, 60)
+
+                    Color.clear.frame(height: 60)
+                }
+                .scrollIndicators(.hidden)
+                .focusSection()
+                .defaultFocusIfAvailable($focusedItemID, items.first?.id)
+            }
+        }
+        .onExitCommand(perform: onDismiss)
+    }
+
+    @MainActor
+    private func loadMoreIfNeeded(currentItem: NuvioMeta) {
+        guard hasMore,
+              !isLoadingMore,
+              let index = items.firstIndex(where: { $0.id == currentItem.id }),
+              index >= max(items.count - TVHomeRowPrefetchThreshold, 0) else { return }
+
+        if !pendingItems.isEmpty {
+            let batchCount = min(18, pendingItems.count)
+            let batch = Array(pendingItems.prefix(batchCount))
+            let existingIDs = Set(items.map(\.id))
+            items.append(contentsOf: batch.filter { !existingIDs.contains($0.id) })
+            pendingItems.removeFirst(batchCount)
+            hasMore = !pendingItems.isEmpty || (section.contentType != nil && section.catalogId != nil)
+            return
+        }
+
+        guard let contentType = section.contentType,
+              let catalogId = section.catalogId else {
+            hasMore = false
+            return
+        }
+
+        isLoadingMore = true
+        let requestedSkip = nextSkip
+        Task { @MainActor in
+            defer { isLoadingMore = false }
+            do {
+                let page = try await repository.browseCatalog(
+                    addonId: section.addonId,
+                    contentType: contentType,
+                    catalogId: catalogId,
+                    skip: requestedSkip,
+                    genre: section.catalogGenre
+                )
+                let existingIDs = Set(items.map(\.id))
+                let newItems = page.items.filter { !existingIDs.contains($0.id) }
+                items.append(contentsOf: newItems)
+                nextSkip = page.nextSkip ?? (requestedSkip + page.items.count)
+                hasMore = page.hasMore && !newItems.isEmpty
+            } catch {
+                hasMore = false
+            }
+        }
     }
 }
 

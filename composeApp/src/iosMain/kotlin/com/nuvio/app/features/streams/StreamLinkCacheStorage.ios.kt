@@ -1,17 +1,17 @@
 package com.nuvio.app.features.streams
 
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
-import platform.Foundation.NSUserDefaults
 
 actual object StreamLinkCacheStorage {
     actual fun loadEntry(hashedKey: String): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(hashedKey))
+        AppleFileStringStorage.load(ProfileScopedKey.of(hashedKey))
 
     actual fun saveEntry(hashedKey: String, payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(hashedKey))
+        AppleFileStringStorage.save(ProfileScopedKey.of(hashedKey), payload)
     }
 
     actual fun removeEntry(hashedKey: String) {
-        NSUserDefaults.standardUserDefaults.removeObjectForKey(ProfileScopedKey.of(hashedKey))
+        AppleFileStringStorage.remove(ProfileScopedKey.of(hashedKey))
     }
 }

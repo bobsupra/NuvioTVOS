@@ -1,29 +1,23 @@
 package com.nuvio.app.features.plugins
 
-import platform.Foundation.NSUserDefaults
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import platform.Foundation.timeIntervalSince1970
 
 internal object PluginStorage {
     private const val pluginsStateKey = "plugins_state"
 
     fun loadState(profileId: Int): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey("${pluginsStateKey}_$profileId")
+        AppleFileStringStorage.load("${pluginsStateKey}_$profileId")
 
     fun saveState(profileId: Int, payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(
-            payload,
-            forKey = "${pluginsStateKey}_$profileId",
-        )
+        AppleFileStringStorage.save("${pluginsStateKey}_$profileId", payload)
     }
 
     fun loadScraperSettings(scraperId: String): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey("settings_${scraperId}")
+        AppleFileStringStorage.load("settings_${scraperId}")
 
     fun saveScraperSettings(scraperId: String, payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(
-            payload,
-            forKey = "settings_${scraperId}",
-        )
+        AppleFileStringStorage.save("settings_${scraperId}", payload)
     }
 }
 

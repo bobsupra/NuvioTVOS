@@ -1,15 +1,15 @@
 package com.nuvio.app.features.trakt
 
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import com.nuvio.app.core.storage.ProfileScopedKey
-import platform.Foundation.NSUserDefaults
 
 internal actual object TraktLibraryStorage {
     private const val payloadKey = "trakt_library_payload"
 
     actual fun loadPayload(): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey(ProfileScopedKey.of(payloadKey))
+        AppleFileStringStorage.load(ProfileScopedKey.of(payloadKey))
 
     actual fun savePayload(payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = ProfileScopedKey.of(payloadKey))
+        AppleFileStringStorage.save(ProfileScopedKey.of(payloadKey), payload)
     }
 }

@@ -1,16 +1,16 @@
 package com.nuvio.app.features.watchprogress
 
-import platform.Foundation.NSUserDefaults
+import com.nuvio.app.core.storage.AppleFileStringStorage
 
 actual object ContinueWatchingEnrichmentStorage {
     actual fun loadPayload(key: String): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey(key)
+        AppleFileStringStorage.load(key)
 
     actual fun savePayload(key: String, payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = key)
+        AppleFileStringStorage.save(key, payload)
     }
 
     actual fun removePayload(key: String) {
-        NSUserDefaults.standardUserDefaults.removeObjectForKey(key)
+        AppleFileStringStorage.remove(key)
     }
 }

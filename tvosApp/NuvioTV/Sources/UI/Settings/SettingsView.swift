@@ -2,7 +2,11 @@ import SwiftUI
 import UIKit
 
 enum AppFocusOutline {
-    static let color = Color.white
+    static var color: Color {
+        let theme = ProfileSettings.current.string(forKey: SettingsKey.theme)
+            ?? SettingsAccent.white.rawValue
+        return SettingsAccent.color(for: theme)
+    }
     static let width: CGFloat = 4
     static let emphasizedWidth: CGFloat = 6
 }
@@ -134,6 +138,9 @@ enum SettingsKey {
     /// reorder) so a pull never disturbs the built-in rows or a local reorder.
     static let homeCatalogSyncedOrder = "nuvio.tv.settings.layout.homeCatalogSyncedOrder"
     static let heroEnabled = "nuvio.tv.settings.layout.heroEnabled"
+    /// JSON `[String]` of Home section ids selected as Grid View hero sources.
+    /// Empty means all available catalog rows.
+    static let heroCatalogs = "nuvio.tv.settings.layout.heroCatalogs"
     static let posterLabels = "nuvio.tv.settings.layout.posterLabels"
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
     static let discoverLocation = "nuvio.tv.settings.layout.discoverLocation"
@@ -199,7 +206,7 @@ enum SettingsKey {
     static let all = [
         profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, heroEnabled, posterLabels, catalogAddonNames, discoverLocation,
+        homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
         continueWatchingSort, showUnairedNextUp, hideUnreleased, showFullDates,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
@@ -550,7 +557,7 @@ enum SettingsBackground: String, CaseIterable, Identifiable {
 
     var color: Color {
         switch self {
-        case .charcoal: return Color(red: 0.015, green: 0.015, blue: 0.018)
+        case .charcoal: return Color(red: 13.0 / 255.0, green: 13.0 / 255.0, blue: 13.0 / 255.0)
         case .black: return .black
         case .midnight: return Color(red: 0.020, green: 0.030, blue: 0.065)
         case .forest: return Color(red: 0.018, green: 0.048, blue: 0.036)
@@ -1657,6 +1664,7 @@ private struct LayoutDiscoverySettingsView: View {
 
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
+    @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
@@ -1665,8 +1673,8 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
 
-    /// Classic was never a distinct layout (behaved like Modern); keep Modern/Compact only.
-    private let layouts = ["Modern", "Compact"]
+    /// Classic was never a distinct layout (behaved like Modern).
+    private let layouts = ["Modern", "Compact", "Grid View"]
     private let discoverLocations = ["Search", "Home", "Library", "Off"]
     private let continueWatchingSorts = ["Default", "Recently watched", "Release order", "Next up"]
 
@@ -1683,7 +1691,7 @@ private struct LayoutDiscoverySettingsView: View {
                     title: L10n.string("tvos_layout_layout", fallback: "Layout"),
                     subtitle: L10n.string(
                         "tvos_layout_layout_subtitle",
-                        fallback: "Modern uses larger posters; Compact tightens row and hero sizing"
+                        fallback: "Modern and Compact use rows; Grid View shows each catalog in a 6 by 3 poster grid"
                     ),
                     selection: $homeLayout,
                     options: layouts,
@@ -1703,6 +1711,14 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $heroEnabled,
                     accentColor: accentColor
                 )
+
+                if homeLayout == "Grid View" {
+                    HeroCatalogSelectionRow(
+                        selectionData: $heroCatalogsData,
+                        accentColor: accentColor
+                    )
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                }
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_poster_labels", fallback: "Poster Labels"),
@@ -1797,6 +1813,88 @@ private struct LayoutDiscoverySettingsView: View {
                     accentColor: accentColor
                 )
             }
+        }
+    }
+}
+
+/// Grid View-only multi-select for choosing which Home catalogs feed the hero
+/// carousel. An empty saved selection represents the default "all catalogs".
+private struct HeroCatalogSelectionRow: View {
+    @Binding var selectionData: Data
+    let accentColor: Color
+    @State private var catalogs: [(id: String, title: String)] = []
+
+    private var explicitlySelected: Set<String> {
+        guard let ids = try? JSONDecoder().decode([String].self, from: selectionData) else { return [] }
+        return Set(ids)
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(L10n.string("layout_hero_catalogs", fallback: "Hero Catalogs"))
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(.white)
+                Text(L10n.string(
+                    "layout_hero_catalogs_sub",
+                    fallback: "Select one or more catalogs for hero content."
+                ))
+                .font(.system(size: 18, weight: .medium))
+                .foregroundColor(.white.opacity(0.56))
+            }
+
+            if catalogs.isEmpty {
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_no_rows_recorded_yet", fallback: "No catalogs recorded yet"),
+                    value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
+                )
+            } else {
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 14) {
+                        ForEach(catalogs, id: \.id) { catalog in
+                            CollectionChipButton(
+                                title: catalog.title,
+                                isSelected: isSelected(catalog.id)
+                            ) {
+                                toggle(catalog.id)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 6)
+                }
+                .focusSection()
+            }
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
+        .animation(.easeInOut(duration: 0.2), value: selectionData)
+        .onAppear { loadCatalogs() }
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
+            loadCatalogs()
+        }
+    }
+
+    private func isSelected(_ id: String) -> Bool {
+        explicitlySelected.isEmpty || explicitlySelected.contains(id)
+    }
+
+    private func toggle(_ id: String) {
+        var selected = explicitlySelected
+        if selected.isEmpty { selected = Set(catalogs.map(\.id)) }
+        if selected.contains(id) {
+            guard selected.count > 1 else { return }
+            selected.remove(id)
+        } else {
+            selected.insert(id)
+        }
+        selectionData = (try? JSONEncoder().encode(catalogs.map(\.id).filter(selected.contains))) ?? Data()
+    }
+
+    private func loadCatalogs() {
+        catalogs = TVHomeCatalogOrder.snapshotRows().filter {
+            $0.id != TVHomeSection.continueWatchingId
+                && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
         }
     }
 }

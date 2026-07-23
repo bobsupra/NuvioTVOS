@@ -218,6 +218,31 @@ final class WatchedIdentityPolicyTests: XCTestCase {
         XCTAssertTrue(WatchedStore.isRepresentedByTraktSnapshot(movie))
     }
 
+    func testLargeHistoryMergeCompletesWithinWatchdogBudget() {
+        let baseDate = Date(timeIntervalSince1970: 1_700_000_000)
+        var items = (0..<10_000).map { index in
+            WatchedStoreItem(
+                meta: makeMeta(id: "tmdb:\(index)", imdbId: nil, tmdbId: index, type: "movie"),
+                watchedAt: baseDate.addingTimeInterval(Double(index))
+            )
+        }
+        let replacementDate = baseDate.addingTimeInterval(20_000)
+        items.append(
+            WatchedStoreItem(
+                meta: makeMeta(id: "tt0133093", imdbId: "tt0133093", tmdbId: 603, type: "movie"),
+                watchedAt: replacementDate
+            )
+        )
+
+        let startedAt = Date()
+        let merged = WatchedStore.mergedByIdentity(items)
+        let elapsed = Date().timeIntervalSince(startedAt)
+
+        XCTAssertEqual(merged.count, 10_000)
+        XCTAssertEqual(merged.first?.watchedAt, replacementDate)
+        XCTAssertLessThan(elapsed, 5, "History merge must stay below tvOS's 10-second watchdog window")
+    }
+
     private func makeMeta(
         id: String,
         imdbId: String?,

@@ -1,5 +1,6 @@
 package com.nuvio.app.core.network
 
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
@@ -8,16 +9,15 @@ import io.ktor.client.request.get
 import io.ktor.client.statement.bodyAsText
 import io.ktor.http.ContentType
 import io.ktor.http.isSuccess
-import platform.Foundation.NSUserDefaults
 
 internal actual object SyncBackendStorage {
     private const val KEY_SELECTION_PAYLOAD = "nuvio_sync_backend_selection_payload_v1"
 
     actual fun loadSelectionPayload(): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey(KEY_SELECTION_PAYLOAD)
+        AppleFileStringStorage.load(KEY_SELECTION_PAYLOAD)
 
     actual fun saveSelectionPayload(payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = KEY_SELECTION_PAYLOAD)
+        AppleFileStringStorage.save(KEY_SELECTION_PAYLOAD, payload)
     }
 }
 

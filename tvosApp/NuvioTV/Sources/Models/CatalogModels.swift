@@ -1001,20 +1001,30 @@ enum ContinueWatchingStore {
     /// wins by timestamp and remains visible.
     static func removeWatched(_ watchedItems: [WatchedStoreItem]) {
         guard !watchedItems.isEmpty else { return }
+        let newestWatchedByIdentity = WatchedStore.newestWatchedDatesByIdentity(watchedItems)
         removeEpisodeResumePoints(watchedItems: watchedItems)
         let current = items()
         let remaining = current.filter { progress in
-            !watchedItems.contains { watched in
-                guard WatchedStore.sameContent(watched.meta, progress.meta),
-                      watched.watchedAt >= progress.lastWatchedAt else {
-                    return false
-                }
-                if progress.meta.isSeries {
-                    guard let progressEpisode = progress.episodeNumbers else { return false }
-                    return watched.season == progressEpisode.season
-                        && watched.episode == progressEpisode.episode
-                }
-                return watched.season == nil && watched.episode == nil
+            let season: Int?
+            let episode: Int?
+            if progress.meta.isSeries {
+                guard let progressEpisode = progress.episodeNumbers else { return true }
+                season = progressEpisode.season
+                episode = progressEpisode.episode
+            } else {
+                season = nil
+                episode = nil
+            }
+            let keys = WatchedStore.watchedIdentityKeys(
+                metaId: progress.meta.id,
+                imdbId: progress.meta.imdbId,
+                tmdbId: progress.meta.tmdbId,
+                contentType: progress.meta.type,
+                season: season,
+                episode: episode
+            )
+            return !keys.contains {
+                newestWatchedByIdentity[$0].map { $0 >= progress.lastWatchedAt } ?? false
             }
         }
         guard remaining.count != current.count else { return }
@@ -1135,12 +1145,19 @@ enum ContinueWatchingStore {
     }
 
     private static func removeEpisodeResumePoints(watchedItems: [WatchedStoreItem]) {
+        let newestWatchedByIdentity = WatchedStore.newestWatchedDatesByIdentity(watchedItems)
         let current = episodeResumePoints()
         let remaining = current.filter { point in
-            !watchedItems.contains { watched in
-                guard let season = watched.season, let episode = watched.episode,
-                      watched.watchedAt >= point.updatedAt else { return false }
-                return resumePoint(point, matches: watched.meta, season: season, episode: episode, episodeId: nil)
+            let keys = WatchedStore.watchedIdentityKeys(
+                metaId: point.metaId,
+                imdbId: point.imdbId,
+                tmdbId: point.tmdbId,
+                contentType: "series",
+                season: point.season,
+                episode: point.episode
+            )
+            return !keys.contains {
+                newestWatchedByIdentity[$0].map { $0 >= point.updatedAt } ?? false
             }
         }
         guard remaining.count != current.count,
@@ -2382,17 +2399,7 @@ enum WatchedStore {
             !stillBlocking.contains { tombstoneMatches($0, item: item) }
         }
 
-        var merged: [WatchedStoreItem] = []
-        (items() + accepted).forEach { item in
-            if let index = merged.firstIndex(where: { sameWatchedIdentity($0, item) }) {
-                if item.watchedAt > merged[index].watchedAt {
-                    merged[index] = item
-                }
-            } else {
-                merged.append(item)
-            }
-        }
-        merged.sort { $0.watchedAt > $1.watchedAt }
+        let merged = mergedByIdentity(items() + accepted)
         guard persist(merged) else { return false }
         ContinueWatchingStore.removeWatched(merged)
         return true
@@ -2445,9 +2452,82 @@ enum WatchedStore {
         return !traktIdentityKeys(item).isEmpty
     }
 
-    private static func sameWatchedIdentity(_ lhs: WatchedStoreItem, _ rhs: WatchedStoreItem) -> Bool {
-        sameContent(lhs.meta, rhs.meta) && lhs.season == rhs.season && lhs.episode == rhs.episode
+    /// Deduplicates a watched snapshot in one indexed pass. The previous
+    /// implementation scanned every accumulated row for every incoming row,
+    /// which made a large Trakt history quadratic and could block tvOS's main
+    /// thread long enough to trigger the scene-update watchdog.
+    static func mergedByIdentity(_ items: [WatchedStoreItem]) -> [WatchedStoreItem] {
+        var merged: [WatchedStoreItem] = []
+        merged.reserveCapacity(items.count)
+        var indexByIdentity: [String: Int] = [:]
+        indexByIdentity.reserveCapacity(items.count)
+
+        for item in items {
+            let identityKeys = watchedIdentityKeys(item)
+            let existingIndex = identityKeys.compactMap { indexByIdentity[$0] }.min()
+
+            if let existingIndex {
+                if item.watchedAt > merged[existingIndex].watchedAt {
+                    merged[existingIndex] = item
+                }
+                // Retain every alias learned for this content so a later row
+                // can match by IMDb, TMDB, or catalog id without another scan.
+                for key in identityKeys {
+                    indexByIdentity[key] = min(indexByIdentity[key] ?? existingIndex, existingIndex)
+                }
+            } else {
+                let index = merged.count
+                merged.append(item)
+                for key in identityKeys {
+                    indexByIdentity[key] = index
+                }
+            }
+        }
+
+        return merged.sorted { $0.watchedAt > $1.watchedAt }
     }
+
+    static func newestWatchedDatesByIdentity(_ items: [WatchedStoreItem]) -> [String: Date] {
+        var newestByIdentity: [String: Date] = [:]
+        newestByIdentity.reserveCapacity(items.count)
+        for item in items {
+            for key in watchedIdentityKeys(item) {
+                if item.watchedAt > (newestByIdentity[key] ?? .distantPast) {
+                    newestByIdentity[key] = item.watchedAt
+                }
+            }
+        }
+        return newestByIdentity
+    }
+
+    private static func watchedIdentityKeys(_ item: WatchedStoreItem) -> Set<String> {
+        watchedIdentityKeys(
+            metaId: item.meta.id,
+            imdbId: item.meta.imdbId,
+            tmdbId: item.meta.tmdbId,
+            contentType: item.meta.type,
+            season: item.season,
+            episode: item.episode
+        )
+    }
+
+    static func watchedIdentityKeys(
+        metaId: String,
+        imdbId: String?,
+        tmdbId: Int?,
+        contentType: String,
+        season: Int?,
+        episode: Int?
+    ) -> Set<String> {
+        let type = normalizedType(contentType)
+        let season = season.map(String.init) ?? "-"
+        let episode = episode.map(String.init) ?? "-"
+        return Set(contentIdentityKeys(metaId: metaId, imdbId: imdbId, tmdbId: tmdbId).map {
+            "\(type)|\($0)|\(season)|\(episode)"
+        })
+    }
+
+    private static let identityTrimmingCharacters = CharacterSet.whitespacesAndNewlines
 
     private static func contentIdentityKeys(for meta: NuvioMeta) -> Set<String> {
         contentIdentityKeys(metaId: meta.id, imdbId: meta.imdbId, tmdbId: meta.tmdbId)
@@ -2459,7 +2539,7 @@ enum WatchedStore {
         tmdbId: Int?
     ) -> Set<String> {
         var keys: Set<String> = []
-        let rawID = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let rawID = metaId.trimmingCharacters(in: identityTrimmingCharacters).lowercased()
         if !rawID.isEmpty {
             if rawID.hasPrefix("tt") {
                 keys.insert("imdb:\(rawID)")
@@ -2469,7 +2549,7 @@ enum WatchedStore {
                 keys.insert("id:\(rawID)")
             }
         }
-        if let imdb = imdbId?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+        if let imdb = imdbId?.trimmingCharacters(in: identityTrimmingCharacters).lowercased(),
            !imdb.isEmpty {
             keys.insert("imdb:\(imdb)")
         }

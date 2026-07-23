@@ -13,6 +13,11 @@ protocol CatalogRepository {
     /// Get catalogs for home screen
     func getHomeCatalogs() async throws -> [NuvioCatalog]
 
+    /// Progressive Home variant: yields the accumulated catalog list whenever
+    /// another provider row becomes available. Repositories that only support
+    /// batch loading fall back to one yield from `getHomeCatalogs()`.
+    func homeCatalogsProgressively() -> AsyncThrowingStream<[NuvioCatalog], Error>
+
     /// True when the latest Home request returned usable rows but one or more
     /// expected sources failed. Home uses this to replace a partial cache once.
     var homeCatalogLoadWasPartial: Bool { get }
@@ -84,6 +89,23 @@ protocol CatalogRepository {
 extension CatalogRepository {
     var homeCatalogLoadWasPartial: Bool { false }
 
+    func homeCatalogsProgressively() -> AsyncThrowingStream<[NuvioCatalog], Error> {
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                do {
+                    let catalogs = try await getHomeCatalogs()
+                    if !Task.isCancelled {
+                        continuation.yield(catalogs)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func browseCatalog(
         addonId: String?,
         contentType: String,
@@ -149,6 +171,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
     private(set) var homeCatalogLoadWasPartial = false
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
+    private let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
     private var cachedMetaById: [String: NuvioMeta] = [:]
     private let builtInSubtitleAddons = [
         StremioSubtitleAddon(
@@ -164,7 +187,58 @@ final class CinemetaCatalogRepository: CatalogRepository {
         "Talk-Show", "Game-Show"
     ]
 
+    private func cachedMetadata(for id: String) -> NuvioMeta? {
+        metadataCacheQueue.sync { cachedMetaById[id] }
+    }
+
+    private func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
+        metadataCacheQueue.sync {
+            if let requestedID {
+                cachedMetaById[requestedID] = meta
+            }
+            cachedMetaById[meta.id] = meta
+        }
+    }
+
+    private func cacheMetadata(_ items: [NuvioMeta]) {
+        metadataCacheQueue.sync {
+            for item in items {
+                cachedMetaById[item.id] = item
+            }
+        }
+    }
+
+    private func removeCachedMetadata(for id: String) {
+        metadataCacheQueue.sync {
+            _ = cachedMetaById.removeValue(forKey: id)
+        }
+    }
+
     func getHomeCatalogs() async throws -> [NuvioCatalog] {
+        try await loadHomeCatalogs()
+    }
+
+    func homeCatalogsProgressively() -> AsyncThrowingStream<[NuvioCatalog], Error> {
+        AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
+            let task = Task {
+                do {
+                    _ = try await self.loadHomeCatalogs { catalogs in
+                        guard !Task.isCancelled else { return }
+                        continuation.yield(catalogs)
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
+    private func loadHomeCatalogs(
+        onUpdate: (([NuvioCatalog]) -> Void)? = nil
+    ) async throws -> [NuvioCatalog] {
+        homeCatalogLoadWasPartial = false
         let specs: [(id: String, name: String, type: String, catalogId: String)] = [
             ("movie_top", "Popular - Movies", "movie", "top"),
             ("series_top", "Popular - Series", "series", "top"),
@@ -195,6 +269,33 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
         try Task.checkCancellation()
 
+        func builtInCatalogs() -> [NuvioCatalog] {
+            var result: [NuvioCatalog] = []
+            for (index, spec) in specs.enumerated() {
+                guard let page = pages[index] else { continue }
+                cacheMetadata(page)
+                result.append(
+                    NuvioCatalog(
+                        id: spec.id,
+                        name: spec.name,
+                        description: spec.name,
+                        itemIds: page.map(\.id),
+                        items: page,
+                        contentType: spec.type,
+                        catalogId: spec.catalogId
+                    )
+                )
+            }
+            return result
+        }
+
+        // Publish the base rows now. Add-on catalogs can be slow or numerous;
+        // they must not hold already-loaded rows off Home.
+        var catalogs = builtInCatalogs()
+        if !catalogs.isEmpty {
+            onUpdate?(catalogs)
+        }
+
         // Retry only missing rows once after a short backoff. Successful rows
         // remain usable and are never discarded because a sibling host request
         // failed.
@@ -223,22 +324,20 @@ final class CinemetaCatalogRepository: CatalogRepository {
             try Task.checkCancellation()
         }
 
-        var catalogs: [NuvioCatalog] = []
-        for (index, spec) in specs.enumerated() {
-            guard let page = pages[index] else { continue }
-            page.forEach { cachedMetaById[$0.id] = $0 }
-            catalogs.append(
-                NuvioCatalog(
-                    id: spec.id,
-                    name: spec.name,
-                    description: spec.name,
-                    itemIds: page.map(\.id),
-                    contentType: spec.type,
-                    catalogId: spec.catalogId
-                )
-            )
+        let retriedBuiltIns = builtInCatalogs()
+        if retriedBuiltIns.count != catalogs.count {
+            catalogs = retriedBuiltIns
+            onUpdate?(catalogs)
         }
-        let addonResult = await addonHomeCatalogs()
+
+        // Each successful add-on row is appended and published immediately.
+        // A failed sibling no longer prevents later catalogs from appearing.
+        var progressiveAddonCatalogs: [NuvioCatalog] = []
+        let addonResult = await addonHomeCatalogs { [weak self] catalog in
+            guard let self else { return }
+            progressiveAddonCatalogs.append(catalog)
+            onUpdate?(catalogs + self.orderedAddonCatalogs(progressiveAddonCatalogs))
+        }
         try Task.checkCancellation()
         catalogs.append(contentsOf: addonResult.catalogs)
         homeCatalogLoadWasPartial = pages.contains(where: { $0 == nil }) || addonResult.hadFailures
@@ -251,11 +350,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// custom catalogs — Marvel, actors, lists — that belong on Home. Search-
     /// only catalogs and ones needing unsupported extras are skipped; a
     /// required genre is satisfied with the catalog's first declared option.
-    private func addonHomeCatalogs() async -> (catalogs: [NuvioCatalog], hadFailures: Bool) {
+    private func addonHomeCatalogs(
+        onCatalogLoaded: ((NuvioCatalog) -> Void)? = nil
+    ) async -> (catalogs: [NuvioCatalog], hadFailures: Bool) {
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
-        let maxRows = 24
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
@@ -263,7 +363,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
             guard !Task.isCancelled else { break }
-            guard catalogs.count < maxRows else { break }
             guard let manifest = await manifest(for: manifestURL) else {
                 guard !Task.isCancelled else { break }
                 hadFailures = true
@@ -273,7 +372,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
             guard manifest.id != Self.cinemetaAddonId else { continue }
 
             let base = manifestURL.deletingLastPathComponent()
-            let remaining = maxRows - catalogs.count
             let eligible = (manifest.catalogs ?? []).filter { catalog in
                 guard catalog.eligibleForHome else { return false }
                 guard !disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") else {
@@ -282,14 +380,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 return !catalog.requiresGenre || catalog.firstGenreOption != nil
             }
 
-            // BetterPosters rejects/limits a burst of all 13 catalog requests
-            // on some Apple TV networks. Its proven path is ordered serial
-            // fetching (the same behavior triggered by disabling/re-enabling
-            // the add-on). Continue Watching remains visible during this work.
-            var loadedForManifest = 0
-            var failedForManifest = 0
-            for catalog in eligible.prefix(remaining) {
-                guard !Task.isCancelled else { break }
+            func load(_ catalog: AddonManifestCatalog) async -> NuvioCatalog? {
                 do {
                     var path = "catalog/\(catalog.type)/\(catalog.id)"
                     let catalogGenre = catalog.requiresGenre ? catalog.firstGenreOption : nil
@@ -302,54 +393,80 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         base.appendingPathComponent(path)
                     )
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
-                    guard !items.isEmpty else {
-                        hadFailures = true
-                        failedForManifest += 1
-                        continue
-                    }
+                    guard !items.isEmpty else { return nil }
                     let catalogName = catalog.name ?? catalog.id
-                    catalogs.append(
-                        NuvioCatalog(
-                            id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
-                            name: catalogName,
-                            description: catalogName,
-                            itemIds: items.map(\.id),
-                            items: items,
-                            contentType: catalog.type,
-                            catalogId: catalog.id,
-                            addonId: manifest.id,
-                            catalogGenre: catalogGenre
-                        )
+                    return NuvioCatalog(
+                        id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
+                        name: catalogName,
+                        description: catalogName,
+                        itemIds: items.map(\.id),
+                        items: items,
+                        contentType: catalog.type,
+                        catalogId: catalog.id,
+                        addonId: manifest.id,
+                        catalogGenre: catalogGenre
                     )
-                    loadedForManifest += 1
                 } catch {
-                    guard !Task.isCancelled else { break }
-                    hadFailures = true
-                    failedForManifest += 1
+                    return nil
                 }
             }
-            reports.append("\(manifest.id): \(loadedForManifest)/\(eligible.prefix(remaining).count), failed \(failedForManifest)")
+
+            // BetterPosters rejects/limits a burst of all 13 catalog requests
+            // on some Apple TV networks, so keep requests ordered and serial.
+            // Publish each success, then retry only this manifest's missing rows.
+            var loadedForManifest = 0
+            var missingForManifest: [AddonManifestCatalog] = []
+            for catalog in eligible {
+                guard !Task.isCancelled else { break }
+                if let loaded = await load(catalog) {
+                    catalogs.append(loaded)
+                    loadedForManifest += 1
+                    onCatalogLoaded?(loaded)
+                } else if !Task.isCancelled {
+                    missingForManifest.append(catalog)
+                }
+            }
+
+            if !missingForManifest.isEmpty, !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 600_000_000)
+                var stillMissing: [AddonManifestCatalog] = []
+                for catalog in missingForManifest {
+                    guard !Task.isCancelled else { break }
+                    if let loaded = await load(catalog) {
+                        catalogs.append(loaded)
+                        loadedForManifest += 1
+                        onCatalogLoaded?(loaded)
+                    } else if !Task.isCancelled {
+                        stillMissing.append(catalog)
+                    }
+                }
+                missingForManifest = stillMissing
+            }
+
+            hadFailures = hadFailures || !missingForManifest.isEmpty
+            reports.append("\(manifest.id): \(loadedForManifest)/\(eligible.count), failed \(missingForManifest.count)")
         }
 
         Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
+        return (orderedAddonCatalogs(catalogs), hadFailures)
+    }
 
+    private func orderedAddonCatalogs(_ catalogs: [NuvioCatalog]) -> [NuvioCatalog] {
         // Order the add-on rows to match the account's Home layout. Rows the
         // account hasn't placed keep their natural (manifest) order, after the
         // placed ones — mirroring the phone/Google-TV apps.
         let orderIndex = TVHomeCatalogOrder.syncedCatalogOrderIndex()
-        if !orderIndex.isEmpty {
-            catalogs = catalogs
-                .enumerated()
-                .sorted { lhs, rhs in
-                    let lKey = Self.accountCatalogKey(fromCatalogId: lhs.element.id)
-                    let rKey = Self.accountCatalogKey(fromCatalogId: rhs.element.id)
-                    let lRank = orderIndex[lKey] ?? Int.max
-                    let rRank = orderIndex[rKey] ?? Int.max
-                    return lRank != rRank ? lRank < rRank : lhs.offset < rhs.offset
-                }
-                .map(\.element)
-        }
-        return (catalogs, hadFailures)
+        guard !orderIndex.isEmpty else { return catalogs }
+        return catalogs
+            .enumerated()
+            .sorted { lhs, rhs in
+                let lKey = Self.accountCatalogKey(fromCatalogId: lhs.element.id)
+                let rKey = Self.accountCatalogKey(fromCatalogId: rhs.element.id)
+                let lRank = orderIndex[lKey] ?? Int.max
+                let rRank = orderIndex[rKey] ?? Int.max
+                return lRank != rRank ? lRank < rRank : lhs.offset < rhs.offset
+            }
+            .map(\.element)
     }
 
     /// Maps an add-on catalog's tvOS id (`addon_<addonId>_<type>_<catalogId>`)
@@ -360,7 +477,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func getMetadata(id: String, type: String) async throws -> NuvioMeta {
-        if let cached = cachedMetaById[id] {
+        if let cached = cachedMetadata(for: id) {
             return cached
         }
 
@@ -368,7 +485,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
-        cachedMetaById.removeValue(forKey: id)
+        removeCachedMetadata(for: id)
         return try await loadMetadata(id: id, type: type)
     }
 
@@ -395,8 +512,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 let url = baseURL.appendingPathComponent("meta/\(metaType)/\(resolvedId).json")
                 let response: CinemetaMetaResponse = try await fetch(url)
                 let meta = response.meta.toMeta(fallbackType: metaType)
-                cachedMetaById[id] = meta
-                cachedMetaById[meta.id] = meta
+                cacheMetadata(meta, requestedID: id)
                 return meta
             } catch {
                 lastError = error
@@ -409,8 +525,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 let meta = response.meta.toMeta(fallbackType: metaType)
                 // Cache under the requested id too in case the addon
                 // canonicalizes to a different id space.
-                cachedMetaById[id] = meta
-                cachedMetaById[meta.id] = meta
+                cacheMetadata(meta, requestedID: id)
                 return meta
             } catch {
                 if lastError == nil { lastError = error }
@@ -733,7 +848,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         async let movies = fetchCatalog(type: "movie", catalogId: "top", skip: nil, search: query, genre: nil)
         async let series = fetchCatalog(type: "series", catalogId: "top", skip: nil, search: query, genre: nil)
         let results = try await movies + series
-        results.forEach { cachedMetaById[$0.id] = $0 }
+        cacheMetadata(results)
         return results
     }
 
@@ -754,7 +869,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             search: nil,
             genre: genre
         )
-        items.forEach { cachedMetaById[$0.id] = $0 }
+        cacheMetadata(items)
         return CatalogPage(
             items: items,
             hasMore: !items.isEmpty,
@@ -788,7 +903,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             search: nil,
             genre: genre
         )
-        items.forEach { cachedMetaById[$0.id] = $0 }
+        cacheMetadata(items)
         return CatalogPage(
             items: items,
             hasMore: !items.isEmpty,
@@ -810,7 +925,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             search: nil,
             genre: genre
         )
-        items.forEach { cachedMetaById[$0.id] = $0 }
+        cacheMetadata(items)
         return CatalogPage(
             items: items,
             hasMore: !items.isEmpty,
@@ -884,7 +999,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 for meta in response.metas.map({ $0.toMeta(fallbackType: source.type) }) {
                     guard items.count < limit else { break }
                     guard seen.insert(meta.id).inserted else { continue }
-                    cachedMetaById[meta.id] = meta
+                    cacheMetadata(meta)
                     items.append(meta)
                 }
             } catch {

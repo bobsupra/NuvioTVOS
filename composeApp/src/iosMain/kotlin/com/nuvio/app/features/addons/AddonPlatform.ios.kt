@@ -1,5 +1,6 @@
 package com.nuvio.app.features.addons
 
+import com.nuvio.app.core.storage.AppleFileStringStorage
 import io.ktor.client.HttpClient
 import io.ktor.client.engine.darwin.Darwin
 import io.ktor.client.plugins.HttpTimeout
@@ -28,8 +29,8 @@ actual object AddonStorage {
     private const val defaultAddonsSeededKey = "default_addons_seeded"
 
     actual fun loadInstalledAddonUrls(profileId: Int): List<String> =
-        NSUserDefaults.standardUserDefaults
-            .stringForKey("${addonUrlsKey}_$profileId")
+        AppleFileStringStorage
+            .load("${addonUrlsKey}_$profileId")
             .orEmpty()
             .lineSequence()
             .map { it.trim() }
@@ -37,15 +38,15 @@ actual object AddonStorage {
             .toList()
 
     actual fun saveInstalledAddonUrls(profileId: Int, urls: List<String>) {
-        NSUserDefaults.standardUserDefaults.setObject(
-            urls.joinToString(separator = "\n"),
-            forKey = "${addonUrlsKey}_$profileId",
+        AppleFileStringStorage.save(
+            key = "${addonUrlsKey}_$profileId",
+            value = urls.joinToString(separator = "\n"),
         )
     }
 
     actual fun loadAddonEnabledStates(profileId: Int): Map<String, Boolean> =
-        NSUserDefaults.standardUserDefaults
-            .stringForKey("${addonEnabledStatesKey}_$profileId")
+        AppleFileStringStorage
+            .load("${addonEnabledStatesKey}_$profileId")
             .orEmpty()
             .lineSequence()
             .mapNotNull(::parseEnabledStateLine)
@@ -55,9 +56,9 @@ actual object AddonStorage {
         val payload = states.entries.joinToString(separator = "\n") { (url, enabled) ->
             "$url\t$enabled"
         }
-        NSUserDefaults.standardUserDefaults.setObject(
-            payload,
-            forKey = "${addonEnabledStatesKey}_$profileId",
+        AppleFileStringStorage.save(
+            key = "${addonEnabledStatesKey}_$profileId",
+            value = payload,
         )
     }
 

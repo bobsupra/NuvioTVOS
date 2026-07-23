@@ -1,14 +1,14 @@
 package com.nuvio.app.features.profiles
 
-import platform.Foundation.NSUserDefaults
+import com.nuvio.app.core.storage.AppleFileStringStorage
 
 actual object ProfileStorage {
     private const val payloadKey = "profile_payload"
 
     actual fun loadPayload(): String? =
-        NSUserDefaults.standardUserDefaults.stringForKey(payloadKey)
+        AppleFileStringStorage.load(payloadKey)
 
     actual fun savePayload(payload: String) {
-        NSUserDefaults.standardUserDefaults.setObject(payload, forKey = payloadKey)
+        AppleFileStringStorage.save(payloadKey, payload)
     }
 }

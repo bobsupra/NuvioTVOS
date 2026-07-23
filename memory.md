@@ -255,14 +255,190 @@ frame if that button was focusable during the spatial hop.
 
 ## Beta release workflow
 
-Last verified: Beta 3 on 2026-07-15.
+Last verified end-to-end: Beta 3.1.5 on 2026-07-22.
 
-1. Confirm `main` and `origin/main` are aligned, inspect the latest `tvos-beta-*` tag, and preserve unrelated dirty files.
-2. Bump `CFBundleShortVersionString` and `CFBundleVersion` in both `tvosApp/NuvioTV/Info.plist` and `tvosApp/TopShelf/Info.plist`.
-3. Update the Latest tvOS Beta section in `README.md` and add `release/tvos-beta-X.Y.md` with Fixed and improved plus Known issues.
-4. Build from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`, Release, generic tvOS destination, with signing disabled. Beta 3 uses the public `bobsupra/MPVKit` Nuvio branch and `0.41.0-n8.1.2-nuvio.4` Libmpv artifact, which includes both AVFoundation audio and MoltenVK video support for tvOS.
-5. Xcode 27 beta can crash in Release optimization for `AddonManifest.supportsResource`; keep its targeted `@_optimize(none)` workaround and archive with `SWIFT_ENABLE_BATCH_MODE=NO`.
-6. Package `NuvioTV.app` inside `Payload/` as `artifacts/NuvioTV-X.Y-unsigned-release.ipa` and verify the ZIP, app/Top Shelf version and build, arm64 executable, unsigned status, byte size, and SHA-256.
-7. Stage only the intended source, version, notes, archive, IPA, and requested memory changes. Do not stage unrelated `.DS_Store` changes. Commit as `Release tvOS beta X.Y`.
-8. Create annotated tag `tvos-beta-X.Y`, push `main` and the tag, then create a non-draft, non-prerelease GitHub release named `Beta X.Y` and mark it latest.
-9. Upload the IPA asset as `NuvioTV-X.Y-unsigned.ipa`. Verify the public release API reports the correct tag, uploaded asset size/digest, and that remote `main` plus the peeled tag point to the release commit.
+Use this checklist from start to finish for every beta. Replace `X.Y.Z` with
+the release version and `BUILD` with the next integer build number.
+
+### 1. Audit before changing anything
+
+1. Run `git status --short`, note every modified/untracked file, and treat
+   pre-existing changes as user work. Never discard, reset, or overwrite them.
+2. Confirm the active branch is `main`, inspect `HEAD`, `origin/main`, recent
+   commits, and the latest `tvos-beta-*` tags.
+3. Fetch `origin` and stop if `main` and `origin/main` have diverged or the
+   target tag/release already exists.
+4. Inspect both committed changes since the previous release and the intended
+   uncommitted diff. Use actual code behavior—not only issue descriptions—to
+   decide what belongs in the release.
+5. Keep unrelated dirty files out of the release. Stage exact paths later;
+   never use broad staging such as `git add -A` in a dirty worktree.
+6. If unrelated dirty files are tvOS build inputs, do not archive from that
+   worktree: stop for direction or prepare a separate release worktree from the
+   exact approved source state. Never stash user work without permission.
+
+### 2. Build the complete change list
+
+1. Review `git diff --stat`, `git diff --name-status`, focused source diffs,
+   added regression-test names, and the previous release notes.
+2. Group user-visible changes by subject, for example:
+   - Trakt/sync and watched history
+   - resume and playback continuity
+   - episodes, sources, audio, and subtitles
+   - skip segments
+   - player presentation and controls
+   - tests
+3. Describe only behavior actually present in the release tree. Do not claim
+   that an investigated-but-unfixed issue was fixed.
+4. Carry unresolved reports into **Known issues**. Mention provider/data
+   dependencies explicitly (for example, Recap appears only when its timing
+   provider returns a recap interval).
+
+### 3. Bump every version consistently
+
+1. Increment the build number from the previous release.
+2. Update `CFBundleShortVersionString` in:
+   - `tvosApp/NuvioTV/Info.plist`
+   - `tvosApp/TopShelf/Info.plist`
+3. Update every applicable `MARKETING_VERSION` and
+   `CURRENT_PROJECT_VERSION` in
+   `tvosApp/NuvioTV.xcodeproj/project.pbxproj` (app, Top Shelf, and tests).
+4. Validate both plists with `plutil -lint`.
+5. Search the release-facing files for the old version/build and confirm no
+   stale value remains.
+
+### 4. Write structured patch notes and README
+
+1. Add `release/tvos-beta-X.Y.Z.md`.
+2. Use this release-note structure:
+
+   ```text
+   ## tvOS Beta X.Y.Z
+
+   Important unsigned-IPA notice
+
+   ### Feature/fix group 1
+   - Specific user-visible changes
+
+   ### Feature/fix group 2
+   - Specific user-visible changes
+
+   ### Tests
+   - New regression coverage
+
+   ### Known issues
+   - Honest remaining limitations
+   ```
+
+3. Keep bullets concrete: state what was wrong, what now happens, and any
+   relevant conflict/fallback rule. Prefer several clear themed sections over
+   one long “Fixed and improved” list.
+4. Update README's **Latest tvOS Beta** version/build, tag URL, IPA URL, and
+   **New in Beta X.Y.Z** summary. The summary should be shorter than the full
+   notes but cover every major change group.
+5. Standard release identifiers:
+   - tag: `tvos-beta-X.Y.Z`
+   - release name: `Beta X.Y.Z`
+   - asset: `NuvioTV-X.Y.Z-unsigned-release.ipa`
+
+### 5. Validate before the Release build
+
+1. Run `git diff --check`.
+2. Run the focused unit/regression tests for every changed subsystem. Be
+   careful that `-only-testing` names the newly added test classes as well as
+   older classes in the same file.
+3. Record the number of executed tests and require zero failures.
+4. For risky player/device changes, compile both simulator and generic-device
+   destinations. Do not claim physical Apple TV validation when only a device
+   compile was performed.
+5. Stop the release on test, compile, plist, or formatting failure.
+
+### 6. Create the unsigned Release archive
+
+1. Archive from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`,
+   configuration `Release`, destination `generic/platform=tvOS`.
+2. Disable signing with:
+   - `CODE_SIGNING_ALLOWED=NO`
+   - `CODE_SIGNING_REQUIRED=NO`
+3. Keep `SWIFT_ENABLE_BATCH_MODE=NO`; Xcode 27 beta has previously crashed
+   during Release optimization without this workaround.
+4. Use a release-specific archive and DerivedData path so older artifacts are
+   not overwritten:
+
+   ```text
+   artifacts/NuvioTV-X.Y.Z-unsigned-release.xcarchive
+   /tmp/NuvioTVOS-X-Y-Z-ReleaseDerivedData
+   ```
+
+5. Require `** ARCHIVE SUCCEEDED **`. Existing deprecation/concurrency
+   warnings may be reported, but new errors must block the release.
+
+### 7. Package and verify the IPA
+
+1. Copy the archived `NuvioTV.app` into a fresh staging directory as
+   `Payload/NuvioTV.app`.
+2. ZIP the `Payload` root into
+   `artifacts/NuvioTV-X.Y.Z-unsigned-release.ipa` using `ditto`.
+3. Verify all of the following:
+   - `unzip -tq` reports no compressed-data errors
+   - app version and build equal `X.Y.Z (BUILD)`
+   - Top Shelf version and build equal `X.Y.Z (BUILD)`
+   - the main executable is Mach-O `arm64`
+   - the app bundle reports “code object is not signed at all”
+   - byte size is recorded
+   - SHA-256 is recorded
+4. The archive, staging folder, and IPA are intentionally ignored by Git and
+   uploaded as release artifacts. Do not force-add them to the repository.
+
+### 8. Review and commit the exact source state
+
+1. Re-run `git diff --check` and inspect `git status --short`.
+2. Stage only the intended source, tests, project version, README, release
+   notes, and explicitly requested memory files by exact path.
+3. Confirm the cached diff contains no unrelated files or build products.
+4. Commit as `Release tvOS Beta X.Y.Z`.
+5. Confirm the worktree has no unintended unstaged release changes and that
+   the built artifact corresponds to the committed source state.
+
+### 9. Tag and push safely
+
+1. Fetch `origin` again and confirm `origin/main` still points to the pre-release
+   base; stop on unexpected remote movement.
+2. Create annotated tag `tvos-beta-X.Y.Z` with message
+   `tvOS Beta X.Y.Z`.
+3. Push `main` and the tag atomically when supported.
+4. Verify:
+   - local `HEAD`
+   - `origin/main`
+   - the peeled local tag
+   - the peeled remote tag
+
+   All four must point to the release commit.
+
+### 10. Publish and verify the GitHub release
+
+1. Create a GitHub release from the annotated tag:
+   - name `Beta X.Y.Z`
+   - body from `release/tvos-beta-X.Y.Z.md`
+   - non-draft
+   - non-prerelease
+   - marked latest
+2. Upload exactly
+   `NuvioTV-X.Y.Z-unsigned-release.ipa` with
+   `application/octet-stream`.
+3. Prefer `gh` when installed. If it is unavailable, use the authenticated
+   GitHub REST API through the existing Git credential helper without printing,
+   storing, or exposing the credential. Never ask the user to paste a token
+   into chat.
+4. Verify through the public GitHub release/latest API:
+   - correct tag/name and latest status
+   - `draft=false` and `prerelease=false`
+   - asset state is `uploaded`
+   - remote asset byte size equals the local IPA
+   - GitHub's SHA-256 digest equals the local checksum
+   - public download returns HTTP 200 and the exact byte count
+5. Verify README's release and download links resolve.
+6. Final handoff should include the release link, direct IPA link, commit,
+   tag, version/build, test count, byte size, SHA-256, and a concise grouped
+   change list. Call out any physical-device behavior that still needs real
+   Apple TV validation.

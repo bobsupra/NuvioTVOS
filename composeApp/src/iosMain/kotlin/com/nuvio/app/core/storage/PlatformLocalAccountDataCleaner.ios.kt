@@ -1,5 +1,6 @@
 package com.nuvio.app.core.storage
 
+import com.nuvio.app.features.profiles.MAX_PROFILES
 import platform.Foundation.NSUserDefaults
 
 internal actual object PlatformLocalAccountDataCleaner {
@@ -58,11 +59,13 @@ internal actual object PlatformLocalAccountDataCleaner {
     )
 
     actual fun wipe() {
+        // Shrink an oversized defaults domain in one operation before issuing individual writes.
+        AppleFileStringStorage.wipe()
         val defaults = NSUserDefaults.standardUserDefaults
 
         plainKeys.forEach(defaults::removeObjectForKey)
 
-        (1..4).forEach { profileId ->
+        (1..MAX_PROFILES).forEach { profileId ->
             profileIndexedPrefixes.forEach { prefix ->
                 defaults.removeObjectForKey("$prefix$profileId")
             }
