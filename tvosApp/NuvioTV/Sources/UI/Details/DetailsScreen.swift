@@ -1235,10 +1235,14 @@ enum SmartPlaybackSelector {
         // decoded frames then use MoltenVK/libplacebo's PBO upload path, which
         // MTLSimDriver can terminate as XPC API misuse. Prefer another stream;
         // physical Apple TV keeps AV1 available through its real Metal driver.
-        return !isAV1LabeledStream(stream)
-        #else
-        return true
+        if isAV1LabeledStream(stream) { return false }
         #endif
+        // Keep weaker hardware (Apple TV HD) from auto-picking or offering
+        // 4K/HDR/Dolby Vision sources it can only software-decode, which
+        // starves the CPU and produces choppy video with no audio at all.
+        // See AppleTVCapability.swift. No-op on Apple TV 4K models, which
+        // report an unrestricted ceiling.
+        return AppleTVCapability.current.isPlayable(tags: StreamQualityTags.parse(stream: stream))
     }
 
 }
