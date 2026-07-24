@@ -2151,6 +2151,17 @@ struct TVHomeView: View {
                 store.sections = reordered
             }
         }
+        // Individual revision changes can arrive while the initial physical-
+        // device load is still in flight. Once account sync confirms that all
+        // Home inputs have landed, queue one replacement load from that final
+        // add-on and catalog-settings snapshot.
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
+            homeReloadTask?.cancel()
+            let identity = contentIdentity
+            homeReloadTask = Task { @MainActor in
+                await reloadHomeAfterSyncedInputs(for: identity)
+            }
+        }
         .onDisappear {
             #if DEBUG
             print("[ContinueWatching] Home disappeared; cancelling refresh")
@@ -2706,6 +2717,21 @@ struct TVHomeView: View {
             }
             isLoading = false
         }
+    }
+
+    @MainActor
+    private func reloadHomeAfterSyncedInputs(for identity: TVHomeContentIdentity) async {
+        // Do not overlap the revision-owned load. Waiting preserves its useful
+        // rows, then forceReload replaces them using the complete synced inputs.
+        while store.isLoading(for: identity) {
+            do {
+                try await Task.sleep(nanoseconds: 200_000_000)
+            } catch {
+                return
+            }
+        }
+        guard !Task.isCancelled, identity == contentIdentity else { return }
+        await load(for: identity, forceReload: true)
     }
 
     @MainActor

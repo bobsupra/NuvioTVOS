@@ -1909,6 +1909,9 @@ private struct IntegrationSettingsView: View {
     @AppStorage private var traktClientID: String
     @AppStorage private var traktClientSecret: String
     @AppStorage private var simklClientID: String
+    @State private var traktClientIDDraft: String
+    @State private var traktClientSecretDraft: String
+    @State private var simklClientIDDraft: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
@@ -1930,6 +1933,9 @@ private struct IntegrationSettingsView: View {
         let profileStore = ProfileSettings.store(for: profileID)
         let trimmedProfileID = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let profileScope = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
+        let storedTraktClientID = profileStore.string(forKey: SettingsKey.traktClientID) ?? ""
+        let storedTraktClientSecret = profileStore.string(forKey: SettingsKey.traktClientSecret) ?? ""
+        let storedSimklClientID = profileStore.string(forKey: SettingsKey.simklClientID) ?? ""
         _traktViewModel = StateObject(
             wrappedValue: TraktSettingsViewModel(store: profileStore)
         )
@@ -1951,6 +1957,9 @@ private struct IntegrationSettingsView: View {
             SettingsKey.simklClientID,
             store: profileStore
         )
+        _traktClientIDDraft = State(initialValue: storedTraktClientID)
+        _traktClientSecretDraft = State(initialValue: storedTraktClientSecret)
+        _simklClientIDDraft = State(initialValue: storedSimklClientID)
     }
 
     var body: some View {
@@ -1964,24 +1973,22 @@ private struct IntegrationSettingsView: View {
                     fallback: "Watchlist, progress, history, comments, and recommendations"
                 )
             ) {
-                SettingsTextFieldRow(
+                SettingsNativeTextFieldRow(
                     title: "Trakt Client ID",
                     subtitle: "Create an API app at trakt.tv/oauth/applications",
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $traktClientID,
-                    onCommit: { traktViewModel.credentialsDidChange() }
+                    text: $traktClientIDDraft
                 )
 
-                SettingsTextFieldRow(
+                SettingsNativeTextFieldRow(
                     title: "Trakt Client Secret",
                     subtitle: L10n.string(
                         "tvos_settings_stored_locally_on_this_apple_tv",
                         fallback: "Stored locally on this Apple TV"
                     ),
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $traktClientSecret,
-                    isSecure: true,
-                    onCommit: { traktViewModel.credentialsDidChange() }
+                    text: $traktClientSecretDraft,
+                    isSecure: true
                 )
 
                 SettingsInfoRow(title: "Trakt Redirect URI", value: TraktConfig.redirectURI)
@@ -1989,7 +1996,8 @@ private struct IntegrationSettingsView: View {
                 TraktConnectionSettingsCard(
                     viewModel: traktViewModel,
                     accentColor: accentColor,
-                    onStartLogin: { showingTraktLogin = true },
+                    credentialsReady: traktCredentialsReady,
+                    onStartLogin: connectTrakt,
                     onOpenSettings: { showingTraktSettings = true }
                 )
             }
@@ -1998,12 +2006,11 @@ private struct IntegrationSettingsView: View {
                 title: "Simkl",
                 subtitle: "Connect a Simkl account with a Client ID and PIN login"
             ) {
-                SettingsTextFieldRow(
+                SettingsNativeTextFieldRow(
                     title: "Simkl Client ID",
                     subtitle: "Create an API app at simkl.com/settings/developer — stored only on this Apple TV",
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $simklClientID,
-                    onCommit: { simklViewModel.credentialsDidChange() }
+                    text: $simklClientIDDraft
                 )
 
                 SettingsInfoRow(title: "Simkl Redirect URI", value: SimklConfig.redirectURI)
@@ -2011,7 +2018,8 @@ private struct IntegrationSettingsView: View {
                 SimklConnectionSettingsCard(
                     viewModel: simklViewModel,
                     accentColor: accentColor,
-                    onStartLogin: { showingSimklLogin = true },
+                    credentialsReady: simklCredentialsReady,
+                    onStartLogin: connectSimkl,
                     onOpenSettings: { showingSimklSettings = true }
                 )
             }
@@ -2103,9 +2111,6 @@ private struct IntegrationSettingsView: View {
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
         }
-        .onChange(of: traktClientID) { _ in traktViewModel.credentialsDidChange() }
-        .onChange(of: traktClientSecret) { _ in traktViewModel.credentialsDidChange() }
-        .onChange(of: simklClientID) { _ in simklViewModel.credentialsDidChange() }
         .sheet(item: $debridAccountToConnect) { provider in
             if provider == .premiumize && !PremiumizeOAuthConfiguration.isDeviceOAuthConfigured {
                 PremiumizeApiKeySheet(
@@ -2163,6 +2168,30 @@ private struct IntegrationSettingsView: View {
         }
         return debridProvider == provider.debridKind.rawValue &&
             !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var traktCredentialsReady: Bool {
+        !traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var simklCredentialsReady: Bool {
+        !simklClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func connectTrakt() {
+        traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        traktClientSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        traktViewModel.credentialsDidChange()
+        guard traktViewModel.credentialsConfigured else { return }
+        showingTraktLogin = true
+    }
+
+    private func connectSimkl() {
+        simklClientID = simklClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+        simklViewModel.credentialsDidChange()
+        guard simklViewModel.credentialsConfigured else { return }
+        showingSimklLogin = true
     }
 }
 
@@ -2448,6 +2477,7 @@ private struct DebridDeviceAuthorizationSheet: View {
 private struct TraktConnectionSettingsCard: View {
     @ObservedObject var viewModel: TraktSettingsViewModel
     let accentColor: Color
+    let credentialsReady: Bool
     let onStartLogin: () -> Void
     let onOpenSettings: () -> Void
 
@@ -2481,7 +2511,7 @@ private struct TraktConnectionSettingsCard: View {
             case .disconnected, .awaitingApproval:
                 SettingsActionRow(
                     title: viewModel.mode == .awaitingApproval ? L10n.string("tvos_settings_continue_trakt_login", fallback: "Continue Trakt Login") : L10n.string("tvos_settings_connect_with_trakt", fallback: "Connect with Trakt"),
-                    subtitle: viewModel.credentialsConfigured
+                    subtitle: credentialsReady
                         ? "Scan the QR or enter the code at trakt.tv/activate"
                         : "Enter your Trakt Client ID and Client Secret first",
                     value: viewModel.mode == .awaitingApproval ? L10n.string("tvos_settings_resume", fallback: "Resume") : L10n.string("tvos_settings_connect", fallback: "Connect"),
@@ -2489,8 +2519,8 @@ private struct TraktConnectionSettingsCard: View {
                 ) {
                     onStartLogin()
                 }
-                .opacity(viewModel.credentialsConfigured ? 1 : 0.5)
-                .disabled(!viewModel.credentialsConfigured)
+                .opacity(credentialsReady ? 1 : 0.5)
+                .disabled(!credentialsReady)
             case .connected:
                 connectedBody
             }
@@ -3021,6 +3051,7 @@ private struct TraktDeviceLoginSheet: View {
 private struct SimklConnectionSettingsCard: View {
     @ObservedObject var viewModel: SimklSettingsViewModel
     let accentColor: Color
+    let credentialsReady: Bool
     let onStartLogin: () -> Void
     let onOpenSettings: () -> Void
 
@@ -3056,7 +3087,7 @@ private struct SimklConnectionSettingsCard: View {
                     title: viewModel.mode == .awaitingApproval
                         ? "Continue Simkl Login"
                         : "Connect with Simkl",
-                    subtitle: viewModel.credentialsConfigured
+                    subtitle: credentialsReady
                         ? "Scan the QR or enter the PIN at simkl.com/pin"
                         : "Enter your Simkl Client ID first",
                     value: viewModel.mode == .awaitingApproval
@@ -3066,8 +3097,8 @@ private struct SimklConnectionSettingsCard: View {
                 ) {
                     onStartLogin()
                 }
-                .opacity(viewModel.credentialsConfigured ? 1 : 0.5)
-                .disabled(!viewModel.credentialsConfigured)
+                .opacity(credentialsReady ? 1 : 0.5)
+                .disabled(!credentialsReady)
             case .connected:
                 SettingsActionRow(
                     title: "Simkl Account",
@@ -7365,6 +7396,62 @@ private struct SettingsTextFieldRow: View {
     }
 }
 
+/// Uses the system tvOS text field directly. Credential drafts intentionally
+/// stay local until the user chooses Connect.
+private struct SettingsNativeTextFieldRow: View {
+    let title: String
+    let subtitle: String
+    let placeholder: String
+    @Binding var text: String
+    var isSecure: Bool = false
+    var fieldWidth: CGFloat = 300
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        SettingsRowShell(isFocused: isFocused, accentColor: .white) {
+            SettingsRowText(title: title, subtitle: subtitle)
+
+            Spacer(minLength: 24)
+
+            ZStack(alignment: .leading) {
+                Group {
+                    if isSecure {
+                        SecureField(placeholder, text: $text)
+                    } else {
+                        TextField(placeholder, text: $text)
+                    }
+                }
+                .textFieldStyle(.plain)
+                .focused($isFocused)
+                .focusEffectDisabledIfAvailable()
+                .submitLabel(.done)
+                .textInputAutocapitalization(.never)
+                .autocorrectionDisabled()
+                .frame(width: fieldWidth, height: 48)
+                // Keep the reliable native editor in the focus hierarchy, but
+                // hide tvOS's hard-coded white focus pill.
+                .opacity(0.02)
+
+                Text(displayText)
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
+                    .lineLimit(1)
+                    .padding(.horizontal, 16)
+                    .allowsHitTesting(false)
+            }
+            .frame(width: fieldWidth, height: 48)
+            .modifier(GlassCapsule(focused: isFocused))
+        }
+        .entryLockable()
+    }
+
+    private var displayText: String {
+        guard !text.isEmpty else { return placeholder }
+        return isSecure ? String(repeating: "•", count: text.count) : text
+    }
+}
+
 /// Display half of the text-field row, styled to match the Search tab's glass
 /// capsule. A hidden, off-screen UITextField drives editing (a native focused
 /// TextField/SecureField on tvOS always paints its own white pill); the owning
@@ -7454,6 +7541,7 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
         private let text: Binding<String>
         private let isEditing: Binding<Bool>
         private let onCommit: () -> Void
+        private var committedCurrentEditingSession = false
 
         init(text: Binding<String>, isEditing: Binding<Bool>, onCommit: @escaping () -> Void) {
             self.text = text
@@ -7465,15 +7553,29 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
             text.wrappedValue = sender.text ?? ""
         }
 
+        func textFieldDidBeginEditing(_ textField: UITextField) {
+            committedCurrentEditingSession = false
+        }
+
         func textFieldShouldReturn(_ textField: UITextField) -> Bool {
-            isEditing.wrappedValue = false
+            commit(textField)
             textField.resignFirstResponder()
-            onCommit()
             return true
         }
 
         func textFieldDidEndEditing(_ textField: UITextField) {
+            // The real tvOS keyboard can dismiss with Done without delivering
+            // the simulator's editingChanged/Return sequence. Read the UIKit
+            // value directly so Client IDs and API keys are not lost.
+            commit(textField)
+        }
+
+        private func commit(_ textField: UITextField) {
+            text.wrappedValue = textField.text ?? ""
             isEditing.wrappedValue = false
+            guard !committedCurrentEditingSession else { return }
+            committedCurrentEditingSession = true
+            onCommit()
         }
     }
 }

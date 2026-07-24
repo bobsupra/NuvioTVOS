@@ -38,7 +38,8 @@ Important: release IPAs are often unsigned because no tvOS signing identity is c
 - Introduces native **Simkl** integration on Apple TV ahead of the official Nuvio client's announced rollout, with profile-scoped PIN login and Keychain token storage.
 - Lets Simkl independently power watched history, Plan to Watch library items, Continue Watching, resume positions, and player scrobbling.
 - Adds one-click transfers from Trakt or Nuvio into Simkl for watch history, library items, and in-progress playback, with live progress and additive imports that preserve existing Simkl data.
-- Improves Trakt and Simkl Continue Watching ordering, provider switching, Home refresh reliability, and landscape-artwork transitions.
+- Fixes Trakt and Simkl credential entry on physical Apple TVs while preserving the compact glass design; credentials are applied only when **Connect** is chosen.
+- Improves Trakt and Simkl Continue Watching ordering, provider switching, complete post-sync Home catalog loading, and landscape-artwork transitions.
 - Temporarily disables automatic next-episode playback. The manual Next Episode card now hides after five seconds and returns with the player controls, matching Skip Intro.
 - Adds 14 focused Simkl regression tests covering authentication, history/library/progress writes and transfers, routing, ordering, and cached account statistics.
 

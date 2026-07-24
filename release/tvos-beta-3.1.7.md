@@ -25,7 +25,14 @@
 - Prioritizes genuinely paused Trakt playback ahead of generated Next Up suggestions and fetches remote playback inputs concurrently.
 - Refreshes Continue Watching when Home becomes active again, even when tvOS kept the Home tab mounted while Settings was open.
 - Publishes profile catalog and collection revisions as soon as synced inputs land, cancels stale Home loads, and retries incomplete initial catalog loads.
+- Forces one final Home catalog rebuild after all profile-scoped account data has landed, fixing physical Apple TVs that otherwise needed a profile switch before every catalog appeared.
 - Preloads landscape artwork before changing a focused poster's aspect presentation, reducing portrait-to-landscape flashes and preserving smooth image transitions.
+
+### Real Apple TV credential entry
+
+- Uses the native tvOS editor for Trakt Client ID, Trakt Client Secret, and Simkl Client ID so typing and choosing Done update reliably on physical Apple TV hardware.
+- Keeps the compact glass field design without tvOS's bright duplicate focus layer.
+- Holds credential edits as drafts and validates/saves them only when **Connect** is chosen, preventing searches or account resets while the user is still typing.
 
 ### Next Episode card
 

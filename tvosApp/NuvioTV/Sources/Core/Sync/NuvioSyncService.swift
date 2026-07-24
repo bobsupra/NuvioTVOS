@@ -15,6 +15,10 @@ final class NuvioSyncManager: ObservableObject {
     /// The object is `[StreamAddonPreference]`, with `[String]` accepted for the
     /// old reorder-only path.
     static let addonOrderChangedNotification = Notification.Name("nuvio.tv.addons.orderChanged")
+    /// Posted after an account pull has applied every profile-scoped Home input.
+    /// Revision counters publish individual changes, while this completion
+    /// signal guarantees one final catalog rebuild on slower physical devices.
+    static let homeContentSyncedNotification = Notification.Name("nuvio.tv.homeContentSynced")
     /// Short, non-sensitive status strings shown only when Home content is
     /// missing on a physical Apple TV.
     static private(set) var addonSyncDiagnostic = "not pulled"
@@ -841,6 +845,10 @@ final class NuvioSyncManager: ObservableObject {
                 profileSyncError = nil
             }
 
+            // Home can already be loading from an earlier revision while the
+            // add-on and catalog settings above are still landing. Always
+            // request one final rebuild from the complete synced snapshot.
+            NotificationCenter.default.post(name: Self.homeContentSyncedNotification, object: nil)
             if !pullWasIncomplete {
                 Self.accountSyncDiagnostic = "home inputs pulled"
             }
