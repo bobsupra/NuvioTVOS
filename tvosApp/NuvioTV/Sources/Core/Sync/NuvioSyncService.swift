@@ -15,10 +15,6 @@ final class NuvioSyncManager: ObservableObject {
     /// The object is `[StreamAddonPreference]`, with `[String]` accepted for the
     /// old reorder-only path.
     static let addonOrderChangedNotification = Notification.Name("nuvio.tv.addons.orderChanged")
-    /// Posted after an account pull applies profile-scoped Home inputs (add-ons,
-    /// catalog layout, and watch progress). Home keeps its catalog tree cached,
-    /// so it must explicitly rebuild once those inputs arrive.
-    static let homeContentSyncedNotification = Notification.Name("nuvio.tv.homeContentSynced")
     /// Short, non-sensitive status strings shown only when Home content is
     /// missing on a physical Apple TV.
     static private(set) var addonSyncDiagnostic = "not pulled"
@@ -31,6 +27,10 @@ final class NuvioSyncManager: ObservableObject {
     /// names instead of rendering local stubs.
     @Published private(set) var isPullingAccountProfiles = false
     @Published private(set) var profileSyncError: String?
+    /// Persistent Home input versions. Unlike a one-shot notification, the
+    /// latest values are still visible when Home mounts after account sync.
+    @Published private(set) var homeCatalogRevision: UInt = 0
+    @Published private(set) var homeCollectionsRevision: UInt = 0
 
     private let client = NuvioAPIClient()
 
@@ -134,7 +134,21 @@ final class NuvioSyncManager: ObservableObject {
                 let urls = notification.object as? [String] ?? []
                 preferences = urls.map { StreamAddonPreference(url: $0, enabled: true) }
             }
-            Task { @MainActor in self?.pushAddonPreferences(preferences) }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.homeCatalogRevision &+= 1
+                self.pushAddonPreferences(preferences)
+            }
+        })
+        observers.append(center.addObserver(
+            forName: CollectionsStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.homeCollectionsRevision &+= 1
+            }
         })
         observers.append(center.addObserver(
             forName: CollectionsStore.locallyEditedNotification,
@@ -699,6 +713,10 @@ final class NuvioSyncManager: ObservableObject {
                 try ensureStillSyncing(profileId: activeProfile.id)
                 lastPulledAddonRows = remoteAddons
                 let appliedCount = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
+                // Mirror Android's DataStore Flow: publish immediately after
+                // this profile-scoped input lands instead of waiting for the
+                // unrelated library/progress pulls below to finish.
+                homeCatalogRevision &+= 1
                 Self.addonSyncDiagnostic = "remote \(remoteAddons.count), enabled \(appliedCount)"
                 print("Nuvio sync pulled \(appliedCount) enabled add-on(s).")
             } catch is CancellationError {
@@ -735,6 +753,7 @@ final class NuvioSyncManager: ObservableObject {
                 ) {
                     try ensureStillSyncing(profileId: activeProfile.id)
                     client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
+                    homeCatalogRevision &+= 1
                     Self.catalogSettingsSyncDiagnostic = "pulled \(catalogSettings.items.count) item(s)"
                     print("Nuvio sync pulled home catalog settings (\(catalogSettings.items.count) item(s)).")
                 } else {
@@ -822,10 +841,6 @@ final class NuvioSyncManager: ObservableObject {
                 profileSyncError = nil
             }
 
-            // Home may have loaded while this pull was in flight using the
-            // default/no-add-on settings. Rebuild its cached catalog tree only
-            // after all profile-scoped inputs above have landed.
-            NotificationCenter.default.post(name: Self.homeContentSyncedNotification, object: nil)
             if !pullWasIncomplete {
                 Self.accountSyncDiagnostic = "home inputs pulled"
             }

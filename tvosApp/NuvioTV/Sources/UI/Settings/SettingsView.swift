@@ -157,6 +157,7 @@ enum SettingsKey {
     static let traktWatchProgressSource = "nuvio.tv.settings.integrations.traktWatchProgressSource"
     static let traktLibrarySourceMode = "nuvio.tv.settings.integrations.traktLibrarySourceMode"
     static let traktMoreLikeThisSource = "nuvio.tv.settings.integrations.traktMoreLikeThisSource"
+    static let simklClientID = "nuvio.tv.settings.integrations.simklClientID"
     static let tmdbEnabled = "nuvio.tv.settings.integrations.tmdbEnabled"
     static let tmdbApiKey = "nuvio.tv.settings.integrations.tmdbApiKey"
     static let mdbListEnabled = "nuvio.tv.settings.integrations.mdbListEnabled"
@@ -201,7 +202,7 @@ enum SettingsKey {
 
     /// API app credentials must remain on the Apple TV and never enter the
     /// account settings payload.
-    static let deviceLocal = Set([traktClientID, traktClientSecret])
+    static let deviceLocal = Set([traktClientID, traktClientSecret, simklClientID])
 
     static let all = [
         profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
@@ -211,6 +212,7 @@ enum SettingsKey {
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, traktLibrarySourceMode, traktMoreLikeThisSource,
+        simklClientID,
         tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         streamAddonManifestURL, streamAddonManifestURLs,
@@ -1903,8 +1905,10 @@ private struct IntegrationSettingsView: View {
     let accentColor: Color
 
     @StateObject private var traktViewModel: TraktSettingsViewModel
+    @StateObject private var simklViewModel: SimklSettingsViewModel
     @AppStorage private var traktClientID: String
     @AppStorage private var traktClientSecret: String
+    @AppStorage private var simklClientID: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
@@ -1917,13 +1921,20 @@ private struct IntegrationSettingsView: View {
     @State private var debridAccountToConnect: DebridAccountProvider?
     @State private var showingTraktLogin = false
     @State private var showingTraktSettings = false
+    @State private var showingSimklLogin = false
+    @State private var showingSimklSettings = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
         self.accentColor = accentColor
         let profileStore = ProfileSettings.store(for: profileID)
+        let trimmedProfileID = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let profileScope = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
         _traktViewModel = StateObject(
             wrappedValue: TraktSettingsViewModel(store: profileStore)
+        )
+        _simklViewModel = StateObject(
+            wrappedValue: SimklSettingsViewModel(store: profileStore, profileScope: profileScope)
         )
         _traktClientID = AppStorage(
             wrappedValue: "",
@@ -1933,6 +1944,11 @@ private struct IntegrationSettingsView: View {
         _traktClientSecret = AppStorage(
             wrappedValue: "",
             SettingsKey.traktClientSecret,
+            store: profileStore
+        )
+        _simklClientID = AppStorage(
+            wrappedValue: "",
+            SettingsKey.simklClientID,
             store: profileStore
         )
     }
@@ -1975,6 +1991,28 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor,
                     onStartLogin: { showingTraktLogin = true },
                     onOpenSettings: { showingTraktSettings = true }
+                )
+            }
+
+            SettingsGroup(
+                title: "Simkl",
+                subtitle: "Connect a Simkl account with a Client ID and PIN login"
+            ) {
+                SettingsTextFieldRow(
+                    title: "Simkl Client ID",
+                    subtitle: "Create an API app at simkl.com/settings/developer — stored only on this Apple TV",
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $simklClientID,
+                    onCommit: { simklViewModel.credentialsDidChange() }
+                )
+
+                SettingsInfoRow(title: "Simkl Redirect URI", value: SimklConfig.redirectURI)
+
+                SimklConnectionSettingsCard(
+                    viewModel: simklViewModel,
+                    accentColor: accentColor,
+                    onStartLogin: { showingSimklLogin = true },
+                    onOpenSettings: { showingSimklSettings = true }
                 )
             }
 
@@ -2062,9 +2100,12 @@ private struct IntegrationSettingsView: View {
         .onAppear {
             traktViewModel.reload()
             traktViewModel.loadConnectedData()
+            simklViewModel.reload()
+            simklViewModel.loadConnectedData()
         }
         .onChange(of: traktClientID) { _ in traktViewModel.credentialsDidChange() }
         .onChange(of: traktClientSecret) { _ in traktViewModel.credentialsDidChange() }
+        .onChange(of: simklClientID) { _ in simklViewModel.credentialsDidChange() }
         .sheet(item: $debridAccountToConnect) { provider in
             if provider == .premiumize && !PremiumizeOAuthConfiguration.isDeviceOAuthConfigured {
                 PremiumizeApiKeySheet(
@@ -2091,8 +2132,23 @@ private struct IntegrationSettingsView: View {
             TraktConnectedSettingsSheet(viewModel: traktViewModel, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .sheet(isPresented: $showingSimklLogin, onDismiss: {
+            if simklViewModel.mode == .connected {
+                showingSimklSettings = true
+            }
+        }) {
+            SimklPINLoginSheet(viewModel: simklViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingSimklSettings) {
+            SimklConnectedSettingsSheet(viewModel: simklViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
         .onChange(of: traktViewModel.mode) { mode in
             if mode == .connected { showingTraktLogin = false }
+        }
+        .onChange(of: simklViewModel.mode) { mode in
+            if mode == .connected { showingSimklLogin = false }
         }
     }
 
@@ -2568,7 +2624,7 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
                             subtitle: "Choose which library to use for saving and viewing your collection",
                             selection: librarySourceSelection,
-                            options: ["Trakt", "Nuvio Library"],
+                            options: ["Trakt", "Simkl", "Nuvio Library"],
                             accentColor: accentColor
                         )
 
@@ -2576,10 +2632,10 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("trakt_watch_progress_dialog_title", fallback: "Watch Progress"),
                             subtitle: L10n.string(
                                 "tvos_settings_choose_the_source_for_resume_and_continu_53af657c",
-                                fallback: "Choose the source for Resume and Continue Watching"
+                                fallback: "Choose the source for Resume, Continue Watching, and watched updates"
                             ),
                             selection: watchProgressSelection,
-                            options: ["Trakt", "Nuvio Sync"],
+                            options: ["Trakt", "Simkl", "Nuvio Sync"],
                             accentColor: accentColor
                         )
 
@@ -2723,15 +2779,23 @@ private struct TraktConnectedSettingsSheet: View {
 
     private var librarySourceSelection: Binding<String> {
         Binding(
-            get: { viewModel.librarySourceMode == .trakt ? "Trakt" : "Nuvio Library" },
-            set: { viewModel.setLibrarySourceMode($0 == "Trakt" ? .trakt : .local) }
+            get: { viewModel.librarySourceMode.label },
+            set: { label in
+                viewModel.setLibrarySourceMode(
+                    TraktLibrarySourceMode.allCases.first { $0.label == label } ?? .local
+                )
+            }
         )
     }
 
     private var watchProgressSelection: Binding<String> {
         Binding(
-            get: { viewModel.watchProgressSource == .trakt ? "Trakt" : "Nuvio Sync" },
-            set: { viewModel.setWatchProgressSource($0 == "Trakt" ? .trakt : .nuvioSync) }
+            get: { viewModel.watchProgressSource.label },
+            set: { label in
+                viewModel.setWatchProgressSource(
+                    TraktWatchProgressSource.allCases.first { $0.label == label } ?? .nuvioSync
+                )
+            }
         )
     }
 
@@ -2846,7 +2910,7 @@ private struct TraktDeviceLoginSheet: View {
                     .foregroundColor(.white.opacity(0.66))
                     .multilineTextAlignment(.center)
                 dialogButton(title: L10n.string("tvos_settings_done", fallback: "Done"), isPrimary: true) { dismiss() }
-            } else if viewModel.isLoading && viewModel.deviceUserCode == nil {
+            } else if viewModel.deviceUserCode == nil && viewModel.errorMessage == nil {
                 ProgressView()
                     .controlSize(.large)
                     .tint(.white)
@@ -2930,7 +2994,7 @@ private struct TraktDeviceLoginSheet: View {
         .frame(width: 960)
         .padding(.horizontal, 88)
         .padding(.vertical, 64)
-        .background(Color(red: 0.11, green: 0.11, blue: 0.11))
+        .loginGlassPanel()
         .onAppear {
             if viewModel.mode != .connected && viewModel.deviceUserCode == nil {
                 viewModel.connect()
@@ -2950,19 +3014,729 @@ private struct TraktDeviceLoginSheet: View {
 
     @ViewBuilder
     private func dialogButton(title: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        ProviderLoginGlassButton(title: title, isPrimary: isPrimary, action: action)
+    }
+}
+
+private struct SimklConnectionSettingsCard: View {
+    @ObservedObject var viewModel: SimklSettingsViewModel
+    let accentColor: Color
+    let onStartLogin: () -> Void
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 18) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(Color(red: 0.08, green: 0.55, blue: 0.82))
+                    Text("SIMKL")
+                        .font(.system(size: 21, weight: .black))
+                        .foregroundColor(.white)
+                }
+                .frame(width: 92, height: 62)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(statusTitle)
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text(statusSubtitle)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 16)
+            }
+
+            switch viewModel.mode {
+            case .disconnected, .awaitingApproval:
+                SettingsActionRow(
+                    title: viewModel.mode == .awaitingApproval
+                        ? "Continue Simkl Login"
+                        : "Connect with Simkl",
+                    subtitle: viewModel.credentialsConfigured
+                        ? "Scan the QR or enter the PIN at simkl.com/pin"
+                        : "Enter your Simkl Client ID first",
+                    value: viewModel.mode == .awaitingApproval
+                        ? L10n.string("tvos_settings_resume", fallback: "Resume")
+                        : L10n.string("tvos_settings_connect", fallback: "Connect"),
+                    accentColor: accentColor
+                ) {
+                    onStartLogin()
+                }
+                .opacity(viewModel.credentialsConfigured ? 1 : 0.5)
+                .disabled(!viewModel.credentialsConfigured)
+            case .connected:
+                SettingsActionRow(
+                    title: "Simkl Account",
+                    subtitle: "View the connected account or disconnect this profile",
+                    value: L10n.string("tvos_settings_open", fallback: "Open"),
+                    accentColor: accentColor,
+                    action: onOpenSettings
+                )
+            }
+
+            if let message = viewModel.statusMessage,
+               !message.isEmpty,
+               viewModel.mode == .connected {
+                Text(message)
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(.white.opacity(0.62))
+            }
+
+            if let error = viewModel.errorMessage,
+               !error.isEmpty,
+               viewModel.mode != .awaitingApproval {
+                Text(error)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+            }
+        }
+    }
+
+    private var statusTitle: String {
+        switch viewModel.mode {
+        case .disconnected:
+            return L10n.string("tvos_settings_not_connected", fallback: "Not connected")
+        case .awaitingApproval:
+            return L10n.string("tvos_settings_waiting_for_approval", fallback: "Waiting for approval")
+        case .connected:
+            let name = viewModel.username?.isEmpty == false
+                ? (viewModel.username ?? "Simkl User")
+                : "Simkl User"
+            return "Connected as \(name)"
+        }
+    }
+
+    private var statusSubtitle: String {
+        switch viewModel.mode {
+        case .disconnected:
+            return "Connect with a QR code and PIN at simkl.com/pin."
+        case .awaitingApproval:
+            return "Finish approving this Apple TV in Simkl, or resume the login sheet."
+        case .connected:
+            return "This profile is connected to Simkl."
+        }
+    }
+}
+
+private struct SimklConnectedSettingsSheet: View {
+    @ObservedObject var viewModel: SimklSettingsViewModel
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var showingDisconnectConfirmation = false
+    @State private var showingHistoryTransferSources = false
+    @State private var showingLibraryTransferSources = false
+    @State private var showingProgressTransferSources = false
+
+    var body: some View {
+        ZStack {
+            Color(red: 0.055, green: 0.055, blue: 0.055).ignoresSafeArea()
+
+            VStack(spacing: 0) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 24) {
+                        HStack(spacing: 20) {
+                            ZStack {
+                                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                                    .fill(Color(red: 0.08, green: 0.55, blue: 0.82))
+                                Text("SIMKL")
+                                    .font(.system(size: 27, weight: .black))
+                                    .foregroundColor(.white)
+                            }
+                            .frame(width: 112, height: 76)
+
+                            VStack(alignment: .leading, spacing: 7) {
+                                Text(viewModel.username?.isEmpty == false
+                                    ? "Connected as \(viewModel.username ?? "Simkl User")"
+                                    : "Simkl Connected")
+                                    .font(.system(size: 34, weight: .bold))
+                                    .foregroundColor(.white)
+
+                                Text("This Simkl account is linked to the current Nuvio profile.")
+                                    .font(.system(size: 19, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.62))
+                            }
+                        }
+
+                        SettingsGroup(
+                            title: "Account",
+                            subtitle: "Account information returned by Simkl"
+                        ) {
+                            if let username = viewModel.username, !username.isEmpty {
+                                SettingsInfoRow(title: "Username", value: username)
+                            }
+                            if let plan = viewModel.accountPlan, !plan.isEmpty {
+                                SettingsInfoRow(title: "Plan", value: plan.uppercased())
+                            }
+                            if let accountID = viewModel.accountID, !accountID.isEmpty {
+                                SettingsInfoRow(title: "Account ID", value: accountID)
+                            }
+                        }
+
+                        SettingsGroup(
+                            title: "Cached",
+                            subtitle: "Watched activity currently loaded from your Simkl account"
+                        ) {
+                            SimklConnectedStatsStrip(
+                                stats: viewModel.connectedStats,
+                                isLoading: viewModel.isStatsLoading
+                            )
+
+                            SettingsActionRow(
+                                title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
+                                subtitle: "Refresh Simkl watch progress, account information, and cached stats",
+                                value: viewModel.isLoading
+                                    ? L10n.string("tvos_settings_syncing", fallback: "Syncing")
+                                    : L10n.string("tvos_settings_refresh", fallback: "Refresh"),
+                                accentColor: accentColor
+                            ) {
+                                viewModel.refreshNow()
+                            }
+                            .disabled(
+                                viewModel.isLoading
+                                    || viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+                        }
+
+                        SettingsGroup(
+                            title: "Simkl Features",
+                            subtitle: "Choose how Simkl is used throughout Nuvio"
+                        ) {
+                            SettingsChoiceRow(
+                                title: "Library Source",
+                                subtitle: "Use Simkl Plan to Watch as your Nuvio library",
+                                selection: librarySourceSelection,
+                                options: TraktLibrarySourceMode.allCases.map(\.label),
+                                accentColor: accentColor
+                            )
+                            .disabled(
+                                viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+
+                            SettingsChoiceRow(
+                                title: "Watch Progress",
+                                subtitle: "Use Simkl for Resume, Continue Watching, and watched updates",
+                                selection: watchProgressSelection,
+                                options: TraktWatchProgressSource.allCases.map(\.label),
+                                accentColor: accentColor
+                            )
+                            .disabled(
+                                viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+
+                        }
+
+                        SettingsGroup(
+                            title: "Transfer Watch History",
+                            subtitle: "Copy watched movies and episodes into Simkl without deleting existing Simkl history"
+                        ) {
+                            SettingsActionRow(
+                                title: "Transfer to Simkl",
+                                subtitle: "Choose Nuvio Sync or a connected Trakt account as the source",
+                                value: viewModel.isTransferringHistory
+                                    ? "\(viewModel.historyTransferProgress ?? 1)%"
+                                    : "Choose Source",
+                                accentColor: accentColor
+                            ) {
+                                showingHistoryTransferSources = true
+                            }
+                            .disabled(
+                                viewModel.isLoading
+                                    || viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+
+                            if let progress = viewModel.historyTransferProgress {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    HStack {
+                                        Text("\(viewModel.historyTransferSourceLabel ?? "History") → Simkl")
+                                            .font(.system(size: 19, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.76))
+                                        Spacer()
+                                        Text("\(progress)%")
+                                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                                            .foregroundColor(progress == 100 ? .green : accentColor)
+                                    }
+
+                                    ProgressView(value: Double(progress), total: 100)
+                                        .tint(progress == 100 ? .green : accentColor)
+                                }
+                                .padding(.horizontal, 22)
+                                .padding(.vertical, 18)
+                                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+                            }
+                        }
+
+                        SettingsGroup(
+                            title: "Transfer Library",
+                            subtitle: "Copy library items into Simkl Plan to Watch without removing existing Simkl items"
+                        ) {
+                            SettingsActionRow(
+                                title: "Transfer to Simkl Plan to Watch",
+                                subtitle: "Choose Nuvio Library or a connected Trakt account as the source",
+                                value: viewModel.isTransferringLibrary
+                                    ? "\(viewModel.libraryTransferProgress ?? 1)%"
+                                    : "Choose Source",
+                                accentColor: accentColor
+                            ) {
+                                showingLibraryTransferSources = true
+                            }
+                            .disabled(
+                                viewModel.isLoading
+                                    || viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+
+                            if let progress = viewModel.libraryTransferProgress {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    HStack {
+                                        Text("\(viewModel.libraryTransferSourceLabel ?? "Library") → Simkl Plan to Watch")
+                                            .font(.system(size: 19, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.76))
+                                        Spacer()
+                                        Text("\(progress)%")
+                                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                                            .foregroundColor(progress == 100 ? .green : accentColor)
+                                    }
+
+                                    ProgressView(value: Double(progress), total: 100)
+                                        .tint(progress == 100 ? .green : accentColor)
+                                }
+                                .padding(.horizontal, 22)
+                                .padding(.vertical, 18)
+                                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+                            }
+                        }
+
+                        SettingsGroup(
+                            title: "Transfer Continue Watching",
+                            subtitle: "Copy unfinished playback positions into Simkl for cross-device resume"
+                        ) {
+                            SettingsActionRow(
+                                title: "Transfer Progress to Simkl",
+                                subtitle: "Choose Nuvio Sync or a connected Trakt account as the source",
+                                value: viewModel.isTransferringProgress
+                                    ? "\(viewModel.progressTransferProgress ?? 1)%"
+                                    : "Choose Source",
+                                accentColor: accentColor
+                            ) {
+                                showingProgressTransferSources = true
+                            }
+                            .disabled(
+                                viewModel.isLoading
+                                    || viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+
+                            if let progress = viewModel.progressTransferProgress {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    HStack {
+                                        Text("\(viewModel.progressTransferSourceLabel ?? "Progress") → Simkl")
+                                            .font(.system(size: 19, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.76))
+                                        Spacer()
+                                        Text("\(progress)%")
+                                            .font(.system(size: 20, weight: .bold, design: .rounded))
+                                            .foregroundColor(progress == 100 ? .green : accentColor)
+                                    }
+
+                                    ProgressView(value: Double(progress), total: 100)
+                                        .tint(progress == 100 ? .green : accentColor)
+                                }
+                                .padding(.horizontal, 22)
+                                .padding(.vertical, 18)
+                                .background(Color.white.opacity(0.07), in: RoundedRectangle(cornerRadius: 16))
+                            }
+                        }
+
+                        SettingsGroup(
+                            title: "Account Login",
+                            subtitle: "Manage the Simkl connection for this Nuvio profile"
+                        ) {
+                            SettingsActionRow(
+                                title: L10n.string("debrid_disconnect", fallback: "Disconnect"),
+                                subtitle: "Remove this profile's Simkl token from this Apple TV",
+                                value: L10n.string("debrid_disconnect", fallback: "Disconnect"),
+                                accentColor: accentColor
+                            ) {
+                                showingDisconnectConfirmation = true
+                            }
+                            .disabled(
+                                viewModel.isLoading
+                                    || viewModel.isTransferringHistory
+                                    || viewModel.isTransferringLibrary
+                                    || viewModel.isTransferringProgress
+                            )
+                        }
+
+                        if let message = viewModel.statusMessage, !message.isEmpty {
+                            Text(message)
+                                .font(.system(size: 18, weight: .medium))
+                                .foregroundColor(.white.opacity(0.62))
+                        }
+                        if let error = viewModel.errorMessage, !error.isEmpty {
+                            Text(error)
+                                .font(.system(size: 18, weight: .semibold))
+                                .foregroundColor(.red.opacity(0.9))
+                        }
+                    }
+                    .frame(maxWidth: 1120)
+                    .padding(.horizontal, 64)
+                    .padding(.top, 52)
+                    .padding(.bottom, 24)
+                }
+
+                HStack {
+                    Button { dismiss() } label: {
+                        Text(L10n.string("tvos_settings_back", fallback: "Back"))
+                            .font(.system(size: 24, weight: .semibold))
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 34)
+                            .padding(.vertical, 16)
+                            .background(Color.white.opacity(0.14), in: Capsule())
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+
+                    Spacer()
+                }
+                .frame(maxWidth: 1120)
+                .padding(.horizontal, 64)
+                .padding(.bottom, 40)
+            }
+        }
+        .task {
+            viewModel.reload()
+            viewModel.loadConnectedData()
+        }
+        .onChange(of: viewModel.mode) { mode in
+            if mode != .connected { dismiss() }
+        }
+        .confirmationDialog(
+            "Disconnect Simkl?",
+            isPresented: $showingDisconnectConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button(L10n.string("debrid_disconnect", fallback: "Disconnect"), role: .destructive) {
+                viewModel.disconnect()
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Transfer Watch History to Simkl",
+            isPresented: $showingHistoryTransferSources,
+            titleVisibility: .visible
+        ) {
+            Button("From Nuvio Sync") {
+                viewModel.transferWatchHistory(from: .nuvioSync)
+            }
+            if viewModel.isTraktTransferAvailable {
+                Button("From Trakt") {
+                    viewModel.transferWatchHistory(from: .trakt)
+                }
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        } message: {
+            Text("This only adds watched history to Simkl. Existing Simkl history is not removed.")
+        }
+        .confirmationDialog(
+            "Transfer Library to Simkl",
+            isPresented: $showingLibraryTransferSources,
+            titleVisibility: .visible
+        ) {
+            Button("From Nuvio Library") {
+                viewModel.transferLibrary(from: .nuvioLibrary)
+            }
+            if viewModel.isTraktTransferAvailable {
+                Button("From Trakt") {
+                    viewModel.transferLibrary(from: .trakt)
+                }
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        } message: {
+            Text("This adds library items to Simkl Plan to Watch. Existing Simkl lists and history are not removed.")
+        }
+        .confirmationDialog(
+            "Transfer Continue Watching to Simkl",
+            isPresented: $showingProgressTransferSources,
+            titleVisibility: .visible
+        ) {
+            Button("From Nuvio Sync") {
+                viewModel.transferProgress(from: .nuvioSync)
+            }
+            if viewModel.isTraktTransferAvailable {
+                Button("From Trakt") {
+                    viewModel.transferProgress(from: .trakt)
+                }
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        } message: {
+            Text("This saves unfinished playback positions in Simkl. Completed history and existing Simkl lists are unchanged.")
+        }
+    }
+
+    private var librarySourceSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.librarySourceMode.label },
+            set: { label in
+                TraktSettingsStore.librarySourceMode =
+                    TraktLibrarySourceMode.allCases.first { $0.label == label } ?? .local
+            }
+        )
+    }
+
+    private var watchProgressSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.watchProgressSource.label },
+            set: { label in
+                TraktSettingsStore.watchProgressSource =
+                    TraktWatchProgressSource.allCases.first { $0.label == label } ?? .nuvioSync
+            }
+        )
+    }
+}
+
+private struct SimklConnectedStatsStrip: View {
+    let stats: SimklCachedStats?
+    let isLoading: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            stat(value: stats?.moviesWatched, label: L10n.string("nav_movies", fallback: "Movies"))
+            divider
+            stat(value: stats?.showsWatched, label: L10n.string("trakt_stat_shows", fallback: "Shows"))
+            divider
+            stat(value: stats?.episodesWatched, label: L10n.string("tmdb_episodes_title", fallback: "Episodes"))
+            divider
+            stat(
+                text: stats?.totalWatchedHours.map { "\($0)h" },
+                label: L10n.string("tvos_settings_hours", fallback: "Watched Hours")
+            )
+        }
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+        .overlay(alignment: .top) { Divider().overlay(Color.white.opacity(0.16)) }
+        .overlay(alignment: .bottom) { Divider().overlay(Color.white.opacity(0.16)) }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.16))
+            .frame(width: 1, height: 72)
+    }
+
+    private func stat(value: Int?, label: String) -> some View {
+        stat(text: value.map(String.init), label: label)
+    }
+
+    private func stat(text: String?, label: String) -> some View {
+        VStack(spacing: 7) {
+            Text(text ?? (isLoading ? "..." : "-"))
+                .font(.system(size: 27, weight: .semibold))
+                .foregroundColor(.white)
+            Text(label)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(.white.opacity(0.62))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct SimklPINLoginSheet: View {
+    @ObservedObject var viewModel: SimklSettingsViewModel
+    let accentColor: Color
+    @Environment(\.dismiss) private var dismiss
+
+    private var verificationURI: String {
+        let value = viewModel.verificationURI?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return value.isEmpty ? SimklConfig.pinVerificationURL : value
+    }
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Text(viewModel.mode == .connected ? "Simkl Connected" : "Connect Simkl")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundColor(.white)
+
+            if viewModel.mode == .connected {
+                Text(viewModel.username.map { "Signed in as \($0)" }
+                    ?? "This Apple TV is linked to Simkl.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+                    .multilineTextAlignment(.center)
+                dialogButton(
+                    title: L10n.string("tvos_settings_done", fallback: "Done"),
+                    isPrimary: true
+                ) {
+                    dismiss()
+                }
+            } else if viewModel.deviceUserCode == nil && viewModel.errorMessage == nil {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                    .frame(height: 320)
+                Text(viewModel.statusMessage ?? "Starting Simkl login…")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.64))
+                dialogButton(
+                    title: L10n.string("action_cancel", fallback: "Cancel"),
+                    isPrimary: false
+                ) {
+                    viewModel.cancelPINFlow()
+                    dismiss()
+                }
+            } else if let code = viewModel.deviceUserCode, !code.isEmpty {
+                Text("Scan the QR on your phone, then enter the PIN shown below.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let image = QRCode.image(from: verificationURI, scale: 10) {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(16)
+                        .background(
+                            Color.white,
+                            in: RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        )
+                }
+
+                VStack(spacing: 12) {
+                    Text(code)
+                        .font(.system(size: 54, weight: .bold, design: .rounded))
+                        .tracking(4)
+                        .foregroundColor(.white)
+                        .accessibilityLabel("Simkl PIN \(code)")
+
+                    Text(verificationURI)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.54))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 10) {
+                    if viewModel.isPolling { ProgressView().tint(.white) }
+                    Text(viewModel.statusMessage ?? "Waiting for approval…")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.64))
+                }
+
+                if let error = viewModel.errorMessage, !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                        .multilineTextAlignment(.center)
+                }
+
+                HStack(spacing: 18) {
+                    dialogButton(
+                        title: L10n.string("action_cancel", fallback: "Cancel"),
+                        isPrimary: false
+                    ) {
+                        viewModel.cancelPINFlow()
+                        dismiss()
+                    }
+                    dialogButton(
+                        title: L10n.string("action_retry", fallback: "Retry"),
+                        isPrimary: true
+                    ) {
+                        viewModel.cancelPINFlow()
+                        viewModel.connect()
+                    }
+                }
+            } else {
+                Text(viewModel.errorMessage ?? "Unable to start Simkl login.")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 18) {
+                    dialogButton(
+                        title: L10n.string("action_close", fallback: "Close"),
+                        isPrimary: false
+                    ) {
+                        dismiss()
+                    }
+                    dialogButton(
+                        title: L10n.string("action_retry", fallback: "Retry"),
+                        isPrimary: true
+                    ) {
+                        viewModel.connect()
+                    }
+                }
+            }
+        }
+        .frame(width: 960)
+        .padding(.horizontal, 88)
+        .padding(.vertical, 64)
+        .loginGlassPanel()
+        .onAppear {
+            if viewModel.mode != .connected && viewModel.deviceUserCode == nil {
+                viewModel.connect()
+            } else if viewModel.mode == .awaitingApproval {
+                viewModel.retryPolling()
+            }
+        }
+        .onChange(of: viewModel.mode) { mode in
+            if mode == .connected {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dialogButton(
+        title: String,
+        isPrimary: Bool,
+        action: @escaping () -> Void
+    ) -> some View {
+        ProviderLoginGlassButton(title: title, isPrimary: isPrimary, action: action)
+    }
+}
+
+private struct ProviderLoginGlassButton: View {
+    let title: String
+    let isPrimary: Bool
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
         Button(action: action) {
             Text(title)
                 .font(.system(size: 24, weight: .semibold))
-                .foregroundColor(isPrimary ? .black : .white)
+                .foregroundColor(isFocused || isPrimary ? .black : .white)
                 .padding(.horizontal, 34)
-                .padding(.vertical, 16)
-                .background(
-                    isPrimary ? Color.white : Color.white.opacity(0.14),
-                    in: Capsule()
+                .frame(height: 58)
+                .loginGlassCapsule(
+                    highlighted: isFocused,
+                    prominent: isPrimary
                 )
+                .scaleEffect(isFocused ? 1.04 : 1)
         }
         .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
         .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }
 

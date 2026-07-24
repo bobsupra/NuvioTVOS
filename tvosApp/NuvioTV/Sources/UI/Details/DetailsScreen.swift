@@ -1628,8 +1628,7 @@ struct TvDetailsContent: View {
     }
 
     private func currentContinueWatchingItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
-        if TraktSettingsStore.watchProgressSource == .trakt,
-           TraktAuthStore.state.isAuthenticated {
+        if RemoteTrackingState.isProgressSourceAuthenticated {
             return TraktProgressService.currentContinueWatchingItem(for: meta)
         }
         return ContinueWatchingStore.item(for: meta.id)

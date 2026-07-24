@@ -14,6 +14,7 @@ public class LibraryViewModel: ObservableObject {
     public var lastFocusedItemID: String?
     private var libraryObserver: NSObjectProtocol?
     private var traktAuthObserver: NSObjectProtocol?
+    private var simklAuthObserver: NSObjectProtocol?
     private var traktSettingsObserver: NSObjectProtocol?
     private var traktMutationObserver: NSObjectProtocol?
     private var displayedSource: TraktLibrarySourceMode?
@@ -76,6 +77,15 @@ public class LibraryViewModel: ObservableObject {
                 await self?.refreshSelectedLibrary()
             }
         }
+        simklAuthObserver = NotificationCenter.default.addObserver(
+            forName: SimklAuthStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshSelectedLibrary()
+            }
+        }
         traktSettingsObserver = NotificationCenter.default.addObserver(
             forName: TraktSettingsStore.libraryChangedNotification,
             object: nil,
@@ -98,15 +108,18 @@ public class LibraryViewModel: ObservableObject {
     }
 
     deinit {
-        for observer in [libraryObserver, traktAuthObserver, traktSettingsObserver, traktMutationObserver].compactMap({ $0 }) {
+        for observer in [
+            libraryObserver, traktAuthObserver, simklAuthObserver,
+            traktSettingsObserver, traktMutationObserver
+        ].compactMap({ $0 }) {
             NotificationCenter.default.removeObserver(observer)
         }
     }
     
     public func loadLibrary() {
-        guard !usesTraktLibrary else {
-            if displayedSource != .trakt {
-                displayedSource = .trakt
+        guard !usesRemoteLibrary else {
+            if displayedSource != TraktSettingsStore.librarySourceMode {
+                displayedSource = TraktSettingsStore.librarySourceMode
                 items = []
                 validateFilters()
             }
@@ -123,39 +136,39 @@ public class LibraryViewModel: ObservableObject {
         let generation = refreshGeneration
         let profileID = LibraryStore.activeProfileId
 
-        guard usesTraktLibrary else {
+        guard usesRemoteLibrary else {
             loadLibrary()
             return
         }
 
-        if displayedSource != .trakt {
-            displayedSource = .trakt
+        if displayedSource != TraktSettingsStore.librarySourceMode {
+            displayedSource = TraktSettingsStore.librarySourceMode
             items = []
             validateFilters()
         }
 
-        guard let remoteItems = await TraktLibraryService.fetchLibrary(repository: repository),
+        guard let remoteItems = await SelectedLibraryService.fetchLibrary(repository: repository),
               !Task.isCancelled,
               generation == refreshGeneration,
               profileID == LibraryStore.activeProfileId,
-              usesTraktLibrary else {
+              usesRemoteLibrary else {
             return
         }
 
-        displayedSource = .trakt
+        displayedSource = TraktSettingsStore.librarySourceMode
         items = remoteItems.map(\.stremioMeta)
         validateFilters()
     }
 
-    private var usesTraktLibrary: Bool {
-        TraktSettingsStore.librarySourceMode == .trakt && TraktAuthStore.state.isAuthenticated
+    private var usesRemoteLibrary: Bool {
+        SelectedLibraryService.isSelectedAndAuthenticated
     }
 
     /// The Android TV library updates its Trakt snapshot immediately after a
     /// validated watchlist mutation. Do the same here so navigation into
     /// Library never waits on a second network pull to reveal the title.
     private func applyTraktMutation(_ mutation: TraktLibraryMutation) {
-        guard usesTraktLibrary else { return }
+        guard usesRemoteLibrary else { return }
         let item = LibraryStoreItem(meta: mutation.meta, addedAt: Date()).stremioMeta
         if mutation.isInWatchlist {
             items = [item] + items.filter {
@@ -166,7 +179,7 @@ public class LibraryViewModel: ObservableObject {
                 $0.id == item.id && $0.contentType.caseInsensitiveCompare(item.contentType) == .orderedSame
             }
         }
-        displayedSource = .trakt
+        displayedSource = TraktSettingsStore.librarySourceMode
         validateFilters()
     }
 

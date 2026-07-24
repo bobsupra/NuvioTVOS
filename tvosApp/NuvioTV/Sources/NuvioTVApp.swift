@@ -441,8 +441,7 @@ struct ContentView: View {
 
     private static func resumePosition(for item: ContinueWatchingItem) -> Double? {
         let currentItem: ContinueWatchingItem
-        if TraktSettingsStore.watchProgressSource == .trakt,
-           TraktAuthStore.state.isAuthenticated,
+        if RemoteTrackingState.isProgressSourceAuthenticated,
            let latest = TraktProgressService.currentContinueWatchingItem(for: item.meta) {
             currentItem = latest
         } else {
@@ -454,8 +453,7 @@ struct ContentView: View {
             // Looking it up in Nuvio Sync's separate episode ledger can return
             // an older checkpoint for the same episode (or no checkpoint at
             // all), so never cross the two progress sources here.
-            if TraktSettingsStore.watchProgressSource == .trakt,
-               TraktAuthStore.state.isAuthenticated {
+            if RemoteTrackingState.isProgressSourceAuthenticated {
                 return currentItem.isUpNextEntry ? nil : currentItem.resumePosition
             }
             guard let numbers = currentItem.episodeNumbers else { return nil }
@@ -474,8 +472,7 @@ struct ContentView: View {
     }
 
     private static func resumePosition(for meta: NuvioMeta, episode: NuvioVideo?) -> Double? {
-        if TraktSettingsStore.watchProgressSource == .trakt,
-           TraktAuthStore.state.isAuthenticated {
+        if RemoteTrackingState.isProgressSourceAuthenticated {
             guard let item = TraktProgressService.currentContinueWatchingItem(for: meta),
                   !item.isUpNextEntry else { return nil }
             if meta.isSeries {
@@ -511,8 +508,7 @@ struct ContentView: View {
         continueWatchingPlaybackTask = nil
         isResolvingContinueWatchingStream = false
 
-        let item = TraktSettingsStore.watchProgressSource == .trakt
-            && TraktAuthStore.state.isAuthenticated
+        let item = RemoteTrackingState.isProgressSourceAuthenticated
             ? (TraktProgressService.currentContinueWatchingItem(for: item.meta) ?? item)
             : item
         let context = Self.episodeContext(for: item)
@@ -761,6 +757,8 @@ struct ContentView: View {
             searchViewModel: searchViewModel,
             libraryViewModel: libraryViewModel,
             homeStore: homeStore,
+            homeCatalogRevision: syncManager.homeCatalogRevision,
+            homeCollectionsRevision: syncManager.homeCollectionsRevision,
             accountEmail: authManager.currentEmail,
             isAuthenticated: authManager.isAuthenticated,
             onSwitchProfile: {
@@ -1452,6 +1450,8 @@ private struct TVMainTabView: View {
     @ObservedObject var searchViewModel: SearchViewModel
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var homeStore: TVHomeStore
+    let homeCatalogRevision: UInt
+    let homeCollectionsRevision: UInt
     let accountEmail: String?
     let isAuthenticated: Bool
     let onSwitchProfile: () -> Void
@@ -1529,6 +1529,12 @@ private struct TVMainTabView: View {
             TVHomeView(
                 store: homeStore,
                 repository: CinemetaCatalogRepository(),
+                isActive: selectedTab == .home,
+                contentIdentity: TVHomeContentIdentity(
+                    profileId: activeProfile?.id ?? "none",
+                    catalogRevision: homeCatalogRevision
+                ),
+                collectionsRevision: homeCollectionsRevision,
                 onNavigateToDetails: onNavigateToDetails,
                 onOpenCollectionFolder: onOpenCollectionFolder,
                 onResumePlayback: onResumePlayback,
@@ -1785,6 +1791,9 @@ private struct HomeTabBarScrollState: View {
 struct TVHomeView: View {
     @ObservedObject var store: TVHomeStore
     let repository: CatalogRepository
+    let isActive: Bool
+    let contentIdentity: TVHomeContentIdentity
+    let collectionsRevision: UInt
     let onNavigateToDetails: (String, String) -> Void
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
@@ -1813,10 +1822,11 @@ struct TVHomeView: View {
     @State private var landscapeFocusedId: String?
     @State private var focusWork = TVHomeFocusWork()
     @State private var rowScrollStore = TVHomeRowScrollStore()
-    @State private var addonReloadTask: Task<Void, Never>?
+    @State private var homeReloadTask: Task<Void, Never>?
     @State private var continueWatching: [ContinueWatchingItem] = []
     @State private var displayedProgressSource: TraktWatchProgressSource?
     @State private var continueWatchingRefreshGeneration = 0
+    @State private var continueWatchingRefreshTask: Task<Void, Never>?
     @State private var watchedTitleKeys: Set<String> = []
     @State private var errorMessage: String?
     @State private var didRequestInitialCardFocus = false
@@ -1911,9 +1921,9 @@ struct TVHomeView: View {
                         }
                 } else if let errorMessage, store.sections.isEmpty && continueWatching.isEmpty {
                     TVErrorView(message: errorMessage) {
-                        addonReloadTask?.cancel()
-                        addonReloadTask = Task { @MainActor in
-                            await loadWithAutomaticRetry()
+                        homeReloadTask?.cancel()
+                        homeReloadTask = Task { @MainActor in
+                            await loadWithAutomaticRetry(for: contentIdentity)
                         }
                     }
                 } else {
@@ -2095,18 +2105,22 @@ struct TVHomeView: View {
             .ignoresSafeArea(.container, edges: [.top, .bottom])
 
         }
-        .task {
-            await loadWithAutomaticRetry()
+        .task(id: contentIdentity) {
+            await loadWithAutomaticRetry(for: contentIdentity)
             await ContinueWatchingStore.refreshMissingEpisodeDetails()
         }
-        .task {
-            await refreshContinueWatchingFromSelectedSource()
+        .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
+            await refreshCollectionSections(for: contentIdentity)
         }
         .onAppear {
+            #if DEBUG
+            print("[ContinueWatching] Home appeared source=\(selectedProgressSource.rawValue)")
+            #endif
             // Classic was never a distinct layout; collapse legacy values to Modern.
             if homeLayout == "Classic" { homeLayout = "Modern" }
             refreshContinueWatching()
             refreshWatchedTitles()
+            scheduleContinueWatchingRefresh()
         }
         // Home stays mounted behind Details/Player, so `onAppear` no longer
         // fires on return. Refresh the Continue Watching row whenever the store
@@ -2115,18 +2129,20 @@ struct TVHomeView: View {
             refreshContinueWatching()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification)) { _ in
-            Task { await refreshContinueWatchingFromSelectedSource() }
+            scheduleContinueWatchingRefresh()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification)) { _ in
-            Task { await refreshContinueWatchingFromSelectedSource() }
+            scheduleContinueWatchingRefresh()
+        }
+        // TabView can keep Home mounted while Settings is selected, so returning
+        // to Home does not reliably produce another onAppear.
+        .onChange(of: isActive) { active in
+            if active {
+                scheduleContinueWatchingRefresh()
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
             refreshWatchedTitles()
-        }
-        // Collection rows arrive from the account sync, which usually lands
-        // after Home has loaded — splice them in when the store updates.
-        .onReceive(NotificationCenter.default.publisher(for: CollectionsStore.changedNotification)) { _ in
-            Task { await refreshCollectionSections() }
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
@@ -2135,28 +2151,14 @@ struct TVHomeView: View {
                 store.sections = reordered
             }
         }
-        // Add-on enable/order changes must replace the mounted catalog tree.
-        // Persisting the setting alone is not enough because `TVHomeStore`
-        // intentionally caches its sections while Home remains mounted.
-        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.addonOrderChangedNotification)) { _ in
-            addonReloadTask?.cancel()
-            addonReloadTask = Task { @MainActor in
-                await reloadHomeAfterCurrentLoad()
-            }
-        }
-        // Account sync applies add-on and Home-catalog settings after the
-        // initial Home load can already have cached its rows. Rebuild once the
-        // remote profile data is fully available so Better Posters and other
-        // synced catalogs appear without requiring an app relaunch.
-        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
-            addonReloadTask?.cancel()
-            addonReloadTask = Task { @MainActor in
-                await reloadHomeAfterCurrentLoad()
-            }
-        }
         .onDisappear {
+            #if DEBUG
+            print("[ContinueWatching] Home disappeared; cancelling refresh")
+            #endif
             focusWork.cancelAll()
-            addonReloadTask?.cancel()
+            homeReloadTask?.cancel()
+            continueWatchingRefreshTask?.cancel()
+            continueWatchingRefreshTask = nil
             continueWatchingRefreshGeneration &+= 1
         }
         .onChange(of: isLoading) { loading in
@@ -2582,12 +2584,12 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private func loadWithAutomaticRetry() async {
+    private func loadWithAutomaticRetry(for identity: TVHomeContentIdentity) async {
         let maximumAttempts = 3
         for attempt in 0..<maximumAttempts {
-            await load()
+            await load(for: identity)
             guard !Task.isCancelled else { return }
-            if store.hasLoaded {
+            if store.isLoaded(for: identity) {
                 // Add-on rows are best-effort, so a partial response is still
                 // useful. Keep it visible, wait briefly, then replace the tree
                 // once instead of caching the omission for the whole session.
@@ -2597,7 +2599,7 @@ struct TVHomeView: View {
                 } catch {
                     return
                 }
-                await reloadHomeForAddonChange()
+                await load(for: identity, forceReload: true)
                 return
             }
             guard attempt < maximumAttempts - 1 else { return }
@@ -2613,7 +2615,10 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private func load() async {
+    private func load(
+        for identity: TVHomeContentIdentity,
+        forceReload: Bool = false
+    ) async {
         // Progress is local/account-synced state and does not depend on the
         // catalog network request below. Publish it first so Home is useful
         // even while a large add-on is still resolving its rows.
@@ -2623,13 +2628,14 @@ struct TVHomeView: View {
         // Returning from a card: the catalog is still cached in the store, so
         // skip the network round-trip. The saved card re-focuses itself via
         // `initialFocusCardKey`, which restores the row/scroll position too.
-        if store.hasLoaded {
+        if !forceReload, store.isLoaded(for: identity) {
             isLoading = false
             refreshContinueWatching()
             refreshWatchedTitles()
             return
         }
 
+        let generation = store.beginLoad(for: identity)
         isLoading = true
         errorMessage = nil
 
@@ -2637,6 +2643,7 @@ struct TVHomeView: View {
         // their folder rows before starting provider requests so a slow catalog
         // host cannot hold the user's collections off Home.
         let collectionSections = await loadCollectionSections()
+        guard store.isCurrentLoad(generation, for: identity) else { return }
         let previouslyLoadedCatalogSections = store.sections.filter { !$0.isCollectionRow }
         publishHomeSections(
             catalogSections: previouslyLoadedCatalogSections,
@@ -2644,13 +2651,15 @@ struct TVHomeView: View {
             resetFocusIfEmpty: true
         )
 
+        var receivedCatalogUpdate = false
         do {
-            var receivedCatalogUpdate = false
             var latestCatalogSections: [TVHomeSection] = []
             for try await catalogs in repository.homeCatalogsProgressively() {
                 try Task.checkCancellation()
+                guard store.isCurrentLoad(generation, for: identity) else { return }
                 let catalogSections = await makeHomeCatalogSections(from: catalogs)
                 try Task.checkCancellation()
+                guard store.isCurrentLoad(generation, for: identity) else { return }
                 latestCatalogSections = catalogSections
                 receivedCatalogUpdate = receivedCatalogUpdate || !catalogSections.isEmpty
                 let loadedIds = Set(catalogSections.map(\.id))
@@ -2669,6 +2678,7 @@ struct TVHomeView: View {
             guard receivedCatalogUpdate || !collectionSections.isEmpty else {
                 throw URLError(.cannotLoadFromNetwork)
             }
+            guard store.isCurrentLoad(generation, for: identity) else { return }
             publishHomeSections(
                 catalogSections: receivedCatalogUpdate
                     ? latestCatalogSections
@@ -2676,18 +2686,23 @@ struct TVHomeView: View {
                 collectionSections: collectionSections,
                 resetFocusIfEmpty: true
             )
-            store.hasLoaded = true
+            store.finishLoad(generation, for: identity)
             refreshContinueWatching()
             refreshWatchedTitles()
             isLoading = false
         } catch is CancellationError {
+            guard store.isCurrentLoad(generation, for: identity) else { return }
+            store.cancelLoad(generation, for: identity)
             isLoading = false
         } catch {
+            guard store.isCurrentLoad(generation, for: identity) else { return }
             errorMessage = error.localizedDescription
             // Synced collections or progressively loaded catalogs remain useful
             // even if another provider failed after they were published.
-            if !store.sections.isEmpty {
-                store.hasLoaded = true
+            if receivedCatalogUpdate || !collectionSections.isEmpty {
+                store.finishLoad(generation, for: identity)
+            } else {
+                store.cancelLoad(generation, for: identity)
             }
             isLoading = false
         }
@@ -2772,45 +2787,6 @@ struct TVHomeView: View {
         shouldRestoreHomeFocus = false
     }
 
-    @MainActor
-    private func reloadHomeAfterCurrentLoad() async {
-        // Account sync often lands while the four base Cinemeta rows are still
-        // loading. Wait for that request to publish, then run one replacement
-        // load using the newly applied add-ons instead of dropping the event.
-        while isLoading && !store.hasLoaded {
-            do {
-                try await Task.sleep(nanoseconds: 200_000_000)
-            } catch {
-                return
-            }
-        }
-        guard !Task.isCancelled else { return }
-        await reloadHomeForAddonChange()
-    }
-
-    @MainActor
-    private func reloadHomeForAddonChange() async {
-        guard !Task.isCancelled else { return }
-
-        // Direct callers must not overlap the initial request. Notification
-        // callers use `reloadHomeAfterCurrentLoad()` above and therefore queue.
-        guard store.hasLoaded || !isLoading else { return }
-
-        // Keep the last successful rows mounted while the replacement tree is
-        // fetched. A slow/dead add-on must never blank Home or hide Continue
-        // Watching; `load()` swaps in the new tree only after it completes.
-        let hadUsableSections = !store.sections.isEmpty
-        store.hasLoaded = false
-        isLoading = true
-        errorMessage = nil
-        await load()
-        // A failed replacement must not invalidate the rows it deliberately
-        // kept mounted. They remain the last known-good Home cache.
-        if !store.hasLoaded && hadUsableSections {
-            store.hasLoaded = true
-        }
-    }
-
     /// Builds one Home row per synced collection with emoji/folder cards.
     /// Uses the same vertical paging / spacing rhythm as catalog rows
     /// (`TVHomeLayout`, measured heights, neighbor materialization) so the
@@ -2857,9 +2833,20 @@ struct TVHomeView: View {
 
     /// Re-resolves collection rows in place after a sync pull / local edit
     /// lands while Home is already loaded, without disturbing catalog rows.
-    private func refreshCollectionSections() async {
-        guard store.hasLoaded else { return }
+    private func refreshCollectionSections(for identity: TVHomeContentIdentity) async {
+        // The revision is retained even if it changes during the initial catalog
+        // request. Wait for that identity to finish, then apply the latest store
+        // snapshot instead of dropping an early collection update.
+        while store.isLoading(for: identity) {
+            do {
+                try await Task.sleep(nanoseconds: 100_000_000)
+            } catch {
+                return
+            }
+        }
+        guard store.isLoaded(for: identity) else { return }
         let fresh = await loadCollectionSections()
+        guard store.isLoaded(for: identity) else { return }
         let catalogRows = store.sections.filter { !$0.isCollectionRow }
         let pinned = fresh.filter(\.isPinnedCollection)
         let unpinned = fresh.filter { !$0.isPinnedCollection }
@@ -3046,10 +3033,10 @@ struct TVHomeView: View {
     }
 
     private func refreshContinueWatching() {
-        guard !usesTraktProgress else {
-            if displayedProgressSource != .trakt {
+        guard !usesRemoteProgress else {
+            if displayedProgressSource != selectedProgressSource {
                 continueWatching = []
-                displayedProgressSource = .trakt
+                displayedProgressSource = selectedProgressSource
             }
             return
         }
@@ -3057,38 +3044,93 @@ struct TVHomeView: View {
         displayedProgressSource = .nuvioSync
     }
 
+    private func scheduleContinueWatchingRefresh() {
+        guard isActive else { return }
+        #if DEBUG
+        print("[ContinueWatching] Scheduling source=\(selectedProgressSource.rawValue)")
+        #endif
+        continueWatchingRefreshTask?.cancel()
+        continueWatchingRefreshTask = Task {
+            await refreshContinueWatchingFromSelectedSource()
+        }
+    }
+
     @MainActor
     private func refreshContinueWatchingFromSelectedSource() async {
         continueWatchingRefreshGeneration &+= 1
         let generation = continueWatchingRefreshGeneration
         let profileID = ContinueWatchingStore.activeProfileId
+        let source = selectedProgressSource
 
-        // Watched history is authoritative whenever Trakt is connected, even
-        // when the user keeps resume progress in Nuvio Sync.
-        if TraktAuthStore.state.isAuthenticated {
-            let traktStore = ProfileSettings.current
-            _ = await TraktHistoryService.syncWatchedHistory(store: traktStore)
+        #if DEBUG
+        print("[ContinueWatching] Refresh \(generation) started source=\(source.rawValue) profile=\(profileID ?? "none")")
+        #endif
+        refreshContinueWatching()
+        guard usesRemoteProgress else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) using local source")
+            #endif
+            return
         }
 
-        refreshContinueWatching()
-        guard usesTraktProgress else { return }
-
-        let items = await TraktProgressService.fetchContinueWatching(repository: repository)
-        guard !Task.isCancelled,
-              generation == continueWatchingRefreshGeneration,
-              profileID == ContinueWatchingStore.activeProfileId,
-              usesTraktProgress,
-              let items else { return }
+        let items = await TraktProgressService.fetchContinueWatching(
+            repository: repository,
+            source: source
+        )
+        guard !Task.isCancelled else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) discarded: task cancelled")
+            #endif
+            return
+        }
+        guard generation == continueWatchingRefreshGeneration else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) discarded: newer generation \(continueWatchingRefreshGeneration)")
+            #endif
+            return
+        }
+        guard profileID == ContinueWatchingStore.activeProfileId else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) discarded: profile changed")
+            #endif
+            return
+        }
+        guard source == selectedProgressSource, usesRemoteProgress else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) discarded: source changed")
+            #endif
+            return
+        }
+        guard let items else {
+            #if DEBUG
+            print("[ContinueWatching] Refresh \(generation) failed: provider returned nil")
+            #endif
+            return
+        }
+        #if DEBUG
+        print("[ContinueWatching] Refresh \(generation) displaying \(items.count) items")
+        #endif
         continueWatching = items.filter { isVisible($0.meta) }
-        displayedProgressSource = .trakt
+        displayedProgressSource = source
+
+        // Continue Watching is visible now. Refresh watched checkmarks afterward
+        // so a full history sync never blocks the row during a source switch.
+        switch source {
+        case .nuvioSync:
+            break
+        case .trakt:
+            _ = await TraktHistoryService.syncWatchedHistory()
+        case .simkl:
+            _ = await SimklHistoryService.syncWatchedHistory()
+        }
     }
 
     private var selectedProgressSource: TraktWatchProgressSource {
         TraktSettingsStore.watchProgressSource
     }
 
-    private var usesTraktProgress: Bool {
-        selectedProgressSource == .trakt && TraktAuthStore.state.isAuthenticated
+    private var usesRemoteProgress: Bool {
+        RemoteTrackingState.isProgressSourceAuthenticated
     }
 
     private func refreshWatchedTitles() {
@@ -3243,6 +3285,14 @@ enum TVHomeCatalogOrder {
     }
 }
 
+/// Cache key for the profile-scoped inputs that build Home's catalog tree.
+/// The sync revision is retained by `NuvioSyncManager`, so Home sees the latest
+/// identity even when account sync finishes before this view is mounted.
+struct TVHomeContentIdentity: Hashable {
+    let profileId: String
+    let catalogRevision: UInt
+}
+
 /// Holds the Home screen's browsing state outside `TVHomeView` so it survives
 /// the details/player push (which tears the view down). Owned by `ContentView`;
 /// lets returning from a card restore the cached catalog + the focused card
@@ -3250,17 +3300,74 @@ enum TVHomeCatalogOrder {
 final class TVHomeStore: ObservableObject {
     @Published var sections: [TVHomeSection] = []
     @Published var hero: NuvioMeta?
-    /// True once the catalog has loaded at least once, so `load()` can skip the
-    /// network round-trip on return.
-    @Published var hasLoaded = false
+    /// True when any last-known-good tree is available. Cache reuse additionally
+    /// requires `loadedContentIdentity` to match the requested profile/revision.
+    @Published private(set) var hasLoaded = false
     /// Composite "<sectionId>\u{1}<metaId>" key of the last focused card.
     var lastFocusedCardID: String?
+    private var loadedContentIdentity: TVHomeContentIdentity?
+    private var loadingContentIdentity: TVHomeContentIdentity?
+    private var loadGeneration: UInt = 0
+
+    func isLoaded(for identity: TVHomeContentIdentity) -> Bool {
+        hasLoaded && loadedContentIdentity == identity
+    }
+
+    func isLoading(for identity: TVHomeContentIdentity) -> Bool {
+        loadingContentIdentity == identity
+    }
+
+    @discardableResult
+    func beginLoad(for identity: TVHomeContentIdentity) -> UInt {
+        let previousProfileId = loadedContentIdentity?.profileId
+            ?? loadingContentIdentity?.profileId
+        if let previousProfileId, previousProfileId != identity.profileId {
+            sections = []
+            hero = nil
+            lastFocusedCardID = nil
+            loadedContentIdentity = nil
+        }
+
+        loadGeneration &+= 1
+        loadingContentIdentity = identity
+        hasLoaded = false
+        return loadGeneration
+    }
+
+    func isCurrentLoad(
+        _ generation: UInt,
+        for identity: TVHomeContentIdentity
+    ) -> Bool {
+        loadGeneration == generation && loadingContentIdentity == identity
+    }
+
+    func finishLoad(
+        _ generation: UInt,
+        for identity: TVHomeContentIdentity
+    ) {
+        guard isCurrentLoad(generation, for: identity) else { return }
+        loadedContentIdentity = identity
+        loadingContentIdentity = nil
+        hasLoaded = true
+    }
+
+    func cancelLoad(
+        _ generation: UInt,
+        for identity: TVHomeContentIdentity
+    ) {
+        guard isCurrentLoad(generation, for: identity) else { return }
+        loadingContentIdentity = nil
+        hasLoaded = loadedContentIdentity != nil
+    }
 
     func reset() {
+        loadGeneration &+= 1
         sections = []
         hero = nil
         hasLoaded = false
         lastFocusedCardID = nil
+        loadedContentIdentity = nil
+        loadingContentIdentity = nil
     }
 }
 

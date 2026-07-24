@@ -10,7 +10,7 @@ struct PlayerView: View {
     let subtitle: String
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
-    /// Episode context for the Netflix-style auto-play. Empty for movies/trailers.
+    /// Episode context for the in-player Next Episode card. Empty for movies/trailers.
     var episodes: [NuvioVideo] = []
     var currentEpisode: NuvioVideo? = nil
     var autoPlayNextEnabled: Bool = true
@@ -255,10 +255,9 @@ struct PlayerView: View {
                 .zIndex(3)
             }
 
-            // Netflix-style next-episode prompt, shown near the end. Visible even
-            // when the transport controls are up (raised above them); focusable
-            // only when the controls are down so it doesn't fight them for focus.
-            // Left/Right still fast-forward, which cancels the countdown.
+            // Next-episode prompt, shown near the end. It auto-hides like the skip
+            // card, returns with the transport controls, and advances only when
+            // the user selects it.
             if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
                 Button(action: { viewModel.playNextEpisode() }) {
                     NextEpisodeOverlay(

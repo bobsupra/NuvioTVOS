@@ -2266,7 +2266,7 @@ enum WatchedStore {
         // failed write does not drop resume progress with nothing to replace it.
         ContinueWatchingStore.removeWatched([item])
         let traktStore = ProfileSettings.current
-        if TraktAuthStore.state(in: traktStore).isAuthenticated(in: traktStore) {
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
             let profileId = activeProfileId
             _ = enqueuePendingTraktMutation(
                 meta: meta,
@@ -2277,6 +2277,17 @@ enum WatchedStore {
             )
             Task {
                 _ = await TraktHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: true,
+                    store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: traktStore) {
+            Task {
+                _ = await SimklHistoryService.setWatched(
                     meta,
                     season: season,
                     episode: episode,
@@ -2346,23 +2357,35 @@ enum WatchedStore {
         episode: Int?
     ) {
         let traktStore = ProfileSettings.current
-        guard TraktAuthStore.state(in: traktStore).isAuthenticated(in: traktStore) else { return }
-        let profileId = activeProfileId
-        _ = enqueuePendingTraktMutation(
-            meta: meta,
-            season: season,
-            episode: episode,
-            isWatched: false,
-            profileId: profileId
-        )
-        Task {
-            _ = await TraktHistoryService.setWatched(
-                meta,
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
+            let profileId = activeProfileId
+            _ = enqueuePendingTraktMutation(
+                meta: meta,
                 season: season,
                 episode: episode,
                 isWatched: false,
-                store: traktStore
+                profileId: profileId
             )
+            Task {
+                _ = await TraktHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: false,
+                    store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: traktStore) {
+            Task {
+                _ = await SimklHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: false,
+                    store: traktStore
+                )
+            }
         }
     }
 
@@ -2435,6 +2458,30 @@ enum WatchedStore {
         }
         confirmPendingTraktMutations(against: remoteItems)
         return true
+    }
+
+    /// Applies Simkl's cached remote snapshot while removing only rows that
+    /// were previously supplied by Simkl. Local or Trakt-only marks are not
+    /// treated as deletions, and marks created while the pull was running win.
+    @discardableResult
+    static func reconcileSimklSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        previousRemoteItems: [WatchedStoreItem],
+        syncStartedAt: Date
+    ) -> Bool {
+        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
+
+        let currentRemoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
+        let removedRemoteKeys = Set(previousRemoteItems.flatMap(watchedIdentityKeys))
+            .subtracting(currentRemoteKeys)
+        guard !removedRemoteKeys.isEmpty else { return true }
+
+        let current = items()
+        let updated = current.filter { item in
+            guard item.watchedAt <= syncStartedAt else { return true }
+            return watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys)
+        }
+        return updated.count == current.count || persist(updated)
     }
 
     static func sameContent(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
@@ -3054,9 +3101,16 @@ enum ProfileSettings {
     /// writing into a removed suite.
     static func eraseAll(profileIds: [String]) {
         current = .standard
+        let simklTokenStorage = SimklKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
+            simklTokenStorage.setAccessToken(nil, for: id)
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
         }
+        SimklAuthStore.clearAuth(
+            profileScope: "default",
+            store: .standard,
+            tokenStorage: simklTokenStorage
+        )
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)
         }

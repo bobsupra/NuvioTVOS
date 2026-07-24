@@ -87,7 +87,7 @@ class PlayerViewModel: ObservableObject {
     /// Seconds to wait after pausing before the metadata sheet appears.
     private static let pauseOverlayDelaySeconds: UInt64 = 5
 
-    // MARK: Next-episode auto-play
+    // MARK: Next episode
 
     /// The episode that will play after this one, if any. Drives the Next
     /// Episode card; nil for movies, trailers, or the last episode.
@@ -95,8 +95,7 @@ class PlayerViewModel: ObservableObject {
     /// Whether the Next Episode card is visible (near the end of an episode
     /// that has a follow-up).
     @Published var showNextEpisodeCard: Bool = false
-    /// Seconds left on the auto-play countdown, or nil when there is no active
-    /// countdown (auto-play off, cancelled by a fast-forward, or not started).
+    /// Seconds left before the card auto-hides, or nil while controls are shown.
     @Published var nextEpisodeCountdown: Int?
     /// True while the next episode's stream is being resolved and loaded, so the
     /// card can show a spinner instead of a Play button.
@@ -117,22 +116,14 @@ class PlayerViewModel: ObservableObject {
     /// Resolves a next episode into a ready-to-play stream, provided by the app
     /// layer (reuses the details screen's add-on fetch + smart selection).
     private var resolveNextStream: ((NuvioVideo) async -> PreparedNextStream?)?
-    /// Master toggle from Settings → "Auto-Play Next Episode".
-    private var autoPlayNextEnabled: Bool = true
-    /// Set when the user fast-forwards with the card up: they may be watching
-    /// credits or a post-credit scene, so the countdown is cancelled (the card
-    /// stays for a manual Play). Reset on each new episode.
-    private var autoAdvanceDisabled: Bool = false
     private var isAdvanceInFlight: Bool = false
-    /// Wall-clock moment the auto-advance fires, set when the card first arms so
-    /// the countdown is a fixed 10s from the card appearing (skips the credits)
-    /// rather than tracking the video's final seconds.
-    private var autoAdvanceDeadline: Date?
+    private var autoHiddenNextEpisodeCard = false
+    private var nextEpisodeAutoHideDeadline: Date?
     /// Fallback when IntroDB has no ending marker: show the Next Episode card
     /// this many seconds before the end. When an ending skip exists, the card
     /// arms at the same moment as Skip Ending instead.
     private static let nextCardLeadSeconds: Double = 120
-    private static let autoCountdownSeconds = 10
+    private static let nextEpisodeAutoHideSeconds = 5
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
 
@@ -594,7 +585,7 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Next-episode auto-play
+    // MARK: - Next episode
 
     /// Supplies the series context and the resolver that turns a next episode
     /// into a ready-to-play stream. Called by PlayerView once per presented
@@ -607,12 +598,14 @@ class PlayerViewModel: ObservableObject {
     ) {
         seriesEpisodes = episodes
         currentEpisodeVideo = current
-        autoPlayNextEnabled = autoPlayEnabled
+        // Auto-play is temporarily disabled. Keep accepting the setting so the
+        // player configuration API does not need to change.
+        _ = autoPlayEnabled
         resolveNextStream = resolver
-        autoAdvanceDisabled = false
+        autoHiddenNextEpisodeCard = false
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
-        autoAdvanceDeadline = nil
+        nextEpisodeAutoHideDeadline = nil
         nextEpisode = Self.nextEpisode(after: current, in: episodes)
     }
 
@@ -633,7 +626,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     /// Re-evaluated on every poll tick: shows the card with Skip Ending (when
-    /// IntroDB has an outro) and runs the auto-play countdown once armed.
+    /// IntroDB has an outro) and auto-hides it like the Skip Intro card.
     private func updateNextEpisodeState() {
         guard let _ = nextEpisode,
               subtitle != PlaybackMarkers.trailerSubtitle,
@@ -648,22 +641,39 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        if !showNextEpisodeCard { showNextEpisodeCard = true }
-        guard autoPlayNextEnabled, !autoAdvanceDisabled, nextEpisodeIsPlayable else {
+        if autoHiddenNextEpisodeCard {
+            if showNextEpisodeCard != showControls {
+                showNextEpisodeCard = showControls
+            }
             if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
-            autoAdvanceDeadline = nil
+            nextEpisodeAutoHideDeadline = nil
             return
         }
 
-        // Fixed 10s countdown from when the card first arms, so it advances a few
-        // seconds into the credits instead of waiting for the very end.
-        if autoAdvanceDeadline == nil {
-            autoAdvanceDeadline = Date().addingTimeInterval(Double(Self.autoCountdownSeconds))
+        if !showNextEpisodeCard { showNextEpisodeCard = true }
+
+        if showControls {
+            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
+            nextEpisodeAutoHideDeadline = nil
+            return
         }
-        let secondsLeft = autoAdvanceDeadline?.timeIntervalSinceNow ?? 0
-        let countdown = max(0, Int(secondsLeft.rounded(.up)))
-        if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
-        if secondsLeft <= 0.05 { advance(userInitiated: false) }
+
+        if nextEpisodeAutoHideDeadline == nil {
+            nextEpisodeAutoHideDeadline = Date().addingTimeInterval(Double(Self.nextEpisodeAutoHideSeconds))
+            nextEpisodeCountdown = Self.nextEpisodeAutoHideSeconds
+        }
+
+        guard let deadline = nextEpisodeAutoHideDeadline else { return }
+        let secondsLeft = deadline.timeIntervalSinceNow
+        if secondsLeft <= 0.05 {
+            autoHiddenNextEpisodeCard = true
+            showNextEpisodeCard = false
+            nextEpisodeCountdown = nil
+            nextEpisodeAutoHideDeadline = nil
+        } else {
+            let countdown = max(1, Int(secondsLeft.rounded(.up)))
+            if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
+        }
     }
 
     /// Prefer IntroDB ending start so Next Episode and Skip Ending appear together.
@@ -682,7 +692,8 @@ class PlayerViewModel: ObservableObject {
     private func clearNextEpisodeCard() {
         if showNextEpisodeCard { showNextEpisodeCard = false }
         if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
-        autoAdvanceDeadline = nil
+        autoHiddenNextEpisodeCard = false
+        nextEpisodeAutoHideDeadline = nil
     }
 
     // MARK: - IntroDB skip segments
@@ -787,15 +798,10 @@ class PlayerViewModel: ObservableObject {
 
     /// Play the next episode now (the card's Play button).
     func playNextEpisode() {
-        advance(userInitiated: true)
+        advance()
     }
 
-    private var canAutoAdvanceOnEnd: Bool {
-        nextEpisode != nil && nextEpisodeIsPlayable && autoPlayNextEnabled && !autoAdvanceDisabled
-            && subtitle != PlaybackMarkers.trailerSubtitle
-    }
-
-    private func advance(userInitiated: Bool) {
+    private func advance() {
         guard !isAdvanceInFlight,
               let next = nextEpisode,
               EpisodeReleasePolicy.hasAired(next.released),
@@ -835,7 +841,6 @@ class PlayerViewModel: ObservableObject {
                 // end-of-playback flow (which returns to the details screen).
                 isAdvanceInFlight = false
                 isAdvancingEpisode = false
-                autoAdvanceDisabled = true
                 status = .ended
                 return
             }
@@ -861,10 +866,10 @@ class PlayerViewModel: ObservableObject {
             currentEpisodeVideo = episode
             nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
         }
-        autoAdvanceDisabled = false
+        autoHiddenNextEpisodeCard = false
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
-        autoAdvanceDeadline = nil
+        nextEpisodeAutoHideDeadline = nil
         isAdvanceInFlight = false
         isAdvancingEpisode = false
         isReloadingStream = false
@@ -899,6 +904,8 @@ class PlayerViewModel: ObservableObject {
         isSwitchingSource = false
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
+        autoHiddenNextEpisodeCard = false
+        nextEpisodeAutoHideDeadline = nil
         status = .error("This stream link has expired. Go back and start it again to load a fresh stream.")
     }
 
@@ -983,7 +990,8 @@ class PlayerViewModel: ObservableObject {
         reloadAttempts += 1
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
-        autoAdvanceDeadline = nil
+        autoHiddenNextEpisodeCard = false
+        nextEpisodeAutoHideDeadline = nil
         status = .buffering
         engine.pausePlayback()
         if let toast { showPlayerToast(toast) }
@@ -1134,15 +1142,6 @@ class PlayerViewModel: ObservableObject {
         updateSkipIntervalState()
 
         if c.isPlayerEnded {
-            // Roll straight into the next episode instead of ending, when armed —
-            // but only on a genuine watch-through. mpv can momentarily report
-            // "ended" while a fresh stream is still loading (position ~0); without
-            // this position check that would wrongly clear Continue Watching and
-            // jump to the following episode.
-            if canAutoAdvanceOnEnd, time.duration >= 60, time.current / time.duration >= 0.85 {
-                advance(userInitiated: false)
-                return
-            }
             // Only a genuine watch-through counts. A stream that dies early
             // (expired link, decode error) also reports "ended", and that must
             // neither mark the title watched nor wipe the resume point.
@@ -1393,7 +1392,6 @@ class PlayerViewModel: ObservableObject {
         // 32 minutes remaining after seeking to 5 minutes remaining).
         lastStablePlaybackTime = snapshot
         explicitSeekProgressCheckpoint = (snapshot, Date())
-        if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
     }
 
     private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
@@ -1800,8 +1798,6 @@ class PlayerViewModel: ObservableObject {
             pendingSeekDelta = target - position
         }
 
-        if showNextEpisodeCard { disableAutoAdvanceForCurrentEpisode() }
-
         // Left/right skip always dismisses the pause metadata sheet so SeekHUD /
         // transport can take over (same idea as Android onUserInteraction).
         if showPauseOverlay {
@@ -1860,15 +1856,6 @@ class PlayerViewModel: ObservableObject {
                 scheduleControlsHide()
             }
         }
-    }
-
-    /// Cancels the countdown for the current episode after a manual seek; the
-    /// Next Episode card remains so the user can still advance by hand.
-    func disableAutoAdvanceForCurrentEpisode() {
-        guard !autoAdvanceDisabled else { return }
-        autoAdvanceDisabled = true
-        nextEpisodeCountdown = nil
-        autoAdvanceDeadline = nil
     }
 
     func setSpeed(_ speed: PlaybackSpeed) {
@@ -2692,8 +2679,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private var usesTraktProgress: Bool {
-        TraktSettingsStore.watchProgressSource == .trakt &&
-            TraktAuthStore.state.isAuthenticated
+        RemoteTrackingState.isProgressSourceAuthenticated
     }
 
     private func reportTraktProgress(
@@ -2709,6 +2695,25 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
+        let episodeNumbers = resolvedEpisodeNumbers
+        if TraktSettingsStore.watchProgressSource == .simkl,
+           didStartTraktScrobble,
+           action == nil,
+           !force {
+            // Simkl extrapolates between real player events and explicitly
+            // warns against periodic heartbeat scrobbles. Keep the optimistic
+            // local resume point current without making another API request.
+            TraktProgressService.recordLocalPlayback(
+                meta: meta,
+                position: playbackTime.current,
+                duration: playbackTime.duration,
+                season: episodeNumbers?.season,
+                episode: episodeNumbers?.episode,
+                notify: false
+            )
+            return
+        }
+
         let now = Date()
         guard force || now.timeIntervalSince(lastTraktProgressReport) >= Self.traktProgressReportInterval else {
             return
@@ -2719,7 +2724,6 @@ class PlayerViewModel: ObservableObject {
         didStartTraktScrobble = true
         if scrobbleAction == .stop { didQueueTraktStop = true }
         lastTraktProgressReport = now
-        let episodeNumbers = resolvedEpisodeNumbers
         let traktStore = ProfileSettings.current
 
         TraktProgressService.recordLocalPlayback(
@@ -2774,10 +2778,6 @@ class PlayerViewModel: ObservableObject {
             return true
         }
         return playbackTime.current / playbackTime.duration >= 0.90
-    }
-
-    private var nextEpisodeIsPlayable: Bool {
-        nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) } ?? false
     }
 
     /// Season/episode for the item currently playing. Prefer the structured

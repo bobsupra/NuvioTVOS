@@ -240,21 +240,21 @@ class DetailsViewModel: ObservableObject {
 
     func toggleWatchlist() {
         guard let meta = uiState.meta else { return }
-        if TraktSettingsStore.librarySourceMode != .trakt {
+        if TraktSettingsStore.librarySourceMode == .local {
             uiState.isInWatchlist = LibraryStore.toggle(meta: meta)
             return
         }
 
         // A Trakt-selected library must never silently fall back to Nuvio
         // Sync. Without a live Trakt session, leave the state unchanged.
-        guard TraktAuthStore.state.isAuthenticated else { return }
+        guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
 
         // Keep Details responsive, then let LibraryViewModel refresh the
         // Trakt-backed list from the notification posted after the mutation.
         let desiredMembership = !uiState.isInWatchlist
         uiState.isInWatchlist = desiredMembership
         Task {
-            let succeeded = await TraktLibraryService.setWatchlist(
+            let succeeded = await SelectedLibraryService.setWatchlist(
                 meta,
                 isInWatchlist: desiredMembership
             )

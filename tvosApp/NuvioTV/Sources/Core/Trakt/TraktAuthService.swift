@@ -45,11 +45,13 @@ enum TraktConnectionMode {
 
 enum TraktWatchProgressSource: String, CaseIterable {
     case trakt = "TRAKT"
+    case simkl = "SIMKL"
     case nuvioSync = "NUVIO_SYNC"
 
     var label: String {
         switch self {
         case .trakt: return "Trakt"
+        case .simkl: return "Simkl"
         case .nuvioSync: return "Nuvio Sync"
         }
     }
@@ -57,11 +59,13 @@ enum TraktWatchProgressSource: String, CaseIterable {
 
 enum TraktLibrarySourceMode: String, CaseIterable {
     case trakt = "TRAKT"
+    case simkl = "SIMKL"
     case local = "LOCAL"
 
     var label: String {
         switch self {
         case .trakt: return "Trakt"
+        case .simkl: return "Simkl"
         case .local: return "Nuvio Library"
         }
     }
@@ -329,14 +333,18 @@ enum TraktSettingsStore {
 
     static var librarySourceMode: TraktLibrarySourceMode {
         get {
-            let raw = ProfileSettings.current.string(forKey: SettingsKey.traktLibrarySourceMode)
-            return TraktLibrarySourceMode(rawValue: raw ?? "") ?? TraktDefaults.librarySourceMode
+            librarySourceMode(in: ProfileSettings.current)
         }
         set {
             guard newValue != librarySourceMode else { return }
             ProfileSettings.current.set(newValue.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
             NotificationCenter.default.post(name: libraryChangedNotification, object: nil)
         }
+    }
+
+    static func librarySourceMode(in defaults: UserDefaults) -> TraktLibrarySourceMode {
+        let raw = defaults.string(forKey: SettingsKey.traktLibrarySourceMode)
+        return TraktLibrarySourceMode(rawValue: raw ?? "") ?? TraktDefaults.librarySourceMode
     }
 
     static var moreLikeThisSource: TraktMoreLikeThisSource {
@@ -355,6 +363,48 @@ enum TraktSettingsStore {
     private static func normalizeContinueWatchingDaysCap(_ days: Int) -> Int {
         if days == TraktDefaults.continueWatchingDaysCapAll { return days }
         return min(max(days, 7), 365)
+    }
+}
+
+enum RemoteTrackingState {
+    static var isProgressSourceAuthenticated: Bool {
+        isProgressSourceAuthenticated(in: ProfileSettings.current)
+    }
+
+    static func isProgressSourceAuthenticated(in store: UserDefaults) -> Bool {
+        switch TraktSettingsStore.watchProgressSource(in: store) {
+        case .nuvioSync:
+            return false
+        case .trakt:
+            return TraktAuthStore.state(in: store).isAuthenticated(in: store)
+        case .simkl:
+            return SimklRuntimeSession.authenticatedState(store: store) != nil
+        }
+    }
+
+    static func routesWatchedHistory(
+        to target: TraktWatchProgressSource,
+        selectedSource: TraktWatchProgressSource
+    ) -> Bool {
+        target != .nuvioSync && target == selectedSource
+    }
+
+    static func shouldSyncWatchedHistory(
+        to target: TraktWatchProgressSource,
+        in store: UserDefaults = ProfileSettings.current
+    ) -> Bool {
+        let selectedSource = TraktSettingsStore.watchProgressSource(in: store)
+        guard routesWatchedHistory(to: target, selectedSource: selectedSource) else {
+            return false
+        }
+        switch target {
+        case .nuvioSync:
+            return false
+        case .trakt:
+            return TraktAuthStore.state(in: store).isAuthenticated(in: store)
+        case .simkl:
+            return SimklRuntimeSession.authenticatedState(store: store) != nil
+        }
     }
 }
 
@@ -785,11 +835,13 @@ struct TraktProgressService {
 
     private struct LocalPlaybackCheckpoint {
         let profileId: String?
+        let source: TraktWatchProgressSource
         let item: ContinueWatchingItem
     }
 
     private struct ContinueWatchingSnapshot {
         let profileId: String?
+        let source: TraktWatchProgressSource
         let items: [ContinueWatchingItem]
     }
 
@@ -803,15 +855,23 @@ struct TraktProgressService {
     /// a replacement Trakt fetch is still in flight.
     private static var continueWatchingSnapshots: [ContinueWatchingSnapshot] = []
 
-    static func currentContinueWatchingItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
+    static func currentContinueWatchingItem(
+        for meta: NuvioMeta,
+        source sourceOverride: TraktWatchProgressSource? = nil
+    ) -> ContinueWatchingItem? {
         pruneExpiredLocalCheckpoints()
         let profileId = ContinueWatchingStore.activeProfileId
+        let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
         if let local = localPlaybackCheckpoints.first(where: {
-            $0.profileId == profileId && WatchedStore.sameContent($0.item.meta, meta)
+            $0.profileId == profileId
+                && $0.source == source
+                && WatchedStore.sameContent($0.item.meta, meta)
         })?.item {
             return local
         }
-        return continueWatchingSnapshots.first(where: { $0.profileId == profileId })?
+        return continueWatchingSnapshots.first(where: {
+            $0.profileId == profileId && $0.source == source
+        })?
             .items.first(where: { WatchedStore.sameContent($0.meta, meta) })
     }
 
@@ -821,6 +881,7 @@ struct TraktProgressService {
         duration: Double,
         season: Int?,
         episode: Int?,
+        source sourceOverride: TraktWatchProgressSource? = nil,
         notify: Bool
     ) {
         guard position.isFinite,
@@ -829,8 +890,11 @@ struct TraktProgressService {
               duration > 0 else { return }
 
         let profileId = ContinueWatchingStore.activeProfileId
+        let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
         localPlaybackCheckpoints.removeAll {
-            $0.profileId == profileId && WatchedStore.sameContent($0.item.meta, meta)
+            $0.profileId == profileId
+                && $0.source == source
+                && WatchedStore.sameContent($0.item.meta, meta)
         }
 
         let progressPercent = position / duration * 100
@@ -841,6 +905,7 @@ struct TraktProgressService {
             localPlaybackCheckpoints.append(
                 LocalPlaybackCheckpoint(
                     profileId: profileId,
+                    source: source,
                     item: ContinueWatchingItem(
                         meta: meta,
                         streamUrl: "",
@@ -858,7 +923,11 @@ struct TraktProgressService {
                 )
             )
         } else {
-            removeFromContinueWatchingSnapshot(meta: meta, profileId: profileId)
+            removeFromContinueWatchingSnapshot(
+                meta: meta,
+                profileId: profileId,
+                source: source
+            )
         }
 
         if notify {
@@ -870,62 +939,101 @@ struct TraktProgressService {
     }
 
     static func fetchContinueWatching(
-        repository: CatalogRepository
+        repository: CatalogRepository,
+        source sourceOverride: TraktWatchProgressSource? = nil,
+        updateDisplayedSnapshot: Bool = true
     ) async -> [ContinueWatchingItem]? {
-        guard TraktSettingsStore.watchProgressSource == .trakt,
+        let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
+        #if DEBUG
+        print("[ContinueWatching] Provider fetch started source=\(source.rawValue)")
+        #endif
+        if source == .simkl {
+            guard SimklRuntimeSession.authenticatedState() != nil else { return [] }
+            guard let items = await SimklProgressService.fetchContinueWatching(
+                repository: repository
+            ) else { return nil }
+            let resolvedItems = updateDisplayedSnapshot
+                ? mergingLocalPlaybackCheckpoints(into: items, source: source)
+                : items
+            if updateDisplayedSnapshot {
+                replaceContinueWatchingSnapshot(resolvedItems, source: source)
+            }
+            return resolvedItems
+        }
+
+        guard source == .trakt,
               TraktAuthStore.state.isAuthenticated else {
             return []
         }
 
         let service = TraktAuthService()
-        guard await service.refreshTokenIfNeeded() else { return nil }
-
-        var receivedResponse = false
-        var seeds: [TraktProgressSeed] = []
-
-        if let movies: [TraktPlaybackDTO] = try? await service.authorizedGet(
-            path: "sync/playback/movies"
-        ) {
-            receivedResponse = true
-            seeds.append(contentsOf: movies.compactMap { playbackSeed(from: $0, type: "movie") })
+        guard await service.refreshTokenIfNeeded() else {
+            #if DEBUG
+            print("[ContinueWatching] Trakt token refresh failed")
+            #endif
+            return nil
         }
 
-        if let episodes: [TraktPlaybackDTO] = try? await service.authorizedGet(
-            path: "sync/playback/episodes"
-        ) {
-            receivedResponse = true
-            seeds.append(contentsOf: episodes.compactMap { playbackSeed(from: $0, type: "series") })
+        async let moviesRequest: [TraktPlaybackDTO]? = fetchList(
+            TraktPlaybackDTO.self,
+            path: "sync/playback/movies",
+            service: service
+        )
+        async let episodesRequest: [TraktPlaybackDTO]? = fetchList(
+            TraktPlaybackDTO.self,
+            path: "sync/playback/episodes",
+            service: service
+        )
+        async let watchedShowsRequest: [TraktWatchedShowDTO]? = fetchList(
+            TraktWatchedShowDTO.self,
+            path: "sync/watched/shows",
+            service: service
+        )
+        async let episodeHistoryRequest: [TraktEpisodeHistoryDTO]? = fetchList(
+            TraktEpisodeHistoryDTO.self,
+            path: "users/me/history/episodes?page=1&limit=100",
+            service: service
+        )
+
+        let (movies, episodes, watchedShows, episodeHistory) = await (
+            moviesRequest,
+            episodesRequest,
+            watchedShowsRequest,
+            episodeHistoryRequest
+        )
+        #if DEBUG
+        print(
+            "[ContinueWatching] Trakt lists movies=\(movies?.count.description ?? "failed") "
+                + "episodes=\(episodes?.count.description ?? "failed") "
+                + "shows=\(watchedShows?.count.description ?? "failed") "
+                + "history=\(episodeHistory?.count.description ?? "failed")"
+        )
+        #endif
+        guard movies != nil || episodes != nil || watchedShows != nil || episodeHistory != nil else {
+            return nil
         }
 
+        var seeds =
+            movies.orEmpty.compactMap { playbackSeed(from: $0, type: "movie") }
+            + episodes.orEmpty.compactMap { playbackSeed(from: $0, type: "series") }
         let playbackIDs = Set(seeds.map(\.contentID))
-        if let watchedShows: [TraktWatchedShowDTO] = try? await service.authorizedGet(
-            path: "sync/watched/shows"
-        ) {
-            receivedResponse = true
-            seeds.append(contentsOf: watchedShows.compactMap { show in
-                guard let seed = nextUpSeed(from: show), !playbackIDs.contains(seed.contentID) else {
-                    return nil
-                }
-                return seed
-            })
-        }
+
+        seeds.append(contentsOf: watchedShows.orEmpty.compactMap { show in
+            guard let seed = nextUpSeed(from: show), !playbackIDs.contains(seed.contentID) else {
+                return nil
+            }
+            return seed
+        })
 
         // Some Trakt accounts return watched shows with an empty `seasons`
         // array even though episode history and stats are present. History is
         // the authoritative fallback for choosing the next episode in that case.
-        if let episodeHistory: [TraktEpisodeHistoryDTO] = try? await service.authorizedGet(
-            path: "users/me/history/episodes?page=1&limit=100"
-        ) {
-            receivedResponse = true
-            seeds.append(contentsOf: episodeHistory.compactMap { history in
-                guard let seed = nextUpSeed(from: history), !playbackIDs.contains(seed.contentID) else {
-                    return nil
-                }
-                return seed
-            })
-        }
-
-        guard receivedResponse else { return nil }
+        seeds.append(contentsOf: episodeHistory.orEmpty.compactMap { history in
+            guard let seed = nextUpSeed(from: history), !playbackIDs.contains(seed.contentID) else {
+                return nil
+            }
+            return seed
+        })
 
         let cutoff: Date? = {
             let days = TraktSettingsStore.continueWatchingDaysCap
@@ -935,29 +1043,91 @@ struct TraktProgressService {
 
         let recentSeeds = seeds
             .filter { cutoff == nil || $0.lastUpdated >= cutoff! }
-            .sorted { $0.lastUpdated > $1.lastUpdated }
+            .sorted {
+                ordersBefore(
+                    isUpNext: $0.isUpNext,
+                    updatedAt: $0.lastUpdated,
+                    otherIsUpNext: $1.isUpNext,
+                    otherUpdatedAt: $1.lastUpdated
+                )
+            }
 
-        var items: [ContinueWatchingItem] = []
         var usedContentIDs = Set<String>()
-        for seed in recentSeeds {
-            guard !Task.isCancelled, items.count < maxItems else { break }
-            guard usedContentIDs.insert(seed.contentID).inserted else { continue }
-            if let item = await makeItem(from: seed, repository: repository) {
-                items.append(item)
+        let uniqueSeeds = recentSeeds.filter {
+            usedContentIDs.insert($0.contentID).inserted
+        }
+        let metadataTasks = uniqueSeeds.prefix(maxItems).enumerated().map { index, seed in
+            Task { @MainActor in
+                (index, seed.title, await makeItem(from: seed, repository: repository))
             }
         }
-        let mergedItems = mergingLocalPlaybackCheckpoints(into: items)
-        replaceContinueWatchingSnapshot(mergedItems)
-        return mergedItems
+        var indexedItems: [(Int, ContinueWatchingItem)] = []
+        for task in metadataTasks {
+            guard !Task.isCancelled else {
+                #if DEBUG
+                print("[ContinueWatching] Trakt metadata assembly cancelled")
+                #endif
+                return nil
+            }
+            let (index, title, item) = await task.value
+            if let item {
+                indexedItems.append((index, item))
+            } else {
+                #if DEBUG
+                print("[ContinueWatching] Trakt metadata omitted \(title)")
+                #endif
+            }
+        }
+        let items = indexedItems.sorted { $0.0 < $1.0 }.map(\.1)
+        let resolvedItems = updateDisplayedSnapshot
+            ? mergingLocalPlaybackCheckpoints(into: items, source: source)
+            : items
+        if updateDisplayedSnapshot {
+            replaceContinueWatchingSnapshot(resolvedItems, source: source)
+        }
+        #if DEBUG
+        print("[ContinueWatching] Trakt provider returning \(resolvedItems.count) items")
+        #endif
+        return resolvedItems
+    }
+
+    private static func fetchList<Element: Decodable>(
+        _ type: Element.Type,
+        path: String,
+        service: TraktAuthService
+    ) async -> [Element]? {
+        do {
+            return try await service.authorizedGet(path: path)
+        } catch {
+            #if DEBUG
+            print("[ContinueWatching] Trakt GET \(path) failed: \(error.localizedDescription)")
+            #endif
+            return nil
+        }
+    }
+
+    nonisolated static func ordersBefore(
+        isUpNext: Bool,
+        updatedAt: Date,
+        otherIsUpNext: Bool,
+        otherUpdatedAt: Date
+    ) -> Bool {
+        if isUpNext != otherIsUpNext {
+            return !isUpNext
+        }
+        return updatedAt > otherUpdatedAt
     }
 
     private static func mergingLocalPlaybackCheckpoints(
-        into remoteItems: [ContinueWatchingItem]
+        into remoteItems: [ContinueWatchingItem],
+        source: TraktWatchProgressSource
     ) -> [ContinueWatchingItem] {
         pruneExpiredLocalCheckpoints()
 
         let profileId = ContinueWatchingStore.activeProfileId
-        let checkpoints = localPlaybackCheckpoints.filter { $0.profileId == profileId }
+        let checkpoints = localPlaybackCheckpoints.filter {
+            $0.profileId == profileId && $0.source == source
+        }
         var merged = remoteItems
         var confirmedItems: [ContinueWatchingItem] = []
 
@@ -981,9 +1151,11 @@ struct TraktProgressService {
 
         if !confirmedItems.isEmpty {
             localPlaybackCheckpoints.removeAll { checkpoint in
-                checkpoint.profileId == profileId && confirmedItems.contains { confirmed in
-                    WatchedStore.sameContent(checkpoint.item.meta, confirmed.meta)
-                }
+                checkpoint.profileId == profileId
+                    && checkpoint.source == source
+                    && confirmedItems.contains { confirmed in
+                        WatchedStore.sameContent(checkpoint.item.meta, confirmed.meta)
+                    }
             }
         }
 
@@ -1001,16 +1173,27 @@ struct TraktProgressService {
         }
     }
 
-    private static func replaceContinueWatchingSnapshot(_ items: [ContinueWatchingItem]) {
+    private static func replaceContinueWatchingSnapshot(
+        _ items: [ContinueWatchingItem],
+        source: TraktWatchProgressSource
+    ) {
         let profileId = ContinueWatchingStore.activeProfileId
-        continueWatchingSnapshots.removeAll { $0.profileId == profileId }
+        continueWatchingSnapshots.removeAll {
+            $0.profileId == profileId && $0.source == source
+        }
         continueWatchingSnapshots.append(
-            ContinueWatchingSnapshot(profileId: profileId, items: items)
+            ContinueWatchingSnapshot(profileId: profileId, source: source, items: items)
         )
     }
 
-    private static func removeFromContinueWatchingSnapshot(meta: NuvioMeta, profileId: String?) {
-        guard let index = continueWatchingSnapshots.firstIndex(where: { $0.profileId == profileId }) else {
+    private static func removeFromContinueWatchingSnapshot(
+        meta: NuvioMeta,
+        profileId: String?,
+        source: TraktWatchProgressSource
+    ) {
+        guard let index = continueWatchingSnapshots.firstIndex(where: {
+            $0.profileId == profileId && $0.source == source
+        }) else {
             return
         }
         let remaining = continueWatchingSnapshots[index].items.filter {
@@ -1018,6 +1201,7 @@ struct TraktProgressService {
         }
         continueWatchingSnapshots[index] = ContinueWatchingSnapshot(
             profileId: profileId,
+            source: source,
             items: remaining
         )
     }
@@ -1034,6 +1218,18 @@ struct TraktProgressService {
         action: TraktScrobbleAction,
         store: UserDefaults = ProfileSettings.current
     ) async -> Bool {
+        if TraktSettingsStore.watchProgressSource(in: store) == .simkl {
+            return await SimklProgressService.reportPlayback(
+                meta: meta,
+                position: position,
+                duration: duration,
+                season: season,
+                episode: episode,
+                action: action,
+                store: store
+            )
+        }
+
         guard TraktSettingsStore.watchProgressSource(in: store) == .trakt,
               TraktAuthStore.state(in: store).isAuthenticated(in: store),
               position.isFinite,
@@ -1100,7 +1296,7 @@ struct TraktProgressService {
             title: media.title ?? contentID,
             year: media.year,
             progressPercent: progress,
-            lastUpdated: traktDate(item.pausedAt) ?? Date(),
+            lastUpdated: traktDate(item.pausedAt) ?? .distantPast,
             season: item.episode?.season,
             episode: item.episode?.number,
             episodeTitle: item.episode?.title,
@@ -1137,7 +1333,7 @@ struct TraktProgressService {
             title: show.title ?? contentID,
             year: show.year,
             progressPercent: 0,
-            lastUpdated: latest.watchedAt ?? traktDate(item.lastWatchedAt) ?? Date(),
+            lastUpdated: latest.watchedAt ?? traktDate(item.lastWatchedAt) ?? .distantPast,
             season: latest.season,
             episode: latest.episode,
             episodeTitle: nil,
@@ -1161,7 +1357,7 @@ struct TraktProgressService {
             title: show.title ?? contentID,
             year: show.year,
             progressPercent: 0,
-            lastUpdated: traktDate(item.watchedAt) ?? Date(),
+            lastUpdated: traktDate(item.watchedAt) ?? .distantPast,
             season: season,
             episode: number,
             episodeTitle: episode.title,
@@ -1174,8 +1370,21 @@ struct TraktProgressService {
         from seed: TraktProgressSeed,
         repository: CatalogRepository
     ) async -> ContinueWatchingItem? {
-        var meta = (try? await repository.getMetadata(id: seed.contentID, type: seed.type))
-            ?? placeholderMeta(for: seed)
+        // Home caches lightweight catalog cards without episode guides. Next Up
+        // must bypass that shallow cache or the newest watched show is omitted.
+        let loadedMeta: NuvioMeta?
+        if seed.isUpNext {
+            loadedMeta = try? await repository.refreshMetadata(
+                id: seed.contentID,
+                type: seed.type
+            )
+        } else {
+            loadedMeta = try? await repository.getMetadata(
+                id: seed.contentID,
+                type: seed.type
+            )
+        }
+        var meta = loadedMeta ?? placeholderMeta(for: seed)
 
         var season = seed.season
         var episode = seed.episode
@@ -1316,6 +1525,47 @@ struct TraktProgressService {
 /// connected Trakt account should receive an explicit watched action even when
 /// resume points are kept in Nuvio Sync.
 struct TraktHistoryService {
+    /// Returns a complete Trakt watched snapshot without mutating Nuvio's
+    /// watched store. Used by one-way provider transfers.
+    static func fetchWatchedHistory(
+        store: UserDefaults = ProfileSettings.current
+    ) async -> [WatchedStoreItem]? {
+        guard TraktAuthStore.state(in: store).isAuthenticated(in: store) else { return nil }
+
+        let service = TraktAuthService(store: store)
+        guard await service.refreshTokenIfNeeded(),
+              let movies: [TraktWatchedMovieDTO] = try? await service.authorizedGet(
+                path: "sync/watched/movies"
+              ),
+              let shows: [TraktWatchedShowDTO] = try? await service.authorizedGet(
+                path: "sync/watched/shows"
+              ) else {
+            return nil
+        }
+
+        var remoteItems = movies.compactMap(watchedMovie)
+        guard remoteItems.count == movies.count else { return nil }
+
+        var needsHistoryFallback = false
+        for show in shows {
+            if show.seasons.orEmpty.isEmpty {
+                needsHistoryFallback = true
+            } else if let episodes = watchedEpisodes(show) {
+                remoteItems.append(contentsOf: episodes)
+            } else {
+                return nil
+            }
+        }
+
+        if needsHistoryFallback {
+            guard let historyItems = await fetchCompleteEpisodeHistory(using: service) else {
+                return nil
+            }
+            remoteItems.append(contentsOf: historyItems)
+        }
+        return WatchedStore.mergedByIdentity(remoteItems)
+    }
+
     /// Pulls Trakt's complete watched snapshot into the durable store used by
     /// Details, episode cards, Continue Watching reconciliation, and Nuvio
     /// Sync. This runs whenever Trakt is connected, independently of which
@@ -1838,8 +2088,11 @@ struct TraktLibraryService {
         }
     }
 
-    static func fetchLibrary(repository: CatalogRepository) async -> [LibraryStoreItem]? {
-        guard TraktSettingsStore.librarySourceMode == .trakt,
+    static func fetchLibrary(
+        repository: CatalogRepository,
+        requireSelectedSource: Bool = true
+    ) async -> [LibraryStoreItem]? {
+        guard (!requireSelectedSource || TraktSettingsStore.librarySourceMode == .trakt),
               TraktAuthStore.state.isAuthenticated else {
             return []
         }

@@ -25,22 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.6 (build 47)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.7 (build 48)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.6) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.7) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.6/NuvioTV-3.1.6-unsigned-release.ipa)
+[NuvioTV-3.1.7-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.7/NuvioTV-3.1.7-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.6
+### New in Beta 3.1.7
 
-- Adds **Grid View** to Home: every catalog receives a six-column, three-row poster preview with a dedicated **See All** tile and a full paginated catalog browser.
-- Adds an automatic Grid View hero slideshow and lets you choose which Home catalogs supply its featured titles from Settings → Layout & Discovery.
-- Loads Home progressively so synced collections and built-in catalogs appear first while slower add-on catalogs arrive without blocking the screen.
-- Removes the old Home catalog-row limit, retries missing add-on rows, and keeps metadata caching thread-safe during progressive updates.
-- Makes large watched-history merges and Continue Watching cleanup substantially faster by indexing media identities and newest watched timestamps.
-- Adds a 10,000-item watched-history regression test to protect startup and sync performance.
+- Introduces native **Simkl** integration on Apple TV ahead of the official Nuvio client's announced rollout, with profile-scoped PIN login and Keychain token storage.
+- Lets Simkl independently power watched history, Plan to Watch library items, Continue Watching, resume positions, and player scrobbling.
+- Adds one-click transfers from Trakt or Nuvio into Simkl for watch history, library items, and in-progress playback, with live progress and additive imports that preserve existing Simkl data.
+- Improves Trakt and Simkl Continue Watching ordering, provider switching, Home refresh reliability, and landscape-artwork transitions.
+- Temporarily disables automatic next-episode playback. The manual Next Episode card now hides after five seconds and returns with the player controls, matching Skip Intro.
+- Adds 14 focused Simkl regression tests covering authentication, history/library/progress writes and transfers, routing, ordering, and cached account statistics.
 
 ### The new player
 
@@ -56,6 +56,21 @@ Nuvio supports Trakt device login with user-provided API credentials. This is us
 4. Choose **Connect with Trakt**, scan the QR code or enter its code at `trakt.tv/activate`, and approve the connection.
 
 The Client ID and Client Secret are stored only on that Apple TV; they are deliberately excluded from Nuvio account/profile sync. Changing either credential disconnects the old Trakt session so it cannot be reused with a different application.
+
+### Simkl sign-in with your own API app
+
+Nuvio also supports Simkl's TV PIN flow with a user-provided Client ID.
+
+1. Create an application in [Simkl developer settings](https://simkl.com/settings/developer/).
+2. Use `urn:ietf:wg:oauth:2.0:oob` as the redirect URI when configuring the application.
+3. On Apple TV, go to **Settings → Integrations → Simkl** and enter its Client ID.
+4. Choose **Connect with Simkl**, scan the QR code, and enter the displayed PIN at `simkl.com/pin`.
+
+Simkl's PIN exchange does not require a Client Secret and does not send the redirect URI. The Client ID stays on the Apple TV and is excluded from Nuvio account/profile sync; the long-lived access token is stored in the device Keychain for the current profile.
+
+Once connected, Simkl can be selected independently as the Library and Watch Progress source. Nuvio imports Simkl watched history, uses Plan to Watch for the library, loads paused playback into Continue Watching, and sends start, pause, and stop scrobbles from the player.
+
+The connected Simkl screen can also transfer watched history from the active Nuvio Sync profile or a connected Trakt account. Transfers are additive, preserve watched dates and episode numbers, and display live completion progress.
 
 ### Notes
 
@@ -81,6 +96,7 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
 - tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
 - Trakt device-code login using a user-provided Client ID and Client Secret, stored locally on the Apple TV.
+- Simkl PIN login, watched-history sync, Plan to Watch library sync, playback progress, and scrobbling.
 - New AetherEngine-first player with Siri Remote controls, precise seeking and resume, embedded/add-on subtitle support, saved track selections, frame-rate matching, and a one-way MPVKit compatibility fallback.
 - Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).

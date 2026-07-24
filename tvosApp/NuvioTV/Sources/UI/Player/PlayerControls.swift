@@ -458,13 +458,12 @@ extension View {
 
 // MARK: - Next episode card
 //
-// Netflix-style auto-play prompt shown near the end of an episode. Liquid Glass
-// card with the upcoming episode's thumbnail, a live countdown when auto-play is
-// armed, and a Play button that advances immediately.
+// Next-episode prompt shown near the end of an episode. Liquid Glass card with
+// the upcoming episode's thumbnail, a short auto-hide countdown, and a manual
+// Play button.
 struct NextEpisodeOverlay: View {
     let episode: NuvioVideo
-    /// Seconds left on the auto-play countdown; nil when the timer is off or was
-    /// cancelled by a fast-forward (manual Play only).
+    /// Seconds left before the card hides; nil while controls are visible.
     let countdown: Int?
     let isAdvancing: Bool
     var isFocused: Bool
@@ -498,7 +497,7 @@ struct NextEpisodeOverlay: View {
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
                 } else if let countdown, !isAdvancing {
-                    Text("Playing in \(countdown)s")
+                    Text("Hiding in \(countdown)s")
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
                         .contentTransition(.numericText())
@@ -552,7 +551,7 @@ struct NextEpisodeOverlay: View {
             } else {
                 Image(systemName: isPlayable ? "play.fill" : "calendar")
                     .font(.system(size: 22, weight: .bold))
-                Text(isPlayable ? (countdown != nil ? "Play Now" : "Play") : "Not Yet")
+                Text(isPlayable ? "Play" : "Not Yet")
             }
         }
         .font(.system(size: 24, weight: .semibold))

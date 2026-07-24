@@ -57,6 +57,7 @@ struct PosterCard: View {
     #if os(tvOS)
     @FocusState private var isFocused: Bool
     @State private var didRequestInitialFocus = false
+    @State private var landscapeArtworkPrepared = false
     #endif
 
     var body: some View {
@@ -103,7 +104,7 @@ struct PosterCard: View {
                 effectiveSmoothFocus
                     ? .spring(response: landscapeTransitionDuration, dampingFraction: 1.0)
                     : nil,
-                value: isLandscape
+                value: effectiveLandscape
             )
         #else
         Button(action: onClick) {
@@ -118,16 +119,23 @@ struct PosterCard: View {
         VStack(alignment: .leading, spacing: 9) {
             CachedPosterArtwork(
                 urlString: imageUrl,
+                preloadURLString: landscapePreloadURL,
                 width: cardWidth,
                 height: cardHeight,
-                minimumSwapDelay: isLandscape && effectiveSmoothFocus ? landscapeTransitionDuration : 0
+                maximumWidth: artworkDecodeWidth,
+                minimumSwapDelay: 0,
+                onPreloadFinished: {
+                    #if os(tvOS)
+                    landscapeArtworkPrepared = true
+                    #endif
+                }
             ) {
                 placeholderView
             }
             .frame(width: cardWidth, height: cardHeight)
             .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
             .overlay(alignment: .bottomLeading) {
-                if isLandscape {
+                if effectiveLandscape {
                     landscapeOverlay
                 }
             }
@@ -315,8 +323,12 @@ struct PosterCard: View {
         focusHighlighterEnabled
     }
 
+    private var effectiveLandscape: Bool {
+        isLandscape && (landscapeArtworkPrepared || landscapeArtworkURL == nil)
+    }
+
     private var cardWidth: CGFloat {
-        if isLandscape {
+        if effectiveLandscape {
             return 560
         }
         return effectiveHomeLayout == "Compact" ? 170 : 210
@@ -332,7 +344,7 @@ struct PosterCard: View {
     }
 
     private var cardHeight: CGFloat {
-        isLandscape ? 315 : (effectiveHomeLayout == "Compact" ? 255 : 315)
+        effectiveLandscape ? 315 : (effectiveHomeLayout == "Compact" ? 255 : 315)
     }
 
     private var totalCardHeight: CGFloat {
@@ -351,12 +363,24 @@ struct PosterCard: View {
         16
     }
 
-    private var imageUrl: String? {
-        if isLandscape, continueEpisodeText != nil,
+    private var landscapeArtworkURL: String? {
+        if continueEpisodeText != nil,
            let continueEpisodeArtworkURL, !continueEpisodeArtworkURL.isEmpty {
             return continueEpisodeArtworkURL
         }
-        return isLandscape ? (meta.backgroundUrl ?? meta.posterUrl) : meta.posterUrl
+        return meta.backgroundUrl ?? meta.posterUrl
+    }
+
+    private var imageUrl: String? {
+        effectiveLandscape ? landscapeArtworkURL : meta.posterUrl
+    }
+
+    private var landscapePreloadURL: String? {
+        isFocused ? landscapeArtworkURL : nil
+    }
+
+    private var artworkDecodeWidth: CGFloat {
+        560
     }
 
     private var focusedBorderColor: Color {
@@ -416,6 +440,18 @@ struct PosterCard: View {
         meta.posterUrl
     }
 
+    private var landscapePreloadURL: String? {
+        nil
+    }
+
+    private var artworkDecodeWidth: CGFloat {
+        cardWidth
+    }
+
+    private var effectiveLandscape: Bool {
+        false
+    }
+
     private var focusedBorderColor: Color {
         .clear
     }
@@ -449,9 +485,12 @@ struct PosterCard: View {
 #if canImport(UIKit)
 private struct CachedPosterArtwork<Placeholder: View>: View {
     let urlString: String?
+    let preloadURLString: String?
     let width: CGFloat
     let height: CGFloat
+    let maximumWidth: CGFloat
     let minimumSwapDelay: TimeInterval
+    let onPreloadFinished: () -> Void
     @ViewBuilder let placeholder: Placeholder
 
     @State private var image: UIImage?
@@ -462,22 +501,30 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
     /// instead of flashing the placeholder for a frame.
     @State private var previousImage: UIImage?
     @State private var previousLoadedKey: String?
+    @State private var preloadedImage: UIImage?
+    @State private var preloadedKey: String?
 
     private var maxPixelSize: Int {
         let displayScale = UIScreen.main.scale
-        return max(160, Int(ceil(max(width, height) * displayScale)))
+        return max(160, Int(ceil(max(maximumWidth, height) * displayScale)))
     }
 
     private var cacheKey: String {
         "\(urlString ?? "")#\(maxPixelSize)"
     }
 
+    private var preloadCacheKey: String {
+        "\(preloadURLString ?? "")#\(maxPixelSize)"
+    }
+
     var body: some View {
-        ZStack {
+        ZStack(alignment: .center) {
             if let image = displayedImage {
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: .fill)
+                    .frame(width: width, height: height, alignment: .center)
+                    .clipped()
             } else {
                 placeholder
             }
@@ -485,10 +532,14 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
         .task(id: cacheKey) {
             await load()
         }
+        .task(id: preloadCacheKey) {
+            await preload()
+        }
     }
 
     private var displayedImage: UIImage? {
         if loadedKey == cacheKey { return image }
+        if preloadedKey == cacheKey { return preloadedImage }
         if previousLoadedKey == cacheKey { return previousImage }
 
         // While a brand-new variant is loading, keep real artwork on screen.
@@ -512,6 +563,14 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
         let loadStartedAt = Date()
         if loadedKey == key { return }
 
+        if preloadedKey == key, let preloadedImage {
+            previousImage = image
+            previousLoadedKey = loadedKey
+            image = preloadedImage
+            loadedKey = key
+            return
+        }
+
         // Moving back from landscape to portrait should be synchronous. The
         // portrait was retained when the landscape artwork replaced it, so
         // promote it without waiting for even an in-memory actor lookup.
@@ -534,6 +593,36 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
             image = cached
             loadedKey = key
         }
+    }
+
+    @MainActor
+    private func preload() async {
+        guard let preloadURLString,
+              let url = URL(string: preloadURLString) else {
+            return
+        }
+
+        let key = preloadCacheKey
+        if loadedKey == key, let image {
+            preloadedImage = image
+            preloadedKey = key
+            onPreloadFinished()
+            return
+        }
+        if preloadedKey == key {
+            onPreloadFinished()
+            return
+        }
+
+        if let cached = await PosterArtworkCache.shared.image(
+            for: url,
+            maxPixelSize: maxPixelSize
+        ) {
+            guard !Task.isCancelled, key == preloadCacheKey else { return }
+            preloadedImage = cached
+            preloadedKey = key
+        }
+        onPreloadFinished()
     }
 }
 
@@ -858,7 +947,7 @@ struct CardActionMenuOverlay: View {
     }
 
     private func toggleLibrary() {
-        guard TraktSettingsStore.librarySourceMode == .trakt else {
+        guard TraktSettingsStore.librarySourceMode != .local else {
             inLibrary = LibraryStore.toggle(meta: meta)
             return
         }
@@ -866,12 +955,12 @@ struct CardActionMenuOverlay: View {
         // Do not put an item into Nuvio Sync when the selected destination is
         // Trakt. A missing/expired Trakt session simply leaves the menu state
         // unchanged instead of creating a hidden local-only save.
-        guard TraktAuthStore.state.isAuthenticated else { return }
+        guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
 
         let desiredMembership = !inLibrary
         inLibrary = desiredMembership
         Task {
-            let succeeded = await TraktLibraryService.setWatchlist(
+            let succeeded = await SelectedLibraryService.setWatchlist(
                 meta,
                 isInWatchlist: desiredMembership
             )
