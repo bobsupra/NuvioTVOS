@@ -2,7 +2,6 @@
 //  DetailsScreenUITests.swift
 //  NuvioTVUITests
 //
-//  Created by Claude Code
 //  UI tests for content details screen
 //
 

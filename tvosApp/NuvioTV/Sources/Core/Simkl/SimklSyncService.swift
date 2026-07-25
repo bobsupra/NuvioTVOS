@@ -31,16 +31,42 @@ struct SimklSyncIDs: Codable, Equatable {
     let imdb: String?
     let tmdb: Int?
     let tvdb: Int?
+    /// Anime id spaces. Simkl accepts all of these on `/sync/history` and
+    /// `/scrobble/*`; omitting them is what made anime carrying only a `kitsu:`
+    /// or `mal:` id impossible to sync or scrobble.
+    let mal: Int?
+    let anidb: Int?
+    let anilist: Int?
+    let kitsu: Int?
 
     enum CodingKeys: String, CodingKey {
-        case simkl, imdb, tmdb, tvdb
+        case simkl, imdb, tmdb, tvdb, mal, anidb, anilist, kitsu
     }
 
-    init(simkl: Int? = nil, imdb: String? = nil, tmdb: Int? = nil, tvdb: Int? = nil) {
+    init(
+        simkl: Int? = nil,
+        imdb: String? = nil,
+        tmdb: Int? = nil,
+        tvdb: Int? = nil,
+        mal: Int? = nil,
+        anidb: Int? = nil,
+        anilist: Int? = nil,
+        kitsu: Int? = nil
+    ) {
         self.simkl = simkl
         self.imdb = imdb
         self.tmdb = tmdb
         self.tvdb = tvdb
+        self.mal = mal
+        self.anidb = anidb
+        self.anilist = anilist
+        self.kitsu = kitsu
+    }
+
+    /// Any identifier Simkl can match on.
+    var hasUsableIdentifier: Bool {
+        simkl != nil || imdb != nil || tmdb != nil || tvdb != nil
+            || mal != nil || anidb != nil || anilist != nil || kitsu != nil
     }
 
     init(from decoder: Decoder) throws {
@@ -48,6 +74,10 @@ struct SimklSyncIDs: Codable, Equatable {
         simkl = Self.flexibleInt(in: container, forKey: .simkl)
         tmdb = Self.flexibleInt(in: container, forKey: .tmdb)
         tvdb = Self.flexibleInt(in: container, forKey: .tvdb)
+        mal = Self.flexibleInt(in: container, forKey: .mal)
+        anidb = Self.flexibleInt(in: container, forKey: .anidb)
+        anilist = Self.flexibleInt(in: container, forKey: .anilist)
+        kitsu = Self.flexibleInt(in: container, forKey: .kitsu)
         imdb = try container.decodeIfPresent(String.self, forKey: .imdb)
     }
 
@@ -83,21 +113,101 @@ struct SimklSyncSeason: Codable {
     let episodes: [SimklSyncEpisode]?
 }
 
+/// One row of `/sync/all-items`.
+///
+/// The row is *not* flat. Watch state — `status`, `last_watched_at`,
+/// `added_to_watchlist_at`, `seasons` — sits at the top level, but the title
+/// itself is nested under whichever of `movie` / `show` / `anime` applies
+/// (anime uses `show`, matching the cross-catalog data model):
+///
+/// ```json
+/// { "status": "completed", "last_watched_at": "2026-05-15T00:13:09Z",
+///   "movie": { "title": "Pulp Fiction", "year": 1994, "ids": { … } } }
+/// ```
+///
+/// Reading `title` / `year` / `ids` flat yields nil for every row, which
+/// collapses every item to the identity `title::0` and leaves it with no
+/// resolvable content id — so nothing Simkl holds ever reaches the app. The
+/// decoder accepts the flat shape too, because that is how this type is
+/// re-read from its own cache.
 struct SimklSyncItem: Codable {
     let title: String?
     let year: Int?
     let ids: SimklSyncIDs?
     let status: String?
     let addedToWatchlistAt: String?
-    let lastWatched: String?
-    let watchedAt: String?
+    /// Simkl's name for "when this was last watched". There is no `watched_at`
+    /// at this level, and the sibling `last_watched` field is a different thing
+    /// that reads null on every row.
+    let lastWatchedAt: String?
     let seasons: [SimklSyncSeason]?
 
     enum CodingKeys: String, CodingKey {
         case title, year, ids, status, seasons
+        case movie, show, anime
         case addedToWatchlistAt = "added_to_watchlist_at"
-        case lastWatched = "last_watched"
-        case watchedAt = "watched_at"
+        case lastWatchedAt = "last_watched_at"
+    }
+
+    private struct Media: Decodable {
+        let title: String?
+        let year: Int?
+        let ids: SimklSyncIDs?
+    }
+
+    init(
+        title: String?,
+        year: Int?,
+        ids: SimklSyncIDs?,
+        status: String?,
+        addedToWatchlistAt: String?,
+        lastWatchedAt: String?,
+        seasons: [SimklSyncSeason]?
+    ) {
+        self.title = title
+        self.year = year
+        self.ids = ids
+        self.status = status
+        self.addedToWatchlistAt = addedToWatchlistAt
+        self.lastWatchedAt = lastWatchedAt
+        self.seasons = seasons
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        status = try container.decodeIfPresent(String.self, forKey: .status)
+        addedToWatchlistAt = try container.decodeIfPresent(
+            String.self,
+            forKey: .addedToWatchlistAt
+        )
+        lastWatchedAt = try container.decodeIfPresent(String.self, forKey: .lastWatchedAt)
+        seasons = try container.decodeIfPresent([SimklSyncSeason].self, forKey: .seasons)
+
+        let media = try [CodingKeys.movie, .show, .anime]
+            .lazy
+            .compactMap { try container.decodeIfPresent(Media.self, forKey: $0) }
+            .first
+        if let media {
+            title = media.title
+            year = media.year
+            ids = media.ids
+        } else {
+            // Cache round-trip, which this type encodes flat.
+            title = try container.decodeIfPresent(String.self, forKey: .title)
+            year = try container.decodeIfPresent(Int.self, forKey: .year)
+            ids = try container.decodeIfPresent(SimklSyncIDs.self, forKey: .ids)
+        }
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encodeIfPresent(title, forKey: .title)
+        try container.encodeIfPresent(year, forKey: .year)
+        try container.encodeIfPresent(ids, forKey: .ids)
+        try container.encodeIfPresent(status, forKey: .status)
+        try container.encodeIfPresent(addedToWatchlistAt, forKey: .addedToWatchlistAt)
+        try container.encodeIfPresent(lastWatchedAt, forKey: .lastWatchedAt)
+        try container.encodeIfPresent(seasons, forKey: .seasons)
     }
 }
 
@@ -147,14 +257,21 @@ struct SimklActivityGroup: Codable, Equatable {
     }
 }
 
+struct SimklSettingsActivity: Codable, Equatable {
+    let all: String?
+}
+
 struct SimklActivitiesResponse: Codable, Equatable {
     let all: String?
     let tvShows: SimklActivityGroup?
     let movies: SimklActivityGroup?
     let anime: SimklActivityGroup?
+    /// Bumps when the account's own preferences change. Simkl asks callers to
+    /// gate `POST /users/settings` on this instead of refetching on launch.
+    let settings: SimklSettingsActivity?
 
     enum CodingKeys: String, CodingKey {
-        case all, movies, anime
+        case all, movies, anime, settings
         case tvShows = "tv_shows"
     }
 
@@ -205,11 +322,19 @@ struct SimklPlaybackDTO: Codable {
 
 // MARK: - Cache and transport
 
-private enum SimklSyncCache {
-    private static let itemCacheKey = "nuvio.tv.simkl.sync.items"
-    private static let itemActivityKey = "nuvio.tv.simkl.sync.items.activities"
-    private static let historyCacheKey = "nuvio.tv.simkl.sync.history"
+/// Internal rather than file-private so the playback-cache invalidation that
+/// keeps Continue Watching correct after a scrobble is directly testable.
+enum SimklSyncCache {
+    // v2: everything written under the v1 keys was decoded from a misread row
+    // shape — every entry collapsed to the identity `title::0` with no ids, so
+    // the caches hold nothing usable. Moving the key retires that content and
+    // forces one full re-pull instead of a delta that would only ever recover
+    // titles touched after the stale watermark.
+    private static let itemCacheKey = "nuvio.tv.simkl.sync.items.v2"
+    private static let itemActivityKey = "nuvio.tv.simkl.sync.items.activities.v2"
+    private static let historyCacheKey = "nuvio.tv.simkl.sync.history.v2"
     private static let historyWatermarkKey = "nuvio.tv.simkl.sync.history.watermark"
+    private static let historyActivityKey = "nuvio.tv.simkl.sync.history.activities"
     private static let playbackCacheKey = "nuvio.tv.simkl.sync.playback"
     private static let playbackWatermarkKey = "nuvio.tv.simkl.sync.playback.watermark"
 
@@ -239,8 +364,7 @@ private enum SimklSyncCache {
                 ids: ids,
                 status: "plantowatch",
                 addedToWatchlistAt: addedAt,
-                lastWatched: nil,
-                watchedAt: nil,
+                lastWatchedAt: nil,
                 seasons: nil
             )
             if item.meta.isSeries {
@@ -266,13 +390,48 @@ private enum SimklSyncCache {
         store.string(forKey: historyWatermarkKey)
     }
 
+    static func historyActivities(in store: UserDefaults) -> SimklActivitiesResponse? {
+        decode(SimklActivitiesResponse.self, key: historyActivityKey, store: store)
+    }
+
     static func saveHistory(
         _ records: [SimklHistoryRecord],
         watermark: String?,
+        activities: SimklActivitiesResponse?,
         store: UserDefaults
     ) {
         encode(records, key: historyCacheKey, store: store)
         store.set(watermark, forKey: historyWatermarkKey)
+        if let activities {
+            encode(activities, key: historyActivityKey, store: store)
+        }
+    }
+
+    /// Seasons Simkl currently holds watched episodes in for a title. Used to
+    /// scope a whole-title unwatch so it clears episodes instead of deleting
+    /// the library row.
+    static func watchedSeasons(matching ids: SimklSyncIDs, in store: UserDefaults) -> [Int] {
+        let seasons = history(in: store)
+            .filter { $0.key.hasPrefix("series:") }
+            .flatMap(\.items)
+            .filter { sameTitle($0.meta, ids) }
+            .compactMap(\.season)
+        return Array(Set(seasons)).sorted()
+    }
+
+    /// Cached history rows carry the ids Simkl answered with, which is rarely
+    /// the same id space the local meta uses — match on any shared identifier.
+    private static func sameTitle(_ meta: NuvioMeta, _ ids: SimklSyncIDs) -> Bool {
+        if let imdb = ids.imdb?.lowercased(), !imdb.isEmpty,
+           meta.imdbId?.lowercased() == imdb {
+            return true
+        }
+        if let tmdb = ids.tmdb, meta.tmdbId == tmdb { return true }
+        if let simkl = ids.simkl,
+           meta.id.caseInsensitiveCompare("simkl:\(simkl)") == .orderedSame {
+            return true
+        }
+        return false
     }
 
     static func playbacks(in store: UserDefaults) -> [SimklPlaybackDTO]? {
@@ -290,6 +449,18 @@ private enum SimklSyncCache {
     ) {
         encode(playbacks, key: playbackCacheKey, store: store)
         store.set(watermark, forKey: playbackWatermarkKey)
+    }
+
+    /// Forces the next Continue Watching read to re-fetch `sync/playback`.
+    ///
+    /// The cache is keyed on Simkl's account watermark, which lags a scrobble we
+    /// just sent — Simkl holds a 20-second per-user lock, and the request is in
+    /// flight while Home is already refreshing. Without dropping the watermark
+    /// here, that refresh is served the list from *before* the current viewing
+    /// session, and the title vanishes as soon as the optimistic local
+    /// checkpoint stops masking it.
+    static func invalidatePlaybacks(in store: UserDefaults) {
+        store.removeObject(forKey: playbackWatermarkKey)
     }
 
     static func addPlayback(
@@ -336,8 +507,7 @@ private enum SimklSyncCache {
             ids: media?.ids,
             status: nil,
             addedToWatchlistAt: nil,
-            lastWatched: nil,
-            watchedAt: nil,
+            lastWatchedAt: nil,
             seasons: nil
         )
         return [
@@ -419,6 +589,17 @@ private struct SimklAuthorizedClient {
         query: [URLQueryItem] = [],
         body: B
     ) async throws -> Int {
+        try await postReturningBody(path: path, query: query, body: body).status
+    }
+
+    /// `/sync/history` always answers 201, even when it resolved nothing, and
+    /// reports the rejects in a `not_found` object. Callers that need to know
+    /// what actually landed have to read the body.
+    func postReturningBody<B: Encodable>(
+        path: String,
+        query: [URLQueryItem] = [],
+        body: B
+    ) async throws -> (status: Int, data: Data) {
         let result = try await client.post(
             path: path,
             clientID: clientID,
@@ -433,7 +614,7 @@ private struct SimklAuthorizedClient {
                 tokenStorage: tokenStorage
             )
         }
-        return result.statusCode
+        return (result.statusCode, result.rawData)
     }
 }
 
@@ -504,12 +685,19 @@ struct SimklHistoryService {
 
         let previousRecords = SimklSyncCache.history(in: store)
         let oldWatermark = SimklSyncCache.historyWatermark(in: store)
+        let previousActivities = SimklSyncCache.historyActivities(in: store)
         if !force, !previousRecords.isEmpty, oldWatermark == activities.all {
             return true
         }
 
+        // `date_from` never reports items the user deleted outright — only the
+        // `removed_from_list` watermark moves. Without a full re-read here the
+        // deleted title keeps its cached record forever and stays watched
+        // locally. The library loader already does this; history needs it too.
+        let hadRemovals = activities.removalsChanged(comparedWith: previousActivities)
+
         var records = previousRecords
-        if previousRecords.isEmpty || oldWatermark == nil {
+        if previousRecords.isEmpty || oldWatermark == nil || hadRemovals {
             records = []
             for type in ["shows", "movies", "anime"] {
                 guard let response = try? await service.get(
@@ -537,7 +725,12 @@ struct SimklHistoryService {
             previousRemoteItems: previousItems,
             syncStartedAt: syncStartedAt
         ) else { return false }
-        SimklSyncCache.saveHistory(records, watermark: activities.all, store: store)
+        SimklSyncCache.saveHistory(
+            records,
+            watermark: activities.all,
+            activities: activities,
+            store: store
+        )
         return true
     }
 
@@ -556,17 +749,24 @@ struct SimklHistoryService {
             client: client,
             tokenStorage: tokenStorage,
             profileScope: profileScope
-        ),
-              let body = historyMutation(
+        ) else { return false }
+
+        let body: SimklHistoryMutation?
+        if isWatched {
+            body = historyMutation(
                 meta: meta,
                 season: season,
                 episode: episode,
-                watchedAt: isWatched ? iso8601(Date()) : nil
-              ) else { return false }
+                watchedAt: iso8601(Date())
+            )
+        } else {
+            body = historyRemoval(meta: meta, season: season, episode: episode, store: store)
+        }
+        guard let body else { return false }
+
         do {
             let status = try await service.post(
                 path: isWatched ? "sync/history" : "sync/history/remove",
-                query: [URLQueryItem(name: "skip_auto_watching", value: "yes")],
                 body: body
             )
             guard (200..<300).contains(status) else { return false }
@@ -617,14 +817,15 @@ struct SimklHistoryService {
         guard let meta = placeholderMeta(item: item, type: type) else { return [] }
         if type == "movie" {
             guard item.status?.lowercased() == "completed"
-                    || item.watchedAt != nil
-                    || item.lastWatched != nil else { return [] }
-            return [
-                WatchedStoreItem(
-                    meta: meta,
-                    watchedAt: parseDate(item.watchedAt ?? item.lastWatched) ?? .distantPast
-                )
-            ]
+                    || item.lastWatchedAt != nil else { return [] }
+            // A movie marked watched in one action can come back completed with
+            // no timestamp; fall back to when it entered the list rather than
+            // stamping `.distantPast`, which sorts wrong and loses to any
+            // tombstone it collides with.
+            let watchedAt = parseDate(item.lastWatchedAt)
+                ?? parseDate(item.addedToWatchlistAt)
+                ?? .distantPast
+            return [WatchedStoreItem(meta: meta, watchedAt: watchedAt)]
         }
 
         return (item.seasons ?? []).flatMap { season -> [WatchedStoreItem] in
@@ -729,13 +930,13 @@ struct SimklHistoryTransferService {
             let batch = Array(entries[start..<end])
             let body = combinedMutation(batch)
 
+            let rejected: Int
             do {
-                let status = try await service.post(
+                let response = try await service.postReturningBody(
                     path: "sync/history",
-                    query: [URLQueryItem(name: "skip_auto_watching", value: "yes")],
                     body: body
                 )
-                guard (200..<300).contains(status) else {
+                guard (200..<300).contains(response.status) else {
                     return result(
                         total: total,
                         transferred: transferred,
@@ -743,6 +944,11 @@ struct SimklHistoryTransferService {
                         validCount: entries.count
                     )
                 }
+                // Simkl answers 201 even when it matched nothing, listing what it
+                // could not resolve under `not_found`. Counting the batch as
+                // transferred on status alone is what made this report success
+                // while the account stayed empty.
+                rejected = Self.notFoundCount(in: response.data, batch: batch)
             } catch {
                 return result(
                     total: total,
@@ -752,7 +958,7 @@ struct SimklHistoryTransferService {
                 )
             }
 
-            transferred += batch.count
+            transferred += max(batch.count - rejected, 0)
             let percentage = min(
                 100,
                 max(1, Int((Double(transferred) / Double(total) * 100).rounded(.down)))
@@ -773,6 +979,57 @@ struct SimklHistoryTransferService {
             skipped: skipped,
             validCount: entries.count
         )
+    }
+
+    /// Source entries in this batch that Simkl said it could not resolve.
+    ///
+    /// `/sync/history` reports rejects in three arrays — `movies`, `shows`,
+    /// `episodes` — and a show that resolves fine can still have unmatched
+    /// episodes, so the show never appears in `not_found.shows`. Reading only
+    /// the first two counts those episodes as transferred. Each rejected movie
+    /// or episode is one source entry; a rejected *show* takes down every entry
+    /// this batch grouped under it, so those are counted back by identity.
+    private static func notFoundCount(in data: Data, batch: [SimklHistoryMutation]) -> Int {
+        guard !data.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let notFound = object["not_found"] as? [String: Any] else {
+            return 0
+        }
+
+        func rows(_ key: String) -> [[String: Any]] {
+            (notFound[key] as? [Any])?.compactMap { $0 as? [String: Any] } ?? []
+        }
+
+        var entriesPerShow: [String: Int] = [:]
+        for show in batch.flatMap({ $0.shows ?? [] }) {
+            entriesPerShow[transferKey(show), default: 0] += 1
+        }
+
+        let rejectedShows = rows("shows").reduce(0) { partial, row in
+            guard let key = responseTransferKey(row) else { return partial + 1 }
+            return partial + (entriesPerShow[key] ?? 1)
+        }
+
+        return rows("movies").count + rows("episodes").count + rejectedShows
+    }
+
+    /// `not_found` rows are verbatim echoes of what was sent, so the same
+    /// identity rule that grouped the batch re-identifies them.
+    private static func responseTransferKey(_ row: [String: Any]) -> String? {
+        let ids = row["ids"] as? [String: Any]
+        if let imdb = ids?["imdb"] as? String, !imdb.isEmpty {
+            return "imdb:\(imdb.lowercased())"
+        }
+        if let tmdb = intValue(ids?["tmdb"]) { return "tmdb:\(tmdb)" }
+        if let simkl = intValue(ids?["simkl"]) { return "simkl:\(simkl)" }
+        guard let title = row["title"] as? String else { return nil }
+        return "title:\(title.lowercased()):\(intValue(row["year"]) ?? 0)"
+    }
+
+    private static func intValue(_ value: Any?) -> Int? {
+        if let number = value as? Int { return number }
+        if let string = value as? String { return Int(string) }
+        return nil
     }
 
     private static func combinedMutation(
@@ -809,7 +1066,7 @@ struct SimklHistoryTransferService {
         var seasons: [Int: [Int: SimklWriteEpisode]] = [:]
         for season in (lhs.seasons ?? []) + (rhs.seasons ?? []) {
             var episodes = seasons[season.number] ?? [:]
-            for episode in season.episodes {
+            for episode in season.episodes ?? [] {
                 if let existing = episodes[episode.number] {
                     episodes[episode.number] = newest(existing, episode)
                 } else {
@@ -1148,6 +1405,10 @@ struct SimklProgressTransferResult {
 }
 
 struct SimklProgressTransferService {
+    /// Simkl's documented write ceiling is 1 POST/sec per access token; a
+    /// little headroom keeps a slow-clock device from crowding the boundary.
+    private static let writeIntervalNanoseconds: UInt64 = 1_200_000_000
+
     static func transfer(
         _ items: [ContinueWatchingItem],
         store: UserDefaults = ProfileSettings.current,
@@ -1198,6 +1459,7 @@ struct SimklProgressTransferService {
         var transferred = 0
         var skipped = 0
         var failed = 0
+        var isFirstWrite = true
 
         for item in sourceItems {
             guard !Task.isCancelled else {
@@ -1219,18 +1481,44 @@ struct SimklProgressTransferService {
                 continue
             }
 
-            let body = SimklScrobbleRequest(
+            // `/scrobble/*` takes one item per request — there is no batch form
+            // — and Simkl caps writes at 1 POST/sec per access token, with
+            // overage answered by a throttling block on the token or client_id
+            // rather than a retryable 429. Pace the loop instead of racing it.
+            if !isFirstWrite {
+                try? await Task.sleep(nanoseconds: writeIntervalNanoseconds)
+                guard !Task.isCancelled else {
+                    return SimklProgressTransferResult(
+                        total: total,
+                        transferred: transferred,
+                        skipped: skipped,
+                        failed: total - transferred - skipped
+                    )
+                }
+            }
+            isFirstWrite = false
+
+            let body = scrobbleRequest(
+                meta: item.meta,
+                media: media,
                 progress: percentage,
-                movie: item.meta.isSeries ? nil : media,
-                show: item.meta.isSeries ? media : nil,
-                episode: item.meta.isSeries
-                    ? SimklScrobbleEpisode(season: item.season, number: item.episode)
-                    : nil
+                season: item.season,
+                episode: item.episode
             )
 
             do {
-                let status = try await service.post(path: "scrobble/pause", body: body)
-                if (200..<300).contains(status) {
+                var response = try await service.postReturningBody(
+                    path: "scrobble/pause",
+                    body: body
+                )
+                if isLockCollision(status: response.status, data: response.data) {
+                    try? await Task.sleep(nanoseconds: 3_000_000_000)
+                    response = try await service.postReturningBody(
+                        path: "scrobble/pause",
+                        body: body
+                    )
+                }
+                if (200..<300).contains(response.status) {
                     transferred += 1
                     SimklSyncCache.addPlayback(item, progress: percentage, store: store)
                     await TraktProgressService.recordLocalPlayback(
@@ -1281,6 +1569,11 @@ struct SimklProgressTransferService {
 // MARK: - Playback progress and scrobbling
 
 struct SimklProgressService {
+    /// Outcome of the most recent scrobble attempt, for the Settings diagnostics
+    /// row. Every failure path here returns `false` to a caller that ignores it,
+    /// so without this a rejected scrobble is indistinguishable from a sent one.
+    static private(set) var scrobbleDiagnostic = "not attempted"
+
     static func fetchContinueWatching(
         repository: CatalogRepository,
         store: UserDefaults = ProfileSettings.current
@@ -1309,6 +1602,10 @@ struct SimklProgressService {
         for playback in playbacks.sorted(by: {
             (parseDate($0.pausedAt) ?? .distantPast) > (parseDate($1.pausedAt) ?? .distantPast)
         }) {
+            // Cut at the same percentage the rest of the app calls "finished".
+            // Simkl's own resumable window is wider (it only auto-completes at
+            // 80% on `/scrobble/stop`), but admitting 90-100% here surfaces rows
+            // every other screen already treats as watched.
             guard !Task.isCancelled,
                   let progress = playback.progress,
                   progress > 0, progress < 90,
@@ -1349,41 +1646,79 @@ struct SimklProgressService {
         tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
         profileScope: String? = nil
     ) async -> Bool {
-        guard TraktSettingsStore.watchProgressSource(in: store) == .simkl,
-              let service = SimklAuthorizedClient(
-                store: store,
-                client: client,
-                tokenStorage: tokenStorage,
-                profileScope: profileScope
-              ),
-              let media = scrobbleMedia(meta),
-              duration > 0, position.isFinite, duration.isFinite else { return false }
+        guard TraktSettingsStore.watchProgressSource(in: store) == .simkl else {
+            scrobbleDiagnostic = "skipped: watch progress source is "
+                + "\(TraktSettingsStore.watchProgressSource(in: store).rawValue), not simkl"
+            return false
+        }
+        guard let service = SimklAuthorizedClient(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ) else {
+            scrobbleDiagnostic = "skipped: no Simkl access token"
+            return false
+        }
+        guard duration > 0, position.isFinite, duration.isFinite else {
+            scrobbleDiagnostic = "skipped: no usable playback timeline"
+            return false
+        }
+        guard let media = scrobbleMedia(meta) else {
+            // Simkl matches on simkl/imdb/tmdb ids. Content carrying only an id
+            // space Simkl does not accept (kitsu, for example) cannot be
+            // scrobbled at all, so say so rather than failing mutely.
+            scrobbleDiagnostic = "skipped: \(meta.id) has no Simkl-usable id (needs simkl, imdb, or tmdb)"
+            return false
+        }
         if meta.isSeries {
-            guard let season, season >= 0, let episode, episode > 0 else { return false }
+            guard let season, season >= 0, let episode, episode > 0 else {
+                scrobbleDiagnostic = "skipped: \(meta.id) is a series with no season/episode"
+                return false
+            }
         }
 
-        let progress = min(max(position / duration * 100, 0), 100)
-        let body = SimklScrobbleRequest(
+        // Simkl accepts at most two decimal places on `progress`; an unrounded
+        // Double serialises with full precision and risks a 400.
+        let rawProgress = min(max(position / duration * 100, 0), 100)
+        let progress = (rawProgress * 100).rounded() / 100
+        let body = scrobbleRequest(
+            meta: meta,
+            media: media,
             progress: progress,
-            movie: meta.isSeries ? nil : media,
-            show: meta.isSeries ? media : nil,
-            episode: meta.isSeries
-                ? SimklScrobbleEpisode(season: season, number: episode)
-                : nil
+            season: season,
+            episode: episode
         )
         do {
-            let status = try await service.post(path: "scrobble/\(action.rawValue)", body: body)
+            let path = "scrobble/\(action.rawValue)"
+            var response = try await service.postReturningBody(path: path, body: body)
+            // A collision with Simkl's 20-second per-user scrobble lock comes
+            // back as 400 `rate_limit`, not 429 — the documented handling is to
+            // wait a moment and retry once. Without this a play/pause in quick
+            // succession drops the second event on the floor.
+            if isLockCollision(status: response.status, data: response.data) {
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+                response = try await service.postReturningBody(path: path, body: body)
+            }
+            let status = response.status
             // Simkl documents 409 stop as idempotent success for a recently
             // completed session.
             guard (200..<300).contains(status) || (action == .stop && status == 409) else {
+                scrobbleDiagnostic = "\(action.rawValue) \(meta.id) failed: HTTP \(status)"
+                print("Simkl scrobble \(action.rawValue) failed for \(meta.id): HTTP \(status)")
                 return false
             }
+            scrobbleDiagnostic = "\(action.rawValue) \(meta.id) ok (\(String(format: "%.2f", progress))%)"
+            // The account now holds progress the cached playback list predates.
+            SimklSyncCache.invalidatePlaybacks(in: store)
             NotificationCenter.default.post(
                 name: TraktSettingsStore.continueWatchingChangedNotification,
                 object: nil
             )
             return true
         } catch {
+            scrobbleDiagnostic = "\(action.rawValue) \(meta.id) failed: \(error.localizedDescription)"
+            print("Simkl scrobble \(action.rawValue) failed for \(meta.id): \(error.localizedDescription)")
             return false
         }
     }
@@ -1400,8 +1735,7 @@ struct SimklProgressService {
                 ids: media.ids,
                 status: nil,
                 addedToWatchlistAt: nil,
-                lastWatched: nil,
-                watchedAt: nil,
+                lastWatchedAt: nil,
                 seasons: nil
             ),
             playback.movie == nil ? "series" : "movie"
@@ -1427,7 +1761,10 @@ private struct SimklWriteMedia: Encodable {
 
 private struct SimklWriteSeason: Encodable {
     let number: Int
-    let episodes: [SimklWriteEpisode]
+    /// Omitted — not empty — when the whole season is the unit. Simkl reads a
+    /// season without `episodes` as "every episode in it"; an empty array is
+    /// not the same instruction.
+    let episodes: [SimklWriteEpisode]?
 }
 
 private struct SimklWriteEpisode: Encodable {
@@ -1454,7 +1791,41 @@ private struct SimklScrobbleRequest: Encodable {
     let progress: Double
     let movie: SimklScrobbleMedia?
     let show: SimklScrobbleMedia?
+    let anime: SimklScrobbleMedia?
     let episode: SimklScrobbleEpisode?
+}
+
+/// Builds a `/scrobble/*` body with the item under the container Simkl keys on.
+///
+/// `mal` / `anidb` / `anilist` / `kitsu` exist only on the `anime` object — sent
+/// under `show` they ride along as extra properties the matcher never looks at,
+/// so a title carrying nothing but an anime-catalog id silently fails to
+/// resolve. Anything with a cross-catalog id (simkl / imdb / tmdb / tvdb) stays
+/// under `show` or `movie`, which is what Simkl recommends when the caller
+/// can't tell whether a title is anime.
+private func scrobbleRequest(
+    meta: NuvioMeta,
+    media: SimklScrobbleMedia,
+    progress: Double,
+    season: Int?,
+    episode: Int?
+) -> SimklScrobbleRequest {
+    let ids = media.ids
+    let hasCrossCatalogID = ids.simkl != nil || ids.imdb != nil
+        || ids.tmdb != nil || ids.tvdb != nil
+    // The `anime` container is only valid paired with an episode, so an anime
+    // *film* known solely by a MAL id still goes out as a movie — best effort.
+    let useAnimeContainer = meta.isSeries && !hasCrossCatalogID
+
+    return SimklScrobbleRequest(
+        progress: progress,
+        movie: meta.isSeries ? nil : media,
+        show: meta.isSeries && !useAnimeContainer ? media : nil,
+        anime: useAnimeContainer ? media : nil,
+        episode: meta.isSeries
+            ? SimklScrobbleEpisode(season: season, number: episode)
+            : nil
+    )
 }
 
 private struct SimklScrobbleMedia: Encodable {
@@ -1469,7 +1840,7 @@ private struct SimklScrobbleEpisode: Encodable {
 }
 
 private func syncMedia(_ meta: NuvioMeta, to: String?) -> SimklWriteMedia? {
-    guard let ids = simklIDs(meta), ids.imdb != nil || ids.tmdb != nil || ids.simkl != nil else {
+    guard let ids = simklIDs(meta) else {
         return nil
     }
     return SimklWriteMedia(
@@ -1488,7 +1859,7 @@ private func historyMutation(
     episode: Int?,
     watchedAt: String?
 ) -> SimklHistoryMutation? {
-    guard let ids = simklIDs(meta), ids.imdb != nil || ids.tmdb != nil || ids.simkl != nil else {
+    guard let ids = simklIDs(meta) else {
         return nil
     }
     let seasons: [SimklWriteSeason]?
@@ -1515,8 +1886,86 @@ private func historyMutation(
         : SimklHistoryMutation(movies: [media], shows: nil)
 }
 
+/// Body for `/sync/history/remove`.
+///
+/// Granularity is load-bearing here: a show sent with neither `seasons` nor
+/// `episodes` means "delete this title from the library entirely" — every
+/// episode *and* the watchlist row. A whole-title unwatch in Nuvio does not
+/// mean that, so a series without an explicit episode is scoped to the seasons
+/// Simkl actually holds watched episodes in, which unmarks them and leaves the
+/// library row alone. With nothing watched there is nothing to unmark, and the
+/// write is skipped rather than sent in its destructive form.
+///
+/// Movies have no narrower form — the bare shape is the only way to unmark one.
+private func historyRemoval(
+    meta: NuvioMeta,
+    season: Int?,
+    episode: Int?,
+    store: UserDefaults
+) -> SimklHistoryMutation? {
+    guard let ids = simklIDs(meta) else { return nil }
+
+    func media(_ seasons: [SimklWriteSeason]?) -> SimklWriteMedia {
+        SimklWriteMedia(
+            to: nil,
+            title: meta.name,
+            year: meta.year,
+            ids: ids,
+            watchedAt: nil,
+            seasons: seasons
+        )
+    }
+
+    guard meta.isSeries else {
+        return SimklHistoryMutation(movies: [media(nil)], shows: nil)
+    }
+
+    if let season, let episode {
+        return SimklHistoryMutation(
+            movies: nil,
+            shows: [
+                media([
+                    SimklWriteSeason(
+                        number: season,
+                        episodes: [SimklWriteEpisode(number: episode, watchedAt: nil)]
+                    )
+                ])
+            ]
+        )
+    }
+
+    var seasonNumbers = SimklSyncCache.watchedSeasons(matching: ids, in: store)
+    if seasonNumbers.isEmpty {
+        // Never-synced profile: fall back to what this device knows is watched.
+        seasonNumbers = Array(
+            Set(
+                WatchedStore.watchedEpisodeKeys(meta: meta).compactMap {
+                    Int($0.split(separator: ":").first ?? "")
+                }
+            )
+        ).sorted()
+    }
+    guard !seasonNumbers.isEmpty else { return nil }
+
+    return SimklHistoryMutation(
+        movies: nil,
+        shows: [media(seasonNumbers.map { SimklWriteSeason(number: $0, episodes: nil) })]
+    )
+}
+
+/// Simkl reports its 20-second per-user write lock as `400 rate_limit` rather
+/// than `429`, so the status alone can't be told apart from a malformed body.
+private func isLockCollision(status: Int, data: Data) -> Bool {
+    guard status == 400, !data.isEmpty,
+          let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+          let error = object["error"] as? String else {
+        return false
+    }
+    return error.caseInsensitiveCompare("rate_limit") == .orderedSame
+}
+
 private func scrobbleMedia(_ meta: NuvioMeta) -> SimklScrobbleMedia? {
-    guard let ids = simklIDs(meta), ids.imdb != nil || ids.tmdb != nil || ids.simkl != nil else {
+    guard let ids = simklIDs(meta) else {
         return nil
     }
     return SimklScrobbleMedia(title: meta.name, year: meta.year, ids: ids)
@@ -1524,13 +1973,26 @@ private func scrobbleMedia(_ meta: NuvioMeta) -> SimklScrobbleMedia? {
 
 private func simklIDs(_ meta: NuvioMeta) -> SimklSyncIDs? {
     let first = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
-    let simkl = meta.id.hasPrefix("simkl:") ? Int(meta.id.dropFirst("simkl:".count)) : nil
-    let imdb = meta.imdbId ?? (first.hasPrefix("tt") ? first : nil)
-    let tmdb = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:")
-        ? Int(meta.id.dropFirst("tmdb:".count))
-        : nil)
-    guard simkl != nil || imdb != nil || tmdb != nil else { return nil }
-    return SimklSyncIDs(simkl: simkl, imdb: imdb, tmdb: tmdb)
+    /// Leading numeric id for a `prefix:1234` style meta id, e.g. `kitsu:42` → 42.
+    func prefixedInt(_ prefix: String) -> Int? {
+        guard meta.id.hasPrefix("\(prefix):") else { return nil }
+        let value = meta.id.dropFirst(prefix.count + 1)
+        // Some spaces append an episode segment (`kitsu:42:7`); keep the title id.
+        return Int(value.split(separator: ":").first ?? "")
+    }
+
+    let ids = SimklSyncIDs(
+        simkl: prefixedInt("simkl"),
+        imdb: meta.imdbId ?? (first.hasPrefix("tt") ? first : nil),
+        tmdb: meta.tmdbId ?? prefixedInt("tmdb"),
+        tvdb: prefixedInt("tvdb"),
+        mal: prefixedInt("mal"),
+        anidb: prefixedInt("anidb"),
+        anilist: prefixedInt("anilist"),
+        kitsu: prefixedInt("kitsu")
+    )
+    guard ids.hasUsableIdentifier else { return nil }
+    return ids
 }
 
 private func placeholderMeta(item: SimklSyncItem, type: String) -> NuvioMeta? {

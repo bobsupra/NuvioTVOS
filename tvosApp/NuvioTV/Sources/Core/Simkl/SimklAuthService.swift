@@ -131,6 +131,9 @@ enum SimklAuthStore {
         /// Non-secret marker that a Keychain token exists for this profile.
         static let hasAccessToken = "nuvio.tv.simkl.auth.hasAccessToken"
         static let cachedStats = "nuvio.tv.simkl.auth.cachedStats"
+        /// `settings.all` from the last `/users/settings` read, so the next one
+        /// can be skipped until the account actually changes.
+        static let settingsWatermark = "nuvio.tv.simkl.auth.settingsWatermark"
     }
 
     static func state(
@@ -162,7 +165,7 @@ enum SimklAuthStore {
         if defaults.string(forKey: Key.credentialClientID) != clientID {
             [
                 Key.username, Key.accountID, Key.accountPlan, Key.avatarURL,
-                Key.hasAccessToken, Key.cachedStats
+                Key.hasAccessToken, Key.cachedStats, Key.settingsWatermark
             ].forEach { defaults.removeObject(forKey: $0) }
         }
         defaults.set(response.userCode, forKey: Key.userCode)
@@ -211,6 +214,14 @@ enum SimklAuthStore {
         defaults.set(data, forKey: Key.cachedStats)
     }
 
+    static func settingsWatermark(in defaults: UserDefaults) -> String? {
+        defaults.string(forKey: Key.settingsWatermark)
+    }
+
+    static func saveSettingsWatermark(_ watermark: String, store defaults: UserDefaults) {
+        defaults.set(watermark, forKey: Key.settingsWatermark)
+    }
+
     static func updatePollInterval(_ seconds: Int, store defaults: UserDefaults) {
         defaults.set(max(seconds, 5), forKey: Key.pollInterval)
     }
@@ -230,7 +241,8 @@ enum SimklAuthStore {
         [
             Key.username, Key.accountID, Key.accountPlan, Key.avatarURL,
             Key.userCode, Key.verificationURI, Key.expiresAt, Key.pollInterval,
-            Key.credentialClientID, Key.hasAccessToken, Key.cachedStats
+            Key.credentialClientID, Key.hasAccessToken, Key.cachedStats,
+            Key.settingsWatermark
         ].forEach { defaults.removeObject(forKey: $0) }
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -597,6 +609,11 @@ final class SimklAuthService {
                         return .failed("Unable to securely save the Simkl login. Try connecting again.")
                     }
                     SimklAuthStore.clearPINFlow(store: store)
+                    // Connecting Simkl is the user asking for their playback to
+                    // land in Simkl, and every write is gated on this setting.
+                    // Without it, Settings reads "Connected" while nothing is
+                    // ever scrobbled.
+                    TraktSettingsStore.selectWatchProgressSourceOnConnect(.simkl, in: store)
                     let username = await fetchUserSettings()
                     return .approved(username)
                 }
@@ -639,6 +656,58 @@ final class SimklAuthService {
 
     func clearPINFlow() {
         SimklAuthStore.clearPINFlow(store: store)
+    }
+
+    /// Refreshes the cached profile only when the account actually changed.
+    ///
+    /// `/users/settings` is set-and-forget in practice, and Simkl asks callers
+    /// to gate it on the `settings.all` activity timestamp instead of refetching
+    /// on every launch or screen appearance. `/sync/activities` is the cheapest
+    /// call in the API, so most appearances now cost one small read and stop.
+    @discardableResult
+    func refreshUserSettingsIfNeeded() async -> String? {
+        let state = currentState()
+        guard let token = state.accessToken, !token.isEmpty else { return nil }
+
+        let cachedName = state.username?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let hasCachedProfile = !cachedName.isEmpty && state.accountID?.isEmpty == false
+
+        // Nothing cached yet, so there is nothing to compare a timestamp
+        // against — read the profile and record the watermark for next time.
+        guard hasCachedProfile else {
+            let username = await fetchUserSettings()
+            if username != nil, let watermark = await settingsWatermark(token: token) {
+                SimklAuthStore.saveSettingsWatermark(watermark, store: store)
+            }
+            return username
+        }
+
+        // Not every account reports one: Simkl answers with an empty `settings`
+        // group where nothing has ever been changed, and then there is no
+        // timestamp to gate on. Profile data is set-and-forget, so keep the
+        // cache rather than refetching forever — the explicit refresh action
+        // still reads it unconditionally.
+        guard let watermark = await settingsWatermark(token: token) else {
+            return cachedName
+        }
+        guard watermark != SimklAuthStore.settingsWatermark(in: store) else {
+            return cachedName
+        }
+
+        let username = await fetchUserSettings()
+        if username != nil {
+            SimklAuthStore.saveSettingsWatermark(watermark, store: store)
+        }
+        return username
+    }
+
+    private func settingsWatermark(token: String) async -> String? {
+        let response: SimklHTTPResult<SimklActivitiesResponse>? = try? await client.get(
+            path: "sync/activities",
+            clientID: clientID,
+            accessToken: token
+        )
+        return response?.value?.settings?.all
     }
 
     @discardableResult
@@ -686,7 +755,9 @@ final class SimklAuthService {
         guard let accountID, !accountID.isEmpty else { return nil }
 
         do {
-            let response: SimklHTTPResult<SimklUserStatsResponse> = try await client.get(
+            // `POST` with no body, same as /users/settings — Simkl serves both
+            // reads that way and neither answers GET.
+            let response: SimklHTTPResult<SimklUserStatsResponse> = try await client.postEmptyBody(
                 path: "users/\(accountID)/stats",
                 clientID: clientID,
                 accessToken: token
@@ -884,16 +955,26 @@ final class SimklSettingsViewModel: ObservableObject {
         reload()
     }
 
-    func loadConnectedData() {
+    /// Screen-appearance refresh. Deliberately cheap: the profile read is gated
+    /// on the account's own change timestamp, and stats are left alone.
+    ///
+    /// `/users/{id}/stats` is the most expensive call in the Simkl API —
+    /// computed live over the user's whole history on every request, with the
+    /// docs asking that it fire only on an explicit user action, never on
+    /// launch, resume, or in a polling loop. The cached figures from the last
+    /// deliberate refresh are what the card shows until the user asks again.
+    func loadConnectedData(includeStats: Bool = false) {
         guard mode == .connected, !isLoading, !isStatsLoading,
               !isTransferringHistory, !isTransferringLibrary,
               !isTransferringProgress else { return }
         isLoading = true
-        isStatsLoading = true
+        isStatsLoading = includeStats
         Task {
-            _ = await service.fetchUserSettings()
-            connectedStats = await service.fetchUserStats()
-            isStatsLoading = false
+            _ = await service.refreshUserSettingsIfNeeded()
+            if includeStats {
+                connectedStats = await service.fetchUserStats()
+                isStatsLoading = false
+            }
             isLoading = false
             reload()
         }
@@ -1149,7 +1230,9 @@ final class SimklSettingsViewModel: ObservableObject {
                     self.statusMessage = "Connected to Simkl."
                     self.isPolling = false
                     self.reload()
-                    self.loadConnectedData()
+                    // Connecting is the explicit action that earns the one
+                    // expensive stats read.
+                    self.loadConnectedData(includeStats: true)
                     return
                 case .expired:
                     self.errorMessage = "Simkl PIN expired. Start again."

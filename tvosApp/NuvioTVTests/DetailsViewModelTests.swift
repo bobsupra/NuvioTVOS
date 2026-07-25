@@ -2,7 +2,6 @@
 //  DetailsViewModelTests.swift
 //  NuvioTVTests
 //
-//  Created by Claude Code
 //  Unit tests for DetailsViewModel
 //
 

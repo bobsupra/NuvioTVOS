@@ -2,7 +2,6 @@
 //  DetailsScreen.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Content details screen with adaptive layouts for iOS/iPad/tvOS
 //
 
@@ -247,8 +246,17 @@ struct DetailsScreen: View {
         didHandleInitialStreamPicker = true
         onInitialStreamPickerPresented?()
         isSmartPlaybackPending = false
-        pendingEpisode = initialStreamPickerEpisode
-        if let episode = initialStreamPickerEpisode {
+        // Prefer the entry from the guide this screen just loaded. A Continue
+        // Watching card carries no episode guide, so it can only name the season
+        // and episode — and the player queues the next episode by matching ids,
+        // which a stand-in entry would not satisfy.
+        let requestedEpisode = initialStreamPickerEpisode.map { requested in
+            (meta.videos ?? []).first {
+                $0.season == requested.season && $0.episode == requested.episode
+            } ?? requested
+        }
+        pendingEpisode = requestedEpisode
+        if let episode = requestedEpisode {
             pendingEpisodeSubtitle = "S\(episode.season) · E\(episode.episode) · \(episode.title)"
             viewModel.prepareStreams(forId: episode.id, type: "series")
         } else {

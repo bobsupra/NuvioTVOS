@@ -2,7 +2,6 @@
 //  CastCrewSection.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Cast and crew display section for content details
 //
 

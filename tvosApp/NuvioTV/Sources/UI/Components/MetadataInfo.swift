@@ -2,7 +2,6 @@
 //  MetadataInfo.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Metadata info display component for content details
 //
 

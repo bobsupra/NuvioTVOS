@@ -2,7 +2,6 @@
 //  EndToEndFlowTests.swift
 //  NuvioTVUITests
 //
-//  Created by Claude Code
 //  End-to-end tests for critical user flows
 //
 

@@ -2,7 +2,6 @@
 //  PosterCard.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Reusable poster card component for iOS/tvOS
 //
 
@@ -176,15 +175,10 @@ struct PosterCard: View {
     // MARK: - Helper Views
 
     private var placeholderView: some View {
-        ZStack {
-            Rectangle()
-                .fill(Color.white.opacity(0.08))
-            Image(systemName: "photo")
-                .resizable()
-                .scaledToFit()
-                .frame(width: 42, height: 42)
-                .foregroundColor(.white.opacity(0.38))
-        }
+        ArtworkPlaceholder(
+            isAwaitingArtwork: imageUrl?.isEmpty == false,
+            cornerRadius: cardCornerRadius
+        )
     }
 
     @ViewBuilder
@@ -483,6 +477,62 @@ struct PosterCard: View {
 }
 
 #if canImport(UIKit)
+/// Liquid Glass surface shared by collection folder covers and loading cards, so
+/// the two cannot drift apart. tvOS 26+ uses real `glassEffect`; older systems
+/// get frosted material.
+struct LiquidGlassSurface: ViewModifier {
+    let cornerRadius: CGFloat
+    var prominent: Bool = false
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if #available(tvOS 26.0, *) {
+            content
+                .background(Color.white.opacity(prominent ? 0.14 : 0.08), in: shape)
+                .glassEffect(.regular, in: shape)
+        } else {
+            content
+                .background(.ultraThinMaterial, in: shape)
+                .background(Color.white.opacity(prominent ? 0.12 : 0.06), in: shape)
+        }
+    }
+}
+
+/// What a card shows before its artwork arrives.
+///
+/// Distinguishes waiting from having nothing to wait for: a card whose title has
+/// no poster URL will never fill in, so spinning on it forever would be a lie.
+/// Only a card with artwork still in flight gets the activity indicator.
+private struct ArtworkPlaceholder: View {
+    let isAwaitingArtwork: Bool
+    let cornerRadius: CGFloat
+
+    var body: some View {
+        ZStack {
+            // Fills the card, then takes the glass treatment on that footprint —
+            // the same surface a collection folder cover uses.
+            Color.clear
+
+            if isAwaitingArtwork {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white.opacity(0.55))
+            } else {
+                Image(systemName: "photo")
+                    .resizable()
+                    .scaledToFit()
+                    .frame(width: 42, height: 42)
+                    .foregroundColor(.white.opacity(0.38))
+            }
+        }
+        .modifier(LiquidGlassSurface(cornerRadius: cornerRadius))
+    }
+}
+
 private struct CachedPosterArtwork<Placeholder: View>: View {
     let urlString: String?
     let preloadURLString: String?
@@ -972,11 +1022,122 @@ struct CardActionMenuOverlay: View {
     }
 }
 
+/// Quick actions for a Continue Watching card, which are about the *resume*
+/// rather than the title: pick a stream by hand, restart the episode, or drop
+/// the card. Same glass panel as `CardActionMenuOverlay`, but a long press on a
+/// Continue Watching card raises this one instead — library/watched toggles are
+/// meaningless for something already in progress.
+struct ContinueWatchingActionMenuOverlay: View {
+    let item: ContinueWatchingItem
+    let onDetails: () -> Void
+    let onPlayManually: () -> Void
+    let onStartFromBeginning: () -> Void
+    let onRemove: () -> Void
+    let onDismiss: () -> Void
+
+    private enum Field: Hashable { case details, manual, restart, remove }
+
+    @FocusState private var focused: Field?
+
+    /// A Next Up card is a suggestion for an episode that has never been played,
+    /// so there is no progress to restart from — matching the phone's sheet.
+    private var showsStartFromBeginning: Bool { !item.isUpNextEntry }
+
+    var body: some View {
+        ZStack {
+            Color.black.opacity(0.14)
+                .ignoresSafeArea()
+
+            GlassControlsContainer {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(item.meta.name)
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundColor(.white)
+                            .lineLimit(2)
+                        Text(item.episodeDisplayLine ?? "Continue watching")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white.opacity(0.55))
+                            .lineLimit(1)
+                    }
+                    .padding(.bottom, 4)
+
+                    CardActionMenuButton(
+                        title: "Go to details",
+                        systemImage: "info.circle",
+                        isFocused: focused == .details,
+                        action: onDetails
+                    )
+                    .focused($focused, equals: .details)
+
+                    CardActionMenuButton(
+                        title: "Play manually",
+                        systemImage: "play.fill",
+                        isFocused: focused == .manual,
+                        action: onPlayManually
+                    )
+                    .focused($focused, equals: .manual)
+
+                    if showsStartFromBeginning {
+                        CardActionMenuButton(
+                            title: "Start from beginning",
+                            systemImage: "arrow.counterclockwise",
+                            isFocused: focused == .restart,
+                            action: onStartFromBeginning
+                        )
+                        .focused($focused, equals: .restart)
+                    }
+
+                    CardActionMenuButton(
+                        title: "Remove",
+                        systemImage: "trash",
+                        isFocused: focused == .remove,
+                        isDestructive: true,
+                        action: onRemove
+                    )
+                    .focused($focused, equals: .remove)
+                }
+                .padding(26)
+                .frame(width: 440, alignment: .leading)
+                .glassRoundedRect(cornerRadius: 28)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+                .focusSection()
+            }
+        }
+        .onAppear {
+            // Seed focus on the first action once the overlay has taken over from
+            // the (fading, unfocusable) tab view behind it.
+            DispatchQueue.main.async { focused = .details }
+        }
+        // Re-grab focus if the engine drops it while the tab view fades out, so
+        // the menu never ends up with nothing highlighted.
+        .onChange(of: focused) { newValue in
+            if newValue == nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    if focused == nil { focused = .details }
+                }
+            }
+        }
+        .onExitCommand(perform: onDismiss)
+    }
+}
+
 private struct CardActionMenuButton: View {
     let title: String
     let systemImage: String
     let isFocused: Bool
+    /// Tints the resting state to mark an action that discards something. The
+    /// focused state stays black-on-white like every other row, so the panel
+    /// never grows a second highlight treatment.
+    var isDestructive: Bool = false
     let action: () -> Void
+
+    private var restingColor: Color {
+        isDestructive ? Color(red: 0.93, green: 0.45, blue: 0.55) : .white
+    }
 
     var body: some View {
         // Mirrors the profile page's TVProfileActionButton: the focused state is
@@ -992,7 +1153,7 @@ private struct CardActionMenuButton: View {
                     .font(.system(size: 22, weight: .semibold))
                 Spacer(minLength: 0)
             }
-            .foregroundColor(isFocused ? .black : .white)
+            .foregroundColor(isFocused ? .black : restingColor)
             .padding(.horizontal, 22)
             .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
             .loginGlassCapsule(highlighted: isFocused)

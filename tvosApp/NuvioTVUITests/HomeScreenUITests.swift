@@ -2,7 +2,6 @@
 //  HomeScreenUITests.swift
 //  NuvioTVUITests
 //
-//  Created by Claude Code
 //  UI tests for home screen functionality
 //
 

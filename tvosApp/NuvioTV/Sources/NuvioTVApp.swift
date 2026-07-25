@@ -2,7 +2,6 @@
 //  NuvioTVApp.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Main SwiftUI app entry point with Master view coordinator
 //
 
@@ -95,6 +94,10 @@ struct ContentView: View {
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
     /// card). Presented as an overlay over the tab view, like Details/Player.
     @State private var cardMenuMeta: NuvioMeta?
+    /// Continue Watching entry whose quick-actions menu is showing. Held apart
+    /// from `cardMenuMeta` because a resume card offers resume actions (play
+    /// manually / restart / remove) rather than the generic title actions.
+    @State private var continueWatchingMenuItem: ContinueWatchingItem?
     /// URL-less Continue Watching entries (for example synced progress or Next
     /// Up) resolve their stream in place instead of opening Details first.
     @State private var isResolvingContinueWatchingStream = false
@@ -277,7 +280,7 @@ struct ContentView: View {
 
     private var isOverlayPresented: Bool {
         if isResolvingContinueWatchingStream { return true }
-        if cardMenuMeta != nil { return true }
+        if cardMenuMeta != nil || continueWatchingMenuItem != nil { return true }
         return fullScreenOverlayPresented
     }
 
@@ -305,6 +308,10 @@ struct ContentView: View {
         }
         if cardMenuMeta != nil {
             withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
+            return
+        }
+        if continueWatchingMenuItem != nil {
+            withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
             return
         }
         switch activeScreen {
@@ -503,7 +510,10 @@ struct ContentView: View {
     /// Starts a Continue Watching card immediately. Locally played entries use
     /// their last stream URL; synced and Next Up entries fetch and smart-select
     /// a stream in the background without opening Details first.
-    private func resumePlayback(_ item: ContinueWatchingItem) {
+    ///
+    /// `startFromBeginning` plays the same episode with no resume point, for the
+    /// card menu's "Start from beginning".
+    private func resumePlayback(_ item: ContinueWatchingItem, startFromBeginning: Bool = false) {
         continueWatchingPlaybackTask?.cancel()
         continueWatchingPlaybackTask = nil
         isResolvingContinueWatchingStream = false
@@ -522,7 +532,7 @@ struct ContentView: View {
                 meta: item.meta,
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
-                resumeFrom: Self.resumePosition(for: item)
+                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item)
             )
             return
         }
@@ -559,7 +569,7 @@ struct ContentView: View {
                     meta: item.meta,
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
-                    resumeFrom: Self.resumePosition(for: item)
+                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item)
                 )
             } else {
                 // Keep the manual picker available when no add-on returns a
@@ -569,6 +579,58 @@ struct ContentView: View {
                 }
             }
         }
+    }
+
+    /// Opens Details with the stream picker already raised for the episode the
+    /// card would resume, so the user chooses the source by hand instead of
+    /// taking the smart-selected one that pressing the card plays. The resume
+    /// point still applies — Details' play path looks it up per episode.
+    private func playContinueWatchingManually(_ item: ContinueWatchingItem) {
+        let episode = Self.manualPlaybackEpisode(for: item)
+        withAnimation(.easeInOut(duration: 0.28)) {
+            continueWatchingMenuItem = nil
+            reopenStreamPickerOnDetails = true
+            reopenStreamPickerEpisode = episode
+            activeScreen = .details(id: item.meta.id, type: item.meta.type)
+        }
+    }
+
+    /// Episode entry the stream picker should open on, or nil for a movie.
+    /// Provider-backed rows often arrive without an episode guide, so fall back
+    /// to the same `id:season:episode` video id the resume path already uses.
+    private static func manualPlaybackEpisode(for item: ContinueWatchingItem) -> NuvioVideo? {
+        guard item.meta.isSeries, let numbers = item.episodeNumbers else { return nil }
+        if let current = episodeContext(for: item).current { return current }
+        return NuvioVideo(
+            id: "\(item.meta.id):\(numbers.season):\(numbers.episode)",
+            title: item.episodeDisplayTitle ?? "Episode \(numbers.episode)",
+            season: numbers.season,
+            episode: numbers.episode,
+            thumbnail: item.episodeArtworkURL,
+            overview: item.episodeOverview,
+            released: item.released,
+            rating: nil
+        )
+    }
+
+    /// Drops a card from Continue Watching for good.
+    ///
+    /// Local progress is deleted outright and retired on the account, since a
+    /// pull would otherwise restore what the user just removed. Trakt/Simkl rows
+    /// are owned by the provider and are rebuilt on every refresh, so the
+    /// removal is also recorded on this device — that record is what makes the
+    /// card stay gone until the title is watched again.
+    private func removeFromContinueWatching(_ item: ContinueWatchingItem) {
+        ContinueWatchingDismissStore.dismiss(item)
+
+        let keys = WatchProgressLedger.records()
+            .filter { $0.contentId == item.meta.id }
+            .map(\.progressKey)
+        ContinueWatchingStore.remove(metaId: item.meta.id)
+        TraktProgressService.forgetLocalPlayback(meta: item.meta)
+
+        guard !keys.isEmpty else { return }
+        Task { await syncManager.deleteRemoteWatchProgress(keys: keys) }
     }
 
     private func presentPlayback(
@@ -747,6 +809,34 @@ struct ContentView: View {
                 .transition(.opacity)
                 .zIndex(3)
             }
+
+            if let menuItem = continueWatchingMenuItem {
+                ContinueWatchingActionMenuOverlay(
+                    item: menuItem,
+                    onDetails: {
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            continueWatchingMenuItem = nil
+                            activeScreen = .details(id: menuItem.meta.id, type: menuItem.meta.type)
+                        }
+                    },
+                    onPlayManually: {
+                        playContinueWatchingManually(menuItem)
+                    },
+                    onStartFromBeginning: {
+                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
+                        resumePlayback(menuItem, startFromBeginning: true)
+                    },
+                    onRemove: {
+                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
+                        removeFromContinueWatching(menuItem)
+                    },
+                    onDismiss: {
+                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(3)
+            }
         }
     }
 
@@ -835,6 +925,11 @@ struct ContentView: View {
             onLongPressCard: { meta in
                 withAnimation(.easeInOut(duration: 0.2)) {
                     cardMenuMeta = meta
+                }
+            },
+            onLongPressContinueWatching: { item in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    continueWatchingMenuItem = item
                 }
             },
             onOpenCloudLibrary: {
@@ -1465,6 +1560,9 @@ private struct TVMainTabView: View {
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
     let onLongPressCard: (NuvioMeta) -> Void
+    /// Long press on a Continue Watching card, which gets its own resume-centric
+    /// menu instead of the generic title actions.
+    let onLongPressContinueWatching: (ContinueWatchingItem) -> Void
     let onOpenCloudLibrary: () -> Void
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -1538,7 +1636,8 @@ private struct TVMainTabView: View {
                 onNavigateToDetails: onNavigateToDetails,
                 onOpenCollectionFolder: onOpenCollectionFolder,
                 onResumePlayback: onResumePlayback,
-                onLongPressCard: onLongPressCard
+                onLongPressCard: onLongPressCard,
+                onLongPressContinueWatching: onLongPressContinueWatching
             )
                 .id(activeProfile?.id ?? "none")
                 .tabItem {
@@ -1798,6 +1897,9 @@ struct TVHomeView: View {
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
     var onLongPressCard: ((NuvioMeta) -> Void)? = nil
+    /// Raised instead of `onLongPressCard` for cards in the Continue Watching
+    /// row, which carry resume actions the generic title menu has no use for.
+    var onLongPressContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
 
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -1827,6 +1929,7 @@ struct TVHomeView: View {
     @State private var displayedProgressSource: TraktWatchProgressSource?
     @State private var continueWatchingRefreshGeneration = 0
     @State private var continueWatchingRefreshTask: Task<Void, Never>?
+    @State private var isLoadingMoreContinueWatching = false
     @State private var watchedTitleKeys: Set<String> = []
     @State private var errorMessage: String?
     @State private var didRequestInitialCardFocus = false
@@ -2052,7 +2155,7 @@ struct TVHomeView: View {
                                                 onNavigateToDetails(meta.id, meta.type)
                                             }
                                         },
-                                        onLongPress: onLongPressCard
+                                        onLongPress: longPressHandler(for: section.id)
                                     )
                                     .background(
                                         GeometryReader { rowGeo in
@@ -2107,6 +2210,11 @@ struct TVHomeView: View {
         }
         .task(id: contentIdentity) {
             await loadWithAutomaticRetry(for: contentIdentity)
+            // Add-on metadata providers are configured by the time Home has
+            // loaded, so this is the pass that recovers titles an earlier sync
+            // could not resolve. Mirrors the phone's
+            // `retryMetadataResolutionWhenAddonMetaProvidersReady`.
+            await ContinueWatchingBuilder.rebuild(reason: "home loaded")
             await ContinueWatchingStore.refreshMissingEpisodeDetails()
         }
         .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
@@ -2127,6 +2235,15 @@ struct TVHomeView: View {
         // changes (progress saved during playback, item finished/removed).
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification)) { _ in
             refreshContinueWatching()
+        }
+        // A removal has to leave the row immediately, including under Trakt/Simkl
+        // where the displayed list belongs to the provider and only changes on
+        // the next fetch.
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingDismissStore.changedNotification)) { _ in
+            let remaining = continueWatching.filter { !ContinueWatchingDismissStore.isDismissed($0) }
+            if remaining.count != continueWatching.count {
+                continueWatching = remaining
+            }
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification)) { _ in
             scheduleContinueWatchingRefresh()
@@ -2292,7 +2409,7 @@ struct TVHomeView: View {
                                     onResumePlayback(item)
                                 }
                             },
-                            onLongPress: onLongPressCard
+                            onLongPress: longPressHandler(for: section.id)
                         )
                     } else {
                         TVHomeCatalogGridSection(
@@ -2471,8 +2588,33 @@ struct TVHomeView: View {
         }
     }
 
+    /// One progress bar per card, and a card is a title — so two rows for the
+    /// same series (a remote provider can hand back a playback per episode)
+    /// have to collapse rather than trap. `uniqueKeysWithValues` crashes on the
+    /// collision; keep the most recent entry, which is the one the card is
+    /// meant to resume.
     private var continueWatchingByMetaId: [String: ContinueWatchingItem] {
-        Dictionary(uniqueKeysWithValues: continueWatching.map { ($0.meta.id, $0) })
+        Dictionary(continueWatching.map { ($0.meta.id, $0) }) { older, newer in
+            newer.lastWatchedAt > older.lastWatchedAt ? newer : older
+        }
+    }
+
+    /// Held cards in the Continue Watching row open the resume menu; every other
+    /// row keeps the generic title menu. A Continue Watching card whose entry has
+    /// since gone (the row refreshed mid-press) falls back rather than doing
+    /// nothing.
+    private func longPressHandler(for sectionId: String) -> ((NuvioMeta) -> Void)? {
+        guard sectionId == TVHomeSection.continueWatchingId,
+              let onLongPressContinueWatching else {
+            return onLongPressCard
+        }
+        return { meta in
+            if let item = continueWatchingByMetaId[meta.id] {
+                onLongPressContinueWatching(item)
+            } else {
+                onLongPressCard?(meta)
+            }
+        }
     }
 
     /// Continue Watching context for the hero — only when the focused card is
@@ -2963,6 +3105,12 @@ struct TVHomeView: View {
 
     @MainActor
     private func loadMoreSectionIfNeeded(sectionId: String, currentItem: NuvioMeta) {
+        // The resume row is built locally from the ledger rather than fetched
+        // from an add-on catalog, so it pages through its own path.
+        if sectionId == TVHomeSection.continueWatchingId {
+            loadMoreContinueWatchingIfNeeded(currentItem: currentItem)
+            return
+        }
         guard let sectionIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else { return }
         let section = store.sections[sectionIndex]
         guard section.hasMore,
@@ -3066,8 +3214,42 @@ struct TVHomeView: View {
             }
             return
         }
-        continueWatching = ContinueWatchingStore.items().filter { isVisible($0.meta) }
+        // The store holds the persisted first page and is authoritative — a save
+        // during playback lands there immediately. Pages scrolled in beyond it
+        // live only in the builder, so merge them back, letting the store win on
+        // any title present in both.
+        var byId: [String: ContinueWatchingItem] = [:]
+        for item in ContinueWatchingBuilder.pagedItems {
+            byId[item.meta.id] = item
+        }
+        for item in ContinueWatchingStore.items() {
+            byId[item.meta.id] = item
+        }
+        continueWatching = byId.values
+            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+            .filter { isVisible($0.meta) && !ContinueWatchingDismissStore.isDismissed($0) }
         displayedProgressSource = .nuvioSync
+    }
+
+    /// Pages in more of the account's history as focus nears the end of the
+    /// Continue Watching row, the same way a catalog row loads its next page.
+    /// Everything is already in the local ledger, so this only costs metadata
+    /// lookups for titles this device has not rendered before.
+    private func loadMoreContinueWatchingIfNeeded(currentItem: NuvioMeta) {
+        guard !usesRemoteProgress,
+              ContinueWatchingBuilder.canLoadMore,
+              !isLoadingMoreContinueWatching,
+              let index = continueWatching.firstIndex(where: { $0.meta.id == currentItem.id }),
+              index >= max(continueWatching.count - TVHomeRowPrefetchThreshold, 0) else {
+            return
+        }
+        isLoadingMoreContinueWatching = true
+        Task { @MainActor in
+            defer { isLoadingMoreContinueWatching = false }
+            _ = await ContinueWatchingBuilder.loadNextPage()
+            guard !usesRemoteProgress else { return }
+            refreshContinueWatching()
+        }
     }
 
     private func scheduleContinueWatchingRefresh() {
@@ -3136,7 +3318,17 @@ struct TVHomeView: View {
         #if DEBUG
         print("[ContinueWatching] Refresh \(generation) displaying \(items.count) items")
         #endif
-        continueWatching = items.filter { isVisible($0.meta) }
+        // The row shows one card per title, but a remote provider can return a
+        // paused playback per episode — two rows for one series otherwise, and
+        // a duplicate-key trap downstream. The provider already sorts newest
+        // first, so keeping the first occurrence keeps both the order and the
+        // episode the user would resume. The local path dedupes the same way.
+        var seenMetaIds = Set<String>()
+        continueWatching = items.filter {
+            isVisible($0.meta)
+                && !ContinueWatchingDismissStore.isDismissed($0)
+                && seenMetaIds.insert($0.meta.id).inserted
+        }
         displayedProgressSource = source
 
         // Continue Watching is visible now. Refresh watched checkmarks afterward
@@ -3161,7 +3353,7 @@ struct TVHomeView: View {
 
     private func refreshWatchedTitles() {
         watchedTitleKeys = Set(
-            WatchedStore.items()
+            WatchedStore.visibleItems()
                 .filter { $0.season == nil && $0.episode == nil }
                 .map { watchedTitleKey(for: $0.meta) }
         )
@@ -4630,7 +4822,7 @@ private struct TVCollectionFolderCard: View {
                 coverGlyph
             }
             .frame(width: cardWidth, height: cardHeight)
-            .modifier(CollectionFolderEmojiGlass(cornerRadius: cardCornerRadius, prominent: showFocus))
+            .modifier(LiquidGlassSurface(cornerRadius: cardCornerRadius, prominent: showFocus))
 
             focusGifOverlay
                 .clipShape(cardShape)
@@ -4667,30 +4859,6 @@ private struct TVCollectionFolderCard: View {
             Image(systemName: "folder")
                 .font(.system(size: 40))
                 .foregroundColor(.white.opacity(0.25))
-        }
-    }
-}
-
-/// Liquid Glass surface for collection folder cards in emoji cover mode.
-/// tvOS 26+ uses real `glassEffect`; older systems get frosted material.
-private struct CollectionFolderEmojiGlass: ViewModifier {
-    let cornerRadius: CGFloat
-    var prominent: Bool = false
-
-    private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
-    }
-
-    @ViewBuilder
-    func body(content: Content) -> some View {
-        if #available(tvOS 26.0, *) {
-            content
-                .background(Color.white.opacity(prominent ? 0.14 : 0.08), in: shape)
-                .glassEffect(.regular, in: shape)
-        } else {
-            content
-                .background(.ultraThinMaterial, in: shape)
-                .background(Color.white.opacity(prominent ? 0.12 : 0.06), in: shape)
         }
     }
 }

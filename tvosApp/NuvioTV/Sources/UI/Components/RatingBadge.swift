@@ -2,7 +2,6 @@
 //  RatingBadge.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Rating badge and certification badge components
 //
 

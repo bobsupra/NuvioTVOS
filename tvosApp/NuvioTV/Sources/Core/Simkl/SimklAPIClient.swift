@@ -88,12 +88,14 @@ final class SimklAPIClient {
         return try await perform(request)
     }
 
+    /// `POST` with no request body. Simkl serves `/users/settings` and
+    /// `/users/{id}/stats` this way "for historical reasons" — both are reads
+    /// that take no payload, and neither answers `GET`.
     func postEmptyBody<T: Decodable>(
         path: String,
         clientID: String,
         accessToken: String?
     ) async throws -> SimklHTTPResult<T> {
-        // Simkl's /users/settings is POST for historical reasons and takes no body.
         let request = try makeRequest(
             path: path,
             method: "POST",
@@ -248,7 +250,11 @@ final class SimklAPIClient {
         case 403:
             return raw ?? "Simkl rejected this request. Check your Client ID."
         case 412:
-            return raw ?? "Simkl Client ID is missing, wrong, or disabled."
+            // 412 is `client_id_failed`, which Simkl also returns once an app
+            // has burned through its request quota or picked up a throttling
+            // block — not only when the ID itself is wrong.
+            return raw ?? "Simkl rejected the Client ID, or this app has hit its request limit. "
+                + "Check the value, or wait and try again."
         case 429:
             return raw ?? "Simkl is rate limiting requests. Wait and try again."
         case 500...599:

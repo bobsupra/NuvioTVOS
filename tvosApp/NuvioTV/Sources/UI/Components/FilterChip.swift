@@ -2,7 +2,6 @@
 //  FilterChip.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Filter chip component for iOS/tvOS
 //
 

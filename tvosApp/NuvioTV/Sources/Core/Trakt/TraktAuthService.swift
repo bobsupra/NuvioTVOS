@@ -43,7 +43,7 @@ enum TraktConnectionMode {
     case connected
 }
 
-enum TraktWatchProgressSource: String, CaseIterable {
+enum TraktWatchProgressSource: String, CaseIterable, Codable {
     case trakt = "TRAKT"
     case simkl = "SIMKL"
     case nuvioSync = "NUVIO_SYNC"
@@ -136,7 +136,11 @@ enum TraktDefaults {
     static let continueWatchingDaysCapAll = 0
     static let continueWatchingDaysCap = 60
     static let showMetaComments = true
-    static let watchProgressSource = TraktWatchProgressSource.trakt
+    /// Nuvio Sync, not Trakt. The old default named a provider the user had not
+    /// necessarily connected, and because every Trakt/Simkl write is gated on the
+    /// selected source matching, a Simkl-only account silently scrobbled nowhere.
+    /// Connecting a tracker now selects it (see `selectWatchProgressSourceOnConnect`).
+    static let watchProgressSource = TraktWatchProgressSource.nuvioSync
     static let librarySourceMode = TraktLibrarySourceMode.trakt
     static let moreLikeThisSource = TraktMoreLikeThisSource.trakt
 }
@@ -329,6 +333,61 @@ enum TraktSettingsStore {
     static func watchProgressSource(in defaults: UserDefaults) -> TraktWatchProgressSource {
         let raw = defaults.string(forKey: SettingsKey.traktWatchProgressSource)
         return TraktWatchProgressSource(rawValue: raw ?? "") ?? TraktDefaults.watchProgressSource
+    }
+
+    /// True once the user has picked a source from the Settings row themselves.
+    static func watchProgressSourceChosenByUser(in defaults: UserDefaults = ProfileSettings.current) -> Bool {
+        defaults.bool(forKey: SettingsKey.watchProgressSourceChosenByUser)
+    }
+
+    /// Records an explicit choice, so connecting a tracker later never silently
+    /// overrides what the user asked for.
+    static func markWatchProgressSourceChosenByUser(in defaults: UserDefaults = ProfileSettings.current) {
+        defaults.set(true, forKey: SettingsKey.watchProgressSourceChosenByUser)
+    }
+
+    /// One-time upgrade step for installs that never stored a source.
+    ///
+    /// The default used to be `.trakt`, so a Trakt user who never opened the
+    /// picker relied on it. Flipping the default to `.nuvioSync` would silently
+    /// stop their scrobbling, so resolve the absent value once from whichever
+    /// tracker this profile actually has credentials for and write it down.
+    static func migrateWatchProgressSourceIfNeeded(
+        in defaults: UserDefaults,
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
+    ) {
+        guard defaults.string(forKey: SettingsKey.traktWatchProgressSource) == nil else { return }
+        let resolved: TraktWatchProgressSource
+        if TraktAuthStore.state(in: defaults).isAuthenticated(in: defaults) {
+            resolved = .trakt
+        } else if SimklRuntimeSession.authenticatedState(
+            store: defaults,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ) != nil {
+            resolved = .simkl
+        } else {
+            resolved = .nuvioSync
+        }
+        defaults.set(resolved.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+    }
+
+    /// Points watch progress at a tracker the user has just connected.
+    ///
+    /// Connecting Trakt or Simkl is the clearest possible statement that the user
+    /// wants their playback to land there, and every write path is gated on this
+    /// value. Without this, "Connected" was shown while nothing was ever sent.
+    /// An explicit choice already on record always wins.
+    static func selectWatchProgressSourceOnConnect(
+        _ source: TraktWatchProgressSource,
+        in defaults: UserDefaults = ProfileSettings.current
+    ) {
+        guard source != .nuvioSync else { return }
+        guard !watchProgressSourceChosenByUser(in: defaults) else { return }
+        guard watchProgressSource(in: defaults) != source else { return }
+        defaults.set(source.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+        NotificationCenter.default.post(name: continueWatchingChangedNotification, object: nil)
     }
 
     static var librarySourceMode: TraktLibrarySourceMode {
@@ -584,6 +643,10 @@ final class TraktAuthService {
             if let token = response.value, (200..<300).contains(response.statusCode) {
                 TraktAuthStore.saveToken(token, clientID: clientID, store: store)
                 TraktAuthStore.clearDeviceFlow(store: store)
+                // Same reasoning as the Simkl connect path: point watch progress
+                // at the tracker the user just linked, unless they have already
+                // chosen a source by hand.
+                TraktSettingsStore.selectWatchProgressSourceOnConnect(.trakt, in: store)
                 let username = await fetchUserSettings()
                 return .approved(username)
             }
@@ -831,9 +894,14 @@ enum TraktScrobbleAction: String {
 struct TraktProgressService {
     private static let completionPercent = 90.0
     private static let maxItems = 20
-    private static let localCheckpointLifetime: TimeInterval = 10 * 60
+    /// Long enough to outlive an app relaunch plus Simkl's 20-second per-user
+    /// scrobble lock. Kept to an hour so a checkpoint the server never confirms
+    /// (for example the title was marked watched on another device) cannot linger
+    /// as a ghost card for a whole session.
+    private static let localCheckpointLifetime: TimeInterval = 60 * 60
+    private static let checkpointStorageKey = "nuvio.tv.remoteProgress.localCheckpoints.v1"
 
-    private struct LocalPlaybackCheckpoint {
+    private struct LocalPlaybackCheckpoint: Codable {
         let profileId: String?
         let source: TraktWatchProgressSource
         let item: ContinueWatchingItem
@@ -845,11 +913,67 @@ struct TraktProgressService {
         let items: [ContinueWatchingItem]
     }
 
-    /// Optimistic positions bridge the short interval between leaving playback
-    /// and Trakt returning the newly-scrobbled timestamp from `sync/playback`.
+    /// Optimistic positions bridge the interval between leaving playback and the
+    /// provider returning the newly-scrobbled timestamp from `sync/playback`.
     /// They are deliberately separate from ContinueWatchingStore so choosing
     /// Trakt never contaminates Nuvio Sync's independent progress ledger.
-    private static var localPlaybackCheckpoints: [LocalPlaybackCheckpoint] = []
+    ///
+    /// Persisted: these used to be memory-only, so quitting the app during the
+    /// window when the provider had not yet published the scrobble left the title
+    /// missing from Continue Watching with nothing to mask the gap.
+    private static var cachedCheckpoints: [LocalPlaybackCheckpoint]?
+    private static var localPlaybackCheckpoints: [LocalPlaybackCheckpoint] {
+        get {
+            if let cachedCheckpoints { return cachedCheckpoints }
+            let loaded = loadCheckpoints()
+            cachedCheckpoints = loaded
+            return loaded
+        }
+        set {
+            cachedCheckpoints = newValue
+            saveCheckpoints(newValue)
+        }
+    }
+
+    private static func loadCheckpoints() -> [LocalPlaybackCheckpoint] {
+        guard let data = UserDefaults.standard.data(forKey: checkpointStorageKey),
+              let decoded = try? checkpointDecoder().decode(
+                  [LocalPlaybackCheckpoint].self,
+                  from: data
+              ) else {
+            return []
+        }
+        return decoded
+    }
+
+    private static func saveCheckpoints(_ checkpoints: [LocalPlaybackCheckpoint]) {
+        guard !checkpoints.isEmpty else {
+            UserDefaults.standard.removeObject(forKey: checkpointStorageKey)
+            return
+        }
+        guard let data = try? checkpointEncoder().encode(checkpoints) else { return }
+        UserDefaults.standard.set(data, forKey: checkpointStorageKey)
+    }
+
+    private static func checkpointEncoder() -> JSONEncoder {
+        let encoder = JSONEncoder()
+        encoder.nonConformingFloatEncodingStrategy = .convertToString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return encoder
+    }
+
+    private static func checkpointDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        decoder.nonConformingFloatDecodingStrategy = .convertFromString(
+            positiveInfinity: "Infinity",
+            negativeInfinity: "-Infinity",
+            nan: "NaN"
+        )
+        return decoder
+    }
     /// Last list handed to Home for each profile. Details and an already-rendered
     /// Home card use this synchronously, avoiding a stale resume position while
     /// a replacement Trakt fetch is still in flight.
@@ -891,6 +1015,9 @@ struct TraktProgressService {
 
         let profileId = ContinueWatchingStore.activeProfileId
         let source = sourceOverride ?? TraktSettingsStore.watchProgressSource
+        // Going back to a title retires the removal the user made earlier, so a
+        // provider row they are actively watching again is never hidden.
+        ContinueWatchingDismissStore.clear(contentId: meta.id)
         localPlaybackCheckpoints.removeAll {
             $0.profileId == profileId
                 && $0.source == source
@@ -907,7 +1034,11 @@ struct TraktProgressService {
                     profileId: profileId,
                     source: source,
                     item: ContinueWatchingItem(
-                        meta: meta,
+                        // Snapshot drops the episode guide, which can run to
+                        // megabytes — tvOS aborts the process on a UserDefaults
+                        // value that large. The overrides below already carry
+                        // everything the card renders.
+                        meta: meta.persistenceSnapshot,
                         streamUrl: "",
                         position: position,
                         duration: duration,
@@ -936,6 +1067,24 @@ struct TraktProgressService {
                 object: nil
             )
         }
+    }
+
+    /// Drops a title from the optimistic layers that sit in front of the
+    /// provider's list, so a card the user removed cannot be re-shown by a
+    /// checkpoint or the snapshot of the last fetch while the row refreshes.
+    static func forgetLocalPlayback(meta: NuvioMeta) {
+        let profileId = ContinueWatchingStore.activeProfileId
+        let source = TraktSettingsStore.watchProgressSource
+        localPlaybackCheckpoints.removeAll {
+            $0.profileId == profileId
+                && $0.source == source
+                && WatchedStore.sameContent($0.item.meta, meta)
+        }
+        removeFromContinueWatchingSnapshot(
+            meta: meta,
+            profileId: profileId,
+            source: source
+        )
     }
 
     static func fetchContinueWatching(
@@ -1643,7 +1792,7 @@ struct TraktHistoryService {
             // A partial response is still useful for importing new marks, but
             // absence is authoritative only when both Trakt collections loaded.
             return WatchedStore.mergeRemote(
-                remoteItems,
+                remoteItems.map { $0.adding(source: .trakt) },
                 confirmsTombstoneDeletions: false
             )
         }
@@ -2530,6 +2679,8 @@ final class TraktSettingsViewModel: ObservableObject {
     }
 
     func setWatchProgressSource(_ source: TraktWatchProgressSource) {
+        // A hand-picked source outranks the connect-time selection from then on.
+        TraktSettingsStore.markWatchProgressSourceChosenByUser(in: store)
         watchProgressSource = source
         TraktSettingsStore.watchProgressSource = watchProgressSource
     }

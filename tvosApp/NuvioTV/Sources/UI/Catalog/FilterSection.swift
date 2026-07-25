@@ -2,7 +2,6 @@
 //  FilterSection.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Filter section for catalog browsing
 //
 

@@ -2,7 +2,6 @@
 //  CatalogBrowseView.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Main catalog browsing screen with adaptive grid layout
 //
 

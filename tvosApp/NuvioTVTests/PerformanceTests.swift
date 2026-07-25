@@ -2,7 +2,6 @@
 //  PerformanceTests.swift
 //  NuvioTVTests
 //
-//  Created by Claude Code
 //  Performance and memory profiling tests
 //
 

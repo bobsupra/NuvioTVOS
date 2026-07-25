@@ -190,6 +190,64 @@ final class PlaybackBackendPolicyTests: XCTestCase {
 }
 
 final class WatchedIdentityPolicyTests: XCTestCase {
+    /// A mark belongs to the backend that was selected when it was made, and
+    /// only that backend confirms it on a pull. Switching the selected source
+    /// used to keep showing it, because every read saw the shared local union —
+    /// a title watched only in Nuvio Sync kept its checkmark under Simkl, which
+    /// neither account agreed with.
+    func testAMarkIsOnlyVisibleUnderTheSourceThatHasIt() {
+        let movie = makeMeta(id: "tt15047880", imdbId: "tt15047880", tmdbId: nil)
+        let nuvioOnly = WatchedStoreItem(
+            meta: movie,
+            watchedAt: Date(),
+            sources: [TraktWatchProgressSource.nuvioSync.rawValue]
+        )
+
+        XCTAssertTrue(nuvioOnly.isVisible(under: .nuvioSync))
+        XCTAssertFalse(nuvioOnly.isVisible(under: .simkl))
+        XCTAssertFalse(nuvioOnly.isVisible(under: .trakt))
+    }
+
+    /// The same title can genuinely be watched in two places, so attribution is
+    /// a set — and collapsing duplicates has to union it rather than let the
+    /// newer row's attribution erase the older one's.
+    func testAttributionAccumulatesAcrossBackends() {
+        let movie = makeMeta(id: "tt0816692", imdbId: "tt0816692", tmdbId: nil)
+        let older = WatchedStoreItem(
+            meta: movie,
+            watchedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            sources: [TraktWatchProgressSource.nuvioSync.rawValue]
+        )
+        let newer = WatchedStoreItem(
+            meta: movie,
+            watchedAt: Date(timeIntervalSince1970: 1_800_000_000),
+            sources: [TraktWatchProgressSource.simkl.rawValue]
+        )
+
+        let merged = WatchedStore.mergedByIdentity([older, newer])
+
+        XCTAssertEqual(merged.count, 1)
+        let row = try? XCTUnwrap(merged.first)
+        XCTAssertEqual(row?.watchedAt, newer.watchedAt, "newest row still wins on timing")
+        XCTAssertTrue(row?.isVisible(under: .nuvioSync) ?? false)
+        XCTAssertTrue(row?.isVisible(under: .simkl) ?? false)
+    }
+
+    /// Rows written before attribution existed carry an empty set. They stay
+    /// visible everywhere until the migration backfills them, so an upgrade
+    /// never blanks a user's checkmarks.
+    func testUnattributedLegacyRowsStayVisibleUnderEverySource() {
+        let legacy = WatchedStoreItem(
+            meta: makeMeta(id: "tt0110912", imdbId: "tt0110912", tmdbId: nil),
+            watchedAt: Date()
+        )
+
+        XCTAssertTrue(legacy.sources.isEmpty)
+        for source in [TraktWatchProgressSource.nuvioSync, .simkl, .trakt] {
+            XCTAssertTrue(legacy.isVisible(under: source))
+        }
+    }
+
     func testMatchesCatalogAndTraktItemsAcrossIMDbAndTMDBAliases() {
         let catalog = makeMeta(id: "tmdb:94997", imdbId: "tt11198330", tmdbId: 94997)
         let trakt = makeMeta(id: "tt11198330", imdbId: "tt11198330", tmdbId: 94997)
@@ -279,15 +337,17 @@ final class EpisodeResumeIsolationTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        ContinueWatchingStore.eraseAllProfiles()
-        WatchedStore.eraseAllProfiles()
         ContinueWatchingStore.setActiveProfile(profileId)
         WatchedStore.setActiveProfile(profileId)
+        // Scoped: these suites run inside the app's own container, so a
+        // directory-wide erase would take a real install's history with it.
+        ContinueWatchingStore.eraseProfile(profileId)
+        WatchedStore.eraseProfile(profileId)
     }
 
     override func tearDown() {
-        ContinueWatchingStore.eraseAllProfiles()
-        WatchedStore.eraseAllProfiles()
+        ContinueWatchingStore.eraseProfile(profileId)
+        WatchedStore.eraseProfile(profileId)
         super.tearDown()
     }
 
@@ -362,23 +422,366 @@ final class EpisodeResumeIsolationTests: XCTestCase {
             episode: 1,
             episodeId: "tt-test:1:1"
         )
-        let staleRemote = ContinueWatchingItem(
-            meta: meta,
-            streamUrl: "",
+        let staleRemote = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
             position: 120,
             duration: 3_000,
-            lastWatchedAt: Date(timeIntervalSinceNow: -3_600),
-            season: 1,
-            episode: 1
+            lastWatchedAt: Date(timeIntervalSinceNow: -3_600)
         )
 
-        XCTAssertTrue(ContinueWatchingStore.mergeRemote([staleRemote]))
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([staleRemote]))
+        XCTAssertEqual(WatchProgressLedger.record(forKey: "tt-test_s1e1")?.position, 360)
         XCTAssertEqual(
             ContinueWatchingStore.resumePosition(
                 for: meta, season: 1, episode: 1, episodeId: "tt-test:1:1"
             ),
             360
         )
+    }
+
+    /// A finished episode must stay in the ledger: it is the seed that produces
+    /// the next episode's Next Up card here and on every other device.
+    func testFinishedEpisodeStaysInLedgerAfterLeavingContinueWatching() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 2_990,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+
+        XCTAssertTrue(ContinueWatchingStore.items().isEmpty, "a finished episode should not render")
+        let record = WatchProgressLedger.record(forKey: "tt-test_s1e1")
+        XCTAssertNotNil(record, "a finished episode must remain a Next Up seed")
+        XCTAssertEqual(WatchProgressLedger.upNextSeeds().first?.progressKey, "tt-test_s1e1")
+    }
+
+    /// Rows the phone stores without a runtime used to be discarded here, which
+    /// is what made recently watched titles disappear from this device.
+    func testRemoteRowWithoutDurationSurvivesAndRendersAsResumable() {
+        let remote = WatchProgressRecord(
+            progressKey: "tt-no-duration",
+            contentId: "tt-no-duration",
+            contentType: "movie",
+            videoId: "tt-no-duration",
+            season: nil,
+            episode: nil,
+            position: 600,
+            duration: 0,
+            lastWatchedAt: Date()
+        )
+
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([remote]))
+        XCTAssertEqual(WatchProgressLedger.records().count, 1)
+        XCTAssertFalse(WatchProgressLedger.isComplete(remote))
+        XCTAssertEqual(
+            WatchProgressLedger.continueWatchingCandidates().first?.progressKey,
+            "tt-no-duration"
+        )
+    }
+
+    /// Completing during the credits must retire the episode, not leave it as
+    /// resume progress. The ending marker fires below the 90% the ledger treats
+    /// as finished, so recording the literal position left the row showing
+    /// "8m left" forever and never produced a Next Up seed.
+    func testCompletingDuringCreditsSeedsTheNextEpisode() {
+        let meta = makeSeries()
+        // Where a user typically is when the ending marker fires: past the story,
+        // still short of the completion threshold.
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e02.mkv",
+            position: 2_600,
+            duration: 3_000,
+            season: 1,
+            episode: 2,
+            episodeId: "tt-test:1:2"
+        )
+        XCTAssertTrue(
+            WatchProgressLedger.upNextSeeds().isEmpty,
+            "87% is not finished on its own"
+        )
+
+        ContinueWatchingStore.markPlaybackCompleted(
+            meta: meta,
+            duration: 3_000,
+            season: 1,
+            episode: 2
+        )
+
+        XCTAssertEqual(WatchProgressLedger.upNextSeeds().first?.progressKey, "tt-test_s1e2")
+        XCTAssertFalse(
+            WatchProgressLedger.continueWatchingCandidates()
+                .contains { $0.progressKey == "tt-test_s1e2" },
+            "a finished episode must not also be offered as resume progress"
+        )
+    }
+
+    /// A just-finished episode must outrank months-old progress when the metadata
+    /// budget is handed out, or the newest entries never get looked up and the
+    /// row silently omits them.
+    func testUpNextSeedsAreNotStarvedByOlderInProgressRows() {
+        let now = Date()
+        var records: [WatchProgressRecord] = (0..<70).map { index in
+            WatchProgressRecord(
+                progressKey: "tt-old-\(index)_s1e1",
+                contentId: "tt-old-\(index)",
+                contentType: "series",
+                videoId: "tt-old-\(index):1:1",
+                season: 1,
+                episode: 1,
+                position: 300,
+                duration: 3_000,
+                lastWatchedAt: now.addingTimeInterval(-86_400 * Double(index + 2))
+            )
+        }
+        // Finished minutes ago, so it must be resolved before any of the above.
+        records.append(
+            WatchProgressRecord(
+                progressKey: "tt-fresh_s1e1",
+                contentId: "tt-fresh",
+                contentType: "series",
+                videoId: "tt-fresh:1:1",
+                season: 1,
+                episode: 1,
+                position: 3_000,
+                duration: 3_000,
+                lastWatchedAt: now
+            )
+        )
+        XCTAssertTrue(WatchProgressLedger.mergeRemote(records))
+
+        let candidates = WatchProgressLedger.continueWatchingCandidates()
+        let seeds = WatchProgressLedger.upNextSeeds()
+        XCTAssertEqual(seeds.first?.contentId, "tt-fresh")
+
+        // The builder's ordering: newest first across both kinds.
+        let resolutionOrder = (candidates + seeds)
+            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+        let budgeted = resolutionOrder.prefix(64).map(\.contentId)
+        XCTAssertTrue(
+            budgeted.contains("tt-fresh"),
+            "the freshest record must be inside the metadata budget"
+        )
+        XCTAssertEqual(budgeted.first, "tt-fresh")
+    }
+
+    /// The row pages through the whole account newest-first, so the first page a
+    /// cold start shows is always the most recent activity — not whatever the
+    /// ledger happened to list first.
+    @MainActor
+    func testRowPlanIsNewestFirstAndPagesTheWholeAccount() {
+        let now = Date()
+        let candidates: [WatchProgressRecord] = (0..<30).map { index in
+            makeRecord(
+                id: "tt-progress-\(index)",
+                position: 300,
+                lastWatchedAt: now.addingTimeInterval(-3_600 * Double(index + 1))
+            )
+        }
+        let seeds: [WatchProgressRecord] = (0..<10).map { index in
+            makeRecord(
+                id: "tt-seed-\(index)",
+                position: 3_000,
+                lastWatchedAt: now.addingTimeInterval(-60 * Double(index + 1))
+            )
+        }
+
+        let plan = ContinueWatchingBuilder.planEntries(candidates: candidates, seeds: seeds)
+
+        XCTAssertEqual(plan.count, 40, "every title must be reachable by paging")
+        // Seeds here are minutes old, progress is hours old, so seeds lead.
+        XCTAssertEqual(plan.first?.record.contentId, "tt-seed-0")
+        XCTAssertTrue(plan.prefix(10).allSatisfy(\.isSeed))
+        let timestamps = plan.map(\.record.lastWatchedAt)
+        XCTAssertEqual(timestamps, timestamps.sorted(by: >), "plan must be newest-first")
+    }
+
+    /// A title that is both in progress and has a finished episode must appear
+    /// once, as resume progress — never as a duplicate Next Up card.
+    @MainActor
+    func testProgressOutranksASeedForTheSameTitle() {
+        let now = Date()
+        let candidate = makeRecord(id: "tt-same", position: 300, lastWatchedAt: now)
+        let seed = makeRecord(
+            id: "tt-same",
+            position: 3_000,
+            lastWatchedAt: now.addingTimeInterval(-600)
+        )
+
+        let plan = ContinueWatchingBuilder.planEntries(candidates: [candidate], seeds: [seed])
+
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertEqual(plan.first?.isSeed, false)
+    }
+
+    private func makeRecord(
+        id: String,
+        position: Double,
+        lastWatchedAt: Date
+    ) -> WatchProgressRecord {
+        WatchProgressRecord(
+            progressKey: "\(id)_s1e1",
+            contentId: id,
+            contentType: "series",
+            videoId: "\(id):1:1",
+            season: 1,
+            episode: 1,
+            position: position,
+            duration: 3_000,
+            lastWatchedAt: lastWatchedAt
+        )
+    }
+
+    /// The rendered list lives in Caches, which tvOS evicts under storage
+    /// pressure — it is the only directory a tvOS app can write to on device.
+    /// Losing it must cost the presentation, never the history.
+    func testHistorySurvivesLosingTheRenderedList() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+        XCTAssertFalse(ContinueWatchingStore.items().isEmpty)
+
+        // Simulate the eviction: drop the derived file, keep the ledger.
+        ContinueWatchingStore.simulateStorageEvictionForTesting()
+
+        XCTAssertTrue(ContinueWatchingStore.items().isEmpty, "the rendered list is gone")
+        XCTAssertEqual(
+            WatchProgressLedger.continueWatchingCandidates().first?.progressKey,
+            "tt-test_s1e1",
+            "the history must still be there for the builder to re-render"
+        )
+    }
+
+    /// Movie rows the backend discarded were still flagged as synced, so a
+    /// corrected payload alone would never resend them. The recovery re-flags
+    /// exactly those, and leaves episode rows — which did sync — alone.
+    func testMovieRowsAreReflaggedForRepushExactlyOnce() {
+        let now = Date()
+        let movie = WatchProgressRecord(
+            progressKey: "tt-movie",
+            contentId: "tt-movie",
+            contentType: "movie",
+            videoId: "tt-movie",
+            season: nil,
+            episode: nil,
+            position: 600,
+            duration: 5_400,
+            lastWatchedAt: now
+        )
+        let episode = WatchProgressRecord(
+            progressKey: "tt-show_s1e1",
+            contentId: "tt-show",
+            contentType: "series",
+            videoId: "tt-show:1:1",
+            season: 1,
+            episode: 1,
+            position: 600,
+            duration: 3_000,
+            lastWatchedAt: now
+        )
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([movie, episode]))
+        XCTAssertEqual(WatchProgressLedger.record(forKey: "tt-movie")?.isPendingPush, false)
+
+        WatchProgressLedger.repushMoviesOnceIfNeeded()
+
+        XCTAssertEqual(
+            WatchProgressLedger.record(forKey: "tt-movie")?.isPendingPush,
+            true,
+            "a movie the server never stored must be resent"
+        )
+        XCTAssertEqual(
+            WatchProgressLedger.record(forKey: "tt-show_s1e1")?.isPendingPush,
+            false,
+            "episode rows synced fine and must not be re-uploaded"
+        )
+
+        // Clearing the flag again after a later successful push must stick —
+        // the recovery is one-time, not a permanent re-upload loop.
+        WatchProgressLedger.markPushed(keys: ["tt-movie"])
+        WatchProgressLedger.repushMoviesOnceIfNeeded()
+        XCTAssertEqual(WatchProgressLedger.record(forKey: "tt-movie")?.isPendingPush, false)
+    }
+
+    /// A pending local row must not shield stale history from newer server
+    /// progress — otherwise a backfill from an older install would roll back
+    /// what the user has since watched on their phone.
+    func testNewerRemoteProgressWinsOverStalePendingLocalRow() {
+        let staleLocal = ContinueWatchingItem(
+            meta: makeSeries(),
+            streamUrl: "",
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -86_400),
+            season: 1,
+            episode: 1
+        )
+        WatchProgressLedger.backfillIfEmpty(from: [staleLocal])
+        XCTAssertEqual(WatchProgressLedger.record(forKey: "tt-test_s1e1")?.isPendingPush, true)
+
+        let newerRemote = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
+            position: 1_800,
+            duration: 3_000,
+            lastWatchedAt: Date()
+        )
+
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([newerRemote]))
+        XCTAssertEqual(WatchProgressLedger.record(forKey: "tt-test_s1e1")?.position, 1_800)
+    }
+
+    /// Continue Watching shows one row per series, newest first — matching
+    /// `continueWatchingProgressEntries` in the phone app.
+    func testCandidatesKeepOnlyTheNewestEpisodePerSeries() {
+        let older = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -7_200)
+        )
+        let newer = WatchProgressRecord(
+            progressKey: "tt-test_s1e2",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:2",
+            season: 1,
+            episode: 2,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date()
+        )
+
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([older, newer]))
+        let candidates = WatchProgressLedger.continueWatchingCandidates()
+        XCTAssertEqual(candidates.count, 1)
+        XCTAssertEqual(candidates.first?.progressKey, "tt-test_s1e2")
+        // Both rows stay stored; only the rendered row is deduplicated.
+        XCTAssertEqual(WatchProgressLedger.records().count, 2)
     }
 
     private func makeSeries() -> NuvioMeta {
@@ -407,6 +810,125 @@ final class EpisodeResumeIsolationTests: XCTestCase {
                 NuvioVideo(id: "tt-test:1:1", title: "One", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
                 NuvioVideo(id: "tt-test:1:2", title: "Two", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil),
             ]
+        )
+    }
+}
+
+/// Removing a Continue Watching card has to stick even where the row is owned
+/// by a provider that rebuilds it on every refresh — and it must never outlive
+/// the user going back to the title.
+final class ContinueWatchingDismissStoreTests: XCTestCase {
+    private let profileId = "continue-watching-dismiss-tests"
+
+    override func setUp() {
+        super.setUp()
+        ContinueWatchingStore.setActiveProfile(profileId)
+        ContinueWatchingStore.eraseProfile(profileId)
+    }
+
+    override func tearDown() {
+        ContinueWatchingStore.eraseProfile(profileId)
+        super.tearDown()
+    }
+
+    func testDismissHidesOnlyTheRemovedEpisode() {
+        let meta = makeSeries()
+        let episodeOne = makeItem(meta: meta, season: 1, episode: 1)
+        let episodeTwo = makeItem(meta: meta, season: 1, episode: 2)
+
+        ContinueWatchingDismissStore.dismiss(episodeOne)
+
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(episodeOne))
+        XCTAssertFalse(
+            ContinueWatchingDismissStore.isDismissed(episodeTwo),
+            "removing one episode must not hide the show's next episode"
+        )
+    }
+
+    func testDismissedMovieStaysDismissed() {
+        let item = makeItem(meta: makeMovie(), season: nil, episode: nil)
+        ContinueWatchingDismissStore.dismiss(item)
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+    }
+
+    func testFreshProgressRetiresTheRemoval() {
+        let meta = makeSeries()
+        let item = makeItem(meta: meta, season: 1, episode: 1)
+        ContinueWatchingDismissStore.dismiss(item)
+
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-dismiss-series:1:1"
+        )
+
+        XCTAssertFalse(
+            ContinueWatchingDismissStore.isDismissed(item),
+            "watching a removed title again must bring its card back"
+        )
+    }
+
+    func testRemovalsAreScopedToTheActiveProfile() {
+        let item = makeItem(meta: makeSeries(), season: 1, episode: 1)
+        ContinueWatchingDismissStore.dismiss(item)
+
+        ContinueWatchingStore.setActiveProfile("\(profileId)-other")
+        XCTAssertFalse(ContinueWatchingDismissStore.isDismissed(item))
+
+        ContinueWatchingStore.setActiveProfile(profileId)
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+    }
+
+    private func makeItem(meta: NuvioMeta, season: Int?, episode: Int?) -> ContinueWatchingItem {
+        ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 360,
+            duration: 3_000,
+            lastWatchedAt: Date(),
+            season: season,
+            episode: episode
+        )
+    }
+
+    private func makeSeries() -> NuvioMeta {
+        makeMeta(id: "tt-dismiss-series", type: "series", videos: [
+            NuvioVideo(id: "tt-dismiss-series:1:1", title: "One", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+            NuvioVideo(id: "tt-dismiss-series:1:2", title: "Two", season: 1, episode: 2, thumbnail: nil, overview: nil, released: nil, rating: nil),
+        ])
+    }
+
+    private func makeMovie() -> NuvioMeta {
+        makeMeta(id: "tt-dismiss-movie", type: "movie", videos: nil)
+    }
+
+    private func makeMeta(id: String, type: String, videos: [NuvioVideo]?) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: "Dismiss Test",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: id,
+            tmdbId: nil,
+            type: type,
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: videos
         )
     }
 }

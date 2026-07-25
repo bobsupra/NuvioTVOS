@@ -2,7 +2,6 @@
 //  CatalogBrowseViewModelTests.swift
 //  NuvioTVTests
 //
-//  Created by Claude Code
 //  Unit tests for CatalogBrowseViewModel
 //
 

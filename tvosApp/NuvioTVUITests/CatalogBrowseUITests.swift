@@ -2,7 +2,6 @@
 //  CatalogBrowseUITests.swift
 //  NuvioTVUITests
 //
-//  Created by Claude Code
 //  UI tests for catalog browsing functionality
 //
 

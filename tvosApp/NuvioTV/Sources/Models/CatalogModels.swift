@@ -2,7 +2,6 @@
 //  CatalogModels.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Swift data models for catalog browsing
 //
 
@@ -646,6 +645,9 @@ struct ContinueWatchingItem: Identifiable, Codable {
     }
 
     var remainingText: String {
+        // Synced rows can arrive without a runtime; there is no honest number to
+        // show for those, so offer the action instead.
+        guard duration > 0 else { return "RESUME" }
         let remaining = max(0, duration - position)
         let minutes = Int(remaining / 60)
         let hours = minutes / 60
@@ -691,13 +693,10 @@ enum ContinueWatchingStore {
     static private(set) var persistenceDiagnostic = "not attempted"
 
     private enum PersistenceError: LocalizedError {
-        case applicationSupportUnavailable
         case verificationFailed
 
         var errorDescription: String? {
             switch self {
-            case .applicationSupportUnavailable:
-                return "Application Support is unavailable"
             case .verificationFailed:
                 return "the saved progress could not be verified"
             }
@@ -722,7 +721,16 @@ enum ContinueWatchingStore {
     /// so reads/writes land in that profile's bucket.
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
+        // The raw ledger is profile-scoped too; it must move first so anything
+        // reading progress during this switch sees the new profile's rows.
+        WatchProgressLedger.setActiveProfile(profileId)
+        ContinueWatchingDismissStore.setActiveProfile(profileId)
         migrateLegacyHistoryIfNeeded()
+        // Carry a pre-ledger install's history across, so upgrading users keep
+        // their row and it becomes syncable.
+        WatchProgressLedger.backfillIfEmpty(from: items())
+        // Recover movie rows a rejected payload left marked as synced.
+        WatchProgressLedger.repushMoviesOnceIfNeeded()
         // Rebuild Top Shelf on every profile load. Its App Group snapshot may
         // have been cleared by an update or signing change even when the local
         // Continue Watching file is still intact.
@@ -730,13 +738,19 @@ enum ContinueWatchingStore {
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
-    private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+    private static var storageKey: String { storageKey(for: activeProfileId) }
+
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
     }
 
     private static var episodeResumeStorageKey: String {
-        "\(storageKey).episodeResumePoints.v1"
+        episodeResumeStorageKey(for: activeProfileId)
+    }
+
+    private static func episodeResumeStorageKey(for profileId: String?) -> String {
+        "\(storageKey(for: profileId)).episodeResumePoints.v1"
     }
 
     static func items() -> [ContinueWatchingItem] {
@@ -760,6 +774,29 @@ enum ContinueWatchingStore {
 
     static func item(for metaId: String) -> ContinueWatchingItem? {
         items().first { $0.meta.id == metaId }
+    }
+
+    /// Accounts for every entry between the stored file and the rendered row.
+    ///
+    /// A count that drops between these stages is the whole question when a user
+    /// reports "only N showed", and each stage discards for a different reason:
+    /// the file is capped, `shouldKeep` drops finished playback, and Home hides
+    /// unreleased titles when that preference is on.
+    static func rowDiagnostic() -> String {
+        guard let data = data(for: storageKey) else {
+            return "stored file missing (rebuilds from ledger on next Home load)"
+        }
+        let decoded: [ContinueWatchingItem]
+        do {
+            decoded = try makeDecoder().decode([ContinueWatchingItem].self, from: data)
+        } catch {
+            return "stored file unreadable: \(diagnosticText(for: error))"
+        }
+        let kept = decoded.filter { shouldKeep(position: $0.position, duration: $0.duration) }
+        let upNext = kept.filter(\.isUpNextEntry).count
+        let unaired = kept.filter { $0.isUpNextEntry && !$0.hasAired }.count
+        return "cap \(maxItems); stored \(decoded.count), passing filter \(kept.count), "
+            + "of those up-next \(upNext) (unaired \(unaired)); \(persistenceDiagnostic)"
     }
 
     /// Exact per-episode resume lookup. A series request never falls back to
@@ -817,23 +854,19 @@ enum ContinueWatchingStore {
         let key = storageKey
         let source: String
         let rawData: Data?
-        if UserDefaults.standard.bool(forKey: fallbackMarkerKey(for: key)),
-           let data = UserDefaults.standard.data(forKey: key) {
-            source = "UserDefaults fallback"
+        if let url = storageURL(for: key), let data = try? Data(contentsOf: url) {
+            source = "Caches"
             rawData = data
-        } else if let url = storageURL(for: key), let data = try? Data(contentsOf: url) {
-            source = "Application Support"
-            rawData = data
-        } else if let url = fallbackStorageURL(for: key), let data = try? Data(contentsOf: url) {
-            source = "Caches fallback"
-            rawData = data
-        } else if let url = legacyStorageURL(for: key), let data = try? Data(contentsOf: url) {
-            source = "Documents (legacy)"
-            rawData = data
+        } else if let match = legacyStorageURLs(for: key).lazy
+            .compactMap({ url in (try? Data(contentsOf: url)).map { (url, $0) } })
+            .first {
+            source = "legacy \(match.0.deletingLastPathComponent().lastPathComponent)"
+            rawData = match.1
         } else if let data = UserDefaults.standard.data(forKey: key) {
             source = "UserDefaults (legacy)"
             rawData = data
         } else {
+            // Not an error: evicted or not yet built. The ledger rebuilds it.
             source = "missing"
             rawData = nil
         }
@@ -886,11 +919,42 @@ enum ContinueWatchingStore {
               duration.isFinite,
               position > 0,
               duration >= 60 else { return }
+
+        // Going back to a title retires the removal the user made earlier, so a
+        // months-old dismissal can never hide progress they just made.
+        ContinueWatchingDismissStore.clear(contentId: meta.id)
+
+        // Record the raw row before any display rule runs. A finished episode is
+        // not "nothing to store" — it is precisely the seed that produces the
+        // next episode's Next Up card, here and on every other device.
+        WatchProgressLedger.upsert(
+            WatchProgressRecord(
+                progressKey: WatchProgressLedger.progressKey(
+                    contentId: meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                contentId: meta.id,
+                contentType: meta.isSeries ? "series" : "movie",
+                videoId: WatchProgressLedger.videoId(
+                    contentId: meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                season: season,
+                episode: episode,
+                position: position,
+                duration: duration,
+                lastWatchedAt: Date(),
+                isPendingPush: true
+            )
+        )
+
         guard shouldKeep(position: position, duration: duration) else {
             if let season, let episode {
                 removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
             }
-            remove(metaId: meta.id)
+            remove(metaId: meta.id, retainingLedger: true)
             return
         }
 
@@ -923,6 +987,52 @@ enum ContinueWatchingStore {
         persist(Array(updated))
     }
 
+    /// Records a genuine watch-through.
+    ///
+    /// The ledger row becomes a completed row rather than being deleted: that
+    /// completed row is exactly what seeds the following episode's Next Up card,
+    /// here and on every other device. Position-at-runtime is how the phone
+    /// marks a finished row, and it is the only completion signal the sync
+    /// payload can carry — there is no `is_completed` column on the wire.
+    static func markPlaybackCompleted(
+        meta: NuvioMeta,
+        duration: Double,
+        season: Int? = nil,
+        episode: Int? = nil
+    ) {
+        guard duration.isFinite, duration > 0 else { return }
+        ContinueWatchingDismissStore.clear(contentId: meta.id)
+        WatchProgressLedger.upsert(
+            WatchProgressRecord(
+                progressKey: WatchProgressLedger.progressKey(
+                    contentId: meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                contentId: meta.id,
+                contentType: meta.isSeries ? "series" : "movie",
+                videoId: WatchProgressLedger.videoId(
+                    contentId: meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                season: season,
+                episode: episode,
+                position: duration,
+                duration: duration,
+                lastWatchedAt: Date(),
+                isPendingPush: true
+            )
+        )
+        if let season, let episode {
+            removeEpisodeResumePoint(meta: meta, season: season, episode: episode)
+        }
+        remove(metaId: meta.id, retainingLedger: true)
+    }
+
+    /// Display-only "Next Up" suggestion. Deliberately absent from the ledger: a
+    /// suggestion is not playback, and pushing one would create a phantom
+    /// just-started row on every other device.
     static func saveUpNext(meta: NuvioMeta, duration: Double, season: Int, episode: Int, released: String? = nil) {
         let item = ContinueWatchingItem(
             meta: meta,
@@ -992,7 +1102,15 @@ enum ContinueWatchingStore {
         value?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    static func remove(metaId: String) {
+    /// Removes a title from the rendered row.
+    ///
+    /// `retainingLedger` keeps the underlying synced rows — used when an episode
+    /// simply finished, where the row still has to seed Next Up. A user-initiated
+    /// removal clears both, so the title does not come back on the next rebuild.
+    static func remove(metaId: String, retainingLedger: Bool = false) {
+        if !retainingLedger {
+            WatchProgressLedger.removeContent(id: metaId)
+        }
         persist(items().filter { $0.meta.id != metaId })
     }
 
@@ -1031,31 +1149,19 @@ enum ContinueWatchingStore {
         persist(remaining)
     }
 
-    @discardableResult
-    static func mergeRemote(_ remoteItems: [ContinueWatchingItem]) -> Bool {
-        guard !remoteItems.isEmpty else { return true }
-        var byId: [String: ContinueWatchingItem] = [:]
-        // Remote items come second and win timestamp ties, so a re-pull can
-        // refresh an entry's presentation (e.g. up-next state) even when the
-        // underlying remote row hasn't moved.
-        (items() + remoteItems).forEach { item in
-            let existing = byId[item.meta.id]
-            if existing == nil || item.lastWatchedAt >= existing!.lastWatchedAt {
-                byId[item.meta.id] = item
-            }
-        }
-        let merged = Array(byId.values)
-            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-            .prefix(maxItems)
-            .map { $0 }
-        guard persist(merged) else { return false }
-        remoteItems.forEach { item in
-            guard item.meta.isSeries,
-                  !item.isUpNextEntry,
-                  let season = item.season,
+    /// Installs a freshly derived list. `ContinueWatchingBuilder` owns the
+    /// derivation; this store only persists and publishes the result.
+    static func replaceAll(_ newItems: [ContinueWatchingItem]) {
+        let ordered = Array(newItems.sorted { $0.lastWatchedAt > $1.lastWatchedAt }.prefix(maxItems))
+        guard persist(ordered) else { return }
+
+        // Keep per-episode resume points in step so opening an episode directly
+        // still resumes where the account left it.
+        for item in ordered where item.meta.isSeries && !item.isUpNextEntry {
+            guard let season = item.season,
                   let episode = item.episode,
                   shouldKeep(position: item.position, duration: item.duration) else {
-                return
+                continue
             }
             let episodeId = item.meta.videos?.first {
                 $0.season == season && $0.episode == episode
@@ -1070,22 +1176,17 @@ enum ContinueWatchingStore {
                 updatedAt: item.lastWatchedAt
             )
         }
-        // A Nuvio Sync progress pull can arrive after the watched pull and
-        // otherwise resurrect an episode that Trakt/local history just marked.
-        removeWatched(WatchedStore.items())
-        return true
-    }
-
-    static func replaceAll(_ newItems: [ContinueWatchingItem]) {
-        persist(Array(newItems.sorted { $0.lastWatchedAt > $1.lastWatchedAt }.prefix(maxItems)))
     }
 
     private static func shouldKeep(position: Double, duration: Double) -> Bool {
         // Any started playback counts (> 0), matching the phone app's rule —
         // a stricter threshold here hides items the phone still lists.
-        guard duration >= 60, position > 0 else { return false }
-        let remaining = duration - position
-        return remaining >= 60 && (position / duration) < 0.92
+        guard position > 0 else { return false }
+        // An unknown runtime is not evidence of completion. The phone stores
+        // duration-less rows and keeps them resumable; treating them as
+        // finished here is what made synced titles vanish from this device.
+        guard duration > 0 else { return true }
+        return (position / duration) < WatchProgressLedger.completionFraction
     }
 
     private static func episodeResumePoints() -> [EpisodeResumePoint] {
@@ -1185,6 +1286,9 @@ enum ContinueWatchingStore {
 
     private static func clampedResume(position: Double, duration: Double) -> Double? {
         guard position > 5, shouldKeep(position: position, duration: duration) else { return nil }
+        // With no known runtime there is nothing to clamp against; resume where
+        // the row says playback stopped.
+        guard duration > 0 else { return position }
         return max(0, min(position, max(duration - 5, 0)))
     }
 
@@ -1200,54 +1304,32 @@ enum ContinueWatchingStore {
         }
 
         let key = storageKey
-        let defaults = UserDefaults.standard
-        var primaryError: Error?
-        if let url = storageURL(for: key) {
-            do {
-                try writeAndVerify(data, to: url)
-                if let fallbackURL = fallbackStorageURL(for: key) {
-                    try? FileManager.default.removeItem(at: fallbackURL)
-                }
-                defaults.removeObject(forKey: key)
-                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
-                persistenceDiagnostic = "Application Support: \(storedItems.count) item(s), \(data.count) bytes"
-                NotificationCenter.default.post(name: changedNotification, object: nil)
-                writeTopShelfFeed()
-                return true
-            } catch {
-                primaryError = error
-            }
-        } else {
-            primaryError = PersistenceError.applicationSupportUnavailable
+        guard let url = storageURL(for: key) else {
+            persistenceDiagnostic = "save failed: Caches unavailable"
+            return false
         }
 
-        // Synced progress can contain several megabytes of episode metadata.
-        // tvOS 27 aborts the process when a value that large is written to
-        // UserDefaults, so the fallback must remain file-backed too.
-        if let fallbackURL = fallbackStorageURL(for: key) {
-            do {
-                try writeAndVerify(data, to: fallbackURL)
-                if let primaryURL = storageURL(for: key),
-                   FileManager.default.fileExists(atPath: primaryURL.path) {
-                    try FileManager.default.removeItem(at: primaryURL)
-                }
-                defaults.removeObject(forKey: key)
-                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
-                let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-                persistenceDiagnostic = "Caches fallback: \(storedItems.count) item(s); \(reason)"
-                NotificationCenter.default.post(name: changedNotification, object: nil)
-                writeTopShelfFeed()
-                return true
-            } catch {
-                let primaryReason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-                persistenceDiagnostic = "save failed: \(primaryReason); Caches fallback: \(diagnosticText(for: error))"
-                return false
+        do {
+            try writeAndVerify(data, to: url)
+            // Retire any copy an older build left in a directory tvOS will not
+            // let us write to again.
+            for legacyURL in legacyStorageURLs(for: key) {
+                try? FileManager.default.removeItem(at: legacyURL)
             }
+            let defaults = UserDefaults.standard
+            defaults.removeObject(forKey: key)
+            defaults.removeObject(forKey: fallbackMarkerKey(for: key))
+            persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+            writeTopShelfFeed()
+            return true
+        } catch {
+            // Deliberately no UserDefaults fallback: a synced list carries several
+            // megabytes of episode metadata, and tvOS 27 aborts the process when a
+            // value that large is written to UserDefaults.
+            persistenceDiagnostic = "save failed: \(diagnosticText(for: error))"
+            return false
         }
-
-        let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-        persistenceDiagnostic = "save failed: \(reason); Caches unavailable"
-        return false
     }
 
     /// Mirrors the active profile's Continue Watching list into the App Group so
@@ -1274,9 +1356,26 @@ enum ContinueWatchingStore {
         TopShelfFeedStore.write(Array(entries))
     }
 
+    /// Deletes one profile's resume state, leaving every other profile alone.
+    /// Use this rather than ``eraseAllProfiles()`` for anything that is only
+    /// cleaning up after itself — see ``WatchedStore/eraseProfile(_:)``.
+    static func eraseProfile(_ profileId: String) {
+        WatchProgressLedger.eraseProfile(profileId)
+        ContinueWatchingDismissStore.eraseProfile(profileId)
+        for key in [storageKey(for: profileId), episodeResumeStorageKey(for: profileId)] {
+            UserDefaults.standard.removeObject(forKey: key)
+            if let url = storageURL(for: key) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
     /// Deletes every profile's watch history (and the legacy shared list).
     /// Called on sign-out so the next user starts with no resume state.
     static func eraseAllProfiles() {
+        WatchProgressLedger.eraseAllProfiles()
+        ContinueWatchingDismissStore.eraseAllProfiles()
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }
@@ -1284,10 +1383,7 @@ enum ContinueWatchingStore {
         if let directory = storageDirectoryURL {
             try? FileManager.default.removeItem(at: directory)
         }
-        if let directory = fallbackStorageDirectoryURL {
-            try? FileManager.default.removeItem(at: directory)
-        }
-        if let legacyDirectory = legacyStorageDirectoryURL {
+        for legacyDirectory in legacyStorageDirectoryURLs {
             try? FileManager.default.removeItem(at: legacyDirectory)
         }
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -1314,35 +1410,46 @@ enum ContinueWatchingStore {
         }
     }
 
+    /// Caches is the only directory a tvOS app can actually write to on real
+    /// hardware. Application Support and Documents both raise "you don't have
+    /// permission" on device while succeeding in the Simulator, which is how the
+    /// old primary path shipped: every physical Apple TV was silently running on
+    /// what the code called its fallback.
+    ///
+    /// Caches being evictable is acceptable here because this file is a derived
+    /// view. [[WatchProgressLedger]] holds the durable history in UserDefaults,
+    /// and `ContinueWatchingBuilder` rebuilds this from it on the next Home load.
     private static var storageDirectoryURL: URL? {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
-            .appendingPathComponent("Nuvio", isDirectory: true)
-            .appendingPathComponent(storageDirectoryName, isDirectory: true)
-    }
-
-    /// Pre-sideload builds used Documents. Some signing/install paths expose
-    /// that directory as read-only on tvOS, so it is migration-only now.
-    private static var legacyStorageDirectoryURL: URL? {
-        FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first?
-            .appendingPathComponent(storageDirectoryName, isDirectory: true)
-    }
-
-    private static var fallbackStorageDirectoryURL: URL? {
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("Nuvio", isDirectory: true)
             .appendingPathComponent(storageDirectoryName, isDirectory: true)
+    }
+
+    /// Read-only migration sources, newest scheme first. Older builds aimed at
+    /// Application Support (which worked only in the Simulator) and, before that,
+    /// Documents. Anything found here is copied into Caches and removed.
+    private static var legacyStorageDirectoryURLs: [URL] {
+        let manager = FileManager.default
+        var urls: [URL] = []
+        if let applicationSupport = manager.urls(for: .applicationSupportDirectory, in: .userDomainMask).first {
+            urls.append(
+                applicationSupport
+                    .appendingPathComponent("Nuvio", isDirectory: true)
+                    .appendingPathComponent(storageDirectoryName, isDirectory: true)
+            )
+        }
+        if let documents = manager.urls(for: .documentDirectory, in: .userDomainMask).first {
+            urls.append(documents.appendingPathComponent(storageDirectoryName, isDirectory: true))
+        }
+        return urls
     }
 
     private static func storageURL(for key: String) -> URL? {
         storageDirectoryURL?.appendingPathComponent(fileName(for: key))
     }
 
-    private static func legacyStorageURL(for key: String) -> URL? {
-        legacyStorageDirectoryURL?.appendingPathComponent(fileName(for: key))
-    }
-
-    private static func fallbackStorageURL(for key: String) -> URL? {
-        fallbackStorageDirectoryURL?.appendingPathComponent(fileName(for: key))
+    private static func legacyStorageURLs(for key: String) -> [URL] {
+        legacyStorageDirectoryURLs.map { $0.appendingPathComponent(fileName(for: key)) }
     }
 
     private static func fileName(for key: String) -> String {
@@ -1355,65 +1462,36 @@ enum ContinueWatchingStore {
     }
 
     private static func data(for key: String) -> Data? {
-        let defaults = UserDefaults.standard
-        let markerKey = fallbackMarkerKey(for: key)
-
-        // A verified fallback is newer than any file left by the failed write.
-        // Retry the preferred storage opportunistically without risking it.
-        if defaults.bool(forKey: markerKey), let data = defaults.data(forKey: key) {
-            if let url = storageURL(for: key) {
-                do {
-                    try writeAndVerify(data, to: url)
-                    defaults.removeObject(forKey: key)
-                    defaults.removeObject(forKey: markerKey)
-                    persistenceDiagnostic = "recovered Application Support storage"
-                } catch {
-                    persistenceDiagnostic = "using UserDefaults fallback: \(diagnosticText(for: error))"
-                }
-            }
-            return data
-        }
-
         if let url = storageURL(for: key),
            let data = try? Data(contentsOf: url) {
             return data
         }
 
-        if let fallbackURL = fallbackStorageURL(for: key),
-           let data = try? Data(contentsOf: fallbackURL) {
-            if let url = storageURL(for: key) {
-                do {
-                    try writeAndVerify(data, to: url)
-                    try? FileManager.default.removeItem(at: fallbackURL)
-                    persistenceDiagnostic = "recovered Application Support storage"
-                } catch {
-                    persistenceDiagnostic = "using Caches fallback: \(diagnosticText(for: error))"
-                }
-            }
-            return data
-        }
-
-        // Preserve progress from older builds when their Documents file is
-        // still readable, but keep all future writes in Application Support.
-        if let legacyURL = legacyStorageURL(for: key),
-           let data = try? Data(contentsOf: legacyURL) {
+        // Nothing in Caches: either this is the first read after an upgrade, or
+        // tvOS evicted the file. Recover whatever an older build left behind and
+        // move it into Caches. A miss here is not an error — the ledger can
+        // rebuild the whole view.
+        for legacyURL in legacyStorageURLs(for: key) {
+            guard let data = try? Data(contentsOf: legacyURL) else { continue }
             if let url = storageURL(for: key) {
                 do {
                     try writeAndVerify(data, to: url)
                     try? FileManager.default.removeItem(at: legacyURL)
-                    persistenceDiagnostic = "migrated Documents progress"
+                    persistenceDiagnostic = "migrated progress from \(legacyURL.deletingLastPathComponent().lastPathComponent)"
                 } catch {
-                    persistenceDiagnostic = "Documents migration failed: \(diagnosticText(for: error))"
+                    persistenceDiagnostic = "migration failed: \(diagnosticText(for: error))"
                 }
             }
             return data
         }
 
+        let defaults = UserDefaults.standard
         guard let data = defaults.data(forKey: key) else { return nil }
         if let url = storageURL(for: key) {
             do {
                 try writeAndVerify(data, to: url)
                 defaults.removeObject(forKey: key)
+                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
                 persistenceDiagnostic = "migrated UserDefaults progress"
             } catch {
                 // Preserve the legacy value until the destination is verified.
@@ -1469,18 +1547,114 @@ enum ContinueWatchingStore {
         try data.write(to: url, options: [.atomic])
     }
 
+    /// Drops the derived file the way tvOS does when it reclaims Caches, leaving
+    /// the ledger untouched. Exists so the recovery path is actually covered.
+    static func simulateStorageEvictionForTesting() {
+        removeStorage(for: storageKey)
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
     private static func removeStorage(for key: String) {
         UserDefaults.standard.removeObject(forKey: key)
         UserDefaults.standard.removeObject(forKey: fallbackMarkerKey(for: key))
         if let url = storageURL(for: key) {
             try? FileManager.default.removeItem(at: url)
         }
-        if let legacyURL = legacyStorageURL(for: key) {
+        for legacyURL in legacyStorageURLs(for: key) {
             try? FileManager.default.removeItem(at: legacyURL)
         }
-        if let fallbackURL = fallbackStorageURL(for: key) {
-            try? FileManager.default.removeItem(at: fallbackURL)
+    }
+}
+
+/// Cards the user removed from Continue Watching by hand.
+///
+/// Local progress is deleted outright when a card is removed, but a Trakt- or
+/// Simkl-backed row is rebuilt from the provider on every refresh, and a synced
+/// Nuvio row can be restored by a pull that races the delete. A removal only
+/// stays removed if this device also remembers it.
+///
+/// The key carries the episode the card was showing, so the removal is scoped
+/// to exactly what the user dismissed: finishing a later episode produces a
+/// different key, and any fresh progress for the title clears its keys outright
+/// (see `ContinueWatchingStore.save`), so a show they return to always comes
+/// back on its own.
+enum ContinueWatchingDismissStore {
+    static let changedNotification = Notification.Name("nuvio.tv.continueWatching.dismissed")
+
+    private static let baseKey = "nuvio.tv.continueWatching.dismissedKeys"
+    private static let separator = "\u{1f}"
+
+    private(set) static var activeProfileId: String?
+
+    /// Driven by `ContinueWatchingStore.setActiveProfile` so removals follow the
+    /// same profile scope as the row they hide.
+    static func setActiveProfile(_ profileId: String?) {
+        activeProfileId = profileId
+    }
+
+    private static var storageKey: String {
+        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+        return "\(baseKey).\(id)"
+    }
+
+    /// Scoped counterpart to ``eraseAllProfiles()`` — see
+    /// ``WatchedStore/eraseProfile(_:)``.
+    static func eraseProfile(_ profileId: String) {
+        let key = profileId.isEmpty ? baseKey : "\(baseKey).\(profileId)"
+        UserDefaults.standard.removeObject(forKey: key)
+    }
+
+    static func key(for item: ContinueWatchingItem) -> String {
+        let numbers = item.episodeNumbers
+        return key(contentId: item.meta.id, season: numbers?.season, episode: numbers?.episode)
+    }
+
+    static func key(contentId: String, season: Int?, episode: Int?) -> String {
+        let id = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(id)\(separator)\(season ?? -1)\(separator)\(episode ?? -1)"
+    }
+
+    static func keys() -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: storageKey) ?? [])
+    }
+
+    static func isDismissed(_ item: ContinueWatchingItem) -> Bool {
+        let current = keys()
+        guard !current.isEmpty else { return false }
+        return current.contains(key(for: item))
+    }
+
+    static func dismiss(_ item: ContinueWatchingItem) {
+        var current = keys()
+        guard current.insert(key(for: item)).inserted else { return }
+        persist(current)
+    }
+
+    /// Retires every removal recorded for a title.
+    static func clear(contentId: String) {
+        let current = keys()
+        guard !current.isEmpty else { return }
+        let prefix = "\(contentId.trimmingCharacters(in: .whitespacesAndNewlines))\(separator)"
+        let remaining = current.filter { !$0.hasPrefix(prefix) }
+        guard remaining.count != current.count else { return }
+        persist(remaining)
+    }
+
+    private static func persist(_ keys: Set<String>) {
+        if keys.isEmpty {
+            UserDefaults.standard.removeObject(forKey: storageKey)
+        } else {
+            UserDefaults.standard.set(Array(keys), forKey: storageKey)
         }
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    /// Deletes every profile's removals (and the legacy shared set) on sign-out.
+    static func eraseAllProfiles() {
+        let defaults = UserDefaults.standard
+        defaults.dictionaryRepresentation().keys
+            .filter { $0.hasPrefix(baseKey) }
+            .forEach { defaults.removeObject(forKey: $0) }
     }
 }
 
@@ -2108,11 +2282,61 @@ struct WatchedStoreItem: Identifiable, Codable {
     let season: Int?
     let episode: Int?
 
-    init(meta: NuvioMeta, watchedAt: Date, season: Int? = nil, episode: Int? = nil) {
+    /// Which backends have this mark, as `TraktWatchProgressSource` raw values.
+    ///
+    /// The store is one shared list, but each backend keeps its own account, and
+    /// a mark made under one is deliberately not pushed to the others. Without
+    /// recording who confirmed a row, switching the selected source shows the
+    /// union — a title watched only in Nuvio Sync keeps its checkmark under
+    /// Simkl, which is not what either account says.
+    ///
+    /// A title can genuinely be watched in more than one place, so this is a set
+    /// rather than a single owner. Empty means "not yet attributed": rows written
+    /// before this existed, which ``migrateSourcesIfNeeded()`` backfills and
+    /// which stay visible everywhere until it does.
+    var sources: Set<String>
+
+    enum CodingKeys: String, CodingKey {
+        case meta, watchedAt, season, episode, sources
+    }
+
+    init(
+        meta: NuvioMeta,
+        watchedAt: Date,
+        season: Int? = nil,
+        episode: Int? = nil,
+        sources: Set<String> = []
+    ) {
         self.meta = meta
         self.watchedAt = watchedAt
         self.season = season
         self.episode = episode
+        self.sources = sources
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        meta = try container.decode(NuvioMeta.self, forKey: .meta)
+        watchedAt = try container.decode(Date.self, forKey: .watchedAt)
+        season = try container.decodeIfPresent(Int.self, forKey: .season)
+        episode = try container.decodeIfPresent(Int.self, forKey: .episode)
+        sources = try container.decodeIfPresent(Set<String>.self, forKey: .sources) ?? []
+    }
+
+    /// Visible when the active source confirmed it, or when nothing has attributed
+    /// it yet — an unattributed row is not evidence that the source *lacks* it.
+    func isVisible(under source: TraktWatchProgressSource) -> Bool {
+        sources.isEmpty || sources.contains(source.rawValue)
+    }
+
+    func adding(source: TraktWatchProgressSource) -> WatchedStoreItem {
+        WatchedStoreItem(
+            meta: meta,
+            watchedAt: watchedAt,
+            season: season,
+            episode: episode,
+            sources: sources.union([source.rawValue])
+        )
     }
 }
 
@@ -2143,7 +2367,42 @@ enum WatchedStore {
 
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
+        migrateSourcesIfNeeded()
         NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    /// Attributes rows written before `sources` existed.
+    ///
+    /// The best available reconstruction is the trackers' own cached snapshots:
+    /// anything Simkl supplied is still listed there, so those rows are tagged
+    /// accordingly and everything else is treated as Nuvio Sync's. Runs once per
+    /// profile — after it, an empty `sources` means a genuinely new row rather
+    /// than a legacy one.
+    private static func migrateSourcesIfNeeded() {
+        guard let id = activeProfileId, !id.isEmpty else { return }
+        let flagKey = "nuvio.tv.watched.sourcesMigrated.\(id)"
+        let store = ProfileSettings.store(for: id)
+        guard !store.bool(forKey: flagKey) else { return }
+
+        let current = items()
+        guard !current.isEmpty else {
+            store.set(true, forKey: flagKey)
+            return
+        }
+
+        let simklKeys = Set(
+            SimklSyncCache.history(in: store)
+                .flatMap(\.items)
+                .flatMap(watchedIdentityKeys)
+        )
+        let migrated = current.map { item -> WatchedStoreItem in
+            guard item.sources.isEmpty else { return item }
+            let source: TraktWatchProgressSource =
+                watchedIdentityKeys(item).isDisjoint(with: simklKeys) ? .nuvioSync : .simkl
+            return item.adding(source: source)
+        }
+        guard persist(migrated) else { return }
+        store.set(true, forKey: flagKey)
     }
 
     private static var storageKey: String { storageKey(for: activeProfileId) }
@@ -2177,21 +2436,29 @@ enum WatchedStore {
         }
     }
 
+    /// Rows the selected backend actually has — which is what every "is this
+    /// watched?" question in the UI means. ``items()`` stays the full local
+    /// union, because sync pushes and history transfers work from that.
+    static func visibleItems() -> [WatchedStoreItem] {
+        let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+        return items().filter { $0.isVisible(under: source) }
+    }
+
     static func contains(meta: NuvioMeta) -> Bool {
-        items().contains {
+        visibleItems().contains {
             sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil
         }
     }
 
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {
-        items().contains {
+        visibleItems().contains {
             $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
                 && $0.season == season && $0.episode == episode
         }
     }
 
     static func containsEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
-        items().contains {
+        visibleItems().contains {
             sameContent($0.meta, meta) && $0.season == season && $0.episode == episode
         }
     }
@@ -2199,7 +2466,7 @@ enum WatchedStore {
     /// "season:episode" keys of every watched episode of a series, for the
     /// Details episode strip.
     static func watchedEpisodeKeys(metaId: String) -> Set<String> {
-        Set(items().compactMap { item in
+        Set(visibleItems().compactMap { item in
             guard item.meta.id.caseInsensitiveCompare(metaId) == .orderedSame,
                   let season = item.season,
                   let episode = item.episode else {
@@ -2210,7 +2477,7 @@ enum WatchedStore {
     }
 
     static func watchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
-        Set(items().compactMap { item in
+        Set(visibleItems().compactMap { item in
             guard sameContent(item.meta, meta),
                   let season = item.season,
                   let episode = item.episode else {
@@ -2247,11 +2514,14 @@ enum WatchedStore {
 
     @discardableResult
     static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) -> Bool {
+        // A new mark belongs to whichever backend is selected — that is the one
+        // it gets pushed to, and the only one that will confirm it on a pull.
         let item = WatchedStoreItem(
             meta: meta.persistenceSnapshot,
             watchedAt: Date(),
             season: season,
-            episode: episode
+            episode: episode,
+            sources: [TraktSettingsStore.watchProgressSource(in: ProfileSettings.current).rawValue]
         )
         let updated = [item] + items().filter {
             !(sameContent($0.meta, meta)
@@ -2437,6 +2707,7 @@ enum WatchedStore {
         _ remoteItems: [WatchedStoreItem],
         syncStartedAt: Date
     ) -> Bool {
+        let remoteItems = remoteItems.map { $0.adding(source: .trakt) }
         guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
 
         let remoteKeys = Set(remoteItems.flatMap(traktIdentityKeys))
@@ -2469,6 +2740,7 @@ enum WatchedStore {
         previousRemoteItems: [WatchedStoreItem],
         syncStartedAt: Date
     ) -> Bool {
+        let remoteItems = remoteItems.map { $0.adding(source: .simkl) }
         guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
 
         let currentRemoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
@@ -2514,9 +2786,14 @@ enum WatchedStore {
             let existingIndex = identityKeys.compactMap { indexByIdentity[$0] }.min()
 
             if let existingIndex {
+                // The newer row wins on timing, but attribution accumulates:
+                // dropping the loser's sources would forget that the other
+                // backend also has this mark.
+                let combined = merged[existingIndex].sources.union(item.sources)
                 if item.watchedAt > merged[existingIndex].watchedAt {
                     merged[existingIndex] = item
                 }
+                merged[existingIndex].sources = combined
                 // Retain every alias learned for this content so a later row
                 // can match by IMDb, TMDB, or catalog id without another scan.
                 for key in identityKeys {
@@ -2716,7 +2993,11 @@ enum WatchedStore {
     }
 
     private static var tombstoneStorageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return "\(baseKey).tombstones" }
+        tombstoneStorageKey(for: activeProfileId)
+    }
+
+    private static func tombstoneStorageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return "\(baseKey).tombstones" }
         return "\(baseKey).tombstones.\(id)"
     }
 
@@ -2841,6 +3122,27 @@ enum WatchedStore {
             nan: "NaN"
         )
         return decoder
+    }
+
+    /// Deletes one profile's watched marks and tombstones, leaving every other
+    /// profile untouched.
+    ///
+    /// ``eraseAllProfiles()`` is a sign-out operation — it removes the whole
+    /// storage directory. Anything that only needs to clean up after itself
+    /// (tests, in particular, which run inside the app's own container and so
+    /// share these files with a real install) must use this instead.
+    static func eraseProfile(_ profileId: String) {
+        let keys = [storageKey(for: profileId), tombstoneStorageKey(for: profileId)]
+        for key in keys {
+            UserDefaults.standard.removeObject(forKey: key)
+            if let url = storageURL(forKey: key) {
+                try? FileManager.default.removeItem(at: url)
+            }
+            if let url = fallbackStorageURL(forKey: key) {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
     /// Deletes every profile's watched marks and tombstones (the tombstone keys
@@ -3089,6 +3391,10 @@ enum ProfileSettings {
         let suite = store(for: id)
         seedFromGlobalIfNeeded(suite)
         current = suite
+        // Must run after `current` is pointed at the profile, and after the
+        // watch-state stores have been scoped, because it inspects this
+        // profile's Trakt/Simkl credentials.
+        TraktSettingsStore.migrateWatchProgressSourceIfNeeded(in: suite)
     }
 
     static func clearActiveProfile() {

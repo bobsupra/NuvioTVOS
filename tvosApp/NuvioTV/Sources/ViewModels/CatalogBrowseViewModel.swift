@@ -2,7 +2,6 @@
 //  CatalogBrowseViewModel.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  ViewModel for catalog browsing with Combine
 //
 

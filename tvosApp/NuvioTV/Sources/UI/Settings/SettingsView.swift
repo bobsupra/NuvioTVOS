@@ -155,6 +155,9 @@ enum SettingsKey {
     static let traktContinueWatchingDaysCap = "nuvio.tv.settings.integrations.traktContinueWatchingDaysCap"
     static let traktShowMetaComments = "nuvio.tv.settings.integrations.traktShowMetaComments"
     static let traktWatchProgressSource = "nuvio.tv.settings.integrations.traktWatchProgressSource"
+    /// Set once the user picks a watch progress source by hand. Until then,
+    /// connecting a tracker is allowed to select itself.
+    static let watchProgressSourceChosenByUser = "nuvio.tv.settings.integrations.watchProgressSourceChosenByUser"
     static let traktLibrarySourceMode = "nuvio.tv.settings.integrations.traktLibrarySourceMode"
     static let traktMoreLikeThisSource = "nuvio.tv.settings.integrations.traktMoreLikeThisSource"
     static let simklClientID = "nuvio.tv.settings.integrations.simklClientID"
@@ -211,7 +214,8 @@ enum SettingsKey {
         continueWatchingSort, showUnairedNextUp, hideUnreleased, showFullDates,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
-        traktWatchProgressSource, traktLibrarySourceMode, traktMoreLikeThisSource,
+        traktWatchProgressSource, watchProgressSourceChosenByUser,
+        traktLibrarySourceMode, traktMoreLikeThisSource,
         simklClientID,
         tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
@@ -3533,6 +3537,7 @@ private struct SimklConnectedSettingsSheet: View {
         Binding(
             get: { TraktSettingsStore.watchProgressSource.label },
             set: { label in
+                TraktSettingsStore.markWatchProgressSourceChosenByUser()
                 TraktSettingsStore.watchProgressSource =
                     TraktWatchProgressSource.allCases.first { $0.label == label } ?? .nuvioSync
             }
@@ -4596,6 +4601,8 @@ private struct AdvancedSettingsView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
+    @State private var isSeedingTestHistory = false
+    @State private var testHistoryStatus = ContinueWatchingTestData.status
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
     var body: some View {
@@ -4642,6 +4649,75 @@ private struct AdvancedSettingsView: View {
                     subtitle: L10n.string("tvos_settings_draw_extra_focus_outlines_for_layout_debugging", fallback: "Draw extra focus outlines for layout debugging"),
                     isOn: $focusHighlighter,
                     accentColor: accentColor
+                )
+
+                // Reports how many synced rows arrived versus how many could be
+                // rendered. A large "awaiting metadata" count means add-ons could
+                // not resolve those titles — the history itself is still stored.
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_watch_progress_sync", fallback: "Watch Progress Sync"),
+                    value: NuvioSyncManager.progressSyncDiagnostic,
+                    isDiagnostic: true
+                )
+
+                // Why the row holds what it holds: how many entries survived
+                // each stage between the ledger and the screen.
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_continue_watching_row", fallback: "Continue Watching Row"),
+                    value: ContinueWatchingStore.rowDiagnostic(),
+                    isDiagnostic: true
+                )
+
+                // Scrobbles fail silently by design (the caller ignores the
+                // result), so this is the only place a rejected one is visible.
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_simkl_scrobble", fallback: "Simkl Scrobble"),
+                    value: SimklProgressService.scrobbleDiagnostic,
+                    isDiagnostic: true
+                )
+
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_seed_watch_history", fallback: "Seed Test Watch History"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seed_watch_history_subtitle",
+                        fallback: "Fills Continue Watching from your catalogs to test paging, and uploads it to your account so other devices see it too."
+                    ),
+                    value: isSeedingTestHistory ? "Working…" : "Seed",
+                    accentColor: accentColor,
+                    action: {
+                        guard !isSeedingTestHistory else { return }
+                        isSeedingTestHistory = true
+                        Task { @MainActor in
+                            await ContinueWatchingTestData.seed()
+                            testHistoryStatus = ContinueWatchingTestData.status
+                            isSeedingTestHistory = false
+                        }
+                    }
+                )
+
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_clear_test_watch_history", fallback: "Remove Test Watch History"),
+                    subtitle: L10n.string(
+                        "tvos_settings_clear_test_watch_history_subtitle",
+                        fallback: "Deletes the seeded entries from this Apple TV and your account, leaving real history untouched"
+                    ),
+                    value: "Remove",
+                    accentColor: accentColor,
+                    action: {
+                        guard !isSeedingTestHistory else { return }
+                        isSeedingTestHistory = true
+                        Task { @MainActor in
+                            await ContinueWatchingTestData.clear()
+                            testHistoryStatus = ContinueWatchingTestData.status
+                            isSeedingTestHistory = false
+                        }
+                    }
+                )
+
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_test_watch_history", fallback: "Test Watch History"),
+                    value: testHistoryStatus,
+                    isDiagnostic: true
                 )
             }
 
@@ -7620,6 +7696,9 @@ private struct SettingsActionRow: View {
 private struct SettingsInfoRow: View {
     let title: String
     let value: String
+    /// Diagnostics are read off a TV by photographing the screen, so they must
+    /// not elide — the useful part is usually the tail (the error text).
+    var isDiagnostic: Bool = false
 
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 20) {
@@ -7630,10 +7709,11 @@ private struct SettingsInfoRow: View {
             Spacer(minLength: 24)
 
             Text(value)
-                .font(.system(size: 21, weight: .bold))
+                .font(.system(size: isDiagnostic ? 17 : 21, weight: isDiagnostic ? .regular : .bold))
                 .foregroundColor(.white.opacity(0.62))
                 .multilineTextAlignment(.trailing)
-                .lineLimit(2)
+                .lineLimit(isDiagnostic ? nil : 2)
+                .fixedSize(horizontal: false, vertical: true)
         }
         .padding(.horizontal, 20)
         .frame(minHeight: 64)

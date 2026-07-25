@@ -2,7 +2,6 @@
 //  CatalogRepository.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  Repository protocol for catalog operations
 //
 

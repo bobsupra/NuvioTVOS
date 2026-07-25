@@ -2,7 +2,6 @@
 //  DetailsViewModel.swift
 //  NuvioTV
 //
-//  Created by Claude Code
 //  ViewModel for content details screen
 //
 

@@ -76,11 +76,16 @@ final class NuvioSyncManager: ObservableObject {
         observers.forEach(NotificationCenter.default.removeObserver)
     }
 
+    /// The attached manager, for the few callers that need to reach sync from
+    /// outside the view tree. Weak so the root owning it stays authoritative.
+    static private(set) weak var current: NuvioSyncManager?
+
     func attach(authManager: AuthManager, profileViewModel: ProfileViewModel) {
         // `onAppear` may run again after SwiftUI rebuilds the root. Refresh the
         // dependencies even though notification observers only attach once.
         self.authManager = authManager
         self.profileViewModel = profileViewModel
+        Self.current = self
         profileViewModel.configureRemotePinVerifier { [weak self] profileId, pin in
             guard let self else {
                 throw AuthError(message: "PIN verification is unavailable.")
@@ -549,6 +554,67 @@ final class NuvioSyncManager: ObservableObject {
         isPullingAccountProfiles = false
     }
 
+    /// Session and remote profile id for a one-off account write, or nil when the
+    /// account is not in a state to accept one.
+    private func currentSyncTarget() async -> (session: AuthSession, remoteProfileId: Int)? {
+        guard AuthConfig.isConfigured,
+              let authManager,
+              let profileViewModel,
+              let session = await authManager.validSessionForSync(),
+              let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else {
+            return nil
+        }
+        return (
+            session,
+            ProfileSyncIndexStore.remoteId(for: activeProfile, in: profileViewModel.profiles)
+        )
+    }
+
+    /// Uploads pending watch progress now instead of waiting for the debounced
+    /// push. Returns whether the upload completed.
+    @discardableResult
+    func pushWatchProgressNow() async -> Bool {
+        guard let target = await currentSyncTarget() else { return false }
+        // Same ownership rule as the debounced push — this path skips
+        // `pushLocalSnapshots` entirely, so it needs the gate of its own.
+        if let profileId = await profileViewModel?.activeProfile?.id,
+           !Self.ownsWatchState(for: profileId) {
+            return false
+        }
+        do {
+            try await client.pushWatchProgress(
+                session: target.session,
+                remoteProfileId: target.remoteProfileId
+            )
+            return true
+        } catch {
+            print("Nuvio watch progress push failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
+    /// Retires specific progress rows on the account.
+    ///
+    /// Deleting locally is not enough once rows have been uploaded — the next
+    /// pull would simply restore them, so anything that removes synced progress
+    /// has to retire it server-side too.
+    @discardableResult
+    func deleteRemoteWatchProgress(keys: [String]) async -> Bool {
+        guard !keys.isEmpty else { return true }
+        guard let target = await currentSyncTarget() else { return false }
+        do {
+            try await client.deleteWatchProgress(
+                session: target.session,
+                remoteProfileId: target.remoteProfileId,
+                keys: keys
+            )
+            return true
+        } catch {
+            print("Nuvio watch progress delete failed: \(error.localizedDescription)")
+            return false
+        }
+    }
+
     private func schedulePush() {
         guard !isApplyingRemote else { return }
         guard AuthConfig.isConfigured else { return }
@@ -797,7 +863,10 @@ final class NuvioSyncManager: ObservableObject {
                     remoteProfileId: remoteProfileId
                 )
                 try ensureStillSyncing(profileId: activeProfile.id)
-                WatchedStore.mergeRemote(remoteWatched)
+                // These rows are what the Nuvio account itself holds, so they
+                // are attributed to Nuvio Sync — not to whichever tracker
+                // happens to be selected right now.
+                WatchedStore.mergeRemote(remoteWatched.map { $0.adding(source: .nuvioSync) })
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -811,11 +880,17 @@ final class NuvioSyncManager: ObservableObject {
                     remoteProfileId: remoteProfileId
                 )
                 try ensureStillSyncing(profileId: activeProfile.id)
-                guard ContinueWatchingStore.mergeRemote(remoteProgress) else {
-                    throw AuthError(message: ContinueWatchingStore.persistenceDiagnostic)
+                guard WatchProgressLedger.mergeRemote(remoteProgress) else {
+                    throw AuthError(message: "Watch progress could not be saved on this Apple TV.")
                 }
+                // Rendering is a separate, retryable pass: the rows are already
+                // durable, so a slow or failing metadata lookup can no longer
+                // cost the user their history.
+                await ContinueWatchingBuilder.rebuild(reason: "account pull")
                 let uploadStatus = watchStateUploadsEnabled ? "uploads on" : "uploads off"
-                Self.progressSyncDiagnostic = "profile \(activeProfile.id), remote \(remoteProgress.count), stored \(ContinueWatchingStore.items().count), \(uploadStatus); \(ContinueWatchingStore.persistenceDiagnostic)"
+                Self.progressSyncDiagnostic = "profile \(activeProfile.id), remote \(remoteProgress.count), "
+                    + "\(uploadStatus); \(ContinueWatchingBuilder.diagnostic); "
+                    + ContinueWatchingStore.persistenceDiagnostic
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -1031,13 +1106,36 @@ final class NuvioSyncManager: ObservableObject {
             )
 
             guard Self.watchStateSyncEnabled(for: activeProfile.id) else { return }
-            try ensureStillSyncing(profileId: activeProfile.id)
-            try await client.pushLibrary(session: session, remoteProfileId: remoteProfileId)
-            try ensureStillSyncing(profileId: activeProfile.id)
-            try await client.pushWatched(session: session, remoteProfileId: remoteProfileId)
-            try ensureStillSyncing(profileId: activeProfile.id)
-            try await client.pushWatchProgress(session: session, remoteProfileId: remoteProfileId)
-            print("Nuvio sync pushed \(LibraryStore.items().count) library, \(WatchedStore.items().count) watched, \(ContinueWatchingStore.items().count) progress item(s).")
+
+            // `activeProfile` falls back to `profiles.first`, but the stores it
+            // reads from are pointed at whatever profile is genuinely active.
+            // Deciding ownership from one profile's settings while uploading
+            // another profile's rows is how watch state escaped the gate during
+            // the launch window, before profile selection had settled.
+            guard WatchedStore.activeProfileId == activeProfile.id else { return }
+
+            let profileStore = ProfileSettings.store(for: activeProfile.id)
+            let ownsLibrary = Self.ownsLibrary(for: activeProfile.id)
+            if ownsLibrary {
+                try ensureStillSyncing(profileId: activeProfile.id)
+                try await client.pushLibrary(session: session, remoteProfileId: remoteProfileId)
+            }
+
+            let ownsWatchState = Self.ownsWatchState(for: activeProfile.id)
+            if ownsWatchState {
+                try ensureStillSyncing(profileId: activeProfile.id)
+                try await client.pushWatched(session: session, remoteProfileId: remoteProfileId)
+                try ensureStillSyncing(profileId: activeProfile.id)
+                try await client.pushWatchProgress(session: session, remoteProfileId: remoteProfileId)
+            }
+
+            let library = ownsLibrary
+                ? "\(LibraryStore.items().count) library item(s)"
+                : "library owned by \(TraktSettingsStore.librarySourceMode(in: profileStore).rawValue)"
+            let watchState = ownsWatchState
+                ? "\(WatchedStore.items().count) watched, \(ContinueWatchingStore.items().count) progress item(s)"
+                : "watch state owned by \(TraktSettingsStore.watchProgressSource(in: profileStore).rawValue)"
+            print("Nuvio sync pushed \(library); \(watchState).")
         } catch is CancellationError {
             // Signed out mid-push: stop quietly, nothing was corrupted.
         } catch {
@@ -1135,6 +1233,32 @@ final class NuvioSyncManager: ObservableObject {
         let name = profile.name.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         return profile.id == "1" && !profile.isAdmin && profile.avatarId.isEmpty
             && name == "nuvio guest"
+    }
+
+    /// Whether Nuvio Sync is the account that *owns* watch state.
+    ///
+    /// `watchProgressSource` names exactly one owner. When that owner is Trakt
+    /// or Simkl, their snapshot is reconciled into the same local `WatchedStore`
+    /// the push reads from — so an unconditional push copies another tracker's
+    /// history into the Nuvio account, where it then outlives disconnecting
+    /// that tracker. Only upload watch state Nuvio Sync is actually the source
+    /// of. The local store keeps the merged view either way; this gates the
+    /// upload, not the merge.
+    private static func ownsWatchState(for profileId: String) -> Bool {
+        TraktSettingsStore.watchProgressSource(
+            in: ProfileSettings.store(for: profileId)
+        ) == .nuvioSync
+    }
+
+    /// Whether Nuvio Sync owns the library, on the same rule as
+    /// ``ownsWatchState(for:)`` — `librarySourceMode` names one owner, and a
+    /// Trakt or Simkl watchlist is reconciled into the same local
+    /// `LibraryStore` this push reads from. The two settings are independent,
+    /// so a profile can own one and not the other.
+    private static func ownsLibrary(for profileId: String) -> Bool {
+        TraktSettingsStore.librarySourceMode(
+            in: ProfileSettings.store(for: profileId)
+        ) == .local
     }
 
     private static func watchStateSyncEnabled(for profileId: String) -> Bool {
@@ -1268,7 +1392,6 @@ fileprivate final class NuvioAPIClient {
         decoder.keyDecodingStrategy = .convertFromSnakeCase
         return decoder
     }()
-    private let catalogRepository: CatalogRepository = CinemetaCatalogRepository()
     private var lastPulledProfileSettingsJSON: [String: Any]?
 
     func pullProfiles(session: AuthSession) async throws -> [RemoteProfile] {
@@ -1669,7 +1792,13 @@ fileprivate final class NuvioAPIClient {
     }
 
     func pushWatched(session: AuthSession, remoteProfileId: Int) async throws {
-        let payload = WatchedStore.items().map { item -> [String: Any] in
+        // Only rows Nuvio Sync itself owns. The caller already checks that Nuvio
+        // is the selected source, but the local store still holds marks imported
+        // from Trakt or Simkl in an earlier session, and those are not this
+        // account's to upload.
+        let payload = WatchedStore.items()
+            .filter { $0.isVisible(under: .nuvioSync) }
+            .map { item -> [String: Any] in
             [
                 "content_id": item.meta.id,
                 "content_type": item.meta.type,
@@ -1697,11 +1826,14 @@ fileprivate final class NuvioAPIClient {
         let tombstones = await MainActor.run { WatchedStore.tombstones() }
         guard !tombstones.isEmpty else { return }
         let keys = tombstones.map { tombstone -> [String: Any] in
-            [
-                "content_id": tombstone.metaId,
-                "season": tombstone.season.map { $0 as Any } ?? NSNull(),
-                "episode": tombstone.episode.map { $0 as Any } ?? NSNull()
-            ]
+            // Omit rather than null, matching Android's delete payload. The push
+            // above deliberately keeps explicit nulls because that endpoint wants
+            // them — the two RPCs differ, so they are matched individually rather
+            // than by one blanket rule.
+            var key: [String: Any] = ["content_id": tombstone.metaId]
+            if let season = tombstone.season { key["season"] = season }
+            if let episode = tombstone.episode { key["episode"] = episode }
+            return key
         }
         try await rpcVoid(
             "sync_delete_watched_items",
@@ -1713,7 +1845,15 @@ fileprivate final class NuvioAPIClient {
         )
     }
 
-    func pullWatchProgress(session: AuthSession, remoteProfileId: Int) async throws -> [ContinueWatchingItem] {
+    /// Pulls the account's watch progress as raw rows.
+    ///
+    /// This performs no metadata lookups and applies no display rules, so a
+    /// synced row can no longer be lost because an add-on was slow, an id was
+    /// outside Cinemeta's space, or the writer never recorded a duration.
+    /// Rendering — including the finished-episode rollover to "Next Up" — is
+    /// `ContinueWatchingBuilder`'s job, and a failure there is retried instead
+    /// of discarding history.
+    func pullWatchProgress(session: AuthSession, remoteProfileId: Int) async throws -> [WatchProgressRecord] {
         let remote: [RemoteWatchProgress] = try await rpcRows(
             "sync_pull_watch_progress",
             session: session,
@@ -1721,183 +1861,87 @@ fileprivate final class NuvioAPIClient {
                 "p_profile_id": remoteProfileId
             ]
         ).elements
-        var items: [ContinueWatchingItem] = []
-        for entry in remote {
+
+        return remote.map { entry in
             let type = Self.normalizedContentType(entry.contentType)
-            let existing = ContinueWatchingStore.item(for: entry.contentId)
-            var meta = existing?.meta ?? entry.fallbackMeta(type: type)
-            if existing == nil,
-               let fetched = try? await catalogRepository.getMetadata(id: entry.contentId, type: type) {
-                meta = fetched
-            }
-            var position = Double(entry.position) / 1000.0
-            let duration = Double(entry.duration) / 1000.0
-            var season = entry.season ?? existing?.season
-            var episode = entry.episode ?? existing?.episode
-            guard duration > 0 else { continue }
-
-            // The store drops finished entries on read; the phone instead rolls
-            // a finished episode over to the following one, so mirror that here —
-            // otherwise a series whose last-played episode ended disappears
-            // from Continue Watching after sync.
-            let finished = (duration - position) < 60 || (position / duration) >= 0.92
-
-            // Never keep an old cached episode guide for a Next Up item. These
-            // are exactly the records that commonly start as "TBA" and then
-            // receive a title, overview, and still after release.
-            let mayBeUpNext = meta.isSeries && season != nil && episode != nil
-                && (finished || position <= 1.5)
-            if mayBeUpNext,
-               let refreshed = try? await catalogRepository.refreshMetadata(id: entry.contentId, type: type) {
-                meta = refreshed
-            }
-
-            if finished {
-                guard meta.isSeries, let currentSeason = season, let currentEpisode = episode else { continue }
-                if meta.videos?.isEmpty != false,
-                   let fetched = try? await catalogRepository.refreshMetadata(id: entry.contentId, type: type) {
-                    meta = fetched
-                }
-                guard let next = Self.nextEpisode(after: (currentSeason, currentEpisode), in: meta) else {
-                    continue
-                }
-                season = next.season
-                episode = next.episode
-                // Keep the finished episode's duration as the runtime estimate
-                // and start the rolled-over entry at the top.
-                position = 1
-            }
-
-            // An episode row at effectively zero progress (including rows older
-            // builds pushed for rolled-over entries) presents as "Next Up" too,
-            // not as playback with the full runtime remaining.
-            let upNext = finished
-                || (meta.isSeries && season != nil && episode != nil && position <= 1.5)
-
-            let selectedEpisode = Self.episode(in: meta, season: season, episode: episode)
-            let sameEpisodeAsExisting = existing?.season == season && existing?.episode == episode
-            let tmdbEpisode = upNext
-                ? await EpisodeMetadataEnrichment.fetch(meta: meta, season: season, episode: episode)
-                : nil
-
-            items.append(
-                ContinueWatchingItem(
-                    meta: meta,
-                    // A rolled-over entry must not reuse the finished episode's
-                    // stream URL; empty forces Home to resolve the new episode.
-                    streamUrl: finished ? "" : (existing?.streamUrl ?? ""),
-                    position: position,
-                    duration: duration,
-                    lastWatchedAt: Self.date(fromMilliseconds: entry.lastWatched),
-                    season: season,
-                    episode: episode,
-                    released: tmdbEpisode?.released ?? selectedEpisode?.released
-                        ?? (sameEpisodeAsExisting ? existing?.released : nil),
-                    episodeTitleOverride: tmdbEpisode?.title ?? Self.nonPlaceholder(selectedEpisode?.title)
-                        ?? (sameEpisodeAsExisting ? existing?.episodeTitleOverride : nil),
-                    episodeOverviewOverride: tmdbEpisode?.overview ?? Self.nonEmpty(selectedEpisode?.overview)
-                        ?? (sameEpisodeAsExisting ? existing?.episodeOverviewOverride : nil),
-                    episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? selectedEpisode?.thumbnail
-                        ?? (sameEpisodeAsExisting ? existing?.episodeThumbnailOverride : nil),
-                    isUpNext: upNext ? true : nil
-                )
+            return WatchProgressRecord(
+                progressKey: entry.progressKey,
+                contentId: entry.contentId,
+                contentType: type,
+                videoId: entry.videoId,
+                season: entry.season,
+                episode: entry.episode,
+                position: Double(entry.position) / 1000.0,
+                duration: Double(entry.duration) / 1000.0,
+                lastWatchedAt: Self.date(fromMilliseconds: entry.lastWatched)
             )
         }
-        return items
     }
 
-    private static func nextEpisode(
-        after current: (season: Int, episode: Int),
-        in meta: NuvioMeta
-    ) -> NuvioVideo? {
-        (meta.videos ?? [])
-            .filter { $0.season > 0 }
-            .sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
-            .first { ($0.season, $0.episode) > (current.season, current.episode) }
-    }
-
-    private static func episode(in meta: NuvioMeta, season: Int?, episode: Int?) -> NuvioVideo? {
-        guard let season, let episode else { return nil }
-        return meta.videos?.first { $0.season == season && $0.episode == episode }
-    }
-
-    private static func nonPlaceholder(_ value: String?) -> String? {
-        guard let value = nonEmpty(value), value.caseInsensitiveCompare("TBA") != .orderedSame else {
-            return nil
-        }
-        return value
-    }
-
-    private static func nonEmpty(_ value: String?) -> String? {
-        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
-            return nil
-        }
-        return value
-    }
-
+    /// Pushes the raw ledger.
+    ///
+    /// Earlier builds pushed the *rendered* Continue Watching list and then
+    /// deleted every progress key that list did not mention. Because that list
+    /// was a lossy, twenty-item, one-row-per-show derivative of the account, the
+    /// delete could retire rows this device had merely failed to render —
+    /// including an episode the phone had legitimately just started. Deletions
+    /// now happen only where the user actually removed something, via
+    /// `deleteWatchProgress`.
     func pushWatchProgress(session: AuthSession, remoteProfileId: Int) async throws {
         // Episode entries must use the phone's row conventions — video_id
         // "id:s:e" and progress_key "id_s{s}e{e}" — or each platform upserts
         // its own parallel row for the same episode and they fight over
         // recency/progress on the other clients.
-        var staleSeriesKeys: [String] = []
-        let payload = ContinueWatchingStore.items().compactMap { item -> [String: Any]? in
-            // "Next Up" entries are presentation, not playback — pushing them
-            // would create phantom just-started rows on the other clients. The
-            // finished previous-episode row already carries the signal, so
-            // retire any phantom this build (or an older one) wrote earlier.
-            if item.isUpNextEntry {
-                if let season = item.season, let episode = item.episode {
-                    staleSeriesKeys.append("\(item.meta.id)_s\(season)e\(episode)")
-                }
-                staleSeriesKeys.append(item.meta.id)
-                return nil
-            }
-            let videoId: String
-            let progressKey: String
-            if let season = item.season, let episode = item.episode {
-                videoId = "\(item.meta.id):\(season):\(episode)"
-                progressKey = "\(item.meta.id)_s\(season)e\(episode)"
-                staleSeriesKeys.append(item.meta.id)
-            } else {
-                videoId = item.meta.id
-                progressKey = item.meta.id
-            }
-            return [
-                "content_id": item.meta.id,
-                "content_type": item.meta.type,
-                "video_id": videoId,
-                "season": item.season.map { $0 as Any } ?? NSNull(),
-                "episode": item.episode.map { $0 as Any } ?? NSNull(),
-                "position": Int64(item.position * 1000),
-                "duration": Int64(item.duration * 1000),
-                "last_watched": Self.milliseconds(from: item.lastWatchedAt),
-                "progress_key": progressKey
+        // Only rows this device changed. Everything else came from the server,
+        // which already has it — echoing the whole ledger back would put a
+        // few hundred kilobytes on the wire every sync for no benefit.
+        let records = WatchProgressLedger.records().filter(\.isPendingPush)
+        let payload = records.map { record -> [String: Any] in
+            var entry: [String: Any] = [
+                "content_id": record.contentId,
+                "content_type": record.contentType,
+                "video_id": record.videoId,
+                "position": Int64(record.position * 1000),
+                "duration": Int64(record.duration * 1000),
+                "last_watched": Self.milliseconds(from: record.lastWatchedAt),
+                "progress_key": record.progressKey
             ]
+            // Omit season/episode for movies rather than sending explicit nulls,
+            // matching the Android client. To Postgres the two differ — an
+            // explicit null still satisfies a key-presence test — and sending
+            // them made the backend drop every movie row while accepting the
+            // episodes alongside them.
+            if let season = record.season { entry["season"] = season }
+            if let episode = record.episode { entry["episode"] = episode }
+            return entry
         }
-        if !payload.isEmpty {
-            try await rpcVoid(
-                "sync_push_watch_progress",
-                session: session,
-                params: [
-                    "p_entries": payload,
-                    "p_profile_id": remoteProfileId
-                ]
-            )
-        }
+        guard !payload.isEmpty else { return }
+        try await rpcVoid(
+            "sync_push_watch_progress",
+            session: session,
+            params: [
+                "p_entries": payload,
+                "p_profile_id": remoteProfileId
+            ]
+        )
+        WatchProgressLedger.markPushed(keys: records.map(\.progressKey))
+    }
 
-        // Older builds pushed series episodes under the bare series id; those
-        // rows linger as duplicates on other clients, so retire them.
-        if !staleSeriesKeys.isEmpty {
-            try? await rpcVoid(
-                "sync_delete_watch_progress",
-                session: session,
-                params: [
-                    "p_keys": staleSeriesKeys,
-                    "p_profile_id": remoteProfileId
-                ]
-            )
-        }
+    /// Retires specific rows the user removed on this device.
+    func deleteWatchProgress(
+        session: AuthSession,
+        remoteProfileId: Int,
+        keys: [String]
+    ) async throws {
+        guard !keys.isEmpty else { return }
+        try await rpcVoid(
+            "sync_delete_watch_progress",
+            session: session,
+            params: [
+                "p_keys": keys,
+                "p_profile_id": remoteProfileId
+            ]
+        )
     }
 
     private func rpcRows<T: Decodable>(
@@ -2226,7 +2270,7 @@ fileprivate final class NuvioAPIClient {
 /// Optional episode-level enrichment. This uses the same TMDB integration the
 /// Details screen already exposes, and is deliberately a no-op until the user
 /// has enabled it and supplied their own key.
-private enum EpisodeMetadataEnrichment {
+enum EpisodeMetadataEnrichment {
     struct Episode {
         let title: String?
         let overview: String?
@@ -2575,31 +2619,6 @@ private struct RemoteWatchProgress: Decodable {
     let duration: Int64
     let lastWatched: Int64
     let progressKey: String
-
-    func fallbackMeta(type: String) -> NuvioMeta {
-        NuvioMeta(
-            id: contentId,
-            name: contentId,
-            description: nil,
-            posterUrl: nil,
-            backgroundUrl: nil,
-            logoUrl: nil,
-            imdbId: nil,
-            tmdbId: nil,
-            type: type,
-            year: nil,
-            genres: nil,
-            rating: nil,
-            releaseInfo: nil,
-            runtime: nil,
-            cast: nil,
-            director: nil,
-            writer: nil,
-            certification: nil,
-            country: nil,
-            released: nil
-        )
-    }
 
     enum CodingKeys: String, CodingKey {
         case contentId

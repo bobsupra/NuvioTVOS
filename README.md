@@ -25,23 +25,22 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.7 (build 48)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.1.8 (build 49)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.7) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.1.8](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.8) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.7-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.7/NuvioTV-3.1.7-unsigned-release.ipa)
+[NuvioTV-3.1.8-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.8/NuvioTV-3.1.8-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.7
+### New in Beta 3.1.8
 
-- Introduces native **Simkl** integration on Apple TV ahead of the official Nuvio client's announced rollout, with profile-scoped PIN login and Keychain token storage.
-- Lets Simkl independently power watched history, Plan to Watch library items, Continue Watching, resume positions, and player scrobbling.
-- Adds one-click transfers from Trakt or Nuvio into Simkl for watch history, library items, and in-progress playback, with live progress and additive imports that preserve existing Simkl data.
-- Fixes Trakt and Simkl credential entry on physical Apple TVs while preserving the compact glass design; credentials are applied only when **Connect** is chosen.
-- Improves Trakt and Simkl Continue Watching ordering, provider switching, complete post-sync Home catalog loading, and landscape-artwork transitions.
-- Temporarily disables automatic next-episode playback. The manual Next Episode card now hides after five seconds and returns with the player controls, matching Skip Intro.
-- Adds 14 focused Simkl regression tests covering authentication, history/library/progress writes and transfers, routing, ordering, and cached account statistics.
+- Fixes major Simkl synchronization failures by decoding Simkl's real nested response shape, refreshing stale caches after removals and scrobbles, pacing writes, retrying lock collisions, and reporting rejected transfers accurately.
+- Keeps watched history and library state isolated to the selected Nuvio Sync, Trakt, or Simkl source so one provider is not silently copied into another.
+- Rebuilds Continue Watching from a durable per-profile progress ledger, preserves unresolved and duration-less rows, handles completed episodes as Next Up, and pages through larger histories instead of stopping at the first 20 titles.
+- Makes provider checkpoints survive relaunches, fixes duplicate series cards and movie progress uploads, and lets removed cards stay removed until fresh playback occurs.
+- Adds a Continue Watching long-press menu for manual source selection, starting over, opening details, or removing a card, plus clearer artwork loading and on-device sync diagnostics.
+- This beta needs broad testing. If sync, paging, Continue Watching, Simkl, or anything else does not work, please message the maintainer so the problem can be reproduced and fixed faster.
 
 ### The new player
 

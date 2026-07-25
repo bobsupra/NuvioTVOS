@@ -1155,21 +1155,28 @@ class PlayerViewModel: ObservableObject {
                         action: .stop,
                         force: true
                     )
-                } else if let next = nextEpisode {
-                    // Series with a follow-up: roll Continue Watching over to the
-                    // next episode so it shows as "Next Up" instead of vanishing.
-                    ContinueWatchingStore.save(
-                        meta: activeMeta,
-                        streamUrl: "",
-                        position: 1,
-                        duration: max(time.duration, 120),
-                        season: next.season,
-                        episode: next.episode,
-                        episodeId: next.id
-                    )
                 } else {
-                    // Movie or final episode: nothing left to continue.
-                    ContinueWatchingStore.remove(metaId: activeMeta.id)
+                    // Retire the episode that just finished. This keeps a
+                    // completed row in the ledger, which is what produces the
+                    // Next Up card below — and what lets a later season still
+                    // surface one for a series that had no follow-up today.
+                    ContinueWatchingStore.markPlaybackCompleted(
+                        meta: activeMeta,
+                        duration: time.duration,
+                        season: resolvedEpisodeNumbers?.season,
+                        episode: resolvedEpisodeNumbers?.episode
+                    )
+                    if let next = nextEpisode {
+                        // Series with a follow-up: show it as "Next Up" instead
+                        // of letting the title vanish from Continue Watching.
+                        ContinueWatchingStore.saveUpNext(
+                            meta: activeMeta,
+                            duration: max(time.duration, 120),
+                            season: next.season,
+                            episode: next.episode,
+                            released: next.released
+                        )
+                    }
                 }
             }
         } else {
@@ -2637,6 +2644,14 @@ class PlayerViewModel: ObservableObject {
                     force: true
                 )
             } else {
+                // The card is up because this episode reached its ending, so
+                // retire it in the ledger before suggesting the next one.
+                ContinueWatchingStore.markPlaybackCompleted(
+                    meta: activeMeta,
+                    duration: progressTime.duration,
+                    season: resolvedEpisodeNumbers?.season,
+                    episode: resolvedEpisodeNumbers?.episode
+                )
                 ContinueWatchingStore.saveUpNext(
                     meta: activeMeta,
                     duration: progressTime.duration,
@@ -2659,6 +2674,27 @@ class PlayerViewModel: ObservableObject {
                 action: completesPlayback ? .stop : nil,
                 force: force || completesPlayback
             )
+        } else if completesPlayback {
+            // Record completion, not the raw position. An ending marker fires
+            // during the credits — well before the 90% the ledger needs to call
+            // an episode finished — so saving the literal position left the row
+            // as resume progress ("8m left") that could never seed the next
+            // episode, while the title was simultaneously marked watched.
+            ContinueWatchingStore.markPlaybackCompleted(
+                meta: activeMeta,
+                duration: progressTime.duration,
+                season: season,
+                episode: episode
+            )
+            if let nextEpisode {
+                ContinueWatchingStore.saveUpNext(
+                    meta: activeMeta,
+                    duration: max(progressTime.duration, 120),
+                    season: nextEpisode.season,
+                    episode: nextEpisode.episode,
+                    released: nextEpisode.released
+                )
+            }
         } else {
             ContinueWatchingStore.save(
                 meta: activeMeta,
