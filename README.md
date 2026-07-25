@@ -18,6 +18,24 @@
     </a>
   </p>
 
+  <p>
+    <a href="https://github.com/bobsupra/NuvioTVOS/graphs/contributors">
+      <img src="https://img.shields.io/github/contributors/bobsupra/NuvioTVOS?style=for-the-badge&color=44CC11" alt="Contributors" />
+    </a>
+    <a href="https://github.com/bobsupra/NuvioTVOS/forks">
+      <img src="https://img.shields.io/github/forks/bobsupra/NuvioTVOS?style=for-the-badge&color=0A84FF" alt="Forks" />
+    </a>
+    <a href="https://github.com/bobsupra/NuvioTVOS/stargazers">
+      <img src="https://img.shields.io/github/stars/bobsupra/NuvioTVOS?style=for-the-badge&color=0A84FF" alt="Stars" />
+    </a>
+    <a href="https://github.com/bobsupra/NuvioTVOS/issues">
+      <img src="https://img.shields.io/github/issues/bobsupra/NuvioTVOS?style=for-the-badge&color=E5C100" alt="Open issues" />
+    </a>
+    <a href="https://github.com/bobsupra/NuvioTVOS/releases">
+      <img src="https://img.shields.io/github/downloads/bobsupra/NuvioTVOS/total?style=for-the-badge&label=Total%20downloads&color=F47732" alt="Total downloads" />
+    </a>
+  </p>
+
 </div>
 
 
