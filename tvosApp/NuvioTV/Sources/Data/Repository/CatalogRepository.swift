@@ -1269,9 +1269,9 @@ private struct CinemetaMeta: Decodable {
     let releaseInfo: String?
     let year: String?
     let runtime: String?
-    let cast: [String]?
-    let director: [String]?
-    let writer: [String]?
+    let cast: FlexibleStringArray?
+    let director: FlexibleStringArray?
+    let writer: FlexibleStringArray?
     let country: String?
     let released: String?
     let moviedbId: Int?
@@ -1303,9 +1303,9 @@ private struct CinemetaMeta: Decodable {
             rating: parsedImdbRating,
             releaseInfo: releaseInfo ?? year,
             runtime: runtime,
-            cast: cast,
-            director: director,
-            writer: writer,
+            cast: cast?.values,
+            director: director?.values,
+            writer: writer?.values,
             certification: nil,
             country: country,
             released: released,
@@ -1332,6 +1332,47 @@ private struct CinemetaMeta: Decodable {
         guard let source else { return nil }
         let digits = source.prefix(4)
         return Int(digits)
+    }
+}
+
+/// Stremio add-ons disagree on the shape of the people fields. The spec — and
+/// Cinemeta itself — sends `cast`/`director`/`writer` as string arrays, while
+/// AIO Metadata sends a single comma-separated string. Because
+/// `CinemetaCatalogResponse` decodes a whole page of metas at once, and a
+/// Swift optional tolerates a missing value but not a mismatched type, one
+/// non-conforming entry used to throw and drop the entire catalog row from
+/// Home. Accepting both shapes keeps one optional field from invalidating the
+/// complete response.
+///
+/// Not `private`: the test target reaches it through `@testable import`.
+struct FlexibleStringArray: Decodable {
+    let values: [String]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.singleValueContainer()
+
+        if let array = try? container.decode([String].self) {
+            // Spec-compliant data passes through untouched. Anything that
+            // decoded before this type existed must still decode identically,
+            // down to padding: CastCrewSection keys its rows by the name
+            // itself, so silently normalising entries here could collide two
+            // rows that are distinct today.
+            values = array
+            return
+        }
+
+        if let joined = try? container.decode(String.self) {
+            // A scalar here is a joined list, so split it back apart rather
+            // than surfacing "A, B, C" as one cast member.
+            values = joined.split(separator: ",").compactMap {
+                String($0).trimmedNonEmpty
+            }
+            return
+        }
+
+        // Any other shape (numbers, objects) is dropped rather than thrown: a
+        // malformed optional field must never cost us the catalog row.
+        values = []
     }
 }
 

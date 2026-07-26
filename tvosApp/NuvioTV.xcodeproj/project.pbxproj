@@ -24,6 +24,7 @@
 		C0D31071 /* TraktDetailsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30071 /* TraktDetailsService.swift */; };
 		C0D31070 /* TmdbDetailsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30070 /* TmdbDetailsService.swift */; };
 		T0D310E3 /* StreamQualityTagsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E3 /* StreamQualityTagsTests.swift */; };
+		T0D310E4 /* CatalogDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E4 /* CatalogDecodingTests.swift */; };
 		C0D31062 /* CommunityAddonCatalog.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30062 /* CommunityAddonCatalog.swift */; };
 		C0D31060 /* StreamQualityTags.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D30060 /* StreamQualityTags.swift */; };
 		T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */; };
@@ -161,6 +162,7 @@
 		C0D30071 /* TraktDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Trakt/TraktDetailsService.swift; sourceTree = "<group>"; };
 		C0D30070 /* TmdbDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/TMDB/TmdbDetailsService.swift; sourceTree = "<group>"; };
 		T0D300E3 /* StreamQualityTagsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamQualityTagsTests.swift; sourceTree = "<group>"; };
+		T0D300E4 /* CatalogDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CatalogDecodingTests.swift; sourceTree = "<group>"; };
 		C0D30062 /* CommunityAddonCatalog.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Addons/CommunityAddonCatalog.swift; sourceTree = "<group>"; };
 		C0D30060 /* StreamQualityTags.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Streams/StreamQualityTags.swift; sourceTree = "<group>"; };
 		049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_NuvioTV.framework; sourceTree = BUILT_PRODUCTS_DIR; };
@@ -466,6 +468,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				AE10F00B /* PlaybackBackendPolicyTests.swift */,
 				T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */,
 				T0D300E3 /* StreamQualityTagsTests.swift */,
+				T0D300E4 /* CatalogDecodingTests.swift */,
 				51A100050000000000000005 /* SimklAuthServiceTests.swift */,
 			);
 			path = NuvioTVTests;
@@ -738,6 +741,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				AE10B00B /* PlaybackBackendPolicyTests.swift in Sources */,
 				T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */,
 				T0D310E3 /* StreamQualityTagsTests.swift in Sources */,
+				T0D310E4 /* CatalogDecodingTests.swift in Sources */,
 				51A100060000000000000006 /* SimklAuthServiceTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
