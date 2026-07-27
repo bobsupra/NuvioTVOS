@@ -22,8 +22,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include "avassert.h"
-#include "frame.h"
+#include "AetherLibavutil/avassert.h"
+#include "AetherLibavutil/frame.h"
 
 enum AVVideoEncParamsType {
     AV_VIDEO_ENC_PARAMS_NONE = -1,

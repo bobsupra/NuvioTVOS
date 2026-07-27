@@ -10,6 +10,357 @@ the public-API contract.
 
 ## [Unreleased]
 
+## [5.23.3] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.3))
+
+### Fixed
+
+- **HEVC sources whose parameter sets live in-band no longer freeze at 00:00.** A source authored with in-band VPS/SPS/PPS ships an `hvcC` that is just the 23-byte header with `numOfArrays = 0`; the parameter sets travel with the packets instead. That is what `MP4Box ...:xps_inband` and the widely used Dolby Vision MP4 authoring recipes produce, and it is how Dolby's own Profile 8.1 reference asset is built. The normalizer that recovers those parameter sets and rebuilds the record scanned packets from whatever cursor the cue prewarm and the segment-plan pass had left behind, so on a real film (263 s, IRAPs every 2 s) it read 16 mid-GOP packets, found nothing, and let the muxer emit an *empty* `hvcC` box, an init segment MP4Box rejects as an invalid ISO file. AVPlayer accepts the master, fetches the media, fills the entire forward window, and never renders a frame: `CoreMediaErrorDomain -19601`, which is not one of the codes the master-to-media fallback reacts to, so nothing recovers the session. The scan now rewinds to the head first (in-band parameter sets are guaranteed at the first IRAP but only recur once per GOP after it) and counts its budget in video packets, so a film's audio and subtitle tracks cannot exhaust it before the first video packet arrives. Live, forward-only feeds keep scanning from the live cursor. The failure path now logs what it saw. Covered by `InBandParameterSetRebuildTests` against a new `hev1-inband-xps.mp4` fixture.
+- **The same sources are no longer force-routed to the software decoder.** `VTCapabilityProbe.canHardwareDecode` builds a format description from the `avcC` / `hvcC` and asks VideoToolbox for a hardware session. A record with no parameter sets still parses, so the description is created and only the session create fails, with `-4`, because there is no SPS to configure a decoder from. That says nothing about hardware support, but the probe read it as "no hardware decoder" and sent every such source to `SoftwarePlaybackHost` on all platforms, Apple Silicon included, at a real CPU cost. The probe's other unclassifiable cases (no extradata, Annex-B extradata, format-description build failure) already kept the native path; a record that is present but carries nothing to judge now does too.
+- **The derived HEVC `CODECS` string declared the wrong profile-compatibility flags.** RFC 6381 / ISO 14496-15 Annex E write `general_profile_compatibility_flags` in reverse bit order. Trimming trailing zeroes off the stored value coincides with that only for nibble-palindromic values such as `0x60000000`; a real Main10 record stores `0x20000000` and must print `hvc1.2.4...`, matching MP4Box and Dolby's own reference manifests, where the engine printed `hvc1.2.2...`. Since plain HEVC is routed through a master so tvOS gets codec signaling, and the declaration is checked against the init segment on device, every 10-bit non-DV source was shipping a master that misdescribed its own bitstream.
+
+## [5.23.2] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.2))
+
+### Fixed
+
+- **A VOD seek on a slow source no longer reverts the clock to the pre-seek position and flaps the transport.** On a high-latency source (Dolby Vision over SMB) a seek can miss its deadline while the producer is still genuinely working. The deadline recovery then reverted the reported clock to the frozen pre-seek position and reconciled the transport, which on the device is the reported failure: the scrubber visibly jumps back to the old spot and the session parks flapping paused↔playing for ~40 s while the orphaned old-position segment drains. Four changes: (1) the deadline now extends while the producer is demonstrably serving the target — measured as media buffered *at the seek target*, which the old-playhead buffer metric structurally cannot see, and required to be both above a floor and still **growing** between windows so a producer that served a few seconds and then died cannot buy the whole budget. A target the producer's march cannot reach (AE#141) is never granted an extension; (2) the fallthrough holds the clock at the target, re-anchors the producer there once, re-issues the seek so AVPlayer abandons the old-position buffer, and waits a bounded number of windows, reconciling *forward* to the target and never back; (3) a landing that overshoots forward past the target is accepted as complete instead of triggering a backward-yank re-seek on an already-playing item; (4) the wait path edge-detects the landing at AVPlayer's own ~100 ms observer cadence, so the host's loading state clears when playback actually resumes rather than up to a full window later (which left a spinner over already-playing video). Budget is bounded throughout: at most 4 deadline extensions, one re-anchor, and 4 post-re-anchor waits — so `await seek(to:)` stays suspended for at most ~44 s on a source that keeps progressing and never lands — before a terminal give-up that holds the clock at the target rather than reverting, and reports `.rebuffering`/`.stalled` rather than remaining `.seeking`. Live, software and audio-host paths are untouched. Contributed by Brandon Moore (#216), with follow-up hardening on three edges the new wait windows opened: the loop now stands down when the `$renderedTime` sink finalized the same seek underneath it (the sink accepts a landing within ±5 s of the target, the loop's poll wants ±0.75 s, so a landing a few seconds short would otherwise have been re-anchored and re-seeked backward onto an item already reported as playing); a *near* backward seek no longer counts the abandoned playhead's own forward buffer as media served at the target, which the 30 s measurement window alone only kept clear of a far one; and a cancelled calling task terminates on the give-up contract instead of spending all ten windows in a single runloop turn and restarting the producer on the way through. Covered by `RecoverySeekTargetTests`.
+
+## [5.23.1] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.1))
+
+### Fixed
+
+- **The `deactivatesAudioSessionOnStop` release no longer blocks the teardown.** `setActive(false)` is an XPC round trip to mediaserverd, and on an E-AC-3 / Atmos MAT passthrough route the sink renegotiates the HDMI link inside that call: measured at roughly half a second on an Apple TV 4K feeding an AVR, against a few milliseconds for the same call on a 5.1 route. Called inline from `stopInternal` that was half a second of frozen UI on every stop, because the host's dismiss cannot start until `stop()` returns (5.1 content dismissed instantly, Atmos content hung). The release now runs off the main actor just after the teardown, the same treatment `setCategory` got in #114, guarded by the load generation so a `load()` that follows a stop cancels a release that has not run yet rather than losing its session to it. Hosts that leave the flag at its default `false` are unaffected.
+
+## [5.23.0] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.0))
+
+### Added
+
+- **`AetherEngine.deactivatesAudioSessionOnStop` (default `false`): optionally release the shared `AVAudioSession` on final teardown.** On an E-AC-3 / Atmos BITSTREAM PASSTHROUGH route the HDMI sink keeps its own decode ring, and while the session stays active it can keep looping the last MAT frame after the player is released — audio stutters on after leaving playback, and persists even off-screen. Opting in deactivates the session (with `.notifyOthersOnDeactivation`) once playback is torn down for good, which closes that ring. It is off by default because the native path deliberately never *activates* the session (AVKit does, per playback, #24), so deactivating one the host app owns must be the host's decision — an app playing its own audio (UI sounds, TTS, `AVAudioEngine`, a background music player) would otherwise have its session torn out from under it. Only a genuine final teardown honours it: `stop(resetDisplayCriteria: true)`, never a native→native reload, a native→audio/software handoff, or a live retune. `stop(resetDisplayCriteria:finalTeardown:)` lets a host that keeps display criteria across a stop/load pair still declare a genuine final teardown. An `AVAudioSessionErrorCodeIsBusy` result is logged as the informational diagnostic it is, not retried: per `AVAudioSession.h` the session is deactivated regardless and the code only flags that I/O was still running (and iOS/tvOS 26 stopped returning it altogether). The release applies to every backend and runs as the last step of the teardown, once the item is unloaded, the `AVPlayer` released and the software / audio outputs stopped: for the renderer paths, which bypass AVKit and activate the session themselves, it is the engine releasing what the engine took. Contributed by Brandon Moore (#215), with follow-up hardening moving the release from the native host to the engine's own teardown so the software and audio paths are covered too. Covered by `AudioSessionTeardownPolicyTests`.
+
+## [5.22.1] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.22.1))
+
+### Fixed
+
+- **`probeDetectingAtmos` now confirms JOC on sources whose audio does not sit at the head of the container.** The pass sets `AVDISCARD_ALL` on every non-target stream so its caps budget the audio rather than the interleave, but it ran straight after the base probe, and `avformat_find_stream_info` leaves its own packets queued inside libavformat. Those come back from `av_read_frame` regardless of the discard hint, so on a remux whose audio starts well past the head the foreign-packet fuse was spent on that queue before a single audio byte arrived and a genuinely Atmos track reported as not-Atmos. The queue is now discarded with a bounded seek to the start before the decode pass, so the discard takes effect from the first read. Measured on Dolby's own Online Delivery Kit JOC signal remuxed with its audio 70 s in: not confirmed before, confirmed off the first audio packet in 3 ms after. A source that cannot seek is no worse off than before. Covered by `AtmosConfirmationJOCTests`, which skips unless the local fixtures are present.
+
+  Worth recording alongside it: with the audio at the head, `find_stream_info` decodes an E-AC-3 frame on its own and `probe(url:)` already reports `isAtmos` correctly, on both MP4 and MKV and even at a 50 KB probe budget. The pre-decode flag is therefore not the coin flip 5.21.0's notes implied. It is reliable exactly until `find_stream_info` stops reaching the audio, which is what a coarse interleave over a slow link does, and that is the case both this fix and `LoadOptions.confirmAtmos` exist for.
+
+## [5.22.0] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.22.0))
+
+### Added
+
+- **`LoadOptions.confirmAtmos`: the session confirms E-AC-3 JOC on its own audio tracks, so `TrackInfo.isAtmos` is an answer rather than a guess.** 5.21.0 made an authoritative check available as `probeDetectingAtmos`, but only as a static one-shot probe: a host wanting an honest Atmos badge during playback had to open the source a second time itself and patch its own copy of the track list. With the flag set, the engine runs the same bounded decode pass (`AtmosDetectionOptions` caps, one E-AC-3 track at a time, on a second handle to the source) and republishes `audioTracks` as tracks confirm, so every surface bound to the published list lights up on its own. It starts only after the session is up and runs at utility priority, so the first frame never waits on it, and it opens at most one extra handle at a time. Every E-AC-3 track is scanned rather than only the playing one, so a track picker stays consistent when the user switches. Confirmations are held in a session ledger keyed to the loaded source and re-applied after every `audioTracks` republish, because the native demuxed-audio path and a disc title switch both swap the whole list and would otherwise drop the flag on the next audio switch. Skipped for live sources, where a second connection to the origin can cost a tuner and the pass would start at the live edge rather than at the playhead, and for forward-only custom readers, which cannot hand out a second cursor. Default `false`: a session that does not opt in is unchanged. Covered by `AtmosConfirmationTests`.
+
+## [5.21.0] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.21.0))
+
+### Added
+
+- **`AetherEngine.probeDetectingAtmos(url:/source:)`: opt-in, authoritative E-AC-3 JOC (Dolby Atmos) detection.** Nothing in libavformat ever sets `AV_PROFILE_EAC3_DDP_ATMOS` (30); even the MP4 `dec3` box reader takes only data rate, channel mode and LFE and drops the complexity index, so the profile appears on `codecpar` only when `avformat_find_stream_info` happened to decode an audio frame on its own. The lightweight `probe(url:)`/`probe(source:)` path therefore reported `TrackInfo.isAtmos` for JOC roughly by chance. The new API opens an E-AC-3 decoder and reads the authoritative post-decode profile, bounded by `AtmosDetectionOptions` (packet, byte and wall-clock caps, default 64 packets / 8 MiB / 2 s) with no video decode, no HLS server and no playback session. Non-target streams are discarded for the pass, so the caps budget the *audio* rather than the interleaved container; without that, a UHD remux's multi-MB video packets exhaust the byte cap before any audio reaches the decoder and a genuinely Atmos track reports as not-Atmos. The scan does not answer off the first decoded frame: `libavcodec/ac3dec.c` assigns the profile per frame and resets it to unknown whenever the JOC flag is absent, so it keeps decoding within the same budget until the JOC profile appears or a cap fires, and a cap reached after real decodes still reports the observation instead of a give-up. Malformed, no-audio and non-EAC3 sources degrade to "not confirmed" rather than throwing, and a track's `isAtmos` is only ever set, never cleared. Scope is E-AC-3 JOC, which is what `TrackInfo.isAtmos` has always meant; TrueHD carrying Atmos is out of scope. `probe(url:)`/`probe(source:)` themselves are unmodified: this is a separate, strictly opt-in entry point for hosts (a details screen, say) that need an authoritative Atmos badge, not a flag on the default probe. Contributed by Brandon Moore (#214), with follow-up hardening in the scan, the option-range handling and the probe enrichment. Covered by `AtmosDetectionOptionsTests` and `AtmosDetectionProbeIntegrationTests`.
+
+## [5.20.8] - 2026-07-25
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.8))
+
+### Fixed
+
+- **Long-running SoftwarePlaybackHost live sessions no longer leak memory into eventual Jetsam termination.** Each of the four dispatch-block loops (demux, reader, feeder, pumpAudio) now drains its autorelease pool on every iteration instead of only at session end, and inner wait/poll loops (paused condition-wait, back-pressure `isReadyForMoreMediaData` spin, live-edge wait) drain their own pools per spin so that temporaries from `Date` bridging and ObjC runtime calls do not accumulate during extended pauses or renderer back-pressure. Each loop ran inside a single GCD work item that never returned for the lifetime of the session, so the thread's autorelease pool was never drained and per-iteration temporaries accrued unbounded while every pool the engine tracks itself (packet ring, segment cache, audio FIFO) stayed flat. On an Apple TV 4K (3rd gen) live session the physical footprint climbed from 174 MB to 451 MB over ten minutes before the fix and holds flat at ~163 MB over thirteen minutes after it. The same drain is applied to `AudioPlaybackHost.runDemuxLoop` for parity, where no leak was measurable. Reported, diagnosed and fixed by Nathan Piper (#205).
+
+## [5.20.7] - 2026-07-24
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.7))
+
+### Added
+
+- **`LoadOptions.forwardBufferSegments` now reaches a whole-source pre-buffer, bounded in bytes instead of segments.** The 150-segment ceiling (~10 min at 4 s) silently capped a host's "buffer without limit" option, so a user who deliberately opted into pre-buffering a film for a flaky WAN still stalled after ~10 min of content. The ceiling is now 2700 (~3 h), a sanity bound that covers a feature film, so hosts can pass `Int.max`; the floor (4) and the nil default (10) are unchanged and 150 still passes through, leaving sessions that do not opt in untouched. Raising the constant alone would have been unsafe: the segment cache never evicts its hard window, so the retention budget bounds only the entries outside it and a whole-film window would have put ~18 GB of 4K HEVC on the volume unchecked, where a failed segment write degrades to a stall. Windows past 150 now count as an explicit opt-in, dropping the budget's 2 GiB default cap while keeping the quarter-of-free-space clamp, and the producer parks once its race-ahead has filled that budget, resuming as the playhead advances. An opt-in prefetch therefore buffers as much of the source as safely fits and then tracks playback. Reported with a ceiling-raise patch by fxndxs (#207, follow-up to #102). Covered by `PrefetchDiskBudgetTests` and the updated `ForwardBufferWindowTests`.
+
+## [5.20.6] - 2026-07-24
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.6))
+
+### Fixed
+
+- **PGS seek landings now publish when the landing line's own zero-object `CLEAR` is the only stored successor in the drain lead window.** The 5.15.2 reconstruction finalizer correctly handled open-ended and far-clear landings, but treated every stored packet after the playhead as a pass-ending successor. A normal authored `CLEAR` trimmed the held landing candidate to its correct end while carrying no cues that could end `admitDuringReconstruction`, so the bounded candidate remained silently withheld. Reconstruction finalization now uses the decoded gate state: a renderable successor already ends the pass while decoding, while a clear-only successor leaves the correctly trimmed candidate ready to publish. Forced cues and end-of-file landings follow the same path. Reported with a controlled clear-position matrix by cmcpherson274 (#204, residual from #143). Covered by `Issue204PGSClearLandingTests` and the existing #143/#146 reconstruction suites.
+
+## [5.20.5] - 2026-07-24
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.5))
+
+### Fixed
+
+- **Live loopback playlists now keep one stable `TARGETDURATION` and matching `HOLD-BACK` for the complete provider lifetime.** The first-manifest gate captured the observed cadence floor once before waiting, while each playlist refresh independently recomputed timing from the latest cadence and visible segment duration. A session could therefore begin with `TARGETDURATION:1` and `HOLD-BACK=3`, then change to `TARGETDURATION:2` and `HOLD-BACK=6` after AVPlayer was already ready with buffered segments, violating the HLS requirement that `TARGETDURATION` remain constant. The provider now owns one timing seal shared by the startup gate and every playlist build. The gate re-reads cadence after each wake until it releases, then seals that decision; later cadence still controls blocking-reload eligibility but cannot mutate the timing tags. Reported with first-versus-later playlist captures by Simpendaal (#209). Covered by `Issue209LiveTargetDurationStabilityTests`.
+- **Explicit `.fastZap` sessions now have a bounded first-manifest wait on strict-realtime origins.** The low-latency profile shortened segments and holdback, but the first playlist still waited for the complete `3 x TARGETDURATION` cushion or the 30-second outer fallback. A source arriving at wall-clock speed could therefore exceed the host's video-presence watchdog before AVPlayer received any media playlist. Full holdback remains preferred. Once at least two finalized segments exist, `.fastZap` waits one observed-segment grace clamped to 0.5...2.0 seconds, then may serve a shallow first window. `.standard` retains the full-holdback guarantee. The bounded trade-off can produce one early `-16832` or a short rebuffer while the window deepens. Reported with strict-realtime startup measurements by kskchaitanya1993 (#208). Covered by `Issue208FastZapDegradedStartTests`.
+
+## [5.20.4] - 2026-07-24
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.4))
+
+### Fixed
+
+- **VOD playback now reaches the real end of media when the final Cues-derived segment boundary has no matching runtime keyframe.** The natural forward producer correctly carried the remaining EOF media in the preceding segment, but the playlist still advertised a short final slot that no producer or restart anchor could create. AVPlayer waited forever at that impossible segment seam and eventually failed with -12889. A final plan slot shorter than the ordinary cut target now folds into its predecessor while preserving the complete duration and terminal PTS. The collapsed plan is also the single plan used by engine state, provider construction, initial seek mapping, and producer startup. Isolated across four rounds of exceptionally detailed device traces by rrgomes (#169). Covered by `PlanCollapseShortSegmentsTests`.
+
+## [5.20.3] - 2026-07-24
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.3))
+
+### Fixed
+
+- **The first automatically deinterlaced software session after a process launch now warms the Metal deinterlace pipeline before playback reaches its first video frame.** FFmpeg created the `yadif_videotoolbox` Metal compute pipeline synchronously while processing the first interlaced frame. On a cold process this could delay video for roughly ten seconds while audio had already started; the same-URL reload was fast because the pipeline was then cached. A process-wide detached task now builds and destroys a small real hardware-deinterlace graph when `AetherEngine` initializes. Automatic deinterlacing awaits that shared warm-up before renderer audio activation and software-host creation, while forced software deinterlacing bypasses the wait. Warm-up failure remains nonfatal, so the real session still attempts hardware and retains its CPU fallback. Reported with precise cold-vs-warm timing by Simpendaal (#203). Covered by `Issue203SoftwareColdStartTests` and `DeinterlaceHardwareTests`.
+
+## [5.20.2] - 2026-07-23
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.2))
+
+### Fixed
+
+- **Mid-stream VOD resume and producer restarts now seek directly to the target segment's indexed video IRAP instead of landing at an earlier global sync point.** The segment plan already carried the exact video-stream timestamp, but the restart path converted it to seconds and asked libavformat for an unconstrained global seek. On multi-stream MP4 files that can select a much earlier sync point, forcing the producer to scan and discard a whole GOP before it can write the first segment. On a slow HTTP origin that scan took long enough for startup to fail with zero packets written. For non-disc VOD, the demuxer now seeks on the video stream's native timestamp axis with the target as the lower bound; containers that do not support the precise seek retain the previous global-time fallback. Disc sources also keep the fallback because their segment plans use folded multi-clip timestamps. Reported with decisive slow-origin diagnostics by kskchaitanya1993 (#191). Covered by `Issue191IRAPSeekTests`.
+
+## [5.20.1] - 2026-07-23
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.1))
+
+### Fixed
+
+- **The restart scan-forward gate now opens on keyframe presentation time, so the tail of a B-frame VOD file is producible again instead of starving to EOF.** The gate compared packet dts against a plan-boundary PTS (`segmentPlan[baseIndex].startPts`, a Cues timestamp); under B-frame reorder a keyframe's dts sits a reorder delay below its own pts, so the gate dropped the exact IRAP the restart seeked for, the same defect class the #92 cutter fix removed from segment cutting. Mid-file the next IRAP rescued the miss one GOP late; at the file tail there is no next IRAP, so the unbounded VOD gate dropped every remaining packet to EOF and the pump exited with zero packets written, leaving the final segment unproducible under any anchoring (the 5.19.1 escalation restarted into the same starve). Two further layers: a VOD pump whose gate still starves to EOF (no runtime keyframe at or after the targeted boundary, e.g. tail Cues drift or a mis-flagged tail IRAP) re-anchors production on the segment of the last keyframe the gate dropped (bounded), so the tail content gets produced and end-of-media completes through the 5.16.2 tail-park instead of dying at -12889; and the #35/#169 startup readiness gate's data-wait consults pump liveness, so production that already exited with nothing served fails over immediately instead of riding 8 rounds (24 s) of false hope. Traced across three rounds with exemplary lifecycle logs by rrgomes (#169). Covered by `Issue169GateStarvationTests` and extended `StartupReadinessGateTests`.
+
+## [5.20.0] - 2026-07-23
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.20.0))
+
+### Fixed
+
+- **A #168-rerouted live session that loses its ingest now recovers in-engine instead of cycling through the doomed native mount.** When the loopback ingest died mid-session (a MEDIA-SEQUENCE reset from an encoder restart or looped test pool, a CDN gap outliving the refresh-retry budget, an upstream ENDLIST), the pump exit delegated straight to host retune, and a host that answers by re-tuning the same URL relanded on the native bypass, which deterministically builds no video track for HEVC-in-MPEG-TS carriage, so the session re-ran the whole reroute dance (native mount, ~4 s watchdog grace, reroute, rejoin) roughly every 13 s. Three-layer fix: the ingest playlist tracker treats three consecutive whole-window MEDIA-SEQUENCE regressions as an axis reset and rejoins at the new edge under a discontinuity seam instead of starving the reader into its `ingestStalled` terminal; masters whose video-carriage watchdog fired are remembered (bounded, expiring, `RerouteVerdictMemory`), so any later load of the same URL routes straight onto the live-ingest loopback and skips the doomed mount entirely; and engine-created ingest readers gained an in-session reopen transport (`HLSVideoEngine.CustomSourceReopenFactory`, new public surface, hence the minor bump), so `eof`/`readError` pump exits rebuild a fresh reader through the existing bounded live-reopen machinery and only an exhausted budget surfaces `liveSourceReset` to the host. Host-provided custom readers and demuxed-audio companion sessions keep the immediate host-retune contract. Traced end to end with deep-window field logs by kskchaitanya1993 (#199, split out of #189). Covered by `Issue199RerouteRecoveryTests` and extended `HLSPlaylistTrackerTests`.
+
+## [5.19.1] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.19.1))
+
+### Fixed
+
+- **A VOD session whose producer dies mid-session (tail read error) now recovers instead of parking into -12889.** When the source reader stopped for good near the end of a file (reconnect churn on a slow link), the final segment was never produced and the request for it re-armed a 30 s backpressure wait forever: the forward-wait branch judged "will this arrive?" by index distance to the producer's march front alone, a dead producer freezes that front just below the request, and the restart escalation was additionally vetoed by the dead producer's still-installed base "covering" the index. On top of that, a mid-session `readError` pump exit had no recovery arm at all (only the nothing-ever-produced case surfaced as fatal, #126). Three-layer fix: a bounded event-driven revive rebuilds the producer on a fresh demuxer right at the pump exit; the forward wait is liveness-aware (a finished pump restarts immediately, a silently frozen march escalates after one fully burned wait with zero front progress, an advancing front keeps the full #141/#93 patience); and both proofs bypass the producerCovers veto. VOD only; live keeps its pump watchdogs and reopen machinery. Reported with a decisive trace by rrgomes (#169). Covered by `Issue169DeadProducerEscalationTests`.
+
+## [5.19.0] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.19.0))
+
+### Added
+
+- **`LoadOptions.liveJoinProfile` with a `.fastZap` opt-in for low-latency live joins (IPTV channel zapping).** Raw live MPEG-TS on the native loopback path took 10-18 s to first frame on a strict-real-time origin: the 5.18.5 startup cushion gates the first manifest on `HOLD-BACK = 3 x TARGETDURATION` of content (the RFC 8216bis floor, which cannot be undercut without reintroducing the `-16832` restart loop), and with the fixed ~4 s segment cut target `TARGETDURATION` never fell below 6, so the holdback was always >= 18 s regardless of how short the source GOPs were. `.fastZap` cuts live segments at every keyframe past 0.5 s instead, so segments quantize to the source keyframe cadence, `TARGETDURATION` follows the real GOP length, and the holdback the join waits for shrinks proportionally: a short-GOP 1080p50 IPTV stream on a strict-real-time origin reaches `readyToPlay` in ~2 s instead of ~20 s. The holdback contract itself is unchanged in both profiles, so long-GOP sources degrade to `.standard` behavior automatically and bursty ingest origins keep the observed-cadence `TARGETDURATION` floor (#167). Trade-off, documented on the option: a smaller `TARGETDURATION` tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so mid-stream stalls or bursts rebuffer more readily than under `.standard` (the default, byte-identical to 5.18.7). `aetherctl live` gains `--fast-zap` and `--preroll N` (0 models a strict-real-time origin with no backlog burst) for reproducible A/B join-latency runs. Proposed with field measurements by Simpendaal (#195). Covered by `Issue195FastLiveJoinTests`.
+
+## [5.18.7] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.7))
+
+### Fixed
+
+- **HEVC-in-MP4 VOD now plays on Apple TV instead of failing to build a video track.** On tvOS, AVPlayer builds no HEVC track from a bare media playlist; it needs the codec advertised in a master playlist's `EXT-X-STREAM-INF` `CODECS` attribute (H.264 builds without it, and macOS and the Simulator build HEVC media-direct from the init `hvcC`, so neither reproduced it). The loopback now serves HEVC through a master where routing-safe. The plain-HEVC `CODECS` string is also derived from the source `hvcC` per RFC 6381 (e.g. `hvc1.1.6.L93.90`) instead of a hardcoded Main10 declaration, so it matches the init and a strict device no longer rejects the item. Reported by kskchaitanya1993 (#187).
+- **Defensive strip of a zero-sample `sdtp` box from the fragmented init.** The pinned FFmpeg never writes this box, but a consumer that links an older FFmpeg the wrong way (a `-force_load`ed framework shadowing the vendored build) emits an `sdtp` describing zero samples into the `empty_moov` init, which Apple TV rejects and macOS tolerates. The engine now removes it from the captured init regardless of which FFmpeg produced the bytes.
+
+## [5.18.6] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.6))
+
+### Fixed
+
+- **Remote HLS external WebVTT subtitles now recover when the legible media selection loads after the item is ready.** On the `nativeRemoteHLS` bypass the engine surfaces the item's legible `AVMediaSelectionGroup` as `subtitleTracks`. The discovery loaded that group exactly once, and if `loadMediaSelectionGroup(for: .legible)` returned an empty group at that instant it gave up for the whole session, leaving `subtitleTracks` permanently empty. On macOS 26 the group is populated once the master playlist is parsed (before `readyToPlay`), so the single load caught every rendition; a reporter on macOS 27 beta saw a permanently empty subtitle picker, because on that OS the legible group only fills once the item reaches `readyToPlay` and the one-shot load missed it. The discovery now retries the group load once after `readyToPlay` before giving up, so a late-populating legible group no longer drops the renditions. The fast path is unchanged: a non-empty first load skips the wait. Reported by jihongboo (#154).
+
+## [5.18.5] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.5))
+
+### Fixed
+
+- **Long-GOP live played through the loopback no longer restarts inside AVPlayer's own stall-danger zone at startup.** A 4K50 HEVC-in-MPEG-TS stream routed onto the live-ingest loopback (the #168 reroute) cuts keyframe-aligned segments of ~4.8-5.76 s, so the served `EXT-X-TARGETDURATION` is 6. The media playlist advertised no explicit `EXT-X-SERVER-CONTROL:HOLD-BACK`, so AVPlayer fell back to its implicit live-edge holdback of `3 x TARGETDURATION` (~18 s) and tried to begin playback that far behind the live edge, while the fixed two-segment startup cushion built only ~9.6 s of content. AVPlayer's initial seek to edge-minus-holdback therefore landed inside the window's stall-danger region and it spammed `-16832 restarting Ns from end of live playlist; target duration Ts - stall danger`, rebuffering on every channel open until the real-time window naturally deepened past the holdback. The loopback now advertises `HOLD-BACK` explicitly at the RFC 8216bis floor (`3 x TARGETDURATION`, which is also AVPlayer's implicit default made explicit), and the startup gate holds the first manifest until the window carries at least that holdback depth (bounded above by the sliding-window size and the existing startup deadline) so AVPlayer's live-edge seek always lands inside real content. Both the served playlist and the startup cushion derive `TARGETDURATION` through one shared policy, so the depth built can never drift from the holdback advertised. Sources that arrive with a backlog (a Jellyfin transcode, or an upstream live window pulled at I/O speed) satisfy the gate almost immediately; only a strict-real-time origin pays the deepen-the-buffer latency, which is inherent to joining long-GOP live without stalling. Root-caused with field-verified diagnostics by kskchaitanya1993 (#189). Covered by `Issue189LiveEdgeHoldbackTests`.
+
+## [5.18.4] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.4))
+
+### Fixed
+
+- **`AetherPlayerSurface` now rebinds its engine on every SwiftUI update, so replacing the `AetherEngine` instance at the same structural position no longer leaves fresh video black over working audio.** The surface bound the engine to its platform view only in `makeUIView`/`makeNSView`; the update path was empty. When a host tears down and recreates its engine at the same position (a retry/reload flow), SwiftUI reuses the platform view and calls only `updateUIView`, so the new engine's `bind(view:)` never ran: its `boundView` stayed nil, the post-load `presentCurrentLayer()` no-oped on the guard, and the reused view kept displaying the previous engine's detached layer. `isReadyForDisplay` read true throughout, because the host's layer reports ready without being attached to any on-screen view. `updateUIView`/`updateNSView` now call `engine.bind(view:)`; steady-state passes are a cheap no-op (`presentCurrentLayer()` re-attaches the same layer and `attach` short-circuits on identical layer), while an engine swap points the new engine at the reused view and re-attaches its layer. Hosts that keyed the surface identity to the engine (`.id(ObjectIdentifier(engine))`) as a workaround no longer need to. Root-caused and reported by rrgomes (#188). Covered by `Issue188SurfaceRebindTests`.
+
+## [5.18.3] - 2026-07-22
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.3))
+
+### Fixed
+
+- **HEVC-in-MP4 progressive VOD dispatched to the loopback remux no longer builds a fMP4 init that Apple TV hardware rejects.** libx265 (and other encoders) embed a large user-data `SEI_PREFIX` NAL array in the hvcC config record; the VOD muxer copied the source codec parameters verbatim, so that array reached the `init.mp4` sample description. Apple TV builds the HEVC format description straight from the hvcC parameter-set arrays and rejects a record carrying a non-parameter-set array (`asset.tracks count=0`, `AVFoundationErrorDomain -11829`, underlying `CoreMediaErrorDomain -12848`, before any media fetch); macOS and the tvOS Simulator both tolerate it, so it only surfaced on device. Both 8-bit Main and 10-bit Main10/HDR10 were affected. The HEVC config record is now canonicalized before write_header, keeping only the VPS/SPS/PPS arrays and dropping SEI and any other NAL arrays, so the VOD init matches the canonical form the live MPEG-TS and direct fMP4-HLS paths already emit. HDR10 static metadata (in-band per-IRAP plus the `colr`/`mdcv`/`clli` boxes) and Dolby Vision signaling (`dvcC`/`dvvC`, RPU) are outside the hvcC and unaffected. Reported by kskchaitanya1993 (#187). Covered by `HEVCConfigRecordTests`.
+
+## [5.18.2] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.2))
+
+### Fixed
+
+- **Seeks issued while the initial load is still in progress are no longer silently dropped.** `seek(to:)` no-oped for the whole `state == .loading` window (probe, native load, readiness gate, several seconds on slow sources), so hosts rendering the target optimistically watched playback snap back to the pre-seek position. The latest loading-window seek is now stashed in the #127 pre-ready slot, published optimistically to the scrub clock, and replayed when the session settles into a playable state (including autostart paths, where readiness fires while `state` is still `.loading`); a load that dies discards it. Reported by YangHanqing (#178, mechanism 1). Covered by `Issue178LoadingSeekStashTests`.
+- **An ordinary seek issued while a recovery re-anchor was pending no longer lands on the recovery position instead of its own target.** Once a seek-deadline reconcile parked an authoritative restart in the coalescer's pending slot (#79), a subsequent user seek's segment-driven restart was dropped outright, and the producer stayed anchored ~10 s+ away from the requested target while the provider's re-fire bookkeeping believed the restart had run. A new user seek now releases the superseded authoritative claim before dispatching the host seek, so its restart takes the pending slot normally; the #79 lock still blocks stale burst-tail scrubs that arrive without a fresh user seek. Reported by YangHanqing (#178, mechanism 2). Covered by `RestartCoalescerTests`.
+
+## [5.18.1] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.1))
+
+### Fixed
+
+- **High-bitrate live HLS on the ingest path could rebuffer because the reader could not get ahead of the playhead.** The ingest segment loop awaited each fetch fully before starting the next, so every segment paid a connection + TTFB round-trip with no bytes flowing; on a 4K50 HEVC/TS stream (~13 Mbps) the producer ran below real time (cache stuck at ~5 segments) even on links that can pull much faster. Segment fetches now run through a bounded prefetch pipeline: up to 4 fetches (and AES-128 decrypts) in flight, committed to the FIFO strictly in playlist order, so classification, discontinuity handling, and demuxer pacing are unchanged while the link is saturated. Reported with a field-verified design by kskchaitanya1993 (#177). Covered by `Issue177IngestPrefetchTests`.
+- **Live streams delivering just below real time were force-retuned every ~10 s, re-joining behind the live edge and draining the buffer each cycle.** The no-cut watchdog retuned on wall-clock since the last finalized segment alone; a source whose 6 s segment simply has not fully arrived inside the 10 s timeout was classified a cutter wedge although video PTS was still advancing. The wedge classification is now gated on PTS advance: when video advanced at least 2 s in the window, the watchdog holds and re-arms (bounded to 6 consecutive holds) instead of exiting for host retune. A genuine SSAI ad-pod wedge reads at full rate with frozen video PTS and still retunes immediately; the source-starvation classification is unchanged. Reported with a field-verified design by kskchaitanya1993 (#177). Covered by `Issue177NoCutHoldTests`.
+- **Anamorphic (SAR != 1:1) content on the software decode path rendered at coded dimensions, collapsing to a thin strip.** The renderer's cached `CMVideoFormatDescription` snapshots the pixel-aspect attachment at creation but its cache key omitted PAR, so whatever the first frame carried was frozen for the whole stream; garbage `AVCodecContext` SARs (1088:1 seen in the field) and per-field oscillation on interlaced content had no gate. The decoder now resolves SAR frame -> codec context -> stream (first sane value wins, both axes gated to 1...256), latches the first non-square SAR per stream, and the renderer keys its format-description cache on PAR. Reported with a field-verified design by kskchaitanya1993 (#177). Covered by `Issue177SARLatchTests`.
+
+## [5.18.0] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.18.0))
+
+### Fixed
+
+- **IPT-only Dolby Vision (HEVC P5, AV1 P10.0) now fails the load with a clear error when it would start on the software path, instead of playing with a green/purple cast.** Follow-up to 5.17.5: AV1 Profile 10.0 (compat 0) has the same IPT-PQ-c2-only signal as HEVC P5, but on devices without hardware AV1 decode (all Apple TVs, M1/M2 Macs, pre-A17 iPhones) it routes to dav1d, and there is no native fallback to prefer (AVPlayer HLS requires HW AV1), so no route can render it color-correctly. The dispatch now consults `VideoRoutingPolicy.softwarePathCannotRepresent` after the final routing decision and fails fast; this also closes HEVC P5's remaining doors into the software path (forward-only sources, test override). P7 / P8.x and AV1 P10.1 / P10.2 / P10.4 stay software-eligible since their base layer decodes with correct color. Part of the #176 cleanup. Covered by `VideoRoutingPolicyTests`.
+
+### Added
+
+- New public error case `AetherEngineError.dolbyVisionUnplayableOnSoftwarePath(profile:)` (hence the minor bump).
+
+## [5.17.5] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.5))
+
+### Fixed
+
+- **Dolby Vision Profile 5 misrouted to the software path with a green/purple color shift, even on Apple Silicon.** The #2 second-stage gate probes VideoToolbox with a plain-HEVC format description built from the raw hvcC; for P5 that is not what the native route plays (dvh1 + dvcC, decoded by Apple's DV decoder, #98), and VT rejects the bare P5 hvcC with -12906/-4, so the probe returned a false negative and the fallback routed P5 to the SoftwarePlaybackHost, where libavcodec decodes the IPT-PQ-c2 base layer as YCbCr (the reported cast). P5 has no HDR10/HLG/SDR-compatible base layer, so software is never a correct fallback for it: HEVC streams whose DOVI config says profile 5 now bypass the gate and stay native unconditionally (the VT probe is not even invoked); P7 / P8.x keep the gate since their base layer is standard Main10 that the software path decodes with correct color. Reported by ijuniorfu, triaged by DrHurt (#176). Covered by `VideoRoutingPolicyTests`.
+
+## [5.17.4] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.4))
+
+### Fixed
+
+- **`-15410` when the LOCAL segment producer stalls (SSAI cutter wedge) while LL-HLS blocking-reload is latched ON, including a second one right after the stall watchdog's item reload.** Follow-up to the 5.16.0 observed-cadence fix: the cadence policy observes ingest arrivals, which keep flowing while the cutter is wedged, so it cannot see this failure mode. The held `?_HLS_msn=` reload waited on a segment that will never be cut, timed out, and was answered with the unchanged playlist (no requested MSN), which AVPlayer flags as invalid blocking-reload behavior; the item reload against the same zombie server immediately re-armed a second hold. The server now answers an unsatisfiable held blocking reload with a retriable 503 (RFC 8216bis) instead of a spec-invalid unchanged 200, and every live pump exit that delegates to host retune (`segmentStall`, `sourceReplay`, non-URL-reopenable pump deaths) latches the provider production-halted: blocking-reload stops being advertised for the rest of the session (beating the host override), and parked waiters release immediately instead of sleeping out their hold. Reopenable URL exits keep cutting into the same provider and do not latch. Reported by G00380316 (#167 retest). Covered by `LiveProductionHaltTests`.
+
+## [5.17.3] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.3))
+
+### Fixed
+
+- **`EXC_RESOURCE` memory-limit crash on the native loopback pipeline: the persistent source reader kept pulling from the origin while the muxer was correctly backpressure-stalled.** The persistent reader applied window backpressure by blocking the URLSession delegate callback until the consumer drained below the 16 MB high-water mark. Blocking the delegate has no flow-control contract: whether the connection stops reading from the socket is a transport implementation detail. Plain HTTP/1.1 happens to park after a few MB of internal buffering, but the TLS/H2 path keeps reading at line rate and buffers the undelivered body in unbounded URLSession-internal allocations; with a realtime consumer that grows at line rate minus playback rate, goes cold, gets compressed, and trips the jetsam limit after minutes (the reporter's memprobe: delivered bytes at playback rate, malloc growing 12x faster, `vmCmp` climbing ~500 MB per 30 s with rss flat, and the network thread the only active thread, mid `SSL_read`). The reader now uses task suspend/resume, the contractual flow control the streaming path already used: delivery never blocks, the task suspends once the window exceeds the high-water mark, and the read loop resumes it when the drain crosses the new 8 MB low-water mark (or before parking in the frontier wait, where a suspended task would never deliver). Every reconnect and teardown path balances a pending suspend before cancel. Reported by Enoch Abiodun (#174). Covered by `Issue174PersistentReadBackpressureTests` against a loopback origin that counts the bytes it actually manages to serve.
+
+## [5.17.2] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.2))
+
+### Fixed
+
+- **Matroska `TrackTimestampScale != 1` follows RFC 9559 again (FFmpegBuild 2.2.0): the 5.9.4 clamp is dropped, the warning stays.** Upstream review of our proposed FFmpeg patch ([FFmpeg PR 23852](https://code.ffmpeg.org/FFmpeg/FFmpeg/pulls/23852)) corrected the #145 premise: RFC 9559 (11.1.3, 11.2, 5.1.3.5.3) puts Block/SimpleBlock relative timestamps and BlockDuration in Track Ticks, absolute time is `(cluster + rel x TTS) x TimestampScale`, and upstream `matroskadec` implements exactly that. The "hybrid axis" described in the 5.9.4 entry does not exist; the file that motivated it was authored on the segment axis and is invalid per RFC, and the clamp would have mistimed a conformant `TTS != 1` file. Timestamp behavior is now exactly upstream's RFC behavior; the demuxer still warns whenever a track carries `TTS != 1` (the element is deprecated and widely ignored, so such files may be authored against readers that ignore it), which keeps the actual defect reported in #145, the silence, fixed. `Issue145MatroskaTrackTimestampScaleTests` now locks the RFC semantics: a conformant Track Ticks file demuxes at its authored times (the clamp broke exactly this case), and a segment-axis-authored file documents the RFC-scaled rendering as invalid-file behavior.
+
+## [5.17.1] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.1))
+
+### Fixed
+
+- **The wireless-AirPlay LAN-swap reload (and the background-return reopen) destroyed host subtitle session state: mid-session `addExternalSubtitleTrack` registrations vanished (the host's menu kept listing ids that no longer existed), the user's explicit audio/subtitle picks (including subtitles explicitly OFF) were overridden by a re-run of preferred-language auto-selection, and `nativeSubtitleReapplyOrdinal` was wiped, so the AirPlay receiver rendered no subtitles at all.** `reloadAtCurrentPosition` now captures a session carryover before the reload: the fresh `load()` seeds the external-track registry from it id-exactly (removal gaps preserved, no id collisions) and before the native rendition table is built, so mid-session external tracks also become WebVTT-rendition-eligible on the reloaded item, exactly the AirPlay/PiP window where the host overlay cannot draw; the explicit audio pick rides `load()`'s existing `audioSourceStreamIndex` override; the previous subtitle selection is re-selected instead of auto-derived; and the native-rendition pick is replayed the way the #65 recovery already does, recomputed against the rebuilt table. A host `setNativeSubtitleRendering` call landing mid-reload (the AirPlay flip triggers the engine reload and the host reaction from the same KVO change) is latched and applied after the restore instead of being misread as a deselect. The audio-switch reload gets the same native-ordinal replay, and an active external track re-arms through its synthetic id there. Reported by dlev02 (#170). Covered by `Issue170SessionCarryoverTests`.
+
+## [5.17.0] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.17.0))
+
+### Added
+
+- **`LoadOptions.nativeRemoteHLSIngestFallback: Bool`** (default `true`) to opt out of the new live remote-HLS ingest reroute described below.
+- **`HLSLiveIngestReader(playlistURL:httpHeaders:)`**: the ingest reader now carries custom HTTP headers on every playlist, segment, and AES-key fetch (the companion audio reader inherits them), so header-enforcing IPTV origins (Referer / User-Agent / Authorization, #119) accept the ingest the same way they accept the AVPlayer bypass.
+
+### Fixed
+
+- **A live channel whose master advertises HEVC (`CODECS="hvc1..."`) but delivers MPEG-TS segments stayed black (audio-only) on `nativeRemoteHLS`: AVPlayer never built a video track at all.** Per the HLS Authoring Spec, AVFoundation supports HEVC only in fMP4 carriage; for HEVC-in-TS it reaches `readyToPlay`, builds the audio track, and silently never creates the video track, so there is also no `CMFormatDescription` for the 5.16.1 range detection to read and nothing to program display criteria for. The engine now arms a carriage watchdog at `readyToPlay` on live bypass sessions: it polls `item.tracks` at a 0.5 s cadence for 4 s, takes advertisement evidence from `AVURLAsset.variants` (AVFoundation's already-fetched master parse, so no second origin connect past IPTV tokens / WAFs), and when an advertised video rendition never builds an item track it reroutes the session onto the loopback ingest path, where `HLSLiveIngestReader` remuxes TS to fMP4 and the full display-criteria handshake runs. Audio-only masters (radio channels) and masters without variant evidence disarm without firing; VOD is excluded (the AE#154 reroute target, so no ping-pong); dead origins never reach `readyToPlay` and so never trigger it. Follow-up to #168 after the reporter's 5.16.1 retest log proved the track-build rejection branch. Covered by `RemoteHLSIngestFallbackTests` and `HLSLiveIngestHeaderTests`.
+
+## [5.16.2] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.16.2))
+
+### Fixed
+
+- **A long 4K Dolby Vision loopback-HLS VOD failed to finish at end-of-media: AVPlayer parked a fraction of a second from the end (`WaitingToMinimizeStalls`), never fired `didPlayToEndTime`, and after ~43s died with `CoreMediaErrorDomain -12889`.** The final segment is produced and served fine, but its advertised `#EXTINF` is derived from the container duration (`sourceDurationSeconds`), while the muxer writes the final video sample at EOF with only its one-frame duration. When the container duration overshoots the last real video sample (audio a few frames longer, or a rounded-up MKV `Duration`), the video track underfills the advertised segment by ~0.1s, so the video renderer parks waiting for frames that never existed while `loadedTimeRanges` (audio plus the segment map) reports full buffering. The engine now detects this tail park from its 1 Hz native tick and synthesizes organic end-of-media (playhead within `endOfMediaEpsilonSeconds` of duration, final segment loaded to the end, `WaitingToMinimizeStalls`, playhead frozen for a 3-tick grace), so the session finishes cleanly (`.ended` -> mark-watched / autoplay-next) after ~3s instead of hanging then erroring at ~43s. Reported by rrgomes (Apple TV 4K, tvOS 26, 48-min HEVC Main10 DV Profile 8.1). Covered by `NearEndOfMediaParkTests`.
+- **Resuming into the last few seconds of a Dolby Vision title dropped DV: the #35 readiness gate reported "master never produced tracks", reloaded, timed out again, and fell back through the reduced master to the media playlist (HDR10 base, DV dropped).** A tail resume anchors the readiness-gate master on the final segment, still being produced over a slow link, so `awaitStartupReadiness` times out with 0 tracks and no media loaded. The gate (written for the cold DV/HDCP decode failure) misread unstarted production as a decode failure and burned the master fallback chain before it had any segment data to decode. The gate now splits a settle-window timeout by whether any media has loaded: no media means the first segment has not been served yet, so it keeps the DV master and re-awaits, bounded by `maxDataWaitRounds` (~24s of patience, comfortably longer than a slow-link final-segment production); media loaded but still 0 tracks stays the cold-decode park with the reload/fallback chain unchanged. A genuinely wedged producer still falls through once the data-wait budget is spent. Reported by rrgomes. Covered by `StartupReadinessGateTests`.
+
+## [5.16.1] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.16.1))
+
+### Fixed
+
+- **HDR10 / Dolby Vision over `nativeRemoteHLS` presented no video (audio-only, black), and the reported dynamic range was always SDR.** The `nativeRemoteHLS` bypass hands the m3u8 straight to AVPlayer and runs no demux probe, so it never programmed `AVDisplayManager.preferredDisplayCriteria` and never learned the item's dynamic range. On a bare `AVPlayerLayer` an HDR item with the panel in SDR reaches `readyToPlay` and plays audio but presents no video; `videoFormat` also stayed at the `.sdr` default (`appliesPreferredDisplayCriteriaAutomatically` is `AVPlayerViewController`-only and does not exist on the bare `AVPlayer` this path uses). The engine now reads the range back from AVPlayer's parsed video-track `CMFormatDescription` (transfer function plus `dvh1` / `dvhe` sample type) at `readyToPlay` and again at first frame, publishes it into `sourceVideoFormat` / `videoFormat`, and for an HDR range programs the display criteria (Match Dynamic Range plus Match Frame Rate) the same way the loopback path does, with no second connection to the origin. SDR and sole-writer (`suppressDisplayCriteria`) hosts are untouched. Reported on a 4K50 HDR10 HEVC Main10 IPTV channel (Apple TV 4K, tvOS 26). Covered by `RemoteHLSFormatDetectionTests`. Awaiting reporter device retest.
+
+## [5.16.0] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.16.0))
+
+### Added
+
+- **`LoadOptions.liveBlockingReload: Bool?`** to override LL-HLS blocking-reload eligibility for live loopback sessions. `nil` (default) keeps the automatic behavior; `true`/`false` force it regardless of cadence. See the fix below for the auto behavior.
+
+### Fixed
+
+- **Live HLS ingest from a bursty origin looped on `CoreMediaErrorDomain -15410` ("Invalid server blocking reload behavior for low latency"), stalling and self-recovering with a nudge-seek over and over.** LL-HLS blocking-reload eligibility and the local `#EXT-X-TARGETDURATION` floor both derived from `HLSLiveIngestReader.upstreamTargetDuration`, the upstream origin's *self-declared* `#EXT-X-TARGETDURATION`. A relay/budget IPTV origin that advertises a normal target but pushes segments in irregular batches (rather than encoding in disciplined real time) defeated that check: the advertised value looked fine, so the loopback server kept advertising `CAN-BLOCK-RELOAD=YES` and held each `?_HLS_msn=` reload until its batch landed, which AVPlayer treats as a spec violation (`-15410`). The hint was also read once at load and frozen, so it could never reflect how the origin actually behaved. The engine now measures the **observed** inter-segment arrival cadence in the ingest reader (`LiveArrivalCadenceMeter`: the recent-max closed inter-arrival interval, widened by the currently-open gap) and drives both decisions from it on every manifest render (`LiveCadencePolicy`): blocking-reload starts OFF, latches ON only after a sustained window of disciplined cadence, and latches permanently OFF the moment a burst is observed (a monotonic OFF -> ON -> OFF path, since ON/OFF flapping would itself trip `-15410`); the TARGETDURATION floor tracks the monotonic max observed cadence so AVPlayer's 1.5x-target unchanged-playlist patience always covers the real inter-batch gap (no `-12888` regression). Plain-`url:` live with no cadence signal (for example a Jellyfin real-time transcode, which is disciplined) keeps blocking-reload on by default, so mainstream live TV is unaffected; hosts can override either way with the new `LoadOptions.liveBlockingReload`. Reported by a downstream integrator (iPhone 16 Pro Max / iPad 10th generation, HDR10 4K HEVC + EAC3 5.1 bursty ingest). Covered by `LiveCadencePolicyTests`.
+
+## [5.15.5] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.5))
+
+### Fixed
+
+- **Unbounded aggregate memory growth in `SubtitlePacketStore` on sources with many embedded subtitle tracks, up to an iOS jetsam kill.** The store capped retained compressed subtitle packets at 32MB *per stream* (`perStreamByteCap`), but the pump tap and the forward prefetcher both harvest *every* embedded subtitle stream into the session store (so a track switch backfills instantly without a side demuxer, #112). Nothing bounded the sum across streams, so a source with many tracks (99 in the field repro, mostly bitmap/PGS, each independently climbing toward its own 32MB ceiling) grew heap allocations toward N x 32MB (~3.2GB); the host's `memprobe` showed `mallocMB` tracking `subTracks` rather than playback time or bytes downloaded, and the process eventually hit the iOS jetsam limit and was killed. The store now enforces an aggregate byte budget (`aggregateByteCap`, 96MB) across all streams in addition to the per-stream cap: the active drain targets (primary + secondary) are protected so a switch back to them still backfills from a full window, and the coldest (least-recently-touched) non-protected streams evict oldest-first once the aggregate budget is exceeded. Total retained bytes are tracked incrementally (O(1) per append) and a monotonic touch counter orders eviction; the engine keeps the protected set in sync with the active subtitle selection on every change and re-asserts it each drain tick. Reported by Enoch Abiodun (iPhone 16 Pro Max / iPad 10th generation, 99-track source). Covered by `Issue166AggregateByteCapTests`.
+
+## [5.15.4] - 2026-07-21
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.4))
+
+### Fixed
+
+- **On an FFmpeg build without the configured bridge encoder (for example no `--enable-encoder=eac3`), a bridge-required audio codec played as silent video-only with no cascade to FLAC.** The audio route made a single `AudioBridge` attempt with the configured `audioBridgeMode` (default `.surroundCompat` = EAC3). When that mode's encoder was absent from the build, `AudioBridge.init` threw `.encoderNotFound` and the handler dropped straight to silent video-only, so every bridge-required codec (DTS, TrueHD, MP3, Opus, Vorbis, PCM, MP2, LATM-AAC) came up with no audio and the only signal was one log line. The route now cascades: it tries the configured mode and, only on a missing-encoder error, falls through to the other mode's encoder (EAC3 <-> FLAC) before any video-only fallback, and emits a loud ERROR rather than a quiet info line when no bridge encoder is available. Every other init failure is source-specific and stops immediately without a pointless retry. No behavior change when the configured encoder is present: the first attempt succeeds exactly as before. Also fixes a routing log line that hardcoded "FLAC re-encode" regardless of the configured mode, and a stale doc-comment. Reported and hardware-verified by a downstream integrator (Apple TV 4K, DTS 5.1 and TrueHD Atmos over network, audio plays via the FLAC bridge). Covered by `Issue165BridgeModeCascadeTests`.
+
+## [5.15.3] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.3))
+
+### Fixed
+
+- **Scrubbing or seeking a VOD to the very end left the engine reporting `.playing` while AVPlayer sat frozen on the final frame, and `play()` / `togglePlayPause()` could not resume.** A programmatic `seek(to: duration)` never fires `AVPlayerItem.didPlayToEndTime` (that notification is for playback reaching the end on its own), so the seek settled to a phantom `.playing` and, because `AVPlayer.play()` at end-of-media is a no-op, the transport controls stalled with no way to restart. A VOD scrubbed to its final frame now parks at `.paused` (honest, non-terminal, so the scrubber stays live and can scrub back), and `play()` / `togglePlayPause()` rewind to the start before resuming when the playhead is parked at the end. The terminal `.ended` state (organic completion, #63) is deliberately unchanged: it drives the host's end-of-playback handling (mark-watched / autoplay-next / dismiss), so a manual scrub to the end must not trigger it, and a play press racing an end card must not silently restart a finished session. Reported by jihongboo. Covered by `SeekToEndOfMediaTests`.
+
+## [5.15.2] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.2))
+
+### Fixed
+
+- **A seek landing on a PGS line with no following subtitle within a minute stayed dark, forced cues included.** The #143 reconstruction pass reshows the seek-landing line by holding it as a candidate and emitting it once the backscan decode reaches the playhead, using the next composition at/after the playhead as the pass-end trigger. A landing whose set is the newest decodable composition in the drain window (the file's last line, or sparse/forced dialogue whose next line sits beyond the 60 s forward lead) has no such trigger, so the candidate stayed held and the overlay dark: tens of seconds on sparse dialogue, forever at end of file. The drain now finalizes a reconstruction pass once it has seeded a candidate and confirmed no successor is stored ahead in the lead window, emitting the landing line (the whole same-start group) immediately. A line the author cleared before the playhead no longer covers it and is not resurrected; landings with a successor in the window are unchanged. Reported by cmcpherson274 (5.9.7 retest of #143). Covered by `Issue143PGSLandingLineTests` and `SubtitleOverlayDrainerTests`.
+
+## [5.15.1] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.1))
+
+### Fixed
+
+- **Live MPEG-TS channels routed to the software decoder (interlaced H.264 via #150) played silent.** Once #150 began correctly routing interlaced live streams to the software path, those sessions came up with no audio. The software host resolved its audio track only through `av_find_best_stream`, which returns -1 for a live MPEG-TS AAC stream whose codec parameters the probe left empty (sample rate and channel count zero, because stream analysis stops before the first audio frame is decoded), so no decoder opened and audio packets were dropped (`audioCodecID=none` at session start). The native path already handled this; the software path now mirrors it, falling back to the first audio-type stream on live sources when `av_find_best_stream` finds none, and repairing the AAC parameters to 48 kHz stereo AAC-LC so the decoder opens and channel negotiation is correct (the decoder otherwise recovers rate and channels from the first decoded frame, but not before the session reports zero). VOD keeps its existing stream selection. Reported by digilearn-dev (#133). Covered by `SoftwareLiveAudioResolutionTests`.
+
+## [5.15.0] - 2026-07-20
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.15.0))
+
+### Added
+
+- **Bitmap subtitles (PGS / DVB / DVD, embedded and external .sup) now survive PiP, AirPlay, and wired external displays on the native path.** Bitmap tracks join the native rendition table at load as OCR-fed renditions: while one is selected, a worker decodes its harvested compositions ahead of the playhead (packet-store source, drainer pacing, 5.14.1 end-clamp semantics) and recognizes them on-device (Vision, `.accurate`, track-language hinted) into plain-text cues for the track's WebVTT rendition; the #151 forward-prefetch lead rises to 270 s while armed so AVKit's ~240 s .vtt prefetch burst is served populated. External .sup sidecars fill their store from the selection-time sidecar decode's own image cues (no second fetch). Lossy by design: a failed or empty read drops that line from the rendition, and fullscreen keeps the pixel-accurate bitmap overlay. VOD, master-routed sessions; no API breaks, hosts need only the pin bump.
+
 ## [5.14.1] - 2026-07-20
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.14.1))

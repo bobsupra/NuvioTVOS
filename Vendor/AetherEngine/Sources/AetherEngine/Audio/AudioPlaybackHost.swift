@@ -308,14 +308,16 @@ final class AudioPlaybackHost {
         var lastEnqueuedEnd: Double = 0
         var seenSeekGeneration = seekGeneration()
 
-        while !stopRequested() {
+        func demuxIteration() -> Bool {
             if !isPlaying() {
                 condition.lock()
                 while !isPlaying() && !stopRequested() {
-                    _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    autoreleasepool {
+                        _ = condition.wait(until: Date(timeIntervalSinceNow: 0.5))
+                    }
                 }
                 condition.unlock()
-                continue
+                return true
             }
 
             // A seek invalidates the enqueue high-water mark: a stale pre-seek value after a backward seek
@@ -331,9 +333,11 @@ final class AudioPlaybackHost {
             if clockArmed(), let aOut = audioOutput {
                 while !stopRequested() && isPlaying()
                     && (lastEnqueuedEnd - aOut.currentTimeSeconds) > maxBufferAhead {
-                    Thread.sleep(forTimeInterval: 0.05)
+                    autoreleasepool {
+                        Thread.sleep(forTimeInterval: 0.05)
+                    }
                 }
-                if stopRequested() { break }
+                if stopRequested() { return false }
             }
 
             let packet: UnsafeMutablePointer<AVPacket>?
@@ -342,7 +346,7 @@ final class AudioPlaybackHost {
             } catch {
                 EngineLog.emit("[AudioHost] demux read failed: \(error)", category: .swPlayback)
                 onError("Playback error: \(error.localizedDescription)")
-                break
+                return false
             }
 
             guard let packet else {
@@ -365,18 +369,21 @@ final class AudioPlaybackHost {
                 var seekedAway = false
                 while !stopRequested()
                     && (audioOutput?.currentTimeSeconds ?? lastEnqueuedEnd) < lastEnqueuedEnd - 0.25 {
-                    // A seek during the drain re-positions the demuxer so EOF no longer holds. Without this check
-                    // the drain played silence up to the stale high-water mark then fired onEnd(), skipping the seek.
-                    if seekGeneration() != seenSeekGeneration {
-                        seekedAway = true
-                        break
+                    autoreleasepool {
+                        // A seek during the drain re-positions the demuxer so EOF no longer holds. Without this check
+                        // the drain played silence up to the stale high-water mark then fired onEnd(), skipping the seek.
+                        if seekGeneration() != seenSeekGeneration {
+                            seekedAway = true
+                        } else {
+                            Thread.sleep(forTimeInterval: 0.1)
+                        }
                     }
-                    Thread.sleep(forTimeInterval: 0.1)
+                    if seekedAway { break }
                 }
-                if seekedAway { continue }
-                if seekGeneration() != seenSeekGeneration { continue }
+                if seekedAway { return true }
+                if seekGeneration() != seenSeekGeneration { return true }
                 onEnd()
-                break
+                return false
             }
 
             // A seek landed while this packet was in flight: it predates the seek's renderer flush, so enqueueing
@@ -384,7 +391,7 @@ final class AudioPlaybackHost {
             if seekGeneration() != seenSeekGeneration {
                 av_packet_unref(packet)
                 av_packet_free_safe(packet)
-                continue
+                return true
             }
 
             if packet.pointee.stream_index == audioStreamIndex,
@@ -406,6 +413,14 @@ final class AudioPlaybackHost {
 
             av_packet_unref(packet)
             av_packet_free_safe(packet)
+            return true
+        }
+
+        while !stopRequested() {
+            let keepGoing: Bool = autoreleasepool {
+                demuxIteration()
+            }
+            if !keepGoing { break }
         }
     }
 

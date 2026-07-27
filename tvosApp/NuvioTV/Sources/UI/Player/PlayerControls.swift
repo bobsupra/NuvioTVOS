@@ -222,8 +222,7 @@ struct PlayerControls: View {
                 size: 70,
                 iconSize: 30,
                 focusKey: .play,
-                isFocused: focusedControl == .play,
-                isEmphasized: isShowingPause
+                isFocused: focusedControl == .play
             ) {
                 viewModel.togglePlayPause()
             } icon: {
@@ -243,8 +242,7 @@ struct PlayerControls: View {
                     size: 70,
                     iconSize: 28,
                     focusKey: .episodes,
-                    isFocused: focusedControl == .episodes,
-                    isEmphasized: false
+                    isFocused: focusedControl == .episodes
                 ) {
                     viewModel.openSidePanel(.episodes)
                 } icon: {
@@ -258,8 +256,7 @@ struct PlayerControls: View {
                     size: 70,
                     iconSize: 28,
                     focusKey: .sources,
-                    isFocused: focusedControl == .sources,
-                    isEmphasized: false
+                    isFocused: focusedControl == .sources
                 ) {
                     viewModel.openSidePanel(.sources)
                 } icon: {
@@ -272,8 +269,7 @@ struct PlayerControls: View {
                 size: 70,
                 iconSize: 30,
                 focusKey: .settings,
-                isFocused: focusedControl == .settings,
-                isEmphasized: false
+                isFocused: focusedControl == .settings
             ) {
                 viewModel.showSettingsPanel = true
             } icon: {
@@ -289,7 +285,6 @@ struct PlayerControls: View {
         iconSize: CGFloat,
         focusKey: PlayerControlFocus,
         isFocused: Bool,
-        isEmphasized: Bool,
         action: @escaping () -> Void,
         @ViewBuilder icon: () -> Icon
     ) -> some View {
@@ -314,12 +309,6 @@ struct PlayerControls: View {
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .contentShape(Circle())
-                .shadow(
-                    color: .white.opacity(isEmphasized ? 0.74 : 0.42),
-                    radius: isFocused ? 18 : 10,
-                    x: 0,
-                    y: 0
-                )
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focusedControl, equals: focusKey)

@@ -411,6 +411,65 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         )
     }
 
+    /// Marking an episode watched by hand has to settle the raw ledger as well
+    /// as the rendered row: Continue Watching is rebuilt from the ledger, so a
+    /// row left in progress there puts the episode's progress bar straight back
+    /// on the next Home load or sync pull.
+    func testWatchedEpisodeClearsTheLedgerRowBehindTheProgressBar() throws {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e01.mkv",
+            position: 360,
+            duration: 3_000,
+            season: 1,
+            episode: 1,
+            episodeId: "tt-test:1:1"
+        )
+        XCTAssertEqual(
+            WatchProgressLedger.continueWatchingCandidates().first?.progressKey,
+            "tt-test_s1e1"
+        )
+
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 1, episode: 1))
+
+        XCTAssertTrue(WatchProgressLedger.continueWatchingCandidates().isEmpty)
+        let record = try XCTUnwrap(
+            WatchProgressLedger.record(contentId: meta.id, season: 1, episode: 1)
+        )
+        XCTAssertTrue(WatchProgressLedger.isComplete(record))
+        // Completed rather than deleted, so it still seeds the next episode's
+        // Next Up card exactly as watching it through would have.
+        XCTAssertEqual(WatchProgressLedger.upNextSeeds().first?.progressKey, "tt-test_s1e1")
+    }
+
+    /// A mark on one episode must not retire another episode's progress.
+    func testWatchedEpisodeLeavesOtherEpisodesInProgress() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e02.mkv",
+            position: 480,
+            duration: 3_000,
+            season: 1,
+            episode: 2,
+            episodeId: "tt-test:1:2"
+        )
+
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 1, episode: 1))
+
+        XCTAssertEqual(
+            ContinueWatchingStore.resumePosition(
+                for: meta, season: 1, episode: 2, episodeId: "tt-test:1:2"
+            ),
+            480
+        )
+        XCTAssertEqual(
+            WatchProgressLedger.continueWatchingCandidates().first?.progressKey,
+            "tt-test_s1e2"
+        )
+    }
+
     func testOlderRemoteProgressCannotOverwriteNewerEpisodeResume() {
         let meta = makeSeries()
         ContinueWatchingStore.save(
@@ -462,6 +521,42 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         let record = WatchProgressLedger.record(forKey: "tt-test_s1e1")
         XCTAssertNotNil(record, "a finished episode must remain a Next Up seed")
         XCTAssertEqual(WatchProgressLedger.upNextSeeds().first?.progressKey, "tt-test_s1e1")
+    }
+
+    func testUpNextCanFollowFurthestEpisodeOrMostRecentRewatch() {
+        let now = Date()
+        let furthest = WatchProgressRecord(
+            progressKey: "tt-test_s3e5",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:3:5",
+            season: 3,
+            episode: 5,
+            position: 3_000,
+            duration: 3_000,
+            lastWatchedAt: now.addingTimeInterval(-86_400)
+        )
+        let recentRewatch = WatchProgressRecord(
+            progressKey: "tt-test_s1e2",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:2",
+            season: 1,
+            episode: 2,
+            position: 3_000,
+            duration: 3_000,
+            lastWatchedAt: now
+        )
+
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([furthest, recentRewatch]))
+        XCTAssertEqual(
+            WatchProgressLedger.upNextSeeds(preferFurthestEpisode: true).first?.progressKey,
+            furthest.progressKey
+        )
+        XCTAssertEqual(
+            WatchProgressLedger.upNextSeeds(preferFurthestEpisode: false).first?.progressKey,
+            recentRewatch.progressKey
+        )
     }
 
     /// Rows the phone stores without a runtime used to be discarded here, which
@@ -784,6 +879,93 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         XCTAssertEqual(WatchProgressLedger.records().count, 2)
     }
 
+    /// A row deleted on another device reaches this Apple TV only as an absence
+    /// from the account snapshot. The union-only merge could not express that,
+    /// so the deleted title stayed in Continue Watching here forever.
+    func testAccountSnapshotDeletesRowsRemovedOnAnotherDevice() {
+        let kept = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -7_200)
+        )
+        let deletedElsewhere = WatchProgressRecord(
+            progressKey: "tt-test_s1e2",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:2",
+            season: 1,
+            episode: 2,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -3_600)
+        )
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([kept, deletedElsewhere]))
+        XCTAssertEqual(WatchProgressLedger.records().count, 2)
+
+        // The next pull no longer mentions the second row.
+        let outcome = WatchProgressLedger.reconcileRemote([kept], syncStartedAt: Date())
+        XCTAssertTrue(outcome.saved)
+        XCTAssertEqual(outcome.removedKeys, ["tt-test_s1e2"])
+        XCTAssertNil(WatchProgressLedger.record(forKey: "tt-test_s1e2"))
+        XCTAssertNotNil(WatchProgressLedger.record(forKey: "tt-test_s1e1"))
+    }
+
+    /// Absence is only evidence of deletion for rows the server has seen. A row
+    /// written here and not yet pushed is missing from the snapshot for an
+    /// entirely different reason, and discarding it would lose real playback.
+    func testAccountSnapshotKeepsRowsThisDeviceHasNotPushedYet() {
+        let pending = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -60),
+            isPendingPush: true
+        )
+        XCTAssertTrue(WatchProgressLedger.upsert(pending))
+
+        let outcome = WatchProgressLedger.reconcileRemote([], syncStartedAt: Date())
+        XCTAssertTrue(outcome.saved)
+        XCTAssertTrue(outcome.removedKeys.isEmpty)
+        XCTAssertNotNil(
+            WatchProgressLedger.record(forKey: "tt-test_s1e1"),
+            "an unpushed row must survive a snapshot that cannot know about it yet"
+        )
+    }
+
+    /// A zero-row response is indistinguishable from a transient backend or
+    /// profile-routing failure. Preserve the durable local ledger rather than
+    /// making Continue Watching disappear after the delayed account pull.
+    func testEmptyAccountSnapshotKeepsServerKnownRows() {
+        let synced = WatchProgressRecord(
+            progressKey: "tt-test_s1e1",
+            contentId: "tt-test",
+            contentType: "series",
+            videoId: "tt-test:1:1",
+            season: 1,
+            episode: 1,
+            position: 300,
+            duration: 3_000,
+            lastWatchedAt: Date(timeIntervalSinceNow: -7_200)
+        )
+        XCTAssertTrue(WatchProgressLedger.mergeRemote([synced]))
+
+        let outcome = WatchProgressLedger.reconcileRemote([], syncStartedAt: Date())
+        XCTAssertTrue(outcome.saved)
+        XCTAssertTrue(outcome.removedKeys.isEmpty)
+        XCTAssertNotNil(WatchProgressLedger.record(forKey: "tt-test_s1e1"))
+    }
+
     private func makeSeries() -> NuvioMeta {
         NuvioMeta(
             id: "tt-test",
@@ -881,6 +1063,237 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
 
         ContinueWatchingStore.setActiveProfile(profileId)
         XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+    }
+
+    func testUnreleasedPolicyUsesTheFullDateWithinTheCurrentYear() {
+        let future = makeDatedMeta(id: "future", released: "2026-12-01")
+        let past = makeDatedMeta(id: "past", released: "2026-01-01")
+
+        XCTAssertTrue(ContentReleasePolicy.isUnreleased(future, today: "2026-07-26"))
+        XCTAssertFalse(ContentReleasePolicy.isUnreleased(past, today: "2026-07-26"))
+    }
+
+    func testContinueWatchingNextUpSortMovesSuggestionsFirst() {
+        let now = Date()
+        let resume = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "resume", released: "2026-01-01"),
+            streamUrl: "",
+            position: 360,
+            duration: 3_000,
+            lastWatchedAt: now,
+            isUpNext: false
+        )
+        let nextUp = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "next", released: "2025-01-01"),
+            streamUrl: "",
+            position: 1,
+            duration: 3_000,
+            lastWatchedAt: now.addingTimeInterval(-3_600),
+            isUpNext: true
+        )
+
+        let sorted = ContinueWatchingSortPolicy.sorted(
+            [resume, nextUp],
+            preference: "Next up"
+        )
+
+        XCTAssertEqual(sorted.map(\.meta.id), ["next", "resume"])
+    }
+
+    /// A drop that landed while the viewer was away is news.
+    func testUpNextBadgeReadsNewEpisodeWhenTheDropFollowedTheSeedWatch() {
+        let item = makeUpNextItem(released: isoDay(daysAgo: 5), watchedDaysAgo: 30)
+        XCTAssertEqual(item.upNextBadgeText, "NEW EPISODE")
+    }
+
+    /// The regression: an episode already out when the viewer finished the
+    /// previous one is a backlog entry, so it must read "Next Up" even though it
+    /// aired inside the release-alert window.
+    func testUpNextBadgeReadsNextUpWhenTheEpisodeWasOutBeforeTheSeedWatch() {
+        let item = makeUpNextItem(released: isoDay(daysAgo: 40), watchedDaysAgo: 2)
+        XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
+    }
+
+    /// Outside the window nothing is news, whatever the watch history says.
+    func testUpNextBadgeReadsNextUpForAnEpisodeOlderThanTheAlertWindow() {
+        let item = makeUpNextItem(
+            released: isoDay(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
+            watchedDaysAgo: 400
+        )
+        XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
+    }
+
+    /// A drop that opens a later season than the one being watched says so.
+    func testUpNextBadgeReadsNewSeasonWhenTheDropCrossesASeason() {
+        let item = makeUpNextItem(
+            released: isoDay(daysAgo: 5),
+            watchedDaysAgo: 30,
+            season: 3,
+            episode: 1,
+            seedSeason: 2
+        )
+        XCTAssertEqual(item.upNextBadgeText, "NEW SEASON")
+    }
+
+    /// Within a season it stays "New Episode" — the premiere claim needs a real
+    /// rollover, not just an episode 1.
+    func testUpNextBadgeStaysNewEpisodeWithinTheSameSeason() {
+        let item = makeUpNextItem(
+            released: isoDay(daysAgo: 5),
+            watchedDaysAgo: 30,
+            season: 3,
+            episode: 7,
+            seedSeason: 3
+        )
+        XCTAssertEqual(item.upNextBadgeText, "NEW EPISODE")
+    }
+
+    /// A card persisted before the seed season was recorded must not guess at a
+    /// rollover; it falls back to the plain drop badge.
+    func testUpNextBadgeWithoutASeedSeasonDoesNotClaimANewSeason() {
+        let item = makeUpNextItem(released: isoDay(daysAgo: 5), watchedDaysAgo: 30, season: 3, episode: 1)
+        XCTAssertEqual(item.upNextBadgeText, "NEW EPISODE")
+    }
+
+    /// A rollover outside the alert window is not news at all, so it must not
+    /// jump the "New Season" queue either.
+    func testUpNextBadgeDoesNotClaimANewSeasonOutsideTheAlertWindow() {
+        let item = makeUpNextItem(
+            released: isoDay(daysAgo: EpisodeReleasePolicy.newEpisodeWindowDays + 10),
+            watchedDaysAgo: 400,
+            season: 3,
+            episode: 1,
+            seedSeason: 2
+        )
+        XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
+    }
+
+    /// A drop is ordered by its air date, so a show returning today outranks a
+    /// title watched yesterday instead of sinking to the seed's age.
+    func testNewEpisodeDropSortsByItsAirDateRatherThanTheSeedWatch() {
+        let drop = makeUpNextItem(released: isoDay(daysAgo: 1), watchedDaysAgo: 200)
+        let recentlyWatched = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "resume", released: "2026-01-01"),
+            streamUrl: "",
+            position: 600,
+            duration: 3_000,
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 3)
+        )
+
+        let sorted = ContinueWatchingSortPolicy.sorted(
+            [recentlyWatched, drop],
+            preference: "Recently watched"
+        )
+        XCTAssertEqual(sorted.map(\.meta.id), ["series", "resume"])
+    }
+
+    /// The same promotion applies among suggestions, where the up-next-first rule
+    /// cannot be what decides the order.
+    func testNewEpisodeDropOutranksAFresherPlainSuggestion() {
+        let drop = makeUpNextItem(released: isoDay(daysAgo: 1), watchedDaysAgo: 200)
+        let backlog = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "backlog", released: isoDay(daysAgo: 90)),
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 3),
+            season: 1,
+            episode: 4,
+            released: isoDay(daysAgo: 90),
+            isUpNext: true
+        )
+
+        let sorted = ContinueWatchingSortPolicy.sorted([backlog, drop], preference: "Next up")
+        XCTAssertEqual(sorted.map(\.meta.id), ["series", "backlog"])
+    }
+
+    /// Only a drop is promoted: a plain Next Up still sorts on the watch time, or
+    /// every stale suggestion would climb the row on its episode's release date.
+    func testPlainNextUpKeepsSortingByWatchTime() {
+        let backlog = makeUpNextItem(released: isoDay(daysAgo: 10), watchedDaysAgo: 2)
+        XCTAssertEqual(backlog.recencySortDate, backlog.lastWatchedAt)
+    }
+
+    private func makeUpNextItem(
+        released: String,
+        watchedDaysAgo: Int,
+        season: Int = 1,
+        episode: Int = 4,
+        seedSeason: Int? = nil
+    ) -> ContinueWatchingItem {
+        ContinueWatchingItem(
+            meta: makeDatedMeta(id: "series", released: released),
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * Double(watchedDaysAgo)),
+            season: season,
+            episode: episode,
+            released: released,
+            isUpNext: true,
+            upNextSeedSeason: seedSeason
+        )
+    }
+
+    private func isoDay(daysAgo: Int) -> String {
+        let day = Calendar.current.date(byAdding: .day, value: -daysAgo, to: Date()) ?? Date()
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents(in: TimeZone.current, from: day)
+        return String(
+            format: "%04d-%02d-%02d",
+            components.year ?? 2026,
+            components.month ?? 1,
+            components.day ?? 1
+        )
+    }
+
+    func testContinueWatchingReleaseSortUsesExactReleaseDate() {
+        let older = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "older", released: "2026-02-01"),
+            streamUrl: "",
+            position: 100,
+            duration: 1_000,
+            lastWatchedAt: Date()
+        )
+        let newer = ContinueWatchingItem(
+            meta: makeDatedMeta(id: "newer", released: "2026-09-01"),
+            streamUrl: "",
+            position: 100,
+            duration: 1_000,
+            lastWatchedAt: Date().addingTimeInterval(-86_400)
+        )
+
+        let sorted = ContinueWatchingSortPolicy.sorted(
+            [older, newer],
+            preference: "Release order"
+        )
+
+        XCTAssertEqual(sorted.map(\.meta.id), ["newer", "older"])
+    }
+
+    private func makeDatedMeta(id: String, released: String) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: id,
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            type: "movie",
+            year: Int(released.prefix(4)),
+            genres: nil,
+            rating: nil,
+            releaseInfo: released,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: released
+        )
     }
 
     private func makeItem(meta: NuvioMeta, season: Int?, episode: Int?) -> ContinueWatchingItem {

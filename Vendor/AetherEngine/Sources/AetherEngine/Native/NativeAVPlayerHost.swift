@@ -45,6 +45,26 @@ final class NativeAVPlayerHost {
     /// surfaces the failure. Reset on each load.
     @Published private(set) var pendingDisplayRejection: DisplayRejection?
 
+    /// AetherEngine#168: dynamic range read back from the item's parsed video-track CMFormatDescription,
+    /// so the probe-free `nativeRemoteHLS` bypass can report the real format instead of the `.sdr` default.
+    /// nil until a video track resolves (or when none does: the audio-only black-screen symptom). The
+    /// engine's remote-HLS load subscribes and mirrors it into `sourceVideoFormat` / `videoFormat` and, for
+    /// HDR, programs `preferredDisplayCriteria` (the panel switch AVPlayer needs to present HDR at all).
+    @Published private(set) var detectedVideoFormat: VideoFormat?
+
+    /// AetherEngine#168: the same-read nominal frame rate, so the engine's remote-HLS criteria also carry
+    /// Match Frame Rate (the reporter's 4K item is 50 fps). nil when no video track / rate resolves.
+    @Published private(set) var detectedVideoFrameRate: Double?
+
+    /// AetherEngine#168 follow-up: fires once when the armed carriage watchdog concludes the master
+    /// advertises a video rendition but AVPlayer never built a video track past the grace window
+    /// (HEVC-in-MPEG-TS carriage, which AVFoundation's HLS demuxer does not support). The engine's
+    /// remote-HLS load subscribes and reroutes the session onto the loopback live-ingest path.
+    @Published private(set) var remoteHLSVideoCarriageRejected = false
+    /// Set per load; the watchdog itself starts at readyToPlay (a dead origin never reaches it).
+    private var carriageWatchdogArmed = false
+    private var carriageWatchdogTask: Task<Void, Never>?
+
     /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine drives the bounded
     /// retry loop this is true, so a startup failure (`.failed` with any code, including a
     /// display-rejection) is NOT published: the gate polls `awaitStartupReadiness` and decides to
@@ -139,10 +159,11 @@ final class NativeAVPlayerHost {
     /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:]) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.surfaceEndFailures = surfaceEndFailures
+        self.carriageWatchdogArmed = armVideoCarriageWatchdog
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -270,6 +291,13 @@ final class NativeAVPlayerHost {
                         )
                         self.avPlayer.play()
                     }
+                    // #168: publish the item's real dynamic range for the probe-free remote-HLS badge.
+                    await self.publishDetectedVideoFormat(from: item)
+                    // #168 follow-up: watch for an advertised video rendition that never builds a track
+                    // (HEVC-in-MPEG-TS carriage); anchored at readyToPlay so dead origins never arm it.
+                    if self.carriageWatchdogArmed, self.carriageWatchdogTask == nil {
+                        self.startVideoCarriageWatchdog(item: item)
+                    }
                 case .failed:
                     let desc = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
                     self.handleItemFailed(desc, item: item)
@@ -313,6 +341,9 @@ final class NativeAVPlayerHost {
                         Self.dumpAudioRoute(sid: sid, phase: "settled")
                         await Self.warnIfFLACSurroundExceedsRoute(item, sid: sid)
                         await Self.warnIfEAC3SurroundOnStereoRoute(item, sid: sid)
+                        // #168: the video track can be absent from item.tracks at readyToPlay for HLS;
+                        // re-read once playing so the remote-HLS badge settles on the real dynamic range.
+                        await self.publishDetectedVideoFormat(from: item)
                     }
                 }
             }
@@ -592,7 +623,20 @@ final class NativeAVPlayerHost {
             try? await Task.sleep(nanoseconds: tickMs * 1_000_000)
         }
         if let item = playerItem, hasEverPlayed || item.presentationSize != .zero { return .ready }
-        return .timedOut
+        // #169: distinguish an unserved first segment (no media loaded -> still producing over a slow
+        // link, keep waiting) from a served-but-0-tracks master (the cold DV/HDCP decode park).
+        let loaded = playerItem.map { Self.hasLoadedMedia($0.loadedTimeRanges) } ?? false
+        return StartupReadinessGate.timeoutOutcome(hasLoadedMedia: loaded)
+    }
+
+    /// True when the item has any positive-duration loaded range: real media has been served (vs a fresh
+    /// item whose first segment is still being produced). Drives the #169 awaitingData split.
+    nonisolated static func hasLoadedMedia(_ loadedTimeRanges: [NSValue]) -> Bool {
+        for value in loadedTimeRanges {
+            let d = value.timeRangeValue.duration.seconds
+            if d.isFinite && d > 0 { return true }
+        }
+        return false
     }
 
     // MARK: - Playback control
@@ -639,6 +683,69 @@ final class NativeAVPlayerHost {
         return end
     }
 
+    /// Seconds of media buffered *at the pending seek target*, i.e. how much the producer has actually
+    /// served where the seek is trying to land.
+    ///
+    /// Deliberately measures against no playhead. `bufferedEnd` and `avPlayerBufferAheadSeconds()` are both
+    /// measured from `item.currentTime()`, while the deadline loop's frozen position is `renderedTime`;
+    /// during a buffering landing those two legitimately diverge (#123: `currentTime()` is already at the
+    /// target while the rendered frame is still the old one), so any figure derived by subtracting one
+    /// from the other is meaningless in exactly the case the seek-extension logic has to judge. The target
+    /// is an absolute playlist time, so measuring against it needs neither.
+    ///
+    /// Only loaded media inside `[target - tolerance, target + window]` counts, so a *far* backward seek
+    /// cannot count the old position's forward buffer. That window alone is not enough for a *near* one:
+    /// a backward seek of less than `window` leaves the abandoned playhead's buffer sitting inside it, and
+    /// a still-full old buffer would then read as "the producer is serving the target" and buy the seek an
+    /// extension it has not earned. `excludeAtOrAbove` (the frozen playhead, passed by the deadline loop
+    /// for a backward seek only) cuts the window off below it. Note this is an *exclusion* bound, not a
+    /// measurement origin: the reason this function ignores the playhead is that a figure measured *from*
+    /// one is meaningless while `currentTime()` and `renderedTime` diverge, and clamping a range does not
+    /// reintroduce that.
+    func bufferedSecondsAtTarget(
+        _ target: Double,
+        tolerance: Double = 1.0,
+        window: Double = 30.0,
+        excludeAtOrAbove: Double? = nil
+    ) -> Double {
+        guard let item = avPlayer.currentItem else { return 0 }
+        return Self.bufferedSecondsInWindow(
+            ranges: item.loadedTimeRanges.map {
+                let r = $0.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            },
+            target: target,
+            tolerance: tolerance,
+            window: window,
+            excludeAtOrAbove: excludeAtOrAbove)
+    }
+
+    /// Pure part of `bufferedSecondsAtTarget(_:tolerance:window:excludeAtOrAbove:)`: total loaded seconds
+    /// intersecting the target window, with the optional exclusion bound applied.
+    nonisolated static func bufferedSecondsInWindow(
+        ranges: [(start: Double, end: Double)],
+        target: Double,
+        tolerance: Double = 1.0,
+        window: Double = 30.0,
+        excludeAtOrAbove: Double? = nil
+    ) -> Double {
+        guard target.isFinite else { return 0 }
+        let lowerBound = target - tolerance
+        var upperBound = target + window
+        if let excludeAtOrAbove, excludeAtOrAbove.isFinite {
+            upperBound = Swift.min(upperBound, excludeAtOrAbove - tolerance)
+        }
+        guard upperBound > lowerBound else { return 0 }
+        var total = 0.0
+        for range in ranges {
+            guard range.start.isFinite, range.end.isFinite, range.end > range.start else { continue }
+            let lo = Swift.max(range.start, lowerBound)
+            let hi = Swift.min(range.end, upperBound)
+            if hi > lo { total += hi - lo }
+        }
+        return total
+    }
+
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
@@ -649,6 +756,17 @@ final class NativeAVPlayerHost {
     func pause() {
         playIntent = false
         avPlayer.pause()
+    }
+
+    /// Synthesize organic end-of-media when the engine determines a tail park is video-exhaustion
+    /// (AetherEngine#169), not a recoverable stall. Sets the same `didReachEnd` the real
+    /// didPlayToEndTime observer sets, so the engine transitions to `.ended` and the host's
+    /// end-of-playback handling (mark-watched / autoplay-next / dismiss) fires exactly as an organic
+    /// finish. Idempotent, and cleared per load in `unloadCurrentItem`.
+    func markEndOfMediaReached() {
+        guard !didReachEnd else { return }
+        EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) synthesized end-of-media (tail park, #169)", category: .engine)
+        didReachEnd = true
     }
 
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
@@ -716,6 +834,84 @@ final class NativeAVPlayerHost {
         }
     }
 
+    /// DV/SMB forward-seek revert fix: wait longer for the seek already in flight WITHOUT issuing a
+    /// new `avPlayer.seek`. A deadline expiry does not cancel the underlying seek (see `seek(to:deadlineSeconds:)`),
+    /// so it is still progressing toward `target` and its completion (which settles `currentTime` for the
+    /// unchanged generation) can still fire; the engine gave up too early on a slow source. Re-issuing the
+    /// seek would bump the generation and could make AVPlayer re-fetch the target segment it has already
+    /// partly loaded, the opposite of what a starved SMB source needs. This just re-arms the wait and
+    /// re-gates the periodic observer (which the deadline un-gated) so the optimistic clock is not walked
+    /// back to the pre-seek position while the target buffers.
+    ///
+    /// - Returns: `true` once the pending seek has landed (AVPlayer's `currentTime` reached `target`),
+    ///   `false` if it is still pending after `deadlineSeconds` or a newer seek superseded it.
+    func awaitPendingSeekLanding(target seconds: Double, deadlineSeconds: Double, forward: Bool) async -> Bool {
+        // Re-gate: the prior deadline cleared seekInFlight, so the periodic observer would otherwise
+        // publish AVPlayer's still-pre-seek position and un-latch the optimistic clock. The original
+        // seek's completion clears this again when it lands.
+        let gen = seekGeneration
+        // We latch the gate ourselves below so the periodic observer keeps `currentTime` pinned while we
+        // wait. Note the gate is deliberately NOT used as a landing signal: see below.
+        if !seekInFlight { seekInFlight = true }
+        // Poll for landing rather than sleeping the whole window: on a slow extend-path seek AVPlayer can
+        // resume playing partway through the wait, and finalize (which clears the consumer's loading
+        // spinner) must not lag that edge by a full ~4s tick -- that left the spinner up over already-
+        // playing video (device: timeControlStatus=playing at 25360.989 but seek END at 25363.415).
+        // Edge-detect the landing at ~AVPlayer's own 100ms observer cadence so finalize tracks it.
+        //
+        // Poll the published `renderedTime` rather than `avPlayer.currentTime()`: the periodic observer
+        // writes it every 100ms BEFORE the seekInFlight gate, so it is both current and free, whereas
+        // currentTime() is a synchronous XPC read (#134) that this loop would perform ~360 times in a
+        // worst-case seek, on the main actor.
+        let pollInterval = 0.1
+        // Monotonic: a wall-clock step (NTP, user change) must not stretch or truncate the budget.
+        let deadline = DispatchTime.now() + .milliseconds(Int(deadlineSeconds * 1000))
+        while DispatchTime.now() < deadline {
+            do {
+                try await Task.sleep(nanoseconds: UInt64(pollInterval * 1_000_000_000))
+            } catch {
+                // Cancelled. Swallowing this (try?) would turn the loop into an unthrottled MainActor spin
+                // -- Task.sleep then throws instantly every pass -- for the rest of the window.
+                releaseSeekGate()
+                return false
+            }
+            // A newer seek arrived while we waited: let it own the final state.
+            guard gen == seekGeneration else { return false }
+            // Require POSITION evidence. "The completion ran" is deliberately not accepted as a landing:
+            // `reengageStalledConsumer` calls `item.cancelPendingSeeks()` without bumping seekGeneration,
+            // which completes the in-flight seek with finished == false and clears seekInFlight for this
+            // same generation. Treating that as a landing would report the target as reached, retire
+            // `pendingRecoverySeekClockTarget`, and silently lose the seek (#93) while AVPlayer sits
+            // wherever the nudge left it. A genuine landing moves the rendered frame to the target, so
+            // nothing is lost by insisting on it.
+            //
+            // A zero-tolerance seek lands AT the target and a playing item then advances in the seek
+            // direction, so a forward seek can render PAST it. Accept an overshoot in the seek direction;
+            // the pinned pre-seek playhead sits far on the opposite side and is never mistaken for a
+            // landing. This stops a forward overshoot from reading as "still pending" and triggering a
+            // backward-yank re-seek on an already-playing item.
+            let rendered = renderedTime
+            if AetherEngine.seekLandedAtTarget(rendered: rendered, target: seconds, forward: forward) {
+                // The completion may not have run its MainActor job yet; settle so the observer stays gated
+                // until the engine finalizes and mirror what the completion would publish.
+                seekInFlight = false
+                if rendered.isFinite { currentTime = rendered }
+                return true
+            }
+        }
+        // Timed out. Restore the gate to the state the deadline left it in: leaving it latched would keep
+        // the periodic observer from publishing `currentTime`, freezing `host.$currentTime` -- the sole
+        // driver of the engine's clock tick -- for the rest of this generation. On the give-up path this
+        // caller returns immediately afterwards, so nothing else would ever clear it.
+        releaseSeekGate()
+        return false
+    }
+
+    /// Un-gate the periodic observer without asserting a landing (cancellation / give-up paths).
+    private func releaseSeekGate() {
+        seekInFlight = false
+    }
+
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
@@ -761,6 +957,14 @@ final class NativeAVPlayerHost {
         failureMessage = nil
         didReachEnd = false
         didSampleSettledRoute = false
+        // #168: a reused host must not report the prior session's dynamic range before the new item resolves.
+        detectedVideoFormat = nil
+        detectedVideoFrameRate = nil
+        // #168 follow-up: the carriage verdict belongs to the outgoing item.
+        carriageWatchdogTask?.cancel()
+        carriageWatchdogTask = nil
+        carriageWatchdogArmed = false
+        remoteHLSVideoCarriageRejected = false
         // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
         hasEverPlayed = false
         // #93 recovery reload: same content, same position, playback must continue. Skip the
@@ -782,6 +986,8 @@ final class NativeAVPlayerHost {
         renderedTime = 0
         duration = 0
         rate = 0
+        // The AVAudioSession is NOT released here. Teardown ordering is the engine's call, not the host's:
+        // AetherEngine.stopInternal deactivates once every render path is quiesced (#215).
     }
 
     /// Dump asset URL + track FourCCs on .failed and asset.load failure; d9b8aa5 added the asset.load path because item.status never went .failed in DrHurt's P5 MKV session.
@@ -848,6 +1054,84 @@ final class NativeAVPlayerHost {
                 + "enabled=\(itemTrack.isEnabled)\(extra) (readyToPlay)",
                 category: .engine
             )
+        }
+    }
+
+    /// AetherEngine#168 follow-up: after readyToPlay, poll `item.tracks` at a 0.5 s cadence against the
+    /// pure `RemoteHLSIngestFallback.Watchdog`. Advertisement evidence comes from `AVURLAsset.variants`,
+    /// AVFoundation's own already-fetched master-playlist parse, so this adds no origin connect (IPTV
+    /// tokens / WAFs). Publishes `remoteHLSVideoCarriageRejected` once when an advertised video rendition
+    /// never builds an item track (HEVC-in-MPEG-TS carriage); every healthy or judgeless outcome disarms.
+    @MainActor
+    private func startVideoCarriageWatchdog(item: AVPlayerItem) {
+        let sid = sessionID
+        carriageWatchdogTask = Task { @MainActor [weak self] in
+            var watchdog = RemoteHLSIngestFallback.Watchdog()
+            let variants: [AVAssetVariant]
+            if let urlAsset = item.asset as? AVURLAsset {
+                variants = (try? await urlAsset.load(.variants)) ?? []
+            } else {
+                variants = []
+            }
+            let advertises = RemoteHLSIngestFallback.advertisesVideo(
+                variantHasVideoAttributes: variants.map { $0.videoAttributes != nil })
+            while !Task.isCancelled {
+                guard let self, self.playerItem === item else { return }
+                let videoTrackCount = item.tracks.filter { $0.assetTrack?.mediaType == .video }.count
+                switch watchdog.tick(videoTrackCount: videoTrackCount, variantsAdvertiseVideo: advertises) {
+                case .keepWaiting:
+                    break
+                case .disarm:
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) carriage watchdog disarmed "
+                        + "(videoTracks=\(videoTrackCount) advertised=\(advertises.map { "\($0)" } ?? "unknown"))",
+                        category: .engine
+                    )
+                    return
+                case .fire:
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) master advertises video "
+                        + "(\(variants.count) variant(s)) but AVPlayer built no video track after grace; "
+                        + "HEVC-in-MPEG-TS carriage suspected (#168)",
+                        category: .engine
+                    )
+                    self.remoteHLSVideoCarriageRejected = true
+                    return
+                }
+                try? await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+    }
+
+    /// AetherEngine#168: read the item's video-track dynamic range back from AVPlayer's parsed
+    /// CMFormatDescription and publish it, so the probe-free `nativeRemoteHLS` bypass can report the real
+    /// format instead of the `.sdr` default. Called at readyToPlay and again at first `.playing` (an HLS
+    /// video track can be absent from `item.tracks` at the readyToPlay instant). No-op for the item once it
+    /// has been replaced; leaves `detectedVideoFormat` nil while no video track resolves (audio-only black).
+    @MainActor
+    private func publishDetectedVideoFormat(from item: AVPlayerItem) async {
+        guard playerItem === item else { return }
+        for itemTrack in item.tracks {
+            guard let assetTrack = itemTrack.assetTrack, assetTrack.mediaType == .video else { continue }
+            guard let cm = try? await assetTrack.load(.formatDescriptions).first else { continue }
+            let rate = (try? await assetTrack.load(.nominalFrameRate)).map(Double.init)
+            guard playerItem === item else { return }
+            let subType = CMFormatDescriptionGetMediaSubType(cm)
+            let ext = CMFormatDescriptionGetExtensions(cm) as? [String: Any] ?? [:]
+            let transfer = ext[kCMFormatDescriptionExtension_TransferFunction as String] as? String
+            let fmt = RemoteHLSFormatDetection.videoFormat(transferFunction: transfer, videoSubType: subType)
+            // Rate before format: the engine's format sink reads detectedVideoFrameRate when it fires.
+            if let rate, rate > 0 { detectedVideoFrameRate = rate }
+            if detectedVideoFormat != fmt {
+                detectedVideoFormat = fmt
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) remote-HLS videoFormat=\(fmt) "
+                    + "subType='\(fourccString(subType))' transfer=\(transfer ?? "nil") "
+                    + "rate=\(rate.map { String(format: "%.3f", $0) } ?? "nil")",
+                    category: .engine
+                )
+            }
+            return
         }
     }
 

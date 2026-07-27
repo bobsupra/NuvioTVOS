@@ -309,23 +309,23 @@
 
 #include <stdio.h>  /* FILE */
 
-#include <AetherLibavcodec/codec_par.h>
-#include <AetherLibavcodec/defs.h>
-#include <AetherLibavcodec/packet.h>
+#include "AetherLibavcodec/codec_par.h"
+#include "AetherLibavcodec/defs.h"
+#include "AetherLibavcodec/packet.h"
 
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/log.h>
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/log.h"
 
 #include "avio.h"
-#include "version_major.h"
+#include "AetherLibavformat/version_major.h"
 #ifndef HAVE_AV_CONFIG_H
 /* When included as part of the ffmpeg build, only include the major version
  * to avoid unnecessary rebuilds. When included externally, keep including
  * the full version information. */
-#include "version.h"
+#include "AetherLibavformat/version.h"
 
-#include <AetherLibavutil/frame.h>
-#include <AetherLibavcodec/codec.h>
+#include "AetherLibavutil/frame.h"
+#include "AetherLibavcodec/codec.h"
 #endif
 
 struct AVFormatContext;

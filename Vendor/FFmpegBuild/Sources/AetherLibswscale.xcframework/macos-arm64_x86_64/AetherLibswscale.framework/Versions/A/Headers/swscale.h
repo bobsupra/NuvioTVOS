@@ -30,10 +30,10 @@
 
 #include <stdint.h>
 
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/frame.h>
-#include <AetherLibavutil/log.h>
-#include <AetherLibavutil/pixfmt.h>
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/frame.h"
+#include "AetherLibavutil/log.h"
+#include "AetherLibavutil/pixfmt.h"
 #include "version_major.h"
 #ifndef HAVE_AV_CONFIG_H
 /* When included as part of the ffmpeg build, only include the major version

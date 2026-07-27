@@ -25,7 +25,7 @@
 #ifndef AVUTIL_MACROS_H
 #define AVUTIL_MACROS_H
 
-#include "avconfig.h"
+#include "AetherLibavutil/avconfig.h"
 
 #if AV_HAVE_BIGENDIAN
 #   define AV_NE(be, le) (be)

@@ -24,7 +24,7 @@
  * swscale version macros
  */
 
-#include <AetherLibavutil/version.h>
+#include "AetherLibavutil/version.h"
 
 #include "version_major.h"
 

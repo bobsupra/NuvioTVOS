@@ -19,7 +19,7 @@
 #ifndef AVCODEC_AVDCT_H
 #define AVCODEC_AVDCT_H
 
-#include <AetherLibavutil/opt.h>
+#include "AetherLibavutil/opt.h"
 
 /**
  * AVDCT context.

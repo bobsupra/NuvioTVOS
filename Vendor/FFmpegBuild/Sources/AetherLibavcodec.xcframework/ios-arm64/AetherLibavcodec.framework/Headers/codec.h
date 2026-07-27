@@ -23,15 +23,15 @@
 
 #include <stdint.h>
 
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/hwcontext.h>
-#include <AetherLibavutil/log.h>
-#include <AetherLibavutil/pixfmt.h>
-#include <AetherLibavutil/rational.h>
-#include <AetherLibavutil/samplefmt.h>
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/hwcontext.h"
+#include "AetherLibavutil/log.h"
+#include "AetherLibavutil/pixfmt.h"
+#include "AetherLibavutil/rational.h"
+#include "AetherLibavutil/samplefmt.h"
 
-#include "codec_id.h"
-#include "version_major.h"
+#include "AetherLibavcodec/codec_id.h"
+#include "AetherLibavcodec/version_major.h"
 
 /**
  * @addtogroup lavc_core

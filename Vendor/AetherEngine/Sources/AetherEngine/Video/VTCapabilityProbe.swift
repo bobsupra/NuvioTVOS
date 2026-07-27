@@ -30,7 +30,8 @@ enum VTCapabilityProbe {
     /// Callers route `false` to the SoftwarePlaybackHost (libavcodec), which decodes these profiles fine.
     ///
     /// Returns `true` (keep the native path) whenever the format can't be classified (no extradata, Annex-B
-    /// extradata, format-description build failure), so a probe gap never wrongly forces the software path.
+    /// extradata, in-band parameter sets, format-description build failure), so a probe gap never wrongly
+    /// forces the software path.
     /// The throwaway session is invalidated immediately; the whole probe costs well under a millisecond and
     /// runs once per load.
     static func canHardwareDecode(codecpar: UnsafePointer<AVCodecParameters>) -> Bool {
@@ -50,7 +51,16 @@ enum VTCapabilityProbe {
         // with a 0x00 00 (00) 01 start code and can't seed the atom-based format description, so keep native.
         if extradata.pointee == 0x00 { return true }
 
-        let configData = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
+        let configBytes = Array(UnsafeBufferPointer(
+            start: extradata, count: Int(codecpar.pointee.extradata_size)))
+        // In-band parameter sets (`hev1` / `avc1` with an empty config record, what
+        // `MP4Box ...:xps_inband` and the common Dolby-Vision MP4 recipes write): the record parses, so
+        // CMVideoFormatDescriptionCreate succeeds, but VideoToolbox has no SPS to configure a decoder and
+        // fails the session with -4. That says nothing about hardware support, so keep the native path and
+        // let the decoder pick the parameter sets out of the stream (AetherPlayer#2).
+        guard configRecordCarriesParameterSets(configBytes, codecID: codecID) else { return true }
+
+        let configData = Data(configBytes)
         var formatDescription: CMVideoFormatDescription?
         let atoms: NSDictionary = [atomKey: configData]
         let extensions: NSDictionary = [
@@ -93,6 +103,24 @@ enum VTCapabilityProbe {
             category: .engine
         )
         return ok
+    }
+
+    /// True when the avcC / hvcC config record actually carries out-of-band parameter sets, i.e. enough
+    /// for VideoToolbox to build a decoder from the record alone. `false` means "not classifiable from the
+    /// record" (in-band xPS, or a record truncated before the count), never "unsupported".
+    /// hvcC: `numOfArrays` is the 23rd byte. avcC: `numOfSequenceParameterSets` is the low 5 bits of the
+    /// 6th. Other codecs never reach this gate.
+    static func configRecordCarriesParameterSets(_ record: [UInt8], codecID: AVCodecID) -> Bool {
+        switch codecID {
+        case AV_CODEC_ID_HEVC:
+            guard record.count >= 23 else { return false }
+            return record[22] > 0
+        case AV_CODEC_ID_H264:
+            guard record.count >= 6 else { return false }
+            return (record[5] & 0x1F) > 0
+        default:
+            return true
+        }
     }
 
 }

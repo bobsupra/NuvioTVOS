@@ -24,13 +24,13 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <AetherLibavutil/attributes.h>
-#include <AetherLibavutil/buffer.h>
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/rational.h>
-#include <AetherLibavutil/version.h>
+#include "AetherLibavutil/attributes.h"
+#include "AetherLibavutil/buffer.h"
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/rational.h"
+#include "AetherLibavutil/version.h"
 
-#include "version_major.h"
+#include "AetherLibavcodec/version_major.h"
 
 /**
  * @defgroup lavc_packet_side_data AVPacketSideData

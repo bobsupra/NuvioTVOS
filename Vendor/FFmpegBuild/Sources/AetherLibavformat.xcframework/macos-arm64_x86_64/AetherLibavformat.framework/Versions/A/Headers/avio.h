@@ -29,11 +29,11 @@
 #include <stdint.h>
 #include <stdio.h>
 
-#include <AetherLibavutil/attributes.h>
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/log.h>
+#include "AetherLibavutil/attributes.h"
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/log.h"
 
-#include "version_major.h"
+#include "AetherLibavformat/version_major.h"
 
 /**
  * Seeking works like for a local file.

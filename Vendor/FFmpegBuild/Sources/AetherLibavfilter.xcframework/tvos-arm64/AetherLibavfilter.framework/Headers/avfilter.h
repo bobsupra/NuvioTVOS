@@ -37,21 +37,21 @@
 
 #include <stddef.h>
 
-#include <AetherLibavutil/attributes.h>
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/buffer.h>
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/frame.h>
-#include <AetherLibavutil/log.h>
-#include <AetherLibavutil/pixfmt.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/attributes.h"
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/buffer.h"
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/frame.h"
+#include "AetherLibavutil/log.h"
+#include "AetherLibavutil/pixfmt.h"
+#include "AetherLibavutil/rational.h"
 
-#include "version_major.h"
+#include "AetherLibavfilter/version_major.h"
 #ifndef HAVE_AV_CONFIG_H
 /* When included as part of the ffmpeg build, only include the major version
  * to avoid unnecessary rebuilds. When included externally, keep including
  * the full version information. */
-#include "version.h"
+#include "AetherLibavfilter/version.h"
 #endif
 
 /**

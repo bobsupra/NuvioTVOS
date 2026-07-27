@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 5.14.1 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 5.23.3 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
 
 import PackageDescription
 
@@ -13,7 +13,7 @@ let package = Package(
     products: [
         .library(
             name: "AetherEngine",
-            type: .dynamic,
+            type: .static,
             targets: ["AetherEngine"]
         ),
         .library(

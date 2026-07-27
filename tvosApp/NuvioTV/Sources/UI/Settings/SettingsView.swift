@@ -145,6 +145,7 @@ enum SettingsKey {
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
     static let discoverLocation = "nuvio.tv.settings.layout.discoverLocation"
     static let continueWatchingSort = "nuvio.tv.settings.layout.continueWatchingSort"
+    static let upNextFromFurthestEpisode = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
     static let showUnairedNextUp = "nuvio.tv.settings.layout.showUnairedNextUp"
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
@@ -211,7 +212,8 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
-        continueWatchingSort, showUnairedNextUp, hideUnreleased, showFullDates,
+        continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
+        hideUnreleased, showFullDates,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
@@ -665,6 +667,7 @@ struct SettingsView: View {
     let activeProfile: Profile?
     let accountEmail: String?
     let isAuthenticated: Bool
+    let sessionNeedsReauthentication: Bool
     let onChangeProfileName: ((String, String) -> Void)?
     let onChangeProfileAvatar: ((String, String) -> Void)?
     let onChangeProfilePin: ((String, String?, String?) async -> Bool)?
@@ -676,6 +679,7 @@ struct SettingsView: View {
         activeProfile: Profile? = nil,
         accountEmail: String? = nil,
         isAuthenticated: Bool = false,
+        sessionNeedsReauthentication: Bool = false,
         onChangeProfileName: ((String, String) -> Void)? = nil,
         onChangeProfileAvatar: ((String, String) -> Void)? = nil,
         onChangeProfilePin: ((String, String?, String?) async -> Bool)? = nil,
@@ -686,6 +690,7 @@ struct SettingsView: View {
         self.activeProfile = activeProfile
         self.accountEmail = accountEmail
         self.isAuthenticated = isAuthenticated
+        self.sessionNeedsReauthentication = sessionNeedsReauthentication
         self.onChangeProfileName = onChangeProfileName
         self.onChangeProfileAvatar = onChangeProfileAvatar
         self.onChangeProfilePin = onChangeProfilePin
@@ -765,6 +770,12 @@ struct SettingsView: View {
                             .padding(.trailing, 72)
                             .padding(.vertical, 56)
                         }
+                        // Every category shares this one ScrollView, so without a
+                        // per-category identity SwiftUI reuses it and carries the
+                        // previous category's scroll offset into the next one.
+                        // (Subtitles looked right only because it lives in the
+                        // other branch, which is rebuilt on the way in.)
+                        .id(selectedCategory)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -975,6 +986,7 @@ struct SettingsView: View {
                 activeProfile: activeProfile,
                 accountEmail: accountEmail,
                 isAuthenticated: isAuthenticated,
+                sessionNeedsReauthentication: sessionNeedsReauthentication,
                 onChangeProfileName: onChangeProfileName,
                 onChangeProfileAvatar: onChangeProfileAvatar,
                 onChangeProfilePin: onChangeProfilePin,
@@ -1099,6 +1111,7 @@ private struct AccountSettingsView: View {
     let activeProfile: Profile?
     let accountEmail: String?
     let isAuthenticated: Bool
+    let sessionNeedsReauthentication: Bool
     let onChangeProfileName: ((String, String) -> Void)?
     let onChangeProfileAvatar: ((String, String) -> Void)?
     let onChangeProfilePin: ((String, String?, String?) async -> Bool)?
@@ -1112,6 +1125,19 @@ private struct AccountSettingsView: View {
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
     @State private var pinSheetMode: ProfilePinSheetMode?
+
+    private var accountStatusText: String {
+        guard isAuthenticated else {
+            return L10n.string("tvos_account_not_signed_in", fallback: "Not Signed In")
+        }
+        if sessionNeedsReauthentication {
+            return L10n.string(
+                "tvos_account_session_expired",
+                fallback: "Signed In — session expired, sign in again to resume syncing"
+            )
+        }
+        return L10n.string("tvos_account_signed_in", fallback: "Signed In")
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -1217,11 +1243,12 @@ private struct AccountSettingsView: View {
                     fallback: "Account and sync status"
                 )
             ) {
+                // A session the server will no longer renew still reads as
+                // authenticated locally, so "Signed In" would be the one thing
+                // on screen contradicting an account that syncs nothing.
                 SettingsInfoRow(
                     title: L10n.string("tvos_account_status", fallback: "Status"),
-                    value: isAuthenticated
-                        ? L10n.string("tvos_account_signed_in", fallback: "Signed In")
-                        : L10n.string("tvos_account_not_signed_in", fallback: "Not Signed In")
+                    value: accountStatusText
                 )
 
                 if let accountEmail, !accountEmail.isEmpty {
@@ -1675,13 +1702,16 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
+    @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
 
     /// Classic was never a distinct layout (behaved like Modern).
     private let layouts = ["Modern", "Compact", "Grid View"]
-    private let discoverLocations = ["Search", "Home", "Library", "Off"]
+    // Search is the only screen that currently hosts the full Discover surface.
+    // Do not offer Home/Library as dead selections that merely hide Discover.
+    private let discoverLocations = ["Search", "Off"]
     private let continueWatchingSorts = ["Default", "Recently watched", "Release order", "Next up"]
 
     var body: some View {
@@ -1771,6 +1801,11 @@ private struct LayoutDiscoverySettingsView: View {
                     options: discoverLocations,
                     accentColor: accentColor
                 )
+                .onAppear {
+                    if !discoverLocations.contains(discoverLocation) {
+                        discoverLocation = "Search"
+                    }
+                }
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_continue_watching", fallback: "Continue Watching"),
@@ -1780,6 +1815,19 @@ private struct LayoutDiscoverySettingsView: View {
                     ),
                     selection: $continueWatchingSort,
                     options: continueWatchingSorts,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_layout_up_next_furthest",
+                        fallback: "Up Next From Furthest Episode"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_layout_up_next_furthest_subtitle",
+                        fallback: "Show the next episode after the furthest one watched. Turn off for rewatches to follow the most recently watched episode."
+                    ),
+                    isOn: $upNextFromFurthestEpisode,
                     accentColor: accentColor
                 )
 
@@ -1828,7 +1876,7 @@ private struct LayoutDiscoverySettingsView: View {
 private struct HeroCatalogSelectionRow: View {
     @Binding var selectionData: Data
     let accentColor: Color
-    @State private var catalogs: [(id: String, title: String)] = []
+    @State private var catalogs: [TVHomeCatalogOrder.SnapshotRow] = []
 
     private var explicitlySelected: Set<String> {
         guard let ids = try? JSONDecoder().decode([String].self, from: selectionData) else { return [] }
@@ -1898,9 +1946,12 @@ private struct HeroCatalogSelectionRow: View {
     }
 
     private func loadCatalogs() {
+        // A row hidden from Home stays in the snapshot so it can be restored, but
+        // it has no items to draw a hero from — so it is not offered here.
         catalogs = TVHomeCatalogOrder.snapshotRows().filter {
             $0.id != TVHomeSection.continueWatchingId
                 && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
+                && TVHomeCatalogOrder.isRowEnabled($0)
         }
     }
 }
@@ -2699,7 +2750,7 @@ private struct TraktConnectedSettingsSheet: View {
                                 fallback: "Choose where recommendations come from on detail pages"
                             ),
                             selection: moreLikeThisSelection,
-                            options: ["Trakt", "TMDB"],
+                            options: TraktMoreLikeThisSource.allCases.map(\.label),
                             accentColor: accentColor
                         )
                     }
@@ -2852,8 +2903,12 @@ private struct TraktConnectedSettingsSheet: View {
 
     private var moreLikeThisSelection: Binding<String> {
         Binding(
-            get: { viewModel.moreLikeThisSource == .trakt ? "Trakt" : "TMDB" },
-            set: { viewModel.setMoreLikeThisSource($0 == "Trakt" ? .trakt : .tmdb) }
+            get: { viewModel.moreLikeThisSource.label },
+            set: { label in
+                viewModel.setMoreLikeThisSource(
+                    TraktMoreLikeThisSource.allCases.first { $0.label == label } ?? .tmdb
+                )
+            }
         )
     }
 
@@ -3269,6 +3324,13 @@ private struct SimklConnectedSettingsSheet: View {
                                     || viewModel.isTransferringProgress
                             )
 
+                            SettingsChoiceRow(
+                                title: "More Like This",
+                                subtitle: "Choose where recommendations come from on detail pages",
+                                selection: moreLikeThisSelection,
+                                options: TraktMoreLikeThisSource.allCases.map(\.label),
+                                accentColor: accentColor
+                            )
                         }
 
                         SettingsGroup(
@@ -3540,6 +3602,16 @@ private struct SimklConnectedSettingsSheet: View {
                 TraktSettingsStore.markWatchProgressSourceChosenByUser()
                 TraktSettingsStore.watchProgressSource =
                     TraktWatchProgressSource.allCases.first { $0.label == label } ?? .nuvioSync
+            }
+        )
+    }
+
+    private var moreLikeThisSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.moreLikeThisSource.label },
+            set: { label in
+                TraktSettingsStore.moreLikeThisSource =
+                    TraktMoreLikeThisSource.allCases.first { $0.label == label } ?? .tmdb
             }
         )
     }
@@ -4651,6 +4723,15 @@ private struct AdvancedSettingsView: View {
                     accentColor: accentColor
                 )
 
+                // The pull either ran or it did not. Without this, a session the
+                // server rejects looks identical to an account with no history:
+                // both render an empty Continue Watching row.
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_account_sync", fallback: "Account Sync"),
+                    value: NuvioSyncManager.accountSyncDiagnostic,
+                    isDiagnostic: true
+                )
+
                 // Reports how many synced rows arrived versus how many could be
                 // rendered. A large "awaiting metadata" count means add-ons could
                 // not resolve those titles — the history itself is still stored.
@@ -4680,7 +4761,7 @@ private struct AdvancedSettingsView: View {
                     title: L10n.string("tvos_settings_seed_watch_history", fallback: "Seed Test Watch History"),
                     subtitle: L10n.string(
                         "tvos_settings_seed_watch_history_subtitle",
-                        fallback: "Fills Continue Watching from your catalogs to test paging, and uploads it to your account so other devices see it too."
+                        fallback: "Fills Continue Watching from your catalogs to test paging — movies, resuming, Next Up, New Episode, New Season and upcoming cards — and uploads it to your account so other devices see it too."
                     ),
                     value: isSeedingTestHistory ? "Working…" : "Seed",
                     accentColor: accentColor,
@@ -4856,14 +4937,14 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 5.14.1",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/5.14.1 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 5.23.3",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/5.23.3 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(
             id: "aether-ffmpeg",
-            title: "FFmpegBuild 2.1.3 (AetherLib*)",
-            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.1.3 and Vendor/FFmpegBuild.",
+            title: "FFmpegBuild 2.2.0 (AetherLib*)",
+            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.2.0 and Vendor/FFmpegBuild.",
             license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
         ),
         LicenseEntry(
@@ -5004,6 +5085,7 @@ private struct AddonsSettingsSection: View {
                         canMoveUp: index > 0,
                         canMoveDown: index < syncedAddons.count - 1,
                         onEnabledChange: { isEnabled in setAddonEnabled(at: index, isEnabled: isEnabled) },
+                        onDelete: { removeAddon(at: index) },
                         onMove: { up in moveAddon(at: index, up: up) }
                     )
                 }
@@ -5035,6 +5117,15 @@ private struct AddonsSettingsSection: View {
     private func setAddonEnabled(at index: Int, isEnabled: Bool) {
         guard syncedAddons.indices.contains(index) else { return }
         syncedAddons[index].isEnabled = isEnabled
+        persistSyncedAddons()
+    }
+
+    /// Uninstalls the add-on: drops the manifest from the configured list rather
+    /// than disabling it, and pushes the shortened list so the removal reaches
+    /// the account instead of returning on the next pull.
+    private func removeAddon(at index: Int) {
+        guard syncedAddons.indices.contains(index) else { return }
+        syncedAddons.remove(at: index)
         persistSyncedAddons()
     }
 
@@ -5131,6 +5222,10 @@ private struct SyncedAddon: Identifiable {
     var name: String
     var version: String?
     var description: String?
+    /// The add-on's own artwork from its manifest, shown in place of the generic
+    /// sync glyph. Nil until the manifest lands, or when it declares neither a
+    /// logo nor an icon.
+    var logoURL: URL?
     var isEnabled: Bool
 
     var id: String { url.absoluteString }
@@ -5148,6 +5243,7 @@ private struct SyncedAddon: Identifiable {
         }
         version = manifest.version
         description = manifest.description
+        logoURL = manifest.artworkURL(relativeTo: url)
     }
 
     var subtitle: String {
@@ -5160,6 +5256,24 @@ struct StremioManifest: Decodable {
     let name: String?
     let version: String?
     let description: String?
+    /// Stremio manifests carry `logo` (wide/wordmark) and/or `icon` (square).
+    let logo: String?
+    let icon: String?
+
+    /// Absolute artwork URL, preferring the logo. A manifest may give a path
+    /// relative to its own location ("/logo.png"), which has to be resolved
+    /// against the manifest URL or it loads nothing.
+    func artworkURL(relativeTo manifestURL: URL) -> URL? {
+        for candidate in [logo, icon] {
+            guard let raw = candidate?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !raw.isEmpty else { continue }
+            if let absolute = URL(string: raw), absolute.scheme != nil { return absolute }
+            if let resolved = URL(string: raw, relativeTo: manifestURL)?.absoluteURL {
+                return resolved
+            }
+        }
+        return nil
+    }
 
     static func fetch(from manifestURL: URL) async -> StremioManifest? {
         guard let (data, response) = try? await URLSession.shared.data(from: manifestURL),
@@ -5176,6 +5290,7 @@ private struct SyncedAddonSettingsRow: View {
     var canMoveUp: Bool = false
     var canMoveDown: Bool = false
     var onEnabledChange: ((Bool) -> Void)? = nil
+    var onDelete: (() -> Void)? = nil
     /// Called with `true` for up, `false` for down. nil hides the arrows.
     var onMove: ((Bool) -> Void)? = nil
 
@@ -5185,10 +5300,10 @@ private struct SyncedAddonSettingsRow: View {
         HStack(spacing: 14) {
             rowButton
 
-            if let onEnabledChange {
-                AddonReorderButton(systemImage: addon.isEnabled ? "power.circle.fill" : "power.circle", disabled: false) {
-                    onEnabledChange(!addon.isEnabled)
-                }
+            // The row itself toggles active/inactive, so a power button beside it
+            // did the same job twice. Uninstall is what the row could not offer.
+            if let onDelete {
+                AddonReorderButton(systemImage: "trash", disabled: false, action: onDelete)
             }
 
             if let onMove {
@@ -5205,10 +5320,7 @@ private struct SyncedAddonSettingsRow: View {
     private var rowButton: some View {
         Button(action: { onEnabledChange?(!addon.isEnabled) }) {
             SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                Image(systemName: "arrow.triangle.2.circlepath")
-                    .font(.system(size: 26))
-                    .foregroundColor(addon.isEnabled ? accentColor : .white.opacity(0.38))
-                    .frame(width: 48, height: 48)
+                addonArtwork
 
                 VStack(alignment: .leading, spacing: 4) {
                     HStack(spacing: 8) {
@@ -5243,6 +5355,36 @@ private struct SyncedAddonSettingsRow: View {
         .focused($isFocused)
         .focusEffectDisabledIfAvailable()
         .entryLockable()
+    }
+
+    /// The add-on's own logo once its manifest has been read, falling back to the
+    /// sync glyph while that is in flight or for a manifest that ships no
+    /// artwork. Logos are wordmarks as often as square icons, so this fits rather
+    /// than fills — cropping a wordmark to a square makes it unreadable.
+    private var addonArtwork: some View {
+        Group {
+            if let logoURL = addon.logoURL {
+                AsyncImage(url: logoURL) { phase in
+                    if let image = phase.image {
+                        image
+                            .resizable()
+                            .aspectRatio(contentMode: .fit)
+                    } else {
+                        fallbackGlyph
+                    }
+                }
+            } else {
+                fallbackGlyph
+            }
+        }
+        .frame(width: 48, height: 48)
+        .opacity(addon.isEnabled ? 1 : 0.42)
+    }
+
+    private var fallbackGlyph: some View {
+        Image(systemName: "arrow.triangle.2.circlepath")
+            .font(.system(size: 26))
+            .foregroundColor(addon.isEnabled ? accentColor : .white.opacity(0.38))
     }
 }
 
@@ -5281,7 +5423,11 @@ private struct AddonReorderButton: View {
 /// active profile's settings and re-apply to a mounted Home immediately.
 private struct HomeCatalogOrderSection: View {
     let accentColor: Color
-    @State private var rows: [(id: String, title: String)] = []
+    @State private var rows: [TVHomeCatalogOrder.SnapshotRow] = []
+    /// Enabled state per row, read once on appear and updated by the taps here.
+    /// Kept beside `rows` rather than re-read per redraw: each read decodes two
+    /// JSON blobs out of the profile's settings.
+    @State private var enabledByRowId: [String: Bool] = [:]
 
     var body: some View {
         SettingsGroup(title: L10n.string("tvos_settings_home_catalogs", fallback: "Home Catalogs"), subtitle: L10n.string("tvos_settings_controls_catalog_and_collection_row_orde_b7069193", fallback: "Controls catalog and collection row order on Home")) {
@@ -5291,16 +5437,35 @@ private struct HomeCatalogOrderSection: View {
                 ForEach(Array(rows.enumerated()), id: \.element.id) { index, row in
                     HomeCatalogOrderRow(
                         title: row.title,
+                        addonName: row.addonName,
+                        isEnabled: enabledByRowId[row.id] ?? true,
+                        canToggle: row.settingsKey != nil,
                         accentColor: accentColor,
                         canMoveUp: index > 0,
-                        canMoveDown: index < rows.count - 1
-                    ) { up in
-                        move(index, up: up)
-                    }
+                        canMoveDown: index < rows.count - 1,
+                        onToggle: { setEnabled(row, isEnabled: !(enabledByRowId[row.id] ?? true)) },
+                        onMove: { up in move(index, up: up) }
+                    )
                 }
             }
         }
-        .onAppear { rows = TVHomeCatalogOrder.snapshotRows() }
+        .onAppear(perform: reload)
+    }
+
+    private func reload() {
+        rows = TVHomeCatalogOrder.snapshotRows()
+        enabledByRowId = Dictionary(
+            uniqueKeysWithValues: rows.map { ($0.id, TVHomeCatalogOrder.isRowEnabled($0)) }
+        )
+    }
+
+    private func setEnabled(_ row: TVHomeCatalogOrder.SnapshotRow, isEnabled: Bool) {
+        guard row.settingsKey != nil else { return }
+        enabledByRowId[row.id] = isEnabled
+        TVHomeCatalogOrder.setRowEnabled(row, isEnabled: isEnabled)
+        // Home keys its load on this revision, so the row leaves (or comes back
+        // to) the mounted Home instead of waiting for the next launch.
+        NuvioSyncManager.current?.noteHomeCatalogSettingsChangedLocally()
     }
 
     private func move(_ index: Int, up: Bool) {
@@ -5314,31 +5479,46 @@ private struct HomeCatalogOrderSection: View {
 
 private struct HomeCatalogOrderRow: View {
     let title: String
+    let addonName: String?
+    let isEnabled: Bool
+    /// False for a row that is not a catalog (Continue Watching): it stays put
+    /// and reads "Always on" rather than offering a toggle that does nothing.
+    let canToggle: Bool
     let accentColor: Color
     let canMoveUp: Bool
     let canMoveDown: Bool
+    let onToggle: () -> Void
     let onMove: (Bool) -> Void
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         HStack(spacing: 14) {
-            Button(action: {}) {
+            Button(action: onToggle) {
                 SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
-                    Image(systemName: "line.3.horizontal")
-                        .font(.system(size: 24))
-                        .foregroundColor(accentColor)
-                        .frame(width: 48, height: 48)
-
-                    Text(title)
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(title)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(isEnabled ? .white : .white.opacity(0.46))
+                            .lineLimit(1)
+                        if let addonName, !addonName.isEmpty {
+                            Text(addonName)
+                                .font(.system(size: 16, weight: .medium))
+                                .foregroundColor(.white.opacity(isEnabled ? 0.56 : 0.36))
+                                .lineLimit(1)
+                        }
+                    }
 
                     Spacer(minLength: 20)
+
+                    Text(statusText)
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(statusColor)
+                        .lineLimit(1)
                 }
             }
             .buttonStyle(PosterCardButtonStyle())
+            .disabled(!canToggle)
             .focused($isFocused)
             .focusEffectDisabledIfAvailable()
             .entryLockable()
@@ -5346,6 +5526,20 @@ private struct HomeCatalogOrderRow: View {
             AddonReorderButton(systemImage: "chevron.up", disabled: !canMoveUp) { onMove(true) }
             AddonReorderButton(systemImage: "chevron.down", disabled: !canMoveDown) { onMove(false) }
         }
+    }
+
+    private var statusText: String {
+        guard canToggle else {
+            return L10n.string("tvos_settings_row_always_on", fallback: "Always on")
+        }
+        return isEnabled
+            ? L10n.string("settings_fusion_badge_url_active", fallback: "Active")
+            : L10n.string("tvos_settings_disabled", fallback: "Disabled")
+    }
+
+    private var statusColor: Color {
+        guard canToggle else { return .white.opacity(0.42) }
+        return isEnabled ? .white.opacity(0.7) : .white.opacity(0.42)
     }
 }
 

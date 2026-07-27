@@ -694,6 +694,9 @@ public class ProfileViewModel: ObservableObject {
             WatchedStore.setActiveProfile(profile?.id)
             CollectionsStore.setActiveProfile(profile?.id)
             ProfileSettings.setActiveProfile(profile?.id)
+            // Before anything else can write: an oversized preferences
+            // plist aborts the process on the next unrelated set.
+            SimklSyncCache.purgeLegacyPreferenceBlobs(in: ProfileSettings.current)
             self.activeProfile = profile
             return
         }
@@ -705,6 +708,9 @@ public class ProfileViewModel: ObservableObject {
             WatchedStore.setActiveProfile(profile?.id)
             CollectionsStore.setActiveProfile(profile?.id)
             ProfileSettings.setActiveProfile(profile?.id)
+            // Before anything else can write: an oversized preferences
+            // plist aborts the process on the next unrelated set.
+            SimklSyncCache.purgeLegacyPreferenceBlobs(in: ProfileSettings.current)
             self.activeProfile = profile
         } catch {
             print("Failed to load active profile: \(error)")
@@ -947,6 +953,9 @@ public class ProfileViewModel: ObservableObject {
         WatchedStore.setActiveProfile(profile?.id)
         CollectionsStore.setActiveProfile(profile?.id)
         ProfileSettings.setActiveProfile(profile?.id)
+        // Before anything else can write: an oversized preferences
+        // plist aborts the process on the next unrelated set.
+        SimklSyncCache.purgeLegacyPreferenceBlobs(in: ProfileSettings.current)
         activeProfile = profile
 
         guard profiles == remoteProfiles, let profile else { return false }

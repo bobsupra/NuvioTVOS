@@ -55,4 +55,25 @@ struct SubtitleOverlayDrainerTests {
                                                     lead: 60, backscan: 15, jumpThreshold: 2.5)
         #expect(plan == .idle)
     }
+
+    // #143/#204: after the drain window decodes, a still-active reconstruction pass with a seeded
+    // candidate has no renderable successor to end it. Raw packets ahead may be zero-object clears.
+
+    @Test("reconstruction with a seeded candidate should finalize after the window decodes")
+    func finalizeWithCandidate() {
+        #expect(SubtitleOverlayDrainer.shouldFinalizeReconstruction(
+            reconstructing: true, hasCandidate: true))
+    }
+
+    @Test("finalize needs a seeded candidate: a true gap with nothing behind ends nothing")
+    func noFinalizeWithoutCandidate() {
+        #expect(!SubtitleOverlayDrainer.shouldFinalizeReconstruction(
+            reconstructing: true, hasCandidate: false))
+    }
+
+    @Test("finalize only applies inside a reconstruction pass")
+    func noFinalizeOutsideReconstruction() {
+        #expect(!SubtitleOverlayDrainer.shouldFinalizeReconstruction(
+            reconstructing: false, hasCandidate: true))
+    }
 }

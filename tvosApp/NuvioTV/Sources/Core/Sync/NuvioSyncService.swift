@@ -54,6 +54,18 @@ final class NuvioSyncManager: ObservableObject {
     private var pushTask: Task<Void, Never>?
     private var profileSelectionRefreshTask: Task<Void, Never>?
     private var completedInitialPullKeys: Set<String> = []
+    /// When each account+profile last finished a pull, so a screen re-entry can
+    /// tell "the user came back" from "the data is old".
+    private var lastCompletedPullAt: [String: Date] = [:]
+    /// Mirrors the Android client's force-resync floor. Short enough that a
+    /// change made on a phone shows up on the next screen change, long enough
+    /// that walking between tabs costs nothing.
+    private static let minimumRefreshInterval: TimeInterval = 30
+    /// Which account+profile the in-flight pull belongs to, so a request for the
+    /// same one can queue while a request for a different one still preempts it.
+    private var activePullKey: String?
+    /// A refresh that arrived while a pull was running, replayed on completion.
+    private var pendingResyncRequested = false
     private var automaticAccountPullRetryCount = 0
     /// Identifies the pull that currently owns `pullTask` and the post-login
     /// loading gate. A cancelled pull can unwind after its replacement starts;
@@ -177,6 +189,14 @@ final class NuvioSyncManager: ObservableObject {
         authStateChanged(authManager.authState)
     }
 
+    /// Bumps the Home catalog input version after a local change to which rows
+    /// Home shows (Settings → Home Catalogs). Home keys its load on this
+    /// revision, so a hidden row disappears — and a restored one is fetched
+    /// again — without waiting for an account pull to publish the same change.
+    func noteHomeCatalogSettingsChangedLocally() {
+        homeCatalogRevision &+= 1
+    }
+
     func authStateChanged(_ state: AuthState) {
         switch state {
         case let .fullAccount(userId, _):
@@ -215,6 +235,9 @@ final class NuvioSyncManager: ObservableObject {
             profileSelectionRefreshTask?.cancel()
             profileSelectionRefreshTask = nil
             completedInitialPullKeys.removeAll()
+            lastCompletedPullAt.removeAll()
+            activePullKey = nil
+            pendingResyncRequested = false
             observedAuthUserId = nil
             observedActiveProfileId = nil
             isPullingAccountProfiles = false
@@ -237,12 +260,32 @@ final class NuvioSyncManager: ObservableObject {
         schedulePull()
     }
 
-    /// Refresh cross-device changes whenever tvOS returns to the foreground.
+    /// Re-reads the account so changes made on another device land here.
+    ///
+    /// Called when tvOS returns to the foreground, and whenever Home re-reads
+    /// Continue Watching. Home renders that row straight from the local ledger
+    /// when Nuvio Sync owns progress — unlike Trakt and Simkl, which re-fetch
+    /// from the provider on every refresh — so without this the row showed
+    /// whatever the last pull left behind, and a title deleted elsewhere stayed
+    /// until the app was backgrounded or the profile switched.
+    ///
     /// Startup already owns its initial pull, so only refresh an account/profile
-    /// whose bootstrap completed and never replace an in-flight pull.
-    func refreshAccountFromForeground() {
+    /// whose bootstrap completed, and never replace an in-flight pull.
+    ///
+    /// Rate-limited per account+profile, matching the Android client's
+    /// `FORCE_RESYNC_MIN_INTERVAL_MS`. Returning to Home is a hint that the row
+    /// may be stale, not an instruction to re-download the account: every
+    /// landing used to pull profiles, settings, library, watched and progress
+    /// again, which is seconds of work for data that had not changed. Inside the
+    /// window the row keeps rendering from the local ledger, which a local edit
+    /// updates immediately anyway.
+    func refreshAccountIfIdle() {
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
         guard pullTask == nil else { return }
+        if let lastPulledAt = lastCompletedPullAt[key],
+           Date().timeIntervalSince(lastPulledAt) < Self.minimumRefreshInterval {
+            return
+        }
         schedulePull(force: true)
     }
 
@@ -263,6 +306,16 @@ final class NuvioSyncManager: ObservableObject {
         // A delayed snapshot captured the previous profile and must not resume
         // by reading the newly-active profile's global stores.
         pushTask?.cancel()
+
+        // A profile the account has already pulled this session has all its data
+        // on disk, so switching to it is a local operation — the Android client
+        // does no network work on a switch at all. Only a profile this session
+        // has never seen needs its snapshot before it can render; everything
+        // else refreshes on the ordinary schedule, off the critical path.
+        if let key = currentSyncKey(), completedInitialPullKeys.contains(key) {
+            refreshAccountIfIdle()
+            return
+        }
         schedulePull(force: true)
     }
 
@@ -527,10 +580,22 @@ final class NuvioSyncManager: ObservableObject {
         }
         if !force, pullTask != nil { return }
 
+        // A forced pull for the account+profile already being pulled queues
+        // instead of replacing it, mirroring the Android client. Cancelling
+        // mid-pull tears down a sync that may be between a network read and its
+        // local apply, and the replacement then re-downloads what the cancelled
+        // one had already fetched. A pull for a *different* key still cancels:
+        // that data belongs to a profile the user has left.
+        if force, pullTask != nil, activePullKey == currentSyncKey() {
+            pendingResyncRequested = true
+            return
+        }
+
         pullGeneration &+= 1
         let generation = pullGeneration
         automaticAccountPullRetryCount = 0
         pullTask?.cancel()
+        activePullKey = currentSyncKey()
         pullTask = Task { @MainActor [weak self] in
             if !force {
                 try? await Task.sleep(nanoseconds: 500_000_000)
@@ -551,7 +616,15 @@ final class NuvioSyncManager: ObservableObject {
     private func finishPull(generation: UInt) {
         guard generation == pullGeneration else { return }
         pullTask = nil
+        activePullKey = nil
         isPullingAccountProfiles = false
+        // A request that arrived mid-pull was deferred rather than dropped, so
+        // honour it now — but through the same floor, so a burst of screen
+        // changes still collapses into one refresh.
+        if pendingResyncRequested {
+            pendingResyncRequested = false
+            refreshAccountIfIdle()
+        }
     }
 
     /// Session and remote profile id for a one-off account write, or nil when the
@@ -674,6 +747,9 @@ final class NuvioSyncManager: ObservableObject {
 
             guard let session = await authManager.validSessionForSync(validateWithServer: true) else {
                 lastError = AuthError(message: "The account session could not be restored.")
+                // Retrying a session the server has already refused only spends
+                // the backoff and ends on the same failure.
+                if authManager.sessionNeedsReauthentication { break }
                 continue
             }
 
@@ -689,16 +765,25 @@ final class NuvioSyncManager: ObservableObject {
                 throw CancellationError()
             } catch let error as AuthError {
                 lastError = error
-                if error.statusCode == 401 {
+                if error.statusCode == 401 || error.statusCode == 403 {
                     _ = await authManager.refreshSessionForSync()
+                    if authManager.sessionNeedsReauthentication { break }
                 }
             } catch {
                 lastError = error
             }
         }
 
+        if authManager.sessionNeedsReauthentication {
+            throw AuthError(message: Self.reauthenticationMessage)
+        }
         throw lastError
     }
+
+    /// One wording for the state where the account is still configured on this
+    /// Apple TV but its session can no longer be renewed.
+    static let reauthenticationMessage =
+        "Your Nuvio session expired. Sign in again to resume syncing."
 
     private func pullThenPush(generation: UInt) async {
         // Release the who's-watching sync gate on every exit path; the happy
@@ -875,13 +960,30 @@ final class NuvioSyncManager: ObservableObject {
             }
 
             do {
+                // Captured before the request: rows written while it is in
+                // flight are not absent because someone deleted them.
+                let progressPullStartedAt = Date()
                 let remoteProgress = try await client.pullWatchProgress(
                     session: session,
                     remoteProfileId: remoteProfileId
                 )
                 try ensureStillSyncing(profileId: activeProfile.id)
-                guard WatchProgressLedger.mergeRemote(remoteProgress) else {
+                // Authoritative, deletions included. The account is this
+                // backend's source of truth, and a row deleted on another
+                // device reaches us only as an absence from the snapshot.
+                let progressReconcile = WatchProgressLedger.reconcileRemote(
+                    remoteProgress,
+                    syncStartedAt: progressPullStartedAt
+                )
+                guard progressReconcile.saved else {
                     throw AuthError(message: "Watch progress could not be saved on this Apple TV.")
+                }
+                if !progressReconcile.removedKeys.isEmpty,
+                   WatchProgressLedger.records().isEmpty {
+                    // The rebuild below returns early on an empty ledger without
+                    // replacing the derived rows, which would leave the card for
+                    // the title that was just deleted on screen.
+                    ContinueWatchingStore.replaceAll([])
                 }
                 // Rendering is a separate, retryable pass: the rows are already
                 // durable, so a slow or failing metadata lookup can no longer
@@ -937,6 +1039,9 @@ final class NuvioSyncManager: ObservableObject {
             guard !pullWasIncomplete else { return }
             if let key = currentSyncKey() {
                 completedInitialPullKeys.insert(key)
+                // Only a complete pull arms the refresh floor; a partial one has
+                // to stay re-pullable.
+                lastCompletedPullAt[key] = Date()
             }
             await pushLocalSnapshots()
         } catch is CancellationError {
@@ -948,6 +1053,14 @@ final class NuvioSyncManager: ObservableObject {
             guard generation == pullGeneration else { return }
             isApplyingRemoteProfiles = false
             isApplyingRemote = false
+            // "JWT expired" on every request is not a sync failure to retry —
+            // it is a session the user has to renew, and saying so is the only
+            // way an account that syncs nothing stops looking like an empty one.
+            if authManager.sessionNeedsReauthentication {
+                Self.accountSyncDiagnostic = "session expired — sign in again"
+                print("Nuvio sync stopped: \(Self.reauthenticationMessage)")
+                return
+            }
             Self.accountSyncDiagnostic = "failed: \(error.localizedDescription)"
             print("Nuvio sync failed: \(error.localizedDescription)")
             // Keep profile recovery inside this same login-owned task. Running

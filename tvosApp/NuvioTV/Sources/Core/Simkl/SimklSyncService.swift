@@ -337,6 +337,34 @@ enum SimklSyncCache {
     private static let historyActivityKey = "nuvio.tv.simkl.sync.history.activities"
     private static let playbackCacheKey = "nuvio.tv.simkl.sync.playback"
     private static let playbackWatermarkKey = "nuvio.tv.simkl.sync.playback.watermark"
+    private static let storageDirectoryName = "SimklSyncCache"
+
+    /// Removes cache blobs earlier builds wrote into preferences.
+    ///
+    /// Lazy migration in ``encode(_:key:store:)`` is not enough on a device that
+    /// is already over the limit: the next unrelated `UserDefaults` write aborts
+    /// the process before the Simkl cache is ever touched. This has to run at
+    /// startup, before anything else writes. Removing keys only shrinks the
+    /// plist, so it is safe even at the edge.
+    static func purgeLegacyPreferenceBlobs(in store: UserDefaults) {
+        let retired = [
+            itemCacheKey, historyCacheKey, playbackCacheKey,
+            // Pre-v2 names, which the key rename orphaned.
+            "nuvio.tv.simkl.sync.items",
+            "nuvio.tv.simkl.sync.history",
+            "nuvio.tv.simkl.sync.items.activities"
+        ]
+        for key in retired where store.object(forKey: key) != nil {
+            store.removeObject(forKey: key)
+        }
+    }
+
+    /// Sign-out cleanup. These caches used to live in the per-profile settings
+    /// suite, so removing that suite took them with it. They are files now and
+    /// have to be dropped explicitly or the next account inherits them.
+    static func eraseAll() {
+        LargePayloadStore.removeDirectory(storageDirectoryName)
+    }
 
     static func items(in store: UserDefaults) -> SimklAllItemsResponse? {
         decode(SimklAllItemsResponse.self, key: itemCacheKey, store: store)
@@ -518,10 +546,37 @@ enum SimklSyncCache {
         ].joined(separator: ":")
     }
 
+    /// These blobs are far too large for `UserDefaults`.
+    ///
+    /// tvOS aborts the process outright once an app's preferences exceed its
+    /// limit — `__CFPREFERENCES_HAS_DETECTED_THIS_APP_TRYING_TO_STORE_TOO_MUCH_DATA__`,
+    /// a `SIGABRT` with nothing to catch. The history cache carries a full
+    /// `NuvioMeta` per watched episode, so a real account reaches megabytes.
+    /// `WatchedStore` moved to files for exactly this reason; this is the same
+    /// treatment. Small scalars (watermarks, activity timestamps) stay in
+    /// `UserDefaults`, which is what it is for.
     private static func encode<T: Encodable>(_ value: T, key: String, store: UserDefaults) {
-        if let data = try? JSONEncoder().encode(value) {
-            store.set(data, forKey: key)
+        guard let data = try? JSONEncoder().encode(value) else { return }
+        guard LargePayloadStore.write(
+            data,
+            key: scopedKey(key),
+            directory: storageDirectoryName
+        ) else {
+            // Deliberately no preferences fallback. Losing the cache costs one
+            // full re-pull on the next sync; writing a payload this size to
+            // preferences is the abort this whole path exists to avoid.
+            return
         }
+        // An older build's copy would otherwise keep counting against the
+        // preferences budget forever.
+        store.removeObject(forKey: key)
+    }
+
+    /// Profile-scoped: the `UserDefaults` key is shared across profiles and only
+    /// the suite differed, so the filename has to carry the scope instead. Uses
+    /// the same scope Simkl's session helpers already key on.
+    private static func scopedKey(_ key: String) -> String {
+        "\(key).\(SimklRuntimeSession.profileScope())"
     }
 
     private static func decode<T: Decodable>(
@@ -529,6 +584,14 @@ enum SimklSyncCache {
         key: String,
         store: UserDefaults
     ) -> T? {
+        if let data = LargePayloadStore.read(
+            key: scopedKey(key),
+            directory: storageDirectoryName
+        ) {
+            return try? JSONDecoder().decode(type, from: data)
+        }
+        // Written by a build that still used preferences: read it once — the
+        // next `encode` moves it to a file and clears the key.
         guard let data = store.data(forKey: key) else { return nil }
         return try? JSONDecoder().decode(type, from: data)
     }
@@ -590,6 +653,23 @@ private struct SimklAuthorizedClient {
         body: B
     ) async throws -> Int {
         try await postReturningBody(path: path, query: query, body: body).status
+    }
+
+    func delete(path: String, query: [URLQueryItem] = []) async throws -> Int {
+        let result = try await client.delete(
+            path: path,
+            clientID: clientID,
+            accessToken: token,
+            queryItems: query
+        )
+        if result.statusCode == 401 {
+            SimklAuthStore.clearAuth(
+                profileScope: profileScope,
+                store: store,
+                tokenStorage: tokenStorage
+            )
+        }
+        return result.statusCode
     }
 
     /// `/sync/history` always answers 201, even when it resolved nothing, and
@@ -744,6 +824,31 @@ struct SimklHistoryService {
         tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
         profileScope: String? = nil
     ) async -> Bool {
+        await setWatched(
+            meta,
+            season: season,
+            episodes: episode.map { [$0] } ?? [],
+            isWatched: isWatched,
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        )
+    }
+
+    /// Season-wide counterpart: one `sync/history` write for every episode
+    /// listed, because Simkl serialises writes behind a 20-second per-user lock
+    /// and a season sent one episode at a time would spend minutes in it.
+    static func setWatched(
+        _ meta: NuvioMeta,
+        season: Int?,
+        episodes: [Int],
+        isWatched: Bool,
+        store: UserDefaults = ProfileSettings.current,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
+    ) async -> Bool {
         guard let service = SimklAuthorizedClient(
             store: store,
             client: client,
@@ -756,11 +861,11 @@ struct SimklHistoryService {
             body = historyMutation(
                 meta: meta,
                 season: season,
-                episode: episode,
+                episodes: episodes,
                 watchedAt: iso8601(Date())
             )
         } else {
-            body = historyRemoval(meta: meta, season: season, episode: episode, store: store)
+            body = historyRemoval(meta: meta, season: season, episodes: episodes, store: store)
         }
         guard let body else { return false }
 
@@ -770,6 +875,10 @@ struct SimklHistoryService {
                 body: body
             )
             guard (200..<300).contains(status) else { return false }
+            // A mark does not move Simkl's *playback* watermark, so the cached
+            // paused list would keep serving this episode's old position for as
+            // long as it stayed valid. Force the next fetch to re-read it.
+            SimklSyncCache.invalidatePlaybacks(in: store)
             NotificationCenter.default.post(
                 name: TraktSettingsStore.continueWatchingChangedNotification,
                 object: nil
@@ -910,7 +1019,7 @@ struct SimklHistoryTransferService {
             historyMutation(
                 meta: item.meta,
                 season: item.season,
-                episode: item.episode,
+                episodes: item.episode.map { [$0] } ?? [],
                 watchedAt: iso8601(item.watchedAt)
             )
         }
@@ -1598,6 +1707,14 @@ struct SimklProgressService {
             SimklSyncCache.savePlaybacks(fetched, watermark: watermark, store: store)
         }
 
+        // Simkl keeps a paused row until its own rules retire it (an 80%
+        // `scrobble/stop`), and marking an episode watched writes history
+        // without touching it. Judged here against the local marks, newest
+        // wins — the same rule `ContinueWatchingStore.removeWatched` applies to
+        // local rows, so a re-watch started after the mark still comes back.
+        // Read once: `visibleItems()` decodes the watched file on every call.
+        let watchedDates = WatchedStore.newestWatchedDatesByIdentity(WatchedStore.visibleItems())
+
         var results: [ContinueWatchingItem] = []
         for playback in playbacks.sorted(by: {
             (parseDate($0.pausedAt) ?? .distantPast) > (parseDate($1.pausedAt) ?? .distantPast)
@@ -1611,6 +1728,13 @@ struct SimklProgressService {
                   progress > 0, progress < 90,
                   let seed = progressSeed(playback),
                   let placeholder = placeholderMeta(item: seed.item, type: seed.type) else { continue }
+            // Checked before metadata resolution so a retired row costs nothing.
+            guard !isRetiredByWatchedMark(
+                playback,
+                meta: placeholder,
+                type: seed.type,
+                watchedDates: watchedDates
+            ) else { continue }
             let meta = (try? await repository.getMetadata(id: placeholder.id, type: seed.type))
                 ?? placeholder
             let duration = runtimeSeconds(meta.runtime) ?? 100
@@ -1720,6 +1844,103 @@ struct SimklProgressService {
             scrobbleDiagnostic = "\(action.rawValue) \(meta.id) failed: \(error.localizedDescription)"
             print("Simkl scrobble \(action.rawValue) failed for \(meta.id): \(error.localizedDescription)")
             return false
+        }
+    }
+
+    /// Deletes the account-side paused row behind a Continue Watching card.
+    ///
+    /// Removing a card only writes a local dismiss record, which hides it on
+    /// this device alone — the row belongs to the Simkl account, so every other
+    /// client keeps showing it. `DELETE /sync/playback/{id}` retires it for
+    /// real; the id comes from the same playback list the card was built from.
+    ///
+    /// Scoped to the episode the card was showing, matching the dismiss record:
+    /// a different paused episode of the same show is its own card and is not
+    /// what the user removed.
+    @discardableResult
+    static func removePlayback(
+        for item: ContinueWatchingItem,
+        store: UserDefaults = ProfileSettings.current,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
+    ) async -> Bool {
+        guard TraktSettingsStore.watchProgressSource(in: store) == .simkl else { return false }
+        guard let service = SimklAuthorizedClient(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ) else { return false }
+
+        // The cache is what the removed card was rendered from, so it names the
+        // right row without another round trip. Re-read only when it is gone.
+        let playbacks: [SimklPlaybackDTO]
+        if let cached = SimklSyncCache.playbacks(in: store), !cached.isEmpty {
+            playbacks = cached
+        } else if let fetched = try? await service.get(
+            [SimklPlaybackDTO].self,
+            path: "sync/playback"
+        ) {
+            playbacks = fetched
+        } else {
+            return false
+        }
+
+        let targets = playbacks.filter { playbackMatches($0, card: item) }
+        guard !targets.isEmpty else { return false }
+
+        var removedAny = false
+        for id in targets.compactMap(\.id) {
+            guard let status = try? await service.delete(path: "sync/playback/\(id)"),
+                  (200..<300).contains(status) else { continue }
+            removedAny = true
+        }
+        guard removedAny else { return false }
+
+        SimklSyncCache.invalidatePlaybacks(in: store)
+        NotificationCenter.default.post(
+            name: TraktSettingsStore.continueWatchingChangedNotification,
+            object: nil
+        )
+        return true
+    }
+
+    static func playbackMatches(_ playback: SimklPlaybackDTO, card: ContinueWatchingItem) -> Bool {
+        guard let seed = progressSeed(playback),
+              let meta = placeholderMeta(item: seed.item, type: seed.type),
+              WatchedStore.sameContent(meta, card.meta) else { return false }
+        // A card that never named its episode cannot be narrowed any further;
+        // removing every paused row for the title is what the user asked for.
+        guard let season = card.season, let episode = card.episode else { return true }
+        return playback.episode?.season == season
+            && playback.episode?.resolvedNumber == episode
+    }
+
+    /// Whether a watched mark supersedes this paused row.
+    ///
+    /// `watchedDates` is keyed by content identity, so a row Simkl returns
+    /// under a different id space than the mark was written with still matches.
+    /// A row Simkl never dated is treated as older than any mark: without a
+    /// timestamp there is nothing to argue it happened after one.
+    static func isRetiredByWatchedMark(
+        _ playback: SimklPlaybackDTO,
+        meta: NuvioMeta,
+        type: String,
+        watchedDates: [String: Date]
+    ) -> Bool {
+        let pausedAt = parseDate(playback.pausedAt) ?? .distantPast
+        let keys = WatchedStore.watchedIdentityKeys(
+            metaId: meta.id,
+            imdbId: meta.imdbId,
+            tmdbId: meta.tmdbId,
+            contentType: type,
+            season: playback.episode?.season,
+            episode: playback.episode?.resolvedNumber
+        )
+        return keys.contains { key in
+            guard let watchedAt = watchedDates[key] else { return false }
+            return watchedAt >= pausedAt
         }
     }
 
@@ -1853,21 +2074,23 @@ private func syncMedia(_ meta: NuvioMeta, to: String?) -> SimklWriteMedia? {
     )
 }
 
+/// `episodes` carries every episode being marked in one season, so a whole
+/// season is one request rather than one per episode.
 private func historyMutation(
     meta: NuvioMeta,
     season: Int?,
-    episode: Int?,
+    episodes: [Int],
     watchedAt: String?
 ) -> SimklHistoryMutation? {
     guard let ids = simklIDs(meta) else {
         return nil
     }
     let seasons: [SimklWriteSeason]?
-    if meta.isSeries, let season, let episode {
+    if meta.isSeries, let season, !episodes.isEmpty {
         seasons = [
             SimklWriteSeason(
                 number: season,
-                episodes: [SimklWriteEpisode(number: episode, watchedAt: watchedAt)]
+                episodes: episodes.map { SimklWriteEpisode(number: $0, watchedAt: watchedAt) }
             )
         ]
     } else {
@@ -1900,7 +2123,7 @@ private func historyMutation(
 private func historyRemoval(
     meta: NuvioMeta,
     season: Int?,
-    episode: Int?,
+    episodes: [Int],
     store: UserDefaults
 ) -> SimklHistoryMutation? {
     guard let ids = simklIDs(meta) else { return nil }
@@ -1920,14 +2143,14 @@ private func historyRemoval(
         return SimklHistoryMutation(movies: [media(nil)], shows: nil)
     }
 
-    if let season, let episode {
+    if let season, !episodes.isEmpty {
         return SimklHistoryMutation(
             movies: nil,
             shows: [
                 media([
                     SimklWriteSeason(
                         number: season,
-                        episodes: [SimklWriteEpisode(number: episode, watchedAt: nil)]
+                        episodes: episodes.map { SimklWriteEpisode(number: $0, watchedAt: nil) }
                     )
                 ])
             ]

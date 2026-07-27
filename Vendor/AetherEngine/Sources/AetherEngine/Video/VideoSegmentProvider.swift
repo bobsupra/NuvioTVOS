@@ -37,6 +37,97 @@ struct LiveWindowSizing {
     }
 }
 
+// MARK: - Live-edge holdback policy
+
+/// Couples the served `#EXT-X-TARGETDURATION` / `HOLD-BACK` to the startup cushion so they can never
+/// drift. AVPlayer's default live-edge holdback (absent an explicit `HOLD-BACK`) is `3 x TARGETDURATION`:
+/// it wants to play that far behind the live edge. When the served window holds LESS than that behind the
+/// edge, AVPlayer restarts inside its own stall-danger zone and spams
+/// `-16832 restarting Ns from end of live playlist; target duration Ts - stall danger`, rebuffering until
+/// the window naturally deepens (AE#189: long-GOP HEVC-in-TS, 5.76s segments -> TD=6 -> 18s holdback, but
+/// the fixed 2-segment cushion only built ~9.6s). Both the served playlist
+/// (`HLSLocalServer.buildMediaPlaylistText`) and the startup gate (`waitForFirstLiveSegment`) derive
+/// TARGETDURATION here, so the depth the cushion builds to is exactly the depth AVPlayer enforces.
+enum LiveEdgePolicy {
+    /// Never serve an empty or single-segment live playlist (a 1-segment window is an instant -12888).
+    static let minStartupSegments = 2
+
+    /// Served `#EXT-X-TARGETDURATION`, in whole seconds: `>= ceil(max EXTINF)` (HLS requirement), floored
+    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888) and the
+    /// observed-cadence floor. `cutTargetSeconds` / `cadenceFloorSeconds` are nil for VOD/EVENT.
+    static func targetDurationSeconds(maxSegmentDuration: Double,
+                                      cutTargetSeconds: Double?,
+                                      cadenceFloorSeconds: Double?) -> Int {
+        var td = Int(ceil(max(1.0, maxSegmentDuration)))
+        if let cut = cutTargetSeconds { td = max(td, Int(ceil(cut * 1.5))) }
+        if let floor = cadenceFloorSeconds { td = max(td, Int(ceil(floor))) }
+        return td
+    }
+
+    /// AVPlayer's default (and our explicitly advertised) live-edge holdback: `3 x TARGETDURATION`, the
+    /// RFC 8216bis floor for `EXT-X-SERVER-CONTROL:HOLD-BACK`.
+    static func holdBackSeconds(targetDuration: Int) -> Double { Double(3 * targetDuration) }
+
+    /// One observed segment duration gives a strict-realtime fastZap source one more chance to fill
+    /// naturally, while the clamp keeps the startup bound useful for unusually short or long GOPs.
+    static func fastZapDegradedGraceSeconds(
+        maxSegmentDuration: Double
+    ) -> TimeInterval {
+        min(2.0, max(0.5, maxSegmentDuration))
+    }
+
+    /// First-serve gate: hold the first live manifest until the window carries at least the live-edge
+    /// holdback (`3 x TD`) of content behind the edge, so AVPlayer's initial seek-to-edge-minus-holdback
+    /// lands inside the window instead of the stall-danger zone. Bounded above by `windowSegmentCount`: a
+    /// tiny-segment source can never be made to wait for more than the sliding window will ever hold (the
+    /// wall-clock deadline in `waitForFirstLiveSegment` is the outer bound). A source that arrives with a
+    /// backlog (Jellyfin transcode, or an upstream live window pulled at I/O speed) satisfies this almost
+    /// immediately; only a strict-realtime origin pays the deepen-the-buffer latency, which is inherent to
+    /// joining long-GOP live safely.
+    static func startupCushionSatisfied(segmentCount: Int,
+                                        summedDurationSeconds: Double,
+                                        maxSegmentDuration: Double,
+                                        cutTargetSeconds: Double?,
+                                        cadenceFloorSeconds: Double?,
+                                        windowSegmentCount: Int) -> Bool {
+        let td = targetDurationSeconds(maxSegmentDuration: maxSegmentDuration,
+                                       cutTargetSeconds: cutTargetSeconds,
+                                       cadenceFloorSeconds: cadenceFloorSeconds)
+        return startupCushionSatisfied(
+            segmentCount: segmentCount,
+            summedDurationSeconds: summedDurationSeconds,
+            targetDuration: td,
+            windowSegmentCount: windowSegmentCount
+        )
+    }
+
+    static func startupCushionSatisfied(segmentCount: Int,
+                                        summedDurationSeconds: Double,
+                                        targetDuration: Int,
+                                        windowSegmentCount: Int) -> Bool {
+        guard segmentCount >= minStartupSegments else { return false }
+        if segmentCount >= windowSegmentCount { return true }
+        return summedDurationSeconds >= holdBackSeconds(targetDuration: targetDuration)
+    }
+}
+
+struct LiveTargetDurationSeal {
+    private(set) var value: Int?
+    private var didLogUpwardDrift = false
+
+    mutating func resolve(candidate: Int) -> (value: Int, shouldLogDrift: Bool) {
+        guard let sealed = value else {
+            value = candidate
+            return (candidate, false)
+        }
+        guard candidate > sealed, !didLogUpwardDrift else {
+            return (sealed, false)
+        }
+        didLogUpwardDrift = true
+        return (sealed, true)
+    }
+}
+
 // MARK: - Cache-backed provider
 
 /// Thin HLSSegmentProvider over SegmentCache. Cache misses block the HTTP server's connection
@@ -50,10 +141,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let isLive: Bool
     /// Drives both playlist firstVisible and cache eviction cutoff so they never drift.
     private let liveWindowSizing: LiveWindowSizing
-    /// false for bursty upstreams that cannot honor the blocking-reload contract.
-    private let blockingReloadEnabled: Bool
-    /// #EXT-X-TARGETDURATION floor for bursty ingest sources; nil for URL live and VOD.
-    private let targetDurationFloorSeconds: Double?
+    /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
+    private let allowsBoundedDegradedStart: Bool
+    /// Host override for blocking-reload (`LoadOptions.liveBlockingReload`): nil = auto (observed policy for
+    /// ingest, on by default for signal-less live), true/false = force. Wins over the policy (#167).
+    private let blockingReloadOverride: Bool?
+    /// Observed-cadence policy for live ingest sources; drives blocking-reload eligibility and the
+    /// TARGETDURATION floor from real arrival cadence. nil for URL live (no cadence signal) and VOD (#167).
+    private let liveCadencePolicy: LiveCadencePolicy?
 
     private let codecsString: String
     private let supplementalCodecsString: String?
@@ -89,6 +184,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Base index of the active producer (#93 residual): a fetch for an index within the
     /// producer's forward march window waits for the march instead of tearing it down.
     private let activeProducerBase: (() -> Int?)?
+    /// AE#169 round 2: whether the installed producer's pump has EXITED (any reason). A finished
+    /// pump can never march, so a forward-window fetch must restart instead of backpressure-waiting
+    /// on a front that is provably frozen. nil/false during a coalesced restart (no producer
+    /// installed) keeps the normal wait+ride paths.
+    private let producerFinished: (() -> Bool)?
+
+    /// AE#169 round 2: single-slot record of the last forward-window fetch that burned its FULL
+    /// backpressure wait. Same index + unmoved march front on the next fetch is proof the march is
+    /// not coming (the wait would re-arm forever against a dead producer); a moved front overwrites
+    /// the record and keeps the patience. Guarded by stateLock.
+    private var _forwardMissIndex: Int = .min
+    private var _forwardMissFront: Int = .min
 
     /// Base index of the engine's current producer. Guards against stale-producer waits:
     /// abs(index - lastRestartIndex) <= 2 = cold start, wait; larger = restart needed.
@@ -131,6 +238,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Set by cancelWaiters() on stop(). Without it, parked LL-HLS blocking-reload threads sleep
     /// their full timeout (18-30 s) and can write stale playlists into a recycled fd of the next session.
     private var waitersCancelled = false
+    /// Terminal latch (#167 follow-up): the live pump exited for host retune (SSAI cutter wedge,
+    /// source replay, custom-reader death), so no further segment will ever be cut into this provider.
+    /// The cadence policy cannot see this (it observes ingest arrivals, which keep flowing while the
+    /// cutter is wedged), so it is a separate, producer-level condition.
+    private var _liveProductionHalted = false
+    /// RFC 8216 requires TARGETDURATION to stay constant for the lifetime of a media playlist.
+    /// Guarded by stateLock and preserved across in-provider producer reopens.
+    private var liveTargetDurationSeal = LiveTargetDurationSeal()
     private var refreshCounter: Int = 0
     /// EXT-X-MEDIA-SEQUENCE first index; monotonically advancing, stays 0 for VOD.
     private var _liveFirstVisible: Int = 0
@@ -149,11 +264,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         sourceBitrate: Int64,
         isLive: Bool = false,
         liveWindowSizing: LiveWindowSizing = LiveWindowSizing(targetSegmentDurationSeconds: 4.0, dvrWindowSeconds: nil),
-        blockingReloadEnabled: Bool = true,
-        targetDurationFloorSeconds: Double? = nil,
+        allowsBoundedDegradedStart: Bool = false,
+        blockingReloadOverride: Bool? = nil,
+        liveCadencePolicy: LiveCadencePolicy? = nil,
         restartHandler: ((Int) -> Void)? = nil,
         restartActivity: (() -> Bool)? = nil,
         activeProducerBase: (() -> Int?)? = nil,
+        producerFinished: (() -> Bool)? = nil,
         initialRestartIndex: Int = 0,
         repositionWaitSlice: TimeInterval = 8.0,
         sparseHoleWaitSlice: TimeInterval = 2.0,
@@ -172,8 +289,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.segments = segments
         self.isLive = isLive
         self.liveWindowSizing = liveWindowSizing
-        self.blockingReloadEnabled = blockingReloadEnabled
-        self.targetDurationFloorSeconds = targetDurationFloorSeconds
+        self.allowsBoundedDegradedStart = allowsBoundedDegradedStart
+        self.blockingReloadOverride = blockingReloadOverride
+        self.liveCadencePolicy = liveCadencePolicy
         self.codecsString = codecsString
         self.supplementalCodecsString = supplementalCodecs
         self.resolution = resolution
@@ -184,6 +302,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.restartHandler = restartHandler
         self.restartActivity = restartActivity
         self.activeProducerBase = activeProducerBase
+        self.producerFinished = producerFinished
         self._lastRestartIndex = initialRestartIndex
         self.repositionWaitSlice = repositionWaitSlice
         self.sparseHoleWaitSlice = sparseHoleWaitSlice
@@ -426,6 +545,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             producerPassedAndPruned = highWater > index
         }
         let needsRestart: Bool
+        // AE#169 round 2: set when the forward-wait branch has PROOF the active march is never
+        // arriving (pump finished, or a full backpressure wait elapsed with zero front progress
+        // for this same index). Bypasses the restart loop's producerCovers veto below, which
+        // otherwise reads the dead producer's still-installed base and suppresses the fire.
+        var marchProvenDead = false
+        // AE#169 round 2: true when the fetch takes the VOD forward-window backpressure wait, so a
+        // full-timeout miss records (index, front) for the frozen-march escalation above.
+        var tookForwardWait = false
         if staleBelowProducer || producerPassedAndPruned {
             needsRestart = true
         } else if let r = range {
@@ -450,7 +577,36 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // at 75; the request for seg159 parked 3x30 s into -1017 item death while the
                 // march was ~2 minutes away). highWater is reset per provider-fired restart, so
                 // max(highWater, lastRestartIndex) tracks the active producer's front.
-                needsRestart = index > activeMarchFront + Self.forwardWaitWindow
+                //
+                // AE#169 round 2: index distance alone is still not proof the march will ARRIVE.
+                // A producer that died mid-session (source read error at the tail) freezes the
+                // front just below the request, and the 30 s wait re-armed forever (seg719 miss
+                // x11 into -12889). A finished pump, or a full wait already burned with zero
+                // front progress for this same index, escalates to restart instead. VOD only:
+                // live has its own pump watchdogs and reopen machinery.
+                let front = activeMarchFront
+                tookForwardWait = !isLive
+                if !isLive {
+                    stateLock.lock()
+                    let missIndex = _forwardMissIndex
+                    let missFront = _forwardMissFront
+                    stateLock.unlock()
+                    marchProvenDead = Self.forwardWaitMarchDead(
+                        index: index, marchFront: front,
+                        producerFinished: producerFinished?() ?? false,
+                        lastMissIndex: missIndex, lastMissFront: missFront)
+                    if marchProvenDead {
+                        EngineLog.emit(
+                            "[HLSVideoEngine] seg\(index): #169 forward-wait march dead "
+                            + "(front=\(front) "
+                            + (producerFinished?() ?? false
+                                ? "producer finished" : "frozen across a full wait")
+                            + "); escalating to restart",
+                            category: .session
+                        )
+                    }
+                }
+                needsRestart = index > front + Self.forwardWaitWindow || marchProvenDead
             }
         } else {
             // Empty cache: cold start (producer at lastRestartIndex, hasn't written yet) vs. big scrub
@@ -484,7 +640,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     // covers (base <= index <= base + forward window) never fires OR backstops:
                     // the march will deliver it, and the backstop killed a 75%-complete capture
                     // on device while a forward-march neighbor got its healthy producer restarted.
-                    let producerCovers = activeProducerCovers(index)
+                    // AE#169 round 2: a march proven dead (finished pump / frozen front across a
+                    // full wait) must not veto the fire; the still-installed dead producer's base
+                    // covering the index is exactly the wedge being escaped.
+                    let producerCovers = !marchProvenDead && activeProducerCovers(index)
                     // A request superseded by a NEWER declared target is an orphan of a skip
                     // storm: AVPlayer's newest request is what it actually wants (the same
                     // newest-wins semantics the coalescer applies to immediate restarts).
@@ -503,6 +662,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                             category: .session
                         )
                         lastRestartIndex = index
+                        clearForwardWaitMiss()
                         restart(index)
                         // Reset highWater AFTER restart() returns (synchronous: old producer has exited).
                         // Pre-restart reset would be clobbered by the old producer's final write re-bumping
@@ -520,7 +680,41 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
 
         let bytes = cache.fetch(index: index, timeout: forwardBackpressureWaitSeconds)
+        if tookForwardWait, !needsRestart {
+            if bytes == nil {
+                // Record the front as of the END of the burned wait: progress DURING the wait
+                // resets the comparison base, so only a truly frozen march escalates next time.
+                recordForwardWaitMiss(index: index, front: activeMarchFront)
+            } else {
+                clearForwardWaitMiss()
+            }
+        }
         return logServed(index: index, bytes: bytes, totalStart: totalStart, restarted: needsRestart)
+    }
+
+    /// AE#169 round 2 pure decision: whether the forward-window backpressure wait may still trust
+    /// the active march to deliver `index`. A FINISHED pump can never march. A recorded full-wait
+    /// miss for the same index with an unmoved front means the wait already failed empirically and
+    /// re-arming it would park forever (rrgomes: seg719 miss x11 into -12889). Everything else
+    /// keeps the wait: slow sources legitimately take most of the patience window for one segment.
+    static func forwardWaitMarchDead(index: Int, marchFront: Int, producerFinished: Bool,
+                                     lastMissIndex: Int, lastMissFront: Int) -> Bool {
+        if producerFinished { return true }
+        return lastMissIndex == index && lastMissFront == marchFront
+    }
+
+    private func recordForwardWaitMiss(index: Int, front: Int) {
+        stateLock.lock()
+        _forwardMissIndex = index
+        _forwardMissFront = front
+        stateLock.unlock()
+    }
+
+    private func clearForwardWaitMiss() {
+        stateLock.lock()
+        _forwardMissIndex = .min
+        _forwardMissFront = .min
+        stateLock.unlock()
     }
 
     private func logServed(index: Int, bytes: Data?, totalStart: DispatchTime, restarted: Bool) -> Data? {
@@ -619,49 +813,181 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     var liveTargetSegmentDuration: Double? {
         isLive ? liveWindowSizing.targetSegmentDurationSeconds : nil
     }
-    var liveBlockingReloadEnabled: Bool { blockingReloadEnabled }
-    var liveTargetDurationFloorSeconds: Double? {
-        isLive ? targetDurationFloorSeconds : nil
+    var liveBlockingReloadEnabled: Bool {
+        Self.resolveLiveBlockingReload(halted: liveProductionHalted,
+                                       override: blockingReloadOverride,
+                                       policy: liveCadencePolicy)
     }
-    /// 2 = one segment (~4 s) of startup cushion absorbing transcode jitter that caused -16832
-    /// "restarting from end of live playlist". 1 disables. Distinct from the reverted hold-back
-    /// which trailed the ADVERTISED edge without building an actual buffer.
-    private static let liveStartupSegments = 2
 
-    /// Block until liveStartupSegments segments exist. Avoids -12888 on an empty playlist
-    /// and gives AVPlayer its startup cushion. Subsequent polls return instantly.
+    var liveProductionHalted: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveProductionHalted
+    }
+
+    /// Live pump exited for host retune: no further segment will ever be cut into this provider.
+    /// Latch blocking-reload off for every subsequent manifest render (including an item reload
+    /// against this server) and release parked ?_HLS_msn= waiters so they 503 now instead of
+    /// sleeping out their full hold against a dead producer (-15410, #167 follow-up).
+    func markLiveProductionHalted() {
+        stateLock.lock()
+        _liveProductionHalted = true
+        stateLock.unlock()
+        cancelWaiters()
+    }
+    var liveTargetDurationFloorSeconds: Double? {
+        // The floor tracks observed cadence regardless of the gate override: patience must cover the real
+        // inter-batch gap even when a host forces blocking-reload on/off (#167).
+        isLive ? liveCadencePolicy?.targetDurationFloorSeconds : nil
+    }
+
+    func currentLiveTargetDuration(
+        maxSegmentDuration: Double
+    ) -> (value: Int, cadenceFloor: Double?) {
+        let floor = liveCadencePolicy?.targetDurationFloorSeconds
+        return (
+            LiveEdgePolicy.targetDurationSeconds(
+                maxSegmentDuration: maxSegmentDuration,
+                cutTargetSeconds: liveWindowSizing.targetSegmentDurationSeconds,
+                cadenceFloorSeconds: floor
+            ),
+            floor
+        )
+    }
+
+    private func sealLiveTargetDuration(candidate: Int) -> Int {
+        stateLock.lock()
+        let resolved = liveTargetDurationSeal.resolve(candidate: candidate).value
+        stateLock.unlock()
+        return resolved
+    }
+
+    func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int {
+        let candidate = currentLiveTargetDuration(maxSegmentDuration: maxSegmentDuration)
+        stateLock.lock()
+        let resolved = liveTargetDurationSeal.resolve(candidate: candidate.value)
+        stateLock.unlock()
+
+        if resolved.shouldLogDrift {
+            EngineLog.emit(
+                "[HLSVideoEngine] live TARGETDURATION remains sealed at "
+                + "\(resolved.value)s, later candidate \(candidate.value)s "
+                + "(max segment \(String(format: "%.3f", maxSegmentDuration))s, "
+                + "cadence floor "
+                + (candidate.cadenceFloor.map { String(format: "%.3f", $0) } ?? "nil")
+                + ")",
+                category: .session
+            )
+        }
+        return resolved.value
+    }
+
+    /// Resolve blocking-reload eligibility: a halted producer disables it unconditionally (no override
+    /// can conjure segments from a dead pump, #167 follow-up); otherwise a host override wins; otherwise
+    /// the observed-cadence policy decides for ingest sources; signal-less live (plain-url Jellyfin
+    /// transcode) keeps the low-latency default. Pure so the precedence is unit-testable without a full
+    /// provider (#167).
+    static func resolveLiveBlockingReload(halted: Bool = false, override: Bool?, policy: LiveCadencePolicy?) -> Bool {
+        if halted { return false }
+        if let override { return override }
+        if let policy { return policy.blockingReloadEnabled }
+        return true
+    }
+    /// Under stateLock: (count, summed EXTINF, max EXTINF) over the resident segments. At startup the
+    /// window has not slid yet, so this is the full first-served window (LiveEdgePolicy sizes the cushion).
+    private func liveCushionSnapshot() -> (count: Int, summed: Double, maxDuration: Double) {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        var summed = 0.0
+        var maxDuration = 0.0
+        for seg in segments {
+            summed += seg.durationSeconds
+            maxDuration = max(maxDuration, seg.durationSeconds)
+        }
+        return (segments.count, summed, maxDuration)
+    }
+
+    /// Block until the first live window holds the live-edge holdback (3 x TARGETDURATION) of content, so
+    /// AVPlayer's initial seek to edge-minus-holdback lands inside the window instead of its stall-danger
+    /// zone (-16832; AE#189). A `.fastZap` session may take the explicitly bounded shallow-window path
+    /// after two segments and one clamped segment-duration grace (AE#208). `.standard` never takes it.
+    /// Both paths avoid -12888 on an empty or single-segment playlist. The gate and served playlist use
+    /// the same sealed TARGETDURATION.
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
         guard isLive else { return true }
         let deadline = Date().addingTimeInterval(timeout)
+        let window = liveWindowSizing.windowSegmentCount
+        var degradedDeadline: Date?
+        var degradedGrace: TimeInterval?
         firstSegmentCondition.lock()
         defer { firstSegmentCondition.unlock() }
         while true {
             if waitersCancelled { return false }
-            stateLock.lock()
-            let count = segments.count
-            stateLock.unlock()
-            if count >= Self.liveStartupSegments { return true }
-            if !firstSegmentCondition.wait(until: deadline) {
-                // Re-read after the timed-out wait: an append racing the
-                // deadline would otherwise be judged on the stale count
-                // (waitForLiveSegment below already does this).
-                stateLock.lock()
-                let count = segments.count
-                stateLock.unlock()
-                // Degraded start: serving the first playlist with fewer
-                // than liveStartupSegments segments loses the startup
-                // cushion that absorbs transcode jitter, so a -16832
-                // "restarting from end of live playlist" stall right
-                // after startup becomes likely. Make it observable.
-                if count > 0 && count < Self.liveStartupSegments {
+            let snap = liveCushionSnapshot()
+            let target = currentLiveTargetDuration(maxSegmentDuration: snap.maxDuration)
+            if LiveEdgePolicy.startupCushionSatisfied(segmentCount: snap.count,
+                                                       summedDurationSeconds: snap.summed,
+                                                       targetDuration: target.value,
+                                                       windowSegmentCount: window) {
+                _ = sealLiveTargetDuration(candidate: target.value)
+                return true
+            }
+            if allowsBoundedDegradedStart,
+               snap.count >= LiveEdgePolicy.minStartupSegments,
+               degradedDeadline == nil {
+                let grace = LiveEdgePolicy.fastZapDegradedGraceSeconds(
+                    maxSegmentDuration: snap.maxDuration
+                )
+                degradedGrace = grace
+                degradedDeadline = Date().addingTimeInterval(grace)
+            }
+            let effectiveDeadline = degradedDeadline.map { min(deadline, $0) } ?? deadline
+            if !firstSegmentCondition.wait(until: effectiveDeadline) {
+                // Re-read after the timed-out wait: an append racing the deadline would otherwise be judged
+                // on the stale snapshot (waitForLiveSegment below already does this).
+                let after = liveCushionSnapshot()
+                let afterTarget = currentLiveTargetDuration(maxSegmentDuration: after.maxDuration)
+                if LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
+                                                          summedDurationSeconds: after.summed,
+                                                          targetDuration: afterTarget.value,
+                                                          windowSegmentCount: window) {
+                    _ = sealLiveTargetDuration(candidate: afterTarget.value)
+                    return true
+                }
+                if let degradedDeadline,
+                   Date() >= degradedDeadline,
+                   after.count >= LiveEdgePolicy.minStartupSegments {
+                    let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                    let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: sealed)
                     EngineLog.emit(
-                        "[HLSVideoEngine] WARNING: live startup degraded, serving first "
-                        + "playlist with \(count)/\(Self.liveStartupSegments) segments after "
-                        + "\(Int(timeout))s timeout (no startup cushion)",
+                        "[HLSVideoEngine] fastZap startup degraded, serving first playlist with "
+                        + "\(after.count) segments / \(String(format: "%.3f", after.summed))s "
+                        + "before \(String(format: "%.3f", holdBack))s holdback after "
+                        + "\(String(format: "%.3f", degradedGrace ?? 0))s grace",
+                        category: .session
+                    )
+                    return true
+                }
+                guard Date() >= deadline else { continue }
+                // Degraded start: serving before the holdback cushion is built (transcode too slow, or a
+                // strict-realtime origin that has not produced 3 x TD of content within the deadline) makes
+                // a -16832 "restarting from end of live playlist" stall right after startup likely. Observe it.
+                if after.count > 0 && !LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
+                                                                             summedDurationSeconds: after.summed,
+                                                                             targetDuration: afterTarget.value,
+                                                                             windowSegmentCount: window) {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] WARNING: live startup degraded, serving first playlist with "
+                        + "\(after.count) segments / \(String(format: "%.1f", after.summed))s < "
+                        + "\(String(format: "%.1f", LiveEdgePolicy.holdBackSeconds(targetDuration: afterTarget.value)))s holdback "
+                        + "after \(Int(timeout))s timeout (undersized startup cushion)",
                         category: .session
                     )
                 }
-                return count > 0
+                if after.count > 0 {
+                    _ = sealLiveTargetDuration(candidate: afterTarget.value)
+                }
+                return after.count > 0
             }
         }
     }

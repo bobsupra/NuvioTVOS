@@ -21,9 +21,9 @@
 #ifndef AVCODEC_BSF_H
 #define AVCODEC_BSF_H
 
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/log.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/log.h"
+#include "AetherLibavutil/rational.h"
 
 #include "codec_id.h"
 #include "codec_par.h"

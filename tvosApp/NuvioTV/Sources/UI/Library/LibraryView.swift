@@ -1,9 +1,15 @@
 import SwiftUI
 
+/// Same poster geometry as the See All catalog, Grid Home, and Search. Seven
+/// columns fit only because of `pageInset` — the old 80pt inset left room for six.
 private enum LibraryGridMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
+    /// Leading/trailing inset for the whole screen. With the grid's own 12pt
+    /// (which keeps a focused card's 1.06 scale from clipping) this is the 48pt
+    /// gutter Grid Home uses, so posters line up across the two screens.
+    static let pageInset: CGFloat = 36
 }
 
 public struct LibraryView: View {
@@ -164,7 +170,7 @@ public struct LibraryView: View {
                 .focusSection()
                 .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
             }
-            .padding(.horizontal, 80)
+            .padding(.horizontal, LibraryGridMetrics.pageInset)
             .padding(.top, 56)
         }
         .onChange(of: focusedItemID) { newValue in

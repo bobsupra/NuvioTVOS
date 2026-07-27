@@ -23,10 +23,10 @@
 
 #include <stdint.h>
 
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/channel_layout.h>
-#include <AetherLibavutil/rational.h>
-#include <AetherLibavutil/pixfmt.h>
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/channel_layout.h"
+#include "AetherLibavutil/rational.h"
+#include "AetherLibavutil/pixfmt.h"
 
 #include "codec_id.h"
 #include "defs.h"

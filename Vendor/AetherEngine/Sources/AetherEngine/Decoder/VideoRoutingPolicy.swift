@@ -48,16 +48,49 @@ enum VideoRoutingPolicy {
     /// Second-stage gate (#2): a codec that passed `requiresSoftwarePath` as native (H.264 / HEVC) but whose
     /// specific format VideoToolbox cannot HARDWARE-decode must still fall back to software, or the native
     /// AVPlayer path reaches readyToPlay and then renders nothing (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext
-    /// on Intel Macs / older Apple TV). Pure so it is unit-testable; the impure VT probe result
-    /// (`VTCapabilityProbe.canHardwareDecode`) is injected as `canHardwareDecode`. Only H.264 / HEVC consult
-    /// this gate; AV1 / VP9 / etc. already have their own routing above and must not be reclassified here.
+    /// on Intel Macs / older Apple TV). Pure so it is unit-testable; the impure VT probe
+    /// (`VTCapabilityProbe.canHardwareDecode`) is injected as the `canHardwareDecode` closure and only runs
+    /// when the gate actually consults it. Only H.264 / HEVC consult this gate; AV1 / VP9 / etc. already
+    /// have their own routing above and must not be reclassified here.
+    ///
+    /// #176: HEVC DV Profile 5 bypasses the gate entirely. The probe builds a plain-HEVC format description
+    /// from the raw hvcC, which is not what the native path plays (dvh1 + dvcC, decoded by Apple's DV
+    /// decoder), so a probe rejection there is not evidence the dvh1 route fails. And P5 has no compatible
+    /// base layer: libavcodec decodes its IPT-PQ-c2 signal as YCbCr (green/purple cast), so the software
+    /// path is never a correct fallback for it. P7 / P8.x keep the gate; their base layer is standard
+    /// Main10 that the software path decodes with correct color.
     static func forcesSoftwareForUndecodableFormat(
         codecID: AVCodecID,
-        canHardwareDecode: Bool
+        dvProfile: Int?,
+        canHardwareDecode: () -> Bool
     ) -> Bool {
         switch codecID {
+        case AV_CODEC_ID_HEVC where dvProfile == 5:
+            return false
         case AV_CODEC_ID_H264, AV_CODEC_ID_HEVC:
-            return !canHardwareDecode
+            return !canHardwareDecode()
+        default:
+            return false
+        }
+    }
+
+    /// #176 follow-up: DV variants whose only signal is IPT-PQ-c2 (no compatible base layer) cannot be
+    /// color-correctly decoded by the software path: libavcodec / dav1d hand the IPT signal on as YCbCr,
+    /// which renders with a green/purple cast. That is HEVC P5 and AV1 P10.0 (compat 0). P7 / P8.x /
+    /// P10.1 / P10.2 / P10.4 base layers are self-contained HDR10 / SDR / HLG and stay software-eligible.
+    /// Consulted after the final routing decision; a true here fails the load instead of playing wrong color
+    /// (AV1 P10.0 without HW AV1 has no native fallback, HEVC P5 reaches software only off forward-only
+    /// sources the native path cannot serve).
+    static func softwarePathCannotRepresent(
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dvBlCompatID: Int?
+    ) -> Bool {
+        switch codecID {
+        case AV_CODEC_ID_HEVC:
+            return dvProfile == 5
+        case AV_CODEC_ID_AV1:
+            return dvProfile == 10 && dvBlCompatID == 0
         default:
             return false
         }

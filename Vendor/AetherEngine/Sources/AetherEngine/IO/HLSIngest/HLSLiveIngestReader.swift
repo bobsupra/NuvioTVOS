@@ -1,7 +1,7 @@
 import Foundation
 import CommonCrypto
 
-/// Live HLS ingest as a forward-only `IOReader`. Resolves master -> highest-BANDWIDTH variant, polls the media playlist, fetches MPEG-TS segments sequentially, and exposes a single TS byte stream for `AetherEngine.load(source: .custom(reader, formatHint: "mpegts"), options: <isLive>)`.
+/// Live HLS ingest as a forward-only `IOReader`. Resolves master -> highest-BANDWIDTH variant, polls the media playlist, fetches MPEG-TS segments through a bounded prefetch pipeline (#177: up to `maxConcurrentSegmentFetches` in flight, committed in playlist order), and exposes a single TS byte stream for `AetherEngine.load(source: .custom(reader, formatHint: "mpegts"), options: <isLive>)`.
 ///
 /// Phase-1: unencrypted TS on the MAIN variant only. Encrypted (EXT-X-KEY), fMP4 (EXT-X-MAP), unreachable, and stalled streams all go terminal with `HLSIngestError`; host falls back to the Jellyfin-mediated route.
 ///
@@ -17,6 +17,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     private let playlistURL: URL
+    private let httpHeaders: [String: String]
     private let role: Role
     private let fifo = ByteFIFO(capacity: 16 * 1024 * 1024)
     private let session: URLSession
@@ -28,6 +29,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var _terminalError: HLSIngestError?
     /// Written before any segment byte reaches the FIFO; first write wins.
     private var _upstreamTargetDuration: Double?
+    /// Tracks observed segment-arrival cadence for LL-HLS shaping (AetherEngine#167). Updated whenever new
+    /// upstream segments appear; read via `observedLiveCadenceSeconds`.
+    private var _cadenceMeter = LiveArrivalCadenceMeter()
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// "mpegts" or "aac", classified from the first segment's leading bytes, written before that segment's first FIFO byte.
@@ -42,12 +46,30 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private let keyCacheLock = NSLock()
     private var keyCache: [String: Data] = [:]
 
+    /// #177: bounded prefetch window. Serial fetch paid a connection + TTFB round-trip per segment
+    /// with no bytes flowing, capping ingest near real-time on high-bitrate streams. Four in-flight
+    /// fetches saturate the link while bounding in-memory segment bytes to the window size.
+    static let maxConcurrentSegmentFetches = 4
+
+    /// First-segment classification latch; touched only from the ingest task's ordered commit path.
+    private var sniffedFirstSegment = false
+
     public var terminalError: HLSIngestError? {
         startLock.withLock { _terminalError }
     }
 
     public var upstreamTargetDuration: Double? {
         startLock.withLock { _upstreamTargetDuration }
+    }
+
+    public var observedLiveCadenceSeconds: Double? {
+        let now = Self.monotonicNow()
+        return startLock.withLock { _cadenceMeter.observedCadence(at: now) }
+    }
+
+    /// Monotonic seconds (uptime); immune to wall-clock jumps that would corrupt interval measurement.
+    private static func monotonicNow() -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
     }
 
     public var companionAudioReader: IOReader? {
@@ -83,11 +105,28 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     }
 
     public convenience init(playlistURL: URL) {
-        self.init(playlistURL: playlistURL, role: .mainVideo)
+        self.init(playlistURL: playlistURL, httpHeaders: [:], role: .mainVideo)
     }
 
-    init(playlistURL: URL, role: Role) {
+    /// `httpHeaders` ride on every fetch (playlist, segment, AES key) and inherit to the companion audio
+    /// reader, so header-enforcing IPTV origins (Referer / User-Agent / Authorization, #119) accept the
+    /// ingest the same way they accept the AVPlayer bypass (AetherEngine#168).
+    public convenience init(playlistURL: URL, httpHeaders: [String: String]) {
+        self.init(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+    }
+
+    /// #199: fresh reader over the same playlist URL and headers, for the in-engine live reopen of an
+    /// engine-created ingest session (the dead reader's construction inputs are immutable, so the fresh
+    /// one rejoins the same channel at its current live edge). Main-video role only: the companion
+    /// audio reader's lifetime is owned by its parent and never reopens independently.
+    func makeFreshMainReader() -> HLSLiveIngestReader? {
+        guard role == .mainVideo else { return nil }
+        return HLSLiveIngestReader(playlistURL: playlistURL, httpHeaders: httpHeaders, role: .mainVideo)
+    }
+
+    init(playlistURL: URL, httpHeaders: [String: String] = [:], role: Role) {
         self.playlistURL = playlistURL
+        self.httpHeaders = httpHeaders
         self.role = role
         let config = URLSessionConfiguration.ephemeral
         config.timeoutIntervalForRequest = 10
@@ -154,7 +193,6 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         do {
             let (mediaURL, seedPlaylist) = try await resolveMediaPlaylistURL()
             var tracker = HLSPlaylistTracker()
-            var sniffedFirstSegment = false
             var loggedEncryptedDirectPlay = false
             var refreshInterval: Double = 2
             var pendingPlaylist: HLSMediaPlaylist? = seedPlaylist
@@ -190,6 +228,12 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                 let isJoin = !sniffedFirstSegment
                 let fresh = tracker.newSegments(in: media)
                 if tracker.stallCount > 6 { throw HLSIngestError.ingestStalled }
+                if !fresh.isEmpty {
+                    // Real arrival of new content: the interval since the previous arrival is the observed
+                    // cadence the engine shapes the local playlist around (AetherEngine#167).
+                    let now = Self.monotonicNow()
+                    startLock.withLock { _cadenceMeter.recordArrival(at: now) }
+                }
                 if isJoin, !fresh.isEmpty {
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
                     EngineLog.emit(
@@ -198,31 +242,10 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     )
                 }
 
-                for segment in fresh {
-                    guard !Task.isCancelled else { return }
-                    if segment.discontinuityBefore {
-                        // Phase 1 decision (design spec): the seam is logged, the actual
-                        // timestamp handling rides on the producer's PTS-leap rebase
-                        // heuristic downstream; a deterministic force-cut hint is a P2 item.
-                        EngineLog.emit("[HLSIngest] discontinuity seam before segment \(segment.uri)", category: .engine)
+                if !fresh.isEmpty {
+                    guard try await ingestSegmentBatch(fresh, mediaURL: mediaURL) else {
+                        return // FIFO closed underneath us
                     }
-                    guard let segmentURL = HLSPlaylistParser.resolve(uri: segment.uri, against: mediaURL) else {
-                        throw HLSIngestError.playlistInvalid(reason: "unresolvable segment URI")
-                    }
-                    let fetched = try await fetchSegment(segmentURL)
-                    if fetched.isEmpty { continue } // 404: slid out of the provider window
-                    // Decrypt before classification (TS sync byte 0x47 is only visible in plaintext) and before the FIFO.
-                    let bytes: Data
-                    if let crypt = segment.crypt {
-                        bytes = try await decryptSegment(fetched, crypt: crypt, against: mediaURL)
-                    } else {
-                        bytes = fetched
-                    }
-                    if !sniffedFirstSegment {
-                        sniffedFirstSegment = true
-                        try classifyFirstSegment(bytes)
-                    }
-                    guard fifo.write(bytes) else { return } // closed underneath us
                 }
 
                 if media.hasEndList {
@@ -246,6 +269,79 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
             startLock.withLock { _terminalError = .playlistUnreachable(status: -1) }
             EngineLog.emit("[HLSIngest] terminal (transport): \(error.localizedDescription)", category: .engine)
             fifo.cancel()
+        }
+    }
+
+    /// #177: bounded prefetch pipeline over one batch of fresh segments. Up to
+    /// `maxConcurrentSegmentFetches` fetches (and decrypts) run concurrently; results are committed
+    /// to the FIFO strictly in playlist order, so every downstream ordering contract (first-segment
+    /// classification before any FIFO byte, discontinuity logging, demuxer pacing via the blocking
+    /// FIFO write) is unchanged. In-flight bytes are held in memory, decoupled from FIFO
+    /// backpressure; the window is anchored at the commit point, bounding buffered segments to the
+    /// window size even when the head segment is slow. Returns false when the FIFO was closed.
+    private func ingestSegmentBatch(_ segments: [HLSMediaSegment], mediaURL: URL) async throws -> Bool {
+        // Resolve every URI upfront so an unresolvable one throws before any fetch is spawned.
+        let resolved: [(segment: HLSMediaSegment, url: URL)] = try segments.map { segment in
+            guard let url = HLSPlaylistParser.resolve(uri: segment.uri, against: mediaURL) else {
+                throw HLSIngestError.playlistInvalid(reason: "unresolvable segment URI")
+            }
+            return (segment, url)
+        }
+        return try await withThrowingTaskGroup(of: (Int, Data).self) { group -> Bool in
+            var nextToSpawn = 0
+            var nextToCommit = 0
+            var ready: [Int: Data] = [:]
+
+            while nextToSpawn < resolved.count,
+                  nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
+                nextToSpawn += 1
+            }
+            while nextToCommit < resolved.count {
+                guard let (index, bytes) = try await group.next() else { break }
+                ready[index] = bytes
+                while let head = ready.removeValue(forKey: nextToCommit) {
+                    let segment = resolved[nextToCommit].segment
+                    nextToCommit += 1
+                    if segment.discontinuityBefore {
+                        // Phase 1 decision (design spec): the seam is logged, the actual
+                        // timestamp handling rides on the producer's PTS-leap rebase
+                        // heuristic downstream; a deterministic force-cut hint is a P2 item.
+                        EngineLog.emit("[HLSIngest] discontinuity seam before segment \(segment.uri)", category: .engine)
+                    }
+                    if head.isEmpty { continue } // 404: slid out of the provider window
+                    if !sniffedFirstSegment {
+                        sniffedFirstSegment = true
+                        try classifyFirstSegment(head)
+                    }
+                    guard fifo.write(head) else { // closed underneath us
+                        group.cancelAll()
+                        return false
+                    }
+                }
+                while nextToSpawn < resolved.count,
+                      nextToSpawn < nextToCommit + Self.maxConcurrentSegmentFetches {
+                    spawnFetch(into: &group, index: nextToSpawn, item: resolved[nextToSpawn], mediaURL: mediaURL)
+                    nextToSpawn += 1
+                }
+            }
+            return true
+        }
+    }
+
+    /// One in-flight prefetch: fetch plus (for AES-128 sources) inline decrypt. Decrypting in
+    /// flight is safe because the key cache tolerates concurrent misses; classification stays on
+    /// the ordered commit path (TS sync byte is only visible in plaintext).
+    private func spawnFetch(
+        into group: inout ThrowingTaskGroup<(Int, Data), Error>,
+        index: Int,
+        item: (segment: HLSMediaSegment, url: URL),
+        mediaURL: URL
+    ) {
+        group.addTask {
+            let fetched = try await self.fetchSegment(item.url)
+            guard !fetched.isEmpty, let crypt = item.segment.crypt else { return (index, fetched) }
+            return (index, try await self.decryptSegment(fetched, crypt: crypt, against: mediaURL))
         }
     }
 
@@ -337,7 +433,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     + "starting companion reader on \(audioURL.lastPathComponent)",
                     category: .engine
                 )
-                installCompanion(HLSLiveIngestReader(playlistURL: audioURL, role: .companionAudio))
+                installCompanion(HLSLiveIngestReader(playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio))
             }
             EngineLog.emit("[HLSIngest] master playlist: picked variant bandwidth=\(best.bandwidth)", category: .engine)
             return (url, nil)
@@ -381,9 +477,18 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
     }
 
+    /// Applies the configured origin headers to every ingest fetch. Internal for the header-contract tests.
+    func makeRequest(_ url: URL) -> URLRequest {
+        var request = URLRequest(url: url)
+        for (field, value) in httpHeaders {
+            request.setValue(value, forHTTPHeaderField: field)
+        }
+        return request
+    }
+
     /// Fetch + parse a playlist. Returns parsed playlist and final URL after redirects (relative segment URIs resolve against it).
     private func fetchPlaylist(_ url: URL) async throws -> (HLSPlaylist, URL) {
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await session.data(for: makeRequest(url))
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.playlistUnreachable(status: status)
@@ -399,7 +504,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         for attempt in 0..<3 {
             if Task.isCancelled { throw CancellationError() }
             do {
-                let (data, response) = try await session.data(from: url)
+                let (data, response) = try await session.data(for: makeRequest(url))
                 lastStatus = (response as? HTTPURLResponse)?.statusCode ?? -1
                 if (200..<300).contains(lastStatus) { return data }
                 if lastStatus == 404 { return Data() } // slid out of provider window; tracker advances regardless
@@ -432,7 +537,7 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
         let cacheKey = url.absoluteString
         if let cached = keyCacheLock.withLock({ keyCache[cacheKey] }) { return cached }
 
-        let (data, response) = try await session.data(from: url)
+        let (data, response) = try await session.data(for: makeRequest(url))
         let status = (response as? HTTPURLResponse)?.statusCode ?? -1
         guard (200..<300).contains(status) else {
             throw HLSIngestError.segmentDecryptFailed(reason: "key fetch HTTP \(status)")

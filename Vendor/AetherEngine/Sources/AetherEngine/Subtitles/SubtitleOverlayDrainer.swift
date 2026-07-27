@@ -43,4 +43,13 @@ enum SubtitleOverlayDrainer {
         }
         return .decode(from: cursor.lastDecodedPts.nextUp, through: through)
     }
+
+    /// Whether a reconstruction pass should be finalized after its drain window has decoded.
+    /// A renderable composition at/after the playhead ends the pass inside
+    /// `admitDuringReconstruction`. If the pass is still active with a seeded candidate, only
+    /// non-rendering packets such as a PGS clear were decoded ahead, or no successor was present.
+    static func shouldFinalizeReconstruction(reconstructing: Bool,
+                                             hasCandidate: Bool) -> Bool {
+        reconstructing && hasCandidate
+    }
 }

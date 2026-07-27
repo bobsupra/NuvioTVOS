@@ -19,12 +19,11 @@ struct PlayerSidePanelChrome<Content: View>: View {
 
     var body: some View {
         HStack(spacing: 0) {
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.3)],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-            .allowsHitTesting(false)
+            // Nothing is drawn beside the panel: any scrim here is laid out
+            // inside the safe area (the chrome only ignores the trailing edge),
+            // so it renders as a dimmed rectangle with visible seams at the
+            // screen's left and bottom instead of a full-bleed wash.
+            Spacer(minLength: 0)
 
             VStack(alignment: .leading, spacing: 20) {
                 Text(title)
@@ -51,7 +50,6 @@ struct PlayerSidePanelChrome<Content: View>: View {
             .padding(.trailing, 12)
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
-        .background(Color.black.opacity(0.1).ignoresSafeArea())
         .ignoresSafeArea(edges: .trailing)
         .transition(.move(edge: .trailing).combined(with: .opacity))
         .onExitCommand(perform: onExit)

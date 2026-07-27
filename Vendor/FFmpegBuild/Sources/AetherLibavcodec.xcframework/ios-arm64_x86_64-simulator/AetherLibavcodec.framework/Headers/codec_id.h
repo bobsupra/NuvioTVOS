@@ -21,8 +21,8 @@
 #ifndef AVCODEC_CODEC_ID_H
 #define AVCODEC_CODEC_ID_H
 
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/samplefmt.h>
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/samplefmt.h"
 
 #include "version_major.h"
 

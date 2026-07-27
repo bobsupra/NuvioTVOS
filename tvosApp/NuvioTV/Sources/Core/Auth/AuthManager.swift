@@ -16,6 +16,17 @@ final class AuthManager: ObservableObject {
     // Global auth state.
     @Published private(set) var authState: AuthState = .loading
 
+    /// The stored session is dead and only a fresh sign-in can revive it: the
+    /// server refused the refresh token itself.
+    ///
+    /// Deliberately not the same as `.signedOut` — the account, its profiles and
+    /// all local data are still here, and the user is still "signed in" as far
+    /// as this Apple TV is concerned. What stopped working is sync, and without
+    /// this flag it stops *silently*: every request answers "JWT expired", the
+    /// pull never applies anything, and Home renders an account that looks empty
+    /// rather than one that needs signing in again.
+    @Published private(set) var sessionNeedsReauthentication = false
+
     // QR login UI state.
     @Published var qrImage: UIImage?
     @Published var qrCode: String?
@@ -107,6 +118,12 @@ final class AuthManager: ObservableObject {
             // existing token below when refreshing is temporarily unavailable.
             if let refreshed = await refreshSessionForSync() {
                 candidate = refreshed
+            } else if sessionNeedsReauthentication {
+                // The refresh token was refused outright. Handing the caller a
+                // token that is past its own expiry only buys one "JWT expired"
+                // per request, which is what made a dead session look like an
+                // empty account.
+                return nil
             }
         }
         guard validateWithServer else { return candidate }
@@ -114,9 +131,12 @@ final class AuthManager: ObservableObject {
         do {
             _ = try await service.getUser(accessToken: candidate.accessToken)
             return candidate
-        } catch let error as AuthError where error.statusCode == 401 {
+        } catch let error as AuthError where Self.isCredentialRejection(error) {
             // The server is authoritative. A token can be revoked/rejected
-            // before its locally stored expiry, so refresh once on a real 401.
+            // before its locally stored expiry, so refresh once on a real
+            // rejection. Matching 401 alone was not enough: GoTrue answers 403
+            // (`bad_jwt`) for an expired access token, which fell through to the
+            // permissive branch below and kept the dead token in play.
             guard !attemptedRefresh else { return nil }
             return await refreshSessionForSync()
         } catch {
@@ -124,6 +144,16 @@ final class AuthManager: ObservableObject {
             // session; the sync request will surface its own network failure.
             return candidate
         }
+    }
+
+    /// Whether a failure means the credential itself was refused, as opposed to
+    /// the request never reaching a verdict. GoTrue answers 400 (`invalid_grant`)
+    /// or 401 for a refused refresh token and 403 (`bad_jwt`) for an expired
+    /// access token; PostgREST answers 401. Anything else — offline, DNS, 5xx —
+    /// says nothing about the session and must never cost the user their login.
+    private static func isCredentialRejection(_ error: AuthError) -> Bool {
+        guard let statusCode = error.statusCode else { return false }
+        return [400, 401, 403].contains(statusCode)
     }
 
     func refreshSessionForSync() async -> AuthSession? {
@@ -136,8 +166,18 @@ final class AuthManager: ObservableObject {
         }
 
         guard let session = currentSessionForSync() else { return nil }
-        let task = Task { [service] in
-            try? await service.refresh(refreshToken: session.refreshToken)
+        let task = Task { [weak self, service] () -> AuthSession? in
+            do {
+                return try await service.refresh(refreshToken: session.refreshToken)
+            } catch {
+                // Only the server refusing the refresh token is fatal: a TV that
+                // is merely offline must not be told to sign in again.
+                if let authError = error as? AuthError, Self.isCredentialRejection(authError) {
+                    self?.sessionNeedsReauthentication = true
+                    print("Nuvio session cannot be renewed (\(authError.message)). Sign in again to resume sync.")
+                }
+                return nil
+            }
         }
         refreshTask = task
         guard let refreshed = await task.value else {
@@ -154,6 +194,8 @@ final class AuthManager: ObservableObject {
 
     private func apply(session: AuthSession) {
         currentSession = session
+        // A working session, however it was obtained, retires the warning.
+        sessionNeedsReauthentication = false
         if !store.save(session) {
             // Do not strand a successful login on Home just because secure
             // persistence is unavailable in this simulator/install. The live
@@ -183,6 +225,7 @@ final class AuthManager: ObservableObject {
         store.clear()
         store.didSkipLogin = false
         clearQrState()
+        sessionNeedsReauthentication = false
         authState = .signedOut
         Task {
             if let accessToken = session?.accessToken {

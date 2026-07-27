@@ -5,6 +5,7 @@
 //  Reusable poster card component for iOS/tvOS
 //
 
+import CryptoKit
 import ImageIO
 import SwiftUI
 #if canImport(UIKit)
@@ -176,7 +177,7 @@ struct PosterCard: View {
 
     private var placeholderView: some View {
         ArtworkPlaceholder(
-            isAwaitingArtwork: imageUrl?.isEmpty == false,
+            hasArtworkURL: imageUrl?.isEmpty == false,
             cornerRadius: cardCornerRadius
         )
     }
@@ -476,6 +477,136 @@ struct PosterCard: View {
     #endif
 }
 
+#if os(tvOS)
+/// Poster tile for the full-width grids — Search results and the Grid Home
+/// previews — so both read as one card: art that lifts and outlines on focus,
+/// plus the two-line title/subtitle pair when poster labels are on.
+///
+/// Distinct from `PosterCard`, which is the row-strip card: that one also has to
+/// expand to landscape artwork, carry Continue Watching progress, and stay
+/// cheap while a whole strip of it is mounted, so it deliberately stays flatter.
+struct PosterGridCard: View {
+    let meta: NuvioMeta
+    var width: CGFloat = 210
+    var height: CGFloat = 315
+    var externalFocus: FocusState<String?>.Binding? = nil
+    /// Defaults to `meta.id`. Home passes a section-scoped key, since the same
+    /// title can appear in more than one catalog.
+    var focusValue: String? = nil
+    var retainFocusAppearance = false
+    /// Pre-resolved watched state; `nil` lets the badge look it up itself.
+    var isWatched: Bool? = nil
+    var shouldRequestInitialFocus = false
+    var onInitialFocusRequested: (() -> Void)? = nil
+    var onFocus: ((NuvioMeta) -> Void)? = nil
+    var onLongPress: (() -> Void)? = nil
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+    @State private var didRequestInitialFocus = false
+    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    private var showsFocusedAppearance: Bool { focused || retainFocusAppearance }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: 16, style: .continuous)
+    }
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 12) {
+                CachedPosterArtwork(
+                    urlString: meta.posterUrl,
+                    preloadURLString: nil,
+                    width: width,
+                    height: height,
+                    maximumWidth: width,
+                    minimumSwapDelay: 0,
+                    onPreloadFinished: {}
+                ) {
+                    placeholder
+                }
+                .frame(width: width, height: height)
+                .clipShape(shape)
+                .overlay(alignment: .topTrailing) {
+                    if let isWatched {
+                        if isWatched { WatchedCheckmarkIcon() }
+                    } else {
+                        WatchedCheckmarkBadge(meta: meta)
+                    }
+                }
+                .overlay(
+                    shape.stroke(
+                        showsFocusedAppearance ? AppFocusOutline.color : .clear,
+                        lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                    )
+                )
+                .shadow(
+                    color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2),
+                    radius: showsFocusedAppearance ? 16 : 6
+                )
+
+                if posterLabels {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text(meta.name)
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
+                            .lineLimit(1)
+                        Text(subtitle)
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white.opacity(0.45))
+                            .lineLimit(1)
+                    }
+                    .frame(width: width, alignment: .leading)
+                }
+            }
+            .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: focusValue ?? meta.id))
+        .focusEffectDisabledIfAvailable()
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
+        )
+        .onChange(of: focused) { isFocused in
+            if isFocused { onFocus?(meta) }
+        }
+        .onAppear {
+            guard shouldRequestInitialFocus, !didRequestInitialFocus else { return }
+            didRequestInitialFocus = true
+            onInitialFocusRequested?()
+            DispatchQueue.main.async { focused = true }
+        }
+        .animation(
+            smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil,
+            value: showsFocusedAppearance
+        )
+    }
+
+    private var placeholder: some View {
+        ZStack {
+            Rectangle().fill(Color.white.opacity(0.07))
+            Image(systemName: meta.type == "series" ? "tv" : "film")
+                .font(.system(size: 40))
+                .foregroundColor(.white.opacity(0.25))
+        }
+    }
+
+    private var subtitle: String {
+        let typeLabel = meta.type == "series"
+            ? L10n.string("type_series", fallback: "Series")
+            : L10n.string("type_movie", fallback: "Movie")
+        var parts: [String] = [typeLabel]
+        if let year = meta.year { parts.append(String(year)) }
+        if let rating = meta.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
+        return parts.joined(separator: "  ·  ")
+    }
+}
+#endif
+
 #if canImport(UIKit)
 /// Liquid Glass surface shared by collection folder covers and loading cards, so
 /// the two cannot drift apart. tvOS 26+ uses real `glassEffect`; older systems
@@ -502,13 +633,45 @@ struct LiquidGlassSurface: ViewModifier {
     }
 }
 
-/// What a card shows before its artwork arrives.
+/// A card standing in for one whose row has no data yet.
 ///
-/// Distinguishes waiting from having nothing to wait for: a card whose title has
-/// no poster URL will never fill in, so spinning on it forever would be a lie.
-/// Only a card with artwork still in flight gets the activity indicator.
+/// This is the one place a spinner still belongs: the row's catalog request is
+/// genuinely outstanding and will either answer or fail, unlike a single poster
+/// URL that can hang forever with nothing left to report. Shares the glass
+/// surface with `ArtworkPlaceholder` so a loading row and a loaded one read as
+/// the same material.
+struct LoadingPosterCard: View {
+    let width: CGFloat
+    let height: CGFloat
+    var cornerRadius: CGFloat = 16
+
+    var body: some View {
+        ZStack {
+            Color.clear
+
+            ProgressView()
+                .progressViewStyle(.circular)
+                .tint(.white.opacity(0.55))
+        }
+        .frame(width: width, height: height)
+        .modifier(LiquidGlassSurface(cornerRadius: cornerRadius))
+        .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
+    }
+}
+
+/// What a card shows when it has no artwork on screen.
+///
+/// Matches the Android app, where `AsyncImage` is given the same flat card
+/// painter for `placeholder`, `error` and `fallback`: loading and failed look
+/// identical, so a poster that never arrives is a quiet empty card rather than
+/// a spinner with no exit. An add-on that generates art on demand answers some
+/// titles in milliseconds and others never, and only the card knows which — a
+/// progress indicator promises an arrival nothing can guarantee.
+///
+/// A title with no artwork URL at all keeps the glyph, the same distinction
+/// Android draws with `MonochromePosterPlaceholder`.
 private struct ArtworkPlaceholder: View {
-    let isAwaitingArtwork: Bool
+    let hasArtworkURL: Bool
     let cornerRadius: CGFloat
 
     var body: some View {
@@ -517,11 +680,7 @@ private struct ArtworkPlaceholder: View {
             // the same surface a collection folder cover uses.
             Color.clear
 
-            if isAwaitingArtwork {
-                ProgressView()
-                    .progressViewStyle(.circular)
-                    .tint(.white.opacity(0.55))
-            } else {
+            if !hasArtworkURL {
                 Image(systemName: "photo")
                     .resizable()
                     .scaledToFit()
@@ -700,9 +859,15 @@ private actor PosterArtworkCache {
         }
 
         let task = Task.detached(priority: .utility) { () -> UIImage? in
-            guard let (data, _) = try? await URLSession.shared.data(from: url) else {
-                return nil
+            // Disk before network, like Coil. The bytes are keyed by URL alone,
+            // so one stored poster serves every size a card asks for.
+            if let stored = await PosterDiskCache.shared.data(for: url),
+               let image = downsamplePosterImage(data: stored, maxPixelSize: boundedPixelSize) {
+                return image
             }
+
+            guard let data = await downloadPosterData(url: url) else { return nil }
+            await PosterDiskCache.shared.store(data, for: url)
             return downsamplePosterImage(data: data, maxPixelSize: boundedPixelSize)
         }
 
@@ -715,6 +880,99 @@ private actor PosterArtworkCache {
         }
         return image
     }
+}
+
+/// Poster bytes that survive relaunch, mirroring the Android image loader's
+/// 200 MB Coil disk cache.
+///
+/// tvOS gives `URLCache` no disk store, so without this every cold start
+/// re-requests every poster. Against an add-on that renders art on demand that
+/// also re-triggers every slow generation, which is why the same Home looks
+/// worse on Apple TV than on Android for identical add-ons. Stored raw and
+/// keyed by URL alone — decoding happens per card, at that card's size.
+private actor PosterDiskCache {
+    static let shared = PosterDiskCache()
+
+    private let directory: URL
+    private let maximumBytes = 200 * 1024 * 1024
+    private let fileManager = FileManager.default
+    /// Walking the directory on every write would cost more than the eviction
+    /// saves, so the sweep runs once per batch of new artwork.
+    private var bytesWrittenSinceTrim = 0
+    private let trimInterval = 20 * 1024 * 1024
+
+    init() {
+        let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
+        directory = caches.appendingPathComponent("poster_artwork", isDirectory: true)
+        try? fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
+    }
+
+    func data(for url: URL) -> Data? {
+        let file = fileURL(for: url)
+        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else { return nil }
+        // Touch on read so eviction keeps what is actually being looked at
+        // rather than merely what was fetched most recently.
+        try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
+        return data
+    }
+
+    func store(_ data: Data, for url: URL) {
+        try? data.write(to: fileURL(for: url), options: .atomic)
+
+        bytesWrittenSinceTrim += data.count
+        guard bytesWrittenSinceTrim >= trimInterval else { return }
+        bytesWrittenSinceTrim = 0
+        trim()
+    }
+
+    private func fileURL(for url: URL) -> URL {
+        // A poster URL can carry query parameters and characters a file name
+        // cannot, so hash it rather than sanitising it.
+        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        return directory.appendingPathComponent(digest.map { String(format: "%02x", $0) }.joined())
+    }
+
+    private func trim() {
+        let keys: [URLResourceKey] = [.contentModificationDateKey, .fileSizeKey]
+        guard let files = try? fileManager.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: keys
+        ) else {
+            return
+        }
+
+        var entries: [(url: URL, modified: Date, size: Int)] = []
+        var total = 0
+        for file in files {
+            guard let values = try? file.resourceValues(forKeys: Set(keys)),
+                  let size = values.fileSize else { continue }
+            entries.append((file, values.contentModificationDate ?? .distantPast, size))
+            total += size
+        }
+
+        guard total > maximumBytes else { return }
+        for entry in entries.sorted(by: { $0.modified < $1.modified }) {
+            guard total > maximumBytes else { break }
+            try? fileManager.removeItem(at: entry.url)
+            total -= entry.size
+        }
+    }
+}
+
+/// Matches what the Android loader gets from OkHttp's defaults: a 10s ceiling
+/// instead of `URLSession`'s 60s, and a non-2xx response treated as a failure
+/// instead of being handed to the decoder as if it were image bytes.
+private func downloadPosterData(url: URL) async -> Data? {
+    var request = URLRequest(url: url)
+    request.timeoutInterval = 10
+
+    guard let (data, response) = try? await URLSession.shared.data(for: request) else {
+        return nil
+    }
+    if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
+        return nil
+    }
+    return data.isEmpty ? nil : data
 }
 
 private func downsamplePosterImage(data: Data, maxPixelSize: Int) -> UIImage? {

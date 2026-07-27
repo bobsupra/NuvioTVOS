@@ -1,10 +1,16 @@
 import SwiftUI
 import UIKit
 
+/// Same poster geometry as the See All catalog and Grid Home. Seven columns fit
+/// only because of `pageInset` — the old 80pt inset left room for six.
 private enum SearchGridMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
+    /// Leading/trailing inset for the whole screen. With the grid's own 12pt
+    /// (which keeps a focused card's 1.06 scale from clipping) this is the 48pt
+    /// gutter Grid Home uses, so posters line up across the two screens.
+    static let pageInset: CGFloat = 36
 }
 
 struct SearchView: View {
@@ -30,6 +36,7 @@ struct SearchView: View {
     @State private var searchTextInputActive = false
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
 
     init(viewModel: SearchViewModel, showDiscover: Bool = true, onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil) {
         _viewModel = StateObject(wrappedValue: viewModel)
@@ -78,7 +85,7 @@ struct SearchView: View {
                     }
                 }
             }
-            .padding(.horizontal, 80)
+            .padding(.horizontal, SearchGridMetrics.pageInset)
             .padding(.top, 56)
             // Let the results viewport use the space below tvOS's bottom safe
             // area instead of leaving a black bar at the screen edge.
@@ -213,7 +220,7 @@ struct SearchView: View {
 
             Spacer()
 
-            if !viewModel.results.isEmpty {
+            if !visibleResults.isEmpty {
                 Text(resultsCountLabel)
                     .font(.system(size: 22, weight: .medium))
                     .foregroundColor(.white.opacity(0.5))
@@ -222,6 +229,11 @@ struct SearchView: View {
     }
 
     // MARK: - Results / states
+
+    private var visibleResults: [NuvioMeta] {
+        guard hideUnreleased else { return viewModel.results }
+        return viewModel.results.filter { !ContentReleasePolicy.isUnreleased($0) }
+    }
 
     @ViewBuilder
     private var resultsContainer: some View {
@@ -235,7 +247,7 @@ struct SearchView: View {
             centeredState {
                 messageState(icon: "wifi.exclamationmark", title: error)
             }
-        } else if viewModel.results.isEmpty {
+        } else if visibleResults.isEmpty {
             centeredState {
                 messageState(
                     icon: "magnifyingglass",
@@ -253,7 +265,7 @@ struct SearchView: View {
     }
 
     private var resultsCountLabel: String {
-        let count = viewModel.results.count
+        let count = visibleResults.count
         if count == 1 {
             return L10n.format("tvos_search_result_count_one", fallback: "%d result", count)
         }
@@ -263,9 +275,11 @@ struct SearchView: View {
     private var resultsGrid: some View {
         ScrollView {
             LazyVGrid(columns: gridColumns, alignment: .leading, spacing: SearchGridMetrics.posterGap) {
-                ForEach(viewModel.results) { item in
-                    SearchResultCard(
+                ForEach(visibleResults) { item in
+                    PosterGridCard(
                         meta: item,
+                        width: SearchGridMetrics.posterWidth,
+                        height: SearchGridMetrics.posterHeight,
                         externalFocus: $focusedResultID,
                         retainFocusAppearance: overlayRestoreResultID == item.id,
                         onLongPress: onLongPress.map { cb in { cb(item) } }
@@ -289,10 +303,10 @@ struct SearchView: View {
     private var defaultResultFocusID: String? {
         if shouldRestoreResultFocus,
            let saved = lastFocusedResultID,
-           viewModel.results.contains(where: { $0.id == saved }) {
+           visibleResults.contains(where: { $0.id == saved }) {
             return saved
         }
-        return viewModel.results.first?.id
+        return visibleResults.first?.id
     }
 
     private var gridColumns: [GridItem] {
@@ -376,88 +390,6 @@ struct SearchView: View {
 }
 
 // MARK: - Result card
-
-private struct SearchResultCard: View {
-    let meta: NuvioMeta
-    var externalFocus: FocusState<String?>.Binding? = nil
-    var retainFocusAppearance = false
-    var onLongPress: (() -> Void)? = nil
-    let action: () -> Void
-    @FocusState private var focused: Bool
-    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
-    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
-    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
-
-    var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 12) {
-                AsyncImage(url: URL(string: meta.posterUrl ?? "")) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } else {
-                        ZStack {
-                            Rectangle().fill(Color.white.opacity(0.07))
-                            Image(systemName: meta.type == "series" ? "tv" : "film")
-                                .font(.system(size: 40))
-                                .foregroundColor(.white.opacity(0.25))
-                        }
-                    }
-                }
-                .frame(width: SearchGridMetrics.posterWidth, height: SearchGridMetrics.posterHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                .overlay(alignment: .topTrailing) {
-                    WatchedCheckmarkBadge(meta: meta)
-                }
-                .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(showsFocusedAppearance ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
-                )
-                .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
-
-                if posterLabels {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(meta.name)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
-                            .lineLimit(1)
-                        Text(subtitle)
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.white.opacity(0.45))
-                            .lineLimit(1)
-                    }
-                    .frame(width: SearchGridMetrics.posterWidth, alignment: .leading)
-                }
-            }
-            .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($focused)
-        .modifier(ExternalFocusBinding(binding: externalFocus, id: meta.id))
-        .focusEffectDisabledIfAvailable()
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
-        )
-        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
-    }
-
-    private var subtitle: String {
-        let typeLabel = meta.type == "series"
-            ? L10n.string("type_series", fallback: "Series")
-            : L10n.string("type_movie", fallback: "Movie")
-        var parts: [String] = [typeLabel]
-        if let year = meta.year { parts.append(String(year)) }
-        if let rating = meta.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
-        return parts.joined(separator: "  ·  ")
-    }
-
-    private var focusBorderColor: Color {
-        AppFocusOutline.color
-    }
-
-    private var showsFocusedAppearance: Bool {
-        focused || retainFocusAppearance
-    }
-}
 
 // MARK: - Hidden text input
 

@@ -16,6 +16,8 @@ struct ForwardBufferWindowTests {
         #expect(HLSVideoEngine.clampedForwardWindow(4) == 4)
         #expect(HLSVideoEngine.clampedForwardWindow(50) == 50)
         #expect(HLSVideoEngine.clampedForwardWindow(150) == 150)
+        #expect(HLSVideoEngine.clampedForwardWindow(900) == 900)
+        #expect(HLSVideoEngine.clampedForwardWindow(2700) == 2700)
     }
 
     @Test("values below the floor clamp up to 4 (AVPlayer prefetch would starve)")
@@ -25,10 +27,10 @@ struct ForwardBufferWindowTests {
         #expect(HLSVideoEngine.clampedForwardWindow(-5) == 4)
     }
 
-    @Test("values above the ceiling clamp down to 150 (disk/demux cost)")
+    @Test("values above the sanity ceiling clamp down to 2700 (~3 h, whole-film bound)")
     func aboveCeilingClampsDown() {
-        #expect(HLSVideoEngine.clampedForwardWindow(151) == 150)
-        #expect(HLSVideoEngine.clampedForwardWindow(1000) == 150)
+        #expect(HLSVideoEngine.clampedForwardWindow(2701) == 2700)
+        #expect(HLSVideoEngine.clampedForwardWindow(Int.max) == 2700)
     }
 
     @Test("LoadOptions defaults forwardBufferSegments to nil")

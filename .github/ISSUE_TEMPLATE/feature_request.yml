@@ -27,12 +27,12 @@ body:
         - Watch Progress
         - Subtitles
         - Audio
-        - Navigation / Gestures
+        - Navigation / Siri Remote
         - UI / Layout
         - Settings
         - Sync (Trakt / remote)
         - Downloads / Offline
-        - Platform-specific (iOS only / Android only / Desktop only)
+        - tvOS / Apple TV integration
         - Other
     validations:
       required: true

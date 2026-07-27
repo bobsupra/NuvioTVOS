@@ -87,21 +87,21 @@ s#    ff_objc_release\(&encoder\);\n    ff_objc_release\(&buffer\);\n\}#    } //
 }
 
 patch_ffmpeg_pgssub() {
-    # AetherEngine #142: pgssubdec flushes retained palettes/objects for ANY
-    # composition_state != Normal (0), including 0xC0 Epoch Continue. Per the PGS
-    # semantics, Epoch Continue means the previous epoch CONTINUES across a
-    # connection point, so retained decoder state stays valid; a bare
-    # Epoch-Continue display set (PCS+WDS+END, no PDS/ODS retransmit) references
-    # that state. With the upstream flush it fails find_palette ("Invalid palette
-    # id 0"), the whole set is dropped, and since PGS end times are closed by the
-    # successor cue the predecessor cue overstays. Skip the flush for Epoch
-    # Continue only: Acquisition Point (1) and Epoch Start (2) are self-contained
-    # restatements, their flush stays correct.
+    # AetherEngine #142 (rationale aligned with FFmpeg PR 23851 review): an
+    # Epoch Continue set marks a seamless connection between two clips. A
+    # conformant set re-conveys the palettes/objects it references (overwriting
+    # the cached entries before END resolves anything), so skipping the flush
+    # is output-neutral for conformant streams. A non-conformant bare
+    # PCS+WDS+END continue set relying on retained state, however, fails
+    # find_palette ("Invalid palette id 0") under the upstream flush, the whole
+    # set is dropped, and since PGS end times are closed by the successor cue
+    # the predecessor cue overstays. Keep the cache on Epoch Continue as error
+    # resilience; Acquisition Point (1) and Epoch Start (2) still flush.
     local F="${FFMPEG_SRC}/libavcodec/pgssubdec.c"
     grep -q "epoch-continue" "${F}" && return
     echo "→ Patching FFmpeg: retain pgssubdec state across Epoch Continue (AetherEngine #142)"
     perl -0777 -pi -e '
-s#    state = bytestream_get_byte\(&buf\) >> 6;\n    if \(state != 0\) \{\n        flush_cache\(avctx\);\n    \}#    state = bytestream_get_byte(&buf) >> 6;\n    if (state != 0 \&\& state != 3) {\n        /* epoch-continue (3) continues the previous epoch: retained palettes\n         * and objects stay valid and a bare PCS+WDS+END set references them,\n         * so only acquisition point (1) and epoch start (2) release the cache.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142). */\n        flush_cache(avctx);\n    }#;
+s#    state = bytestream_get_byte\(&buf\) >> 6;\n    if \(state != 0\) \{\n        flush_cache\(avctx\);\n    \}#    state = bytestream_get_byte(&buf) >> 6;\n    if (state != 0 \&\& state != 3) {\n        /* epoch-continue (3): seamless connection between two clips; a\n         * conformant set re-conveys the data it references (overwriting the\n         * cached entries), while non-conformant bare PCS+WDS+END sets rely on\n         * the retained state, so keep the cache; only acquisition point (1)\n         * and epoch start (2) release it.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142). */\n        flush_cache(avctx);\n    }#;
 ' "${F}"
     if ! grep -q "epoch-continue" "${F}"; then
         echo "ERROR: pgssubdec epoch-continue patch did not apply (upstream source changed?)"
@@ -110,26 +110,23 @@ s#    state = bytestream_get_byte\(&buf\) >> 6;\n    if \(state != 0\) \{\n     
 }
 
 patch_ffmpeg_matroska_tts() {
-    # AetherEngine #145: matroskadec handles TrackTimestampScale != 1 incoherently.
-    # read_header bakes the scale into the stream time_base (segment scale x TTS)
-    # but matroska_parse_block divides only the CLUSTER component by it
-    # (cluster_time / track->time_scale + block_time), so packets land on a
-    # hybrid axis: seconds = cluster + rel x TTS. Neither the unscaled nor the
-    # fully scaled axis; non-monotonic in storage order once a late-rel block
-    # precedes an early-rel block of the next cluster, and completely silent.
-    # TrackTimestampScale is deprecated (RFC 9559 caps it at Matroska v3) and
-    # matroska.org documents that most readers ignore it, so a real-world
-    # non-1.0 value is almost always muxer damage; full spec scaling would
-    # desync the track from its siblings instead of playing it correctly.
-    # Clamp any non-1.0 value to 1.0 with a warning, extending upstream's own
-    # "< 0.01" clamp in the same spot: every track stays on the coherent,
-    # monotonic segment axis (cluster + rel), in sync with its sibling tracks,
-    # and the deviation is no longer silent.
+    # AetherEngine #145, reworked after upstream review (FFmpeg PR 23852):
+    # RFC 9559 (11.1.3, 11.2, 5.1.3.5.3) puts Block/SimpleBlock relative
+    # timestamps and BlockDuration in Track Ticks, so absolute time is
+    # (cluster + rel x TTS) x TimestampScale, and upstream matroskadec
+    # implements exactly that. The earlier clamp here (any TTS != 1 forced to
+    # 1.0) rested on a wrong reading of the RFC and would mistime a conformant
+    # TTS != 1 file; the file that motivated it was authored on the segment
+    # axis (invalid per RFC). What remains worth carrying: TTS != 1 is
+    # deprecated (maxver 3), many readers ignore it, and a file carrying it may
+    # have been authored against such readers. Emit a warning next to
+    # upstream's own "< 0.01" guard so the condition is visible; timestamp
+    # behavior stays RFC.
     local F="${FFMPEG_SRC}/libavformat/matroskadec.c"
     grep -q "AetherEngine issue 145" "${F}" && return
-    echo "→ Patching FFmpeg: clamp matroska TrackTimestampScale != 1 to the segment axis (AetherEngine #145)"
+    echo "→ Patching FFmpeg: warn on matroska TrackTimestampScale != 1 (AetherEngine #145)"
     perl -0777 -pi -e '
-s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1\.0\.\\n",\n                   track->time_scale\);\n            track->time_scale = 1\.0;\n        \}#        if (track->time_scale != 1.0) {\n            /* TrackTimestampScale != 1 is deprecated (RFC 9559, maxver 3) and\n             * the handling below is incoherent: the stream time_base bakes the\n             * scale in while matroska_parse_block divides only the cluster\n             * component by it, so packets land on a hybrid axis\n             * (cluster + rel * scale), non-monotonic in storage order. Clamp\n             * to 1.0: every track stays on the coherent segment axis, in sync\n             * with its sibling tracks, and the deviation is logged. See\n             * FFmpegBuild build.sh patch_ffmpeg_matroska_tts (AetherEngine issue 145). */\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "TrackTimestampScale %f not supported, assuming 1.0 "\n                   "(timestamps stay on the segment axis).\\n",\n                   track->time_scale);\n            track->time_scale = 1.0;\n        }#;
+s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1\.0\.\\n",\n                   track->time_scale\);\n            track->time_scale = 1\.0;\n        \}#        if (track->time_scale < 0.01) {\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "Track TimestampScale too small %f, assuming 1.0.\\n",\n                   track->time_scale);\n            track->time_scale = 1.0;\n        } else if (track->time_scale != 1.0) {\n            /* Applied per RFC 9559: block timestamps and BlockDuration are\n             * Track Ticks, scaled against the segment axis. The element is\n             * deprecated (maxver 3) and many readers ignore it, so a file\n             * carrying it may have been authored against such readers; surface\n             * it instead of staying silent. See FFmpegBuild build.sh\n             * patch_ffmpeg_matroska_tts (AetherEngine issue 145). */\n            av_log(matroska->ctx, AV_LOG_WARNING,\n                   "TrackTimestampScale %f applied per RFC 9559; many readers "\n                   "ignore this element and files may be authored against them.\\n",\n                   track->time_scale);\n        }#;
 ' "${F}"
     if ! grep -q "AetherEngine issue 145" "${F}"; then
         echo "ERROR: matroska TrackTimestampScale patch did not apply (upstream source changed?)"

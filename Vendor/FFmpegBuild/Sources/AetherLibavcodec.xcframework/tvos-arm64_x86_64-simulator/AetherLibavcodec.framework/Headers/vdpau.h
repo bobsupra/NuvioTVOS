@@ -51,8 +51,8 @@
 
 #include <vdpau/vdpau.h>
 
-#include <AetherLibavutil/avconfig.h>
-#include <AetherLibavutil/attributes.h>
+#include "AetherLibavutil/avconfig.h"
+#include "AetherLibavutil/attributes.h"
 
 #include "avcodec.h"
 

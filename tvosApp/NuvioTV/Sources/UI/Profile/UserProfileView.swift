@@ -232,7 +232,6 @@ struct AddProfileButton: View {
                             .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.3),
                                     lineWidth: isFocused ? AppFocusOutline.width : 2)
                     )
-                    .shadow(color: isFocused ? Color.white.opacity(0.3) : .clear, radius: 24)
 
                 Text("Add Profile")
                     .font(.custom("Inter-Bold", size: 28))
@@ -259,7 +258,7 @@ private struct ProfilePlainButtonStyle: ButtonStyle {
 /// One avatar from the account's shared catalog (`get_avatar_catalog`). The
 /// `id` is the server row referenced by `profiles.avatar_id`, so storing it
 /// keeps profile pushes within the `fk_profiles_avatar_id` foreign key.
-struct AvatarCatalogItem: Identifiable, Decodable {
+struct AvatarCatalogItem: Identifiable, Codable {
     let id: String
     let displayName: String
     let storagePath: String
@@ -290,10 +289,17 @@ struct AvatarCatalogItem: Identifiable, Decodable {
     }
 }
 
-/// Fetches the shared avatar catalog once and caches it for the session. Loads
-/// with the publishable key (no user session required), so avatars render on
-/// who's-watching even before the account sync runs. Backed by a shared
-/// singleton so every avatar surface resolves the same images.
+/// Fetches the shared avatar catalog and caches it. Loads with the publishable
+/// key (no user session required), so avatars render on who's-watching even
+/// before the account sync runs. Backed by a shared singleton so every avatar
+/// surface resolves the same images.
+///
+/// The catalog is also persisted between launches. It is small, static
+/// metadata, and without it a cold launch has no way to draw the active
+/// profile's avatar until a network round-trip finishes — which is invisible on
+/// who's-watching (the picker waits there anyway) but obvious when
+/// auto-select-last goes straight to Home and the sidebar shows the fallback
+/// person glyph.
 @MainActor
 final class AvatarCatalogStore: ObservableObject {
     static let shared = AvatarCatalogStore()
@@ -302,8 +308,25 @@ final class AvatarCatalogStore: ObservableObject {
     private var byId: [String: AvatarCatalogItem] = [:]
     private var isLoading = false
     private var hasLoaded = false
+    private var attempts = 0
 
-    private init() {}
+    /// Shared (not profile-scoped): the catalog is account-wide and identical
+    /// for every profile on the device.
+    private static let cacheKey = "nuvio.tv.avatarCatalog.v1"
+    /// A cold launch competing with the account pull can be rate limited, and
+    /// one silent failure used to mean no avatar for the rest of the session.
+    private static let maxAttempts = 4
+
+    private init() {
+        hydrateFromCache()
+    }
+
+    private func hydrateFromCache() {
+        guard let data = UserDefaults.standard.data(forKey: Self.cacheKey),
+              let cached = try? JSONDecoder().decode([AvatarCatalogItem].self, from: data),
+              !cached.isEmpty else { return }
+        apply(cached)
+    }
 
     func loadIfNeeded() {
         guard !hasLoaded, !isLoading, AuthConfig.isConfigured else { return }
@@ -311,8 +334,15 @@ final class AvatarCatalogStore: ObservableObject {
         Task { await load() }
     }
 
+    private func apply(_ catalog: [AvatarCatalogItem]) {
+        let sorted = catalog.sorted { $0.sortOrder < $1.sortOrder }
+        items = sorted
+        byId = Dictionary(sorted.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
     private func load() async {
         defer { isLoading = false }
+        attempts += 1
         guard let url = URL(string: "\(AuthConfig.normalizedAPIBaseURL)/rest/v1/rpc/get_avatar_catalog") else { return }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
@@ -325,16 +355,37 @@ final class AvatarCatalogStore: ObservableObject {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
                 print("Avatar catalog load failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
+                scheduleRetry()
                 return
             }
             let decoded = try JSONDecoder().decode([AvatarCatalogItem].self, from: data)
-            let sorted = decoded.sorted { $0.sortOrder < $1.sortOrder }
-            items = sorted
-            byId = Dictionary(sorted.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+            apply(decoded)
             hasLoaded = true
-            print("Avatar catalog loaded \(sorted.count) avatar(s).")
+            if let encoded = try? JSONEncoder().encode(items) {
+                UserDefaults.standard.set(encoded, forKey: Self.cacheKey)
+            }
+            print("Avatar catalog loaded \(items.count) avatar(s).")
         } catch {
             print("Avatar catalog load failed: \(error.localizedDescription)")
+            scheduleRetry()
+        }
+    }
+
+    /// Retries a failed fetch with a widening delay. A cold launch fires the
+    /// account pull, the Home catalogs and this within the same second, and the
+    /// backend answers the loser with 429 — which is worth waiting out rather
+    /// than leaving the profile without its picture until the app restarts.
+    private func scheduleRetry() {
+        guard attempts < Self.maxAttempts else {
+            print("Avatar catalog load gave up after \(attempts) attempt(s).")
+            return
+        }
+        let delay = Double(attempts) * 2
+        Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard let self, !self.hasLoaded else { return }
+            self.isLoading = true
+            await self.load()
         }
     }
 
@@ -415,8 +466,7 @@ struct ProfileAvatarView: View {
             Circle()
                 .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.28), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
-        .shadow(color: isFocused ? Color.white.opacity(0.3) : .black.opacity(0.24),
-                radius: isFocused ? 24 : 10, x: 0, y: 8)
+        .shadow(color: .black.opacity(0.24), radius: isFocused ? 24 : 10, x: 0, y: 8)
         .onAppear { catalog.loadIfNeeded() }
     }
 }

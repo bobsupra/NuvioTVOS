@@ -11,7 +11,7 @@ import AetherLibavcodec
 /// pgssubdec patch that skips the flush for Epoch Continue only; Epoch Start and Acquisition Point
 /// keep flushing (both are self-contained restatements by spec, the flush is safe there).
 ///
-/// These tests drive the shipped Libavcodec pgssub decoder directly with synthetic display sets, the
+/// These tests drive the shipped AetherLibavcodec pgssub decoder directly with synthetic display sets, the
 /// same call path EmbeddedSubtitleDecoder uses.
 struct Issue142PGSEpochContinueTests {
 

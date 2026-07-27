@@ -33,9 +33,9 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <AetherLibavutil/buffer.h>
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/buffer.h"
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/rational.h"
 #include "version_major.h"
 
 /** Data type identifiers for TIFF tags */

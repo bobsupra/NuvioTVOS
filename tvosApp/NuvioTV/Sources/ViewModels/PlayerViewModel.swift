@@ -266,11 +266,19 @@ class PlayerViewModel: ObservableObject {
 
     /// True while a mid-session source switch is resolving/loading.
     @Published private(set) var isSwitchingSource = false
+    /// What that switch is doing, shown beside the loading spinner.
+    @Published private(set) var switchingSourceMessage = "Trying next source…"
     /// Brief on-screen notice ("Source failed — trying another").
     @Published var playerToast: String?
     /// URLs that failed to load/play this session (watchdog, mpv error, slate).
     private var failedStreamURLs: Set<String> = []
     private var currentLoadStarted = false
+    /// True from the moment a new URL is applied until that stream actually
+    /// starts. The engine reports neither "loading" nor "playing" while it tears
+    /// the old pipeline down and opens the new one, which the poll would
+    /// otherwise read as `.paused` — a black screen with no spinner, and the
+    /// pause metadata sheet arming behind it.
+    private var isAwaitingStreamStart = false
     private var loadWatchdogTask: Task<Void, Never>?
     private var isFailingOver = false
     private var toastClearTask: Task<Void, Never>?
@@ -470,6 +478,7 @@ class PlayerViewModel: ObservableObject {
         self.title = meta.name
         self.subtitle = subtitle
         self.status = .buffering
+        self.isAwaitingStreamStart = true
         // A replaced file keeps the previous file's position/duration cached in
         // the controller until mpv publishes the new timeline. Clear the public
         // timeline now so end-of-episode UI cannot be re-armed for the new episode.
@@ -828,7 +837,8 @@ class PlayerViewModel: ObservableObject {
                     duration: time.duration,
                     season: next.season,
                     episode: next.episode,
-                    released: next.released
+                    released: next.released,
+                    seedSeason: resolvedEpisodeNumbers?.season
                 )
             }
         }
@@ -902,6 +912,7 @@ class PlayerViewModel: ObservableObject {
         isReloadingStream = false
         isFailingOver = false
         isSwitchingSource = false
+        isAwaitingStreamStart = false
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
         autoHiddenNextEpisodeCard = false
@@ -987,6 +998,8 @@ class PlayerViewModel: ObservableObject {
         isFailingOver = true
         isReloadingStream = true
         isSwitchingSource = true
+        switchingSourceMessage = "Trying next source…"
+        isAwaitingStreamStart = true
         reloadAttempts += 1
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
@@ -1174,7 +1187,8 @@ class PlayerViewModel: ObservableObject {
                             duration: max(time.duration, 120),
                             season: next.season,
                             episode: next.episode,
-                            released: next.released
+                            released: next.released,
+                            seedSeason: resolvedEpisodeNumbers?.season
                         )
                     }
                 }
@@ -1199,28 +1213,35 @@ class PlayerViewModel: ObservableObject {
 
         let previousStatus = status
 
-        let latestStatus: PlayerStatus
+        let engineStatus: PlayerStatus
         if !c.currentErrorMessage.isEmpty {
-            latestStatus = .error(c.currentErrorMessage)
+            engineStatus = .error(c.currentErrorMessage)
         } else if c.isPlayerEnded {
-            latestStatus = .ended
+            engineStatus = .ended
         } else if c.isPlayerLoading {
-            latestStatus = .buffering
+            engineStatus = .buffering
         } else if c.isPlayerPlaying {
-            latestStatus = .playing
+            engineStatus = .playing
         } else {
-            latestStatus = .paused
+            engineStatus = .paused
         }
+        // First real frames/audio — disarm the load watchdog. Keyed off the raw
+        // engine status so the mapping below can't hide the start.
+        if engineStatus == .playing || (engineStatus == .paused && time.duration > 0 && !c.isPlayerLoading) {
+            isAwaitingStreamStart = false
+            markLoadStarted()
+        }
+
+        // A stream that was just handed to the engine hasn't opened yet, so the
+        // idle pipeline reads as paused. Keep reporting `.buffering` until it
+        // really starts, so a source/episode switch shows the spinner over the
+        // black frame instead of parked transport controls.
+        let latestStatus = (isAwaitingStreamStart && engineStatus == .paused) ? .buffering : engineStatus
         if status != latestStatus { status = latestStatus }
 
         #if DEBUG
         updatePlaybackDebugHUD(from: c)
         #endif
-
-        // First real frames/audio — disarm the load watchdog.
-        if status == .playing || (status == .paused && time.duration > 0 && !c.isPlayerLoading) {
-            markLoadStarted()
-        }
 
         // The controls are shown on launch (showControls defaults to true) but the
         // auto-hide timer is only armed by user transport actions. Arm it whenever
@@ -1317,6 +1338,7 @@ class PlayerViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: Self.pauseOverlayDelaySeconds * 1_000_000_000)
             guard !Task.isCancelled, let self else { return }
             guard self.status == .paused,
+                  !self.isAwaitingStreamStart,
                   !self.showSettingsPanel,
                   !self.isScrubbing,
                   self.subtitle != PlaybackMarkers.trailerSubtitle
@@ -1348,6 +1370,7 @@ class PlayerViewModel: ObservableObject {
         toastClearTask?.cancel()
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
+        isAwaitingStreamStart = false
         sidePanel = nil
         availableSources = []
         pendingSeekDelta = 0
@@ -2479,24 +2502,37 @@ class PlayerViewModel: ObservableObject {
         let resume = lastStablePlaybackTime?.current
             ?? (time.current > 10 ? time.current : nil)
         let subtitleLine = panelSourceSubtitleLine
-        isSwitchingSource = true
-        status = .buffering
-        engine.pausePlayback()
-        showPlayerToast("Switching source…")
+        beginSourceSwitch(message: "Switching source…")
+        // Drop the panel now, not after the resolve: it covers the whole screen,
+        // so leaving it up hides the spinner for the entire round trip.
+        closeSidePanel()
 
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isSwitchingSource = false }
             guard let prepared = await resolvePlaybackStream(stream, contentId, subtitleLine) else {
                 self.showPlayerToast("Couldn't open this source")
+                self.isAwaitingStreamStart = false
                 self.status = .paused
                 return
             }
             self.failedStreamURLs.removeAll()
             self.replaceStream(prepared: prepared, episode: nil, resumeFrom: resume)
-            self.closeSidePanel()
             self.showPlayerToast("Source switched")
         }
+    }
+
+    /// Shared entry for a user-initiated switch: park the engine and put the
+    /// player into a labelled loading state that stays up until the new stream
+    /// actually starts.
+    private func beginSourceSwitch(message: String) {
+        isSwitchingSource = true
+        switchingSourceMessage = message
+        isAwaitingStreamStart = true
+        status = .buffering
+        cancelPauseOverlaySchedule()
+        showPauseOverlay = false
+        engine.pausePlayback()
     }
 
     func selectEpisode(_ episode: NuvioVideo) {
@@ -2508,23 +2544,21 @@ class PlayerViewModel: ObservableObject {
             closeSidePanel()
             return
         }
-        isSwitchingSource = true
-        status = .buffering
-        engine.pausePlayback()
-        showPlayerToast("Loading episode…")
+        beginSourceSwitch(message: "Loading episode…")
+        closeSidePanel()
 
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isSwitchingSource = false }
             guard let prepared = await resolveNextStream(episode) else {
                 self.showPlayerToast("Couldn't load this episode")
+                self.isAwaitingStreamStart = false
                 self.status = .paused
                 return
             }
             self.failedStreamURLs.removeAll()
             self.availableSources = []
             self.replaceStream(prepared: prepared, episode: episode, resumeFrom: nil)
-            self.closeSidePanel()
         }
     }
 
@@ -2657,7 +2691,8 @@ class PlayerViewModel: ObservableObject {
                     duration: progressTime.duration,
                     season: nextEpisode.season,
                     episode: nextEpisode.episode,
-                    released: nextEpisode.released
+                    released: nextEpisode.released,
+                    seedSeason: resolvedEpisodeNumbers?.season
                 )
             }
             lastProgressSave = Date()
@@ -2692,7 +2727,8 @@ class PlayerViewModel: ObservableObject {
                     duration: max(progressTime.duration, 120),
                     season: nextEpisode.season,
                     episode: nextEpisode.episode,
-                    released: nextEpisode.released
+                    released: nextEpisode.released,
+                    seedSeason: season
                 )
             }
         } else {

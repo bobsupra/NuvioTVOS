@@ -74,11 +74,13 @@ enum TraktLibrarySourceMode: String, CaseIterable {
 enum TraktMoreLikeThisSource: String, CaseIterable {
     case trakt = "TRAKT"
     case tmdb = "TMDB"
+    case simkl = "SIMKL"
 
     var label: String {
         switch self {
         case .trakt: return "Trakt"
         case .tmdb: return "TMDB"
+        case .simkl: return "Simkl"
         }
     }
 }
@@ -1054,11 +1056,9 @@ struct TraktProgressService {
                 )
             )
         } else {
-            removeFromContinueWatchingSnapshot(
-                meta: meta,
-                profileId: profileId,
-                source: source
-            )
+            removeFromContinueWatchingSnapshot(profileId: profileId, source: source) {
+                WatchedStore.sameContent($0.meta, meta)
+            }
         }
 
         if notify {
@@ -1072,19 +1072,53 @@ struct TraktProgressService {
     /// Drops a title from the optimistic layers that sit in front of the
     /// provider's list, so a card the user removed cannot be re-shown by a
     /// checkpoint or the snapshot of the last fetch while the row refreshes.
-    static func forgetLocalPlayback(meta: NuvioMeta) {
+    ///
+    /// `season`/`episode` narrow the removal to one episode — what a watched
+    /// mark clears, since another episode of the same show may still be
+    /// legitimately in progress. `recordedNoLaterThan` keeps progress made
+    /// *after* the mark (the user carried on watching), mirroring how
+    /// ``ContinueWatchingStore/removeWatched(_:)`` settles the same race.
+    static func forgetLocalPlayback(
+        meta: NuvioMeta,
+        season: Int? = nil,
+        episode: Int? = nil,
+        recordedNoLaterThan cutoff: Date? = nil,
+        notify: Bool = false
+    ) {
         let profileId = ContinueWatchingStore.activeProfileId
         let source = TraktSettingsStore.watchProgressSource
-        localPlaybackCheckpoints.removeAll {
-            $0.profileId == profileId
-                && $0.source == source
-                && WatchedStore.sameContent($0.item.meta, meta)
+        let matchesRemoval: (ContinueWatchingItem) -> Bool = { item in
+            guard WatchedStore.sameContent(item.meta, meta) else { return false }
+            if let cutoff, item.lastWatchedAt > cutoff { return false }
+            guard let season, let episode else { return true }
+            // A row that never recorded its episode cannot be attributed to this
+            // mark, and Details only draws a bar for a row that names one.
+            guard let rowSeason = item.season, let rowEpisode = item.episode else { return false }
+            return rowSeason == season && rowEpisode == episode
         }
-        removeFromContinueWatchingSnapshot(
-            meta: meta,
+
+        let removingCheckpoints = localPlaybackCheckpoints.contains {
+            $0.profileId == profileId && $0.source == source && matchesRemoval($0.item)
+        }
+        if removingCheckpoints {
+            localPlaybackCheckpoints.removeAll {
+                $0.profileId == profileId && $0.source == source && matchesRemoval($0.item)
+            }
+        }
+        let removedFromSnapshot = removeFromContinueWatchingSnapshot(
             profileId: profileId,
-            source: source
+            source: source,
+            where: matchesRemoval
         )
+
+        // The caller's own store notification has already been posted by now, so
+        // a view that reads this layer needs its own signal to look again.
+        if notify, removingCheckpoints || removedFromSnapshot {
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
+        }
     }
 
     static func fetchContinueWatching(
@@ -1166,23 +1200,44 @@ struct TraktProgressService {
             movies.orEmpty.compactMap { playbackSeed(from: $0, type: "movie") }
             + episodes.orEmpty.compactMap { playbackSeed(from: $0, type: "series") }
         let playbackIDs = Set(seeds.map(\.contentID))
+        let preferFurthestEpisode = UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
 
-        seeds.append(contentsOf: watchedShows.orEmpty.compactMap { show in
-            guard let seed = nextUpSeed(from: show), !playbackIDs.contains(seed.contentID) else {
+        let watchedShowSeeds: [TraktProgressSeed] = watchedShows.orEmpty.compactMap { show in
+            guard let seed = nextUpSeed(
+                from: show,
+                preferFurthestEpisode: preferFurthestEpisode
+            ), !playbackIDs.contains(seed.contentID) else {
                 return nil
             }
             return seed
-        })
+        }
+        seeds.append(contentsOf: watchedShowSeeds)
+        let watchedShowIDs = Set(watchedShowSeeds.map(\.contentID))
 
         // Some Trakt accounts return watched shows with an empty `seasons`
         // array even though episode history and stats are present. History is
         // the authoritative fallback for choosing the next episode in that case.
-        seeds.append(contentsOf: episodeHistory.orEmpty.compactMap { history in
-            guard let seed = nextUpSeed(from: history), !playbackIDs.contains(seed.contentID) else {
-                return nil
+        var historySeedsByContentID: [String: TraktProgressSeed] = [:]
+        for history in episodeHistory.orEmpty {
+            guard let candidate = nextUpSeed(from: history),
+                  !playbackIDs.contains(candidate.contentID),
+                  !watchedShowIDs.contains(candidate.contentID) else {
+                continue
             }
-            return seed
-        })
+            if let current = historySeedsByContentID[candidate.contentID] {
+                guard UpNextEpisodeSelectionPolicy.prefers(
+                    candidateSeason: candidate.season ?? 0,
+                    candidateEpisode: candidate.episode ?? 0,
+                    candidateWatchedAt: candidate.lastUpdated,
+                    over: current.season ?? 0,
+                    currentEpisode: current.episode ?? 0,
+                    currentWatchedAt: current.lastUpdated,
+                    preferFurthestEpisode: preferFurthestEpisode
+                ) else { continue }
+            }
+            historySeedsByContentID[candidate.contentID] = candidate
+        }
+        seeds.append(contentsOf: historySeedsByContentID.values)
 
         let cutoff: Date? = {
             let days = TraktSettingsStore.continueWatchingDaysCap
@@ -1335,24 +1390,26 @@ struct TraktProgressService {
         )
     }
 
+    /// Returns whether the snapshot actually lost a row.
+    @discardableResult
     private static func removeFromContinueWatchingSnapshot(
-        meta: NuvioMeta,
         profileId: String?,
-        source: TraktWatchProgressSource
-    ) {
+        source: TraktWatchProgressSource,
+        where matchesRemoval: (ContinueWatchingItem) -> Bool
+    ) -> Bool {
         guard let index = continueWatchingSnapshots.firstIndex(where: {
             $0.profileId == profileId && $0.source == source
         }) else {
-            return
+            return false
         }
-        let remaining = continueWatchingSnapshots[index].items.filter {
-            !WatchedStore.sameContent($0.meta, meta)
-        }
+        let remaining = continueWatchingSnapshots[index].items.filter { !matchesRemoval($0) }
+        guard remaining.count != continueWatchingSnapshots[index].items.count else { return false }
         continueWatchingSnapshots[index] = ContinueWatchingSnapshot(
             profileId: profileId,
             source: source,
             items: remaining
         )
+        return true
     }
 
     /// Writes the current player position to the same Trakt playback feed that
@@ -1454,7 +1511,10 @@ struct TraktProgressService {
         )
     }
 
-    private static func nextUpSeed(from item: TraktWatchedShowDTO) -> TraktProgressSeed? {
+    private static func nextUpSeed(
+        from item: TraktWatchedShowDTO,
+        preferFurthestEpisode: Bool
+    ) -> TraktProgressSeed? {
         guard let show = item.show, let contentID = contentID(from: show.ids) else { return nil }
         let watched = item.seasons.orEmpty.flatMap { season -> [TraktWatchedEpisodeSeed] in
             guard let seasonNumber = season.number, seasonNumber > 0 else { return [] }
@@ -1469,12 +1529,20 @@ struct TraktProgressService {
                 )
             }
         }
-        guard let latest = watched.max(by: { lhs, rhs in
-            switch (lhs.watchedAt, rhs.watchedAt) {
-            case let (left?, right?) where left != right: return left < right
-            default: return (lhs.season, lhs.episode) < (rhs.season, rhs.episode)
+        guard var selected = watched.first else { return nil }
+        for candidate in watched.dropFirst() {
+            if UpNextEpisodeSelectionPolicy.prefers(
+                candidateSeason: candidate.season,
+                candidateEpisode: candidate.episode,
+                candidateWatchedAt: candidate.watchedAt ?? .distantPast,
+                over: selected.season,
+                currentEpisode: selected.episode,
+                currentWatchedAt: selected.watchedAt ?? .distantPast,
+                preferFurthestEpisode: preferFurthestEpisode
+            ) {
+                selected = candidate
             }
-        }) else { return nil }
+        }
 
         return TraktProgressSeed(
             contentID: contentID,
@@ -1482,9 +1550,9 @@ struct TraktProgressService {
             title: show.title ?? contentID,
             year: show.year,
             progressPercent: 0,
-            lastUpdated: latest.watchedAt ?? traktDate(item.lastWatchedAt) ?? .distantPast,
-            season: latest.season,
-            episode: latest.episode,
+            lastUpdated: selected.watchedAt ?? traktDate(item.lastWatchedAt) ?? .distantPast,
+            season: selected.season,
+            episode: selected.episode,
             episodeTitle: nil,
             isUpNext: true,
             ids: show.ids
@@ -1535,6 +1603,10 @@ struct TraktProgressService {
         }
         var meta = loadedMeta ?? placeholderMeta(for: seed)
 
+        // The seed's own season, kept before the up-next branch below overwrites
+        // `season` with the suggested episode's — the pair is what tells a season
+        // rollover from a step inside one.
+        let seedSeason = seed.season
         var season = seed.season
         var episode = seed.episode
         var episodeTitle = seed.episodeTitle
@@ -1588,7 +1660,8 @@ struct TraktProgressService {
             episodeTitleOverride: episodeTitle,
             episodeOverviewOverride: episodeOverview,
             episodeThumbnailOverride: episodeThumbnail,
-            isUpNext: seed.isUpNext
+            isUpNext: seed.isUpNext,
+            upNextSeedSeason: seed.isUpNext ? seedSeason : nil
         )
     }
 
@@ -1810,11 +1883,31 @@ struct TraktHistoryService {
         store: UserDefaults = ProfileSettings.current,
         notifyChange: Bool = true
     ) async -> Bool {
+        await setWatched(
+            meta,
+            season: season,
+            episodes: episode.map { [$0] } ?? [],
+            isWatched: isWatched,
+            store: store,
+            notifyChange: notifyChange
+        )
+    }
+
+    /// Season-wide counterpart: every episode listed rides in one `sync/history`
+    /// write instead of one request each.
+    static func setWatched(
+        _ meta: NuvioMeta,
+        season: Int?,
+        episodes: [Int],
+        isWatched: Bool,
+        store: UserDefaults = ProfileSettings.current,
+        notifyChange: Bool = true
+    ) async -> Bool {
         guard TraktAuthStore.state(in: store).isAuthenticated(in: store),
               let mutation = mutation(
                 for: meta,
                 season: season,
-                episode: episode,
+                episodes: episodes,
                 watchedAt: isWatched ? iso8601Now() : nil
               ) else {
             return false
@@ -1837,10 +1930,12 @@ struct TraktHistoryService {
         }
     }
 
+    /// `episodes` carries every episode being marked in one season, so a whole
+    /// season is one request rather than one per episode.
     private static func mutation(
         for meta: NuvioMeta,
         season: Int?,
-        episode: Int?,
+        episodes: [Int],
         watchedAt: String?
     ) -> TraktHistoryMutation? {
         let firstIDComponent = meta.id.split(separator: ":", maxSplits: 1).first.map(String.init) ?? meta.id
@@ -1855,11 +1950,13 @@ struct TraktHistoryService {
 
         if meta.isSeries {
             let seasons: [TraktHistorySeason]?
-            if let season, let episode {
+            if let season, !episodes.isEmpty {
                 seasons = [
                     TraktHistorySeason(
                         number: season,
-                        episodes: [TraktHistoryEpisode(number: episode, watchedAt: watchedAt)]
+                        episodes: episodes.map {
+                            TraktHistoryEpisode(number: $0, watchedAt: watchedAt)
+                        }
                     )
                 ]
             } else {

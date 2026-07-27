@@ -21,6 +21,16 @@ protocol CatalogRepository {
     /// expected sources failed. Home uses this to replace a partial cache once.
     var homeCatalogLoadWasPartial: Bool { get }
 
+    /// Stable description of what failed in the latest Home request, or nil
+    /// when everything loaded. An unchanged signature across two attempts means
+    /// the failure is permanent — a dead add-on URL, or a catalog its host
+    /// always rejects — so retrying re-fetches every row to recover nothing.
+    var homeCatalogFailureSignature: String? { get }
+
+    /// Signature of the add-on and catalog settings the next Home request would
+    /// read. Unchanged between loads means a reload rebuilds the same tree.
+    var homeCatalogInputSignature: String { get }
+
     /// Get metadata for a specific content item. `type` ("movie"/"series") is
     /// carried from the catalog item so the correct meta endpoint is queried —
     /// series ids have no reliable marker to guess from.
@@ -87,6 +97,10 @@ protocol CatalogRepository {
 
 extension CatalogRepository {
     var homeCatalogLoadWasPartial: Bool { false }
+
+    var homeCatalogFailureSignature: String? { nil }
+
+    var homeCatalogInputSignature: String { "" }
 
     func homeCatalogsProgressively() -> AsyncThrowingStream<[NuvioCatalog], Error> {
         AsyncThrowingStream(bufferingPolicy: .bufferingNewest(1)) { continuation in
@@ -169,6 +183,24 @@ struct StreamAddonPreference: Codable, Equatable {
 final class CinemetaCatalogRepository: CatalogRepository {
     static private(set) var homeAddonFetchDiagnostic = "not started"
     private(set) var homeCatalogLoadWasPartial = false
+    private(set) var homeCatalogFailureSignature: String?
+
+    /// Everything a Home request reads before it can decide which rows exist.
+    /// Sorted so an unordered set or dictionary cannot produce a spurious
+    /// difference between two otherwise identical snapshots.
+    var homeCatalogInputSignature: String {
+        let urls = Self.configuredStreamAddonManifestURLs
+            .map(\.absoluteString)
+            .joined(separator: "|")
+        let disabled = TVHomeCatalogOrder.disabledCatalogKeys()
+            .sorted()
+            .joined(separator: ",")
+        let order = TVHomeCatalogOrder.syncedCatalogOrderIndex()
+            .sorted { $0.key < $1.key }
+            .map { "\($0.key)=\($0.value)" }
+            .joined(separator: ",")
+        return "urls:[\(urls)] disabled:[\(disabled)] order:[\(order)]"
+    }
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
     private var cachedMetaById: [String: NuvioMeta] = [:]
@@ -238,6 +270,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         onUpdate: (([NuvioCatalog]) -> Void)? = nil
     ) async throws -> [NuvioCatalog] {
         homeCatalogLoadWasPartial = false
+        homeCatalogFailureSignature = nil
         let specs: [(id: String, name: String, type: String, catalogId: String)] = [
             ("movie_top", "Popular - Movies", "movie", "top"),
             ("series_top", "Popular - Series", "series", "top"),
@@ -268,10 +301,23 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
         try Task.checkCancellation()
 
+        // The built-in rows are Cinemeta catalogs, so they answer to the same
+        // hidden-catalog keys as every add-on row — both the account's and the
+        // ones Settings writes locally. Without this, hiding "Popular - Movies"
+        // was the one toggle Home ignored.
+        let disabledBuiltInKeys = TVHomeCatalogOrder.disabledCatalogKeys()
+
         func builtInCatalogs() -> [NuvioCatalog] {
             var result: [NuvioCatalog] = []
             for (index, spec) in specs.enumerated() {
                 guard let page = pages[index] else { continue }
+                guard !disabledBuiltInKeys.contains(
+                    TVHomeCatalogOrder.catalogSettingsKey(
+                        addonId: Self.cinemetaAddonId,
+                        contentType: spec.type,
+                        catalogId: spec.catalogId
+                    )
+                ) else { continue }
                 cacheMetadata(page)
                 result.append(
                     NuvioCatalog(
@@ -281,7 +327,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         itemIds: page.map(\.id),
                         items: page,
                         contentType: spec.type,
-                        catalogId: spec.catalogId
+                        catalogId: spec.catalogId,
+                        addonName: Self.cinemetaDisplayName
                     )
                 )
             }
@@ -339,7 +386,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
         try Task.checkCancellation()
         catalogs.append(contentsOf: addonResult.catalogs)
-        homeCatalogLoadWasPartial = pages.contains(where: { $0 == nil }) || addonResult.hadFailures
+        let missingBuiltIns = pages.indices
+            .filter { pages[$0] == nil }
+            .map(String.init)
+            .joined(separator: ",")
+        homeCatalogLoadWasPartial = !missingBuiltIns.isEmpty || addonResult.hadFailures
+        // Built from the same per-add-on report the diagnostic uses, so the
+        // signature changes whenever any row's outcome changes -- and only then.
+        homeCatalogFailureSignature = homeCatalogLoadWasPartial
+            ? "builtin:[\(missingBuiltIns)] addons:[\(Self.homeAddonFetchDiagnostic)]"
+            : nil
         guard !catalogs.isEmpty else { throw URLError(.cannotLoadFromNetwork) }
         return catalogs
     }
@@ -359,6 +415,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var reports: [String] = []
         var hadFailures = false
         Self.homeAddonFetchDiagnostic = "loading"
+        print("Home addons: \(Self.configuredStreamAddonManifestURLs.count) configured manifest url(s)")
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
             guard !Task.isCancelled else { break }
@@ -403,6 +460,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         contentType: catalog.type,
                         catalogId: catalog.id,
                         addonId: manifest.id,
+                        addonName: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
                         catalogGenre: catalogGenre
                     )
                 } catch {
@@ -443,10 +501,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
 
             hadFailures = hadFailures || !missingForManifest.isEmpty
-            reports.append("\(manifest.id): \(loadedForManifest)/\(eligible.count), failed \(missingForManifest.count)")
+            reports.append(
+                "\(manifest.id): \(loadedForManifest)/\(eligible.count) loaded"
+                    + ", \((manifest.catalogs ?? []).count) declared"
+                    + ", failed \(missingForManifest.count)"
+            )
         }
 
         Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
+        print("Home addons: \(Self.homeAddonFetchDiagnostic)")
         return (orderedAddonCatalogs(catalogs), hadFailures)
     }
 
@@ -501,6 +564,17 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if id.hasPrefix("tmdb:"),
            let tmdbNum = Int(id.dropFirst(5)),
            let imdb = await Self.resolveImdbFromTmdb(tmdbId: tmdbNum, type: metaType) {
+            resolvedId = imdb
+        }
+
+        // Same for simkl:123. Simkl's recommendation payload carries only its
+        // own id, so the trade happens here — once, for the card the user
+        // opened — instead of for every card in the More Like This row.
+        if id.hasPrefix("simkl:"),
+           let imdb = await SimklDetailsService.resolveImdbID(
+               simklID: String(id.dropFirst(6)),
+               type: metaType
+           ) {
             resolvedId = imdb
         }
 
@@ -968,7 +1042,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
     /// Cinemeta's manifest id as it appears in the Android app's collection
     /// sources; resolves to the built-in `baseURL` without a manifest fetch.
-    private static let cinemetaAddonId = "com.linvo.cinemeta"
+    static let cinemetaAddonId = "com.linvo.cinemeta"
+    /// Label for the built-in rows, which are served from `baseURL` rather than
+    /// from a configured manifest that could supply a name.
+    static let cinemetaDisplayName = "Cinemeta"
 
     /// Manifest cache for the configured stream add-ons, shared by the home
     /// catalog rows and the collection-folder resolver.

@@ -58,12 +58,26 @@ enum ContinueWatchingBuilder {
     private static var materialized: [ContinueWatchingItem] = []
     private static var consumedEntries = 0
     private static var isLoadingPage = false
+    /// Whose history `plan` and `materialized` describe.
+    ///
+    /// This state is static while the profile it belongs to is not, and Home
+    /// merges `pagedItems` with the store on every refresh. A switch re-points
+    /// the store immediately, so without an owner to check against, the outgoing
+    /// profile's cards keep rendering under the new profile's name until some
+    /// later rebuild happens to replace them.
+    private static var materializedProfileId: String?
 
-    /// Every item built so far, including pages beyond the persisted first one.
-    static var pagedItems: [ContinueWatchingItem] { materialized }
+    /// Every item built so far, including pages beyond the persisted first one —
+    /// empty unless they belong to the profile that is active now.
+    static var pagedItems: [ContinueWatchingItem] {
+        materializedProfileId == WatchProgressLedger.activeProfileId ? materialized : []
+    }
 
     /// True while the ledger still holds titles that have not been rendered.
-    static var canLoadMore: Bool { consumedEntries < plan.count }
+    static var canLoadMore: Bool {
+        materializedProfileId == WatchProgressLedger.activeProfileId
+            && consumedEntries < plan.count
+    }
 
     /// Last outcome, for the on-screen sync diagnostic.
     static private(set) var diagnostic = "not built"
@@ -96,12 +110,14 @@ enum ContinueWatchingBuilder {
             plan = []
             materialized = []
             consumedEntries = 0
+            materializedProfileId = profileId
             return
         }
 
         plan = planEntries(candidates: candidates, seeds: seeds)
         materialized = []
         consumedEntries = 0
+        materializedProfileId = profileId
 
         let page = await materializeNextPage(
             generation: currentGeneration,
@@ -218,7 +234,8 @@ enum ContinueWatchingBuilder {
                         episodeTitleOverride: tmdbEpisode?.title ?? nonPlaceholder(next.title),
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
-                        isUpNext: true
+                        isUpNext: true,
+                        upNextSeedSeason: season
                     )
                 )
                 continue

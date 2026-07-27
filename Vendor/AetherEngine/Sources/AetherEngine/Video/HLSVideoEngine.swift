@@ -416,7 +416,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// Session-long FLAC bridge for codecs illegal in fMP4. Engine-owned (not producer-owned) so
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
-    private var segmentPlan: [Segment] = []
+    var segmentPlan: [Segment] = []
 
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
@@ -441,6 +441,23 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// performRestart rebuilds muxer AND re-arms the audio bridge, so transient causes heal;
     /// a persistent cause exhausts the cap instead of restart-storming.
     var muxerFailureReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+
+    /// AE#169 round 2: bounded revive for a VOD pump that died on a MID-SESSION read error (under
+    /// `restartLock`). #126 only surfaced the nothing-ever-produced case as fatal and assumed the
+    /// scrub/wedge arms covered the rest; a tail request within the forward-wait window of the dead
+    /// producer's front reached neither (rrgomes: seg719 miss x11 into -12889), so the exit gets
+    /// its own event-driven arm. Same gate shape as #99.
+    var readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
+
+    /// AE#169 round 2 (under `restartLock`): the demuxer's last read threw, so the next
+    /// performRestart replaces it via the #79 fresh-demuxer path instead of seeking a connection
+    /// that just failed (a sticky pb error would burn the revive gate without one fresh attempt).
+    var mainDemuxerSuspectDead = false
+
+    /// AE#169 round 3 (under `restartLock`): bounded re-anchor for a VOD pump whose restart
+    /// scan-forward gate starved to EOF (no runtime keyframe at/after the targeted plan boundary,
+    /// the unproducible tail segment). Same gate shape as #99.
+    var gateStarvationReviveGate = MuxerFailureReviveGate(maxAttempts: 2)
 
     /// #93 residual: a stalled AVPlayer sometimes never resumes REQUESTING after a wedge re-anchor
     /// (device: plain playback, one -15628 errorLog, then zero segment GETs while parked in
@@ -478,6 +495,20 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// latency on a 24 fps 1440p LAN source and stays within the spec's 2-6 s range.
     static let targetSegmentDuration: Double = 4.0
 
+    /// Live cut target under `LiveJoinProfile.fastZap` (AE#195): cut at every keyframe past 0.5 s, so
+    /// segments quantize to the source GOP and the served TARGETDURATION (whose 3 x holdback gates the
+    /// first live manifest, AE#189) is driven by `ceil(max EXTINF)` instead of the
+    /// `ceil(1.5 x cut target)` floor (which collapses to 1 at this value).
+    static let fastZapLiveCutTargetSeconds: Double = 0.5
+
+    /// Resolve a host `LiveJoinProfile` to the live segment cut target.
+    static func liveCutTargetSeconds(for profile: LiveJoinProfile) -> Double {
+        switch profile {
+        case .standard: return targetSegmentDuration
+        case .fastZap: return fastZapLiveCutTargetSeconds
+        }
+    }
+
     /// Cue-prewarm seek deadline. MKV Cues resolve in under 1 s; a missing/out-of-bounds index
     /// degrades into a multi-GB linear scan. Beyond this, abort and build a uniform-stride plan.
     static let cuePrewarmTimeout: TimeInterval = 10.0
@@ -486,10 +517,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// clamped to a quarter of the tmp volume's available capacity, so a nearly-full device never
     /// trades playback headroom for seek history. Live passes 0 (window-only pruning; the sliding
     /// playlist already dropped everything behind the window, so retention would serve nothing).
-    static func vodRetentionBudgetBytes(volumeAvailableBytes: Int64?) -> Int {
+    /// `capRelaxed` (#207) drops the 2 GiB default for a host that explicitly asked to pre-buffer more
+    /// than the historical window could hold; the quarter-of-free-space clamp, which is what actually
+    /// protects the volume, always applies. Unknown capacity keeps the conservative cap either way.
+    static func vodRetentionBudgetBytes(volumeAvailableBytes: Int64?, capRelaxed: Bool = false) -> Int {
         let cap = 2 << 30
         guard let available = volumeAvailableBytes else { return cap }
-        return min(cap, max(0, Int(available / 4)))
+        let quarterOfFree = max(0, Int(available / 4))
+        return capRelaxed ? quarterOfFree : min(cap, quarterOfFree)
+    }
+
+    /// Largest forward window the default 2 GiB retention budget covers by construction
+    /// (150 segments x ~10 MB for 4K HEVC ~ 1.5 GB), i.e. the old `clampedForwardWindow` ceiling.
+    static let defaultRetentionCapWindowCeiling = 150
+
+    /// #207: a window past `defaultRetentionCapWindowCeiling` is an explicit host opt-in into a
+    /// whole-source prefetch, so the budget follows it up (see `vodRetentionBudgetBytes`).
+    static func retentionCapRelaxed(forwardWindowSegments: Int) -> Bool {
+        forwardWindowSegments > defaultRetentionCapWindowCeiling
     }
 
     // MARK: - Measurement spike: sliding-window prototype (superseded)
@@ -516,9 +561,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLiveSession: Bool = false,
         dvrWindowSeconds: Double? = nil,
-        liveSourceCadenceHint: Double? = nil,
+        liveJoinProfile: LiveJoinProfile = .standard,
+        liveCutTargetSeconds: Double? = nil,
+        blockingReloadOverride: Bool? = nil,
+        liveCadenceObservation: (@Sendable () -> Double?)? = nil,
+        initialTargetDurationFloor: Double? = nil,
         preopenedDemuxer: Demuxer? = nil,
         sourceReopenableByURL: Bool = true,
+        customSourceReopenFactory: CustomSourceReopenFactory? = nil,
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
@@ -539,15 +589,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
         self.audioBridgeMode = audioBridgeMode
         self.isLiveSession = isLiveSession
         self.dvrWindowSeconds = dvrWindowSeconds
-        self.liveSourceCadenceHint = liveSourceCadenceHint
-        // Bursty ingest sources whose upstream cadence exceeds 1.5x our cut target can't honor
-        // LL-HLS blocking reload (-15410, device repro 2026-06-11). For those, disable blocking
-        // reload and raise TARGETDURATION to cadence so plain 1.5x-TD patience covers the gap.
-        self.liveBlockingReloadEnabled = liveSourceCadenceHint
-            .map { $0 <= Self.targetSegmentDuration * 1.5 } ?? true
-        self.liveTargetDurationFloorSeconds = liveSourceCadenceHint.map { ceil($0) }
+        self.liveJoinProfile = liveJoinProfile
+        // An explicit cut target keeps precedence for direct callers. Otherwise resolve the profile.
+        let resolvedLiveCutTarget = liveCutTargetSeconds
+            ?? Self.liveCutTargetSeconds(for: liveJoinProfile)
+        self.liveCutTargetSeconds = resolvedLiveCutTarget
+        self.blockingReloadOverride = blockingReloadOverride
+        // Trust OBSERVED arrival cadence, not the upstream's self-reported TARGETDURATION, for blocking-reload
+        // eligibility and the TARGETDURATION floor (-15410, AetherEngine#167). Built only for live ingest
+        // sources that expose a cadence observation; URL live and VOD leave it nil and fall back to the
+        // signal-less default (blocking-reload on, server's own 1.5x-cut-target floor).
+        self.liveCadencePolicy = liveCadenceObservation.map { observe in
+            LiveCadencePolicy(
+                observe: observe,
+                cutTargetSeconds: resolvedLiveCutTarget,
+                initialFloorSeconds: initialTargetDurationFloor
+            )
+        }
         self.preopenedDemuxer = preopenedDemuxer
         self.sourceReopenableByURL = sourceReopenableByURL
+        self.customSourceReopenFactory = customSourceReopenFactory
         self.companionAudioReader = companionAudioReader
         self.forwardWindowSegments = Self.clampedForwardWindow(forwardBufferSegments)
     }
@@ -558,36 +619,59 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// AVPlayer, see `SegmentCache`). From `LoadOptions.forwardBufferSegments`; nil -> historical 10.
     let forwardWindowSegments: Int
 
+    /// Session retention budget resolved in `start()`; also bounds the producer's race-ahead on disk
+    /// (#207, see `PrefetchDiskBudget`). 0 for live (window-only pruning).
+    private var retentionBudgetBytes: Int = 0
+
     /// Clamp for `forwardWindowSegments`: below 4 the window would undercut AVPlayer's own ~5-7-segment
-    /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`); above 150 (~10 min at 4 s
-    /// segments, ~1.5 GB disk for 4K HEVC) the disk and ahead-of-time demux cost stops being worth it.
-    /// nil keeps the historical default of 10.
+    /// prefetch and starve it (see `LiveWindowSizing.minSafeSegments`). The 2700 ceiling (~3 h at 4 s
+    /// segments) is a sanity bound against accidental values, not a cost bound: it covers a whole
+    /// feature film, so a host's "buffer without limit" option can pass `Int.max` (#207). The disk cost
+    /// is bounded in bytes rather than segments, by the session retention budget the producer parks on
+    /// (`PrefetchDiskBudget`, `vodRetentionBudgetBytes`). nil keeps the historical default of 10.
     static func clampedForwardWindow(_ requested: Int?) -> Int {
-        min(max(requested ?? 10, 4), 150)
+        min(max(requested ?? 10, 4), 2700)
     }
 
     /// When true, `start()` skips the VOD duration guard / cue prewarm / precomputed plan and
     /// uses the forward-only live cut mode (producer cuts at each IDR past the duration target).
     let isLiveSession: Bool
 
+    /// Controls whether the first live manifest may take the bounded shallow-window path.
+    private let liveJoinProfile: LiveJoinProfile
+
+    /// Live segment cut target for this session, resolved from the host's `LiveJoinProfile` (AE#195).
+    /// Drives the producer's keyframe cut, `LiveWindowSizing`, and (via the served TARGETDURATION floor)
+    /// the AE#189 startup-cushion depth. VOD ignores it (cuts come from the precomputed plan).
+    let liveCutTargetSeconds: Double
+
     /// False for IOReader-backed sources (`aether-custom://source` placeholder); `handlePumpFinished`
     /// surfaces loss via `onLiveSourceReset` immediately instead of burning 6 reopen attempts.
     let sourceReopenableByURL: Bool
 
-    /// Upstream segment cadence for custom-ingest live sessions (`LiveIngestSourceInfo`). nil for URL
-    /// live sources and VOD.
-    private let liveSourceCadenceHint: Double?
+    /// #199: vends a fresh reader (plus FFmpeg format hint) for an engine-created ingest source, so a
+    /// live pump exit reopens in-session instead of delegating to host retune. Called once per reopen
+    /// attempt; each vended reader is owned by this session (closed on replacement and on stop). nil for
+    /// URL sources and host-provided custom readers.
+    public typealias CustomSourceReopenFactory = @Sendable () -> (reader: IOReader, formatHint: String?)?
+    let customSourceReopenFactory: CustomSourceReopenFactory?
+
+    /// #199: the reader vended by `customSourceReopenFactory` that the CURRENT demuxer reads from.
+    /// Guarded by `restartLock`. The original load's reader stays engine-owned (AetherEngine closes it
+    /// in stopInternal); only factory-vended replacements are owned here.
+    var reopenCustomReader: IOReader?
 
     /// Demuxed audio rendition reader for live HLS ingest. When the main demuxer finds no audio and
     /// this is non-nil, `start()` opens `sideAudioDemuxer` over it. Engine owns the side demuxer, not
     /// this reader (owned by the host's main reader). nil for muxed-audio sessions.
     private let companionAudioReader: IOReader?
 
-    /// Whether the local live playlist may advertise LL-HLS CAN-BLOCK-RELOAD (derived from cadence hint).
-    private let liveBlockingReloadEnabled: Bool
+    /// Host override for LL-HLS blocking-reload (`LoadOptions.liveBlockingReload`); nil = auto (#167).
+    private let blockingReloadOverride: Bool?
 
-    /// TARGETDURATION floor = ceil(upstream cadence) for bursty ingest; nil when no cadence hint.
-    private let liveTargetDurationFloorSeconds: Double?
+    /// Observed-cadence policy driving blocking-reload eligibility and the TARGETDURATION floor for live
+    /// ingest sources; nil for URL live and VOD (#167).
+    private let liveCadencePolicy: LiveCadencePolicy?
 
     /// DVR window in seconds; nil = live-only (window still bounded to `liveOnlyFloorSeconds`).
     private let dvrWindowSeconds: Double?
@@ -667,7 +751,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sourceVideoTbSeconds = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         }
         let durationSeconds = dem.duration
-        let plan: [Segment]
+        var plan: [Segment]
         if isLiveSession {
             sourceBitrate = dem.bitRate
             self.firstKeyframePts = 0
@@ -787,20 +871,37 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // negotiation state didn't match (Vincent test 2026-05-26, HDR10 panel).
         let hdcpLevel: String? = nil
 
-        // 5. Rebuild hvcC from in-band parameter sets when numOfArrays=0 (DV P5 MP4 encoders
-        //    that ship VPS/SPS/PPS per-IRAP instead of in the config record, #19 Wandering Earth 2).
-        //    Without VPS/SPS/PPS in hvcC, AVPlayer fails the dvh1 sample entry with CME -4.
-        let hevcExtradataOverride = rebuildHEVCExtradataWithInBandParameterSets(
+        // 5. Normalize the HEVC config record shipped in init.mp4:
+        //    a) numOfArrays=0 (DV P5 MP4 encoders shipping VPS/SPS/PPS per-IRAP, #19 Wandering Earth 2):
+        //       rebuild the hvcC from in-band parameter sets, else the dvh1 sample entry fails CME -4.
+        //    b) numOfArrays>0 but carrying non-parameter-set arrays (libx265's user-data SEI_PREFIX, AE#187):
+        //       strip everything but VPS/SPS/PPS. Apple TV hardware rejects an hvcC with an SEI array
+        //       (tracks count=0 / -12848); macOS + the tvOS Simulator tolerate it, so it is device-only.
+        let hevcExtradataOverride: [UInt8]?
+        if let rebuilt = rebuildHEVCExtradataWithInBandParameterSets(
             demuxer: dem,
             videoStreamIndex: videoIndex,
-            codecpar: codecpar
-        )
-        if let rebuilt = hevcExtradataOverride {
+            codecpar: codecpar,
+            rewindBeforeScan: !isLiveSession
+        ) {
+            hevcExtradataOverride = rebuilt
             EngineLog.emit(
                 "[HLSVideoEngine] rebuilt hvcC with in-band parameter sets: "
                 + "\(codecpar.pointee.extradata_size) B → \(rebuilt.count) B",
                 category: .session
             )
+        } else if codecpar.pointee.codec_id == AV_CODEC_ID_HEVC,
+                  let ed = codecpar.pointee.extradata,
+                  case let source = Array(UnsafeBufferPointer(start: ed, count: Int(codecpar.pointee.extradata_size))),
+                  let canonical = Self.canonicalizeHEVCConfigRecord(source) {
+            hevcExtradataOverride = canonical
+            EngineLog.emit(
+                "[HLSVideoEngine] canonicalized hvcC (stripped non-parameter-set NAL arrays): "
+                + "\(source.count) B → \(canonical.count) B (AE#187)",
+                category: .session
+            )
+        } else {
+            hevcExtradataOverride = nil
         }
 
         // 6. Reset demuxer cursor to 0 (cue prewarm moved it mid-file). Skipped for live
@@ -820,15 +921,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
             .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]))?
             .volumeAvailableCapacityForImportantUsage
         #endif
+        let capRelaxed = Self.retentionCapRelaxed(forwardWindowSegments: forwardWindowSegments)
         let retentionBudget = isLiveSession
             ? 0
-            : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes)
+            : Self.vodRetentionBudgetBytes(volumeAvailableBytes: availableBytes, capRelaxed: capRelaxed)
+        self.retentionBudgetBytes = retentionBudget
         let segmentCache = SegmentCache(forwardWindow: forwardWindowSegments,
                                         retentionBudgetBytes: retentionBudget)
         self.cache = segmentCache
         EngineLog.emit(
             "[HLSVideoEngine] segment retention budget: \(retentionBudget / (1 << 20)) MiB "
-            + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"))",
+            + "(volumeAvailable=\(availableBytes.map { "\($0 / (1 << 20)) MiB" } ?? "unknown"), "
+            + "forwardWindow=\(forwardWindowSegments) seg"
+            + (capRelaxed ? ", opt-in prefetch: default cap relaxed" : "") + ")",
             category: .session
         )
 
@@ -872,7 +977,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // Fold degenerate sub-frame segments (keyframe clusters make buildKeyframeSegmentPlan emit
         // ~40 ms segments the producer cannot cut, wedging the near-EOF resume; the plan and producer
         // share these boundaries, so the merge fixes both at once).
-        self.segmentPlan = Self.collapseShortSegments(plan, minDurationSeconds: Self.minSegmentDurationSeconds)
+        plan = Self.collapseShortSegments(plan, minDurationSeconds: Self.minSegmentDurationSeconds)
+        self.segmentPlan = plan
 
         // #93 residual: anchor the FIRST producer at the session's start position instead of seg0.
         // A resume start otherwise produces seg0 (torn down and discarded seconds later when
@@ -1038,7 +1144,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 EngineLog.emit(
                     isHEAAC
                         ? "[HLSVideoEngine] audio: HE-AAC (profile=\(acpForHE.profile) frameSize=\(acpForHE.frame_size)), ADTS stream-copy would mis-signal SBR, bridging instead"
-                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + FLAC re-encode",
+                        : "[HLSVideoEngine] audio: codec=\(compat) (bridge required), decoding + \(audioBridgeMode == .surroundCompat ? "EAC3" : "FLAC") re-encode",
                     category: .session
                 )
             } else if compat != .unsupported {
@@ -1167,11 +1273,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sourceBitrate: sourceBitrate,
             isLive: isLiveSession,
             liveWindowSizing: LiveWindowSizing(
-                targetSegmentDurationSeconds: Self.targetSegmentDuration,
+                targetSegmentDurationSeconds: liveCutTargetSeconds,
                 dvrWindowSeconds: dvrWindowSeconds
             ),
-            blockingReloadEnabled: liveBlockingReloadEnabled,
-            targetDurationFloorSeconds: liveTargetDurationFloorSeconds,
+            allowsBoundedDegradedStart: liveJoinProfile == .fastZap,
+            blockingReloadOverride: blockingReloadOverride,
+            liveCadencePolicy: liveCadencePolicy,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.requestRestart(at: idx)
             },
@@ -1180,6 +1287,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             },
             activeProducerBase: isLiveSession ? nil : { [weak self] in
                 self?.currentProducerBaseIndex
+            },
+            // AE#169 round 2: a finished pump can never march; the forward-window wait must
+            // escalate to restart instead of parking on its frozen front.
+            producerFinished: isLiveSession ? nil : { [weak self] in
+                self?.currentProducerFinished ?? false
             },
             // #93 residual: the first producer may be anchored at the resume segment; without this
             // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
@@ -1215,15 +1327,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
         try srv.start()
         self.server = srv
 
-        // 8. Kick the pump. An anchored first producer (#93 residual) needs the demuxer positioned
-        // at the anchor BEFORE the pump reads, exactly like performRestart's pre-makeProducer seek:
-        // the gate only DROPS pre-target packets, so an unseeked pump would read (and discard) the
-        // whole file up to the resume point. Absolute source-PTS for the same reason as the
-        // restart path (relative playlist time lands a keyframe behind on non-zero startPts0).
+        // 8. Kick the pump. Seek on the video stream's exact plan timestamp and forbid an earlier
+        // landing. A global time seek can choose the previous sync point in a multi-stream MP4,
+        // leaving the producer to scan a whole GOP over the origin before writing anything (#191).
         if initialProducerBaseIndex > 0, initialProducerBaseIndex < plan.count {
-            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
-            let anchorSeconds = Double(plan[initialProducerBaseIndex].startPts) * Double(tb.num) / Double(tb.den)
-            dem.seek(to: anchorSeconds)
+            let targetPts = plan[initialProducerBaseIndex].startPts
+            // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
+            if dem.isDiscSource || !dem.seek(to: targetPts, streamIndex: videoStreamIndex) {
+                let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+                dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
+            }
         }
         prod.start()
 
@@ -1244,12 +1357,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // #15: a SUBTITLES rendition lives only in a master; the pure decision below forces the
         // master for routing-safe subtitled sources so PiP can show subtitles.
         let hasNativeSubs = enableNativeSubtitleTrackForSession && !nativeSubtitleCueStoresForSession.isEmpty
+        // AE#187: tvOS HW HEVC needs the codec advertised in a master's CODECS attribute; a bare media
+        // playlist (H.264 is fine media-direct) fails the item with tracks count=0 / -12848. Scope to
+        // tvOS: iOS/macOS build the HEVC track from the init hvcC media-direct and are left unperturbed.
+        #if os(tvOS)
+        let videoCodecNeedsMasterSignaling = codecpar.pointee.codec_id == AV_CODEC_ID_HEVC
+        #else
+        let videoCodecNeedsMasterSignaling = false
+        #endif
         let useMasterPlaylist = Self.resolveUseMasterPlaylist(
             videoRange: videoRange, effectiveDvMode: effectiveDvMode,
             panelIsInHDRMode: panelIsInHDRMode, displaySupportsHDR: displaySupportsHDR,
             hasNativeSubs: hasNativeSubs,
             builtInPanelEngagesOnDemand: Self.builtInPanelEngagesOnDemand,
-            frameRateKnown: frameRate != nil)
+            frameRateKnown: frameRate != nil,
+            videoCodecNeedsMasterSignaling: videoCodecNeedsMasterSignaling)
         let resolvedURL: URL? = useMasterPlaylist
             ? srv.playlistURL
             : srv.mediaPlaylistURL
@@ -1306,7 +1428,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
         displaySupportsHDR: Bool,
         hasNativeSubs: Bool,
         builtInPanelEngagesOnDemand: Bool,
-        frameRateKnown: Bool
+        frameRateKnown: Bool,
+        videoCodecNeedsMasterSignaling: Bool = false
     ) -> Bool {
         let sourceIsHDR = videoRange != .sdr || effectiveDvMode
         let panelReadyForHDR = panelIsInHDRMode
@@ -1318,7 +1441,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // effectiveDvMode (a device DV capability) even for SDR content, which wrongly sent SDR
         // sources on DV-capable devices to media-direct, so the WebVTT rendition never appeared (#15).
         let routingSafeForMaster = (videoRange == .sdr) || panelReadyForHDR
-        if hasNativeSubs && routingSafeForMaster { return true }
+        // AE#187: Apple TV HW builds an H.264 track from a bare media playlist + init, but HEVC needs
+        // the codec advertised in a master's EXT-X-STREAM-INF CODECS. SDR HEVC otherwise routed
+        // media-direct (below), leaving the device with no HEVC signaling -> tracks count=0 / -12848
+        // before any media fetch (macOS / the Simulator build the track from the init hvcC and never
+        // reproduce it). Forcing the master where it is routing-safe (SDR on any panel, HDR on a ready
+        // one) closes that gap; the caller scopes the flag to tvOS + HEVC.
+        if (hasNativeSubs || videoCodecNeedsMasterSignaling) && routingSafeForMaster { return true }
         return sourceIsHDR && panelReadyForHDR
     }
 
@@ -1503,9 +1632,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         ownedCodecParams = []
         let reopening = reopenDemuxer
         reopenDemuxer = nil
+        // #199: factory-vended ingest reader feeding the current demuxer; session-owned, closed here.
+        let reopenReader = reopenCustomReader
+        reopenCustomReader = nil
         segmentPlan = []
         restartLock.unlock()
         reopening?.markClosed()
+        // Close before waitForFinish: cancels the reader's FIFO so a pump parked in a blocking
+        // custom-IO read unblocks (mirrors markClosed for URL demuxers).
+        reopenReader?.close()
 
         p?.stop()
 
@@ -1548,9 +1683,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.notStarted
         }
 
-        // Scan-forward + dynamic-shift: producer scans for the first AV_PKT_FLAG_KEY packet with
-        // dts >= videoTarget, then computes shift = actualFirstDts - desiredFirstTfdt and applies
-        // it to all subsequent packets. Audio target set dynamically after video lands.
+        // Scan-forward + dynamic-shift: producer scans for the first AV_PKT_FLAG_KEY packet whose
+        // presentation time reaches videoTarget (a plan-boundary PTS; judging by DTS dropped the
+        // anchor IRAP under B-frame reorder, AE#169 round 3), then computes
+        // shift = actualFirstDts - desiredFirstTfdt and applies it to all subsequent packets.
+        // Audio target set dynamically after video lands.
         let videoTarget: Int64
         let desiredVideoTfdt: Int64
         let desiredAudioTfdt: Int64
@@ -1594,10 +1731,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             sideAudioDemuxer: sideAudioDemuxer,
             cache: cache,
             baseIndex: baseIndex,
-            targetSegmentDurationSeconds: Self.targetSegmentDuration,
+            targetSegmentDurationSeconds: liveCutTargetSeconds,
             videoFallbackDurationPts: videoFallbackDurationPts,
             audioFallbackDurationPts: audioFallbackDurationPts,
-            restartTargetVideoDts: videoTarget,
+            restartTargetVideoPts: videoTarget,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
@@ -1607,7 +1744,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             isLive: isLiveSession,
             packedSideAudioStartPts: packedSideAudioStartPts,
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
-            bufferAheadSegments: forwardWindowSegments
+            bufferAheadSegments: forwardWindowSegments,
+            prefetchDiskBudgetBytes: retentionBudgetBytes
         )
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
@@ -1714,12 +1852,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return producer?.anchoredBaseIndex
     }
 
+    /// AE#169 round 2: whether the installed producer's pump has exited. nil producer (mid-restart)
+    /// reads as false; the coalescer's restartActivity covers that window.
+    var currentProducerFinished: Bool {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return producer?.didFinish ?? false
+    }
+
     /// Total media-segment requests seen this session (#93 residual): the stall-triggered
     /// re-engage watchdog compares snapshots to detect a consumer that stopped requesting.
     var mediaFetchCountSnapshot: UInt64 {
         restartLock.lock()
         defer { restartLock.unlock() }
         return provider?.mediaFetchCount ?? 0
+    }
+
+    /// #178: called by the engine when a NEW user seek is dispatched. A recovery re-anchor still
+    /// holding the coalescer's authoritative slot belongs to the superseded seek; left in place it
+    /// would drop the new seek's segment-driven restart and land the producer on the stale
+    /// recovery position. Runs before the host seek so AVPlayer's new segment GETs never race a
+    /// locked slot.
+    func releaseSupersededAuthoritativeRestart() {
+        restartLock.lock()
+        restartCoalescer.clearSupersededAuthoritativePending()
+        restartLock.unlock()
     }
 
     func requestRestart(at idx: Int, authoritative: Bool = false) {
@@ -1815,6 +1972,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
         let ab = audioBridge
         let targetStartPts = segmentPlan[idx].startPts
         let videoTb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+        // AE#169 round 2: consume the suspect-dead mark (the demuxer's last read threw); this
+        // restart replaces it via the #79 fresh-demuxer path instead of seeking the failed
+        // connection.
+        let demuxerSuspectDead = mainDemuxerSuspectDead
+        mainDemuxerSuspectDead = false
         restartLock.unlock()
 
         let restartStart = DispatchTime.now()
@@ -1825,68 +1987,78 @@ public final class HLSVideoEngine: @unchecked Sendable {
         var reopenMs: Double? = nil
         var seekMs: Double = 0
 
-        // The new producer reuses this demuxer unless we have to replace a wedged one (#79, below).
+        // The new producer reuses this demuxer unless we have to replace a wedged (#79) or
+        // suspect-dead (#169) one, below.
         var activeDem = dem
         var freshDemuxer: Demuxer?
+        var oldPumpExited = true
         if let old {
             old.stop()
-            let ok = old.waitForFinish(timeout: 5.0)
+            oldPumpExited = old.waitForFinish(timeout: 5.0)
             stopWaitMs = msSince(restartStart)
-            if !ok {
-                // #79: the old pump is wedged in a blocking network read on the SHARED demuxer; stop() can't
-                // unblock a socket read, so waitForFinish timed out. Reusing this demuxer makes the new
-                // producer's first post-seek read queue behind that stuck read for the full ~20s
-                // connStallTimeout (the reporter's ~25s restart), after which the abandoned reader also steals
-                // the first packet. markClosed() aborts the stuck read immediately (the existing thread-safe
-                // unblock) but dooms the demuxer, so open a FRESH one and hand it to the new producer. Open
-                // FIRST, abort only on success, so a reopen failure falls back to the prior abandon behaviour
-                // (no regression) rather than poisoning the only demuxer. Scoped to the VOD single-demuxer
-                // scrub case; the side-source / live-reopen paths keep their existing behaviour.
-                if !isLiveSession, sideAudioDemuxer == nil {
-                    let reopenStart = DispatchTime.now()
-                    let fresh = Demuxer()
-                    do {
-                        // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
-                        // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
-                        // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
-                        try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: .restartReopen, isLive: false)
-                        dem.markClosed() // abort the wedged read now that the replacement is ready
-                        freshDemuxer = fresh
-                        activeDem = fresh
-                        EngineLog.emit(
-                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged in a read past 5s; "
-                            + "aborted it and reopened a fresh demuxer (avoids the ~20s shared-read stall)",
-                            category: .session
-                        )
-                    } catch {
-                        fresh.close()
-                        EngineLog.emit(
-                            "[HLSVideoEngine] restart at idx=\(idx): old producer wedged; reopen failed (\(error)), "
-                            + "abandoning it and reusing the demuxer",
-                            category: .session
-                        )
-                    }
-                    reopenMs = msSince(reopenStart)
-                } else {
+        }
+        if !oldPumpExited || demuxerSuspectDead {
+            // #79: the old pump is wedged in a blocking network read on the SHARED demuxer; stop() can't
+            // unblock a socket read, so waitForFinish timed out. Reusing this demuxer makes the new
+            // producer's first post-seek read queue behind that stuck read for the full ~20s
+            // connStallTimeout (the reporter's ~25s restart), after which the abandoned reader also steals
+            // the first packet. markClosed() aborts the stuck read immediately (the existing thread-safe
+            // unblock) but dooms the demuxer, so open a FRESH one and hand it to the new producer. Open
+            // FIRST, abort only on success, so a reopen failure falls back to the prior abandon behaviour
+            // (no regression) rather than poisoning the only demuxer. Scoped to the VOD single-demuxer
+            // scrub case; the side-source / live-reopen paths keep their existing behaviour.
+            // AE#169 round 2 takes the same path when the pump exited BECAUSE the demuxer's read
+            // threw: the connection is known-bad, so the revive gets one fresh connection instead
+            // of seeking the demuxer that just failed.
+            if !isLiveSession, sideAudioDemuxer == nil {
+                let reopenStart = DispatchTime.now()
+                let fresh = Demuxer()
+                do {
+                    // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
+                    // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
+                    // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
+                    try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: .restartReopen, isLive: false)
+                    dem.markClosed() // abort any wedged read now that the replacement is ready
+                    freshDemuxer = fresh
+                    activeDem = fresh
                     EngineLog.emit(
-                        "[HLSVideoEngine] restart at idx=\(idx): old producer didn't exit within 5s, abandoning it "
-                        + "(its in-flight read shares the demuxer and may consume the first post-seek packet; "
-                        + "if the new session starts a GOP late, this is why)",
+                        "[HLSVideoEngine] restart at idx=\(idx): "
+                        + (oldPumpExited
+                            ? "#169 demuxer suspect-dead after read error; "
+                            : "old producer wedged in a read past 5s; aborted it and ")
+                        + "reopened a fresh demuxer",
+                        category: .session
+                    )
+                } catch {
+                    fresh.close()
+                    EngineLog.emit(
+                        "[HLSVideoEngine] restart at idx=\(idx): "
+                        + (oldPumpExited ? "#169 suspect-dead demuxer" : "old producer wedged")
+                        + "; reopen failed (\(error)), reusing the demuxer",
                         category: .session
                     )
                 }
+                reopenMs = msSince(reopenStart)
+            } else if !oldPumpExited {
+                EngineLog.emit(
+                    "[HLSVideoEngine] restart at idx=\(idx): old producer didn't exit within 5s, abandoning it "
+                    + "(its in-flight read shares the demuxer and may consume the first post-seek packet; "
+                    + "if the new session starts a GOP late, this is why)",
+                    category: .session
+                )
             }
         }
 
-        // Seek to ABSOLUTE source-PTS, not relative playlist time. segmentPlan[N].startSeconds is
-        // relative to startPts0; if startPts0 != 0 (B-frame head or remux), seeking the relative
-        // value lands a-keyframe-or-more behind (AVSEEK_FLAG_BACKWARD rolls back). Subtitle cue
-        // timestamps are absolute source-PTS, so a wrong seek shifts them up to one segment ahead.
-        let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+        // Seek to the exact video-stream plan timestamp with the target as the lower bound. A
+        // global time seek can choose a much earlier sync point in a multi-stream MP4 (#191).
         // Seek outside restartLock (network-bound). Concurrent stop() calls markClosed() so the
         // seek fails fast instead of racing teardown.
         let seekStart = DispatchTime.now()
-        activeDem.seek(to: absoluteTargetSeconds)
+        // Disc plans use folded multi-clip timestamps that are not valid raw seek targets.
+        if activeDem.isDiscSource || !activeDem.seek(to: targetStartPts, streamIndex: videoStreamIndex) {
+            let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+            activeDem.seek(to: absoluteTargetSeconds)
+        }
         // Re-arm bridge PTS rebase so the encoder timeline starts from the new demuxer cursor.
         ab?.startSegment()
         seekMs = msSince(seekStart)
@@ -1924,6 +2096,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
         }
 
         let elapsedMs = msSince(restartStart)
+        let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(

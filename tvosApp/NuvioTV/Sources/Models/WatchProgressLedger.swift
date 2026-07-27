@@ -74,8 +74,10 @@ enum WatchProgressLedger {
     private static let baseKey = "nuvio.tv.watchProgress.ledger.v1"
     /// Guards the one-time movie re-push recovery, per profile.
     private static let movieRepushFlagKey = "nuvio.tv.watchProgress.ledger.movieRepush.v1"
-    /// Generous: rows are ~150 bytes with no metadata attached, so the whole
-    /// ledger stays well under the size that makes tvOS unhappy in UserDefaults.
+    private static let storageDirectoryName = "WatchProgressLedger"
+    /// Generous: rows are ~150 bytes with no metadata attached. The ledger now
+    /// lives in a file rather than preferences, so this bounds unchecked growth
+    /// rather than the tvOS preferences limit.
     private static let maxRecords = 2000
 
     /// Matches the phone's `CompletionThresholdFraction`. Both platforms must
@@ -105,6 +107,13 @@ enum WatchProgressLedger {
         return "\(baseKey).\(id)"
     }
 
+    /// Shared by the recovery and by ``eraseProfile(_:)``: the two must agree on
+    /// the key or an erase silently fails to clear the flag it is aiming at.
+    private static func repushFlagKey(for profileId: String?) -> String {
+        let id = profileId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return "\(movieRepushFlagKey).\(id.isEmpty ? "default" : id)"
+    }
+
     // MARK: - Storage
 
     static func records() -> [WatchProgressRecord] {
@@ -112,7 +121,7 @@ enum WatchProgressLedger {
         if cachedKey == key, let cachedRecords {
             return cachedRecords
         }
-        guard let data = UserDefaults.standard.data(forKey: key),
+        guard let data = storedData(forKey: key),
               let decoded = try? JSONDecoder().decode([WatchProgressRecord].self, from: data) else {
             cachedRecords = []
             cachedKey = key
@@ -121,6 +130,20 @@ enum WatchProgressLedger {
         cachedRecords = decoded
         cachedKey = key
         return decoded
+    }
+
+    /// File first, then the preferences key older builds wrote. A legacy payload
+    /// is moved across on first read so it stops counting against the tvOS
+    /// preferences budget — see ``LargePayloadStore``.
+    private static func storedData(forKey key: String) -> Data? {
+        if let data = LargePayloadStore.read(key: key, directory: storageDirectoryName) {
+            return data
+        }
+        guard let legacy = UserDefaults.standard.data(forKey: key) else { return nil }
+        if LargePayloadStore.write(legacy, key: key, directory: storageDirectoryName) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return legacy
     }
 
     static func record(forKey key: String) -> WatchProgressRecord? {
@@ -173,8 +196,64 @@ enum WatchProgressLedger {
     @discardableResult
     static func mergeRemote(_ remote: [WatchProgressRecord]) -> Bool {
         guard !remote.isEmpty else { return true }
+        return persist(Array(merged(remote, into: records()).values))
+    }
+
+    /// Applies an account snapshot as authoritative, deletions included.
+    ///
+    /// `sync_pull_watch_progress` returns the profile's entire current state, so
+    /// a row removed on another device is expressed only as an *absence* — there
+    /// is no delete flag to act on. ``mergeRemote(_:)`` unions and therefore can
+    /// never represent that, which left a title deleted on the phone sitting in
+    /// Continue Watching on this Apple TV forever.
+    ///
+    /// Absence only means deletion for rows the server is known to have seen. A
+    /// row still awaiting its push, or written while this pull was in flight, is
+    /// missing for a reason that is not a deletion and is kept.
+    ///
+    /// Returns the keys actually dropped so the caller can clear the *rendered*
+    /// list too: emptying the ledger makes ``ContinueWatchingBuilder/rebuild``
+    /// bail before it replaces the derived rows, which would otherwise strand
+    /// the card for the title that was just deleted.
+    static func reconcileRemote(
+        _ remote: [WatchProgressRecord],
+        syncStartedAt: Date
+    ) -> (saved: Bool, removedKeys: [String]) {
+        // A zero-row response is ambiguous: it can mean the account was
+        // intentionally cleared, but it can also be a transient/backend/profile
+        // mismatch. Never turn that ambiguity into destructive local data loss.
+        // Explicit removals are still reconciled from non-empty snapshots.
+        guard !remote.isEmpty else {
+            return (true, [])
+        }
+
+        let byKey = merged(remote, into: records())
+        let remoteKeys = Set(remote.map(\.progressKey))
+
+        var survivors: [WatchProgressRecord] = []
+        var removedKeys: [String] = []
+        for record in byKey.values {
+            if remoteKeys.contains(record.progressKey)
+                || record.isPendingPush
+                || record.lastWatchedAt > syncStartedAt {
+                survivors.append(record)
+            } else {
+                removedKeys.append(record.progressKey)
+            }
+        }
+
+        return (persist(survivors), removedKeys)
+    }
+
+    /// Remote rows layered onto local ones by `progressKey`, newer wins. A local
+    /// row still awaiting its push outranks an older server copy so a pull that
+    /// races a save cannot roll playback backwards.
+    private static func merged(
+        _ remote: [WatchProgressRecord],
+        into current: [WatchProgressRecord]
+    ) -> [String: WatchProgressRecord] {
         var byKey: [String: WatchProgressRecord] = [:]
-        for record in records() {
+        for record in current {
             byKey[record.progressKey] = record
         }
         for record in remote {
@@ -189,7 +268,7 @@ enum WatchProgressLedger {
                 byKey[record.progressKey] = record
             }
         }
-        return persist(Array(byKey.values))
+        return byKey
     }
 
     /// Clears the pending flag after a push confirms those rows reached the
@@ -260,7 +339,7 @@ enum WatchProgressLedger {
     /// to tell "the server dropped it" from "someone removed it". Episode rows
     /// demonstrably synced, so they are left alone.
     static func repushMoviesOnceIfNeeded() {
-        let flagKey = "\(movieRepushFlagKey).\(activeProfileId ?? "default")"
+        let flagKey = repushFlagKey(for: activeProfileId)
         guard !UserDefaults.standard.bool(forKey: flagKey) else { return }
 
         let current = records()
@@ -289,6 +368,12 @@ enum WatchProgressLedger {
     static func eraseProfile(_ profileId: String) {
         let key = profileId.isEmpty ? baseKey : "\(baseKey).\(profileId)"
         UserDefaults.standard.removeObject(forKey: key)
+        LargePayloadStore.remove(key: key, directory: storageDirectoryName)
+        // The one-shot repush flag is part of this profile's state, and
+        // ``eraseAllProfiles()`` clears it by prefix. Leaving it behind means a
+        // profile erased and rebuilt has already spent its recovery — which for
+        // a test suite silently disables what the next run is asserting.
+        UserDefaults.standard.removeObject(forKey: repushFlagKey(for: profileId))
         invalidateCache()
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -298,6 +383,7 @@ enum WatchProgressLedger {
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) || $0.hasPrefix(movieRepushFlagKey) }
             .forEach { defaults.removeObject(forKey: $0) }
+        LargePayloadStore.removeDirectory(storageDirectoryName)
         invalidateCache()
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -313,7 +399,14 @@ enum WatchProgressLedger {
         )
         guard let data = try? JSONEncoder().encode(trimmed) else { return false }
         let key = storageKey
-        UserDefaults.standard.set(data, forKey: key)
+        guard LargePayloadStore.write(data, key: key, directory: storageDirectoryName) else {
+            // No preferences fallback: the ledger shares its budget with every
+            // other key in the plist, and an oversized write aborts the process.
+            // Callers treat `false` as "not persisted" and keep the row pending.
+            return false
+        }
+        // Left behind by a build that stored the ledger in preferences.
+        UserDefaults.standard.removeObject(forKey: key)
         cachedRecords = trimmed
         cachedKey = key
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -369,11 +462,30 @@ enum WatchProgressLedger {
 
     /// Finished episodes that should seed a "Next Up" suggestion, newest first
     /// and at most one per series. Mirrors `buildHomeNextUpSeedCandidates`.
-    static func upNextSeeds() -> [WatchProgressRecord] {
-        var seenSeries: Set<String> = []
-        return records()
+    static func upNextSeeds(
+        preferFurthestEpisode: Bool = UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
+    ) -> [WatchProgressRecord] {
+        let completedEpisodes = records()
             .filter { $0.isEpisode && $0.isSeries && isComplete($0) && ($0.season ?? 0) > 0 }
-            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-            .filter { seenSeries.insert($0.contentId).inserted }
+
+        var selectedBySeries: [String: WatchProgressRecord] = [:]
+        for candidate in completedEpisodes {
+            guard let current = selectedBySeries[candidate.contentId] else {
+                selectedBySeries[candidate.contentId] = candidate
+                continue
+            }
+            if UpNextEpisodeSelectionPolicy.prefers(
+                candidateSeason: candidate.season ?? 0,
+                candidateEpisode: candidate.episode ?? 0,
+                candidateWatchedAt: candidate.lastWatchedAt,
+                over: current.season ?? 0,
+                currentEpisode: current.episode ?? 0,
+                currentWatchedAt: current.lastWatchedAt,
+                preferFurthestEpisode: preferFurthestEpisode
+            ) {
+                selectedBySeries[candidate.contentId] = candidate
+            }
+        }
+        return selectedBySeries.values.sorted { $0.lastWatchedAt > $1.lastWatchedAt }
     }
 }

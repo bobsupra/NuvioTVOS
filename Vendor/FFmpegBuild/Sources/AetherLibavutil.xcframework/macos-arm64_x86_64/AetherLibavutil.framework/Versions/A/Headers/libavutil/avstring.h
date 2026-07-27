@@ -1,1 +1,0 @@
-../avstring.h

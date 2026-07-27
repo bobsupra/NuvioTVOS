@@ -34,8 +34,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
-#include <AetherLibavutil/pixfmt.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/pixfmt.h"
+#include "AetherLibavutil/rational.h"
 
 /**
  * The spec limits the number of wavelet decompositions to 4 for both

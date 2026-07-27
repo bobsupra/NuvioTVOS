@@ -35,6 +35,10 @@ struct DetailsScreen: View {
     @State private var pendingEpisode: NuvioVideo?
     @State private var didHandleInitialStreamPicker = false
     @State private var expandedComment: TraktCommentReview?
+    /// Set while an episode card's context menu is up. tvOS hands the Menu press
+    /// that dismisses the menu to this screen as well, and without this the
+    /// screen would treat it as Back and return to Home.
+    @State private var isEpisodeMenuPresented = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
@@ -118,6 +122,9 @@ struct DetailsScreen: View {
                         pendingEpisode = video
                         startStreamFlow(streamId: video.id, type: "series", reload: true, forceManualPicker: true)
                     },
+                    onEpisodeMenuPresented: { isPresented in
+                        isEpisodeMenuPresented = isPresented
+                    },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
                     onWatchedClick: { viewModel.toggleWatched() },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
@@ -156,41 +163,29 @@ struct DetailsScreen: View {
 
             #if os(tvOS)
             if isStreamPickerPresented, let meta = viewModel.uiState.meta {
-                // Mount the picker once any group exists (loading chips), any
-                // streams arrived, or discovery finished — so add-ons appear
-                // immediately as loading instead of waiting for the first hit.
-                let hasGroups = !viewModel.uiState.streamGroups.isEmpty
-                let hasStreams = !viewModel.uiState.streams.isEmpty
-                let finished = !viewModel.uiState.isLoadingStreams
-                if hasGroups || hasStreams || finished {
-                    TvStreamPickerOverlay(
-                        meta: meta,
-                        episode: pendingEpisode,
-                        streams: viewModel.uiState.streams,
-                        groups: viewModel.uiState.streamGroups,
-                        streamsRevision: viewModel.uiState.streamsRevision,
-                        isLoading: viewModel.uiState.isLoadingStreams,
-                        emptyReason: viewModel.uiState.streamsEmptyReason,
-                        includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
-                        isResolvingDebrid: isResolvingDebrid,
-                        onSelect: { stream in
-                            playStream(stream, meta: meta)
-                        },
-                        onDismiss: {
-                            isStreamPickerPresented = false
-                        }
-                    )
-                    .transition(.opacity)
-                    .zIndex(10)
-                } else {
-                    TvStreamLoadingOverlay(
-                        meta: meta,
-                        episode: pendingEpisode,
-                        onDismiss: { isStreamPickerPresented = false }
-                    )
-                    .transition(.opacity)
-                    .zIndex(10)
-                }
+                // Mount the picker straight away and let its own panel show the
+                // loading state. Gating it behind the first group/stream meant a
+                // separate full-screen spinner flashed first, then swapped for
+                // the picker's — the same message twice.
+                TvStreamPickerOverlay(
+                    meta: meta,
+                    episode: pendingEpisode,
+                    streams: viewModel.uiState.streams,
+                    groups: viewModel.uiState.streamGroups,
+                    streamsRevision: viewModel.uiState.streamsRevision,
+                    isLoading: viewModel.uiState.isLoadingStreams,
+                    emptyReason: viewModel.uiState.streamsEmptyReason,
+                    includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
+                    isResolvingDebrid: isResolvingDebrid,
+                    onSelect: { stream in
+                        playStream(stream, meta: meta)
+                    },
+                    onDismiss: {
+                        isStreamPickerPresented = false
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(10)
             }
 
             if let expandedComment {
@@ -201,6 +196,7 @@ struct DetailsScreen: View {
                 .transition(.opacity)
                 .zIndex(20)
             }
+
             #endif
         }
         .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
@@ -212,7 +208,11 @@ struct DetailsScreen: View {
         // Home or suspends the app. Catching it here closes just the picker,
         // and otherwise behaves like the regular back action.
         .onExitCommand {
-            if expandedComment != nil {
+            if isEpisodeMenuPresented {
+                // The context menu consumed this press to close itself; it
+                // reaches here anyway. Swallow it so Details stays put.
+                isEpisodeMenuPresented = false
+            } else if expandedComment != nil {
                 expandedComment = nil
             } else if isStreamPickerPresented {
                 isStreamPickerPresented = false
@@ -1414,6 +1414,7 @@ struct TvDetailsContent: View {
     var onPlayManually: (() -> Void)? = nil
     let onEpisodeSelected: (NuvioVideo) -> Void
     var onEpisodePlayManually: ((NuvioVideo) -> Void)? = nil
+    var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
     let onShareClick: () -> Void
@@ -1424,12 +1425,26 @@ struct TvDetailsContent: View {
     let onBack: () -> Void
 
     @FocusState private var actionFocus: DetailsActionFocus?
+    /// Which episode control holds focus, as `TvEpisodeFocus` keys. Owned here
+    /// rather than per card so focus can be put back on a specific episode.
+    @FocusState private var episodeFocus: String?
+    /// Episode control to re-focus once the stream picker closes, captured when
+    /// this content gets disabled. Same approach Home uses for the card you
+    /// left when entering Details — see `restoreEpisodeFocus`.
+    @State private var restoreEpisodeKey: String?
+    @State private var restoreGeneration = 0
+    @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
+    /// Bumped whenever a watched mark or a progress write lands. Resume progress
+    /// is read straight from the stores below rather than from `uiState`, so
+    /// without this the episode strip keeps drawing the bar it rendered with —
+    /// marking an episode watched cleared the stores but nothing re-read them.
+    @State private var progressRevision = 0
 
     var body: some View {
         if let meta = uiState.meta {
             let episodes = sortedEpisodes(meta)
-            let continueItem = currentContinueWatchingItem(for: meta)
+            let continueItem = currentContinueWatchingItem(for: meta, revision: progressRevision)
             let playTarget = playTarget(for: meta, episodes: episodes, continueItem: continueItem)
 
             GeometryReader { proxy in
@@ -1479,8 +1494,11 @@ struct TvDetailsContent: View {
                                     focus: $actionFocus
                                 )
                                 .padding(.bottom, 6)
+                                // Unfocusable while an episode is being restored
+                                // to, so the engine can't claim these instead.
+                                .disabled(restoreEpisodeKey != nil)
 
-                                TvDetailsSummary(meta: meta)
+                                TvDetailsSummary(meta: meta, simkl: uiState.simklRatings)
 
                                 if !episodes.isEmpty {
                                     TvDetailsEpisodes(
@@ -1493,7 +1511,10 @@ struct TvDetailsContent: View {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                                             }
                                         },
-                                        onSelect: onEpisodeSelected
+                                        onSelect: onEpisodeSelected,
+                                        onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
+                                        episodeFocus: $episodeFocus,
+                                        restrictFocusToKey: restoreEpisodeKey
                                     )
                                     .padding(.top, 24)
                                     .id(TvDetailsScrollID.episodesSection)
@@ -1510,6 +1531,7 @@ struct TvDetailsContent: View {
                                 )
                                 .padding(.top, 34)
                                 .id(TvDetailsScrollID.castSection)
+                                .disabled(restoreEpisodeKey != nil)
 
                                 if !uiState.moreLikeThis.isEmpty {
                                     TvDetailsRelatedRow(
@@ -1526,6 +1548,7 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.moreLikeThisSection)
+                                    .disabled(restoreEpisodeKey != nil)
                                 }
 
                                 if !uiState.companies.isEmpty {
@@ -1542,6 +1565,7 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.productionSection)
+                                    .disabled(restoreEpisodeKey != nil)
                                 }
 
                                 if !uiState.comments.isEmpty {
@@ -1558,6 +1582,7 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.commentsSection)
+                                    .disabled(restoreEpisodeKey != nil)
                                 }
                             }
                             .padding(.leading, 96)
@@ -1579,8 +1604,64 @@ struct TvDetailsContent: View {
             .onAppear {
                 DispatchQueue.main.async { actionFocus = .play }
             }
+            // Opening the stream picker disables this content, and on the way
+            // back tvOS re-places focus geometrically — which is how leaving an
+            // episode's picker landed you on the season pills. Capture the
+            // episode on the way out, and while that capture stands every other
+            // control here is unfocusable, so the engine can only put focus back
+            // where it was.
+            .onChange(of: isEnabled) { enabled in
+                if !enabled {
+                    restoreGeneration &+= 1
+                    restoreEpisodeKey = episodeFocus
+                } else if let target = restoreEpisodeKey {
+                    restoreEpisodeFocus(to: target, generation: restoreGeneration)
+                }
+            }
+            .onChange(of: episodeFocus) { newValue in
+                // Restoration landed — lift the restriction.
+                if let newValue, newValue == restoreEpisodeKey {
+                    restoreEpisodeKey = nil
+                }
+            }
+            // Marking an episode watched clears its progress across three
+            // stores, and the remote provider's optimistic layer is cleared one
+            // hop later — so every one of them has to be able to invalidate this
+            // view, not just the mark itself.
+            .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification)) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(
+                    for: TraktSettingsStore.continueWatchingChangedNotification
+                )
+            ) { _ in
+                progressRevision &+= 1
+            }
         } else {
             EmptyView()
+        }
+    }
+
+    /// Nudges focus back onto the captured episode control. The writes are
+    /// delayed because the cards are unfocusable for a few frames while the
+    /// picker fades, and the 1s clear is a safety net for a target that is gone
+    /// (the season was switched, say) so the strip can't stay unfocusable.
+    private func restoreEpisodeFocus(to target: String, generation: Int) {
+        for delay in [0.12, 0.45] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if restoreGeneration == generation, restoreEpisodeKey == target {
+                    episodeFocus = target
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if restoreGeneration == generation, restoreEpisodeKey == target {
+                restoreEpisodeKey = nil
+            }
         }
     }
 
@@ -1635,7 +1716,13 @@ struct TvDetailsContent: View {
         return (first, first.map { "Play S\($0.season) E\($0.episode)" } ?? "Play", true)
     }
 
-    private func currentContinueWatchingItem(for meta: NuvioMeta) -> ContinueWatchingItem? {
+    /// `revision` is deliberately unused: taking it forces the lookup to be
+    /// re-run whenever ``progressRevision`` changes, which is what re-reads the
+    /// stores after a watched mark clears an episode's progress.
+    private func currentContinueWatchingItem(
+        for meta: NuvioMeta,
+        revision: Int
+    ) -> ContinueWatchingItem? {
         if RemoteTrackingState.isProgressSourceAuthenticated {
             return TraktProgressService.currentContinueWatchingItem(for: meta)
         }
@@ -1883,6 +1970,7 @@ private struct OptionalAccessibilityHint: ViewModifier {
 
 private struct TvDetailsSummary: View {
     let meta: NuvioMeta
+    var simkl: SimklTitleRatings? = nil
 
     var body: some View {
         VStack(alignment: .leading, spacing: 20) {
@@ -1970,6 +2058,24 @@ private struct TvDetailsSummary: View {
         }
         if let country = meta.country, !country.isEmpty {
             items.append(country)
+        }
+        items.append(contentsOf: simklMetaItems)
+        return items
+    }
+
+    /// Simkl's community numbers. Drop rate is Simkl-only — neither Trakt nor
+    /// TMDB reports how many viewers gave up on a title.
+    private var simklMetaItems: [String] {
+        guard let simkl else { return [] }
+        var items: [String] = []
+        if let rating = simkl.rating {
+            items.append(String(format: "★ %.1f Simkl", rating))
+        }
+        if let rank = simkl.rank {
+            items.append("#\(rank)")
+        }
+        if let dropRate = simkl.dropRate, dropRate != "0%" {
+            items.append("\(dropRate) dropped")
         }
         return items
     }
@@ -2447,6 +2553,11 @@ private struct TvDetailsEpisodes: View {
     let continueItem: ContinueWatchingItem?
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
+    let onEpisodeMenuPresented: (Bool) -> Void
+    var episodeFocus: FocusState<String?>.Binding
+    /// While set, only the control with this key can take focus — see the
+    /// restore in `TvDetailsContent`.
+    let restrictFocusToKey: String?
 
     @State private var selectedSeason: Int
     @State private var episodeScrollIndex = 0
@@ -2459,7 +2570,10 @@ private struct TvDetailsEpisodes: View {
         seriesRating: Double?,
         continueItem: ContinueWatchingItem?,
         onFocus: @escaping () -> Void,
-        onSelect: @escaping (NuvioVideo) -> Void
+        onSelect: @escaping (NuvioVideo) -> Void,
+        onEpisodeMenuPresented: @escaping (Bool) -> Void,
+        episodeFocus: FocusState<String?>.Binding,
+        restrictFocusToKey: String?
     ) {
         self.meta = meta
         self.episodes = episodes
@@ -2467,6 +2581,9 @@ private struct TvDetailsEpisodes: View {
         self.continueItem = continueItem
         self.onFocus = onFocus
         self.onSelect = onSelect
+        self.onEpisodeMenuPresented = onEpisodeMenuPresented
+        self.episodeFocus = episodeFocus
+        self.restrictFocusToKey = restrictFocusToKey
         _selectedSeason = State(initialValue: Self.defaultSeason(episodes))
         _watchedEpisodeKeys = State(initialValue: WatchedStore.watchedEpisodeKeys(meta: meta))
     }
@@ -2493,6 +2610,7 @@ private struct TvDetailsEpisodes: View {
                         fallbackRating: seriesRating,
                         continueProgress: continueProgress(for: video),
                         isWatched: watchedEpisodeKeys.contains("\(video.season):\(video.episode)"),
+                        isSeasonWatched: isSeasonWatched,
                         onFocus: {
                             if let index = seasonEpisodes.firstIndex(where: { $0.id == video.id }) {
                                 episodeScrollIndex = index
@@ -2506,7 +2624,19 @@ private struct TvDetailsEpisodes: View {
                                 episode: video.episode
                             )
                         },
-                        action: { onSelect(video) }
+                        onToggleSeasonWatched: {
+                            WatchedStore.setSeasonWatched(
+                                meta: meta,
+                                season: selectedSeason,
+                                episodes: seasonEpisodes.map(\.episode),
+                                isWatched: !isSeasonWatched
+                            )
+                        },
+                        onMenuOpened: { onEpisodeMenuPresented(true) },
+                        onMenuClosed: { onEpisodeMenuPresented(false) },
+                        action: { onSelect(video) },
+                        focus: episodeFocus,
+                        restrictFocusToKey: restrictFocusToKey
                     )
                 }
             }
@@ -2542,6 +2672,9 @@ private struct TvDetailsEpisodes: View {
                 .padding(.vertical, 8)
             }
             .scrollClipDisabledIfAvailable()
+            // The pills are the strip's other focus target, and the one the
+            // engine picked when an episode's picker closed.
+            .disabled(restrictFocusToKey != nil)
         } else {
             Text(seasonTitle(selectedSeason))
                 .font(.system(size: 32, weight: .semibold))
@@ -2562,6 +2695,14 @@ private struct TvDetailsEpisodes: View {
         episodes
             .filter { $0.season == selectedSeason }
             .sorted { $0.episode < $1.episode }
+    }
+
+    /// A season counts as watched only when every episode in it is, which is
+    /// what makes the menu item a genuine toggle rather than a re-mark.
+    private var isSeasonWatched: Bool {
+        !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
+            watchedEpisodeKeys.contains("\(selectedSeason):\($0.episode)")
+        }
     }
 
     private static func defaultSeason(_ episodes: [NuvioVideo]) -> Int {
@@ -2593,6 +2734,13 @@ private struct TvDetailsEpisodes: View {
         }
         return continueItem.progress
     }
+}
+
+/// Focus keys for the two controls on an episode card. Strings rather than an
+/// enum so one `FocusState<String?>` can address every card in the strip.
+private enum TvEpisodeFocus {
+    static func card(_ videoID: String) -> String { "episode-card\u{1}\(videoID)" }
+    static func watched(_ videoID: String) -> String { "episode-watched\u{1}\(videoID)" }
 }
 
 private enum TvEpisodeCardLayout {
@@ -2638,12 +2786,22 @@ private struct TvEpisodeCard: View {
     let fallbackRating: Double?
     let continueProgress: Double?
     let isWatched: Bool
+    let isSeasonWatched: Bool
     let onFocus: () -> Void
     let onToggleWatched: () -> Void
+    let onToggleSeasonWatched: () -> Void
+    /// Called when a long press raises the context menu, and again when one of
+    /// its items closes it — see the `.contextMenu` below.
+    let onMenuOpened: () -> Void
+    let onMenuClosed: () -> Void
     let action: () -> Void
+    var focus: FocusState<String?>.Binding
+    let restrictFocusToKey: String?
 
-    @FocusState private var isFocused: Bool
-    @FocusState private var isWatchedControlFocused: Bool
+    private var cardKey: String { TvEpisodeFocus.card(video.id) }
+    private var watchedKey: String { TvEpisodeFocus.watched(video.id) }
+    private var isFocused: Bool { focus.wrappedValue == cardKey }
+    private var isWatchedControlFocused: Bool { focus.wrappedValue == watchedKey }
 
     private let cardWidth: CGFloat = TvEpisodeCardLayout.width
     private let thumbHeight: CGFloat = 300
@@ -2724,43 +2882,66 @@ private struct TvEpisodeCard: View {
                         .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
                 )
                 .shadow(color: .black.opacity(isFocused ? 0.4 : 0.16), radius: isFocused ? 26 : 10, y: 12)
+                // The badge is part of the card's own content, so it scales and
+                // fades with the card and can never be left behind by whatever
+                // is drawn over the top. The focusable control below only draws
+                // itself once focused, and covers this copy when it does.
+                .overlay(alignment: .topTrailing) {
+                    watchedBadge(isControlFocused: false)
+                        .padding(18)
+                        .accessibilityHidden(true)
+                }
             }
             .buttonStyle(PosterCardButtonStyle())
-            .focused($isFocused)
+            .focused(focus, equals: cardKey)
             .focusEffectDisabledIfAvailable()
+            .disabled(restrictFocusToKey != nil && restrictFocusToKey != cardKey)
             .scaleEffect(isFocused ? 1.05 : 1)
             .animation(.easeOut(duration: 0.14), value: isFocused)
             .onChange(of: isFocused) { focused in
                 if focused { onFocus() }
             }
+            // tvOS delivers the Menu press that dismisses a context menu to the
+            // view behind it as well, which backs Details out to Home. Telling
+            // the screen a menu is up lets it swallow exactly that one press.
+            .simultaneousGesture(
+                LongPressGesture(minimumDuration: 0.5).onEnded { _ in
+                    onMenuOpened()
+                }
+            )
             .contextMenu {
-                Button(action: onToggleWatched) {
+                Button {
+                    onMenuClosed()
+                    onToggleWatched()
+                } label: {
                     Label(
                         isWatched ? "Mark as unwatched" : "Mark as watched",
                         systemImage: isWatched ? "eye.slash.fill" : "eye.fill"
                     )
                 }
+
+                Button {
+                    onMenuClosed()
+                    onToggleSeasonWatched()
+                } label: {
+                    Label(
+                        isSeasonWatched ? "Mark season as unwatched" : "Mark season as watched",
+                        systemImage: isSeasonWatched ? "eye.slash" : "eye"
+                    )
+                }
             }
 
             Button(action: onToggleWatched) {
-                Image(systemName: isWatched ? "eye.fill" : "eye.slash.fill")
-                    .font(.system(size: 24, weight: .bold))
-                    .foregroundColor(isWatchedControlFocused ? .black : .white)
-                    .frame(width: 58, height: 58)
-                    .background(
-                        Circle().fill(
-                            isWatchedControlFocused
-                                ? Color.white
-                                : (isWatched
-                                    ? Color(red: 0.10, green: 0.68, blue: 0.34)
-                                    : Color.black.opacity(0.62))
-                        )
-                    )
-                    .overlay(Circle().stroke(Color.white.opacity(0.38), lineWidth: 1))
+                // Only drawn while focused: the rest of the time the copy inside
+                // the card above is the visible badge, and drawing both would
+                // stack two translucent circles on the artwork.
+                watchedBadge(isControlFocused: isWatchedControlFocused)
+                    .opacity(isWatchedControlFocused ? 1 : 0)
             }
             .buttonStyle(PosterCardButtonStyle())
-            .focused($isWatchedControlFocused)
+            .focused(focus, equals: watchedKey)
             .focusEffectDisabledIfAvailable()
+            .disabled(restrictFocusToKey != nil && restrictFocusToKey != watchedKey)
             .scaleEffect(isWatchedControlFocused ? 1.12 : 1)
             .animation(.easeOut(duration: 0.14), value: isWatchedControlFocused)
             .accessibilityLabel(isWatched ? "Mark episode as unwatched" : "Mark episode as watched")
@@ -2769,6 +2950,25 @@ private struct TvEpisodeCard: View {
                 if focused { onFocus() }
             }
         }
+    }
+
+    /// Watched marker, drawn twice: once inside the card as the resting badge,
+    /// and once in the focusable control stacked on top of it.
+    private func watchedBadge(isControlFocused: Bool) -> some View {
+        Image(systemName: isWatched ? "eye.fill" : "eye.slash.fill")
+            .font(.system(size: 24, weight: .bold))
+            .foregroundColor(isControlFocused ? .black : .white)
+            .frame(width: 58, height: 58)
+            .background(
+                Circle().fill(
+                    isControlFocused
+                        ? Color.white
+                        : (isWatched
+                            ? Color(red: 0.10, green: 0.68, blue: 0.34)
+                            : Color.black.opacity(0.62))
+                )
+            )
+            .overlay(Circle().stroke(Color.white.opacity(0.38), lineWidth: 1))
     }
 
     private var episodeArtwork: some View {
@@ -2961,58 +3161,6 @@ private struct TvStreamGlass<S: InsettableShape>: ViewModifier {
 }
 
 #if os(tvOS)
-/// Shown in place of the picker while streams are still loading. Keeping the
-/// picker unmounted until streams exist means the picker's first appearance is
-/// a fresh focus transition, which is the only reliable way to auto-focus the
-/// first stream on tvOS. A focusable spinner keeps the Menu/back button working.
-private struct TvStreamLoadingOverlay: View {
-    let meta: NuvioMeta
-    let episode: NuvioVideo?
-    let onDismiss: () -> Void
-
-    @FocusState private var spinnerFocused: Bool
-
-    var body: some View {
-        GeometryReader { proxy in
-            ZStack {
-                TvDetailsBackdrop(meta: meta)
-
-                HStack(alignment: .center, spacing: 74) {
-                    VStack(alignment: .leading, spacing: 34) {
-                        TvDetailsLogo(meta: meta)
-
-                        if let episode {
-                            Text("Season \(episode.season) · Episode \(episode.episode)")
-                                .font(.system(size: 36, weight: .semibold))
-                                .foregroundColor(.white)
-                                .frame(width: 560, alignment: .center)
-                        }
-                    }
-                    .frame(width: min(proxy.size.width * 0.34, 620), alignment: .leading)
-                    .padding(.top, proxy.size.height * 0.20)
-
-                    VStack(spacing: 26) {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(1.8)
-
-                        Text("Finding streams")
-                            .font(.system(size: 32, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.8))
-                    }
-                    .frame(maxWidth: .infinity, alignment: .center)
-                    .focusable()
-                    .focused($spinnerFocused)
-                }
-                .padding(.horizontal, 96)
-            }
-            .onAppear { spinnerFocused = true }
-            .onExitCommand(perform: onDismiss)
-        }
-        .background(Color.black.ignoresSafeArea())
-    }
-}
-
 private struct TvStreamPickerOverlay: View {
     let meta: NuvioMeta
     let episode: NuvioVideo?
@@ -3042,6 +3190,10 @@ private struct TvStreamPickerOverlay: View {
     // their natural id. One shared state makes programmatic focus moves reliable
     // and lets us seed focus on appear so the picker is never in limbo.
     @FocusState private var focusedItem: String?
+    /// Whether focus has been handed to a stream card yet. The picker usually
+    /// mounts while discovery is still running, so the first seed can only land
+    /// on the All chip; this drives the hand-off once results exist, once.
+    @State private var didSeedStreamFocus = false
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
@@ -3082,8 +3234,9 @@ private struct TvStreamPickerOverlay: View {
                 }
                 .padding(.horizontal, 96)
             }
-            // The picker is only mounted once streams are available, so this
-            // first appearance is a fresh focus transition and the seed wins.
+            // The picker mounts before discovery finishes, so this seed usually
+            // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
+            // first card once results exist.
             .onAppear {
                 refreshDisplayedStreamsIfNeeded()
                 seedInitialFocus()
@@ -3092,12 +3245,13 @@ private struct TvStreamPickerOverlay: View {
             // all flow through this cache key. Focus is excluded.
             .onChange(of: listCacheKey) { _ in
                 refreshDisplayedStreamsIfNeeded()
+                seedStreamFocusIfNeeded()
             }
             // The focus engine can still reject the seed after grabFocus reads
-            // back its own write and stops retrying — e.g. the loading spinner
-            // keeps real focus while it fades out, then its removal makes the
-            // engine re-resolve and write nil into this binding, visibly
-            // un-highlighting the first card. If focus ever evaporates while
+            // back its own write and stops retrying — e.g. the panel's loading
+            // spinner keeps real focus while it fades out, then its removal
+            // makes the engine re-resolve and write nil into this binding,
+            // visibly un-highlighting the first card. If focus evaporates while
             // the picker is up, grab it again — but only if it's *still* gone
             // after a beat. A fast scroll blips `focusedItem` to nil between
             // cards before landing on the next one; re-seeding on that blip
@@ -3421,11 +3575,27 @@ private struct TvStreamPickerOverlay: View {
         DispatchQueue.main.async {
             refreshDisplayedStreamsIfNeeded()
             if let firstID = activeDisplayedStreams.first?.id {
+                didSeedStreamFocus = true
                 grabFocus(firstID, attempt: 0)
             } else {
                 grabFocus(filterAllKey, attempt: 0)
             }
         }
+    }
+
+    /// Hands focus to the first stream once discovery produces one, for the
+    /// common case where the picker opened empty and had to seed the All chip.
+    ///
+    /// Runs once. Anything the user did in the meantime wins: if focus has moved
+    /// off the chip the picker itself seeded — another add-on, sort, or a card
+    /// that arrived earlier — the hand-off is dropped rather than yanking focus
+    /// out from under them mid-scroll.
+    private func seedStreamFocusIfNeeded() {
+        guard !didSeedStreamFocus,
+              let firstID = activeDisplayedStreams.first?.id else { return }
+        didSeedStreamFocus = true
+        guard focusedItem == nil || focusedItem == filterAllKey else { return }
+        grabFocus(firstID, attempt: 0)
     }
 
     /// Asserts focus on `id` and retries for a short window, because the target

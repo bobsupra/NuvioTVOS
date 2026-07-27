@@ -23,7 +23,7 @@
 #ifndef AVCODEC_MEDIACODEC_H
 #define AVCODEC_MEDIACODEC_H
 
-#include "avcodec.h"
+#include "AetherLibavcodec/avcodec.h"
 
 /**
  * This structure holds a reference to a android/view/Surface object that will

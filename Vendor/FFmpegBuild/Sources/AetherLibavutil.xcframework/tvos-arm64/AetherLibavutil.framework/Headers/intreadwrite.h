@@ -20,7 +20,7 @@
 #define AVUTIL_INTREADWRITE_H
 
 #include <stdint.h>
-#include "avconfig.h"
+#include "AetherLibavutil/avconfig.h"
 #include "attributes.h"
 #include "bswap.h"
 

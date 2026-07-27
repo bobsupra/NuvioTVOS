@@ -1,8 +1,8 @@
 // swift-tools-version: 6.0
 //
-// Nuvio fork of FFmpegBuild 2.1.3: frameworks/modules namespaced as AetherLib*
+// Nuvio fork of FFmpegBuild 2.2.0: frameworks/modules namespaced as AetherLib*
 // so they coexist in the same app binary with MPVKit's Libav* stack.
-// Upstream: https://github.com/superuser404notfound/FFmpegBuild/tree/2.1.3
+// Upstream: https://github.com/superuser404notfound/FFmpegBuild/tree/2.2.0
 // Rebuild: re-run Vendor/namespace_ffmpegbuild.py after refreshing upstream xcframeworks.
 
 import PackageDescription
@@ -19,6 +19,7 @@ let package = Package(
             name: "FFmpegBuild",
             targets: ["FFmpegBuild"]
         ),
+        // Individual libraries for consumers that want fine-grained control
         .library(name: "AetherLibavcodec", targets: ["AetherLibavcodec"]),
         .library(name: "AetherLibavformat", targets: ["AetherLibavformat"]),
         .library(name: "AetherLibavutil", targets: ["AetherLibavutil"]),
@@ -30,6 +31,7 @@ let package = Package(
         .library(name: "AetherLibzvbi", targets: ["AetherLibzvbi"]),
     ],
     targets: [
+        // Umbrella target that links all FFmpeg libraries + dav1d + system frameworks
         .target(
             name: "FFmpegBuild",
             dependencies: [
@@ -55,6 +57,7 @@ let package = Package(
                 .linkedLibrary("c++"),
             ]
         ),
+        // Prebuilt xcframeworks (created by build.sh)
         .binaryTarget(name: "AetherLibavcodec", path: "Sources/AetherLibavcodec.xcframework"),
         .binaryTarget(name: "AetherLibavformat", path: "Sources/AetherLibavformat.xcframework"),
         .binaryTarget(name: "AetherLibavutil", path: "Sources/AetherLibavutil.xcframework"),

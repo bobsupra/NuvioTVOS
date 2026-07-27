@@ -43,17 +43,17 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / DTS / DTS-HD MA / MP3 / Opus bridge to EAC3 5.1 (default) or lossless FLAC |
-| Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix) |
+| Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
 | Background audio | Audio keeps playing when the app backgrounds on iOS: native AVPlayer stays alive, the software path drops video and keeps decoding audio (`backgroundPlaybackEnabled` / `pictureInPictureActive`); a paused session survives quick app switches for a grace window (`backgroundTeardownGraceSeconds`, default 15 s) before the wedge-safe teardown runs. tvOS tears down immediately (wedge-safe) unless a PiP window is active, which keeps the pipeline and loopback server alive; with PiP the software path keeps decoding video too (the window needs frames). Hosts gate corrective actions on the published `isSessionReady` |
-| Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
-| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage`), external files as first-class tracks (registered, listed, selected like embedded streams), opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`) |
+| Picture in Picture | Native path: hosts build `AVPictureInPictureController` around `currentAVPlayer`; while `pictureInPictureActive` a native->native load hands the AVPlayerItem over in place so the window survives next-episode transitions. Software path: published `softwarePiPSource` carries the `AVSampleBufferDisplayLayer` plus transport answers on the enqueued frames' PTS axis for sample-buffer PiP. While PiP is active the software path also composites active subtitle cues (text and PGS/DVB bitmaps) into the decoded frames, so the window shows subtitles the host overlay cannot reach. On the native path, a selected bitmap track's compositions are OCR-recognized into its WebVTT rendition, so PGS subtitles render in the PiP window there as well. iOS renders sample-buffer PiP; tvOS AVKit does not evaluate sample-buffer content sources (Apple FB9751461, verified through tvOS 26) |
+| Subtitles | Text (SRT / ASS / SSA / VTT / mov_text) inline, bitmap (PGS / DVB / DVD) as `CGImage`, in-band CEA-608 closed captions (field-1, from an `eia_608`/`c608` demuxable track or extracted from A53 `cc_data` embedded in the video bitstream: H.264/HEVC SEI on the native path, decoded-frame side data such as MPEG-2 on the software path, with the caption track surfacing lazily on first real caption data), DVB teletext decoded to text cues with broadcaster colour preserved and a selectable caption page (libzvbi, `LoadOptions.teletextPage`), external files as first-class tracks (registered, listed, selected like embedded streams), opt-in raw ASS markup + fonts; embedded-text cues harvested from the producer's own read (instant enable, no side-channel bandwidth); opt-in native WebVTT renditions (one per text track incl. load-declared external files, language-tagged) so subtitles survive PiP / AirPlay / external display (`LoadOptions.prepareNativeSubtitles`); bitmap tracks (PGS / DVB / DVD, embedded and external .sup) join as OCR-fed renditions: on-device Vision text recognition runs while the track is selected and fills a language-tagged text rendition, so bitmap subtitles survive PiP / AirPlay / external display on the native path too (lossy by design; fullscreen keeps the pixel-accurate overlay) |
 | Frames | Off-playback `FrameExtractor`: `thumbnail` (scrub preview) + `snapshot` (frame-accurate) |
 | Audio tap | Opt-in `installAudioTap()`: decoded playback audio as mono Float32 48 kHz PCM with source-PTS timestamps, off the render path (live transcription, ShazamKit); delivers on the loopback, remote-HLS (VOD + live), and software paths |
 | Metadata | `MediaMetadata` (title / artist / album / albumArtist + cover) parsed on load |
 | Seek | VOD seeks into watched content are restart-free cache hits (byte-budgeted retention, 2 GiB cap); short forward scrubs ride the cached window; only never-produced targets restart the producer |
-| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes; configurable forward-buffer window (`LoadOptions.forwardBufferSegments`) |
+| Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes; configurable forward-buffer window (`LoadOptions.forwardBufferSegments`), from the 40 s default up to an opt-in whole-source pre-buffer that is bounded in bytes by the session's disk budget rather than in segments |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
 | Network | SMB2/3 shares via the optional `AetherEngineSMB` product (NTLMv2 / guest, read-only) |
@@ -171,7 +171,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.8.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.3")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -224,6 +224,10 @@ Known limitation: SMBClient negotiates only SMB 2.0.2 and 2.1, so there is no SM
 try await player.load(url: streamURL, options: LoadOptions(isLive: true))
 try await player.load(url: streamURL, options: LoadOptions(isLive: true, dvrWindowSeconds: 1800))
 
+// IPTV channel zapping: join in ~3-6s instead of 10-18s on strict-realtime origins by letting
+// TARGETDURATION (and the live-edge holdback derived from it) track the source keyframe cadence:
+try await player.load(url: streamURL, options: LoadOptions(isLive: true, liveJoinProfile: .fastZap))
+
 // Drive a scrubber from the live-edge fields (they tick, so they live on player.clock):
 player.clock.$seekableLiveRange   // ClosedRange<Double>?, session-relative; nil when DVR off
 player.clock.$behindLiveSeconds   // seconds behind the edge; 0 at the edge
@@ -238,6 +242,8 @@ try await player.load(
 )
 ```
 
+`liveJoinProfile: .fastZap` (AetherEngine#195/#208) cuts live segments at every keyframe past 0.5 s instead of the standard ~4 s, so the served `TARGETDURATION` collapses to the source GOP length and its live-edge holdback (`HOLD-BACK` = 3 x `TARGETDURATION`, the RFC 8216bis floor; AetherEngine#189) shrinks with it. The first manifest still prefers the full holdback. After two finalized segments, a strict-realtime source gets one observed-segment grace clamped to 0.5...2.0 s, then a shallow first window may be served so startup stays bounded. This can produce one early `-16832` or a short rebuffer. `.standard` retains the full-holdback guarantee. The smaller `TARGETDURATION` also tightens AVPlayer's unchanged-playlist patience and live-edge buffer, so origins that stall or burst mid-stream rebuffer more readily; opt in for zapping UX, keep `.standard` for lean-back viewing.
+
 Direct ingest covers MPEG-TS with demuxed-audio and packed-audio renditions, in-line AES-128 clear-key decryption, and SSAI ad-pod direct play (versioned init segments, audio re-anchoring, no-cut watchdog). Unsupported encryption / fMP4 playlists surface a typed `HLSIngestError` so the host can fall back. Details in [docs/formats.md › Live ingest](docs/formats.md#live-ingest-aes-128-ssai).
 
 For an upstream AVPlayer can play natively (a standard remote `master.m3u8`, e.g. a Jellyfin live channel), `LoadOptions.nativeRemoteHLS` skips the demuxer probe and the loopback server entirely and hands the URL straight to AVPlayer, which manages the live edge and reconnect itself. Pair it with `isLive: true`. `LoadOptions.httpHeaders` rides into the `AVURLAsset` on this path, so origins that enforce per-stream `Referer` / `User-Agent` / `Authorization` headers (common for IPTV channels) work too.
@@ -249,6 +255,7 @@ A non-live remote `m3u8` handed to the default (loopback) path reroutes onto thi
 <!-- used-by:start -->
 - [Sodalite](https://github.com/superuser404notfound/Sodalite): native Jellyfin client for Apple TV.
 - [AetherPlayer](https://github.com/superuser404notfound/AetherPlayer): native macOS media player.
+- [NowSeen](https://discord.com/invite/7AFh3Hy8p4): IPTV / Manifest app for tvOS.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed.
@@ -274,6 +281,8 @@ try await engine.load(url: url, options: LoadOptions(
 `suppressDisplayCriteria` defaults to `false`, so the engine-driven path is the default: `apply()` runs synchronously inside `load(url:)`, `waitForSwitch` blocks until the panel reaches the target mode (or 5 s timeout), then `replaceCurrentItem` runs against an already-correct panel.
 
 **Handoffs between items:** back-to-back `load()` calls preserve the applied criteria across the seam, so a same-mode follow-up (Dolby Vision episode to Dolby Vision episode) overwrites it in place with a single handshake instead of bouncing the panel through SDR. If your host calls `stop()` between items, pass `stop(resetDisplayCriteria: false)` to get the same behavior ([#128](https://github.com/superuser404notfound/AetherEngine/pull/128)); the plain `stop()` returns the panel to its default mode, which is what you want when leaving playback for the app UI. Audio-only sessions and suppressed hosts clear a leftover criteria automatically.
+
+**Who owns the audio session:** the engine declares the category at init but deliberately never activates it on the native path, because AVKit activates per playback and that is what lets tvOS negotiate the HDMI route (issue [#24](https://github.com/superuser404notfound/AetherEngine/issues/24)). It therefore never releases it either, and on an E-AC-3 / Atmos bitstream-passthrough route the sink can keep looping the last MAT frame after the player is gone. If your app owns the session (no UI sounds, TTS, or `AVAudioEngine` of its own competing with playback), set `engine.deactivatesAudioSessionOnStop = true` and the engine releases the session on a genuine final teardown, meaning `stop()`, never a reload, handoff, or live retune. It is off by default: an app that plays its own audio would otherwise have its session torn out from under it when playback ends.
 
 > **Custom chrome with a SwiftUI `Menu`?** On tvOS 26 an open `Menu`'s focused row blinks on any render transaction in the tree. Build the menu button in UIKit (`UIButton.menu` + `showsMenuAsPrimaryAction`) and guard `updateUIView` so the open dropdown never rebuilds. Pattern in [docs/architecture.md › SwiftUI Menu](docs/architecture.md#swiftui-menu-in-custom-player-chrome).
 
@@ -302,10 +311,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.8.6")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.3")
 ```
 
-Pin to `.upToNextMinor(from: "5.8.6")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "5.23.3")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 

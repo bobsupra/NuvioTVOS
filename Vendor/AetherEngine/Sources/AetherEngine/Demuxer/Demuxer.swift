@@ -118,6 +118,18 @@ struct DemuxerOpenProfile: Sendable {
         profile.skipStreamInfo = true
         return profile
     }
+
+    /// Open profile for the `LoadOptions.confirmAtmos` side demuxer (#214 follow-up). The pass needs only
+    /// `codec_id` / `codec_type` on the audio streams, which `avformat_open_input` resolves from the
+    /// container header (matroska CodecID, MP4 sample entry, MPEG-TS PMT), so `find_stream_info` would be
+    /// pure cost on a remote source for a background enrichment nobody is waiting on. Keeps the playback
+    /// AVIO tuning: the pass does sustained paced reads until it has enough audio packets, not a one-shot
+    /// fetch, and `boundedInitialFetch` stays nil because reaching the audio in an interleaved UHD remux
+    /// can span well past any header-sized bound.
+    static func atmosConfirmationDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?)
+        -> DemuxerOpenProfile {
+        subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
+    }
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
@@ -931,6 +943,33 @@ public final class Demuxer: @unchecked Sendable {
         }
         avformat_flush(ctx)  // prevents assertion failures in matroskadec.c
         lastReadClipIdx = -1  // AE#105: post-seek reads may land mid-clip; require a fresh clean crossing
+    }
+
+    /// Seek on one stream's native timestamp axis, never before `timestamp`.
+    @discardableResult
+    func seek(to timestamp: Int64, streamIndex: Int32) -> Bool {
+        accessLock.lock()
+        defer { accessLock.unlock() }
+        guard let ctx = formatContext,
+              streamIndex >= 0,
+              streamIndex < Int32(ctx.pointee.nb_streams) else { return false }
+        let ret = avformat_seek_file(
+            ctx,
+            streamIndex,
+            timestamp,
+            timestamp,
+            Int64.max,
+            0
+        )
+        if ret < 0 {
+            EngineLog.emit(
+                "[Demuxer] Seek to stream \(streamIndex) timestamp \(timestamp) failed: \(ret)",
+                category: .demux
+            )
+        }
+        avformat_flush(ctx)
+        lastReadClipIdx = -1
+        return ret >= 0
     }
 
     /// #112 round 10: latched by the side reader once a timestamp positioning seek timed out or failed on this

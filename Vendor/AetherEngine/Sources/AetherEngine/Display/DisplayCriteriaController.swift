@@ -186,6 +186,7 @@ final class DisplayCriteriaController {
         guard let window = resolveWindow() else { return }
         let displayManager = window.avDisplayManager
         let screen = window.screen
+
         // HDR headroom only describes dynamic range. A panel that is already in
         // HDR may still be changing from the UI's 60 Hz mode to the video's
         // 23.976/24 Hz mode, so it must not release playback by itself.

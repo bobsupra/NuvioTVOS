@@ -27,16 +27,16 @@
  * Libavcodec external API header
  */
 
-#include <AetherLibavutil/samplefmt.h>
-#include <AetherLibavutil/attributes.h>
-#include <AetherLibavutil/avutil.h>
-#include <AetherLibavutil/buffer.h>
-#include <AetherLibavutil/channel_layout.h>
-#include <AetherLibavutil/dict.h>
-#include <AetherLibavutil/frame.h>
-#include <AetherLibavutil/log.h>
-#include <AetherLibavutil/pixfmt.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/samplefmt.h"
+#include "AetherLibavutil/attributes.h"
+#include "AetherLibavutil/avutil.h"
+#include "AetherLibavutil/buffer.h"
+#include "AetherLibavutil/channel_layout.h"
+#include "AetherLibavutil/dict.h"
+#include "AetherLibavutil/frame.h"
+#include "AetherLibavutil/log.h"
+#include "AetherLibavutil/pixfmt.h"
+#include "AetherLibavutil/rational.h"
 
 #include "codec.h"
 #include "codec_id.h"

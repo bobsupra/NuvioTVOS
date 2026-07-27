@@ -25,6 +25,7 @@ struct DiscoverSection: View {
     @State private var overlayRestoreGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
     @Binding private var parentTransitionActive: Bool
+    @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
 
     init(
         onContentClick: @escaping (String, String) -> Void,
@@ -131,15 +132,20 @@ struct DiscoverSection: View {
 
     // MARK: - Content
 
+    private var visibleItems: [NuvioMeta] {
+        guard hideUnreleased else { return viewModel.items }
+        return viewModel.items.filter { !ContentReleasePolicy.isUnreleased($0) }
+    }
+
     @ViewBuilder
     private var content: some View {
         if viewModel.isLoading {
             centered { ProgressView().scaleEffect(1.6).tint(.white) }
-        } else if let error = viewModel.error, viewModel.items.isEmpty {
+        } else if let error = viewModel.error, visibleItems.isEmpty {
             centered {
                 message(icon: "wifi.exclamationmark", title: error)
             }
-        } else if viewModel.items.isEmpty {
+        } else if visibleItems.isEmpty {
             centered {
                 message(
                     icon: "rectangle.on.rectangle.slash",
@@ -158,7 +164,7 @@ struct DiscoverSection: View {
     private var grid: some View {
         ScrollView {
             LazyVGrid(columns: columns, alignment: .leading, spacing: DiscoverGridMetrics.posterGap) {
-                ForEach(viewModel.items) { item in
+                ForEach(visibleItems) { item in
                     DiscoverCard(
                         meta: item,
                         externalFocus: $focusedCardID,

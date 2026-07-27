@@ -12,6 +12,10 @@ final class SimklAuthServiceTests: XCTestCase {
         suiteName = "SimklAuthServiceTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
         defaults.removePersistentDomain(forName: suiteName)
+        // The sync caches are files keyed on the active profile scope, not on
+        // this suite, so wiping the suite no longer isolates them — they would
+        // otherwise leak between tests and across runs.
+        SimklSyncCache.eraseAll()
         defaults.set("client-id", forKey: SettingsKey.simklClientID)
         tokenStorage = SimklMemoryTokenStorage()
     }
@@ -19,6 +23,7 @@ final class SimklAuthServiceTests: XCTestCase {
     override func tearDown() {
         SimklURLProtocolStub.handler = nil
         defaults.removePersistentDomain(forName: suiteName)
+        SimklSyncCache.eraseAll()
         defaults = nil
         suiteName = nil
         tokenStorage = nil
@@ -1047,6 +1052,150 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(restored.ids?.simkl, 54130)
         XCTAssertEqual(restored.lastWatchedAt, "2026-07-25T18:00:00Z")
         XCTAssertEqual(SimklAllItemsResponse.identity(restored), "simkl:54130")
+    }
+
+    /// Simkl keeps a paused row until its own 80% rule retires it, and a
+    /// watched mark writes history without touching it — so the row comes back
+    /// from `sync/playback` carrying the position the user just cleared. The
+    /// local mark settles it, newest wins.
+    func testPausedRowIsRetiredByANewerWatchedMark() throws {
+        let profileId = "simkl-paused-row-tests"
+        WatchedStore.setActiveProfile(profileId)
+        defer { WatchedStore.eraseProfile(profileId) }
+        let meta = makeMeta(type: "series")
+        WatchedStore.markWatched(meta, season: 1, episode: 1)
+        let watchedDates = WatchedStore.newestWatchedDatesByIdentity(WatchedStore.visibleItems())
+
+        XCTAssertTrue(
+            SimklProgressService.isRetiredByWatchedMark(
+                try makePlayback(season: 1, episode: 1, pausedAt: Date().addingTimeInterval(-3_600)),
+                meta: meta,
+                type: "series",
+                watchedDates: watchedDates
+            )
+        )
+
+        // Watching it again after the mark is newer than the mark, and has to
+        // survive — the same way a local resume row does.
+        XCTAssertFalse(
+            SimklProgressService.isRetiredByWatchedMark(
+                try makePlayback(season: 1, episode: 1, pausedAt: Date().addingTimeInterval(3_600)),
+                meta: meta,
+                type: "series",
+                watchedDates: watchedDates
+            )
+        )
+
+        // A mark on one episode says nothing about another one.
+        XCTAssertFalse(
+            SimklProgressService.isRetiredByWatchedMark(
+                try makePlayback(season: 1, episode: 2, pausedAt: Date().addingTimeInterval(-3_600)),
+                meta: meta,
+                type: "series",
+                watchedDates: watchedDates
+            )
+        )
+    }
+
+    /// Removing a Continue Watching card only wrote a local dismiss record, so
+    /// the paused row stayed on the account and every other Simkl client — and
+    /// this one, after the dismissal expires — kept showing it.
+    func testRemovingACardDeletesTheSimklPausedRow() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+        SimklSyncCache.savePlaybacks(
+            [try makePlayback(id: 77, season: 1, episode: 3, pausedAt: Date())],
+            watermark: "watermark",
+            store: defaults
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            // Simkl ignores anything but a real DELETE on this path.
+            XCTAssertEqual(request.httpMethod, "DELETE")
+            XCTAssertEqual(request.url?.path, "/sync/playback/77")
+            return Self.response(for: request, status: 204, json: "")
+        }
+
+        let removed = await SimklProgressService.removePlayback(
+            for: makeCard(season: 1, episode: 3),
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertTrue(removed)
+    }
+
+    /// A show can be paused on more than one episode, and each is its own card.
+    /// Removing one must not retire the other.
+    func testRemovingACardLeavesAnotherEpisodesPausedRowAlone() async throws {
+        authorize()
+        selectSimklAsProgressSource()
+        SimklSyncCache.savePlaybacks(
+            [try makePlayback(id: 77, season: 1, episode: 3, pausedAt: Date())],
+            watermark: "watermark",
+            store: defaults
+        )
+
+        SimklURLProtocolStub.handler = { request in
+            XCTFail("no Simkl request expected for an episode that was not removed")
+            return Self.response(for: request, status: 204, json: "")
+        }
+
+        let removed = await SimklProgressService.removePlayback(
+            for: makeCard(season: 1, episode: 4),
+            store: defaults,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+
+        XCTAssertFalse(removed)
+    }
+
+    private func selectSimklAsProgressSource() {
+        defaults.set(
+            TraktWatchProgressSource.simkl.rawValue,
+            forKey: SettingsKey.traktWatchProgressSource
+        )
+    }
+
+    private func makeCard(season: Int, episode: Int) -> ContinueWatchingItem {
+        ContinueWatchingItem(
+            meta: makeMeta(type: "series"),
+            streamUrl: "",
+            position: 600,
+            duration: 3_000,
+            lastWatchedAt: Date(),
+            season: season,
+            episode: episode
+        )
+    }
+
+    private func makePlayback(
+        id: Int = 1,
+        season: Int,
+        episode: Int,
+        pausedAt: Date
+    ) throws -> SimklPlaybackDTO {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        return try JSONDecoder().decode(
+            SimklPlaybackDTO.self,
+            from: Data(
+                """
+                {
+                  "id": \(id),
+                  "progress": 42.0,
+                  "paused_at": "\(formatter.string(from: pausedAt))",
+                  "type": "episode",
+                  "episode": {"season": \(season), "number": \(episode), "title": "Episode"},
+                  "show": {"title": "Example Show", "year": 2026, "ids": {"imdb": "tt1234567"}}
+                }
+                """.utf8
+            )
+        )
     }
 
     private func authorize() {

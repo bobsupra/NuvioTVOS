@@ -99,11 +99,28 @@ struct PlayerView: View {
 
             switch viewModel.status {
             case .buffering, .idle:
-                ProgressView()
-                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                    .scaleEffect(2)
-                    .padding(48)
-                    .glassCircle()
+                // A switch keeps this up for the whole round trip (resolve, then
+                // the new stream opening), labelled with what it's waiting on.
+                if viewModel.isSwitchingSource {
+                    VStack(spacing: 14) {
+                        ProgressView()
+                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                            .scaleEffect(1.3)
+                        Text(viewModel.switchingSourceMessage)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.9))
+                    }
+                    .padding(.horizontal, 36)
+                    .padding(.vertical, 28)
+                    .glassRoundedRect(cornerRadius: 24)
+                    .transition(.opacity)
+                } else {
+                    ProgressView()
+                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                        .scaleEffect(2)
+                        .padding(48)
+                        .glassCircle()
+                }
             case .error(let message):
                 VStack(spacing: 16) {
                     Image(systemName: "exclamationmark.triangle")
@@ -122,24 +139,6 @@ struct PlayerView: View {
                 .glassRoundedRect(cornerRadius: 32)
             default:
                 EmptyView()
-            }
-
-            // Mid-session source failover: keep video visible, show a light
-            // status card while the next link resolves.
-            if viewModel.isSwitchingSource {
-                VStack(spacing: 14) {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                        .scaleEffect(1.3)
-                    Text("Trying next source…")
-                        .font(.system(size: 22, weight: .semibold))
-                        .foregroundColor(.white.opacity(0.9))
-                }
-                .padding(.horizontal, 36)
-                .padding(.vertical, 28)
-                .glassRoundedRect(cornerRadius: 24)
-                .transition(.opacity)
-                .zIndex(5)
             }
 
             if let toast = viewModel.playerToast {

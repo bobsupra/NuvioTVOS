@@ -41,6 +41,101 @@ extension AetherEngine {
         return makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
     }
 
+    // MARK: - Bounded, opt-in Atmos/JOC detail probe
+
+    /// `probe(url:)` plus a bounded, OPT-IN decode pass that authoritatively resolves E-AC-3 JOC (Dolby Atmos)
+    /// on the default (or explicitly named) audio track.
+    ///
+    /// FFmpeg's E-AC-3 decoder only populates `AVCodecContext.profile == AV_PROFILE_EAC3_DDP_ATMOS` (30) AFTER
+    /// decoding at least one audio frame. The lightweight `probe(url:)` / `probe(source:)` path never opens a
+    /// decoder -- it only demuxes and runs `avformat_find_stream_info` -- so `TrackInfo.isAtmos` from those
+    /// calls reflects only whatever `codecpar.profile` the container already carries pre-decode, which is
+    /// unresolved for JOC in the common case. Call `probeDetectingAtmos` instead of `probe(url:)` ONLY when a
+    /// host specifically needs an authoritative "Dolby Atmos" badge (e.g. a details screen): it is strictly
+    /// more expensive than `probe(url:)` (it opens a real EAC3 decoder and decodes at least one frame) and
+    /// MUST NOT be used on the playback-start critical path. `probe(url:)` / `probe(source:)` themselves are
+    /// completely unmodified by this API and remain byte-for-byte the same lightweight demux-only probe --
+    /// this is an additive, separate entry point, not a flag on the existing one.
+    ///
+    /// The decode pass is bounded by `atmosDetection` (packet-count / byte / wall-clock caps -- see
+    /// `AtmosDetectionOptions`): it stops at the first successfully decoded audio frame, or at whichever cap
+    /// is hit first. There is no video decode, no HLS server, and no playback session. The demuxer, decoder
+    /// context, packet, and frame are all closed / freed before returning on every path, including error
+    /// paths. A malformed / no-audio / non-EAC3 source is tolerated: the decode pass simply degrades to "not
+    /// authoritatively Atmos" (the base probe's `TrackInfo.isAtmos`, which a pre-existing container-declared
+    /// profile 30 can still leave `true` -- this API only ever ADDS confirmation, never removes a pre-decode
+    /// signal) instead of throwing or hanging.
+    ///
+    /// - Parameters:
+    ///   - url: Media source, forwarded verbatim to `probe(url:)`.
+    ///   - options: Forwarded verbatim to `probe(url:)` (`httpHeaders` only; other flags ignored, same as `probe(url:)`).
+    ///   - atmosDetection: Bounds + optional explicit track override for the decode pass. Defaults resolve the
+    ///     demuxer's own default audio track (`Demuxer.audioStreamIndex`) and cap the decode attempt at 64
+    ///     packets / 8 MiB / 2 s wall clock (soft -- see `AtmosDetectionOptions` doc for the same
+    ///     AVIO-blocking caveat `Demuxer.seekBounded` already documents: a single blocking `av_read_frame()`
+    ///     on a stalled remote socket can still run past the wall-clock budget before the next check fires).
+    /// - Throws: Any error the demuxer raises during open / probe -- identical to `probe(url:)`. Decode-side
+    ///   failures (bad EAC3 extradata, no decoder built, a malformed frame, EOF before any frame decodes) are
+    ///   NEVER thrown; they only affect whether Atmos gets confirmed.
+    public nonisolated static func probeDetectingAtmos(
+        url: URL,
+        options: LoadOptions = .init(),
+        atmosDetection: AtmosDetectionOptions = .init()
+    ) throws -> SourceProbe {
+        try probeDetectingAtmos(source: .url(url), options: options, atmosDetection: atmosDetection)
+    }
+
+    /// `probeDetectingAtmos(url:)` for a custom byte source. Same reader-ownership contract as `probe(source:)`:
+    /// the caller retains ownership, the cursor is left at an unspecified position, and `close()` is NOT called.
+    public nonisolated static func probeDetectingAtmos(
+        source: MediaSource,
+        options: LoadOptions = .init(),
+        atmosDetection: AtmosDetectionOptions = .init()
+    ) throws -> SourceProbe {
+        let demuxer = Demuxer()
+        let displayURL: URL
+        switch source {
+        case .url(let u):
+            try demuxer.open(url: u, extraHeaders: options.httpHeaders)
+            displayURL = u
+        case .custom(let reader, let formatHint):
+            try demuxer.open(reader: reader, formatHint: formatHint)
+            displayURL = URL(string: "aether-custom://source")!
+        }
+        defer { demuxer.close() }
+
+        let base = makeSourceProbe(demuxer: demuxer, displayURL: displayURL)
+        // Flush what `avformat_find_stream_info` left queued before the decode pass starts. Those packets
+        // were read before `detectAtmos` sets AVDISCARD_ALL, so libavformat hands them back regardless of
+        // the hint: on a source whose audio does not sit at the head, the pass burns its whole foreign-packet
+        // fuse on that queue and reports "not Atmos" for genuinely Atmos media without ever reading a byte
+        // of audio. Seeking to the start discards the queue so the discard takes effect from the first read.
+        // A source that cannot seek is no worse off than before.
+        demuxer.seekBounded(to: 0, timeout: Self.atmosProbeFlushSeekTimeout)
+        let targetIndex = Self.atmosDecodeTargetIndex(
+            options: atmosDetection, defaultAudioStreamIndex: demuxer.audioStreamIndex)
+        let outcome = Self.detectAtmos(demuxer: demuxer, targetIndex: targetIndex, options: atmosDetection)
+        guard outcome.confirmedAtmos else { return base }
+        return Self.enrichAtmos(base: base, confirmedTrackID: Int(targetIndex))
+    }
+
+    /// Flip `isAtmos` to `true` on exactly the one confirmed audio track, leaving everything else identical.
+    ///
+    /// Mutates copies rather than rebuilding the structs field by field: both memberwise inits carry defaulted
+    /// parameters, so a hand-copy silently drops any field added later and the compiler stays quiet about it.
+    nonisolated static func enrichAtmos(base: SourceProbe, confirmedTrackID: Int) -> SourceProbe {
+        // Additive only: a track already marked isAtmos by the base probe is left as it is; this only ever
+        // sets true, never clears a pre-decode signal.
+        var probe = base
+        probe.audioTracks = base.audioTracks.map { track in
+            guard track.id == confirmedTrackID else { return track }
+            var confirmed = track
+            confirmed.isAtmos = true
+            return confirmed
+        }
+        return probe
+    }
+
     /// Assemble a `SourceProbe` from an open demuxer. Shared by static probe entry points and `load(source:)`'s internal probe stage so all report identical metadata.
     nonisolated static func makeSourceProbe(
         demuxer: Demuxer,
@@ -472,6 +567,12 @@ extension AetherEngine {
 
     /// Dolby Vision profile number (5, 7, 8, 10) from the dvcC/dvvC configuration record; nil when the stream carries no DV side-data. Same record `CodecRoutePolicy` reads for routing.
     nonisolated static func dvProfile(stream: UnsafeMutablePointer<AVStream>) -> Int? {
+        dvConfig(stream: stream)?.profile
+    }
+
+    /// Profile + base-layer signal compatibility ID from the dvcC/dvvC record (compat 0 = IPT-only, no
+    /// compatible base layer). nil when the stream carries no DV side-data.
+    nonisolated static func dvConfig(stream: UnsafeMutablePointer<AVStream>) -> (profile: Int, blCompatID: Int)? {
         let nb = Int(stream.pointee.codecpar.pointee.nb_coded_side_data)
         guard nb > 0, let sideData = stream.pointee.codecpar.pointee.coded_side_data else {
             return nil
@@ -480,7 +581,7 @@ extension AetherEngine {
             let item = sideData[i]
             guard item.type == AV_PKT_DATA_DOVI_CONF, let raw = item.data, item.size >= 8 else { continue }
             let record = raw.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { $0.pointee }
-            return Int(record.dv_profile)
+            return (Int(record.dv_profile), Int(record.dv_bl_signal_compatibility_id))
         }
         return nil
     }

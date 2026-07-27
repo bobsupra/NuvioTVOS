@@ -16,6 +16,7 @@
 #   restart-witness-av.mp4        - H.264 B-frames + AAC, 12 s (3 segments)
 #   restart-witness-leadaudio.mp4 - same, video delayed 0.3 s so audio leads
 #   restart-witness-subs.mkv      - same as MKV with an embedded SRT track (pump tap)
+#   hev1-inband-xps.mp4           - HEVC with in-band VPS/SPS/PPS and an empty hvcC
 #
 # Real-world DV / Atmos / multichannel sources have to come from your
 # own library. Drop those into ./Fixtures/user/ (also gitignored)
@@ -139,6 +140,39 @@ ffmpeg -hide_banner -loglevel error -y \
     -metadata:s:s:0 language=eng \
     "$FIXTURES_DIR/restart-witness-subs.mkv"
 rm -f "$SRT_TMP"
+
+# HEVC whose parameter sets live IN-BAND only: hev1 sample entry, hvcC header with
+# numOfArrays = 0. That is what `MP4Box ...:xps_inband` and the common Dolby-Vision MP4
+# authoring recipes write, and what the init.mp4 normalizer has to rebuild from packets
+# (AetherPlayer#2, engine #19). ffmpeg always writes the parameter-set arrays, so the
+# shape is synthesized: x265 repeats the headers in-band, then the hvcC payload is
+# truncated to its 22-byte header + numOfArrays = 0 and the freed bytes are absorbed by a
+# sibling `free` box, which keeps every parent box size and chunk offset valid.
+# keyint 120 (5 s at 24 fps) puts the IRAPs far enough apart that a mid-GOP scan cannot
+# stumble onto one by luck.
+echo "→ hev1-inband-xps.mp4 (HEVC with in-band VPS/SPS/PPS, empty hvcC)"
+ffmpeg -hide_banner -loglevel error -y \
+    -f lavfi -i testsrc2=size=320x240:rate=24 -t 6 \
+    -c:v libx265 -x265-params "repeat-headers=1:keyint=120:min-keyint=120:log-level=none" \
+    -tag:v hev1 "$FIXTURES_DIR/hev1-inband-xps.mp4"
+python3 - "$FIXTURES_DIR/hev1-inband-xps.mp4" <<'PY'
+import sys
+
+path = sys.argv[1]
+data = bytearray(open(path, 'rb').read())
+tag = data.find(b'hvcC')
+start = tag - 4
+size = int.from_bytes(data[start:start + 4], 'big')
+payload = data[tag + 4:start + size]
+emptied = bytes(payload[:22]) + b'\x00'   # numOfArrays = 0
+freed = size - (8 + len(emptied))
+assert freed >= 8, f'hvcC too small to empty in place: {size}'
+replacement = bytearray()
+replacement += (8 + len(emptied)).to_bytes(4, 'big') + b'hvcC' + emptied
+replacement += freed.to_bytes(4, 'big') + b'free' + bytes(freed - 8)
+data[start:start + size] = replacement
+open(path, 'wb').write(bytes(data))
+PY
 
 echo ""
 echo "Done. Try:"

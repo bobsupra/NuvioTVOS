@@ -1,1 +1,0 @@
-../avcodec.h

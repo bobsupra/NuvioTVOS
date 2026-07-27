@@ -23,8 +23,8 @@
 
 #include <stddef.h>
 #include <stdint.h>
-#include "avassert.h"
-#include "frame.h"
+#include "AetherLibavutil/avassert.h"
+#include "AetherLibavutil/frame.h"
 
 typedef struct AVVideoRect {
     uint32_t x, y;

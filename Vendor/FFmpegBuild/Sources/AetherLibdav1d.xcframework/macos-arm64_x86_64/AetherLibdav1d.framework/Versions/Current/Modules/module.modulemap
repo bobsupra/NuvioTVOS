@@ -1,9 +1,0 @@
-framework module AetherLibdav1d [system] {
-    umbrella "."
-    exclude header "d3d11va.h"
-    exclude header "d3d12va.h"
-    exclude header "dxva2.h"
-    exclude header "qsv.h"
-    exclude header "vdpau.h"
-    export *
-}

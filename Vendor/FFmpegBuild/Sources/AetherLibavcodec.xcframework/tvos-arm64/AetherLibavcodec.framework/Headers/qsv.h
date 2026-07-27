@@ -23,7 +23,7 @@
 
 #include <mfxvideo.h>
 
-#include <AetherLibavutil/buffer.h>
+#include "AetherLibavutil/buffer.h"
 
 /**
  * This struct is used for communicating QSV parameters between libavcodec and

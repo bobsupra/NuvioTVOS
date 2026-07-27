@@ -372,6 +372,41 @@ final class SegmentCache: @unchecked Sendable {
         return _totalBytes
     }
 
+    /// On-disk bytes at or above the consumer's current target: what the producer's race-ahead owns
+    /// (#207). Everything behind the playhead is either the small backward window or budget-evictable
+    /// extras, so this is the only footprint an opt-in whole-source window grows without bound.
+    var forwardBytes: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return currentForwardBytes()
+    }
+
+    /// #207 producer park step: true once the producer may write `head`. Withheld while its race-ahead
+    /// has reached `budgetBytes` and the consumer still has a safe lead behind it; the extras eviction
+    /// that follows the advancing playhead is what frees the room again.
+    func awaitPrefetchDiskHeadroom(head: Int, budgetBytes: Int, timeout: TimeInterval = 1.0) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if !shouldParkLocked(head: head, budgetBytes: budgetBytes) { return true }
+        _ = condition.wait(until: Date().addingTimeInterval(timeout))
+        return !shouldParkLocked(head: head, budgetBytes: budgetBytes)
+    }
+
+    /// Must be called with condition held.
+    private func shouldParkLocked(head: Int, budgetBytes: Int) -> Bool {
+        PrefetchDiskBudget.shouldPark(forwardBytes: currentForwardBytes(),
+                                      budgetBytes: budgetBytes,
+                                      head: head,
+                                      consumerTarget: currentTargetIndex)
+    }
+
+    /// Must be called with condition held.
+    private func currentForwardBytes() -> Int {
+        var bytes = 0
+        for (k, b) in entryBytes where k >= currentTargetIndex { bytes += b }
+        return bytes
+    }
+
     // MARK: - Internal
 
     /// Prune to [currentTarget - backwardWindow, max(currentTarget + forwardWindow, highestStoredIndex)].

@@ -116,6 +116,11 @@ def rewrite_header_imports(framework_dir: Path) -> None:
             new = new_name(old)
             rewritten = rewritten.replace(f"<{old}/", f"<{new}/")
             rewritten = rewritten.replace(f'"{old}/', f'"{new}/')
+            # FFmpeg 8.1.2 exports canonical lowercase include prefixes
+            # (`libavutil/...`) rather than framework-cased ones.
+            lowercase = old.lower()
+            rewritten = rewritten.replace(f"<{lowercase}/", f"<{new}/")
+            rewritten = rewritten.replace(f'"{lowercase}/', f'"{new}/')
         if rewritten != text:
             header.write_text(rewritten, errors="surrogateescape")
 
@@ -145,7 +150,9 @@ def process_xcframework(old: str) -> None:
     if dst.exists():
         shutil.rmtree(dst)
     print(f"copy {src.name} -> {dst.name}")
-    shutil.copytree(src, dst)
+    # Preserve versioned macOS framework symlinks. Dereferencing them duplicates
+    # Versions/Current and leaves the renamed top-level binary link dangling.
+    shutil.copytree(src, dst, symlinks=True)
 
     # Rename each slice's .framework directory
     for slice_dir in [p for p in dst.iterdir() if p.is_dir()]:

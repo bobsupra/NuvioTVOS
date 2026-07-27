@@ -21,8 +21,8 @@
 
 #include <stdint.h>
 
-#include <AetherLibavutil/pixfmt.h>
-#include <AetherLibavutil/rational.h>
+#include "AetherLibavutil/pixfmt.h"
+#include "AetherLibavutil/rational.h"
 
 /* minimum number of bytes to read from a DV stream in order to
  * determine the profile */

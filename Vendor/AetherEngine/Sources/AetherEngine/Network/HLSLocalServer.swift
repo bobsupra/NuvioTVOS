@@ -42,6 +42,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// Real upstream arrival cadence for bursty sources; raises TARGETDURATION so AVPlayer's 1.5x patience covers the inter-batch gap.
     var liveTargetDurationFloorSeconds: Double? { get }
 
+    /// Session-stable TARGETDURATION for a live playlist. Production providers seal the first resolved
+    /// value so later cadence or visible-segment growth cannot mutate RFC 8216 playlist timing.
+    func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int
+
     /// Master-playlist metadata. When masterCodecs is non-nil the server publishes master.m3u8; nil means media-playlist-only.
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
@@ -107,6 +111,13 @@ extension HLSSegmentProvider {
     var liveTargetSegmentDuration: Double? { nil }
     var liveBlockingReloadEnabled: Bool { true }
     var liveTargetDurationFloorSeconds: Double? { nil }
+    func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int {
+        LiveEdgePolicy.targetDurationSeconds(
+            maxSegmentDuration: maxSegmentDuration,
+            cutTargetSeconds: liveTargetSegmentDuration,
+            cadenceFloorSeconds: liveTargetDurationFloorSeconds
+        )
+    }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
@@ -615,7 +626,14 @@ final class HLSLocalServer: @unchecked Sendable {
                 if let msn = Self.parseHLSMsn(query) {
                     // LL-HLS blocking reload: hold until segment msn is cut so AVPlayer receives it the instant it exists, not a reload-interval late. Gated on liveBlockingReloadEnabled: bursty ingest sources can't honor the contract and withheld it.
                     if p.liveBlockingReloadEnabled {
-                        _ = p.waitForLiveSegment(index: msn, timeout: 18.0)
+                        // Unsatisfiable hold (producer halted/stalled, or timeout): 503, never the
+                        // unchanged playlist. A 200 without the requested MSN after a hold is "Invalid
+                        // server blocking reload behavior" (-15410) to AVPlayer (#167 follow-up;
+                        // RFC 8216bis requires the 503 here).
+                        if !p.waitForLiveSegment(index: msn, timeout: 18.0) {
+                            return send503(fd: fd, path: normalizedPath,
+                                           reason: "blocking reload msn=\(msn) unsatisfiable")
+                        }
                     }
                 } else {
                     _ = p.waitForFirstLiveSegment(timeout: 30.0)
@@ -1182,32 +1200,40 @@ final class HLSLocalServer: @unchecked Sendable {
         // Sliding live: no PLAYLIST-TYPE tag and no ENDLIST (EVENT forbids removal; VOD implies finished asset).
         let typeIsLive = (provider.playlistType == .live && !snapshot.endlistAdded)
 
-        // TARGETDURATION must be >= every EXTINF (HLS spec).
+        // TARGETDURATION must be >= every EXTINF (HLS spec). For live it is also floored by ceil(1.5 x cut
+        // target) (widens AVPlayer's unchanged-playlist patience, anti -12888: (1) empty first manifest,
+        // (2) transcode warm-up stall) and by the observed upstream arrival cadence (bursty ingest). The
+        // SAME derivation feeds the startup cushion (LiveEdgePolicy.startupCushionSatisfied), so the depth
+        // the cushion builds to matches the holdback AVPlayer computes from this value.
         var maxDuration: Double = 0
         for i in firstVisible..<count {
             maxDuration = max(maxDuration, provider.segmentDuration(at: i))
         }
-        var targetDuration = Int(ceil(max(1.0, maxDuration)))
-
-        // Live TARGETDURATION floor = ceil(1.5 * cutTarget). Fixes two problems: (1) empty first manifest (maxDuration=0 -> TD=1, AVPlayer gets only 1.5s patience, -12888 on high-bitrate sources); (2) transcode warm-up ~8s stall at startup (-12888 once before recovery). Advertising a generous TD widens AVPlayer's unchanged-playlist patience at no startup-latency cost; EXTINF stays at cutTarget, reload cadence unchanged.
-        if typeIsLive, let liveTarget = provider.liveTargetSegmentDuration {
-            let liveFloor = Int(ceil(liveTarget * 1.5))
-            targetDuration = max(targetDuration, liveFloor)
-        }
-
-        // Bursty ingest: raise TD to the real upstream arrival cadence so AVPlayer's unchanged-playlist patience (1.5x TD) covers the inter-batch gap. Pairs with liveBlockingReloadEnabled=false.
-        if typeIsLive, let cadenceFloor = provider.liveTargetDurationFloorSeconds {
-            targetDuration = max(targetDuration, Int(ceil(cadenceFloor)))
-        }
+        let targetDuration = typeIsLive
+            ? provider.liveTargetDurationSeconds(maxSegmentDuration: maxDuration)
+            : LiveEdgePolicy.targetDurationSeconds(
+                maxSegmentDuration: maxDuration,
+                cutTargetSeconds: nil,
+                cadenceFloorSeconds: nil
+            )
 
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:7")
         if typeIsLive {
+            var serverControl: [String] = []
             // CAN-BLOCK-RELOAD: AVPlayer sends ?_HLS_msn=N and the server holds the response until that segment is cut (see waitForLiveSegment), so AVPlayer gets each segment the instant it exists instead of a poll-interval late. Segment-level only (no EXT-X-PART). Gated on liveBlockingReloadEnabled: bursty sources can't honor the contract (-15410 and periodic stalls on device repro 2026-06-11); they fall back to plain reloads with a raised TARGETDURATION.
             if provider.liveBlockingReloadEnabled {
-                lines.append("#EXT-X-SERVER-CONTROL:CAN-BLOCK-RELOAD=YES")
+                serverControl.append("CAN-BLOCK-RELOAD=YES")
             }
+            // HOLD-BACK: pin the live-edge holdback to 3 x TARGETDURATION (the RFC 8216bis floor, and
+            // AVPlayer's implicit default made explicit). Without it AVPlayer restarts inside its own
+            // stall-danger zone (-16832) whenever the served window carries less than 3 x TD behind the
+            // edge (AE#189: 5.76s long-GOP segments -> TD=6 -> 18s holdback vs a 9.6s startup window). The
+            // startup cushion is built to exactly this depth, so the advertised value is always satisfiable.
+            let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: targetDuration)
+            serverControl.append("HOLD-BACK=\(String(format: "%.3f", holdBack))")
+            lines.append("#EXT-X-SERVER-CONTROL:\(serverControl.joined(separator: ","))")
         }
         lines.append("#EXT-X-TARGETDURATION:\(targetDuration)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:\(firstVisible)")
@@ -1279,4 +1305,3 @@ enum HLSLocalServerError: Error, CustomStringConvertible {
         }
     }
 }
-

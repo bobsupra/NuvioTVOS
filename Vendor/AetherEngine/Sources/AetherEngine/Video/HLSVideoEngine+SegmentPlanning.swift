@@ -171,8 +171,15 @@ extension HLSVideoEngine {
     /// endless item reload; Sodalite near-EOF resume hang, device-confirmed). Merging widens the window so
     /// a resident keyframe is guaranteed and the two agree. Interior/final short segments fold into the
     /// PRECEDING kept segment; a too-short first segment (no predecessor) folds forward into its successor.
-    /// Every kept boundary is still an original plan boundary (a real keyframe), and total duration is
-    /// conserved. Pure for offline testing.
+    /// Every kept boundary is still an original plan boundary, and total duration is conserved.
+    ///
+    /// AE#169: also fold a final slot shorter than the normal cut target into its predecessor. The final
+    /// boundary has no later IRAP that can rescue a Cues/runtime keyframe disagreement. Advertising that
+    /// terminal slot left seg719 structurally unproducible while the producer correctly carried its tail
+    /// in seg718. Folding only sub-target tails adds less than one ordinary segment span to the existing
+    /// final segment while removing the unrecoverable boundary.
+    ///
+    /// Pure for offline testing.
     static func collapseShortSegments(_ plan: [Segment], minDurationSeconds: Double) -> [Segment] {
         guard plan.count > 1, minDurationSeconds > 0 else { return plan }
         var out: [Segment] = []
@@ -200,14 +207,33 @@ extension HLSVideoEngine {
                 discontinuous: a.discontinuous)
             out.removeFirst()
         }
+        if out.count > 1, let tail = out.last,
+           tail.durationSeconds < Self.targetSegmentDuration {
+            let previous = out[out.count - 2]
+            out[out.count - 2] = Segment(
+                startPts: previous.startPts,
+                endPts: tail.endPts,
+                startSeconds: previous.startSeconds,
+                durationSeconds: previous.durationSeconds + tail.durationSeconds,
+                discontinuous: previous.discontinuous)
+            out.removeLast()
+        }
         return out
     }
 
     /// Scan packets for in-band VPS/SPS/PPS when hvcC `numOfArrays=0` (DV P5 MP4 encoders, e.g. Wandering Earth 2 WEB-DL, issue #19). AVPlayer symptom: `item.tracks count=2`, `fourCC=<no fdesc>`, `CoreMediaErrorDomain -4`. Caller must seek back after this consumes packets.
+    ///
+    /// `rewindBeforeScan` rewinds to the head first, because in-band parameter sets are guaranteed at
+    /// the first IRAP but only recur every GOP after it. Without the rewind the scan inherited whatever
+    /// cursor the cue prewarm and the plan pass had left behind and read 16 mid-GOP packets, so on a
+    /// real film (263 s, IRAPs ~2 s apart) it found nothing, the muxer emitted an empty hvcC, and
+    /// AVPlayer buffered the forward window without ever rendering a frame (AetherPlayer#2). Pass
+    /// `false` for a live, forward-only feed, which cannot rewind.
     func rebuildHEVCExtradataWithInBandParameterSets(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
-        codecpar: UnsafePointer<AVCodecParameters>
+        codecpar: UnsafePointer<AVCodecParameters>,
+        rewindBeforeScan: Bool = true
     ) -> [UInt8]? {
         guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else { return nil }
         let extradataSize = Int(codecpar.pointee.extradata_size)
@@ -216,13 +242,20 @@ extension HLSVideoEngine {
         let naluLengthSize = Int(extradata[21] & 0x03) + 1  // hvcC byte 21 lower 2 bits + 1
         guard naluLengthSize == 4 else { return nil }
 
+        if rewindBeforeScan { demuxer.seek(to: 0) }
+
         var vps: [UInt8]?
         var sps: [UInt8]?
         var pps: [UInt8]?
+        // Counted in VIDEO packets: a film interleaves audio and dozens of subtitle tracks, which
+        // would otherwise exhaust the budget before the first video packet.
         let packetBudget = 16
         var packetsScanned = 0
+        // Second cap so a stream that never yields a video packet cannot walk the whole source.
+        let readBudget = 512
+        var packetsRead = 0
 
-        while packetsScanned < packetBudget {
+        while packetsScanned < packetBudget && packetsRead < readBudget {
             let readResult: UnsafeMutablePointer<AVPacket>?
             do {
                 readResult = try demuxer.readPacket()
@@ -235,8 +268,9 @@ extension HLSVideoEngine {
                 var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
                 trackedPacketFree(&maybePkt)
             }
-            packetsScanned += 1
+            packetsRead += 1
             if pkt.pointee.stream_index != videoStreamIndex { continue }
+            packetsScanned += 1
             guard let pktData = pkt.pointee.data else { continue }
             let pktSize = Int(pkt.pointee.size)
 
@@ -262,7 +296,14 @@ extension HLSVideoEngine {
             if vps != nil && sps != nil && pps != nil { break }
         }
 
-        guard let vps, let sps, let pps else { return nil }
+        guard let vps, let sps, let pps else {
+            EngineLog.emit(
+                "[HLSVideoEngine] in-band parameter-set scan found none: "
+                + "packets=\(packetsScanned) vps=\(vps != nil) sps=\(sps != nil) pps=\(pps != nil)",
+                category: .session
+            )
+            return nil
+        }
 
         // Assemble hvcC: keep source 22-byte header, set numOfArrays=3, append VPS/SPS/PPS arrays (1-byte type, 2-byte numNalus=1, 2-byte nalUnitLength, NAL bytes).
         var hvcC: [UInt8] = []
@@ -280,6 +321,55 @@ extension HLSVideoEngine {
         appendArray(nalUnitType: 33, nal: sps)
         appendArray(nalUnitType: 34, nal: pps)
         return hvcC
+    }
+
+    /// Rewrite an hvcC config record to keep only the VPS(32)/SPS(33)/PPS(34) parameter-set arrays, dropping
+    /// SEI_PREFIX(39)/SEI_SUFFIX(40) and any other NAL arrays. libx265 (and other encoders) embed a large
+    /// user-data SEI_PREFIX array in the hvcC; the VOD muxer forwards the source config record verbatim, so
+    /// that array reaches the fMP4 init sample description. Apple TV hardware builds the HEVC format
+    /// description straight from the hvcC parameter-set arrays and rejects a record carrying non-parameter-set
+    /// arrays: `asset.tracks count=0`, `AVFoundationErrorDomain -11829`, `CoreMediaErrorDomain -12848` (AE#187).
+    /// macOS and the tvOS Simulator tolerate it, so it only surfaces on device. The live MPEG-TS and direct
+    /// fMP4-HLS paths never hit this because their hvcC is rebuilt from parameter sets alone; canonicalizing
+    /// here aligns the VOD path with them. HDR10 static metadata is unaffected: it rides in-band per-IRAP in
+    /// the media packets (untouched) and in the muxer's `mdcv`/`clli` boxes, not the hvcC SEI array. DV is
+    /// unaffected too: the dvcC/dvvC boxes and RPU live outside the hvcC extradata. Returns nil when the record
+    /// already holds only parameter-set arrays (no rewrite needed) or cannot be parsed as an hvcC.
+    static func canonicalizeHEVCConfigRecord(_ extradata: [UInt8]) -> [UInt8]? {
+        guard extradata.count >= 23 else { return nil }
+        guard extradata[0] == 1 else { return nil }  // configurationVersion; guards against Annex-B / non-hvcC
+        let numOfArrays = Int(extradata[22])
+        guard numOfArrays > 0 else { return nil }  // numOfArrays=0 is the in-band-rebuild path, not this one
+
+        // Collect each array's [start, end) byte range and its NAL type, bounds-checked. Any inconsistency
+        // (truncated record) returns nil so a malformed source is forwarded unchanged rather than corrupted.
+        var arrays: [(type: Int, range: Range<Int>)] = []
+        var offset = 23
+        for _ in 0..<numOfArrays {
+            let arrayStart = offset
+            guard offset + 3 <= extradata.count else { return nil }
+            let nalType = Int(extradata[offset]) & 0x3F
+            let numNalus = (Int(extradata[offset + 1]) << 8) | Int(extradata[offset + 2])
+            offset += 3
+            for _ in 0..<numNalus {
+                guard offset + 2 <= extradata.count else { return nil }
+                let nalLen = (Int(extradata[offset]) << 8) | Int(extradata[offset + 1])
+                offset += 2 + nalLen
+                guard offset <= extradata.count else { return nil }
+            }
+            arrays.append((type: nalType, range: arrayStart..<offset))
+        }
+
+        let parameterSetTypes: Set<Int> = [32, 33, 34]  // VPS, SPS, PPS
+        let kept = arrays.filter { parameterSetTypes.contains($0.type) }
+        guard kept.count < arrays.count else { return nil }  // nothing to drop: already canonical
+
+        var out: [UInt8] = []
+        out.reserveCapacity(23 + kept.reduce(0) { $0 + $1.range.count })
+        out.append(contentsOf: extradata[0..<22])  // header verbatim (profile/tier/level/lengthSize)
+        out.append(UInt8(kept.count))               // rewritten numOfArrays
+        for array in kept { out.append(contentsOf: extradata[array.range]) }
+        return out
     }
 
     /// ADTS AAC from MPEG-TS arrives without an AudioSpecificConfig in `extradata`; the fMP4 `mp4a`/`esds` sample entry can't be written. Synthesizes a 2-byte ASC, installs it, and clears the TS codec_tag the mov muxer rejects. Returns true when applied; caller strips per-frame ADTS headers.
@@ -326,5 +416,81 @@ extension HLSVideoEngine {
         return profile == 4        // FF_PROFILE_AAC_HE
             || profile == 28       // FF_PROFILE_AAC_HE_V2
             || frameSize == 2048   // SBR doubles the LC frame to 2048 samples
+    }
+
+    /// AE#187 defense-in-depth: strip a zero-sample `sdtp` box from the video track's `stbl` in the captured init.
+    ///
+    /// Our init is a fragmented `empty_moov` init: the `moov` describes no samples (they live in each
+    /// `moof`), so an `sdtp` (per-sample dependency flags) covering zero samples is meaningless. Apple TV's
+    /// HEVC hardware track builder validates the box against the empty sample table and drops the video track
+    /// (item fails -11829 / -12848); macOS and the Simulator ignore the stray box, and FFmpeg's own
+    /// fragmented init omits it. movenc (n8.1.2, the pinned FFmpegBuild) cannot emit this box under
+    /// `empty_moov` (it zeroes `track->entry` before writing the `stbl`), but a consumer that links an older
+    /// FFmpeg the wrong way (AE#187: a `-force_load`ed 7.1.5 shadowing the vendored 2.2.0) still does, so the
+    /// guard runs on the emitted init bytes and neutralizes the box regardless of who wrote it. Returns nil
+    /// (init forwarded unchanged) when the init is not parseable, has no `moov`/video track, or the video
+    /// `stbl` carries no zero-sample `sdtp`.
+    static func stripEmptyVideoSampleDependencyBox(fromInit initBytes: [UInt8]) -> [UInt8]? {
+        let b = initBytes
+        let n = b.count
+        guard n >= 8 else { return nil }
+
+        func u32(_ o: Int) -> UInt32? {
+            guard o >= 0, o + 4 <= n else { return nil }
+            return (UInt32(b[o]) << 24) | (UInt32(b[o + 1]) << 16) | (UInt32(b[o + 2]) << 8) | UInt32(b[o + 3])
+        }
+        func fourcc(_ o: Int) -> String? {
+            guard o >= 0, o + 4 <= n else { return nil }
+            return String(bytes: b[o..<o + 4], encoding: .ascii)
+        }
+        func boxes(in start: Int, _ end: Int) -> [(boxStart: Int, type: String, payloadStart: Int, boxEnd: Int)] {
+            var out: [(Int, String, Int, Int)] = []
+            var o = start
+            while o + 8 <= end {
+                guard let size = u32(o), size != 1, let t = fourcc(o + 4) else { break }
+                let boxSize = size == 0 ? (end - o) : Int(size)
+                guard boxSize >= 8, o + boxSize <= end else { break }
+                out.append((o, t, o + 8, o + boxSize))
+                o += boxSize
+            }
+            return out.map { (boxStart: $0.0, type: $0.1, payloadStart: $0.2, boxEnd: $0.3) }
+        }
+
+        guard let moov = boxes(in: 0, n).first(where: { $0.type == "moov" }) else { return nil }
+        let moovChildren = boxes(in: moov.payloadStart, moov.boxEnd)
+
+        for trak in moovChildren where trak.type == "trak" {
+            let trakChildren = boxes(in: trak.payloadStart, trak.boxEnd)
+            guard let mdia = trakChildren.first(where: { $0.type == "mdia" }) else { continue }
+            let mdiaChildren = boxes(in: mdia.payloadStart, mdia.boxEnd)
+            guard let hdlr = mdiaChildren.first(where: { $0.type == "hdlr" }),
+                  fourcc(hdlr.payloadStart + 8) == "vide" else { continue }   // hdlr: v/flags(4)+pre_defined(4)+handler_type(4)
+            guard let minf = mdiaChildren.first(where: { $0.type == "minf" }) else { continue }
+            let minfChildren = boxes(in: minf.payloadStart, minf.boxEnd)
+            guard let stbl = minfChildren.first(where: { $0.type == "stbl" }) else { continue }
+            let stblChildren = boxes(in: stbl.payloadStart, stbl.boxEnd)
+            // A fragmented init's stbl holds no samples; a zero-sample sdtp (box size 12 = 8 header +
+            // 4 version/flags, no per-sample bytes) is the anomaly Apple TV rejects. Leave any sdtp that
+            // actually describes samples (a non-fragmented init) untouched.
+            guard let sdtp = stblChildren.first(where: { $0.type == "sdtp" && ($0.boxEnd - $0.boxStart) == 12 })
+            else { continue }
+
+            var out = Array(b[0..<sdtp.boxStart]) + Array(b[sdtp.boxEnd..<n])
+            let removed = sdtp.boxEnd - sdtp.boxStart
+            // sdtp is nested stbl>minf>mdia>trak>moov; every ancestor header precedes sdtp.boxStart (so its
+            // offset is unchanged in `out`), and each ancestor shrinks by the removed box's size.
+            func patchSize(at boxStart: Int, sub: Int) {
+                let old = (UInt32(out[boxStart]) << 24) | (UInt32(out[boxStart + 1]) << 16)
+                        | (UInt32(out[boxStart + 2]) << 8) | UInt32(out[boxStart + 3])
+                let new = old - UInt32(sub)
+                out[boxStart] = UInt8(new >> 24 & 0xFF); out[boxStart + 1] = UInt8(new >> 16 & 0xFF)
+                out[boxStart + 2] = UInt8(new >> 8 & 0xFF); out[boxStart + 3] = UInt8(new & 0xFF)
+            }
+            for ancestor in [stbl.boxStart, minf.boxStart, mdia.boxStart, trak.boxStart, moov.boxStart] {
+                patchSize(at: ancestor, sub: removed)
+            }
+            return out
+        }
+        return nil
     }
 }

@@ -27,7 +27,7 @@
 #define AVUTIL_BSWAP_H
 
 #include <stdint.h>
-#include "avconfig.h"
+#include "AetherLibavutil/avconfig.h"
 #include "attributes.h"
 
 #ifdef HAVE_AV_CONFIG_H

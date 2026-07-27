@@ -67,28 +67,32 @@ class DetailsViewModel: ObservableObject {
             async let tmdbRelatedTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
             async let traktRelatedTask = TraktDetailsService.fetchRelated(for: meta)
             async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
+            async let simklTask = SimklDetailsService.fetchDetails(for: meta)
 
             let companies = await companiesTask
             let tmdbRelated = await tmdbRelatedTask
             let traktRelated = await traktRelatedTask
             let comments = await commentsTask
+            let simkl = await simklTask
 
             guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
 
-            // Prefer Trakt related when the user chose that source and it returned items.
-            let preferTrakt = TraktSettingsStore.moreLikeThisSource == .trakt
-            let moreLikeThis: [RelatedTitle]
-            if preferTrakt, !traktRelated.isEmpty {
-                moreLikeThis = traktRelated
-            } else if !tmdbRelated.isEmpty {
-                moreLikeThis = tmdbRelated
-            } else {
-                moreLikeThis = traktRelated
+            // Use the source the user picked, then fall back through the others
+            // so the row still fills when their choice returns nothing.
+            let simklRelated = simkl?.related ?? []
+            let preferred: [RelatedTitle]
+            switch TraktSettingsStore.moreLikeThisSource {
+            case .trakt: preferred = traktRelated
+            case .tmdb: preferred = tmdbRelated
+            case .simkl: preferred = simklRelated
             }
+            let moreLikeThis = [preferred, tmdbRelated, traktRelated, simklRelated]
+                .first { !$0.isEmpty } ?? []
 
             uiState.companies = companies
             uiState.moreLikeThis = moreLikeThis
             uiState.comments = comments
+            uiState.simklRatings = simkl?.ratings
 
             // Trakt's related endpoint commonly omits usable artwork even with
             // `extended=images`. Resolve those IMDb ids through Cinemeta so the

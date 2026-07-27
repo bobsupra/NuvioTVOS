@@ -43,22 +43,23 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.1.8 (build 49)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2 (build 51)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.1.8](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.1.8) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.1.8-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.1.8/NuvioTV-3.1.8-unsigned-release.ipa)
+[NuvioTV-3.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2/NuvioTV-3.2-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.1.8
+### New in Beta 3.2
 
-- Fixes major Simkl synchronization failures by decoding Simkl's real nested response shape, refreshing stale caches after removals and scrobbles, pacing writes, retrying lock collisions, and reporting rejected transfers accurately.
-- Keeps watched history and library state isolated to the selected Nuvio Sync, Trakt, or Simkl source so one provider is not silently copied into another.
-- Rebuilds Continue Watching from a durable per-profile progress ledger, preserves unresolved and duration-less rows, handles completed episodes as Next Up, and pages through larger histories instead of stopping at the first 20 titles.
-- Makes provider checkpoints survive relaunches, fixes duplicate series cards and movie progress uploads, and lets removed cards stay removed until fresh playback occurs.
-- Adds a Continue Watching long-press menu for manual source selection, starting over, opening details, or removing a card, plus clearer artwork loading and on-device sync diagnostics.
-- This beta needs broad testing. If sync, paging, Continue Watching, Simkl, or anything else does not work, please message the maintainer so the problem can be reproduced and fixed faster.
+- Reworks Home loading, profile switching, row visibility, poster caching, grid focus, and add-on management for a faster and more stable browsing experience.
+- Fixes non-Cinemeta hero cards so focused titles can recover missing runtime and ongoing-status metadata without replacing the add-on's artwork or description.
+- Strengthens Continue Watching and provider synchronization with file-backed progress storage, remote-deletion reconciliation, profile isolation, queued refreshes, season-wide watched actions, and improved New Episode/New Season handling.
+- Adds Simkl ratings and recommendations, nested More Like This navigation, better episode focus restoration, and faster stream-picker feedback.
+- Upgrades AetherEngine with major fixes for HEVC startup, slow seeking, live/HLS playback, Atmos and audio teardown, bitmap subtitles, AirPlay, prebuffering, and playback recovery.
+- Accepts Stremio cast, director, and writer fields as either arrays or comma-separated strings so malformed optional metadata no longer drops an entire catalog page.
+- This beta needs broad testing, especially on physical Apple TV hardware. If something does not work, please message the maintainer with the provider, stream, and steps needed to reproduce it.
 
 ### The new player
 

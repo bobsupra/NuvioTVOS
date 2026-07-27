@@ -20,6 +20,11 @@ struct NuvioCatalog: Identifiable, Codable {
     let catalogId: String?
     /// Source add-on for Home pagination. Nil means the built-in Cinemeta base.
     let addonId: String?
+    /// The source add-on's display name ("Cinemeta", "AIOStreams | ElfHosted"),
+    /// resolved from its manifest while the row was loaded. Settings shows it
+    /// under the row title so two add-ons offering a "Trending" catalog can be
+    /// told apart, the way the Android client labels its rows.
+    let addonName: String?
     /// Required genre extra used for the initial add-on request, if any.
     let catalogGenre: String?
 
@@ -32,6 +37,7 @@ struct NuvioCatalog: Identifiable, Codable {
         contentType: String? = nil,
         catalogId: String? = nil,
         addonId: String? = nil,
+        addonName: String? = nil,
         catalogGenre: String? = nil
     ) {
         self.id = id
@@ -42,6 +48,7 @@ struct NuvioCatalog: Identifiable, Codable {
         self.contentType = contentType
         self.catalogId = catalogId
         self.addonId = addonId
+        self.addonName = addonName
         self.catalogGenre = catalogGenre
     }
 }
@@ -119,6 +126,50 @@ struct NuvioMeta: Identifiable, Codable {
         return status.caseInsensitiveCompare("Continuing") == .orderedSame ? "ONGOING" : status.uppercased()
     }
 
+    /// Add-on catalog cards commonly omit fields that are available from their
+    /// full `/meta` response. Keep the catalog's artwork/copy intact while
+    /// filling the two fields Home's hero cannot otherwise display.
+    var needsHeroMetadataEnrichment: Bool {
+        let hasRuntime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasStatus = status?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return !hasRuntime || (isSeries && !hasStatus)
+    }
+
+    func fillingMissingHeroMetadata(from fullMeta: NuvioMeta) -> NuvioMeta {
+        let resolvedRuntime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? runtime
+            : fullMeta.runtime
+        let resolvedStatus = status?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            ? status
+            : fullMeta.status
+
+        return NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: imdbId ?? fullMeta.imdbId,
+            tmdbId: tmdbId ?? fullMeta.tmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: resolvedRuntime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            released: released,
+            status: resolvedStatus,
+            videos: videos,
+            trailerYtIds: trailerYtIds
+        )
+    }
+
     init(
         id: String,
         name: String,
@@ -189,10 +240,10 @@ enum EpisodeReleasePolicy {
     static let newEpisodeWindowDays = 60
 
     static var showUnairedNextUp: Bool {
-        if UserDefaults.standard.object(forKey: showUnairedNextUpKey) == nil {
+        if ProfileSettings.current.object(forKey: showUnairedNextUpKey) == nil {
             return true
         }
-        return UserDefaults.standard.bool(forKey: showUnairedNextUpKey)
+        return ProfileSettings.current.bool(forKey: showUnairedNextUpKey)
     }
 
     static func hasAired(_ released: String?) -> Bool {
@@ -236,6 +287,24 @@ enum EpisodeReleasePolicy {
         return (0...days).contains(elapsed)
     }
 
+    /// True when an aired up-next episode is a genuine new drop rather than a
+    /// backlog entry.
+    ///
+    /// Recency alone is not enough: an episode that was already out when the
+    /// viewer finished the previous one is something they are behind on, not
+    /// news, however recently it aired. So it also has to have released *after*
+    /// the seeding episode was watched — the same rule the Android client's
+    /// release-alert state uses (`calculateReleaseAlertState`).
+    static func isNewEpisodeDrop(released: String?, seedWatchedAt: Date) -> Bool {
+        guard let releaseDate = releaseDate(for: released),
+              releaseDate > seedWatchedAt else { return false }
+        return isRecentlyReleased(released, within: newEpisodeWindowDays)
+    }
+
+    /// The calendar day `released` names, as a local-midnight date. Nil for a
+    /// missing or unparseable value.
+    static func releaseDate(for released: String?) -> Date? { isoDate(released) }
+
     private static func isoDate(_ value: String?) -> Date? {
         guard let day = isoDay(value) else { return nil }
         let parts = day.split(separator: "-").compactMap { Int($0) }
@@ -272,6 +341,99 @@ enum EpisodeReleasePolicy {
 
     private static func seasonSortKey(_ season: Int) -> Int {
         season <= 0 ? Int.max : season
+    }
+}
+
+enum UpNextEpisodeSelectionPolicy {
+    static let preferenceKey = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
+
+    static var prefersFurthestEpisode: Bool {
+        if ProfileSettings.current.object(forKey: preferenceKey) == nil {
+            return true
+        }
+        return ProfileSettings.current.bool(forKey: preferenceKey)
+    }
+
+    static func prefers(
+        candidateSeason: Int,
+        candidateEpisode: Int,
+        candidateWatchedAt: Date,
+        over currentSeason: Int,
+        currentEpisode: Int,
+        currentWatchedAt: Date,
+        preferFurthestEpisode: Bool
+    ) -> Bool {
+        if preferFurthestEpisode {
+            if candidateSeason != currentSeason {
+                return candidateSeason > currentSeason
+            }
+            if candidateEpisode != currentEpisode {
+                return candidateEpisode > currentEpisode
+            }
+            return candidateWatchedAt > currentWatchedAt
+        }
+        if candidateWatchedAt != currentWatchedAt {
+            return candidateWatchedAt > currentWatchedAt
+        }
+        if candidateSeason != currentSeason {
+            return candidateSeason > currentSeason
+        }
+        return candidateEpisode > currentEpisode
+    }
+}
+
+/// Shared title-level release filtering. A year-only check misses titles dated
+/// later in the current year, which is the common shape returned by metadata
+/// providers.
+enum ContentReleasePolicy {
+    static func isUnreleased(_ meta: NuvioMeta, today: String? = nil) -> Bool {
+        let today = today ?? todayIsoDay()
+
+        if let released = isoDay(meta.released) {
+            return released > today
+        }
+        if let releaseInfo = isoDay(meta.releaseInfo) {
+            return releaseInfo > today
+        }
+
+        guard let releaseYear = meta.year ?? leadingYear(meta.releaseInfo),
+              let currentYear = Int(today.prefix(4)) else {
+            return false
+        }
+        return releaseYear > currentYear
+    }
+
+    private static func isoDay(_ value: String?) -> String? {
+        guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              raw.count >= 10 else {
+            return nil
+        }
+        let day = String(raw.prefix(10))
+        let parts = day.split(separator: "-")
+        guard parts.count == 3,
+              parts[0].count == 4,
+              parts[1].count == 2,
+              parts[2].count == 2,
+              parts.allSatisfy({ Int($0) != nil }) else {
+            return nil
+        }
+        return day
+    }
+
+    private static func leadingYear(_ value: String?) -> Int? {
+        guard let value, value.count >= 4 else { return nil }
+        return Int(value.prefix(4))
+    }
+
+    private static func todayIsoDay() -> String {
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents(in: TimeZone.current, from: Date())
+        guard let year = components.year,
+              let month = components.month,
+              let day = components.day else {
+            return ""
+        }
+        return String(format: "%04d-%02d-%02d", year, month, day)
     }
 }
 
@@ -507,26 +669,82 @@ struct ContinueWatchingItem: Identifiable, Codable {
     /// episode was finished) rather than real playback progress. Optional so
     /// old persisted JSON keeps decoding.
     let isUpNext: Bool?
+    /// Which season the finished episode that seeded this suggestion belonged to.
+    /// `season` above is the *suggested* episode's, so the two are the only way
+    /// to tell a season rollover from a step within a season. Nil for progress
+    /// entries, for JSON written before this existed, and wherever the seed is
+    /// unknown — a rollover is then simply not claimed.
+    let upNextSeedSeason: Int?
+
+    /// The episode this entry points at, resolved once at construction.
+    ///
+    /// Everything below — the title, the artwork, the overview, the aired check,
+    /// the badge — used to re-derive this on every read, and the derivation walks
+    /// `meta.videos` end to end. A card's body reads four or five of them, and
+    /// SwiftUI re-evaluates that body repeatedly while the row scrolls, so a
+    /// long-running series had its whole episode guide scanned several times per
+    /// card per frame. Derived state, so it is deliberately absent from the
+    /// persisted JSON and rebuilt on decode instead.
+    private let resolved: ResolvedEpisode
+
+    private struct ResolvedEpisode {
+        let numbers: (season: Int, episode: Int)?
+        let video: NuvioVideo?
+    }
 
     var isUpNextEntry: Bool { isUpNext == true }
     var hasAired: Bool { EpisodeReleasePolicy.hasAired(released ?? episodeVideo?.released) }
     var airDateText: String? { EpisodeReleasePolicy.airDateText(for: released ?? episodeVideo?.released) }
     var upNextBadgeText: String {
         guard isUpNextEntry else { return remainingText }
-        if hasAired { return isNewEpisodeDrop ? "NEW EPISODE" : "NEXT UP" }
+        if hasAired {
+            if isNewSeasonDrop { return "NEW SEASON" }
+            return isNewEpisodeDrop ? "NEW EPISODE" : "NEXT UP"
+        }
         if let airDateText { return "AIRS \(airDateText.uppercased())" }
         return "UPCOMING"
     }
 
-    /// An aired up-next episode remains a visible "New Episode" drop through
-    /// the release-alert window. Progress timestamps are not reliable after a
-    /// cross-device sync or a regenerated Next Up entry, so they must not hide
-    /// a genuinely recent episode.
+    /// An aired up-next episode reads as a "New Episode" drop only while it is
+    /// inside the release-alert window *and* it aired after the episode that
+    /// seeded this card was watched — `lastWatchedAt` on an up-next entry is the
+    /// finished episode's timestamp, not this one's. Without the second half a
+    /// show the viewer is simply behind on claims a drop it never had: the badge
+    /// said "New Episode" for any episode released in the last two months, even
+    /// one that was already out weeks before they watched the previous one.
     var isNewEpisodeDrop: Bool {
-        isUpNextEntry && hasAired && EpisodeReleasePolicy.isRecentlyReleased(
-            released ?? episodeVideo?.released,
-            within: EpisodeReleasePolicy.newEpisodeWindowDays
+        isUpNextEntry && hasAired && EpisodeReleasePolicy.isNewEpisodeDrop(
+            released: released ?? episodeVideo?.released,
+            seedWatchedAt: lastWatchedAt
         )
+    }
+
+    /// A new drop that also crosses a season boundary — a returning show rather
+    /// than the next episode of one already running, which is the more useful
+    /// thing to say. Both season numbers have to be known, so a card whose seed
+    /// season was never recorded stays "New Episode" instead of guessing.
+    /// Android's `isNewSeasonRelease` reads the same way.
+    var isNewSeasonDrop: Bool {
+        guard isNewEpisodeDrop,
+              let upNextSeedSeason,
+              let season = resolved.numbers?.season else { return false }
+        return season != upNextSeedSeason
+    }
+
+    /// Where this card sits in the row's newest-first order.
+    ///
+    /// A genuine drop is ranked by when it aired, not by when the viewer finished
+    /// the previous episode — otherwise a show they have been away from for
+    /// months sinks to the bottom of the row on the very day it comes back, which
+    /// is exactly the day it deserves the top. Everything else keeps its watch
+    /// time, so this only ever promotes a card the badge already calls news.
+    /// Mirrors the Android client's `sortTimestamp`.
+    var recencySortDate: Date {
+        guard isNewEpisodeDrop,
+              let releaseDate = EpisodeReleasePolicy.releaseDate(
+                for: released ?? episodeVideo?.released
+              ) else { return lastWatchedAt }
+        return releaseDate
     }
 
     init(
@@ -541,7 +759,8 @@ struct ContinueWatchingItem: Identifiable, Codable {
         episodeTitleOverride: String? = nil,
         episodeOverviewOverride: String? = nil,
         episodeThumbnailOverride: String? = nil,
-        isUpNext: Bool? = nil
+        isUpNext: Bool? = nil,
+        upNextSeedSeason: Int? = nil
     ) {
         self.meta = meta
         self.streamUrl = streamUrl
@@ -555,25 +774,97 @@ struct ContinueWatchingItem: Identifiable, Codable {
         self.episodeOverviewOverride = episodeOverviewOverride
         self.episodeThumbnailOverride = episodeThumbnailOverride
         self.isUpNext = isUpNext
+        self.upNextSeedSeason = upNextSeedSeason
+        self.resolved = Self.resolveEpisode(
+            meta: meta,
+            streamUrl: streamUrl,
+            season: season,
+            episode: episode
+        )
     }
 
-    /// Episode numbers for display. Entries saved before episode tracking have
-    /// nil season/episode; for those, fall back to a stream filename tag when
-    /// possible, then to the first playable episode in stored series metadata.
-    private var resolvedNumbers: (season: Int, episode: Int)? {
+    /// Decoding rebuilds the resolved episode rather than reading it: it is
+    /// derived from `meta` and the stored numbers, so keeping it out of the JSON
+    /// leaves the persisted shape (and every older payload) untouched.
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        meta = try container.decode(NuvioMeta.self, forKey: .meta)
+        streamUrl = try container.decode(String.self, forKey: .streamUrl)
+        position = try container.decode(Double.self, forKey: .position)
+        duration = try container.decode(Double.self, forKey: .duration)
+        lastWatchedAt = try container.decode(Date.self, forKey: .lastWatchedAt)
+        season = try container.decodeIfPresent(Int.self, forKey: .season)
+        episode = try container.decodeIfPresent(Int.self, forKey: .episode)
+        released = try container.decodeIfPresent(String.self, forKey: .released)
+        episodeTitleOverride = try container.decodeIfPresent(String.self, forKey: .episodeTitleOverride)
+        episodeOverviewOverride = try container.decodeIfPresent(String.self, forKey: .episodeOverviewOverride)
+        episodeThumbnailOverride = try container.decodeIfPresent(String.self, forKey: .episodeThumbnailOverride)
+        isUpNext = try container.decodeIfPresent(Bool.self, forKey: .isUpNext)
+        upNextSeedSeason = try container.decodeIfPresent(Int.self, forKey: .upNextSeedSeason)
+        resolved = Self.resolveEpisode(
+            meta: meta,
+            streamUrl: streamUrl,
+            season: season,
+            episode: episode
+        )
+    }
+
+    /// Only the stored fields; `resolved` is derived and never encoded.
+    private enum CodingKeys: String, CodingKey {
+        case meta
+        case streamUrl
+        case position
+        case duration
+        case lastWatchedAt
+        case season
+        case episode
+        case released
+        case episodeTitleOverride
+        case episodeOverviewOverride
+        case episodeThumbnailOverride
+        case isUpNext
+        case upNextSeedSeason
+    }
+
+    /// Episode numbers for display, plus the guide entry they point at. Entries
+    /// saved before episode tracking have nil season/episode; for those, fall
+    /// back to a stream filename tag when possible, then to the first playable
+    /// episode in stored series metadata.
+    private static func resolveEpisode(
+        meta: NuvioMeta,
+        streamUrl: String,
+        season: Int?,
+        episode: Int?
+    ) -> ResolvedEpisode {
+        guard let numbers = resolveNumbers(
+            meta: meta,
+            streamUrl: streamUrl,
+            season: season,
+            episode: episode
+        ) else {
+            return ResolvedEpisode(numbers: nil, video: nil)
+        }
+        let video = meta.videos?.first {
+            $0.season == numbers.season && $0.episode == numbers.episode
+        }
+        return ResolvedEpisode(numbers: numbers, video: video)
+    }
+
+    private static func resolveNumbers(
+        meta: NuvioMeta,
+        streamUrl: String,
+        season: Int?,
+        episode: Int?
+    ) -> (season: Int, episode: Int)? {
         if let season, let episode { return (season, episode) }
         guard meta.isSeries else { return nil }
         if let numbers = EpisodeTagResolver.episodeNumbers(in: streamUrl) {
             return numbers
         }
-        return firstPlayableEpisode.map { ($0.season, $0.episode) }
+        return firstPlayableEpisode(in: meta).map { ($0.season, $0.episode) }
     }
 
-    var episodeNumbers: (season: Int, episode: Int)? {
-        resolvedNumbers
-    }
-
-    private var firstPlayableEpisode: NuvioVideo? {
+    private static func firstPlayableEpisode(in meta: NuvioMeta) -> NuvioVideo? {
         guard let videos = meta.videos, !videos.isEmpty else { return nil }
         let sorted = videos.sorted {
             (seasonSortKey($0.season), $0.episode) < (seasonSortKey($1.season), $1.episode)
@@ -581,8 +872,16 @@ struct ContinueWatchingItem: Identifiable, Codable {
         return sorted.first { $0.season > 0 } ?? sorted.first
     }
 
-    private func seasonSortKey(_ season: Int) -> Int {
+    private static func seasonSortKey(_ season: Int) -> Int {
         season <= 0 ? Int.max : season
+    }
+
+    private var resolvedNumbers: (season: Int, episode: Int)? {
+        resolved.numbers
+    }
+
+    var episodeNumbers: (season: Int, episode: Int)? {
+        resolved.numbers
     }
 
     /// "S1 E3 · Title" line for the episode in progress; nil when unknown.
@@ -603,8 +902,7 @@ struct ContinueWatchingItem: Identifiable, Codable {
     /// The full episode entry from the stored series meta, carrying the
     /// episode's title and overview for display.
     var episodeVideo: NuvioVideo? {
-        guard let numbers = resolvedNumbers else { return nil }
-        return meta.videos?.first { $0.season == numbers.season && $0.episode == numbers.episode }
+        resolved.video
     }
 
     var episodeDisplayTitle: String? {
@@ -660,6 +958,66 @@ struct ContinueWatchingItem: Identifiable, Codable {
     }
 }
 
+/// Orders the Continue Watching row.
+///
+/// Every recency comparison here reads `recencySortDate` rather than
+/// `lastWatchedAt`: the two differ only for a genuine new drop, which ranks by
+/// its air date so a returning show surfaces the day it returns instead of at
+/// the age of the episode that seeded it. "Default" is ordered by the same key
+/// before it ever reaches this type — see `refreshContinueWatching()`.
+enum ContinueWatchingSortPolicy {
+    static func sorted(_ items: [ContinueWatchingItem], preference: String) -> [ContinueWatchingItem] {
+        switch preference {
+        case "Recently watched":
+            return items.enumerated()
+                .sorted { lhs, rhs in
+                    if lhs.element.recencySortDate != rhs.element.recencySortDate {
+                        return lhs.element.recencySortDate > rhs.element.recencySortDate
+                    }
+                    return lhs.offset < rhs.offset
+                }
+                .map(\.element)
+        case "Release order":
+            return items.enumerated()
+                .sorted { lhs, rhs in
+                    let left = releaseKey(lhs.element)
+                    let right = releaseKey(rhs.element)
+                    if left != right { return left > right }
+                    if lhs.element.recencySortDate != rhs.element.recencySortDate {
+                        return lhs.element.recencySortDate > rhs.element.recencySortDate
+                    }
+                    return lhs.offset < rhs.offset
+                }
+                .map(\.element)
+        case "Next up":
+            return items.enumerated()
+                .sorted { lhs, rhs in
+                    if lhs.element.isUpNextEntry != rhs.element.isUpNextEntry {
+                        return lhs.element.isUpNextEntry
+                    }
+                    if lhs.element.recencySortDate != rhs.element.recencySortDate {
+                        return lhs.element.recencySortDate > rhs.element.recencySortDate
+                    }
+                    return lhs.offset < rhs.offset
+                }
+                .map(\.element)
+        default:
+            return items
+        }
+    }
+
+    private static func releaseKey(_ item: ContinueWatchingItem) -> String {
+        for value in [item.released, item.episodeVideo?.released, item.meta.released] {
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !value.isEmpty else {
+                continue
+            }
+            return value
+        }
+        return item.meta.year.map { String(format: "%04d", $0) } ?? ""
+    }
+}
+
 enum ContinueWatchingStore {
     /// Posted whenever the list changes (progress saved, item removed, profile
     /// switched) so views like Home can refresh their Continue Watching row
@@ -692,6 +1050,23 @@ enum ContinueWatchingStore {
     /// Last durable-storage result, suitable for the on-screen sync diagnostic.
     static private(set) var persistenceDiagnostic = "not attempted"
 
+    /// Decoded rows for `cachedKey`, mirroring ``WatchProgressLedger``'s memo.
+    ///
+    /// `items()` is not an occasional call: it runs on every Home refresh, every
+    /// resume lookup, every Top Shelf write, and once per page the Continue
+    /// Watching row materialises. A synced list carries several megabytes of
+    /// episode metadata, so decoding it per call put a multi-megabyte
+    /// `JSONDecoder` run on the main actor at exactly the moment the user was
+    /// scrolling into the next page. Every write path below refreshes or clears
+    /// this, because a stale row is worse than a slow one.
+    private static var cachedItems: [ContinueWatchingItem]?
+    private static var cachedKey: String?
+
+    private static func invalidateCache() {
+        cachedItems = nil
+        cachedKey = nil
+    }
+
     private enum PersistenceError: LocalizedError {
         case verificationFailed
 
@@ -721,6 +1096,10 @@ enum ContinueWatchingStore {
     /// so reads/writes land in that profile's bucket.
     static func setActiveProfile(_ profileId: String?) {
         activeProfileId = profileId
+        // The key check in `items()` already separates profiles; this also covers
+        // re-selecting the same profile after the file changed underneath us (a
+        // sync pull, or the legacy migration below).
+        invalidateCache()
         // The raw ledger is profile-scoped too; it must move first so anything
         // reading progress during this switch sees the new profile's rows.
         WatchProgressLedger.setActiveProfile(profileId)
@@ -754,7 +1133,13 @@ enum ContinueWatchingStore {
     }
 
     static func items() -> [ContinueWatchingItem] {
-        guard let data = data(for: storageKey) else {
+        let key = storageKey
+        if cachedKey == key, let cachedItems {
+            return cachedItems
+        }
+        guard let data = data(for: key) else {
+            cachedItems = []
+            cachedKey = key
             return []
         }
         let decoded: [ContinueWatchingItem]
@@ -763,13 +1148,18 @@ enum ContinueWatchingStore {
         } catch {
             // Keep the payload intact so debugSnapshot() can report the actual
             // corruption instead of turning it into an unexplained missing file.
+            // Deliberately uncached: a sync pull may rewrite this file moments
+            // later, and caching the empty result would hide the recovery.
             persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
             return []
         }
 
-        return decoded
+        let kept = decoded
             .filter { shouldKeep(position: $0.position, duration: $0.duration) }
             .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+        cachedItems = kept
+        cachedKey = key
+        return kept
     }
 
     static func item(for metaId: String) -> ContinueWatchingItem? {
@@ -1033,7 +1423,14 @@ enum ContinueWatchingStore {
     /// Display-only "Next Up" suggestion. Deliberately absent from the ledger: a
     /// suggestion is not playback, and pushing one would create a phantom
     /// just-started row on every other device.
-    static func saveUpNext(meta: NuvioMeta, duration: Double, season: Int, episode: Int, released: String? = nil) {
+    static func saveUpNext(
+        meta: NuvioMeta,
+        duration: Double,
+        season: Int,
+        episode: Int,
+        released: String? = nil,
+        seedSeason: Int? = nil
+    ) {
         let item = ContinueWatchingItem(
             meta: meta,
             streamUrl: "",
@@ -1043,7 +1440,8 @@ enum ContinueWatchingStore {
             season: season,
             episode: episode,
             released: released,
-            isUpNext: true
+            isUpNext: true,
+            upNextSeedSeason: seedSeason
         )
         let updated = ([item] + items().filter { $0.meta.id != meta.id }).prefix(maxItems)
         persist(Array(updated))
@@ -1083,7 +1481,8 @@ enum ContinueWatchingStore {
                 episodeTitleOverride: item.episodeTitleOverride,
                 episodeOverviewOverride: item.episodeOverviewOverride,
                 episodeThumbnailOverride: item.episodeThumbnailOverride,
-                isUpNext: item.isUpNext
+                isUpNext: item.isUpNext,
+                upNextSeedSeason: item.upNextSeedSeason
             )
             didRefresh = true
         }
@@ -1112,6 +1511,46 @@ enum ContinueWatchingStore {
             WatchProgressLedger.removeContent(id: metaId)
         }
         persist(items().filter { $0.meta.id != metaId })
+    }
+
+    /// Resolves the raw ledger row behind a watched mark the user made by hand.
+    ///
+    /// ``removeWatched(_:)`` clears the rendered row and the episode's resume
+    /// point, but ``ContinueWatchingBuilder`` rebuilds the row from
+    /// ``WatchProgressLedger`` — so a row still sitting there as in-progress
+    /// puts the progress bar straight back on the next Home load or sync pull.
+    /// Completing the row rather than deleting it keeps the Next Up seed a
+    /// finished episode is meant to produce, exactly as
+    /// ``markPlaybackCompleted(meta:duration:season:episode:)`` does.
+    static func markLedgerWatched(meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) {
+        guard let record = WatchProgressLedger.record(
+            contentId: meta.id,
+            season: season,
+            episode: episode
+        ), !WatchProgressLedger.isComplete(record) else { return }
+
+        // A row whose runtime was never learned cannot express completion as
+        // position-over-runtime, and there is no other completion flag on the
+        // wire. Dropping it is the only way to stop it rebuilding as progress.
+        guard record.duration > 0 else {
+            WatchProgressLedger.remove(keys: [record.progressKey])
+            return
+        }
+
+        WatchProgressLedger.upsert(
+            WatchProgressRecord(
+                progressKey: record.progressKey,
+                contentId: record.contentId,
+                contentType: record.contentType,
+                videoId: record.videoId,
+                season: record.season,
+                episode: record.episode,
+                position: record.duration,
+                duration: record.duration,
+                lastWatchedAt: Date(),
+                isPendingPush: true
+            )
+        )
     }
 
     /// Removes resume rows that are older than a durable watched mark. Episode
@@ -1319,6 +1758,13 @@ enum ContinueWatchingStore {
             let defaults = UserDefaults.standard
             defaults.removeObject(forKey: key)
             defaults.removeObject(forKey: fallbackMarkerKey(for: key))
+            // What was just written *is* what the next read would decode, so
+            // refresh the memo rather than clearing it — a save during playback
+            // would otherwise force a full re-decode on the next row refresh.
+            cachedItems = storedItems
+                .filter { shouldKeep(position: $0.position, duration: $0.duration) }
+                .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+            cachedKey = key
             persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
             NotificationCenter.default.post(name: changedNotification, object: nil)
             writeTopShelfFeed()
@@ -1327,6 +1773,8 @@ enum ContinueWatchingStore {
             // Deliberately no UserDefaults fallback: a synced list carries several
             // megabytes of episode metadata, and tvOS 27 aborts the process when a
             // value that large is written to UserDefaults.
+            // The file may have been partially written, so trust disk over memory.
+            invalidateCache()
             persistenceDiagnostic = "save failed: \(diagnosticText(for: error))"
             return false
         }
@@ -1360,6 +1808,7 @@ enum ContinueWatchingStore {
     /// Use this rather than ``eraseAllProfiles()`` for anything that is only
     /// cleaning up after itself — see ``WatchedStore/eraseProfile(_:)``.
     static func eraseProfile(_ profileId: String) {
+        invalidateCache()
         WatchProgressLedger.eraseProfile(profileId)
         ContinueWatchingDismissStore.eraseProfile(profileId)
         for key in [storageKey(for: profileId), episodeResumeStorageKey(for: profileId)] {
@@ -1374,6 +1823,7 @@ enum ContinueWatchingStore {
     /// Deletes every profile's watch history (and the legacy shared list).
     /// Called on sign-out so the next user starts with no resume state.
     static func eraseAllProfiles() {
+        invalidateCache()
         WatchProgressLedger.eraseAllProfiles()
         ContinueWatchingDismissStore.eraseAllProfiles()
         let defaults = UserDefaults.standard
@@ -1402,6 +1852,8 @@ enum ContinueWatchingStore {
               let profileURL = storageURL(for: profileKey) else { return }
         do {
             try writeAndVerify(legacyData, to: profileURL)
+            // The active profile's file now holds the legacy list.
+            invalidateCache()
             removeStorage(for: baseKey)
             persistenceDiagnostic = "migrated shared progress to profile \(id)"
         } catch {
@@ -1551,6 +2003,7 @@ enum ContinueWatchingStore {
     /// the ledger untouched. Exists so the recovery path is actually covered.
     static func simulateStorageEvictionForTesting() {
         removeStorage(for: storageKey)
+        invalidateCache()
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -2340,6 +2793,104 @@ struct WatchedStoreItem: Identifiable, Codable {
     }
 }
 
+/// File storage for payloads that must never reach `UserDefaults`.
+///
+/// tvOS aborts the process outright on an oversized preferences write —
+/// `__CFPREFERENCES_HAS_DETECTED_THIS_APP_TRYING_TO_STORE_TOO_MUCH_DATA__`,
+/// a `SIGABRT` with nothing to catch. Anything holding a `NuvioMeta` per row
+/// reaches megabytes on a real account and must live in a file instead.
+///
+/// Mirrors ``WatchedStore``'s durable storage: Application Support first, then
+/// Caches, because physical tvOS sideloads can reject Application Support
+/// writes while Simulator succeeds. There is deliberately no `UserDefaults`
+/// tier — falling back to preferences is the crash this exists to prevent, and
+/// every caller is a cache or a store that can survive a failed write.
+enum LargePayloadStore {
+    /// Newest wins rather than preferred-tier-wins: when Application Support
+    /// turns unwritable the stale file there usually can't be deleted either,
+    /// and it would shadow the fresh Caches copy forever.
+    static func read(key: String, directory: String) -> Data? {
+        urls(key: key, directory: directory)
+            .compactMap { url -> (Data, Date)? in
+                guard let data = try? Data(contentsOf: url) else { return nil }
+                let modifiedAt = (try? url.resourceValues(forKeys: [.contentModificationDateKey]))?
+                    .contentModificationDate ?? .distantPast
+                return (data, modifiedAt)
+            }
+            .max { $0.1 < $1.1 }?
+            .0
+    }
+
+    /// Returns whether the payload reached durable storage. Callers that also
+    /// hold a legacy `UserDefaults` copy should clear it only on `true`.
+    @discardableResult
+    static func write(_ data: Data, key: String, directory: String) -> Bool {
+        for url in urls(key: key, directory: directory) {
+            do {
+                try FileManager.default.createDirectory(
+                    at: url.deletingLastPathComponent(),
+                    withIntermediateDirectories: true
+                )
+                try data.write(to: url, options: [.atomic])
+                // A stale copy on the other tier would outrank this one on the
+                // next read if it happened to carry a newer timestamp.
+                removeAll(key: key, directory: directory, except: url)
+                return true
+            } catch {
+                continue
+            }
+        }
+        print("Nuvio large payload write failed for \(key)")
+        return false
+    }
+
+    static func remove(key: String, directory: String) {
+        removeAll(key: key, directory: directory, except: nil)
+    }
+
+    static func removeDirectory(_ directory: String) {
+        for base in [applicationSupportBase, cachesBase] {
+            guard let url = base?.appendingPathComponent(directory, isDirectory: true) else { continue }
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    private static func removeAll(key: String, directory: String, except keep: URL?) {
+        for url in urls(key: key, directory: directory) where url != keep {
+            try? FileManager.default.removeItem(at: url)
+        }
+    }
+
+    /// Preferred tier first.
+    private static func urls(key: String, directory: String) -> [URL] {
+        [applicationSupportBase, cachesBase].compactMap { base in
+            base?
+                .appendingPathComponent(directory, isDirectory: true)
+                .appendingPathComponent(fileName(forKey: key), isDirectory: false)
+        }
+    }
+
+    private static var applicationSupportBase: URL? {
+        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first
+    }
+
+    private static var cachesBase: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+    }
+
+    /// Base64 so a profile-scoped key with `/` or `.` can't escape the
+    /// directory or collide. Same encoding ``WatchedStore`` uses.
+    private static func fileName(forKey key: String) -> String {
+        Data(key.utf8)
+            .base64EncodedString()
+            .replacingOccurrences(of: "/", with: "_")
+            .replacingOccurrences(of: "+", with: "-")
+            .replacingOccurrences(of: "=", with: "")
+            + ".json"
+    }
+}
+
 enum WatchedStore {
     static let changedNotification = Notification.Name("nuvio.tv.watched.changed")
 
@@ -2512,6 +3063,94 @@ enum WatchedStore {
         return containsEpisode(meta: meta, season: season, episode: episode)
     }
 
+    /// Marks or clears every listed episode of one season in a single write.
+    ///
+    /// Looping ``toggleEpisode(meta:season:episode:)`` would re-read and re-persist
+    /// the whole watched file per episode and send one request per episode to the
+    /// backend — a twenty-episode season is twenty of each, and Simkl serialises
+    /// writes behind a 20-second lock. The rows written here are identical to the
+    /// ones ``markWatched(_:season:episode:)`` writes, so checkmarks, Continue
+    /// Watching and sync attribution can't tell the two paths apart.
+    @discardableResult
+    static func setSeasonWatched(
+        meta: NuvioMeta,
+        season: Int,
+        episodes: [Int],
+        isWatched: Bool
+    ) -> Bool {
+        let episodeNumbers = Set(episodes)
+        guard !episodeNumbers.isEmpty else { return false }
+
+        let snapshot = meta.persistenceSnapshot
+        let watchedAt = Date()
+        let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+        let untouched = items().filter { item in
+            guard sameContent(item.meta, meta), item.season == season,
+                  let episode = item.episode else { return true }
+            return !episodeNumbers.contains(episode)
+        }
+        let written = episodeNumbers.sorted().map { episode in
+            WatchedStoreItem(
+                meta: snapshot,
+                watchedAt: watchedAt,
+                season: season,
+                episode: episode,
+                sources: [source.rawValue]
+            )
+        }
+        guard persist(isWatched ? written + untouched : untouched) else { return false }
+
+        for episode in episodeNumbers.sorted() {
+            if isWatched {
+                clearTombstone(meta: meta, season: season, episode: episode)
+            } else {
+                addTombstone(meta: snapshot, season: season, episode: episode)
+            }
+        }
+        if isWatched {
+            // Same ordering rule as the single-episode path: resume progress is
+            // only dropped once the marks it is being replaced by are durable.
+            ContinueWatchingStore.removeWatched(written)
+        }
+
+        let traktStore = ProfileSettings.current
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
+            let profileId = activeProfileId
+            // The pending ledger stays per episode — it is what confirms and
+            // retries each row individually on the next pull.
+            for episode in episodeNumbers.sorted() {
+                _ = enqueuePendingTraktMutation(
+                    meta: meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: isWatched,
+                    profileId: profileId
+                )
+            }
+            Task {
+                _ = await TraktHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episodeNumbers.sorted(),
+                    isWatched: isWatched,
+                    store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: traktStore) {
+            Task {
+                _ = await SimklHistoryService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episodeNumbers.sorted(),
+                    isWatched: isWatched,
+                    store: traktStore
+                )
+            }
+        }
+        return true
+    }
+
     @discardableResult
     static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) -> Bool {
         // A new mark belongs to whichever backend is selected — that is the one
@@ -2534,7 +3173,21 @@ enum WatchedStore {
 
         // Only clear Continue Watching after the watched mark is durable, so a
         // failed write does not drop resume progress with nothing to replace it.
+        // The rendered row, the raw ledger it is rebuilt from, and the remote
+        // provider's optimistic layer all have to be cleared: leaving any one of
+        // them holding this episode puts the resume bar back on the next render.
+        ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
         ContinueWatchingStore.removeWatched([item])
+        let markedAt = item.watchedAt
+        Task { @MainActor in
+            TraktProgressService.forgetLocalPlayback(
+                meta: meta,
+                season: season,
+                episode: episode,
+                recordedNoLaterThan: markedAt,
+                notify: true
+            )
+        }
         let traktStore = ProfileSettings.current
         if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
             let profileId = activeProfileId
@@ -3417,6 +4070,9 @@ enum ProfileSettings {
             store: .standard,
             tokenStorage: simklTokenStorage
         )
+        // Removing the suites no longer takes the sync caches with them — they
+        // are files now, and would otherwise be inherited by the next account.
+        SimklSyncCache.eraseAll()
         for key in SettingsKey.all {
             UserDefaults.standard.removeObject(forKey: key)
         }
@@ -3527,10 +4183,12 @@ struct DetailsUiState {
     var error: String? = nil
     var isInWatchlist: Bool = false
     var isWatched: Bool = false
-    /// Related titles under the cast row (TMDB recommendations or Trakt related).
+    /// Related titles under the cast row (TMDB, Trakt, or Simkl recommendations).
     var moreLikeThis: [RelatedTitle] = []
     /// Production companies + networks from TMDB.
     var companies: [MetaCompany] = []
+    /// Simkl community rating, catalog rank, and drop rate.
+    var simklRatings: SimklTitleRatings? = nil
     /// Top liked Trakt comments (max 5).
     var comments: [TraktCommentReview] = []
     var isLoadingEnrichment: Bool = false

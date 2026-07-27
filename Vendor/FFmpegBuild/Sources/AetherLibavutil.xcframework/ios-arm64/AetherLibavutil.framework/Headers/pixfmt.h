@@ -26,7 +26,7 @@
  * pixel format definitions
  */
 
-#include "avconfig.h"
+#include "AetherLibavutil/avconfig.h"
 #include "version.h"
 
 #define AVPALETTE_SIZE 1024

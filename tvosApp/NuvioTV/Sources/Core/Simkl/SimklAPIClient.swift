@@ -125,6 +125,26 @@ final class SimklAPIClient {
         return try await performRaw(request)
     }
 
+    /// Simkl only honours a real `DELETE` here — `POST` or `GET` against the
+    /// same URL answers without deleting anything. Success is `204`, so there
+    /// is no body to decode.
+    func delete(
+        path: String,
+        clientID: String,
+        accessToken: String,
+        queryItems: [URLQueryItem] = []
+    ) async throws -> SimklHTTPResult<Data> {
+        let request = try makeRequest(
+            path: path,
+            method: "DELETE",
+            clientID: clientID,
+            accessToken: accessToken,
+            queryItems: queryItems,
+            body: nil as Data?
+        )
+        return try await performRaw(request)
+    }
+
     func getRaw(
         path: String,
         clientID: String,
