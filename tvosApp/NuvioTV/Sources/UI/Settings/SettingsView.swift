@@ -164,8 +164,27 @@ enum SettingsKey {
     static let simklClientID = "nuvio.tv.settings.integrations.simklClientID"
     static let tmdbEnabled = "nuvio.tv.settings.integrations.tmdbEnabled"
     static let tmdbApiKey = "nuvio.tv.settings.integrations.tmdbApiKey"
+    static let tmdbLanguage = "nuvio.tv.settings.integrations.tmdbLanguage"
+    static let tmdbUseTrailers = "nuvio.tv.settings.integrations.tmdbUseTrailers"
+    static let tmdbUseArtwork = "nuvio.tv.settings.integrations.tmdbUseArtwork"
+    static let tmdbUseBasicInfo = "nuvio.tv.settings.integrations.tmdbUseBasicInfo"
+    static let tmdbUseDetails = "nuvio.tv.settings.integrations.tmdbUseDetails"
+    static let tmdbUseCredits = "nuvio.tv.settings.integrations.tmdbUseCredits"
+    static let tmdbUseProductions = "nuvio.tv.settings.integrations.tmdbUseProductions"
+    static let tmdbUseNetworks = "nuvio.tv.settings.integrations.tmdbUseNetworks"
+    static let tmdbUseEpisodes = "nuvio.tv.settings.integrations.tmdbUseEpisodes"
+    static let tmdbUseSeasonPosters = "nuvio.tv.settings.integrations.tmdbUseSeasonPosters"
+    static let tmdbUseMoreLikeThis = "nuvio.tv.settings.integrations.tmdbUseMoreLikeThis"
+    static let tmdbUseCollections = "nuvio.tv.settings.integrations.tmdbUseCollections"
     static let mdbListEnabled = "nuvio.tv.settings.integrations.mdbListEnabled"
     static let mdbListApiKey = "nuvio.tv.settings.integrations.mdbListApiKey"
+    static let mdbListUseImdb = "nuvio.tv.settings.integrations.mdbListUseImdb"
+    static let mdbListUseTmdb = "nuvio.tv.settings.integrations.mdbListUseTmdb"
+    static let mdbListUseTomatoes = "nuvio.tv.settings.integrations.mdbListUseTomatoes"
+    static let mdbListUseMetacritic = "nuvio.tv.settings.integrations.mdbListUseMetacritic"
+    static let mdbListUseTrakt = "nuvio.tv.settings.integrations.mdbListUseTrakt"
+    static let mdbListUseLetterboxd = "nuvio.tv.settings.integrations.mdbListUseLetterboxd"
+    static let mdbListUseAudience = "nuvio.tv.settings.integrations.mdbListUseAudience"
     static let debridProvider = "nuvio.tv.settings.integrations.debridProvider"
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     /// Provider-specific device-flow tokens. Keeping them separate matches the
@@ -219,7 +238,13 @@ enum SettingsKey {
         traktWatchProgressSource, watchProgressSourceChosenByUser,
         traktLibrarySourceMode, traktMoreLikeThisSource,
         simklClientID,
-        tmdbEnabled, tmdbApiKey, mdbListEnabled, mdbListApiKey,
+        tmdbEnabled, tmdbApiKey, tmdbLanguage,
+        tmdbUseTrailers, tmdbUseArtwork, tmdbUseBasicInfo, tmdbUseDetails, tmdbUseCredits,
+        tmdbUseProductions, tmdbUseNetworks, tmdbUseEpisodes, tmdbUseSeasonPosters,
+        tmdbUseMoreLikeThis, tmdbUseCollections,
+        mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
+        mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
+        mdbListUseLetterboxd, mdbListUseAudience,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
@@ -1969,6 +1994,18 @@ private struct IntegrationSettingsView: View {
     @State private var simklClientIDDraft: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
+    @AppStorage(SettingsKey.tmdbUseTrailers) private var tmdbUseTrailers = true
+    @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
+    @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
+    @AppStorage(SettingsKey.tmdbUseDetails) private var tmdbUseDetails = true
+    @AppStorage(SettingsKey.tmdbUseCredits) private var tmdbUseCredits = true
+    @AppStorage(SettingsKey.tmdbUseProductions) private var tmdbUseProductions = true
+    @AppStorage(SettingsKey.tmdbUseNetworks) private var tmdbUseNetworks = true
+    @AppStorage(SettingsKey.tmdbUseEpisodes) private var tmdbUseEpisodes = true
+    @AppStorage(SettingsKey.tmdbUseSeasonPosters) private var tmdbUseSeasonPosters = true
+    @AppStorage(SettingsKey.tmdbUseMoreLikeThis) private var tmdbUseMoreLikeThis = true
+    @AppStorage(SettingsKey.tmdbUseCollections) private var tmdbUseCollections = true
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
     @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
@@ -1981,6 +2018,8 @@ private struct IntegrationSettingsView: View {
     @State private var showingTraktSettings = false
     @State private var showingSimklLogin = false
     @State private var showingSimklSettings = false
+    @State private var showingTmdbOptions = false
+    @State private var showingMdbListOptions = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -2028,14 +2067,14 @@ private struct IntegrationSettingsView: View {
                     fallback: "Watchlist, progress, history, comments, and recommendations"
                 )
             ) {
-                SettingsNativeTextFieldRow(
+                SettingsTextFieldRow(
                     title: "Trakt Client ID",
                     subtitle: "Create an API app at trakt.tv/oauth/applications",
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $traktClientIDDraft
                 )
 
-                SettingsNativeTextFieldRow(
+                SettingsTextFieldRow(
                     title: "Trakt Client Secret",
                     subtitle: L10n.string(
                         "tvos_settings_stored_locally_on_this_apple_tv",
@@ -2061,7 +2100,7 @@ private struct IntegrationSettingsView: View {
                 title: "Simkl",
                 subtitle: "Connect a Simkl account with a Client ID and PIN login"
             ) {
-                SettingsNativeTextFieldRow(
+                SettingsTextFieldRow(
                     title: "Simkl Client ID",
                     subtitle: "Create an API app at simkl.com/settings/developer — stored only on this Apple TV",
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
@@ -2087,29 +2126,65 @@ private struct IntegrationSettingsView: View {
                 )
             ) {
                 SettingsToggleRow(
-                    title: L10n.string("tvos_integrations_tmdb", fallback: "TMDB Metadata"),
+                    title: L10n.string("settings_tmdb_enable_enrichment", fallback: "Enable TMDB Enrichment"),
                     subtitle: L10n.string(
-                        "tvos_integrations_tmdb_subtitle",
-                        fallback: "Enable custom TMDB metadata enrichment"
+                        "settings_tmdb_enable_enrichment_description",
+                        fallback: "Use TMDB as a metadata source to enhance add-on data"
                     ),
                     isOn: $tmdbEnabled,
-                    accentColor: accentColor
+                    accentColor: accentColor,
+                    enabled: tmdbHasApiKey
                 )
+                if !tmdbHasApiKey {
+                    SettingsInfoRow(
+                        title: L10n.string("settings_tmdb_personal_api_key", fallback: "Personal API key"),
+                        value: L10n.string("settings_tmdb_add_api_key_first", fallback: "Add your API key below first")
+                    )
+                }
 
                 SettingsTextFieldRow(
-                    title: L10n.string("tvos_settings_tmdb_api_key", fallback: "TMDB API Key"),
-                    subtitle: L10n.string("tvos_settings_stored_locally_on_this_apple_tv", fallback: "Stored locally on this Apple TV"),
-                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    title: L10n.string("settings_tmdb_personal_api_key", fallback: "Personal API key"),
+                    subtitle: L10n.string(
+                        "tvos_settings_stored_locally_on_this_apple_tv",
+                        fallback: "Stored locally on this Apple TV"
+                    ),
+                    placeholder: L10n.string("settings_tmdb_api_key_label", fallback: "API Key"),
                     text: $tmdbApiKey,
-                    isSecure: true
+                    isSecure: true,
+                    onCommit: normalizeTmdbApiKey
                 )
+
+                if tmdbHasApiKey {
+                    SettingsActionRow(
+                        title: L10n.string("settings_tmdb_options", fallback: "TMDB Options"),
+                        subtitle: L10n.string(
+                            "settings_tmdb_options_description",
+                            fallback: "Choose the language and TMDB features used"
+                        ),
+                        value: L10n.string("settings_open", fallback: "Open"),
+                        accentColor: accentColor
+                    ) {
+                        showingTmdbOptions = true
+                    }
+                }
 
                 SettingsToggleRow(
                     title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
-                    subtitle: L10n.string("tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8", fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"),
+                    subtitle: L10n.string(
+                        "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
+                        fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
+                    ),
                     isOn: $mdbListEnabled,
-                    accentColor: accentColor
+                    accentColor: accentColor,
+                    enabled: mdbListHasApiKey
                 )
+
+                if !mdbListHasApiKey {
+                    SettingsInfoRow(
+                        title: L10n.string("mdblist_dialog_title", fallback: "MDBList API Key"),
+                        value: L10n.string("settings_tmdb_add_api_key_first", fallback: "Add your API key below first")
+                    )
+                }
 
                 SettingsTextFieldRow(
                     title: L10n.string("mdblist_dialog_title", fallback: "MDBList API Key"),
@@ -2118,6 +2193,20 @@ private struct IntegrationSettingsView: View {
                     text: $mdbListApiKey,
                     isSecure: true
                 )
+
+                if mdbListHasApiKey {
+                    SettingsActionRow(
+                        title: L10n.string("settings_mdblist_options", fallback: "MDBList Options"),
+                        subtitle: L10n.string(
+                            "settings_mdblist_options_description",
+                            fallback: "Choose the MDBList features used"
+                        ),
+                        value: L10n.string("settings_open", fallback: "Open"),
+                        accentColor: accentColor
+                    ) {
+                        showingMdbListOptions = true
+                    }
+                }
             }
 
             SettingsGroup(
@@ -2165,6 +2254,19 @@ private struct IntegrationSettingsView: View {
             traktViewModel.loadConnectedData()
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
+            normalizeTmdbApiKey()
+            normalizeMdbListApiKey()
+        }
+        .onChange(of: tmdbApiKey) { _ in
+            if !tmdbHasApiKey {
+                tmdbEnabled = false
+                showingTmdbOptions = false
+            }
+        }
+        .onChange(of: mdbListApiKey) { _ in
+            if !mdbListHasApiKey {
+                mdbListEnabled = false
+            }
         }
         .sheet(item: $debridAccountToConnect) { provider in
             if provider == .premiumize && !PremiumizeOAuthConfiguration.isDeviceOAuthConfigured {
@@ -2204,12 +2306,67 @@ private struct IntegrationSettingsView: View {
             SimklConnectedSettingsSheet(viewModel: simklViewModel, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .sheet(isPresented: $showingTmdbOptions) {
+            TmdbOptionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingMdbListOptions) {
+            MdbListOptionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
         .onChange(of: traktViewModel.mode) { mode in
             if mode == .connected { showingTraktLogin = false }
         }
         .onChange(of: simklViewModel.mode) { mode in
             if mode == .connected { showingSimklLogin = false }
         }
+    }
+
+    private var tmdbLanguageOptions: [String] {
+        AppLanguage.pickerLanguages
+            .filter { $0 != .system }
+            .map(\.nativeDisplayName)
+    }
+
+    private var tmdbHasApiKey: Bool {
+        !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var tmdbControlsEnabled: Bool {
+        tmdbEnabled && tmdbHasApiKey
+    }
+
+    private func normalizeTmdbApiKey() {
+        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tmdbHasApiKey {
+            tmdbEnabled = false
+        }
+    }
+
+    private var mdbListHasApiKey: Bool {
+        !mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func normalizeMdbListApiKey() {
+        mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !mdbListHasApiKey {
+            mdbListEnabled = false
+        }
+    }
+
+    private var tmdbLanguageSelection: Binding<String> {
+        Binding(
+            get: {
+                let language = AppLanguage.fromStored(tmdbLanguage)
+                return (language == .system ? AppLanguage.english : language).nativeDisplayName
+            },
+            set: { displayName in
+                let language = AppLanguage.pickerLanguages.first {
+                    $0 != .system && $0.nativeDisplayName == displayName
+                } ?? .english
+                tmdbLanguage = language.tag
+            }
+        )
     }
 
     private func isConnected(_ provider: DebridAccountProvider) -> Bool {
@@ -2247,6 +2404,352 @@ private struct IntegrationSettingsView: View {
         simklViewModel.credentialsDidChange()
         guard simklViewModel.credentialsConfigured else { return }
         showingSimklLogin = true
+    }
+}
+
+private struct TmdbOptionsSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
+    @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
+    @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
+    @AppStorage(SettingsKey.tmdbUseTrailers) private var tmdbUseTrailers = true
+    @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
+    @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
+    @AppStorage(SettingsKey.tmdbUseDetails) private var tmdbUseDetails = true
+    @AppStorage(SettingsKey.tmdbUseCredits) private var tmdbUseCredits = true
+    @AppStorage(SettingsKey.tmdbUseProductions) private var tmdbUseProductions = true
+    @AppStorage(SettingsKey.tmdbUseNetworks) private var tmdbUseNetworks = true
+    @AppStorage(SettingsKey.tmdbUseEpisodes) private var tmdbUseEpisodes = true
+    @AppStorage(SettingsKey.tmdbUseSeasonPosters) private var tmdbUseSeasonPosters = true
+    @AppStorage(SettingsKey.tmdbUseMoreLikeThis) private var tmdbUseMoreLikeThis = true
+    @AppStorage(SettingsKey.tmdbUseCollections) private var tmdbUseCollections = true
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(L10n.string("settings_tmdb_options", fallback: "TMDB Options"))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+
+                        Text(L10n.string(
+                            "settings_tmdb_options_description",
+                            fallback: "Choose the language and TMDB features used"
+                        ))
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("settings_tmdb_section_localization", fallback: "Localization"),
+                        subtitle: L10n.string(
+                            "settings_tmdb_preferred_language_description",
+                            fallback: "TMDB metadata language for titles, descriptions, and enabled fields"
+                        )
+                    ) {
+                        SettingsChoiceRow(
+                            title: L10n.string("settings_tmdb_preferred_language", fallback: "Language"),
+                            subtitle: L10n.string(
+                                "tmdb_language_subtitle",
+                                fallback: "TMDB metadata language for titles and descriptions"
+                            ),
+                            selection: tmdbLanguageSelection,
+                            options: tmdbLanguageOptions,
+                            accentColor: accentColor
+                        )
+                        .opacity(tmdbHasApiKey ? 1 : 0.46)
+                        .disabled(!tmdbHasApiKey)
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("settings_tmdb_section_modules", fallback: "Modules"),
+                        subtitle: L10n.string(
+                            "settings_tmdb_modules_description",
+                            fallback: "Choose which TMDB features are used"
+                        )
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_trailers", fallback: "Trailers"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_trailers_description",
+                                fallback: "Trailer candidates from TMDB videos"
+                            ),
+                            isOn: $tmdbUseTrailers,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_artwork", fallback: "Artwork"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_artwork_description",
+                                fallback: "Artwork images from TMDB"
+                            ),
+                            isOn: $tmdbUseArtwork,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_basic_info", fallback: "Basic Info"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_basic_info_description",
+                                fallback: "Description, genres, and rating from TMDB"
+                            ),
+                            isOn: $tmdbUseBasicInfo,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_details", fallback: "Details"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_details_description",
+                                fallback: "Runtime, status, country, and language from TMDB"
+                            ),
+                            isOn: $tmdbUseDetails,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_credits", fallback: "Credits"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_credits_description",
+                                fallback: "Cast, director, and writer from TMDB"
+                            ),
+                            isOn: $tmdbUseCredits,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_production_companies", fallback: "Productions"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_production_companies_description",
+                                fallback: "Production companies from TMDB"
+                            ),
+                            isOn: $tmdbUseProductions,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_networks", fallback: "Networks"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_networks_description",
+                                fallback: "Networks with logos from TMDB"
+                            ),
+                            isOn: $tmdbUseNetworks,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_episodes", fallback: "Episodes"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_episodes_description",
+                                fallback: "Episode titles, overviews, thumbnails, and runtime from TMDB"
+                            ),
+                            isOn: $tmdbUseEpisodes,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_season_posters", fallback: "Season Posters"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_season_posters_description",
+                                fallback: "Use TMDB season posters for series"
+                            ),
+                            isOn: $tmdbUseSeasonPosters,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_more_like_this_description",
+                                fallback: "TMDB recommendations on the details page"
+                            ),
+                            isOn: $tmdbUseMoreLikeThis,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_collections", fallback: "Collections"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_collections_description",
+                                fallback: "TMDB movie collections in release order"
+                            ),
+                            isOn: $tmdbUseCollections,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
+                    }
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        .onExitCommand { dismiss() }
+    }
+
+    private var tmdbLanguageOptions: [String] {
+        AppLanguage.pickerLanguages
+            .filter { $0 != .system }
+            .map(\.nativeDisplayName)
+    }
+
+    private var tmdbHasApiKey: Bool {
+        !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var tmdbControlsEnabled: Bool {
+        tmdbEnabled && tmdbHasApiKey
+    }
+
+    private var tmdbLanguageSelection: Binding<String> {
+        Binding(
+            get: {
+                let language = AppLanguage.fromStored(tmdbLanguage)
+                return (language == .system ? AppLanguage.english : language).nativeDisplayName
+            },
+            set: { displayName in
+                let language = AppLanguage.pickerLanguages.first {
+                    $0 != .system && $0.nativeDisplayName == displayName
+                } ?? .english
+                tmdbLanguage = language.tag
+            }
+        )
+    }
+}
+
+private struct MdbListOptionsSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
+    @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
+    @AppStorage(SettingsKey.mdbListUseImdb) private var mdbListUseImdb = true
+    @AppStorage(SettingsKey.mdbListUseTmdb) private var mdbListUseTmdb = true
+    @AppStorage(SettingsKey.mdbListUseTomatoes) private var mdbListUseTomatoes = true
+    @AppStorage(SettingsKey.mdbListUseMetacritic) private var mdbListUseMetacritic = true
+    @AppStorage(SettingsKey.mdbListUseTrakt) private var mdbListUseTrakt = true
+    @AppStorage(SettingsKey.mdbListUseLetterboxd) private var mdbListUseLetterboxd = true
+    @AppStorage(SettingsKey.mdbListUseAudience) private var mdbListUseAudience = true
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text(L10n.string("settings_mdblist_options", fallback: "MDBList Options"))
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+
+                        Text(L10n.string(
+                            "settings_mdblist_options_description",
+                            fallback: "Choose the MDBList features used"
+                        ))
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
+                        subtitle: L10n.string(
+                            "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
+                            fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
+                        )
+                    ) {
+                        SettingsToggleRow(
+                            title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
+                            subtitle: L10n.string(
+                                "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
+                                fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
+                            ),
+                            isOn: $mdbListEnabled,
+                            accentColor: accentColor,
+                            enabled: mdbListHasApiKey
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: "Rating Providers",
+                        subtitle: "Choose which Android TV rating badges are shown"
+                    ) {
+                        SettingsToggleRow(
+                            title: "IMDb",
+                            subtitle: "IMDb user rating",
+                            isOn: $mdbListUseImdb,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "TMDB",
+                            subtitle: "The Movie Database rating",
+                            isOn: $mdbListUseTmdb,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "Rotten Tomatoes",
+                            subtitle: "Tomatometer score",
+                            isOn: $mdbListUseTomatoes,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "Metacritic",
+                            subtitle: "Metacritic score",
+                            isOn: $mdbListUseMetacritic,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "Trakt",
+                            subtitle: "Trakt rating",
+                            isOn: $mdbListUseTrakt,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "Letterboxd",
+                            subtitle: "Letterboxd rating",
+                            isOn: $mdbListUseLetterboxd,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                        SettingsToggleRow(
+                            title: "Audience Score",
+                            subtitle: "Audience score",
+                            isOn: $mdbListUseAudience,
+                            accentColor: accentColor,
+                            enabled: mdbListControlsEnabled
+                        )
+                    }
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        .onExitCommand { dismiss() }
+    }
+
+    private var mdbListHasApiKey: Bool {
+        !mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var mdbListControlsEnabled: Bool {
+        mdbListEnabled && mdbListHasApiKey
     }
 }
 
@@ -4937,14 +5440,14 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 5.23.3",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/5.23.3 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 6.0.1",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.0.1 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(
             id: "aether-ffmpeg",
-            title: "FFmpegBuild 2.2.0 (AetherLib*)",
-            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.2.0 and Vendor/FFmpegBuild.",
+            title: "FFmpegBuild 2.4.0 (AetherLib*)",
+            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.4.0 and Vendor/FFmpegBuild.",
             license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
         ),
         LicenseEntry(
@@ -7444,11 +7947,13 @@ private struct SettingsToggleRow: View {
     let subtitle: String
     @Binding var isOn: Bool
     let accentColor: Color
+    var enabled: Bool = true
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         Button {
+            guard enabled else { return }
             isOn.toggle()
         } label: {
             SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
@@ -7460,7 +7965,8 @@ private struct SettingsToggleRow: View {
                     Text(isOn ? L10n.string("subtitle_on", fallback: "On") : L10n.string("playback_afr_off", fallback: "Off"))
                         .font(.system(size: 18, weight: .bold))
                         .foregroundColor(.white.opacity(0.78))
-                        .frame(width: 34, alignment: .trailing)
+                        .fixedSize(horizontal: true, vertical: false)
+                        .frame(minWidth: 34, alignment: .trailing)
 
                     RoundedRectangle(cornerRadius: 14, style: .continuous)
                         .fill(isOn ? accentColor : Color.white.opacity(0.24))
@@ -7478,6 +7984,8 @@ private struct SettingsToggleRow: View {
         .focused($isFocused)
         .focusEffectDisabledIfAvailable()
         .entryLockable()
+        .opacity(enabled ? 1 : 0.46)
+        .disabled(!enabled)
     }
 }
 
@@ -7687,9 +8195,9 @@ private struct SettingsNativeTextFieldRow: View {
             ZStack(alignment: .leading) {
                 Group {
                     if isSecure {
-                        SecureField(placeholder, text: $text)
+                        SecureField("", text: $text)
                     } else {
-                        TextField(placeholder, text: $text)
+                        TextField("", text: $text)
                     }
                 }
                 .textFieldStyle(.plain)
@@ -7707,7 +8215,11 @@ private struct SettingsNativeTextFieldRow: View {
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
                     .lineLimit(1)
-                    .padding(.horizontal, 16)
+                    .frame(
+                        width: fieldWidth - (text.isEmpty ? 0 : 32),
+                        alignment: text.isEmpty ? .center : .leading
+                    )
+                    .padding(.horizontal, text.isEmpty ? 0 : 16)
                     .allowsHitTesting(false)
             }
             .frame(width: fieldWidth, height: 48)
@@ -7751,7 +8263,11 @@ private struct SettingsGlassTextField: View {
                 .font(.system(size: 20, weight: .semibold))
                 .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
                 .lineLimit(1)
-                .padding(.horizontal, 16)
+                .frame(
+                    width: fieldWidth - (text.isEmpty ? 0 : 32),
+                    alignment: text.isEmpty ? .center : .leading
+                )
+                .padding(.horizontal, text.isEmpty ? 0 : 16)
                 .allowsHitTesting(false)
         }
         .frame(width: fieldWidth, height: 48)
@@ -8003,6 +8519,7 @@ private struct SettingsRowShell<Content: View>: View {
             content
         }
         .padding(.horizontal, 20)
+        .padding(.vertical, 12)
         .frame(minHeight: 74)
         .settingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
         .overlay(

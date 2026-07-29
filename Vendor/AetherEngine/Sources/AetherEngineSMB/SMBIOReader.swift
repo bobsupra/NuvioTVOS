@@ -74,11 +74,18 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
                            category: .demux, level: .verbose)
             return -1
         case .success(let data):
-            if data.isEmpty { return 0 } // EOF
-            let n = min(data.count, want)
-            data.copyBytes(to: buffer, count: n)
-            position += Int64(n)
-            return Int32(n)
+            // #243 (same family as the file and HTTP disc readers): this runs on FFmpeg's read
+            // callback, i.e. on a demux pump thread that never returns from its dispatch block and
+            // so never drains its autorelease pool. The SMB body arrives as a dispatch_data-backed
+            // `Data`, and anything the copy bridges out on this thread would be stranded for the
+            // whole session, at the source's read rate.
+            return autoreleasepool { () -> Int32 in
+                if data.isEmpty { return 0 } // EOF
+                let n = min(data.count, want)
+                data.copyBytes(to: buffer, count: n)
+                position += Int64(n)
+                return Int32(n)
+            }
         }
     }
 

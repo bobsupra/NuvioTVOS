@@ -40,7 +40,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Containers | MKV, MP4, WebM, MPEG-TS, AVI, OGG, FLV |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
 | Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / DTS / DTS-HD MA / MP3 / Opus bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
@@ -120,6 +120,14 @@ player.$playbackPhase  // unified: .idle/.loading/.playing/.paused/.seeking/.reb
                        // Prefer this over stitching the raw signals or matching EngineLog text.
 player.$currentAVPlayer // active AVPlayer, re-emitted on every reload (MPNowPlayingSession)
 
+// System Now-Playing on the native video path (tvOS / iOS). Off by default: an
+// AVPlayerViewController host already gets this from AVKit and must NOT opt in.
+// Custom-transport hosts set it before load(), then register commands on the
+// session and stage identity through setVideoNowPlayingInfo.
+player.ownsVideoNowPlayingSession = true
+player.videoNowPlayingSession                  // MPNowPlayingSession?, nil unless opted in
+player.setVideoNowPlayingInfo([ /* MPMediaItemProperty… */ ])
+
 // Time lives on player.clock, a SEPARATE ObservableObject, so the ~10 Hz
 // ticks never fire objectWillChange on the engine (track lists / state views
 // don't re-render per tick; native tvOS Menu dropdowns stay stable).
@@ -133,7 +141,18 @@ player.selectAudioTrack(index: trackID)
 player.subtitleTracks                          // [TrackInfo], text + bitmap + external, one list
 player.selectSubtitleTrack(index: streamID)
 player.clearSubtitle()
-player.$subtitleCues                           // [SubtitleCue]: .text(String), .richText([SubtitleTextRun]) (coloured teletext), or .image(SubtitleImage)
+player.$subtitleCues                           // [SubtitleCue]: .text(String), .richText([SubtitleTextRun]), or .image(SubtitleImage)
+
+// #233: styled text arrives as .richText. A run carries colour, bold, italic, underline,
+// strikeout, font face and an ASS-relative font size; the cue carries the placement it asks
+// for (numpad alignment plus an optional [0, 1] anchor). This covers SRT, WebVTT, teletext
+// and ASS alike, because libavcodec converts them all to ASS event lines before the engine
+// sees them. A cue with no styling still arrives as .text, so handling only that case keeps
+// working. WebVTT cue settings are the exception: libavcodec does not convert them, so VTT
+// positioning does not arrive (its inline bold/italic/underline does).
+for cue in player.subtitleCues {
+    if case .richText(let runs) = cue.body { render(runs, at: cue.placement) }
+}
 
 // External subtitle files are first-class tracks (#88): they appear in subtitleTracks
 // (isExternal == true, synthetic id) and select through the same call as embedded streams.
@@ -160,7 +179,10 @@ player.$discTitles                             // [TitleInfo]: id, name, duratio
 player.$selectedDiscTitle                      // TitleInfo?
 player.selectTitle(id: titleID)                // switch title (rebuilds from the new title's head)
 player.$discChapters                           // [ChapterInfo] for the selected title
-player.selectChapter(id: chapterID)            // seek to a chapter
+player.selectChapter(id: chapterID)            // seek to a chapter (disc chapters only)
+
+// Container chapters (Matroska / MP4; empty for disc sources, which publish discChapters instead)
+player.$mediaChapters                          // [ChapterInfo]; startSeconds are seek(to:) timestamps
 
 // Info panel / Now Playing (iOS / tvOS)
 player.setExternalMetadata([ AVMetadataItem(/* title, artwork, etc. */) ])
@@ -171,7 +193,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.0.1")
 ```
 
 Two complementary samples ship in `Examples/`:
@@ -311,18 +333,19 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "5.23.3")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.0.1")
 ```
 
-Pin to `.upToNextMinor(from: "5.23.3")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.0.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
 | | Min |
 | --- | --- |
 | iOS | 16.0 |
-| tvOS | 16.0 |
+| tvOS | 17.0 |
 | macOS | 14.0 |
+| visionOS | 1.0 |
 | Swift | 6.0 |
 | Xcode | 16.0 |
 

@@ -54,7 +54,8 @@ struct AtmosDetectionProbeIntegrationTests {
     """
 
     /// 0.5s stereo silence, AAC @ 96kbps -- exercises the `.notEAC3` skip path (no decoder is ever opened).
-    private static let aacBase64 = """
+    /// Internal so `Issue222EAC3MoovPrimeTests` can mux the same bytes as a codecpar-derived sample entry.
+    static let aacBase64 = """
     AAAAHGZ0eXBpc29tAAACAGlzb21pc28ybXA0MQAAA3Ntb292AAAAbG12aGQAAAAAAAAAAAAAAAAA
     AAPoAAAB9AABAAABAAAAAAAAAAAAAAAAAQAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAEAA
     AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAACAAACnXRyYWsAAABcdGtoZAAAAAMAAAAAAAAA
@@ -78,7 +79,8 @@ struct AtmosDetectionProbeIntegrationTests {
     """
 
     /// 0.1s of black video, H.264 16x16, no audio stream at all -- exercises `.noAudioTrack`.
-    private static let videoOnlyBase64 = """
+    /// Internal so `Issue222EAC3MoovPrimeTests` can use it as the video track of a muxer under test.
+    static let videoOnlyBase64 = """
     AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAANdbW9vdgAAAGxtdmhkAAAAAAAAAAAA
     AAAAAAAD6AAAAHgAAQAAAQAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAA
     AABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAgAAAod0cmFrAAAAXHRraGQAAAADAAAA

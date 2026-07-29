@@ -191,6 +191,25 @@ final class HLSLocalServer: @unchecked Sendable {
         return URL(string: "http://127.0.0.1:\(port)/master_hdr.m3u8")
     }
 
+    /// Numeric address of the peer on an accepted connection, or nil if the socket is already gone (#227 diag).
+    static func peerAddress(of fd: Int32) -> String? {
+        var storage = sockaddr_storage()
+        var length = socklen_t(MemoryLayout<sockaddr_storage>.size)
+        let named = withUnsafeMutablePointer(to: &storage) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) { getpeername(fd, $0, &length) == 0 }
+        }
+        guard named else { return nil }
+        var host = [CChar](repeating: 0, count: Int(NI_MAXHOST))
+        let resolved = withUnsafePointer(to: &storage) { pointer in
+            pointer.withMemoryRebound(to: sockaddr.self, capacity: 1) {
+                getnameinfo($0, length, &host, socklen_t(host.count), nil, 0, NI_NUMERICHOST)
+            }
+        }
+        guard resolved == 0 else { return nil }
+        let terminator = host.firstIndex(of: 0) ?? host.endIndex
+        return String(decoding: host[..<terminator].map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
     /// The device's active LAN IPv4 address for the AirPlay LAN-host swap (#86), or nil (caller keeps
     /// 127.0.0.1). DrHurt's caveat: en0 isn't always the active interface on multi-NIC / Ethernet devices.
     /// We scan `en*` interfaces (WiFi + wired Ethernet/Thunderbolt; cellular pdp_ip*, VPN utun*, AirDrop awdl*
@@ -272,9 +291,25 @@ final class HLSLocalServer: @unchecked Sendable {
     }
 
     private var loggedMasterPlaylist = false
+    /// #227: set the first time any media byte is served this session (init segment or a media segment).
+    /// The AirPlay progress watchdog needs to tell "the receiver refused the manifest" from "the clock is
+    /// not moving for some other reason", and a receiver that refuses never asks for a segment at all.
+    private var servedMediaBytes = false
+    /// True once the session has served an init or media segment to anyone (#227).
+    var hasServedMediaSegment: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return servedMediaBytes
+    }
+
     private var loggedReducedMasterPlaylist = false
     private var loggedMediaPlaylist = false
     private var loggedRequestHeaders = false
+    /// #227 diag: every distinct client address seen this session, logged once each. AirPlay is supposed to
+    /// hand the playlist URL to the receiver, so a receiver address must show up here while AirPlaying; only
+    /// ever seeing the sender's own address would mean the sender pulls the media and the LAN-IP rewrite is
+    /// solving a problem that does not exist.
+    private var loggedPeers: Set<String> = []
     private var mediaPlaylistBuildCount = 0  // periodic re-log of live playlist head/tail
 
     private let stateLock = NSLock()  // guards all mutable fields; never held across blocking syscalls
@@ -569,6 +604,16 @@ final class HLSLocalServer: @unchecked Sendable {
 
         // #50 diag: promoted to .info so the host mirror names the failing path without a verbose build. Revert once #50 is root-caused.
         EngineLog.emit("[HLSLocalServer] \(firstLine)", category: .hlsServer)
+        // #227 diag: name each distinct client once, so an AirPlay session shows whether the receiver fetches
+        // for itself (its own LAN address appears) or the sender pulls everything (only 127.0.0.1 / own IP).
+        if let peer = Self.peerAddress(of: fd) {
+            stateLock.lock()
+            let isNewPeer = loggedPeers.insert(peer).inserted
+            stateLock.unlock()
+            if isNewPeer {
+                EngineLog.emit("[HLSLocalServer] #227 client \(peer) first request: \(firstLine)", category: .hlsServer)
+            }
+        }
         // Dump request headers once per session; AVPlayer capability headers (Accept, Range, X-Playback-Session-Id) can influence silent variant rejection.
         stateLock.lock()
         let dumpHeaders = !loggedRequestHeaders
@@ -683,6 +728,7 @@ final class HLSLocalServer: @unchecked Sendable {
                            contentType: "text/vtt")
 
         case "/init.mp4":
+            stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
             let data = provider?.initSegment() ?? Data()
             if data.isEmpty {
                 return send404(fd: fd, path: normalizedPath,
@@ -708,6 +754,7 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             if normalizedPath.hasPrefix("/seg"),
                normalizedPath.hasSuffix(".mp4") {
+                stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
                     // File-backed fast path: stream page cache -> socket without Data materialization.

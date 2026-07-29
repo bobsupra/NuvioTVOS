@@ -438,15 +438,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
             func load(_ catalog: AddonManifestCatalog) async -> NuvioCatalog? {
                 do {
-                    var path = "catalog/\(catalog.type)/\(catalog.id)"
                     let catalogGenre = catalog.requiresGenre ? catalog.firstGenreOption : nil
-                    if let genre = catalogGenre,
-                       let genreExtra = encodedExtra(name: "genre", value: genre) {
-                        path += "/" + genreExtra
-                    }
-                    path += ".json"
+                    let url = try StremioCatalogURLBuilder.url(
+                        baseURL: base,
+                        type: catalog.type,
+                        catalogId: catalog.id,
+                        genre: catalogGenre
+                    )
                     let response: CinemetaCatalogResponse = try await fetch(
-                        base.appendingPathComponent(path)
+                        url
                     )
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
                     guard !items.isEmpty else { return nil }
@@ -540,7 +540,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
     func getMetadata(id: String, type: String) async throws -> NuvioMeta {
         if let cached = cachedMetadata(for: id) {
-            return cached
+            return await TmdbDetailsService.localizedMetadata(for: cached)
         }
 
         return try await loadMetadata(id: id, type: type)
@@ -584,7 +584,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
             do {
                 let url = baseURL.appendingPathComponent("meta/\(metaType)/\(resolvedId).json")
                 let response: CinemetaMetaResponse = try await fetch(url)
-                let meta = response.meta.toMeta(fallbackType: metaType)
+                let meta = await TmdbDetailsService.localizedMetadata(
+                    for: response.meta.toMeta(fallbackType: metaType)
+                )
                 cacheMetadata(meta, requestedID: id)
                 return meta
             } catch {
@@ -595,7 +597,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
         for addon in await configuredAddons(supporting: "meta", type: metaType, id: resolvedId) {
             do {
                 let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: metaType, id: resolvedId))
-                let meta = response.meta.toMeta(fallbackType: metaType)
+                let meta = await TmdbDetailsService.localizedMetadata(
+                    for: response.meta.toMeta(fallbackType: metaType)
+                )
                 // Cache under the requested id too in case the addon
                 // canonicalizes to a different id space.
                 cacheMetadata(meta, requestedID: id)
@@ -611,10 +615,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// Best-effort TMDB external_ids lookup so More Like This / production
     /// browse cards that only have `tmdb:` ids can still open in Cinemeta.
     private static func resolveImdbFromTmdb(tmdbId: Int, type: String) async -> String? {
-        let enabled = (ProfileSettings.current.object(forKey: SettingsKey.tmdbEnabled) as? Bool) ?? false
         let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        guard enabled, !apiKey.isEmpty else { return nil }
+        // A TMDB-backed collection is an explicit source choice, independent
+        // of whether optional Details enrichment is enabled.
+        guard !apiKey.isEmpty else { return nil }
         let media = isSeriesType(type) ? "tv" : "movie"
         var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
         components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
@@ -920,7 +925,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         async let movies = fetchCatalog(type: "movie", catalogId: "top", skip: nil, search: query, genre: nil)
         async let series = fetchCatalog(type: "series", catalogId: "top", skip: nil, search: query, genre: nil)
-        let results = try await movies + series
+        let results = await TmdbDetailsService.localizedMetadata(for: try await movies + series)
         cacheMetadata(results)
         return results
     }
@@ -935,13 +940,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
     ) async throws -> CatalogPage {
         let resolvedCatalogId = sort ?? catalogId
         let skip = max(page - 1, 0) * 100
-        let items = try await fetchCatalog(
+        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
             type: contentType,
             catalogId: resolvedCatalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        )
+        ))
         cacheMetadata(items)
         return CatalogPage(
             items: items,
@@ -968,14 +973,14 @@ final class CinemetaCatalogRepository: CatalogRepository {
             sourceBaseURL = baseURL
         }
 
-        let items = try await fetchCatalog(
+        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
             sourceBaseURL: sourceBaseURL,
             type: contentType,
             catalogId: catalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        )
+        ))
         cacheMetadata(items)
         return CatalogPage(
             items: items,
@@ -991,13 +996,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
         skip: Int,
         genre: String?
     ) async throws -> CatalogPage {
-        let items = try await fetchCatalog(
+        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
             type: contentType,
             catalogId: catalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        )
+        ))
         cacheMetadata(items)
         return CatalogPage(
             items: items,
@@ -1066,12 +1071,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
             guard items.count < limit else { break }
             guard let base = await baseURL(forAddonId: source.addonId) else { continue }
             do {
-                var path = "catalog/\(source.type)/\(source.catalogId)"
-                if let genreExtra = source.genre.flatMap({ encodedExtra(name: "genre", value: $0) }) {
-                    path += "/" + genreExtra
-                }
-                path += ".json"
-                let response: CinemetaCatalogResponse = try await fetch(base.appendingPathComponent(path))
+                let url = try StremioCatalogURLBuilder.url(
+                    baseURL: base,
+                    type: source.type,
+                    catalogId: source.catalogId,
+                    genre: source.genre
+                )
+                let response: CinemetaCatalogResponse = try await fetch(url)
                 for meta in response.metas.map({ $0.toMeta(fallbackType: source.type) }) {
                     guard items.count < limit else { break }
                     guard seen.insert(meta.id).inserted else { continue }
@@ -1106,27 +1112,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
         search: String?,
         genre: String?
     ) async throws -> [NuvioMeta] {
-        var path = "catalog/\(type)/\(catalogId)"
-        let extras = [
-            search.flatMap { encodedExtra(name: "search", value: $0) },
-            genre.flatMap { encodedExtra(name: "genre", value: $0) },
-            skip.map { "skip=\($0)" }
-        ].compactMap { $0 }
-
-        if !extras.isEmpty {
-            path += "/" + extras.joined(separator: "&")
-        }
-        path += ".json"
-
-        let response: CinemetaCatalogResponse = try await fetch((sourceBaseURL ?? baseURL).appendingPathComponent(path))
+        let url = try StremioCatalogURLBuilder.url(
+            baseURL: sourceBaseURL ?? baseURL,
+            type: type,
+            catalogId: catalogId,
+            skip: skip,
+            search: search,
+            genre: genre
+        )
+        let response: CinemetaCatalogResponse = try await fetch(url)
         return response.metas.map { $0.toMeta(fallbackType: type) }
-    }
-
-    private func encodedExtra(name: String, value: String) -> String? {
-        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else { return nil }
-        let encoded = trimmed.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? trimmed
-        return "\(name)=\(encoded)"
     }
 
     private func fetch<T: Decodable>(_ url: URL) async throws -> T {

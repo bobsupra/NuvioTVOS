@@ -21,7 +21,12 @@ public struct TitleInfo: Identifiable, Sendable, Equatable {
     }
 }
 
-/// A chapter within the selected title. `startSeconds` is the offset from the title's start.
+/// A chapter of the loaded source. Two publishers use this shape and their time axes differ:
+/// `discChapters` are title-relative (0-based, offset from the selected title's start) and are seeked
+/// through `selectChapter(id:)`, which adds the backend's content-start base. `mediaChapters` are
+/// container (Matroska/MP4) chapters whose `startSeconds` are already content timestamps on the
+/// `seek(to:)` axis, so a host passes them straight to `seek(to:)`; `selectChapter(id:)` resolves
+/// against `discChapters` only and no-ops for them.
 public struct ChapterInfo: Identifiable, Sendable, Equatable {
     public let id: Int
     public let name: String

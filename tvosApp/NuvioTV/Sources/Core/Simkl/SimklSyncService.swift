@@ -1707,6 +1707,19 @@ struct SimklProgressService {
             SimklSyncCache.savePlaybacks(fetched, watermark: watermark, store: store)
         }
 
+        // Simkl has no separate "next up" playback feed. Build the same
+        // display-only suggestions Nuvio Sync builds from the provider's
+        // watched episode history. Refresh that history before reading the
+        // cache so a first Home load is not one refresh behind.
+        if SimklSyncCache.historyWatermark(in: store) != activities.all {
+            _ = await SimklHistoryService.syncWatchedHistory(store: store)
+        }
+        let watchedItems = SimklSyncCache.history(in: store).flatMap(\.items)
+        let upNextSeeds = nextUpSeeds(
+            from: watchedItems,
+            preferFurthestEpisode: UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
+        )
+
         // Simkl keeps a paused row until its own rules retire it (an 80%
         // `scrobble/stop`), and marking an episode watched writes history
         // without touching it. Judged here against the local marks, newest
@@ -1714,6 +1727,20 @@ struct SimklProgressService {
         // local rows, so a re-watch started after the mark still comes back.
         // Read once: `visibleItems()` decodes the watched file on every call.
         let watchedDates = WatchedStore.newestWatchedDatesByIdentity(WatchedStore.visibleItems())
+        let playbackMetas = playbacks.compactMap { playback -> NuvioMeta? in
+            guard let progress = playback.progress,
+                  progress > 0,
+                  progress < 90,
+                  let seed = progressSeed(playback),
+                  let meta = placeholderMeta(item: seed.item, type: seed.type),
+                  !isRetiredByWatchedMark(
+                      playback,
+                      meta: meta,
+                      type: seed.type,
+                      watchedDates: watchedDates
+                  ) else { return nil }
+            return meta
+        }
 
         var results: [ContinueWatchingItem] = []
         for playback in playbacks.sorted(by: {
@@ -1755,7 +1782,129 @@ struct SimklProgressService {
                 )
             )
         }
+
+        // A real paused row wins over a generated suggestion for the same
+        // title. This also keeps the one-card-per-title rule in Home from
+        // hiding a resume row behind its Up Next counterpart.
+        for seed in upNextSeeds where !playbackMetas.contains(where: {
+            WatchedStore.sameContent($0, seed.meta)
+        }) {
+            guard results.count < 20,
+                  !Task.isCancelled,
+                  let item = await makeUpNextItem(from: seed, repository: repository) else {
+                continue
+            }
+            results.append(item)
+        }
         return Array(results.prefix(20))
+    }
+
+    private struct UpNextSeed {
+        let meta: NuvioMeta
+        let season: Int
+        let episode: Int
+        let watchedAt: Date
+    }
+
+    /// Selects one completed episode per series using the same preference as
+    /// Nuvio Sync and Trakt. The following episode is resolved from the fresh
+    /// catalog guide below, so skipped episodes and season rollovers behave
+    /// consistently across all three progress sources.
+    private static func nextUpSeeds(
+        from items: [WatchedStoreItem],
+        preferFurthestEpisode: Bool
+    ) -> [UpNextSeed] {
+        var selectedByContentID: [String: UpNextSeed] = [:]
+
+        for item in items {
+            guard item.meta.isSeries,
+                  let season = item.season,
+                  let episode = item.episode,
+                  season > 0,
+                  episode > 0 else { continue }
+
+            let key = item.meta.imdbId?.lowercased()
+                ?? item.meta.type.lowercased() + ":" + item.meta.id.lowercased()
+            let candidate = UpNextSeed(
+                meta: item.meta,
+                season: season,
+                episode: episode,
+                watchedAt: item.watchedAt
+            )
+            guard let current = selectedByContentID[key] else {
+                selectedByContentID[key] = candidate
+                continue
+            }
+            if UpNextEpisodeSelectionPolicy.prefers(
+                candidateSeason: season,
+                candidateEpisode: episode,
+                candidateWatchedAt: item.watchedAt,
+                over: current.season,
+                currentEpisode: current.episode,
+                currentWatchedAt: current.watchedAt,
+                preferFurthestEpisode: preferFurthestEpisode
+            ) {
+                selectedByContentID[key] = candidate
+            }
+        }
+
+        return selectedByContentID.values.sorted { $0.watchedAt > $1.watchedAt }
+    }
+
+    private static func makeUpNextItem(
+        from seed: UpNextSeed,
+        repository: CatalogRepository
+    ) async -> ContinueWatchingItem? {
+        let meta = (try? await repository.refreshMetadata(
+            id: seed.meta.id,
+            type: "series"
+        )) ?? seed.meta
+        guard let next = nextEpisode(
+            after: (season: seed.season, episode: seed.episode),
+            in: meta
+        ), EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+            watchedSeason: seed.season,
+            candidateSeason: next.season,
+            released: next.released
+        ) else {
+            return nil
+        }
+
+        let enriched = await EpisodeMetadataEnrichment.fetch(
+            meta: meta,
+            season: next.season,
+            episode: next.episode
+        )
+        let duration = max(runtimeSeconds(meta.runtime) ?? 100, 120)
+        return ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 1,
+            duration: duration,
+            lastWatchedAt: seed.watchedAt,
+            season: next.season,
+            episode: next.episode,
+            released: enriched?.released ?? next.released,
+            episodeTitleOverride: enriched?.title ?? next.title,
+            episodeOverviewOverride: enriched?.overview ?? next.overview,
+            episodeThumbnailOverride: enriched?.thumbnail ?? next.thumbnail,
+            isUpNext: true,
+            upNextSeedSeason: seed.season
+        )
+    }
+
+    private static func nextEpisode(
+        after current: (season: Int, episode: Int),
+        in meta: NuvioMeta
+    ) -> NuvioVideo? {
+        let episodes = (meta.videos ?? [])
+            .filter { $0.season > 0 }
+            .sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+        guard let index = episodes.firstIndex(where: {
+            $0.season == current.season && $0.episode == current.episode
+        }) else { return nil }
+        let nextIndex = episodes.index(after: index)
+        return episodes.indices.contains(nextIndex) ? episodes[nextIndex] : nil
     }
 
     static func reportPlayback(

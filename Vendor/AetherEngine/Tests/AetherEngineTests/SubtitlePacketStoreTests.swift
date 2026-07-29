@@ -18,14 +18,18 @@ struct SubtitlePacketStoreTests {
         #expect(got == [10, 20])
     }
 
-    @Test("same-pts append replaces instead of duplicating (producer restart overlap)")
+    /// A restart re-reads the same source bytes, so the overlap it produces is byte-identical:
+    /// that, not the bare timestamp match, is what identifies a duplicate. Distinct payloads on
+    /// one PTS are distinct cues and are all retained (#235, Issue235SamePTSRetentionTests).
+    @Test("a byte-identical re-harvest replaces its entry (producer restart overlap)")
     func dedupOnRestartOverlap() {
         let store = SubtitlePacketStore()
-        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([1]))
-        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: Data([2, 2]))
+        let packet = Data([1, 2, 3, 4])
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: packet)
+        store.append(streamIndex: 3, ptsSeconds: 10, durationSeconds: 2, payload: packet)
         let got = store.entries(streamIndex: 3, from: 0, through: 100)
         #expect(got.count == 1)
-        #expect(got[0].payload == Data([2, 2]))
+        #expect(got[0].payload == packet)
     }
 
     @Test("prune drops entries strictly before the cutoff")

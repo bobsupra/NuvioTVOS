@@ -94,17 +94,18 @@ Release configuration, dynamic framework binaries as embedded in the app (all si
 
 | Target                            | FFmpeg    | dav1d    | zimg     | zvbi     | Total     |
 | --------------------------------- | --------- | -------- | -------- | -------- | --------- |
-| iOS / tvOS arm64                  | ~8.2 MB   | ~0.7 MB  | ~0.3 MB  | ~0.5 MB  | ~9.8 MB   |
+| iOS / tvOS / visionOS arm64       | ~8.2 MB   | ~0.7 MB  | ~0.3 MB  | ~0.5 MB  | ~9.8 MB   |
 | macOS universal (arm64 + x86_64)  | ~17.3 MB  | ~2.3 MB  | ~0.9 MB  | ~1.0 MB  | ~21.5 MB  |
 
 Assembly-optimized paths are enabled where the Apple toolchain permits.
 
 ## Local FFmpeg patches
 
-`build.sh` applies three small patches to the FFmpeg source after checkout (each documented in place):
+`build.sh` applies four small patches to the FFmpeg source after checkout (each documented in place):
 
 - **`patch_ffmpeg`**: balances autoreleased Metal objects in `vf_yadif_videotoolbox.m` (upstream over-release crashes host apps whose GCD queues pop their last-resort autorelease pool at session teardown).
 - **`patch_ffmpeg_pgssub`**: `pgssubdec.c` no longer flushes retained palettes/objects on an Epoch-Continue PCS (composition_state 3). An Epoch Continue set marks a seamless connection between two clips: a conformant set re-conveys everything it references (so skipping the flush is output-neutral), while a non-conformant bare PCS+WDS+END set relies on retained state and was dropped whole with "Invalid palette id 0" under the upstream flush (AetherEngine issue 142). Error resilience, not a spec requirement; Acquisition Point and Epoch Start keep flushing. Proposed upstream as FFmpeg PR 23851.
+- **`patch_ffmpeg_visionos`**: `videotoolbox.c` skips `kCVPixelBufferOpenGLESCompatibilityKey` on visionOS, where the key is unavailable because the platform has neither OpenGL ES nor OpenGL. Upstream selects it on `TARGET_OS_IPHONE`, which is 1 on visionOS (`TARGET_OS_IOS` is the one that is 0), so the hardware-decode path does not compile for `xros` without this. Nothing is lost: the attribute only asks CoreVideo to make the buffer bindable as a GL texture, and on visionOS every consumer is Metal, which the IOSurface properties set alongside it already cover.
 - **`patch_ffmpeg_matroska_tts`**: `matroskadec.c` logs a warning when a Matroska track carries a `TrackTimestampScale` other than 1.0. Timestamp behavior stays exactly as upstream implements it, which is what RFC 9559 specifies (block timestamps and BlockDuration are Track Ticks). The element is deprecated (maxver 3) and many readers ignore it, so a file carrying it may have been authored against such readers and mistime silently; the warning surfaces that condition (AetherEngine issue 145). Until 2.1.x this patch clamped TTS to 1.0; the clamp rested on a wrong reading of the RFC and was dropped after upstream review (FFmpeg PR 23852).
 
 ## Built with

@@ -26,9 +26,13 @@ public final class PlaybackClock: ObservableObject {
     /// Seconds behind the live edge. 0 at the edge.
     @Published public internal(set) var behindLiveSeconds: Double = 0
 
-    /// Source-axis buffer frontier (AetherEngine#54). Same axis as `sourceTime`; draw as `bufferedPosition / duration`. Clamped to never trail the rendered frame.
+    /// Source-axis buffer frontier (AetherEngine#54): the end of the contiguous *safe* range ahead of the
+    /// playhead, i.e. what is guaranteed available without another fetch. Same axis as `sourceTime`; draw
+    /// as `bufferedPosition / duration`. Clamped to never trail the rendered frame.
     ///
-    /// - Native: end of the contiguous `loadedTimeRanges` span, seam-shifted.
+    /// - Native: what AVPlayer already holds, plus the contiguous disk SegmentCache band above it (#105,
+    ///   #207 follow-up). Grows with the Network Buffer setting, unlike AVPlayer's `loadedTimeRanges`
+    ///   alone, which stays pinned by `preferredForwardBufferDuration`.
     /// - Software: newest demuxed source PTS.
     /// - Audio: mirrors `currentTime` (no buffer-ahead surface).
     @Published public internal(set) var bufferedPosition: Double = 0

@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 5.23.3 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 6.0.1 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
 
 import PackageDescription
 
@@ -7,8 +7,9 @@ let package = Package(
     name: "AetherEngine",
     platforms: [
         .iOS(.v16),
-        .tvOS(.v16),
+        .tvOS(.v17),
         .macOS(.v14),
+        .visionOS(.v1),
     ],
     products: [
         .library(
@@ -29,8 +30,6 @@ let package = Package(
     dependencies: [
         // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
         // No network stack, we use custom AVIO + URLSession for HTTP streams.
-        // Resolved over Git rather than a local path so consumers (and
-        // Xcode Cloud) can build without a sibling FFmpegBuild checkout.
         // Nuvio: local namespaced FFmpegBuild (AetherLib*) for MPVKit coexistence.
         .package(path: "../FFmpegBuild"),
         // Pure-Swift SMB2 client (MIT) that speaks the protocol over
@@ -41,7 +40,7 @@ let package = Package(
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
         // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "1.0.2"),  // 1.0.2: iOS slices + x86_64 (Intel Macs)
+        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "2.0.0"),  // 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
     ],
     targets: [
         .target(

@@ -1,5 +1,15 @@
+import CoreGraphics
 import Foundation
 import AetherLibavcodec
+
+extension SubtitleTextRun {
+    /// Same styling, different text. Keeps the trim and fold passes from restating every attribute.
+    func withText(_ newText: String) -> SubtitleTextRun {
+        SubtitleTextRun(text: newText, color: color, isBold: isBold, isItalic: isItalic,
+                        isUnderlined: isUnderlined, isStruckThrough: isStruckThrough,
+                        fontName: fontName, fontSize: fontSize)
+    }
+}
 
 /// Plain-text extraction from FFmpeg subtitle rects, shared by `SubtitleDecoder` (sidecar) and `EmbeddedSubtitleDecoder` (in-container) so ASS parsing fixes live in one place.
 enum SubtitleRectText {
@@ -57,27 +67,78 @@ enum SubtitleRectText {
         return trimmed.isEmpty ? nil : trimmed
     }
 
-    /// Parse an ASS event line's Text body into coloured runs (#107 teletext colour). Tracks the
-    /// current foreground from `\c&Hbbggrr&` / `\1c&Hbbggrr&` (ASS colour is BGR); a bare `\c`/`\1c`
-    /// or unparseable value resets to nil (page default). Applies `\N`/`\n` -> newline, `\h` -> space.
-    /// All other override tags are ignored. Adjacent equal-colour runs are collapsed. nil when nothing
-    /// displayable remains.
-    static func coloredRuns(fromASSEventLine line: String) -> [SubtitleTextRun]? {
+    /// Default ASS play resolution (`ASS_DEFAULT_PLAYRESX/Y`, libavcodec/ass.h). Every event line
+    /// libavcodec synthesises for SRT, WebVTT and teletext positions against this space, so it is
+    /// the right frame of reference unless a real ASS header declares its own.
+    static let defaultASSPlayRes = CGSize(width: 384, height: 288)
+
+    /// Play resolution declared by an ASS `[Script Info]` header, or nil when it declares none.
+    static func playRes(fromASSHeader header: String) -> CGSize? {
+        func value(_ key: String) -> Double? {
+            for line in header.split(separator: "\n", omittingEmptySubsequences: false) {
+                let l = line.trimmingCharacters(in: .whitespaces)
+                guard l.lowercased().hasPrefix(key.lowercased() + ":") else { continue }
+                return Double(l.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+            }
+            return nil
+        }
+        guard let x = value("PlayResX"), let y = value("PlayResY"), x > 0, y > 0 else { return nil }
+        return CGSize(width: x, height: y)
+    }
+
+    /// Accumulated inline ASS override state while walking an event line.
+    private struct RunStyle: Equatable {
+        var color: SubtitleColor?
+        var isBold = false
+        var isItalic = false
+        var isUnderlined = false
+        var isStruckThrough = false
+        var fontName: String?
+        var fontSize: Int?
+
+        func run(_ text: String) -> SubtitleTextRun {
+            SubtitleTextRun(text: text, color: color, isBold: isBold, isItalic: isItalic,
+                            isUnderlined: isUnderlined, isStruckThrough: isStruckThrough,
+                            fontName: fontName, fontSize: fontSize)
+        }
+    }
+
+    /// Parse an ASS event line's Text body into styled runs plus the cue-level placement it asks
+    /// for (#233). Every text subtitle format reaches the engine through libavcodec as one of these
+    /// lines, so this single parser serves SRT (`ff_htmlmarkup_to_ass`), WebVTT, dvb_teletext
+    /// (`txt_format=ass`) and ASS itself.
+    ///
+    /// Inline state comes from `\c`/`\1c` (BGR; a bare tag or unparseable value resets to the page
+    /// default), `\b`, `\i`, `\u`, `\s`, `\fn`, `\fs` and `\r`. Cue-level `\an` and `\pos` are
+    /// lifted out into the placement, with `\pos` normalized against `playRes`. Applies `\N`/`\n`
+    /// -> newline and `\h` -> space. Tags that merely look like these (`\be`, `\bord`, `\iclip`,
+    /// `\shad`, `\fscx`, `\fsp`) are left alone. Adjacent runs of equal styling are collapsed.
+    /// nil when nothing displayable remains.
+    ///
+    /// `firstTextRow` is the 0-based index of the newline-delimited row the first displayable
+    /// character sits on, measured BEFORE the edge trim removes it. libzvbi carries teletext
+    /// row positioning in exactly that ordinal on pages it does not flag as subtitle pages
+    /// (see `teletextBody`); every other format ignores it.
+    static func styledRuns(fromASSEventLine line: String,
+                           playRes: CGSize = SubtitleRectText.defaultASSPlayRes)
+        -> (runs: [SubtitleTextRun], placement: SubtitleTextPlacement?, firstTextRow: Int)? {
         var body = line
         if body.hasPrefix("Dialogue: ") { body.removeFirst("Dialogue: ".count) }
         let parts = body.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
         let text: String = (parts.count == 9 && Int(parts[0]) != nil) ? String(parts[8]) : body
 
-        var runs: [SubtitleTextRun] = []
+        var pieces: [(style: RunStyle, text: String)] = []
         var current = ""
-        var color: SubtitleColor? = nil
+        var style = RunStyle()
+        var alignment: Int?
+        var position: CGPoint?
 
         func flush() {
             guard !current.isEmpty else { return }
-            if let last = runs.last, last.color == color {
-                runs[runs.count - 1] = SubtitleTextRun(text: last.text + current, color: color)
+            if let last = pieces.indices.last, pieces[last].style == style {
+                pieces[last].text += current
             } else {
-                runs.append(SubtitleTextRun(text: current, color: color))
+                pieces.append((style, current))
             }
             current = ""
         }
@@ -92,14 +153,14 @@ enum SubtitleRectText {
                 if n == "h" { current += " "; i += 2; continue }
             }
             if c == "{" {
-                // Override block: colour changes start a new run.
                 var j = i + 1
-                var tag = ""
-                while j < chars.count, chars[j] != "}" { tag.append(chars[j]); j += 1 }
-                if let newColor = parseColorTag(tag) {
-                    flush()
-                    color = newColor   // nil means reset
-                }
+                var block = ""
+                while j < chars.count, chars[j] != "}" { block.append(chars[j]); j += 1 }
+                var next = style
+                applyOverrides(block, to: &next, alignment: &alignment,
+                               position: &position, playRes: playRes)
+                // The text collected so far belongs to the style in force before this block.
+                if next != style { flush(); style = next }
                 i = (j < chars.count) ? j + 1 : j
                 continue
             }
@@ -108,26 +169,109 @@ enum SubtitleRectText {
         }
         flush()
 
+        var runs = pieces.map { $0.style.run($0.text) }
+        let placement = (alignment == nil && position == nil)
+            ? nil : SubtitleTextPlacement(alignment: alignment, position: position)
+        let firstTextRow = Self.firstTextRow(in: runs)
+        guard let trimmed = edgeTrimmed(runs) else { return nil }
+        runs = trimmed
+        return (runs, placement, firstTextRow)
+    }
+
+    /// Index of the row the first displayable character sits on, counting the newline-delimited
+    /// rows of the untrimmed run sequence from 0.
+    private static func firstTextRow(in runs: [SubtitleTextRun]) -> Int {
+        var row = 0
+        for run in runs {
+            for ch in run.text {
+                if ch.isNewline { row += 1; continue }
+                if ch.isWhitespace { continue }
+                return row
+            }
+        }
+        return row
+    }
+
+    /// Apply one override block's tags. Inline attributes mutate `style`; `\an` and `\pos` are
+    /// cue-level and are lifted out instead, so they never split a run.
+    private static func applyOverrides(_ block: String, to style: inout RunStyle,
+                                       alignment: inout Int?, position: inout CGPoint?,
+                                       playRes: CGSize) {
+        for tag in block.split(separator: "\\").map(String.init) {
+            if tag == "r" || (tag.hasPrefix("r") && !tag.hasPrefix("rnd")) {
+                style = RunStyle()
+            } else if let color = parseColorTag("\\" + tag) {
+                style.color = color   // nil means reset
+            } else if let v = intValue(tag, after: "b") {
+                style.isBold = v != 0
+            } else if let v = intValue(tag, after: "i") {
+                style.isItalic = v != 0
+            } else if let v = intValue(tag, after: "u") {
+                style.isUnderlined = v != 0
+            } else if let v = intValue(tag, after: "s") {
+                style.isStruckThrough = v != 0
+            } else if let v = intValue(tag, after: "an"), (1...9).contains(v) {
+                alignment = v
+            } else if tag.hasPrefix("fn") {
+                let name = String(tag.dropFirst(2))
+                style.fontName = name.isEmpty ? nil : name
+            } else if tag.hasPrefix("fs"), tag.dropFirst(2).allSatisfy(\.isNumber) {
+                style.fontSize = Int(tag.dropFirst(2))
+            } else if let p = parsePositionTag(tag, playRes: playRes) {
+                position = p
+            }
+        }
+    }
+
+    /// `tag` as `prefix` followed by digits and nothing else, so `\b1` parses while `\bord2`,
+    /// `\be1`, `\iclip(...)` and `\shad2` do not.
+    private static func intValue(_ tag: String, after prefix: String) -> Int? {
+        guard tag.hasPrefix(prefix) else { return nil }
+        let rest = tag.dropFirst(prefix.count)
+        guard !rest.isEmpty, rest.allSatisfy(\.isNumber) else { return nil }
+        return Int(rest)
+    }
+
+    /// `pos(x,y)` normalized against the play resolution, the same [0, 1] convention
+    /// `SubtitleImage.position` uses.
+    private static func parsePositionTag(_ tag: String, playRes: CGSize) -> CGPoint? {
+        guard tag.hasPrefix("pos("), tag.hasSuffix(")"),
+              playRes.width > 0, playRes.height > 0 else { return nil }
+        let inner = tag.dropFirst(4).dropLast()
+        let parts = inner.split(separator: ",").map {
+            Double($0.trimmingCharacters(in: .whitespaces))
+        }
+        guard parts.count == 2, let x = parts[0], let y = parts[1] else { return nil }
+        return CGPoint(x: x / playRes.width, y: y / playRes.height)
+    }
+
+    /// Trim whitespace and newlines across the edges of a run sequence, so a styled cue matches
+    /// what the plain path produces. libzvbi teletext ass can prefix a row-positioning newline that
+    /// would otherwise render as a blank line ONLY on styled cues (#107). Interior blank lines are
+    /// NOT folded here: that is teletext-specific and lives in `teletextBody`.
+    private static func edgeTrimmed(_ runs: [SubtitleTextRun]) -> [SubtitleTextRun]? {
         var cleaned = runs.filter { !$0.text.isEmpty }
         // Edge-trim leading/trailing whitespace and newlines across the run sequence so a coloured
         // cue matches the plain path (teletextBody flattens + trims the .text case). libzvbi
         // teletext ass can prefix a row-positioning newline that would otherwise render as a blank
         // line ONLY on coloured cues (#107). Interior blank lines are folded separately below;
         // single line breaks and colours are preserved.
+        // Predicate matches the plain path's `.whitespacesAndNewlines` (Unicode Zs plus tab plus
+        // the newline characters). A literal-space/tab/newline test let U+00A0 survive on a styled
+        // cue that an unstyled one trimmed, so the two paths disagreed on the same payload.
         while let first = cleaned.first {
-            let d = String(first.text.drop(while: { $0 == " " || $0 == "\t" || $0 == "\n" }))
+            let d = String(first.text.drop(while: \.isWhitespace))
             if d.isEmpty { cleaned.removeFirst(); continue }
-            cleaned[0] = SubtitleTextRun(text: d, color: first.color)
+            cleaned[0] = first.withText(d)
             break
         }
         while let last = cleaned.last {
             var s = last.text
-            while let c = s.last, c == " " || c == "\t" || c == "\n" { s.removeLast() }
+            while let c = s.last, c.isWhitespace { s.removeLast() }
             if s.isEmpty { cleaned.removeLast(); continue }
-            cleaned[cleaned.count - 1] = SubtitleTextRun(text: s, color: last.color)
+            cleaned[cleaned.count - 1] = last.withText(s)
             break
         }
-        cleaned = collapseInteriorBlankLines(cleaned)
         guard !cleaned.isEmpty else { return nil }
         return cleaned
     }
@@ -135,37 +279,102 @@ enum SubtitleRectText {
     /// Collapse interior blank lines across a run sequence (#107). libzvbi joins teletext rows with
     /// `\N`, so a caption whose lines sit on non-adjacent rows (an empty row between them, used only
     /// for vertical placement) arrives as `line1\n\nline2` and would render a blank line the
-    /// broadcaster never intended. Consecutive newlines (optionally separated by horizontal
-    /// whitespace) fold to one; single line breaks and colours are preserved. The empty row lands
-    /// inside a single run in practice, but a colour change at a row boundary could split it, so the
-    /// boundary between adjacent runs is folded too.
+    /// broadcaster never intended. Consecutive newlines separated by nothing but horizontal
+    /// whitespace fold to one; single line breaks, colours and the indentation of a real row are
+    /// preserved.
+    ///
+    /// Folds the FLATTENED sequence and re-splits it along the original run boundaries. A per-run
+    /// regex plus an adjacent-pair check missed the case the source produces most easily: the
+    /// padding of an empty row carries the spacing attribute that changes colour, so the blank row
+    /// can land in a whitespace-only run of its own and break the chain (`line` / whitespace run /
+    /// `line`).
     private static func collapseInteriorBlankLines(_ runs: [SubtitleTextRun]) -> [SubtitleTextRun] {
-        var folded = runs.map { run in
-            SubtitleTextRun(
-                text: run.text.replacingOccurrences(
-                    of: #"\n(?:[ \t]*\n)+"#, with: "\n", options: .regularExpression),
-                color: run.color
-            )
-        }
-        var i = 0
-        while i < folded.count - 1 {
-            if folded[i].text.hasSuffix("\n") {
-                var next = folded[i + 1].text
-                while next.hasPrefix("\n") { next.removeFirst() }
-                folded[i + 1] = SubtitleTextRun(text: next, color: folded[i + 1].color)
+        var chars: [Character] = []
+        var owner: [Int] = []
+        for (index, run) in runs.enumerated() {
+            for ch in run.text {
+                chars.append(ch)
+                owner.append(index)
             }
-            i += 1
         }
-        return folded.filter { !$0.text.isEmpty }
+
+        var keep = [Bool](repeating: true, count: chars.count)
+        var i = 0
+        while i < chars.count {
+            guard chars[i].isNewline else { i += 1; continue }
+            // Scan past horizontal whitespace and further newlines; everything up to and including
+            // the last newline found is one blank-row gap and collapses onto the first newline.
+            var probe = i + 1
+            var lastNewline = i
+            while probe < chars.count {
+                let c = chars[probe]
+                if c.isNewline { lastNewline = probe }
+                else if !c.isWhitespace { break }
+                probe += 1
+            }
+            if lastNewline > i {
+                for k in (i + 1)...lastNewline { keep[k] = false }
+            }
+            i = lastNewline + 1
+        }
+
+        var texts = [String](repeating: "", count: runs.count)
+        for (index, ch) in chars.enumerated() where keep[index] {
+            texts[owner[index]].append(ch)
+        }
+        return zip(runs, texts).map { $0.withText($1) }.filter { !$0.text.isEmpty }
     }
 
-    /// Body for a teletext rect's ASS line: `.richText` when any run is coloured, `.text` (flattened)
-    /// when none is, nil when empty. Keeps the all-white page on the existing plain-text path (#107).
-    static func teletextBody(fromASSEventLine line: String) -> SubtitleCue.Body? {
-        guard let runs = coloredRuns(fromASSEventLine: line) else { return nil }
-        if runs.contains(where: { $0.color != nil }) {
-            return .richText(runs)
-        }
+    /// Body + placement for any text rect's ASS event line (#233): `.richText` when a run asks for
+    /// styling, `.text` (flattened) when none does, nil when empty. An unstyled track therefore
+    /// keeps the exact body it produced before, so a host handling only `.text` sees no change.
+    static func styledBody(fromASSEventLine line: String,
+                           playRes: CGSize = SubtitleRectText.defaultASSPlayRes)
+        -> (body: SubtitleCue.Body, placement: SubtitleTextPlacement?)? {
+        guard let parsed = styledRuns(fromASSEventLine: line, playRes: playRes) else { return nil }
+        return body(for: parsed.runs).map { ($0, parsed.placement) }
+    }
+
+    /// Teletext variant (#107): identical, plus the interior blank-line fold libzvbi's row joining
+    /// requires, plus the grid-row placement fallback below. Both are deliberately teletext-only,
+    /// since a blank line in an ASS or SRT cue can be intentional and a leading one is never a row
+    /// ordinal.
+    static func teletextBody(fromASSEventLine line: String,
+                             playRes: CGSize = SubtitleRectText.defaultASSPlayRes)
+        -> (body: SubtitleCue.Body, placement: SubtitleTextPlacement?)? {
+        guard let parsed = styledRuns(fromASSEventLine: line, playRes: playRes) else { return nil }
+        let placement = parsed.placement ?? gridPlacement(firstTextRow: parsed.firstTextRow)
+        return body(for: collapseInteriorBlankLines(parsed.runs)).map { ($0, placement) }
+    }
+
+    /// Vertical anchor for a teletext page that carried no `\an` (#233).
+    ///
+    /// `gen_sub_ass` derives the anchor from the grid row and emits it as `{\anN}`, but only for
+    /// pages `subtitle_map` flags as subtitle pages (row-0 header: NEWSFLASH clear AND SUBTITLE set
+    /// AND SUPPRESS_HEADER set). Off that path it writes the whole page instead, one `" \N"` per
+    /// grid row with the empty ones included, and the row ordinal becomes the only carrier of the
+    /// position. This is that same derivation applied to the ordinal, so a page keeps the placement
+    /// its broadcaster chose whether or not the flags made it through:
+    ///
+    ///     vertical_align = 2 - av_clip(i + 1, 0, 23) / 8
+    ///     an             = alignment + vertical_align * 3
+    ///
+    /// with `i` the grid row (emitted row + 1, since `txt_chop_top` defaults to 1) and the
+    /// horizontal alignment left at ffmpeg's own default of 2, centre: the column analysis it does
+    /// for subtitle pages needs the per-row trim that this path never ran. Coarse on purpose. Three
+    /// bands is what the source encodes; mapping each row to its own offset makes consecutive cues
+    /// of different heights sit at different heights, which reads as a blink.
+    ///
+    /// Never overrides an `\an` that arrived, including `{\an2}`: bottom is a real answer and it
+    /// looks exactly like no answer.
+    static func gridPlacement(firstTextRow row: Int) -> SubtitleTextPlacement {
+        let gridRow = row + 1
+        let verticalAlign = 2 - min(max(gridRow + 1, 0), 23) / 8
+        return SubtitleTextPlacement(alignment: 2 + verticalAlign * 3, position: nil)
+    }
+
+    private static func body(for runs: [SubtitleTextRun]) -> SubtitleCue.Body? {
+        if runs.contains(where: \.isStyled) { return .richText(runs) }
         let plain = runs.map(\.text).joined().trimmingCharacters(in: .whitespacesAndNewlines)
         return plain.isEmpty ? nil : .text(plain)
     }

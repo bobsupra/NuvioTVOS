@@ -109,6 +109,28 @@ s#    state = bytestream_get_byte\(&buf\) >> 6;\n    if \(state != 0\) \{\n     
     fi
 }
 
+patch_ffmpeg_visionos() {
+    # visionOS has no OpenGL and no OpenGL ES, so kCVPixelBufferOpenGLESCompatibilityKey
+    # is marked unavailable there. Upstream picks that key on TARGET_OS_IPHONE, which is 1
+    # on visionOS (TARGET_OS_IOS is the one that is 0), so the hardware-decode path fails
+    # to compile for xros with "'kCVPixelBufferOpenGLESCompatibilityKey' is unavailable".
+    # Nothing is lost by omitting it: the attribute only asks CoreVideo to make the buffer
+    # bindable as a GL texture, and on visionOS every consumer is Metal, which the
+    # IOSurface backing set just above already covers. TARGET_OS_VISION is defined as 0 on
+    # SDKs that predate it, and an undefined macro evaluates to 0 in #if, so this is safe
+    # on every other slice.
+    local F="${FFMPEG_SRC}/libavcodec/videotoolbox.c"
+    grep -q "TARGET_OS_VISION" "${F}" && return
+    echo "→ Patching FFmpeg: skip the OpenGL ES buffer attribute on visionOS"
+    perl -0777 -pi -e '
+s@\#if TARGET_OS_IPHONE\n    CFDictionarySetValue\(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue\);\n\#else@\#if TARGET_OS_VISION\n    /* visionOS has neither OpenGL ES nor OpenGL, and the key is unavailable there.\n     * Consumers are Metal, which the IOSurface properties above already cover.\n     * See FFmpegBuild build.sh patch_ffmpeg_visionos. */\n\#elif TARGET_OS_IPHONE\n    CFDictionarySetValue(buffer_attributes, kCVPixelBufferOpenGLESCompatibilityKey, kCFBooleanTrue);\n\#else@;
+' "${F}"
+    if ! grep -q "TARGET_OS_VISION" "${F}"; then
+        echo "ERROR: visionOS videotoolbox patch did not apply (upstream source changed?)"
+        exit 1
+    fi
+}
+
 patch_ffmpeg_matroska_tts() {
     # AetherEngine #145, reworked after upstream review (FFmpeg PR 23852):
     # RFC 9559 (11.1.3, 11.2, 5.1.3.5.3) puts Block/SimpleBlock relative
@@ -436,6 +458,13 @@ COMMON_FLAGS=(
     # the pgssub DECODER was always in, but without this demuxer avformat_open_input rejects the
     # file with AVERROR_INVALIDDATA and external PGS subtitles never load. AetherEngine sidecar path.)
     --enable-demuxer=sup
+    # webvtt: standalone .vtt sidecar files. The webvtt DECODER was always in (it serves WebVTT
+    # tracks inside Matroska and HLS, where those demuxers supply the stream), but without this
+    # demuxer avformat_open_input rejects a .vtt file with AVERROR_INVALIDDATA and an external
+    # WebVTT subtitle never loads. Same shape as the sup case above. It also carries the cue
+    # settings: the demuxer attaches line/position/align to each packet as
+    # AV_PKT_DATA_WEBVTT_SETTINGS, which is the only path they take (the decoder drops them).
+    --enable-demuxer=webvtt
     # Raw MPEG-1/2 and MPEG-4 video elementary-stream demuxers. The mpegps
     # (MPEG Program Stream / DVD VOB) demuxer carries no codec signaling, so
     # it tags a 0x1E0-0x1EF video stream as request_probe and confirms the
@@ -725,6 +754,8 @@ EOF
         isimulator)  MIN_OS="26.0"; SUPPORTED_PLATFORM="iPhoneSimulator" ;;
         tvos)        MIN_OS="26.0"; SUPPORTED_PLATFORM="AppleTVOS" ;;
         tvsimulator) MIN_OS="26.0"; SUPPORTED_PLATFORM="AppleTVSimulator" ;;
+        xros)        MIN_OS="1.0";  SUPPORTED_PLATFORM="XROS" ;;
+        xrsimulator) MIN_OS="1.0";  SUPPORTED_PLATFORM="XRSimulator" ;;
         macos)       MIN_OS="14.0"; SUPPORTED_PLATFORM="MacOSX" ;;
         *)           MIN_OS="26.0"; SUPPORTED_PLATFORM="iPhoneOS" ;;
     esac
@@ -788,6 +819,8 @@ make_xcframeworks() {
         make_framework "$LIB" "$FW" "isimulator"   isimulator-arm64 isimulator-x86_64
         make_framework "$LIB" "$FW" "tvos"         tvos-arm64
         make_framework "$LIB" "$FW" "tvsimulator"  tvsimulator-arm64 tvsimulator-x86_64
+        make_framework "$LIB" "$FW" "xros"         xros-arm64
+        make_framework "$LIB" "$FW" "xrsimulator"  xrsimulator-arm64
         make_framework "$LIB" "$FW" "macos"        macos-arm64 macos-x86_64
 
         local XCF="${OUTPUT_DIR}/${FW}.xcframework"
@@ -799,6 +832,8 @@ make_xcframeworks() {
             -framework "${BUILD_DIR}/frameworks/isimulator/${FW}.framework" \
             -framework "${BUILD_DIR}/frameworks/tvos/${FW}.framework" \
             -framework "${BUILD_DIR}/frameworks/tvsimulator/${FW}.framework" \
+            -framework "${BUILD_DIR}/frameworks/xros/${FW}.framework" \
+            -framework "${BUILD_DIR}/frameworks/xrsimulator/${FW}.framework" \
             -framework "${BUILD_DIR}/frameworks/macos/${FW}.framework" \
             -output "${XCF}" 2>&1 | tail -1
         echo "  ✓ ${FW}.xcframework"
@@ -837,6 +872,7 @@ echo "╚═══════════════════════�
 fetch_ffmpeg
 patch_ffmpeg
 patch_ffmpeg_pgssub
+patch_ffmpeg_visionos
 patch_ffmpeg_matroska_tts
 fetch_dav1d
 fetch_zimg
@@ -850,6 +886,8 @@ build_dav1d_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-
 build_dav1d_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
 build_dav1d_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
 build_dav1d_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_dav1d_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_dav1d_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
 build_dav1d_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
 build_dav1d_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
 
@@ -860,6 +898,8 @@ build_zimg_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-s
 build_zimg_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
 build_zimg_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
 build_zimg_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_zimg_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_zimg_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
 build_zimg_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
 build_zimg_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
 
@@ -870,6 +910,8 @@ build_zvbi_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-s
 build_zvbi_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
 build_zvbi_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
 build_zvbi_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_zvbi_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_zvbi_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
 build_zvbi_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
 build_zvbi_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
 
@@ -880,6 +922,8 @@ build_one isimulator-x86_64  iphonesimulator  x86_64 x86_64-apple-ios16.0-simula
 build_one tvos-arm64         appletvos        arm64  arm64-apple-tvos16.0                   16.0
 build_one tvsimulator-arm64  appletvsimulator arm64  arm64-apple-tvos16.0-simulator         16.0
 build_one tvsimulator-x86_64 appletvsimulator x86_64 x86_64-apple-tvos16.0-simulator        16.0
+build_one xros-arm64         xros             arm64  arm64-apple-xros1.0                    1.0
+build_one xrsimulator-arm64  xrsimulator      arm64  arm64-apple-xros1.0-simulator          1.0
 build_one macos-arm64        macosx           arm64  arm64-apple-macos14.0                  14.0
 build_one macos-x86_64       macosx           x86_64 x86_64-apple-macos14.0                 14.0
 

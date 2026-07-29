@@ -1073,6 +1073,63 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         XCTAssertFalse(ContentReleasePolicy.isUnreleased(past, today: "2026-07-26"))
     }
 
+    func testEpisodeAiringTodayUsesTodayLabel() {
+        let item = makeUpNextItem(released: isoDay(daysAgo: 0), watchedDaysAgo: 1)
+
+        XCTAssertEqual(item.airDateText, "Today")
+        XCTAssertEqual(item.upNextBadgeText, "AIRS TODAY")
+    }
+
+    func testEpisodeGuideDateOverridesAStaleStoredAirDate() {
+        let today = isoDay(daysAgo: 0)
+        let item = ContinueWatchingItem(
+            meta: makeMeta(id: "guide-date", type: "series", videos: [
+                NuvioVideo(
+                    id: "guide-date:1:4",
+                    title: "Episode Four",
+                    season: 1,
+                    episode: 4,
+                    thumbnail: nil,
+                    overview: nil,
+                    released: today,
+                    rating: nil
+                )
+            ]),
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: Date().addingTimeInterval(-86_400),
+            season: 1,
+            episode: 4,
+            released: isoDay(daysAgo: 1),
+            isUpNext: true
+        )
+
+        XCTAssertEqual(item.airDateText, "Today")
+        XCTAssertEqual(item.upNextBadgeText, "AIRS TODAY")
+    }
+
+    func testEpisodeAiringTodaySurfacesWhenUpcomingEpisodesAreHidden() {
+        let settings = ProfileSettings.current
+        let previousValue = settings.object(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        settings.set(false, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        defer {
+            if let previousValue {
+                settings.set(previousValue, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            } else {
+                settings.removeObject(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            }
+        }
+
+        XCTAssertTrue(
+            EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1,
+                candidateSeason: 1,
+                released: isoDay(daysAgo: 0)
+            )
+        )
+    }
+
     func testContinueWatchingNextUpSortMovesSuggestionsFirst() {
         let now = Date()
         let resume = ContinueWatchingItem(

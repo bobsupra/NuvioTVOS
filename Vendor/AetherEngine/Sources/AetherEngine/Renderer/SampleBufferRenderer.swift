@@ -100,8 +100,12 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = gravity
+        // Unavailable on visionOS, which has no display-sleep timer to hold off: the wearer's
+        // displays follow presence, not an idle timer.
+        #if !os(visionOS)
         layer.preventsDisplaySleepDuringVideoPlayback = true
-        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, *) {
+        #endif
+        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
             layer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
@@ -115,7 +119,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     /// Opt the display layer into HDR mode. Pass true only when the decoder delivers raw HDR10/DV pixel buffers; false for SDR or tone-mapped output.
     func setHDROutput(_ isHDR: Bool) {
-        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, *) {
+        if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)

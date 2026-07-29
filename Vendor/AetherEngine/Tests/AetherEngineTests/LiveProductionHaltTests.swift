@@ -52,6 +52,9 @@ final class LiveProductionHaltTests: XCTestCase {
             reason: .muxerFailed, sourceReopenable: false))
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .backpressureWedge, sourceReopenable: false))
+        XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
+            reason: .needsAudioSampleEntryPrime, sourceReopenable: false),
+            "AE#222 rebuilds into the same provider with a primed muxer, so production continues")
     }
 
     // MARK: - Provider halt latch

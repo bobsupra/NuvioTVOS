@@ -60,13 +60,11 @@ struct PGSStaleArrivalGate {
     mutating func resolveHeld(trimAt: Double, playhead: Double) -> [SubtitleCue] {
         reconstructionCandidates = reconstructionCandidates.map { candidate in
             guard candidate.startTime < trimAt, candidate.endTime > trimAt else { return candidate }
-            return SubtitleCue(id: candidate.id, startTime: candidate.startTime,
-                               endTime: trimAt, body: candidate.body)
+            return candidate.with(endTime: trimAt)
         }
         guard !heldCues.isEmpty else { return [] }
         let resolved = heldCues.map { cue in
-            SubtitleCue(id: cue.id, startTime: cue.startTime,
-                        endTime: min(cue.endTime, trimAt), body: cue.body)
+            cue.with(endTime: min(cue.endTime, trimAt))
         }
         heldCues = []
         return resolved.filter { $0.startTime <= playhead && playhead < $0.endTime }
@@ -129,8 +127,7 @@ struct PGSStaleArrivalGate {
         // window stays and the store trim owns it, as before.
         let successorStart = out.map(\.startTime).min()
         for line in active where line.startTime <= playhead && playhead < line.endTime {
-            out.append(SubtitleCue(id: line.id, startTime: line.startTime,
-                                   endTime: min(line.endTime, successorStart ?? line.endTime), body: line.body))
+            out.append(line.with(endTime: min(line.endTime, successorStart ?? line.endTime)))
         }
         return out
     }

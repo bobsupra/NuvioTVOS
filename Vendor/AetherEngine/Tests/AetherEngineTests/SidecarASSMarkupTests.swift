@@ -54,7 +54,11 @@ final class SidecarASSMarkupTests: XCTestCase {
         XCTAssertTrue(builder.script().contains("{\\i1}Hello{\\i0} world"))
     }
 
-    func testDefaultPathStaysPlainTextAndHeaderless() async throws {
+    /// #233 changed half of this contract. The default path is still header-less and still hands
+    /// over no raw event lines, but it no longer flattens the markup away: a styled cue arrives as
+    /// `.richText` with the attributes resolved, and only an unstyled one stays `.text`. The
+    /// flattened string a host reads through `SubtitleCue.text` is unchanged either way.
+    func testDefaultPathResolvesStylingAndStaysHeaderless() async throws {
         let url = try writeTempASS()
         defer { try? FileManager.default.removeItem(at: url) }
 
@@ -62,9 +66,19 @@ final class SidecarASSMarkupTests: XCTestCase {
 
         XCTAssertNil(result.assHeader, "no header when markup preservation is off")
         XCTAssertEqual(result.cues.count, 2)
-        guard case let .text(first) = result.cues[0].body else {
-            return XCTFail("expected text body")
+
+        guard case let .richText(runs) = result.cues[0].body else {
+            return XCTFail("expected a styled body for {\\i1}Hello{\\i0} world")
         }
-        XCTAssertEqual(first, "Hello world")
+        XCTAssertEqual(runs.map(\.text), ["Hello", " world"])
+        XCTAssertTrue(runs[0].isItalic, "the \\i1 run must reach the host italic")
+        XCTAssertFalse(runs[1].isItalic, "\\i0 must end the italic run")
+        XCTAssertEqual(result.cues[0].text, "Hello world", "the flattened accessor is unchanged")
+
+        // No override tags, so nothing to resolve and the body stays exactly what it was.
+        guard case let .text(second) = result.cues[1].body else {
+            return XCTFail("expected a plain body for an unstyled line")
+        }
+        XCTAssertEqual(second, "Second line")
     }
 }

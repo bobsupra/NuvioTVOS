@@ -53,6 +53,14 @@ struct NuvioCatalog: Identifiable, Codable {
     }
 }
 
+/// A rating returned by an external metadata provider such as IMDb or TMDB.
+struct NuvioExternalRating: Codable, Hashable, Identifiable {
+    let source: String
+    let value: Double
+
+    var id: String { source }
+}
+
 /// Content metadata
 struct NuvioMeta: Identifiable, Codable {
     let id: String
@@ -81,6 +89,10 @@ struct NuvioMeta: Identifiable, Codable {
     let videos: [NuvioVideo]?
     /// YouTube trailer ids from Cinemeta `trailers` / `trailerStreams`.
     let trailerYtIds: [String]?
+    /// Optional ratings fetched from the user's enabled MDBList providers.
+    /// This is transient enrichment and is intentionally omitted from compact
+    /// library/watch-state snapshots.
+    let externalRatings: [NuvioExternalRating]?
 
     var isSeries: Bool { type == "series" }
 
@@ -112,7 +124,8 @@ struct NuvioMeta: Identifiable, Codable {
             released: released,
             status: status,
             videos: nil,
-            trailerYtIds: trailerYtIds
+            trailerYtIds: trailerYtIds,
+            externalRatings: nil
         )
     }
 
@@ -166,7 +179,37 @@ struct NuvioMeta: Identifiable, Codable {
             released: released,
             status: resolvedStatus,
             videos: videos,
-            trailerYtIds: trailerYtIds
+            trailerYtIds: trailerYtIds,
+            externalRatings: externalRatings
+        )
+    }
+
+    func withExternalRatings(_ ratings: [NuvioExternalRating]) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            released: released,
+            status: status,
+            videos: videos,
+            trailerYtIds: trailerYtIds,
+            externalRatings: ratings.isEmpty ? nil : ratings
         )
     }
 
@@ -193,7 +236,8 @@ struct NuvioMeta: Identifiable, Codable {
         released: String?,
         status: String? = nil,
         videos: [NuvioVideo]? = nil,
-        trailerYtIds: [String]? = nil
+        trailerYtIds: [String]? = nil,
+        externalRatings: [NuvioExternalRating]? = nil
     ) {
         self.id = id
         self.name = name
@@ -218,6 +262,7 @@ struct NuvioMeta: Identifiable, Codable {
         self.status = status
         self.videos = videos
         self.trailerYtIds = trailerYtIds
+        self.externalRatings = externalRatings
     }
 }
 
@@ -251,6 +296,12 @@ enum EpisodeReleasePolicy {
         return releaseDay < todayIsoDay()
     }
 
+    /// Episodes dated today are still unaired by this date-only policy, but
+    /// deserve to remain visible even when future Up Next suggestions are off.
+    static func isAiringToday(_ released: String?) -> Bool {
+        isoDay(released) == todayIsoDay()
+    }
+
     static func shouldSurfaceNextEpisode(
         watchedSeason: Int?,
         candidateSeason: Int?,
@@ -258,9 +309,12 @@ enum EpisodeReleasePolicy {
     ) -> Bool {
         let isSeasonRollover = seasonSortKey(candidateSeason ?? 0) != seasonSortKey(watchedSeason ?? 0)
         if !isSeasonRollover {
-            return showUnairedNextUp || hasAired(released)
+            return showUnairedNextUp || isAiringToday(released) || hasAired(released)
         }
         if hasAired(released), isoDate(released) != nil {
+            return true
+        }
+        if isAiringToday(released) {
             return true
         }
         guard showUnairedNextUp,
@@ -273,6 +327,9 @@ enum EpisodeReleasePolicy {
 
     static func airDateText(for released: String?) -> String? {
         guard let released, !hasAired(released) else { return nil }
+        if isAiringToday(released) {
+            return "Today"
+        }
         return NuvioDateDisplay.formattedDate(released) ?? released.prefix(10).description
     }
 
@@ -693,8 +750,13 @@ struct ContinueWatchingItem: Identifiable, Codable {
     }
 
     var isUpNextEntry: Bool { isUpNext == true }
-    var hasAired: Bool { EpisodeReleasePolicy.hasAired(released ?? episodeVideo?.released) }
-    var airDateText: String? { EpisodeReleasePolicy.airDateText(for: released ?? episodeVideo?.released) }
+    /// The episode guide travels with refreshed metadata. Prefer it over the
+    /// stored enrichment override so an air-date correction is reflected without
+    /// waiting for a progress record to be rebuilt.
+    private var effectiveEpisodeReleaseDate: String? { episodeVideo?.released ?? released }
+    var hasAired: Bool { EpisodeReleasePolicy.hasAired(effectiveEpisodeReleaseDate) }
+    var isAiringToday: Bool { EpisodeReleasePolicy.isAiringToday(effectiveEpisodeReleaseDate) }
+    var airDateText: String? { EpisodeReleasePolicy.airDateText(for: effectiveEpisodeReleaseDate) }
     var upNextBadgeText: String {
         guard isUpNextEntry else { return remainingText }
         if hasAired {
@@ -714,7 +776,7 @@ struct ContinueWatchingItem: Identifiable, Codable {
     /// one that was already out weeks before they watched the previous one.
     var isNewEpisodeDrop: Bool {
         isUpNextEntry && hasAired && EpisodeReleasePolicy.isNewEpisodeDrop(
-            released: released ?? episodeVideo?.released,
+            released: effectiveEpisodeReleaseDate,
             seedWatchedAt: lastWatchedAt
         )
     }
@@ -742,7 +804,7 @@ struct ContinueWatchingItem: Identifiable, Codable {
     var recencySortDate: Date {
         guard isNewEpisodeDrop,
               let releaseDate = EpisodeReleasePolicy.releaseDate(
-                for: released ?? episodeVideo?.released
+                for: effectiveEpisodeReleaseDate
               ) else { return lastWatchedAt }
         return releaseDate
     }
@@ -2387,13 +2449,27 @@ struct NuvioCollectionFolder: Decodable, Identifiable {
             ?? []
     }
 
-    /// Add-on backed catalog sources, merging the modern `sources` array with
-    /// the legacy `catalogSources` field (mirrors the Android accessor).
-    /// TMDB/Trakt sources are skipped — tvOS resolves add-on catalogs only.
+    /// Provider-aware sources used by the folder browser. Modern payloads keep
+    /// the heterogeneous `sources` array; legacy payloads are promoted from
+    /// `catalogSources` exactly as the Compose client does.
+    var resolvedSources: [NuvioCollectionSource] {
+        if !sources.isEmpty { return sources }
+        return catalogSources.map {
+            NuvioCollectionSource(
+                provider: "addon",
+                addonId: $0.addonId,
+                type: $0.type,
+                catalogId: $0.catalogId,
+                genre: $0.genre
+            )
+        }
+    }
+
+    /// Compatibility accessor for settings that only need add-on catalogs.
     var addonCatalogSources: [NuvioCollectionCatalogSource] {
         var seen = Set<String>()
         var merged: [NuvioCollectionCatalogSource] = []
-        for source in sources {
+        for source in resolvedSources {
             guard source.provider.isEmpty || source.provider.lowercased() == "addon",
                   let addonId = source.addonId, !addonId.isEmpty,
                   let type = source.type, !type.isEmpty,
@@ -2409,25 +2485,60 @@ struct NuvioCollectionFolder: Decodable, Identifiable {
                 )
             )
         }
-        for source in catalogSources {
-            let key = "\(source.addonId)_\(source.type)_\(source.catalogId)_\(source.genre ?? "")"
-            guard seen.insert(key).inserted else { continue }
-            merged.append(source)
-        }
         return merged
     }
 }
 
-struct NuvioCollectionSource: Decodable {
+struct NuvioCollectionSource: Decodable, Hashable {
     var provider: String
     var addonId: String?
     var type: String?
     var catalogId: String?
     var genre: String?
+    var tmdbSourceType: String?
+    var title: String?
+    var tmdbId: Int?
+    var traktListId: Int64?
+    var mediaType: String?
+    var sortBy: String?
+    var sortHow: String?
+    var filters: NuvioTmdbCollectionFilters?
 
     enum CodingKeys: String, CodingKey {
-        case provider, addonId, type, catalogId, genre
-        case addon_id, catalog_id
+        case provider, addonId, type, catalogId, genre, tmdbSourceType, title
+        case tmdbId, traktListId, mediaType, sortBy, sortHow, filters
+        case addon_id, catalog_id, tmdb_source_type, tmdb_id, trakt_list_id
+        case media_type, sort_by, sort_how
+    }
+
+    init(
+        provider: String = "addon",
+        addonId: String? = nil,
+        type: String? = nil,
+        catalogId: String? = nil,
+        genre: String? = nil,
+        tmdbSourceType: String? = nil,
+        title: String? = nil,
+        tmdbId: Int? = nil,
+        traktListId: Int64? = nil,
+        mediaType: String? = nil,
+        sortBy: String? = nil,
+        sortHow: String? = nil,
+        filters: NuvioTmdbCollectionFilters? = nil
+    ) {
+        self.provider = provider
+        self.addonId = addonId
+        self.type = type
+        self.catalogId = catalogId
+        self.genre = genre
+        self.tmdbSourceType = tmdbSourceType
+        self.title = title
+        self.tmdbId = tmdbId
+        self.traktListId = traktListId
+        self.mediaType = mediaType
+        self.sortBy = sortBy
+        self.sortHow = sortHow
+        self.filters = filters
     }
 
     init(from decoder: Decoder) throws {
@@ -2439,6 +2550,88 @@ struct NuvioCollectionSource: Decodable {
         catalogId = try c.decodeIfPresent(String.self, forKey: .catalogId)
             ?? c.decodeIfPresent(String.self, forKey: .catalog_id)
         genre = try c.decodeIfPresent(String.self, forKey: .genre)
+        tmdbSourceType = try c.decodeIfPresent(String.self, forKey: .tmdbSourceType)
+            ?? c.decodeIfPresent(String.self, forKey: .tmdb_source_type)
+        title = try c.decodeIfPresent(String.self, forKey: .title)
+        tmdbId = try c.decodeIfPresent(Int.self, forKey: .tmdbId)
+            ?? c.decodeIfPresent(Int.self, forKey: .tmdb_id)
+        traktListId = try c.decodeIfPresent(Int64.self, forKey: .traktListId)
+            ?? c.decodeIfPresent(Int64.self, forKey: .trakt_list_id)
+        mediaType = try c.decodeIfPresent(String.self, forKey: .mediaType)
+            ?? c.decodeIfPresent(String.self, forKey: .media_type)
+        sortBy = try c.decodeIfPresent(String.self, forKey: .sortBy)
+            ?? c.decodeIfPresent(String.self, forKey: .sort_by)
+        sortHow = try c.decodeIfPresent(String.self, forKey: .sortHow)
+            ?? c.decodeIfPresent(String.self, forKey: .sort_how)
+        filters = try c.decodeIfPresent(NuvioTmdbCollectionFilters.self, forKey: .filters)
+    }
+
+    var normalizedProvider: String {
+        let value = provider.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return value.isEmpty ? "addon" : value
+    }
+
+    var routeKey: String {
+        switch normalizedProvider {
+        case "tmdb":
+            return "tmdb_\(tmdbSourceType ?? "")_\(tmdbId.map(String.init) ?? "")_\(mediaType ?? "")_\(sortBy ?? "")_\(filters?.routeKey ?? "")"
+        case "trakt":
+            return "trakt_\(traktListId.map(String.init) ?? "")_\(mediaType ?? "")_\(sortBy ?? "")_\(sortHow ?? "")"
+        default:
+            return "addon_\(addonId ?? "")_\(type ?? "")_\(catalogId ?? "")_\(genre ?? "")"
+        }
+    }
+}
+
+struct NuvioTmdbCollectionFilters: Decodable, Hashable {
+    var withGenres: String?
+    var releaseDateGte: String?
+    var releaseDateLte: String?
+    var voteAverageGte: Double?
+    var voteAverageLte: Double?
+    var voteCountGte: Int?
+    var withOriginalLanguage: String?
+    var withOriginCountry: String?
+    var withKeywords: String?
+    var withCompanies: String?
+    var withNetworks: String?
+    var year: Int?
+    var watchRegion: String?
+    var withWatchProviders: String?
+
+    var routeKey: String {
+        var parts: [String] = []
+        parts.append(withGenres ?? "")
+        parts.append(releaseDateGte ?? "")
+        parts.append(releaseDateLte ?? "")
+        if let voteAverageGte {
+            parts.append(String(voteAverageGte))
+        } else {
+            parts.append("")
+        }
+        if let voteAverageLte {
+            parts.append(String(voteAverageLte))
+        } else {
+            parts.append("")
+        }
+        if let voteCountGte {
+            parts.append(String(voteCountGte))
+        } else {
+            parts.append("")
+        }
+        parts.append(withOriginalLanguage ?? "")
+        parts.append(withOriginCountry ?? "")
+        parts.append(withKeywords ?? "")
+        parts.append(withCompanies ?? "")
+        parts.append(withNetworks ?? "")
+        if let year {
+            parts.append(String(year))
+        } else {
+            parts.append("")
+        }
+        parts.append(watchRegion ?? "")
+        parts.append(withWatchProviders ?? "")
+        return parts.joined(separator: ",")
     }
 }
 
@@ -2475,7 +2668,7 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
     /// Optional wordmark shown in the hero title area instead of plain text.
     let titleLogoUrl: String?
     let tileShape: CollectionTileShape
-    let sources: [NuvioCollectionCatalogSource]
+    let sources: [NuvioCollectionSource]
     /// Parent collection view mode (Tabs / Rows / Follow layout).
     let viewMode: CollectionFolderViewMode
     let showAllTab: Bool
@@ -2483,7 +2676,7 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
     init(
         collectionId: String,
         folder: NuvioCollectionFolder,
-        sources: [NuvioCollectionCatalogSource],
+        sources: [NuvioCollectionSource],
         viewMode: CollectionFolderViewMode = .tabbedGrid,
         showAllTab: Bool = true
     ) {
@@ -2536,6 +2729,7 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
             && lhs.coverImageUrl == rhs.coverImageUrl
             && lhs.heroBackdropUrl == rhs.heroBackdropUrl
             && lhs.titleLogoUrl == rhs.titleLogoUrl
+            && lhs.sources == rhs.sources
             && lhs.viewMode == rhs.viewMode
             && lhs.showAllTab == rhs.showAllTab
     }
@@ -4187,6 +4381,8 @@ struct DetailsUiState {
     var moreLikeThis: [RelatedTitle] = []
     /// Production companies + networks from TMDB.
     var companies: [MetaCompany] = []
+    /// TMDB creator/director and cast people, including profile photos.
+    var people: [TmdbPersonMetadata] = []
     /// Simkl community rating, catalog rank, and drop rate.
     var simklRatings: SimklTitleRatings? = nil
     /// Top liked Trakt comments (max 5).

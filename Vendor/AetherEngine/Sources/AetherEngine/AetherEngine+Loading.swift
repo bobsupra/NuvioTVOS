@@ -132,6 +132,31 @@ extension AetherEngine {
     /// Lean native-HLS live path: AVPlayerItem from the remote URL on the reused NativeAVPlayerHost. No Demuxer, no HLSVideoEngine, no loopback, no display-criteria handshake (AVKit drives match-content). Live-window surfaces come from `host.seekableEnd`.
     /// `startPosition` (AE#154): resume anchor for VOD playlists on the loopback reroute; nil keeps
     /// the historical no-initial-seek behavior every live caller relies on.
+    /// Build a native host carrying the current Now-Playing ownership choice. Read at creation only:
+    /// a host preserved across a native->native reload (issue #15) keeps what it was created with,
+    /// which is the point, since re-creating it is what breaks AVKit's MediaRemote registration.
+    func makeNativeHost() -> NativeAVPlayerHost {
+        #if os(tvOS) || os(iOS)
+        return NativeAVPlayerHost(ownsNowPlayingSession: ownsVideoNowPlayingSession)
+        #else
+        return NativeAVPlayerHost()
+        #endif
+    }
+
+    /// Replay the staged Now-Playing identity onto a host, and re-assert session ownership. The
+    /// re-assert mirrors the audio path: a preserved host never re-runs init, so a session another
+    /// app took over in the meantime would otherwise never be claimed back. Both no-op for a host
+    /// that owns no session.
+    func replayVideoNowPlayingInfo(to host: NativeAVPlayerHost) {
+        #if os(tvOS) || os(iOS)
+        guard host.ownsNowPlayingSession else { return }
+        if !pendingVideoNowPlayingInfo.isEmpty {
+            host.setNowPlayingInfo(pendingVideoNowPlayingInfo)
+        }
+        host.becomeActiveNowPlaying()
+        #endif
+    }
+
     func loadRemoteHLS(url: URL, options: LoadOptions, startPosition: Double? = nil) async throws {
         playbackBackend = .native
         // #168 follow-up: detect a superseding load()/stop() between the carriage verdict and the reroute.
@@ -141,12 +166,13 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = makeNativeHost()
         }
         host.playerLayer.videoGravity = _videoGravity
         if !pendingExternalMetadata.isEmpty {
             host.setExternalMetadata(pendingExternalMetadata)
         }
+        replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         // A surface bound BEFORE load ran presentCurrentLayer() while nativeHost was still nil
         // (no-op); without this re-present nothing ever attaches host.playerLayer and AVPlayer
@@ -402,6 +428,9 @@ extension AetherEngine {
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
             forwardBufferSegments: loadedOptions.forwardBufferSegments
         )
+        // #240: the pump claims the source link through this gate while it is fetching, so the
+        // subtitle side readers can stay out of its way. Set before start().
+        session.sideReaderLinkGate = sideReaderLinkGate
         session.onFirstHDR10PlusDetected = { [weak self] in
             Task { @MainActor in self?.handleHDR10PlusDetected() }
         }
@@ -689,23 +718,19 @@ extension AetherEngine {
         var playbackURL = try await Task.detached(priority: .userInitiated) { [session] in
             try session.start()
         }.value
-        #if os(iOS)
-        // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP and
-        // force the media playlist, so the receiver reaches the engine-processed stream (DV/Atmos/subtitles
-        // preserved) and isn't handed a DV/HDR master it rejects on an SDR panel (DrHurt). Reverts on the
-        // reload when AirPlay ends.
-        if airPlayActive, let lanURL = airPlayPlaybackURL(base: playbackURL) {
-            EngineLog.emit("[AirPlay] loadNative serving via \(lanURL.absoluteString)", category: .engine)
-            playbackURL = lanURL
-        }
-        #endif
+        // AirPlay (#86): while external playback is active, serve the loopback over the device's LAN IP so
+        // the receiver reaches the engine-processed stream (DV/Atmos/subtitles preserved). An HDR/DV master
+        // is downgraded to the media playlist there (an SDR receiver rejects it, DrHurt); an SDR master is
+        // kept so its subtitle renditions survive the trip (#227). Reverts on the reload when AirPlay ends.
+        let served = airPlayAdjustedPlayback(url: playbackURL, session: session)
+        playbackURL = served.url
         // Superseded while starting: stop and unwind before touching shared state.
         if loadGeneration != generation {
             session.stop()
             try checkLoadCurrent(generation)
         }
         self.nativeVideoSession = session
-        nativeSubtitleRenditionsServed = session.servingMasterPlaylist
+        nativeSubtitleRenditionsServed = served.subtitleRenditionsServed
         extractorYieldState.activate(session: session)
 
         // #15: the stores were created before start() (above) so the VideoSegmentProvider got the references at
@@ -746,13 +771,14 @@ extension AetherEngine {
         if let existing = nativeHost {
             host = existing
         } else {
-            host = NativeAVPlayerHost()
+            host = makeNativeHost()
         }
         host.playerLayer.videoGravity = _videoGravity
         // Forward pre-load externalMetadata so the AVPlayerItem picks it up before AVPlayer assigns it.
         if !pendingExternalMetadata.isEmpty {
             host.setExternalMetadata(pendingExternalMetadata)
         }
+        replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         applyDesiredVolume(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
@@ -819,13 +845,15 @@ extension AetherEngine {
                 // #65: mirror AVPlayer's rendered (playlist-axis) position for off-main wedge re-anchoring.
                 self.renderedPositionMirror.set(value)
                 self.clock.sourceTime = value + shift
-                // bufferedPosition = the disk SegmentCache read-ahead frontier (origin -> disk), which is
-                // what the Network Buffer setting controls, expressed on the display axis as the playhead
-                // plus the seconds of contiguously cached-ahead content. Replaces AVPlayer's shallow ~4 s
+                // bufferedPosition = the end of the contiguous safe range (origin -> disk), expressed on
+                // the display axis as the playhead plus contiguously available seconds ahead of it: the
+                // segments AVPlayer already fetched, plus the disk SegmentCache band above them, which is
+                // what the Network Buffer setting controls. Replaces AVPlayer's shallow ~4 s
                 // loadedTimeRanges end (pinned by preferredForwardBufferDuration), which did not move with
                 // the setting. readAhead >= 0 keeps the #54 contract that bufferedPosition never trails the
                 // rendered frame. Drawn against the 0-based duration, so map onto the display axis to keep
-                // the buffer bar aligned with currentTime (0 off disc). AE#105. See docs issue #33 follow-up.
+                // the buffer bar aligned with currentTime (0 off disc). AE#105, #207 follow-up.
+                // See docs issue #33 follow-up.
                 let renderedDisplay = PresentationAxis.display(
                     sourcePTS: value + shift, origin: self.sourcePresentationOrigin)
                 let readAhead = self.nativeVideoSession?

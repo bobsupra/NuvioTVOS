@@ -15,26 +15,26 @@ struct RemoteHLSMediaSelectionTests {
     @Test("VOD-path playlist misroute on a URL source reroutes")
     func rerouteOnVODPlaylistMisroute() {
         #expect(RemoteHLSMediaSelection.shouldReroute(
-            probeFailure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: false))
+            failure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: false))
     }
 
     @Test("Live raw-path misroute keeps the AE#140 fail-closed behavior")
     func noRerouteOnRawLiveMisroute() {
         #expect(!RemoteHLSMediaSelection.shouldReroute(
-            probeFailure: AVIOReaderError.hlsPlaylistOnRawLivePath, isCustomSource: false))
+            failure: AVIOReaderError.hlsPlaylistOnRawLivePath, isCustomSource: false))
     }
 
     @Test("Custom sources have no URL to reroute")
     func noRerouteForCustomSource() {
         #expect(!RemoteHLSMediaSelection.shouldReroute(
-            probeFailure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: true))
+            failure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: true))
     }
 
     @Test("Successful or unrelated probes never reroute")
     func noRerouteOtherwise() {
-        #expect(!RemoteHLSMediaSelection.shouldReroute(probeFailure: nil, isCustomSource: false))
+        #expect(!RemoteHLSMediaSelection.shouldReroute(failure: nil, isCustomSource: false))
         #expect(!RemoteHLSMediaSelection.shouldReroute(
-            probeFailure: DemuxerError.openFailed(code: -1), isCustomSource: false))
+            failure: DemuxerError.openFailed(code: -1), isCustomSource: false))
     }
 
     @Test("VOD-path misroute has an actionable description")

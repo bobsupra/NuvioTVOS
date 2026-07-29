@@ -166,18 +166,21 @@ struct Issue112PGSDisplaySetAssemblyTests {
         #expect(stored(store).first?.flags == 0x5)
     }
 
-    @Test("un-armed streams keep the per-packet path: NOPTS drops, same-pts replaces")
+    /// The re-harvest half collapses on a byte-identical payload, not on the timestamp: distinct
+    /// payloads on one PTS are distinct cues and are all retained (#235).
+    @Test("un-armed streams keep the per-packet path: NOPTS drops, a re-harvest replaces")
     func unarmedKeepsLegacyBehavior() {
         let store = SubtitlePacketStore()
+        let packet = Data([1, 2, 3])
         store.harvestChunk(streamIndex: 3, ptsSeconds: nil, durationSeconds: 0,
                            flags: 0, payload: pcs, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 3, ptsSeconds: 10, durationSeconds: 0,
-                           flags: 0, payload: Data([1]), assembleSplitDisplaySets: false)
+                           flags: 0, payload: packet, assembleSplitDisplaySets: false)
         store.harvestChunk(streamIndex: 3, ptsSeconds: 10, durationSeconds: 0,
-                           flags: 0, payload: Data([2, 2]), assembleSplitDisplaySets: false)
+                           flags: 0, payload: packet, assembleSplitDisplaySets: false)
         let got = store.entries(streamIndex: 3, from: 0, through: 100)
         #expect(got.count == 1)
-        #expect(got.first?.payload == Data([2, 2]))
+        #expect(got.first?.payload == packet)
     }
 
     @Test("clear resets pending assembly state")

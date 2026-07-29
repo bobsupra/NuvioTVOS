@@ -38,6 +38,7 @@
 		C0D310020000000000000002 /* CatalogModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300020000000000000002 /* CatalogModels.swift */; };
 		C0D310030000000000000003 /* CatalogRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300030000000000000003 /* CatalogRepository.swift */; };
 		C0D310E100000000000000E1 /* StreamsRepository.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300E100000000000000E1 /* StreamsRepository.swift */; };
+		C0D310E500000000000000E5 /* CollectionSourceResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300E500000000000000E5 /* CollectionSourceResolver.swift */; };
 		C0D310040000000000000004 /* CatalogBrowseViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300040000000000000004 /* CatalogBrowseViewModel.swift */; };
 		C0D310050000000000000005 /* CatalogBrowseView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300050000000000000005 /* CatalogBrowseView.swift */; };
 		C0D310060000000000000006 /* FilterSection.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300060000000000000006 /* FilterSection.swift */; };
@@ -176,6 +177,7 @@
 		C0D300020000000000000002 /* CatalogModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Models/CatalogModels.swift; sourceTree = "<group>"; };
 		C0D300030000000000000003 /* CatalogRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Data/Repository/CatalogRepository.swift; sourceTree = "<group>"; };
 		C0D300E100000000000000E1 /* StreamsRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Data/Repository/StreamsRepository.swift; sourceTree = "<group>"; };
+		C0D300E500000000000000E5 /* CollectionSourceResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Data/Repository/CollectionSourceResolver.swift; sourceTree = "<group>"; };
 		C0D300040000000000000004 /* CatalogBrowseViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/CatalogBrowseViewModel.swift; sourceTree = "<group>"; };
 		C0D300050000000000000005 /* CatalogBrowseView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Catalog/CatalogBrowseView.swift; sourceTree = "<group>"; };
 		C0D300060000000000000006 /* FilterSection.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Catalog/FilterSection.swift; sourceTree = "<group>"; };
@@ -311,6 +313,7 @@
 				C0D300020000000000000002 /* CatalogModels.swift */,
 				C0D300030000000000000003 /* CatalogRepository.swift */,
 				C0D300E100000000000000E1 /* StreamsRepository.swift */,
+				C0D300E500000000000000E5 /* CollectionSourceResolver.swift */,
 				C0D300040000000000000004 /* CatalogBrowseViewModel.swift */,
 				C0D300050000000000000005 /* CatalogBrowseView.swift */,
 				C0D300060000000000000006 /* FilterSection.swift */,
@@ -666,6 +669,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				C0D310020000000000000002 /* CatalogModels.swift in Sources */,
 				C0D310030000000000000003 /* CatalogRepository.swift in Sources */,
 				C0D310E100000000000000E1 /* StreamsRepository.swift in Sources */,
+				C0D310E500000000000000E5 /* CollectionSourceResolver.swift in Sources */,
 				C0D310040000000000000004 /* CatalogBrowseViewModel.swift in Sources */,
 				C0D310050000000000000005 /* CatalogBrowseView.swift in Sources */,
 				C0D310060000000000000006 /* FilterSection.swift in Sources */,
@@ -779,7 +783,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
@@ -788,7 +792,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -813,14 +817,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -953,7 +957,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -961,7 +965,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -978,7 +982,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -986,7 +990,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1004,14 +1008,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1031,14 +1035,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 51;
+				CURRENT_PROJECT_VERSION = 52;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2;
+				MARKETING_VERSION = 3.2.1;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;

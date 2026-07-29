@@ -120,6 +120,9 @@ public final class AetherEngine: ObservableObject {
     /// Recomputes isSeeking/seekTarget from both in-flight flags. Idempotent to avoid redundant Combine emissions.
     private func recomputeSeekSignal(target: Double?) {
         let seeking = programmaticSeekInFlight || nativeScrubSeekInFlight
+        // #240: a seek owns the link until it lands. Set unconditionally (not inside the
+        // change guard) so the gate cannot drift from the flags it mirrors.
+        sideReaderLinkGate.setSeeking(seeking)
         if isSeeking != seeking { isSeeking = seeking }
         if seeking {
             if let target { seekTarget = target }
@@ -235,6 +238,11 @@ public final class AetherEngine: ObservableObject {
     /// Chapters of the selected title. Empty until Blu-ray chapter parsing ships (Phase 2); declared
     /// now so hosts can bind the picker against a stable API.
     @Published public internal(set) var discChapters: [ChapterInfo] = []
+    /// Container (Matroska/MP4) chapters of the loaded source, from the probe demuxer at load. Empty
+    /// when the container declares none and for disc sources (whose chapters publish on `discChapters`
+    /// with title-relative seek semantics). `startSeconds` values are content timestamps a host passes
+    /// straight to `seek(to:)`.
+    @Published public internal(set) var mediaChapters: [ChapterInfo] = []
     /// The id of the title the disc demuxer should (re)open with. Mirrors `selectedDiscTitle?.id` but
     /// kept as plain state so it survives the stopInternal inside a reload and threads into audio-switch /
     /// background-resume reopens (a URL-disc reopen with no id would silently revert to the main title).
@@ -474,6 +482,16 @@ public final class AetherEngine: ObservableObject {
     /// nil while idle (subs off, live session, EOF reached).
     var subtitleForwardPrefetchTask: Task<Void, Never>?
     var subtitleForwardPrefetchDemuxer: Demuxer?
+    /// #240: the running session's in-place anchor box, so a playhead jump moves its cursor instead
+    /// of rebuilding the session. nil while no session is live.
+    var subtitleForwardPrefetchReanchor: SubtitleForwardPrefetcher.SideReaderReanchor?
+    /// #240: the lead the running session was started with. A changed lead (the OCR worker arming)
+    /// is the one anchor change that still needs a rebuild, since the loop captures it at start.
+    var subtitleForwardPrefetchActiveLead: Double?
+    /// #240: link arbitration between the video path and the subtitle side readers. On Matroska a
+    /// side reader is a second full copy of the stream, so on a link with little headroom the two
+    /// starve each other; the video path has priority. See `SideReaderLinkPolicy`.
+    nonisolated let sideReaderLinkGate = SideReaderLinkGate()
     /// #121: session-monotonic id source for cues entering the retained overlay stores
     /// (`subtitleCues` / `secondarySubtitleCues`). The overlay decoder is rebuilt on every seek
     /// (`.resetAndDecode`), restarting its own `nextCueID` at zero, so decoder-local ids cannot stay
@@ -496,6 +514,13 @@ public final class AetherEngine: ObservableObject {
     /// instead of one long MainActor pass.
     nonisolated static let subtitleOCRMaxPacketsPerTick: Int = 48
     nonisolated static let subtitleForwardPrefetchParkPollNanoseconds: UInt64 = 500_000_000
+    /// #231: a prefetch session that dies on a read error is restarted, bounded. Consecutive
+    /// failures are what a dead link looks like; the total ceiling covers a source that fails in a
+    /// loop after harvesting a packet each time.
+    nonisolated static let subtitleForwardPrefetchMaxConsecutiveFailures: Int = 3
+    nonisolated static let subtitleForwardPrefetchMaxRestarts: Int = 8
+    /// Doubles per consecutive failure (1s, 2s, 4s), capped by the consecutive-failure ceiling.
+    nonisolated static let subtitleForwardPrefetchRestartBackoffNanoseconds: UInt64 = 1_000_000_000
 
     @Published public internal(set) var isLoadingSubtitles: Bool = false
     @Published public internal(set) var isSubtitleActive: Bool = false
@@ -1163,6 +1188,10 @@ public final class AetherEngine: ObservableObject {
         masterFallbackUsed = true
         session.markServingMediaAfterFallback()
         nativeSubtitleRenditionsServed = false
+        // #227: while AirPlaying, the item under the rejection is the LAN-IP URL; `mediaPlaylistURL` is the
+        // 127.0.0.1 loopback the receiver cannot reach, so the fallback has to be rewritten too or the
+        // recovery loads nothing. Media playlist already, so there is no master to keep.
+        let fallbackURL = airPlayActive ? (airPlayPlaybackURL(base: mediaURL) ?? mediaURL) : mediaURL
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
@@ -1173,7 +1202,7 @@ public final class AetherEngine: ObservableObject {
             + "media playlist (no CC/subtitle renditions) at "
             + (isLive ? "the live edge" : "\(String(format: "%.2f", position))s"),
             category: .session)
-        host.load(url: mediaURL,
+        host.load(url: fallbackURL,
                   startPosition: isLive ? nil : position,
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true),
                   inPlaceSwap: true)
@@ -1186,6 +1215,10 @@ public final class AetherEngine: ObservableObject {
     static let startupGateInitialSeconds: Double = 3.0
     static let startupGateReloadSeconds: Double = 3.0
     static let startupGateMediaSeconds: Double = 2.5
+
+    /// First settle window on a wireless AirPlay hop (#227 follow-up). The receiver fetches across the LAN
+    /// and runs its own decode handshake before anything is playable, which the local 3 s window can miss.
+    static let airPlayGateInitialSeconds: Double = 6.0
 
     /// #124: whether a completed load runs its terminal autostart, the single decision every load
     /// path routes through: the native/software/audio `host.play()` + `state = .playing`, and the
@@ -1205,6 +1238,11 @@ public final class AetherEngine: ObservableObject {
     /// replays that recovery in-session: play, poll readiness, and on a cold failure reload the SAME
     /// master with a fresh asset (bounded) before falling back to the media playlist (HDR10 base, no
     /// DV upgrade). Bounded at every stage, so a cold resume can never hang forever on 0 tracks.
+    ///
+    /// #227: the same escalation is what a wireless AirPlay hop needs. The master kept for an SDR source
+    /// carries the subtitle renditions but assumes the receiver can take that variant, which the sender
+    /// cannot check (a receiver without 4K HEVC would reject it). The gate covers the rejection and the
+    /// silent park, and its reloads are rewritten onto the LAN IP so the receiver can reach them at all.
     @MainActor
     private func runStartupReadinessGate(
         session: HLSVideoEngine, position: Double, gen: UInt64
@@ -1213,13 +1251,18 @@ public final class AetherEngine: ObservableObject {
         host.startupReadinessGateActive = true
         defer { host.startupReadinessGateActive = false }
 
+        // A receiver's first fetch crosses the LAN and its own decode handshake, so the local 3 s settle
+        // window would judge a healthy AirPlay start too early and reload a master that was on its way.
+        let initialSettle = airPlayActive
+            ? Self.airPlayGateInitialSeconds
+            : Self.startupGateInitialSeconds
         var attempt = 1
         var dataWaitRounds = 0
         while true {
             // Attempt 1 plays the item the load path already created; later attempts replay it fresh.
             host.play()
             let timeout = attempt == 1
-                ? Self.startupGateInitialSeconds
+                ? initialSettle
                 : Self.startupGateReloadSeconds
             let outcome = await host.awaitStartupReadiness(timeoutSeconds: timeout)
             try checkLoadCurrent(gen)
@@ -1274,7 +1317,7 @@ public final class AetherEngine: ObservableObject {
                     + "\(StartupReadinessGate.masterAttempts), link may still be warming) at "
                     + "\(String(format: "%.2f", position))s",
                     category: .session)
-                host.load(url: masterURL, startPosition: position, inPlaceSwap: true)
+                host.load(url: airPlayHostSwapped(masterURL), startPosition: position, inPlaceSwap: true)
                 attempt += 1
 
             case .fallBackToMedia:
@@ -1288,7 +1331,7 @@ public final class AetherEngine: ObservableObject {
                         + "HDR-preserving reduced master (subtitles preserved, DV dropped) at "
                         + "\(String(format: "%.2f", position))s",
                         category: .session)
-                    host.load(url: reducedURL, startPosition: position, inPlaceSwap: true)
+                    host.load(url: airPlayHostSwapped(reducedURL), startPosition: position, inPlaceSwap: true)
                     host.play()
                     let reducedOutcome = await host.awaitStartupReadiness(
                         timeoutSeconds: Self.startupGateReloadSeconds)
@@ -1313,7 +1356,7 @@ public final class AetherEngine: ObservableObject {
                     + "playlist at \(String(format: "%.2f", position))s (HDR10 base, DV upgrade "
                     + "dropped this session)",
                     category: .session)
-                host.load(url: mediaURL, startPosition: position, inPlaceSwap: true)
+                host.load(url: airPlayHostSwapped(mediaURL), startPosition: position, inPlaceSwap: true)
                 host.play()
                 // Best-effort readiness confirm; the media playlist is the universal-compatible route.
                 // Clearing the gate (defer) lets a genuine residual media failure surface normally via
@@ -1947,6 +1990,7 @@ public final class AetherEngine: ObservableObject {
         discTitles = []
         selectedDiscTitle = nil
         discChapters = []
+        mediaChapters = []
         subtitleCueDiagnosticCount = 0
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
@@ -1968,7 +2012,12 @@ public final class AetherEngine: ObservableObject {
         // Routed before the probe because we never demux the m3u8.
         if options.nativeRemoteHLS {
             do {
-                try await loadRemoteHLS(url: url, options: options)
+                // AE#246: a VOD playlist honors the resume anchor here the same way the AE#154 reroute
+                // does; without it a rerouted (or directly requested) VOD bypass always restarted at 0.
+                // Live keeps the no-initial-seek contract every live caller relies on, so its anchor
+                // stays nil even when the host passes one.
+                try await loadRemoteHLS(url: url, options: options,
+                                        startPosition: options.isLive ? nil : startPosition)
             } catch is CancellationError {
                 throw CancellationError()
             } catch {
@@ -2086,7 +2135,7 @@ public final class AetherEngine: ObservableObject {
         // domain, so reroute this load onto the nativeRemoteHLS bypass instead of surfacing the
         // former bare AVERROR_INVALIDDATA. loadedOptions flips so every downstream consumer
         // (audio-tap reader selection, seek paths) sees a genuine remote-HLS session.
-        if RemoteHLSMediaSelection.shouldReroute(probeFailure: probeFailure, isCustomSource: isCustomSource),
+        if RemoteHLSMediaSelection.shouldReroute(failure: probeFailure, isCustomSource: isCustomSource),
            case .url(let hlsURL) = source {
             EngineLog.emit("[AetherEngine] AE#154: HLS playlist on the VOD loopback path; rerouting to the native remote-HLS bypass", category: .engine)
             loadedOptions.nativeRemoteHLS = true
@@ -2138,6 +2187,7 @@ public final class AetherEngine: ObservableObject {
         // clamped to an in-range id); non-disc sources report empty/nil (#67).
         discTitles = probeOpened ? probe.discTitleInfos() : []
         discChapters = probeOpened ? probe.discChapterInfos() : []
+        mediaChapters = (probeOpened && discTitles.isEmpty) ? probe.mediaChapterInfos() : []
         activeDiscTitleID = probeOpened ? probe.selectedDiscTitleID : nil
         selectedDiscTitle = activeDiscTitleID.flatMap { id in discTitles.first { $0.id == id } }
         // Content start PTS for the software-path chapter-seek base (see sourceStartSeconds). start_time is
@@ -2359,6 +2409,48 @@ public final class AetherEngine: ObservableObject {
             av1Available: VTCapabilityProbe.av1Available,
             spsIndicatesInterlaced: spsIndicatesInterlaced
         )
+        // #232: a declared interlaced field order is not evidence that any frame IS interlaced.
+        // European 25 fps Blu-ray masters ship as 1080i25 (there is no 1080p25): interlaced carriage,
+        // progressive pictures, and FFmpeg's parser reports TT for them off SEI pic_struct alone while
+        // its decoder leaves AV_FRAME_FLAG_INTERLACED clear on the very same picture. Those streams took
+        // the software detour and then never deinterlaced, because SoftwareVideoDecoder engages the
+        // filter on that flag and on nothing else. So decode a sample and ask the runtime's own
+        // question: would the deinterlacer ever engage. Only a clean answer overrules the declaration;
+        // inconclusive keeps today's routing. VOD + seekable only: the sample moves the read position of
+        // the demuxer the session reuses, and live 1080i broadcast (the case the rule exists for) is
+        // neither seekable nor mis-declared.
+        if useSoftwarePath, probeOpened, !options.isLive, probe.isSourceSeekable,
+           probe.videoStreamIndex >= 0,
+           VideoRoutingPolicy.routesSoftwareForDeclaredInterlace(
+               codecID: detectedCodecID,
+               fieldOrder: detectedFieldOrder,
+               spsIndicatesInterlaced: spsIndicatesInterlaced) {
+            let videoIdx = probe.videoStreamIndex
+            let verdict = await Task.detached(priority: .userInitiated) { [probe] in
+                let verdict = InterlaceProbe.run(demuxer: probe, streamIndex: videoIdx)
+                probe.seek(to: 0)  // sample consumed packets; the session reuses this demuxer
+                return verdict
+            }.value
+            if loadGeneration != gen {
+                probe.markClosed()
+                Task.detached { [probe] in probe.close() }
+                try checkLoadCurrent(gen)
+            }
+            if InterlaceProbe.refutesDeclaredInterlace(verdict) {
+                useSoftwarePath = false
+                EngineLog.emit(
+                    "[AetherEngine] declared interlaced (fieldOrder=\(detectedFieldOrder.rawValue)) but "
+                    + "\(verdict); the deinterlacer would never engage, routing native for HW decode (#232)",
+                    category: .engine
+                )
+            } else {
+                EngineLog.emit(
+                    "[AetherEngine] declared interlaced and the frame sample agrees (\(verdict)); "
+                    + "keeping the software deinterlace path (#232)",
+                    category: .engine
+                )
+            }
+        }
         // #2: an H.264 / HEVC format AVPlayer accepts at the HLS CODECS level but VideoToolbox can't
         // hardware-decode (H.264 High 4:2:2/4:4:4/High-10, HEVC Rext on Intel Macs / older Apple TV) reaches
         // readyToPlay then renders nothing on the native path. QuickTime plays it via its own software decoder;
@@ -2480,6 +2572,8 @@ public final class AetherEngine: ObservableObject {
                 }
                 startMemoryProbe()
                 startLiveTelemetrySampler()
+                armDisplayModeDiagnostic(gen: gen, backend: "software",
+                                         contentRate: detectedRate, requestedRate: snappedRate)
             } else {
                 // Native path: pass the probe Demuxer to loadNative so HLSVideoEngine.start() skips
                 // avformat_open_input + find_stream_info (~1-3 s saved on slow CDN). The cue prewarm
@@ -2534,8 +2628,12 @@ public final class AetherEngine: ObservableObject {
                 // #124: a paused mount skips the terminal play() AND the cold-start readiness gate
                 // (an autostart-path recovery: it plays to poll readiness). loadNative wired
                 // host.$isReady, which settles .loading -> .paused; the host resumes later with play().
+                // #227 follow-up: a master handed to a wireless AirPlay receiver arms the same gate. The
+                // receiver's HDR mode is unreadable from the sender, so an offered HDR/DV master can be
+                // rejected or park silently, and the escalation (reload master -> reduced HDR master ->
+                // media, all on the LAN IP) is exactly the recovery that hop needs.
                 if Self.loadPerformsAutostart(options) {
-                    if didSwitchPanel, let session = nativeVideoSession,
+                    if didSwitchPanel || airPlayServedMasterToReceiver, let session = nativeVideoSession,
                        session.servingMasterPlaylist, !options.isLive {
                         try await runStartupReadinessGate(
                             session: session, position: startPosition ?? 0, gen: gen)
@@ -2543,14 +2641,39 @@ public final class AetherEngine: ObservableObject {
                         nativeHost?.play()
                     }
                     state = .playing
+                    // #227: a receiver that refuses the playlist it was handed neither fails the item nor
+                    // reports a rejection, so the gate above cannot see it. Watch the clock instead.
+                    armAirPlayProgressWatchdog(gen: gen, position: startPosition ?? 0)
                 }
                 startMemoryProbe()
                 startLiveTelemetrySampler()
+                armDisplayModeDiagnostic(gen: gen, backend: "native",
+                                         contentRate: detectedRate, requestedRate: snappedRate)
             }
         } catch is CancellationError {
             // Superseded.
             throw CancellationError()
         } catch {
+            // AE#246: the load-time probe failed for a reason that was not the HLS classification, so the
+            // AE#154 check above saw an inconclusive failure and this load fell through to the loopback
+            // path with no preopened demuxer. The session's own open is then the first one to read the
+            // body, and it has now classified the source as remote HLS after all. Take the same reroute
+            // rather than surfacing a terminal failure for a source AVPlayer can play. A full load()
+            // restart (the #168 reroute's shape) is what clears the half-built loopback session; the
+            // bypass runs no probe, so this cannot bounce back here a second time.
+            if RemoteHLSMediaSelection.shouldReroute(failure: error, isCustomSource: isCustomSource),
+               case .url(let hlsURL) = source,
+               loadGeneration == gen {
+                EngineLog.emit(
+                    "[AetherEngine] AE#246: the loopback session's own open classified the source as HLS; "
+                    + "taking the AE#154 reroute onto the native remote-HLS bypass",
+                    category: .engine
+                )
+                var rerouted = loadedOptions
+                rerouted.nativeRemoteHLS = true
+                _ = try await load(source: .url(hlsURL), startPosition: startPosition, options: rerouted)
+                return nil
+            }
             state = .error("Failed to load: \(error.localizedDescription)")
             throw error
         }
@@ -2666,7 +2789,12 @@ public final class AetherEngine: ObservableObject {
         let audioToRestore = activeAudioTrackIndex
         let carryover = captureSubtitleSessionCarryover()
         sessionPreservingReloadInFlight = true
-        defer { sessionPreservingReloadInFlight = false }
+        // #227: the reconcile has to run on every exit, including a thrown/superseded load, or an edge held
+        // during the reload is lost and the session stays on the wrong URL for the current route.
+        defer {
+            sessionPreservingReloadInFlight = false
+            reconcileExternalPlaybackAfterReload()
+        }
         // Live: rejoin at the live edge; pre-suspend playhead is stale and may have slid out of the window.
         let resume: Double? = LiveReloadPolicy.resumePosition(
             isLive: loadedOptions.isLive, currentTime: pos)
@@ -3265,6 +3393,12 @@ public final class AetherEngine: ObservableObject {
         // Font attachments are session-scoped but must survive stopInternal (audio-track-switch skips the probe;
         // clearing in stopInternal would leave the session with an empty font list after any audio switch).
         fontAttachments = []
+        // Container chapters belong to the source URL, not to the pipeline, so they follow the same rule:
+        // every reopen of the same source (audio switch, iOS background return, #127 expiry) runs through
+        // stopInternal without re-probing, and a wipe there would strip them for the rest of the session.
+        // Disc chapters are NOT in this block: a title switch really does change them, and the reload path
+        // recaptures them from the reopened demuxer.
+        mediaChapters = []
         videoFormat = .sdr
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
@@ -3274,6 +3408,12 @@ public final class AetherEngine: ObservableObject {
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
         pendingExternalMetadata = []
+        #if os(tvOS) || os(iOS)
+        // Same lifetime as pendingExternalMetadata: session identity the host staged, cleared when the
+        // host leaves playback so the next session cannot inherit the previous title's system card.
+        // Surviving stopInternal is deliberate (a reload keeps the card through the seam).
+        pendingVideoNowPlayingInfo = [:]
+        #endif
         // Clear loadedURL on public stop() so reloadAtCurrentPosition can't resurrect the URL after dismissal
         // and selectSubtitleTrack can't spawn a side demuxer against a stopped session.
         loadedURL = nil
@@ -3288,23 +3428,174 @@ public final class AetherEngine: ObservableObject {
     }
 
     /// AirPlay (#86, DrHurt): true while the native AVPlayer reports external playback. loadNative reads it to
-    /// serve the loopback over the device's LAN IP (the receiver can't reach 127.0.0.1) AND to force the MEDIA
-    /// playlist (AVPlayer rejects a DV/HDR MASTER playlist on an SDR receiver and won't auto-switch, DrHurt).
+    /// serve the loopback over the device's LAN IP (the receiver can't reach 127.0.0.1), and for an HDR/DV
+    /// source also to force the MEDIA playlist (AVPlayer rejects a DV/HDR MASTER playlist on an SDR receiver
+    /// and won't auto-switch, DrHurt). An SDR master is kept so its subtitle renditions travel (#227).
     /// Loopback native path only; a remote-HLS source is already receiver-reachable, so it's left untouched.
     private(set) var airPlayActive = false
     private var externalPlaybackObservation: NSKeyValueObservation?
 
+    /// Current external-playback state, or false where the platform has no such route.
+    /// `AVPlayer.isExternalPlaybackActive` is unavailable on visionOS: video goes to the wearer's
+    /// displays, there is no receiver to hand the stream to, so the whole #86 / #227 serve-the-loopback-
+    /// over-the-LAN path is inert there.
+    private var isExternalPlaybackActiveNow: Bool {
+        #if os(visionOS)
+        return false
+        #else
+        return currentAVPlayer?.isExternalPlaybackActive ?? false
+        #endif
+    }
+
     private func observeExternalPlayback() {
         externalPlaybackObservation?.invalidate()
         externalPlaybackObservation = nil
+        #if !os(visionOS)
         guard let player = currentAVPlayer else { return }
         externalPlaybackObservation = player.observe(\.isExternalPlaybackActive, options: [.new]) { [weak self] _, change in
             let active = change.newValue ?? false
             Task { @MainActor in self?.handleExternalPlaybackChange(active: active) }
         }
+        #endif
+    }
+
+    /// #227: an external-playback edge arrived while the reload this observer started was still running, so
+    /// the real route state has to be re-read once the rebuilt item exists.
+    private var externalPlaybackEdgeHeld = false
+
+    /// #227: how long a master handed to a wireless AirPlay receiver gets to actually move the clock before
+    /// it counts as refused. A receiver that will not play the offered variant does NOT fail the item and
+    /// does not report `-11868`: it simply never starts, while the rate flickers to `playing` for a tick
+    /// (device log 2026-07-27, DV master). That is invisible to the readiness gate, so progress is the only
+    /// signal left. A receiver that does take the master fetches its init segment within about a second of
+    /// the playlist, so this is generous without making a parked receiver wait for nothing.
+    static let airPlayProgressWatchdogSeconds: Double = 5.0
+
+    /// Master attempts on a wireless AirPlay hop before the media fallback (#227). Two, matching the #35
+    /// gate: the first attempt is what makes a Match-Dynamic-Range receiver switch its output to HDR, and
+    /// the second is the one that can be accepted once it has.
+    static let airPlayMasterAttempts = 2
+    private var airPlayProgressWatchdog: Task<Void, Never>?
+
+    private var displayModeDiagnostic: Task<Void, Never>?
+
+    /// Sodalite #49: read back what the Match-Frame-Rate switch actually landed on. `preferredDisplayCriteria`
+    /// is a hint with no read-back, so a display-link sample once playback is running is the only way to tell
+    /// three cases apart for a judder report: the panel ignored the criteria and kept the system rate (50.000
+    /// under a 29.970 source), it took a rate that does not divide the content rate (60.000 vs 59.940, one
+    /// repeated frame every ~16 s), or it is correct and the cadence problem is downstream of the panel.
+    /// Logs both backends so the software path serves as the control for a native-path report.
+    @MainActor
+    func armDisplayModeDiagnostic(gen: UInt64, backend: String, contentRate: Double?, requestedRate: Double?) {
+        #if os(tvOS)
+        displayModeDiagnostic?.cancel()
+        displayModeDiagnostic = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .seconds(2.5))
+            guard let self, !Task.isCancelled, self.loadGeneration == gen else { return }
+            let sample = await self.displayCriteria.measureRefreshRate()
+            guard !Task.isCancelled, self.loadGeneration == gen else { return }
+            // currentVideoFrameRate is 0 on audio tracks and while paused, so the first non-zero entry is
+            // the video track's own measure of how many frames the player is actually putting on screen.
+            let playerRate = self.currentAVPlayer?.currentItem?.tracks
+                .lazy.map(\.currentVideoFrameRate).first { $0 > 0 }
+            func fmt(_ value: Double?) -> String {
+                value.map { String(format: "%.3f", $0) } ?? "n/a"
+            }
+            EngineLog.emit(
+                "[DisplayCriteria] mode check (\(backend)): content=\(fmt(contentRate)) "
+                + "requested=\(fmt(requestedRate)) panel=\(fmt(sample?.measured))Hz "
+                + "(nominal \(fmt(sample?.nominal))) player=\(fmt(playerRate.map(Double.init)))fps",
+                category: .engine
+            )
+        }
+        #endif
+    }
+
+    /// Receivers that failed to start on an HDR master this process, by route UID (#227). An Apple TV
+    /// parked in SDR refuses one, and nothing in the public API reports the receiver's dynamic range, so
+    /// the offer has to be made once and remembered. Per process on purpose: a user who switches the
+    /// receiver's output format to HDR gets the offer again on the next launch.
+    private var airPlayReceiversRefusingHDRMaster: Set<String> = []
+
+    /// Route UID of the wireless AirPlay receiver currently holding the audio route, or nil.
+    nonisolated static func currentAirPlayReceiverUID() -> String? {
+        #if os(iOS)
+        return AVAudioSession.sharedInstance().currentRoute.outputs
+            .first { $0.portType == .airPlay }?.uid
+        #else
+        return nil
+        #endif
+    }
+
+    /// Arm the progress watchdog for a load that handed the receiver a playlist with subtitle renditions.
+    /// No-op otherwise: the media playlist is the fallback itself, and a local session cannot be refused.
+    @MainActor
+    func armAirPlayProgressWatchdog(gen: UInt64, position: Double) {
+        airPlayProgressWatchdog?.cancel()
+        airPlayProgressWatchdog = nil
+        guard airPlayActive, airPlayServedMasterToReceiver else { return }
+        let baseline = currentTime
+        airPlayProgressWatchdog = Task { @MainActor [weak self] in
+            let seconds = AetherEngine.airPlayProgressWatchdogSeconds
+            try? await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+            guard let self, !Task.isCancelled, self.loadGeneration == gen else { return }
+            self.handleRefusedAirPlayMaster(baseline: baseline, position: position)
+        }
+    }
+
+    /// The receiver never started on the playlist it was handed (#227): reload the LAN media playlist, which
+    /// every receiver takes, and remember an HDR refusal so the same receiver is not made to wait again.
+    ///
+    /// A second master attempt was tried and dropped. The idea was that the first, refused attempt is what
+    /// makes a Match-Dynamic-Range receiver switch its output to HDR, the way the #35 cold-DV gate's failed
+    /// attempt warms the link; the receiver does switch during that window. On device it changed nothing and
+    /// only doubled the wait before the picture appeared, so the honest answer for such a receiver is the
+    /// media playlist plus a host telling the user to set the format to HDR or Dolby Vision.
+    @MainActor
+    private func handleRefusedAirPlayMaster(baseline: Double, position: Double) {
+        guard airPlayActive, airPlayServedMasterToReceiver else { return }
+        guard let host = nativeHost, let session = nativeVideoSession,
+              let mediaURL = session.mediaPlaylistURL else { return }
+        // Deliberately NOT gated on `state`: a refused session parks at paused, which is exactly the case
+        // this exists for, and an earlier version guarded on `state == .playing` and therefore never fired
+        // (device log 2026-07-27, where the #65 wedge recovery then nudged six times and gave up). The
+        // honest discriminator is the server's: a receiver that refuses the manifest fetches playlists and
+        // never a single segment, while a merely paused session has long since fetched its init segment.
+        let advanced = currentTime - baseline
+        guard advanced < 0.5, !session.hasServedMediaSegment else { return }
+
+        let receiverUID = Self.currentAirPlayReceiverUID()
+        if let receiverUID, session.servedSourceIsHDR {
+            airPlayReceiversRefusingHDRMaster.insert(receiverUID)
+        }
+        EngineLog.emit(
+            "[AirPlay] receiver did not start in "
+            + "\(String(format: "%.0f", Self.airPlayProgressWatchdogSeconds))s (clock advanced "
+            + "\(String(format: "%.2f", advanced))s, no segment fetched); the playlist it was handed is "
+            + "refused, falling back to the LAN media playlist (subtitle renditions dropped"
+            + (receiverUID != nil && session.servedSourceIsHDR
+               ? ", and this receiver is remembered as refusing HDR masters" : "") + ")",
+            category: .session)
+        session.markServingMediaAfterFallback()
+        nativeSubtitleRenditionsServed = false
+        airPlayServedMasterToReceiver = false
+        host.load(url: airPlayHostSwapped(mediaURL), startPosition: position, inPlaceSwap: true)
+        host.play()
     }
 
     private func handleExternalPlaybackChange(active: Bool) {
+        // #227 (device log 2026-07-27): the reload started below tears down the very item the KVO watches, so
+        // AVPlayer reports a transient `false` in the middle of it. Acting on that edge cleared `airPlayActive`
+        // before `loadNative` read it, the rebuilt session served 127.0.0.1 again, the receiver re-engaged
+        // external playback, and that true edge started the next reload: one full session rebuild per turn,
+        // forever (ports 51291, 51296, 51299, ... in the log), with the LAN swap never once applied. Hold any
+        // edge for the duration of the reload and reconcile against the live route afterwards.
+        if sessionPreservingReloadInFlight {
+            externalPlaybackEdgeHeld = true
+            EngineLog.emit("[AirPlay] external playback \(active) during a session-preserving reload; "
+                           + "holding the edge until the rebuilt item settles", category: .engine)
+            return
+        }
         // A wired HDMI external display (USB-C/Lightning-to-HDMI adapter, Sodalite#34) keeps the device as the
         // stream origin: 127.0.0.1 loopback stays reachable and the panel carries DV/HDR (DrHurt measured his
         // adapter exposing SDR/HDR/DV in Display & Brightness), so AVPlayer just pushes the already-master
@@ -3324,6 +3615,31 @@ public final class AetherEngine: ObservableObject {
         Task { try? await reloadAtCurrentPosition() }
     }
 
+    /// Re-read external playback after a session-preserving reload and act on it if it really changed (#227).
+    /// The player flag alone is not trustworthy at this instant: the rebuilt item may not have re-engaged the
+    /// receiver yet, which would read as "AirPlay ended" and start the next reload of the same loop. The audio
+    /// route survives the item teardown, so a receiver still holding the route keeps the session on its LAN URL.
+    func reconcileExternalPlaybackAfterReload() {
+        guard externalPlaybackEdgeHeld else { return }
+        externalPlaybackEdgeHeld = false
+        let active = isExternalPlaybackActiveNow || Self.isWirelessAirPlayRoute()
+        EngineLog.emit("[AirPlay] reconciling the held edge after the reload: active=\(active) "
+                       + "(player=\(isExternalPlaybackActiveNow) "
+                       + "route=\(Self.isWirelessAirPlayRoute()))", category: .engine)
+        handleExternalPlaybackChange(active: active)
+    }
+
+    /// True when a wireless AirPlay receiver holds the current audio route. Unlike
+    /// `AVPlayer.isExternalPlaybackActive` this survives an item teardown, which is what makes it the right
+    /// signal for the post-reload reconcile (#227). Wired HDMI reports `.HDMI` and is excluded by construction.
+    nonisolated static func isWirelessAirPlayRoute() -> Bool {
+        #if os(iOS)
+        return AVAudioSession.sharedInstance().currentRoute.outputs.contains { $0.portType == .airPlay }
+        #else
+        return false
+        #endif
+    }
+
     /// True when a wired HDMI external display is the active audio output (USB-C/Lightning-to-HDMI adapter).
     /// `usesExternalPlaybackWhileExternalScreenIsActive` flips `isExternalPlaybackActive` for both a wired screen
     /// and a wireless AirPlay receiver; the audio route tells them apart (`.HDMI` vs `.airPlay`). Wired keeps the
@@ -3337,15 +3653,57 @@ public final class AetherEngine: ObservableObject {
         #endif
     }
 
-    /// AirPlay loopback URL (#86): rewrite the loopback playback URL to the device's LAN IP and force the MEDIA
-    /// playlist, so the receiver reaches the engine-processed stream and isn't handed a DV/HDR master it rejects
-    /// on an SDR panel (DrHurt). nil if no LAN IP (caller keeps the original 127.0.0.1 URL).
-    func airPlayPlaybackURL(base: URL) -> URL? {
+    /// Playback URL and subtitle-rendition reality for a freshly started loopback session, after the AirPlay
+    /// rewrite (#86, #227). Identity outside iOS and whenever external playback is off; when the LAN IP scan
+    /// comes up empty the loopback URL stays as resolved (the receiver then simply cannot reach it, unchanged
+    /// from #86). `subtitleRenditionsServed` is what the served playlist actually carries, which is what
+    /// `nativeSubtitleRenditionsServed` promises hosts.
+    func airPlayAdjustedPlayback(url: URL, session: HLSVideoEngine) -> (url: URL, subtitleRenditionsServed: Bool) {
+        airPlayServedMasterToReceiver = false
+        #if os(iOS)
+        guard airPlayActive else { return (url, session.servingMasterPlaylist) }
+        let receiverUID = Self.currentAirPlayReceiverUID()
+        let refusedBefore = receiverUID.map { airPlayReceiversRefusingHDRMaster.contains($0) } ?? false
+        let playlist = AirPlayPlaylistDecision.playlistForReceiver(
+            servingMasterPlaylist: session.servingMasterPlaylist,
+            sourceIsHDR: session.servedSourceIsHDR,
+            receiverRefusedHDRMaster: refusedBefore)
+        let carriesRenditions = AirPlayPlaylistDecision.carriesSubtitleRenditions(playlist)
+        guard let lanURL = airPlayPlaybackURL(base: url, playlist: playlist) else {
+            EngineLog.emit("[AirPlay] no LAN IP; keeping \(url.absoluteString)", category: .engine)
+            return (url, session.servingMasterPlaylist)
+        }
+        airPlayServedMasterToReceiver = carriesRenditions
+        EngineLog.emit("[AirPlay] loadNative serving via \(lanURL.absoluteString) (playlist=\(playlist) "
+                       + "sourceIsHDR=\(session.servedSourceIsHDR) refusedBefore=\(refusedBefore) "
+                       + "subtitle renditions \(carriesRenditions ? "carried" : "dropped"))", category: .engine)
+        return (lanURL, carriesRenditions)
+        #else
+        return (url, session.servingMasterPlaylist)
+        #endif
+    }
+
+    /// True while the current native load handed the receiver a MASTER playlist (#227 follow-up). Arms the
+    /// startup-readiness gate on that hop: the sender cannot read the receiver's HDR mode, so a rejected or
+    /// silently parked master has to be caught and downgraded to the LAN media playlist.
+    private(set) var airPlayServedMasterToReceiver = false
+
+    /// The same loopback URL on the device's LAN IP, path untouched (master, reduced master, media). For the
+    /// readiness gate's reloads while AirPlaying, which otherwise hand the receiver a 127.0.0.1 URL it cannot
+    /// reach. Identity when no LAN IP resolves.
+    func airPlayHostSwapped(_ url: URL) -> URL {
+        airPlayPlaybackURL(base: url, playlist: .master) ?? url
+    }
+
+    /// AirPlay loopback URL (#86): rewrite the loopback playback URL to the device's LAN IP so the receiver
+    /// reaches the engine-processed stream. nil if no LAN IP (caller keeps the original 127.0.0.1 URL).
+    ///
+    /// `playlist` also picks the path: the resolved master for SDR (the renditions live only there, #227),
+    /// the reduced HDR master or plain media for HDR. See `AirPlayPlaylistDecision`.
+    func airPlayPlaybackURL(base: URL,
+                            playlist: AirPlayPlaylistDecision.ReceiverPlaylist = .media) -> URL? {
         guard let lanIP = HLSLocalServer.localActiveIPAddress() else { return nil }
-        var c = URLComponents(url: base, resolvingAgainstBaseURL: false)
-        c?.host = lanIP
-        c?.path = "/media.m3u8"
-        return c?.url
+        return AirPlayPlaylistDecision.receiverURL(base: base, lanIP: lanIP, playlist: playlist)
     }
 
     #if os(tvOS) || os(iOS)
@@ -3370,6 +3728,48 @@ public final class AetherEngine: ObservableObject {
         nativeHost?.setExternalMetadata(items)
         audioAVPlayerHost?.setExternalMetadata(items)
     }
+
+    #if os(tvOS) || os(iOS)
+    /// Opt in to owning the system Now-Playing session on the native VIDEO path.
+    ///
+    /// Off by default, and that default is load-bearing. The native path is consumed both by hosts
+    /// that build their own transport around a bare `AVPlayer` and by `AVPlayerViewController` hosts,
+    /// and AVKit owns Now-Playing itself there through private MediaRemote: WWDC22's guidance is not
+    /// to bring an `MPNowPlayingSession` when using AVKit, and doing so costs the host AVKit's card,
+    /// its `externalMetadata`, and its working transport commands. Only a host with custom UI should
+    /// set this. The audio path has no such fork (always a bare AVPlayer) and owns its session
+    /// unconditionally.
+    ///
+    /// Read when a native host is created, so set it before `load()`. A host preserved across a
+    /// native->native reload (issue #15) keeps whatever it was created with; the change takes effect
+    /// on the next fresh host.
+    public var ownsVideoNowPlayingSession: Bool = false
+
+    /// MPNowPlayingSession for the native VIDEO path; nil unless `ownsVideoNowPlayingSession` was set
+    /// before the session loaded (also nil on the software path and with no host). Same contract as
+    /// `audioNowPlayingSession`: the host app registers transport commands on `remoteCommandCenter`
+    /// and stages identity metadata via `setVideoNowPlayingInfo`; the session auto-publishes
+    /// elapsed/rate/duration from the AVPlayer and survives native->native reloads with the host
+    /// (issue #15), so system Now-Playing ownership holds across a background pause.
+    public var videoNowPlayingSession: MPNowPlayingSession? {
+        nativeHost?.nowPlayingSession
+    }
+
+    /// Staged per-item Now-Playing dictionary for the native video path. Replayed at host creation
+    /// and onto every fresh AVPlayerItem (gate reloads, media fallback, in-place swaps). Caller-managed
+    /// like the audio variant: pass an empty dict to clear.
+    var pendingVideoNowPlayingInfo: [String: Any] = [:]
+
+    /// Stage the system Now-Playing identity dictionary for the native video path (MPMediaItemProperty
+    /// keys + a force-decoded, @Sendable-wrapped MPMediaItemArtwork). Elapsed/rate/duration keys are
+    /// unnecessary, the session merges the player truth. Safe before `load()`; replayed at host
+    /// creation. Ignored by a host that does not own the session (`ownsVideoNowPlayingSession`), but
+    /// still staged, so a host that opts in on a later load keeps what it set.
+    public func setVideoNowPlayingInfo(_ info: [String: Any]) {
+        pendingVideoNowPlayingInfo = info
+        nativeHost?.setNowPlayingInfo(info)
+    }
+    #endif
 
     #if os(iOS) || os(tvOS)
     /// Staged per-item Now-Playing dictionary for the audio AVPlayer path. Replayed at host creation.
@@ -3693,6 +4093,11 @@ public final class AetherEngine: ObservableObject {
         nativeVideoSession?.stop()
         nativeVideoSession = nil
         nativeSubtitleRenditionsServed = false
+        airPlayProgressWatchdog?.cancel()
+        airPlayProgressWatchdog = nil
+        displayModeDiagnostic?.cancel()
+        displayModeDiagnostic = nil
+        airPlayServedMasterToReceiver = false
         extractorYieldState.deactivate()
         setPendingRecoverySeekTarget(nil)
         // #127: readiness + deferred host seeks are session-scoped; the host-side sink can't clear them

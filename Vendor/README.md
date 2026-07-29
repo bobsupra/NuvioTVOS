@@ -1,12 +1,12 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 5.23.3)
+## AetherEngine (pin 6.0.1)
 
-Local pin of [AetherEngine 5.23.3](https://github.com/superuser404notfound/AetherEngine/releases/tag/5.23.3) with imports rewritten to the namespaced FFmpeg modules below.
+Local pin of [AetherEngine 6.0.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.1) with imports rewritten to the namespaced FFmpeg modules below.
 
-## FFmpegBuild (based on 2.2.0, namespaced)
+## FFmpegBuild (based on 2.4.0, namespaced)
 
-Local pin of [FFmpegBuild 2.2.0](https://github.com/superuser404notfound/FFmpegBuild/tree/2.2.0) with frameworks/modules renamed to `AetherLib*` so they can embed next to MPVKit’s `Libav*` stack in the same app binary.
+Local pin of [FFmpegBuild 2.4.0](https://github.com/superuser404notfound/FFmpegBuild/tree/2.4.0) with frameworks/modules renamed to `AetherLib*` so they can embed next to MPVKit’s `Libav*` stack in the same app binary.
 
 | Upstream module | Nuvio module / framework |
 |---|---|

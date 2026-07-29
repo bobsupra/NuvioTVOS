@@ -15,6 +15,11 @@ import AetherLibavutil
 /// and losing Atmos JOC). NOT +dash (session-long sidx) or +frag_keyframe (interferes with
 /// explicit cut control).
 ///
+/// AE#222: +delay_moov alone is not enough for a source whose FIRST segment carries no audio packet (audio
+/// blocks sitting behind seconds of video in file order). Such a session is built with an
+/// `audioMoovPrimeFrame`: one real audio frame muxed at init writes moov (with a genuine dec3/dac3/dmlp) up
+/// front, and the primed fragment's bytes are then discarded so the delivered segment is unchanged.
+///
 /// Cut sequence: av_interleaved_write_frame(nil) drains the interleaver, then
 /// av_write_frame(nil) triggers mov_flush_fragment (moof+mdat). First cut only: a second
 /// av_write_frame(nil) (gated by `moovFlushed`) handles FFmpeg splitting ftyp+moov and
@@ -75,6 +80,15 @@ final class MP4SegmentMuxer {
     struct AudioConfig {
         let codecpar: UnsafePointer<AVCodecParameters>
         let timeBase: AVRational
+    }
+
+    /// Result of a segment cut. `deferredAwaitingAudioSampleEntry` is a THIRD state, distinct from both
+    /// success and failure: nothing was written, the muxer is intact, and the caller must retry the cut
+    /// once an audio packet has been muxed. Collapsing it into nil (= failure) is what wedged AE#222.
+    enum CutOutcome: Equatable {
+        case completed(path: URL, bytesWritten: Int)
+        case deferredAwaitingAudioSampleEntry
+        case failed
     }
 
     enum MuxerError: Error, CustomStringConvertible {
@@ -161,6 +175,7 @@ final class MP4SegmentMuxer {
         video: VideoConfig,
         audio: AudioConfig?,
         maxBufferedFragmentSeconds: Double = 8.0,
+        audioMoovPrimeFrame: [UInt8]? = nil,
         onInitCaptured: @escaping (Data) -> Void
     ) throws {
         self.currentSegmentIndex = initialSegmentIndex
@@ -263,6 +278,14 @@ final class MP4SegmentMuxer {
             seconds: maxBufferedFragmentSeconds,
             timeBase: muxerVideoTimeBase
         )
+
+        // AE#222: prime moov from one real audio frame when the audio sample entry is packet-derived. Without
+        // it, a source whose first segment carries no audio packet (video-first interleave: the audio blocks sit
+        // physically behind seconds of video) cannot emit moov at the first cut at all, and no codecpar or
+        // extradata can substitute (movenc builds dec3/dac3/dmlp in handle_eac3 from a PARSED frame only).
+        if let prime = audioMoovPrimeFrame, audio != nil, audioNeedsParsedPacketForMoov {
+            primeMoovWithAudioFrame(prime)
+        }
     }
 
     private let byteCounter: ByteCounter
@@ -387,6 +410,10 @@ final class MP4SegmentMuxer {
                 throw MuxerError.copyParametersFailed(code: aCopy)
             }
             audioStream.pointee.time_base = audio.timeBase
+            // AE#221: repair a degenerate FLAC STREAMINFO before movenc serialises it into dfLa.
+            if let streamInfo = Self.sanitizedFLACExtradata(UnsafePointer(audioStream.pointee.codecpar)) {
+                Self.replaceExtradata(audioStream.pointee.codecpar, with: streamInfo)
+            }
         }
 
         var opts: OpaquePointer? = nil
@@ -502,12 +529,116 @@ final class MP4SegmentMuxer {
         }
     }
 
+    /// Bytes staged for the segment currently being written. Zero right after a moov prime, whose fragment
+    /// bytes are deliberately discarded.
+    var stagedSegmentByteCount: Int { byteCounter.bytesWrittenCurrentSegment }
+
+    /// AE#222: mux one real audio frame and flush, so ftyp+moov (with a packet-derived dec3/dac3/dmlp)
+    /// is emitted here rather than at the first cut, then drop the primed fragment's bytes from the staging
+    /// file. The frame is genuine source audio, so the sample entry describes the real bitstream (Atmos/JOC
+    /// signaling included); discarding its fragment keeps the delivered segment exactly as planned, with no
+    /// out-of-place audio sample and no disjoint track ranges.
+    private func primeMoovWithAudioFrame(_ frame: [UInt8]) {
+        guard let ctx = formatContext, headerWritten, fd >= 0, !frame.isEmpty, !moovFlushed else { return }
+
+        // The prime is only safe if +frag_discont can be re-armed afterwards (see below), so prove that first:
+        // the flag is still set at this point (movenc consumes it on the first packet written), which makes
+        // this a no-op that only reports whether the option is reachable on this build.
+        guard let priv = ctx.pointee.priv_data,
+              av_opt_set(priv, "movflags", "+frag_discont", 0) >= 0 else {
+            EngineLog.emit(
+                "[MP4SegmentMuxer] AE#222 cannot re-arm +frag_discont on this build; skipping the moov prime "
+                + "(a prime without it would place the first real audio fragment at tfdt 0)",
+                category: .session
+            )
+            return
+        }
+
+        var pktOpt: UnsafeMutablePointer<AVPacket>? = av_packet_alloc()
+        guard let pkt = pktOpt else { return }
+        defer { av_packet_free(&pktOpt) }
+        guard av_new_packet(pkt, Int32(frame.count)) == 0, let dst = pkt.pointee.data else { return }
+        frame.withUnsafeBytes { src in
+            if let base = src.baseAddress { memcpy(dst, base, frame.count) }
+        }
+
+        // dts 0, deliberately, even though the frame's real position is later: the primed fragment is
+        // discarded, so its timestamp is never presented, and re-arming +frag_discont below makes the first
+        // REAL audio fragment carry its own dts regardless of what the prime claimed. Carrying the frame's
+        // real position instead would be wrong on a restart muxer, whose output axis starts mid-title, and
+        // would still need the same re-arm.
+        let dts: Int64 = 0
+        pkt.pointee.stream_index = audioOutputStreamIndex
+        pkt.pointee.pts = dts
+        pkt.pointee.dts = dts
+        pkt.pointee.duration = 0
+        pkt.pointee.flags |= AV_PKT_FLAG_KEY
+
+        let rc = av_interleaved_write_frame(ctx, pkt)
+        guard rc >= 0 else {
+            EngineLog.emit(
+                "[MP4SegmentMuxer] AE#222 moov prime write failed (\(rc)); first cut will defer instead",
+                category: .session
+            )
+            return
+        }
+        // Drain before the fragment flush: handle_eac3 runs in mov_write_packet, so the frame must leave the
+        // interleaver before mov_write_moov looks for its parsed bitstream.
+        _ = av_interleaved_write_frame(ctx, nil)
+        _ = av_write_frame(ctx, nil)
+        moovFlushed = true
+        _ = av_write_frame(ctx, nil)
+        audioPacketWritten = true
+
+        // Re-arm +frag_discont, which movenc consumed on the prime packet. Without this the next first-sample
+        // of each track is treated as CONTINUING the primed fragment: movenc rewrites it to
+        // `start_dts + track_duration` (movenc.c mov_write_single_packet) and tfdt is
+        // `cluster[0].dts - start_dts`, so the first real audio fragment would land at tfdt 0 no matter where
+        // its samples actually belong (measured: a 12 s audio start rendered at 0, i.e. 12 s out of sync).
+        // Re-armed, every track keeps the absolute-dts behaviour the session relies on (see the movflags
+        // comment in configureStreamsAndWriteHeader), primed or not.
+        _ = av_opt_set(ctx.pointee.priv_data, "movflags", "+frag_discont", 0)
+
+        discardStagedFragmentBytes()
+        EngineLog.emit(
+            "[MP4SegmentMuxer] AE#222 moov primed from a \(frame.count) B audio frame; "
+            + "primed fragment discarded",
+            category: .session
+        )
+    }
+
+    /// Reset the current staging file to empty. Used after a moov prime, whose fragment must not be served.
+    private func discardStagedFragmentBytes() {
+        guard fd >= 0 else { return }
+        guard ftruncate(fd, 0) == 0, lseek(fd, 0, SEEK_SET) == 0 else {
+            // Leaving primed bytes in front of the real fragment would serve a segment with an out-of-place
+            // audio sample; a wedge is recoverable, a mis-served segment is not.
+            EngineLog.emit(
+                "[MP4SegmentMuxer] AE#222 could not discard the primed fragment (errno=\(errno)); wedging",
+                category: .session
+            )
+            isWedged = true
+            return
+        }
+        byteCounter.bytesWrittenCurrentSegment = 0
+    }
+
     /// Finalize the current segment and rotate fd to a fresh staging file for `nextIdx`.
-    /// Returns `(path, bytes)` for the completed segment, or nil on any write failure.
+    /// Returns `.completed` for the finished segment, `.failed` on a write failure, or
+    /// `.deferredAwaitingAudioSampleEntry` when moov cannot be written yet (AE#222).
     /// +delay_moov first-cut wrinkle: second av_write_frame(nil) (gated by moovFlushed) handles
     /// FFmpeg splitting ftyp+moov and moof+mdat across calls; safe no-op if both arrived in one call.
-    func cutFragmentForNextSegment(_ nextIdx: Int) -> (path: URL, bytesWritten: Int)? {
-        guard let ctx = formatContext, headerWritten, fd >= 0 else { return nil }
+    func cutFragmentForNextSegment(_ nextIdx: Int) -> CutOutcome {
+        guard let ctx = formatContext, headerWritten, fd >= 0 else { return .failed }
+
+        // AE#222: the same precondition flushPendingFragment enforces. A first cut that would write moov for a
+        // packet-derived audio sample entry with no audio packet muxed yet fails -22 inside mov_write_moov,
+        // leaves zero bytes, and used to surface as a failed cut (= a dead pump, three identical revives, and
+        // a host fallback to server transcode). Reporting it as its own state lets the producer fetch a prime
+        // frame and retry, keeping the E-AC-3 / AC-3 / TrueHD stream-copy (and any Atmos) intact.
+        if audioNeedsParsedPacketForMoov, !audioPacketWritten, !moovFlushed {
+            return .deferredAwaitingAudioSampleEntry
+        }
 
         // Drain the interleaver first: av_write_frame(nil) bypasses it, so audio packets buffered
         // waiting for video DTS catch-up would spill into the next fragment (~4 trailing AC-3 frames
@@ -532,7 +663,7 @@ final class MP4SegmentMuxer {
 
         if completedFailed || completedBytes == 0 {
             try? FileManager.default.removeItem(at: completedPath)
-            return nil
+            return .failed
         }
 
         byteCounter.fragmentCuts += 1
@@ -551,10 +682,10 @@ final class MP4SegmentMuxer {
                 category: .session
             )
             isWedged = true
-            return (path: completedPath, bytesWritten: completedBytes)
+            return .completed(path: completedPath, bytesWritten: completedBytes)
         }
 
-        return (path: completedPath, bytesWritten: completedBytes)
+        return .completed(path: completedPath, bytesWritten: completedBytes)
     }
 
     /// Final teardown: flush remaining packets, write trailer (mfra discarded by splitter), close fd.
@@ -562,7 +693,11 @@ final class MP4SegmentMuxer {
     func finalize() -> (path: URL, bytesWritten: Int)? {
         defer { cleanup() }
 
-        guard let ctx = formatContext, headerWritten else {
+        // AE#222: same precondition as the cut. A teardown flush on a muxer that never got an audio packet
+        // cannot write moov either, so it would only emit two more -22s and a truncated file; there is nothing
+        // to salvage (no moov means no playable segment).
+        guard let ctx = formatContext, headerWritten,
+              !(audioNeedsParsedPacketForMoov && !audioPacketWritten && !moovFlushed) else {
             if fd >= 0 { close(fd); fd = -1 }
             try? FileManager.default.removeItem(at: currentStagingPath)
             return nil
@@ -726,6 +861,47 @@ final class MP4SegmentMuxer {
             AV_PKT_DATA_DOVI_CONF
         )
     }
+
+    /// AE#221: FLAC `STREAMINFO` with an illegal `min_blocksize`, clamped up to `max_blocksize`.
+    /// Returns nil when there is nothing to repair, or nothing to repair it with.
+    ///
+    /// The spec floor is 16; 0 shows up in the wild because an MKV -> MP4 remux copies the source
+    /// `CodecPrivate` verbatim and encoders that never rewrite `STREAMINFO` after a streaming pass leave the
+    /// field zeroed. libavcodec's decoder ignores it, so the source demuxes and plays everywhere else, but
+    /// CoreMedia validates it and rejects the whole audio sample description: the HLS asset fails to open
+    /// with `-12848` (surfacing as AVFoundation `-11829 "Cannot Open"`) on the first segment. Stream-copy
+    /// hands the source extradata straight to movenc, which writes it into `dfLa` byte for byte, so without
+    /// this the defect reaches every segment of the session.
+    ///
+    /// `max_blocksize` is the only blocksize the container attests to, so it is the sole honest clamp
+    /// target; when it is illegal too there is nothing to copy from and inventing a value would be a guess.
+    /// Bisected on the reporter's asset: `min_blocksize` alone decides whether the session opens, and
+    /// `total_samples` (equally wrong there, describing the pre-cut source) does not, so nothing else moves.
+    static func sanitizedFLACExtradata(
+        _ codecpar: UnsafePointer<AVCodecParameters>
+    ) -> [UInt8]? {
+        guard codecpar.pointee.codec_id == AV_CODEC_ID_FLAC,
+              let extradata = codecpar.pointee.extradata,
+              codecpar.pointee.extradata_size >= Int32(flacStreamInfoSize) else { return nil }
+
+        var bytes = [UInt8](UnsafeBufferPointer(start: extradata, count: Int(codecpar.pointee.extradata_size)))
+        let minBlockSize = UInt16(bytes[0]) << 8 | UInt16(bytes[1])
+        let maxBlockSize = UInt16(bytes[2]) << 8 | UInt16(bytes[3])
+        guard minBlockSize < flacMinimumBlockSize, maxBlockSize >= flacMinimumBlockSize else { return nil }
+
+        bytes[0] = UInt8(maxBlockSize >> 8)
+        bytes[1] = UInt8(maxBlockSize & 0xFF)
+        EngineLog.emit(
+            "[MP4SegmentMuxer] FLAC STREAMINFO min_blocksize=\(minBlockSize) is illegal, "
+            + "clamped to max_blocksize=\(maxBlockSize) so dfLa passes CoreMedia validation",
+            category: .session
+        )
+        return bytes
+    }
+
+    /// FLAC `STREAMINFO` payload length, and the spec's floor for both blocksize fields.
+    private static let flacStreamInfoSize = 34
+    private static let flacMinimumBlockSize: UInt16 = 16
 
     /// Replace codecpar.extradata using av_malloc + AV_INPUT_BUFFER_PADDING_SIZE pad.
     private static func replaceExtradata(

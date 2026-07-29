@@ -43,23 +43,21 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2 (build 51)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.1 (build 52)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2.1](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.1) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2/NuvioTV-3.2-unsigned-release.ipa)
+[NuvioTV-3.2.1-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.1/NuvioTV-3.2.1-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.2
+### New in Beta 3.2.1
 
-- Reworks Home loading, profile switching, row visibility, poster caching, grid focus, and add-on management for a faster and more stable browsing experience.
-- Fixes non-Cinemeta hero cards so focused titles can recover missing runtime and ongoing-status metadata without replacing the add-on's artwork or description.
-- Strengthens Continue Watching and provider synchronization with file-backed progress storage, remote-deletion reconciliation, profile isolation, queued refreshes, season-wide watched actions, and improved New Episode/New Season handling.
-- Adds Simkl ratings and recommendations, nested More Like This navigation, better episode focus restoration, and faster stream-picker feedback.
-- Upgrades AetherEngine with major fixes for HEVC startup, slow seeking, live/HLS playback, Atmos and audio teardown, bitmap subtitles, AirPlay, prebuffering, and playback recovery.
-- Accepts Stremio cast, director, and writer fields as either arrays or comma-separated strings so malformed optional metadata no longer drops an entire catalog page.
-- This beta needs broad testing, especially on physical Apple TV hardware. If something does not work, please message the maintainer with the provider, stream, and steps needed to reproduce it.
+- Adds TMDB and Trakt-backed collection browsing, localized metadata, person and production catalogs, configurable MDBList rating badges, and safer Stremio catalog URL encoding.
+- Improves Up Next data from Trakt and Simkl, shows same-day releases accurately, and remembers the last playable stream for URL-less Continue Watching rows.
+- Upgrades AetherEngine to 6.0.1 and FFmpegBuild to 2.4.0 with AirPlay/HLS recovery, bounded reader backpressure, subtitle link arbitration, container chapters, FLAC/E-AC-3 fixes, and hardware/software routing improvements.
+- Preserves subtitle styling and placement across ASS, SRT, WebVTT, and teletext, including software PiP rendering and retained-cue paths.
+- Adds broad regression coverage for provider collections, playback, subtitle, memory, seek, interlace, AirPlay, and muxing failures. Physical Apple TV testing is still needed.
 
 ### The new player
 

@@ -9,14 +9,22 @@ import AetherEngine
 /// and optionally activate an embedded subtitle track (`--subs <codec-or-lang>`)
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
-func runPlay(url: URL, seconds: Double, live: Bool, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false) -> Int32 {
+func runPlay(url: URL, seconds: Double, live: Bool, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], mallocCensus: Bool = false, forceSoftware: Bool = false,
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
-    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats))")
+    if mallocCensus {
+        AetherEngine.setLargeAllocationCensusEnabled(
+            true,
+            triggerThresholdMB: censusThresholdMB ?? 32,
+            triggerPollHz: censusHz ?? 8)
+    }
+    if forceSoftware { AetherEngine.setForceSoftwarePathForTesting(true) }
+    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")))")
     print("")
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -62,7 +70,7 @@ private final class AudioContinuityMonitor {
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = []) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -163,6 +171,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, dvrWindow: Dou
     print("")
 
     var subsSelected = false
+    var seekPatternIndex = 0
+    var seekLandings: [Double] = []
     let ticks = max(1, Int(seconds))
     for tick in 1...ticks {
         try? await Task.sleep(nanoseconds: 1_000_000_000)
@@ -190,12 +200,41 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, dvrWindow: Dou
             print("  HOSTCALL seekToLiveEdge()")
             await engine.seekToLiveEdge()
         }
+        // #220 repro affordance: a periodic short backward seek drives the subtitle drain
+        // through .resetAndDecode and re-anchors the #151 forward prefetcher, the churn a
+        // rebuffering remote source produces on its own. Steady-state runs cannot reach it.
+        if let seekEvery, seekEvery > 0, tick > 10, Double(tick).truncatingRemainder(dividingBy: seekEvery) == 0 {
+            // #240: `--seek-pattern` walks a list of absolute targets instead of the short
+            // backward hop, because the two exercise different machinery. A 6 s rewind lands in
+            // the segment cache and never restarts the producer; a far seek restarts it, and the
+            // landing budget it then runs against is what the #240 report is about. The elapsed
+            // time is printed per seek, which is the number under test.
+            let target: Double
+            if !seekPattern.isEmpty {
+                target = seekPattern[seekPatternIndex % seekPattern.count]
+                seekPatternIndex += 1
+            } else {
+                target = max(0, engine.currentTime - 6)
+            }
+            print(String(format: "  SEEKCHURN seek(to: %.2f)", target))
+            let began = DispatchTime.now()
+            await engine.seek(to: target)
+            let ms = Double(DispatchTime.now().uptimeNanoseconds - began.uptimeNanoseconds) / 1e6
+            seekLandings.append(ms)
+            print(String(format: "  SEEKLANDED target=%.2f in %.0fms (clock=%.2f)",
+                         target, ms, engine.currentTime))
+        }
         // Give the session a few seconds to settle before activating subtitles,
         // mirroring a user picking a track from the menu.
         if let subsPick, !subsSelected, tick >= 5 {
-            let match = engine.subtitleTracks.first {
-                $0.codec.localizedCaseInsensitiveContains(subsPick)
-                    || ($0.language?.localizedCaseInsensitiveContains(subsPick) ?? false)
+            let match: TrackInfo?
+            if let wanted = Int(subsPick) {
+                match = engine.subtitleTracks.first { $0.id == wanted }
+            } else {
+                match = engine.subtitleTracks.first {
+                    $0.codec.localizedCaseInsensitiveContains(subsPick)
+                        || ($0.language?.localizedCaseInsensitiveContains(subsPick) ?? false)
+                }
             }
             if let match {
                 print("  SELECT subtitle id=\(match.id) codec=\(match.codec) lang=\(match.language ?? "?")")
@@ -213,6 +252,12 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, dvrWindow: Dou
     tapTask?.cancel()
     print("")
     print("=== PLAY RESULT ===")
+    if !seekLandings.isEmpty {
+        let sorted = seekLandings.sorted()
+        print(String(format: "seek landings: n=%d min=%.0fms median=%.0fms max=%.0fms (%@)",
+                     sorted.count, sorted[0], sorted[sorted.count / 2], sorted[sorted.count - 1],
+                     sorted.map { String(format: "%.0f", $0) }.joined(separator: ", ")))
+    }
     if let monitor {
         print("audio continuity: \(monitor.summary)")
     }

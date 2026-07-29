@@ -29,6 +29,8 @@ enum TVScreen {
     case collectionFolder(TVCollectionFolderItem, collectionTitle: String)
     /// All titles from a production company or network.
     case productionBrowse(MetaCompany)
+    /// Movies and series associated with a TMDB person.
+    case personBrowse(TmdbPersonMetadata)
 }
 
 private enum PlaybackOrigin {
@@ -123,6 +125,8 @@ struct ContentView: View {
     @State private var pendingDeepLinkURL: URL?
     /// Details title to restore when leaving a production company browse.
     @State private var productionBrowseReturn: (id: String, type: String)?
+    /// Details title to restore when leaving a person browse.
+    @State private var personBrowseReturn: (id: String, type: String)?
     /// Titles to walk back through when Details opened Details ("More like
     /// this"). Empty means the current Details is the root of its chain and back
     /// belongs to Home.
@@ -208,7 +212,7 @@ struct ContentView: View {
                         }
                 }
 
-            case .main, .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse:
+            case .main, .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse, .personBrowse:
                 // The tab view (Home included) stays mounted for the whole
                 // session; Details and Player are presented as overlays on TOP
                 // of it rather than replacing it. Returning therefore leaves
@@ -362,7 +366,7 @@ struct ContentView: View {
     private var fullScreenOverlayPresented: Bool {
         if isResolvingContinueWatchingStream { return true }
         switch activeScreen {
-        case .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse: return true
+        case .details, .player, .cloudLibrary, .collectionFolder, .productionBrowse, .personBrowse: return true
         default: return false
         }
     }
@@ -403,6 +407,15 @@ struct ContentView: View {
                     activeScreen = .main
                 }
                 productionBrowseReturn = nil
+            }
+        case .personBrowse:
+            withAnimation(.easeInOut(duration: 0.24)) {
+                if let ret = personBrowseReturn {
+                    activeScreen = .details(id: ret.id, type: ret.type)
+                } else {
+                    activeScreen = .main
+                }
+                personBrowseReturn = nil
             }
         default:
             break
@@ -666,7 +679,18 @@ struct ContentView: View {
         playbackEpisodes = context.episodes
         playbackCurrentEpisode = context.current
 
-        let streamUrl = item.streamUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let profileId = profileViewModel.activeProfile?.id
+        let storedStreamUrl = item.isUpNextEntry
+            ? nil
+            : LastPlaybackStreamStore.load(
+                metaId: item.meta.id,
+                season: item.season,
+                episode: item.episode,
+                profileId: profileId
+            )
+        let streamUrl = [item.streamUrl, storedStreamUrl]
+            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .first { !$0.isEmpty } ?? ""
         if !streamUrl.isEmpty, let url = URL(string: streamUrl) {
             presentPlayback(
                 url: url,
@@ -679,7 +703,6 @@ struct ContentView: View {
         }
 
         isResolvingContinueWatchingStream = true
-        let profileId = profileViewModel.activeProfile?.id
         continueWatchingPlaybackTask = Task {
             let prepared: PreparedNextStream?
             if let episode = context.current {
@@ -929,6 +952,30 @@ struct ContentView: View {
                 .zIndex(1)
             }
 
+            if case .personBrowse(let person) = activeScreen {
+                PersonBrowseView(
+                    person: person,
+                    onSelect: { title in
+                        personBrowseReturn = nil
+                        withAnimation(.easeInOut(duration: 0.28)) {
+                            openDetailsRoot(id: title.id, type: title.type)
+                        }
+                    },
+                    onBack: {
+                        withAnimation(.easeInOut(duration: 0.24)) {
+                            if let ret = personBrowseReturn {
+                                activeScreen = .details(id: ret.id, type: ret.type)
+                            } else {
+                                activeScreen = .main
+                            }
+                            personBrowseReturn = nil
+                        }
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(1)
+            }
+
             if isResolvingContinueWatchingStream {
                 ContinueWatchingPlaybackLoadingView()
                     .transition(.opacity)
@@ -1129,6 +1176,12 @@ struct ContentView: View {
                 productionBrowseReturn = (contentId, contentType)
                 withAnimation(.easeInOut(duration: 0.28)) {
                     activeScreen = .productionBrowse(company)
+                }
+            },
+            onOpenPerson: { person in
+                personBrowseReturn = (contentId, contentType)
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    activeScreen = .personBrowse(person)
                 }
             }
         )
@@ -2084,6 +2137,10 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
+    @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
+    @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
+    @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
+    @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
 
     @State private var isLoading = true
     @State private var focusedMeta: NuvioMeta?
@@ -2135,6 +2192,10 @@ struct TVHomeView: View {
     /// there would let `defaultFocus` reclaim focus the moment Menu tries to
     /// hand it to the sidebar.
     @State private var isGridHeroFocused = false
+
+    private var tmdbHomeSettingsKey: String {
+        "\(tmdbEnabled)|\(tmdbLanguage)|\(tmdbUseArtwork)|\(tmdbUseBasicInfo)"
+    }
     @FocusState private var isLoadingFocusActive: Bool
     @FocusState private var focusedCardID: String?
 
@@ -2416,8 +2477,8 @@ struct TVHomeView: View {
             .ignoresSafeArea(.container, edges: [.top, .bottom])
 
         }
-        .task(id: contentIdentity) {
-            await loadWithAutomaticRetry(for: contentIdentity)
+        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
+            await loadWithAutomaticRetry(for: contentIdentity, forceReload: true)
             // Add-on metadata providers are configured by the time Home has
             // loaded, so this is the pass that recovers titles an earlier sync
             // could not resolve. Mirrors the phone's
@@ -3075,7 +3136,7 @@ struct TVHomeView: View {
 
     private func shouldDisplayContinueWatchingItem(_ item: ContinueWatchingItem) -> Bool {
         isVisible(item.meta)
-            && (showUnairedNextUp || !item.isUpNextEntry || item.hasAired)
+            && (showUnairedNextUp || !item.isUpNextEntry || item.hasAired || item.isAiringToday)
             && !ContinueWatchingDismissStore.isDismissed(item)
     }
 
@@ -3086,10 +3147,13 @@ struct TVHomeView: View {
     }
 
     @MainActor
-    private func loadWithAutomaticRetry(for identity: TVHomeContentIdentity) async {
+    private func loadWithAutomaticRetry(
+        for identity: TVHomeContentIdentity,
+        forceReload: Bool = false
+    ) async {
         let maximumAttempts = 3
         for attempt in 0..<maximumAttempts {
-            await load(for: identity)
+            await load(for: identity, forceReload: forceReload || attempt > 0)
             guard !Task.isCancelled else { return }
             if store.isLoaded(for: identity) {
                 // Add-on rows are best-effort, so a partial response is still
@@ -3270,8 +3334,9 @@ struct TVHomeView: View {
             let pendingItems: [NuvioMeta]
             let nextSkip: Int
             if let catalogItems = catalog.items {
-                items = Array(catalogItems.prefix(18))
-                pendingItems = Array(catalogItems.dropFirst(items.count))
+                let initialItems = Array(catalogItems.prefix(18))
+                items = await TmdbDetailsService.localizedMetadata(for: initialItems)
+                pendingItems = Array(catalogItems.dropFirst(initialItems.count))
                 // The add-on already returned these records, even though Home
                 // reveals them in smaller UI batches.
                 nextSkip = catalogItems.count
@@ -3412,7 +3477,7 @@ struct TVHomeView: View {
                 TVCollectionFolderItem(
                     collectionId: collection.id,
                     folder: folder,
-                    sources: folder.addonCatalogSources,
+                    sources: folder.resolvedSources,
                     viewMode: collection.viewMode,
                     showAllTab: collection.showAllTab
                 )
@@ -5571,7 +5636,7 @@ private enum CollectionFolderGridMetrics {
 private struct CollectionFolderCatalogRow: Identifiable {
     let id: String
     let title: String
-    let source: NuvioCollectionCatalogSource
+    let source: NuvioCollectionSource
     var items: [NuvioMeta]
     var nextSkip: Int
     var hasMore: Bool
@@ -5636,7 +5701,7 @@ struct CollectionFolderBrowseView: View {
         if let row = catalogRows.first(where: { $0.id == Self.sourceKey(source) }) {
             return row.items
         }
-        return items
+        return []
     }
 
     private var columns: [GridItem] {
@@ -5821,6 +5886,7 @@ struct CollectionFolderBrowseView: View {
         if sources.isEmpty {
             items = []
             catalogRows = []
+            errorMessage = "This folder has no sources."
             isLoading = false
             return
         }
@@ -5829,15 +5895,17 @@ struct CollectionFolderBrowseView: View {
         var rows: [CollectionFolderCatalogRow] = []
         var all: [NuvioMeta] = []
         var seen = Set<String>()
+        var firstFailure: Error?
+        let resolver = CollectionSourceResolver(repository: repository)
         for source in sources {
-            guard let page = try? await repository.browseCatalog(
-                addonId: source.addonId,
-                contentType: source.type,
-                catalogId: source.catalogId,
-                skip: 0,
-                genre: source.genre
-            ) else { continue }
-            let batch = Array(page.items.prefix(pageSize))
+            let page: CatalogPage
+            do {
+                page = try await resolver.browse(source)
+            } catch {
+                if firstFailure == nil { firstFailure = error }
+                continue
+            }
+            let batch = pageItems(page, source: source)
             var sourceIds = Set<String>()
             let resolved = batch.filter { sourceIds.insert($0.id).inserted }
             rows.append(
@@ -5846,7 +5914,12 @@ struct CollectionFolderBrowseView: View {
                     title: Self.sourceLabel(source),
                     source: source,
                     items: resolved,
-                    nextSkip: batch.count,
+                    nextSkip: nextCursor(
+                        page,
+                        source: source,
+                        requestedCursor: 0,
+                        receivedCount: batch.count
+                    ),
                     hasMore: page.hasMore && !batch.isEmpty
                 )
             )
@@ -5854,8 +5927,13 @@ struct CollectionFolderBrowseView: View {
                 all.append(meta)
             }
         }
-        catalogRows = rows.filter { !$0.items.isEmpty }
+        // Tabs must retain their source-to-row mapping even when one source is
+        // empty. Rows mode can omit empty strips.
+        catalogRows = usesRows ? rows.filter { !$0.items.isEmpty } : rows
         items = all
+        if items.isEmpty, let firstFailure {
+            errorMessage = firstFailure.localizedDescription
+        }
         isLoading = false
     }
 
@@ -5904,20 +5982,20 @@ struct CollectionFolderBrowseView: View {
 
         Task { @MainActor in
             do {
-                let page = try await repository.browseCatalog(
-                    addonId: source.addonId,
-                    contentType: source.type,
-                    catalogId: source.catalogId,
-                    skip: requestedSkip,
-                    genre: source.genre
-                )
+                let page = try await CollectionSourceResolver(repository: repository)
+                    .browse(source, cursor: requestedSkip)
                 guard let latestIndex = catalogRows.firstIndex(where: { $0.id == rowId }) else { return }
 
-                let batch = Array(page.items.prefix(pageSize))
+                let batch = pageItems(page, source: source)
                 var existingRowIds = Set(catalogRows[latestIndex].items.map(\.id))
                 let newItems = batch.filter { existingRowIds.insert($0.id).inserted }
                 catalogRows[latestIndex].items.append(contentsOf: newItems)
-                catalogRows[latestIndex].nextSkip = requestedSkip + batch.count
+                catalogRows[latestIndex].nextSkip = nextCursor(
+                    page,
+                    source: source,
+                    requestedCursor: requestedSkip,
+                    receivedCount: batch.count
+                )
                 catalogRows[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
                 catalogRows[latestIndex].isLoadingMore = false
 
@@ -5930,19 +6008,33 @@ struct CollectionFolderBrowseView: View {
         }
     }
 
-    private static func sourceKey(_ source: NuvioCollectionCatalogSource) -> String {
-        "\(source.addonId)_\(source.type)_\(source.catalogId)_\(source.genre ?? "")"
+    private func pageItems(
+        _ page: CatalogPage,
+        source: NuvioCollectionSource
+    ) -> [NuvioMeta] {
+        source.normalizedProvider == "addon"
+            ? Array(page.items.prefix(pageSize))
+            : page.items
     }
 
-    private static func sourceLabel(_ source: NuvioCollectionCatalogSource) -> String {
-        let type = source.type.capitalized
-        let name = source.catalogId
-            .replacingOccurrences(of: "_", with: " ")
-            .replacingOccurrences(of: "-", with: " ")
-        if let genre = source.genre, !genre.isEmpty {
-            return "\(name) (\(type)) · \(genre)"
+    private func nextCursor(
+        _ page: CatalogPage,
+        source: NuvioCollectionSource,
+        requestedCursor: Int,
+        receivedCount: Int
+    ) -> Int {
+        if source.normalizedProvider == "addon" {
+            return requestedCursor + receivedCount
         }
-        return "\(name) (\(type))"
+        return page.nextSkip ?? requestedCursor
+    }
+
+    private static func sourceKey(_ source: NuvioCollectionSource) -> String {
+        source.routeKey
+    }
+
+    private static func sourceLabel(_ source: NuvioCollectionSource) -> String {
+        CollectionSourceResolver.label(for: source)
     }
 }
 

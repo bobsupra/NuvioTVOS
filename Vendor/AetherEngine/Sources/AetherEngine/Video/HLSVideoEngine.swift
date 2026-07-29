@@ -343,6 +343,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// for subtitle cue lookup.
     var onPlaylistShiftChanged: (@Sendable (Double) -> Void)?
 
+    /// #240: link arbitration shared with the engine's subtitle side readers. Set by `AetherEngine`
+    /// before `start()`; nil when the session is driven without one (`aetherctl`, tests), which
+    /// leaves the readers ungated exactly as before.
+    var sideReaderLinkGate: SideReaderLinkGate?
+
     /// Fires when AVKit scrub drives a producer restart (AetherEngine#38). `(true, playlistTime)`
     /// at restart-run start; `(false, nil)` when settled. `playlistTime` folds with
     /// `playlistShiftSeconds` onto the source-PTS `seekTarget`.
@@ -453,6 +458,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// performRestart replaces it via the #79 fresh-demuxer path instead of seeking a connection
     /// that just failed (a sticky pb error would burn the revive gate without one fresh attempt).
     var mainDemuxerSuspectDead = false
+
+    /// AE#222 (under `restartLock`): one real audio frame from this source, kept for the whole session so
+    /// every muxer built from here on writes moov (with the packet-derived dec3/dac3/dmlp built from THIS
+    /// frame) at init. Set only after a pump proved the source cuts its first segment before any audio packet
+    /// arrives, which no probe can predict: movenc rejects an immediate moov for E-AC-3 regardless of
+    /// extradata, so a pre-flight cannot tell a video-first interleave apart from a healthy source.
+    var sessionAudioMoovPrimeFrame: [UInt8]?
+
+    /// AE#222 (under `restartLock`): bounded rebuild for a pump that deferred its first cut. One attempt is
+    /// enough by construction (the prime is captured before the restart and reused for the session's whole
+    /// life); the gate exists so a source that somehow defers again cannot restart-storm.
+    var audioSampleEntryPrimeGate = MuxerFailureReviveGate(maxAttempts: 1)
 
     /// AE#169 round 3 (under `restartLock`): bounded re-anchor for a VOD pump whose restart
     /// scan-forward gate starved to EOF (no runtime keyframe at/after the targeted plan boundary,
@@ -692,6 +709,27 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     // MARK: - Public API
 
+    /// AE#246: map a failed fallback open onto the error the caller sees.
+    ///
+    /// The fallback open runs when the load-time probe did not hand over a demuxer, which includes
+    /// the case where that probe failed for a transient reason. It is then the FIRST open to read
+    /// the source body, so it is the one that produces the reader's HLS classification. Interpolating
+    /// that typed error into `openFailed(reason:)` erased its domain and made a reroutable remote-HLS
+    /// source terminal; the classification is rethrown verbatim so `load()` can still reach the AE#154
+    /// reroute (`hlsPlaylistOnVODPath`) or the AE#140 fail-closed rejection (`hlsPlaylistOnRawLivePath`).
+    /// Every other failure keeps the historical wrapped shape.
+    static func openFailure(from error: Error) -> Error {
+        if let readerError = error as? AVIOReaderError {
+            switch readerError {
+            case .hlsPlaylistOnVODPath, .hlsPlaylistOnRawLivePath:
+                return readerError
+            default:
+                break
+            }
+        }
+        return HLSVideoEngineError.openFailed(reason: "\(error)")
+    }
+
     public func start() throws -> URL {
         guard demuxer == nil else { throw HLSVideoEngineError.alreadyStarted }
 
@@ -705,7 +743,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             do {
                 try dem.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: openProfile, isLive: isLiveSession)
             } catch {
-                throw HLSVideoEngineError.openFailed(reason: "\(error)")
+                throw Self.openFailure(from: error)
             }
         }
         demuxer = dem
@@ -1380,6 +1418,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             throw HLSVideoEngineError.openFailed(reason: "server URL not ready")
         }
         self.servingMasterPlaylist = useMasterPlaylist
+        self.servedSourceIsHDR = videoRange != .sdr
         EngineLog.emit("[HLSVideoEngine] serving on \(url.absoluteString) (dvModeAvailable=\(dvModeAvailable) effectiveDvMode=\(effectiveDvMode) panelIsHDR=\(panelIsInHDRMode) displaySupportsHDR=\(displaySupportsHDR) matchContent=\(matchContentEnabled) sourceIsHDR=\(videoRange != .sdr || effectiveDvMode) useMaster=\(useMasterPlaylist) videoRange=\(videoRange) dvVariant=\(dvVariant))")
         return url
     }
@@ -1454,6 +1493,18 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `true` when `start()` chose the master playlist (HDR/DV signaling). Read after `start()`.
     public private(set) var servingMasterPlaylist: Bool = false
 
+    /// `true` when the served variant advertises HDR (`VIDEO-RANGE` other than SDR), i.e. the master an
+    /// external receiver rejects (#227). Read after `start()`.
+    ///
+    /// Deliberately NOT `sourceIsHDR` (`videoRange != .sdr || effectiveDvMode`): `effectiveDvMode` is a
+    /// DEVICE capability, so that expression reads true for SDR content on any DV-capable iPhone or iPad and
+    /// sent every such source down the HDR branch (device log 2026-07-27: `sourceIsHDR=true videoRange=sdr
+    /// dvVariant=none`), which made the 5.23.8 AirPlay fix a no-op on exactly the devices it was written for.
+    /// `resolveUseMasterPlaylist` carries the same warning for the same reason (#15).
+    /// Internal on purpose: it feeds the engine's own AirPlay routing, and hosts read the consequence
+    /// (`AetherEngine.nativeSubtitleRenditionsServed`) rather than the input.
+    private(set) var servedSourceIsHDR: Bool = false
+
     /// The loopback server's media (single-variant) playlist URL, for the reactive master->media
     /// fallback (#98). Nil before the server starts.
     public var mediaPlaylistURL: URL? { server?.mediaPlaylistURL }
@@ -1464,6 +1515,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
     /// HDR-preserving reduced master URL (#98), subtitle-preserving fallback for the #35 cold-DV gate.
     public var reducedHDRMasterPlaylistURL: URL? { server?.reducedHDRMasterPlaylistURL }
+
+    /// True once the loopback server has handed out an init or media segment this session (#227). The
+    /// AirPlay watchdog reads it: a receiver that refuses the manifest asks for playlists and never for a
+    /// segment, which separates a refusal from a clock that is merely paused.
+    public var hasServedMediaSegment: Bool { server?.hasServedMediaSegment ?? false }
 
     /// Flip the serving flag after the engine has reloaded the media playlist on a display rejection.
     func markServingMediaAfterFallback() { servingMasterPlaylist = false }
@@ -1524,17 +1580,33 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// On-disk segment bytes (freshly stat-ed). Used by `aetherctl live --report-cache-bytes`.
     var segmentCacheDiskBytes: Int64 { subsystemSnapshot().cache?.diskBytes() ?? 0 }
 
-    /// Seconds of contiguously cached content ahead of the playhead on the media-playlist axis.
-    /// Reflects the disk SegmentCache read-ahead (what the Network Buffer setting controls), NOT
-    /// AVPlayer's shallow forward buffer. Returns 0 when nothing is cached ahead or the plan is empty.
+    /// Seconds of contiguous *safe* content ahead of the playhead on the media-playlist axis: what the
+    /// consumer already holds, plus what sits contiguously above it in the disk SegmentCache (which is
+    /// what the Network Buffer setting controls). Returns 0 when nothing is cached ahead or the plan is
+    /// empty.
+    ///
+    /// The frontier walk is anchored at `max(playhead, consumer fetch target)`, see
+    /// `SegmentCache.contiguousForwardFrontier(fromPlayhead:)`: the cache retains from
+    /// `fetchTarget - backwardWindow` upward, so under an opt-in whole-source prefetch the playhead's own
+    /// segment is evicted and a playhead-anchored walk collapsed to 0 while the whole band was resident
+    /// (#207 follow-up). A frontier below the playhead still reports 0, which keeps the #54 contract that
+    /// the frontier never trails the rendered frame.
+    ///
+    /// The target anchor holds only inside the consumer's current fetch sequence; a seek ends it, since
+    /// `declareTarget` lands at the destination while `currentTime()` still reports the position the seek
+    /// left, and the target would otherwise measure the band at the destination against that stale
+    /// playhead. What remains is bounded rather than seek-sized: a scrub shorter than the backward window
+    /// stays inside the sequence, so a tick or two around it can still anchor on the old target, and the
+    /// error is at most that window.
+    ///
     /// segmentIndexForPlaylistTime and the plan read each take restartLock briefly and sequentially
     /// (no nesting); a plan rebuilt between them at worst yields one transiently wrong tick, acceptable
     /// for a visual bar.
     func contiguousForwardReadAheadSeconds(playlistSeconds: Double) -> Double {
         guard let cache = subsystemSnapshot().cache else { return 0 }
-        let targetIdx = segmentIndexForPlaylistTime(playlistSeconds)
-        let frontier = cache.contiguousForwardFrontier(from: targetIdx)
-        guard frontier >= targetIdx else { return 0 }
+        let playheadIdx = segmentIndexForPlaylistTime(playlistSeconds)
+        let frontier = cache.contiguousForwardFrontier(fromPlayhead: playheadIdx)
+        guard frontier >= playheadIdx else { return 0 }
         restartLock.lock()
         defer { restartLock.unlock() }
         guard frontier >= 0, frontier < segmentPlan.count else { return 0 }
@@ -1745,8 +1817,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
             packedSideAudioStartPts: packedSideAudioStartPts,
             packedSideAudioFallbackDurationPts: packedSideAudioFallbackDurationPts,
             bufferAheadSegments: forwardWindowSegments,
-            prefetchDiskBudgetBytes: retentionBudgetBytes
+            prefetchDiskBudgetBytes: retentionBudgetBytes,
+            // AE#222: nil until a pump proved this source cuts its first segment before any audio packet
+            // arrives; from then on every producer of the session muxes moov from this frame.
+            audioMoovPrimeFrame: sessionAudioMoovPrimeFrame
         )
+        // #240: threaded onto every producer (initial + restart), like the wedge-detector providers
+        // below. The side readers read one gate for the whole session, so a restart must not leave
+        // a gap where nobody claims the link.
+        prod.sideReaderLinkGate = sideReaderLinkGate
         prod.onFirstHDR10PlusDetected = { [weak self] in
             self?.notifyHDR10PlusOnce()
         }

@@ -64,16 +64,20 @@ class DetailsViewModel: ObservableObject {
             }
 
             async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
+            async let creditsTask = TmdbDetailsService.fetchCredits(for: meta)
             async let tmdbRelatedTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
             async let traktRelatedTask = TraktDetailsService.fetchRelated(for: meta)
             async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
             async let simklTask = SimklDetailsService.fetchDetails(for: meta)
+            async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
 
             let companies = await companiesTask
+            let credits = await creditsTask
             let tmdbRelated = await tmdbRelatedTask
             let traktRelated = await traktRelatedTask
             let comments = await commentsTask
             let simkl = await simklTask
+            let mdbRatings = await mdbRatingsTask
 
             guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
 
@@ -90,6 +94,13 @@ class DetailsViewModel: ObservableObject {
                 .first { !$0.isEmpty } ?? []
 
             uiState.companies = companies
+            if let credits, !credits.isEmpty, let currentMeta = uiState.meta {
+                uiState.meta = credits.applying(to: currentMeta)
+                uiState.people = credits.people
+            }
+            if let currentMeta = uiState.meta {
+                uiState.meta = currentMeta.withExternalRatings(mdbRatings)
+            }
             uiState.moreLikeThis = moreLikeThis
             uiState.comments = comments
             uiState.simklRatings = simkl?.ratings

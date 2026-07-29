@@ -50,6 +50,11 @@ final class EmbeddedSubtitleDecoder {
     /// #107: explicit teletext page override (nil = libzvbi `subtitle` auto-detect).
     private let teletextPage: Int?
 
+    /// #233: coordinate space `\pos` is expressed in. A real ASS track declares its own PlayResX/Y
+    /// in the header libavcodec hands over as extradata; every event line libavcodec synthesises
+    /// for SRT, WebVTT or teletext uses the default 384x288 instead.
+    private let assPlayRes: CGSize
+
     /// Open the subtitle decoder for `stream`. Returns `nil` if the codec couldn't be opened.
     init?(stream: UnsafeMutablePointer<AVStream>, sourceVideoWidth: Int32, sourceVideoHeight: Int32, preserveASSMarkup: Bool = false, teletextPage: Int? = nil) {
         guard let codecpar = stream.pointee.codecpar,
@@ -91,6 +96,14 @@ final class EmbeddedSubtitleDecoder {
         self.preserveASSMarkup = preserveASSMarkup
             && (id == AV_CODEC_ID_ASS || id == AV_CODEC_ID_SSA)
         self.teletextPage = teletextPage
+
+        var playRes = SubtitleRectText.defaultASSPlayRes
+        if let extra = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            let header = String(decoding: UnsafeBufferPointer(
+                start: extra, count: Int(codecpar.pointee.extradata_size)), as: UTF8.self)
+            if let declared = SubtitleRectText.playRes(fromASSHeader: header) { playRes = declared }
+        }
+        self.assPlayRes = playRes
 
         // Some demuxers default to AVDISCARD_DEFAULT and swallow packets; force NONE so everything reaches av_read_frame.
         stream.pointee.discard = AVDISCARD_NONE
@@ -185,17 +198,33 @@ final class EmbeddedSubtitleDecoder {
 
         var bodies: [SubtitleCue.Body] = []
         var textLines: [String] = []
+        var placement: SubtitleTextPlacement?
         if sub.num_rects > 0, let rects = sub.rects {
             for i in 0..<Int(sub.num_rects) {
                 guard let rect = rects[i] else { continue }
                 if isTeletext, let assLine = SubtitleRectText.rawASSLine(for: rect) {
-                    // Teletext decodes as ASS (txt_format=ass); parse colour runs (#107). Falls back
-                    // to plain text inside teletextBody when the page carries no colour.
-                    if let body = SubtitleRectText.teletextBody(fromASSEventLine: assLine) {
-                        bodies.append(body)
+                    // Teletext decodes as ASS (txt_format=ass); parse styled runs (#107 colour,
+                    // #233 the rest). Falls back to plain text inside teletextBody when the page
+                    // carries no styling.
+                    if let parsed = SubtitleRectText.teletextBody(fromASSEventLine: assLine,
+                                                                 playRes: assPlayRes) {
+                        bodies.append(parsed.body)
+                        placement = placement ?? parsed.placement
                     }
                 } else if preserveASSMarkup, let raw = SubtitleRectText.rawASSLine(for: rect) {
                     textLines.append(raw)
+                } else if let assLine = SubtitleRectText.rawASSLine(for: rect),
+                          let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine,
+                                                                  playRes: assPlayRes) {
+                    // #233: libavcodec converts every text format to an ASS event line, so SRT,
+                    // WebVTT and ASS all keep their styling here. An unstyled cue still comes back
+                    // as .text and merges with its siblings below, exactly as the plain path did.
+                    placement = placement ?? parsed.placement
+                    if case .text(let t) = parsed.body {
+                        textLines.append(t)
+                    } else {
+                        bodies.append(parsed.body)
+                    }
                 } else if let text = SubtitleRectText.plainText(for: rect) {
                     textLines.append(text)
                 } else if let image = Self.imageForSubtitleRect(
@@ -208,6 +237,11 @@ final class EmbeddedSubtitleDecoder {
             }
         }
         avsubtitle_free(&sub)
+
+        // #233: WebVTT cue settings never reach the ASS event line (the decoder drops them), but
+        // the demuxer keeps them on the packet, and the #112 store carries them through a rebuild.
+        // An ASS `\an` / `\pos` still wins, since that came from the payload itself.
+        placement = placement ?? WebVTTCueSettings.placement(onPacket: packet)
 
         let merged = textLines
             .joined(separator: "\n")
@@ -240,7 +274,10 @@ final class EmbeddedSubtitleDecoder {
                 case .richText(let runs):
                     return "t:" + runs.map { run in
                         let c = run.color.map { "\($0.r),\($0.g),\($0.b)" } ?? "-"
-                        return "\(run.text)#\(c)"
+                        // #233: two cues differing only in styling are distinct events.
+                        let s = "\(run.isBold)\(run.isItalic)\(run.isUnderlined)"
+                            + "\(run.isStruckThrough)\(run.fontName ?? "-")\(run.fontSize ?? -1)"
+                        return "\(run.text)#\(c)#\(s)"
                     }.joined(separator: "\u{1E}")
                 case .image(let img):
                     // Dimensions + position discriminate cheaply; identical-rect repeats are the target case.
@@ -256,11 +293,16 @@ final class EmbeddedSubtitleDecoder {
         nextCueID += bodies.count
 
         let cues: [SubtitleCue] = bodies.enumerated().map { (offset, body) in
-            SubtitleCue(
+            // Placement is the text equivalent of a bitmap rect's geometry, so an image body keeps
+            // carrying its own and never takes the cue-level one.
+            var cuePlacement = placement
+            if case .image = body { cuePlacement = nil }
+            return SubtitleCue(
                 id: cueIDStart + offset,
                 startTime: startTime,
                 endTime: endTime,
-                body: body
+                body: body,
+                placement: cuePlacement
             )
         }
 

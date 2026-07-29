@@ -77,6 +77,11 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var transferSession: VTPixelTransferSession?
     private var loggedTransferFailure = false
 
+    /// #220: a send failure that survives the drain-and-retry is release-visible once per
+    /// decoder, so a wedge that is a genuine decode error is distinguishable in a field log
+    /// from one that is not.
+    private var loggedSendFailure = false
+
     func open(stream: UnsafeMutablePointer<AVStream>, onFrame: @escaping DecodedFrameHandler) throws {
         self.onFrame = onFrame
         deinterlacer.config = deinterlaceConfig
@@ -137,13 +142,57 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
     }
 
+    /// What to do with a packet after `avcodec_send_packet` returned `ret` (#220).
+    enum PacketSendDisposition: Equatable {
+        /// The decoder took the packet.
+        case accepted
+        /// `AVERROR(EAGAIN)`: the packet was NOT consumed. The decoder's output queue is full
+        /// and has to be read before it accepts more input, which is legal at any time under
+        /// frame threading (a packet that yields no frame, reorder delay, thread_count packets
+        /// in flight). Drain, then send the same packet again.
+        case drainAndRetry
+        /// A real decode error. Drop the packet; the decoder stays usable for the next one.
+        case dropped
+    }
+
+    nonisolated static func disposition(forSendResult ret: Int32) -> PacketSendDisposition {
+        if ret >= 0 { return .accepted }
+        return ret == FFmpegErr.eagain ? .drainAndRetry : .dropped
+    }
+
+    /// Feed one packet and deliver whatever the decoder produces.
+    ///
+    /// #220: this used to `return` on any negative send result without draining. EAGAIN is not
+    /// an error, and returning on it both dropped the packet and left the output queue full, so
+    /// every subsequent send hit the same wall: video wedged permanently until a seek flushed
+    /// the decoder, while audio kept playing.
     func decode(packet: UnsafeMutablePointer<AVPacket>) {
         lock.lock()
         guard let ctx = codecContext else { lock.unlock(); return }
+        var sendRet = avcodec_send_packet(ctx, packet)
+        lock.unlock()
 
-        let sendRet = avcodec_send_packet(ctx, packet)
-        guard sendRet >= 0 else { lock.unlock(); return }
+        if Self.disposition(forSendResult: sendRet) == .drainAndRetry {
+            drainDecodedFrames()
+            lock.lock()
+            sendRet = codecContext == nil ? FFmpegErr.einval : avcodec_send_packet(ctx, packet)
+            lock.unlock()
+        }
+        if Self.disposition(forSendResult: sendRet) == .dropped, !loggedSendFailure {
+            loggedSendFailure = true
+            EngineLog.emit("[SWDecoder] send_packet returned \(sendRet); packet dropped (logged once)",
+                           category: .swPlayback)
+        }
+        // Drain regardless: a dropped packet does not invalidate frames the decoder already holds.
+        drainDecodedFrames()
+    }
 
+    /// Pull every frame the decoder can currently produce, through the deinterlacer when one is
+    /// active. Exits on EAGAIN (needs more input) or EOF, the same condition the receive loop
+    /// has always used.
+    private func drainDecodedFrames() {
+        lock.lock()
+        guard let ctx = codecContext else { lock.unlock(); return }
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
         guard let f = frame else { lock.unlock(); return }
         lock.unlock()

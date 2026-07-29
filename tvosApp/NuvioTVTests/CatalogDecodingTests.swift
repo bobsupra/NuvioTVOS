@@ -7,6 +7,96 @@ import XCTest
 final class CatalogDecodingTests: XCTestCase {
     private let decoder = JSONDecoder()
 
+    func testCollectionFolderPreservesTmdbAndTraktSources() throws {
+        let json = """
+        {
+          "id": "collection",
+          "title": "My collection",
+          "folders": [{
+            "id": "mixed",
+            "title": "Mixed sources",
+            "sources": [
+              {
+                "provider": "tmdb",
+                "tmdbSourceType": "COMPANY",
+                "title": "Pixar",
+                "tmdbId": 3,
+                "mediaType": "movie",
+                "sortBy": "popularity.desc"
+              },
+              {
+                "provider": "trakt",
+                "title": "Watchlist",
+                "traktListId": 123456,
+                "mediaType": "tv",
+                "sortBy": "added",
+                "sortHow": "desc"
+              }
+            ]
+          }]
+        }
+        """
+
+        let collection = try decoder.decode(
+            NuvioCollection.self,
+            from: Data(json.utf8)
+        )
+        let sources = try XCTUnwrap(collection.folders.first?.resolvedSources)
+
+        XCTAssertEqual(sources.count, 2)
+        XCTAssertEqual(sources[0].normalizedProvider, "tmdb")
+        XCTAssertEqual(sources[0].tmdbSourceType, "COMPANY")
+        XCTAssertEqual(sources[0].tmdbId, 3)
+        XCTAssertEqual(sources[1].normalizedProvider, "trakt")
+        XCTAssertEqual(sources[1].traktListId, 123456)
+        XCTAssertEqual(sources[1].mediaType, "tv")
+    }
+
+    func testCollectionFolderPromotesLegacyAddonCatalogSources() throws {
+        let json = """
+        {
+          "id": "collection",
+          "title": "Legacy collection",
+          "folders": [{
+            "id": "legacy",
+            "title": "Legacy folder",
+            "catalogSources": [{
+              "addonId": "https://example.com/manifest.json",
+              "type": "movie",
+              "catalogId": "popular",
+              "genre": "Science Fiction"
+            }]
+          }]
+        }
+        """
+
+        let collection = try decoder.decode(
+            NuvioCollection.self,
+            from: Data(json.utf8)
+        )
+        let source = try XCTUnwrap(collection.folders.first?.resolvedSources.first)
+
+        XCTAssertEqual(source.normalizedProvider, "addon")
+        XCTAssertEqual(source.catalogId, "popular")
+        XCTAssertEqual(source.genre, "Science Fiction")
+    }
+
+    func testStremioCatalogURLDoesNotDoubleEncodeGenre() throws {
+        let url = try StremioCatalogURLBuilder.url(
+            baseURL: try XCTUnwrap(URL(string: "https://example.com/config")),
+            type: "movie",
+            catalogId: "top",
+            skip: 100,
+            genre: "Crime & Mystery"
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://example.com/config/catalog/movie/top/genre=Crime%20%26%20Mystery&skip=100.json"
+        )
+        XCTAssertFalse(url.absoluteString.contains("%2520"))
+    }
+
     func testAcceptsSpecCompliantStringArray() throws {
         let people = try decoder.decode(
             FlexibleStringArray.self,

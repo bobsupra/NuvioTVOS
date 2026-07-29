@@ -15,8 +15,10 @@ enum VideoRoutingPolicy {
     /// native AVPlayer. `av1Available` is `VTCapabilityProbe.av1Available` (HW AV1 decode support).
     /// #150: `spsIndicatesInterlaced` (SPS frame_mbs_only_flag == 0) breaks the tie when the demuxer's
     /// field_order probe stays UNKNOWN; a concrete PROGRESSIVE probe analyzed actual frames and wins.
-    /// A false positive only costs an unnecessary SW decode (deint=interlaced passes progressive
-    /// frames through untouched), never a wrong deinterlace.
+    /// A false positive costs an unnecessary SW decode (deint=interlaced passes progressive frames
+    /// through untouched), never a wrong deinterlace. #232 narrows that class: on a seekable VOD
+    /// source the declaration is checked against decoded frames before it routes (see
+    /// `InterlaceProbe` and `routesSoftwareForDeclaredInterlace`).
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
@@ -30,11 +32,26 @@ enum VideoRoutingPolicy {
              AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1:
             return true
         case AV_CODEC_ID_H264:
-            if interlacedFieldOrders.contains(fieldOrder) { return true }
-            return fieldOrder == AV_FIELD_UNKNOWN && spsIndicatesInterlaced
+            return routesSoftwareForDeclaredInterlace(
+                codecID: codecID, fieldOrder: fieldOrder,
+                spsIndicatesInterlaced: spsIndicatesInterlaced)
         default:
             return false
         }
+    }
+
+    /// #232: true when the declared-interlace rule, and only that rule, is what sends this stream to
+    /// software. That is the single routing decision `InterlaceProbe` is allowed to overrule, so the
+    /// load path asks this before paying for a decode sample: a codec that is software-bound anyway
+    /// (MPEG-2, VC-1, AV1 without HW) must not trigger a probe whose answer changes nothing.
+    static func routesSoftwareForDeclaredInterlace(
+        codecID: AVCodecID,
+        fieldOrder: AVFieldOrder,
+        spsIndicatesInterlaced: Bool
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_H264 else { return false }
+        if interlacedFieldOrders.contains(fieldOrder) { return true }
+        return fieldOrder == AV_FIELD_UNKNOWN && spsIndicatesInterlaced
     }
 
     /// #150: pure extradata classifier feeding `spsIndicatesInterlaced`. Accepts Annex-B (MPEG-TS) and

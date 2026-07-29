@@ -626,11 +626,62 @@ public struct SubtitleColor: Sendable, Equatable {
     public init(r: UInt8, g: UInt8, b: UInt8) { self.r = r; self.g = g; self.b = b }
 }
 
-/// One contiguous same-colour span of a rich-text cue.
+/// One contiguous same-styling span of a rich-text cue.
+///
+/// #233: libavcodec converts every text subtitle format to an ASS event line before the engine
+/// sees it, so SRT (`<b>`, `<font color/size/face>`), WebVTT (`<i>/<b>/<u>`), teletext and ASS
+/// itself all arrive carrying the same override tags and populate the same fields here. A run
+/// with no attribute set is plain text; those cues stay `.text` rather than becoming `.richText`.
 public struct SubtitleTextRun: Sendable, Equatable {
     public let text: String
     public let color: SubtitleColor?
-    public init(text: String, color: SubtitleColor?) { self.text = text; self.color = color }
+    public let isBold: Bool
+    public let isItalic: Bool
+    public let isUnderlined: Bool
+    public let isStruckThrough: Bool
+    /// Face requested by `\fn` (SRT `<font face=>`); nil means the host's default.
+    public let fontName: String?
+    /// Size requested by `\fs` (SRT `<font size=>`), in ASS play-resolution points, so it is a
+    /// relative hint rather than a pixel size; nil means the host's default.
+    public let fontSize: Int?
+
+    public init(text: String, color: SubtitleColor?,
+                isBold: Bool = false, isItalic: Bool = false,
+                isUnderlined: Bool = false, isStruckThrough: Bool = false,
+                fontName: String? = nil, fontSize: Int? = nil) {
+        self.text = text
+        self.color = color
+        self.isBold = isBold
+        self.isItalic = isItalic
+        self.isUnderlined = isUnderlined
+        self.isStruckThrough = isStruckThrough
+        self.fontName = fontName
+        self.fontSize = fontSize
+    }
+
+    /// True when the run asks for anything beyond plain text. Drives the `.text` / `.richText`
+    /// choice, so an unstyled track keeps the body it has always had.
+    public var isStyled: Bool {
+        color != nil || isBold || isItalic || isUnderlined || isStruckThrough
+            || fontName != nil || fontSize != nil
+    }
+}
+
+/// Where a text cue asks to be drawn, from the ASS `\an` / `\pos` overrides (#233).
+///
+/// Bitmap cues carry their own geometry on `SubtitleImage`; this is the text equivalent and is nil
+/// for the overwhelming majority of cues, which simply want the host's default placement.
+public struct SubtitleTextPlacement: Sendable, Equatable {
+    /// ASS numpad alignment from `\an`: 1 bottom-left through 9 top-right, 5 centred.
+    public let alignment: Int?
+    /// Anchor from `\pos`, normalized to [0, 1] against the source video frame the same way
+    /// `SubtitleImage.position` is, with y measured from the top.
+    public let position: CGPoint?
+
+    public init(alignment: Int?, position: CGPoint?) {
+        self.alignment = alignment
+        self.position = position
+    }
 }
 
 /// Decoded subtitle cue (start/end in container seconds). Payload is plain text (SubRip / ASS / SSA / WebVTT / mov_text), coloured rich text (teletext / ASS colour tags), or a rendered bitmap (PGS / DVB / HDMV) with position normalized against the source video frame.
@@ -641,6 +692,10 @@ public struct SubtitleCue: Identifiable, Sendable {
     public let startTime: Double
     public let endTime: Double
     public let body: Body
+    /// #233: placement the source asked for, from ASS `\an` / `\pos`. nil means the host places the
+    /// cue itself, which is the case for nearly every cue. Text cues only; a bitmap cue carries its
+    /// geometry on `SubtitleImage`.
+    public let placement: SubtitleTextPlacement?
 
     public enum Body: Sendable {
         case text(String)
@@ -648,11 +703,13 @@ public struct SubtitleCue: Identifiable, Sendable {
         case richText([SubtitleTextRun])
     }
 
-    public init(id: Int, startTime: Double, endTime: Double, body: Body) {
+    public init(id: Int, startTime: Double, endTime: Double, body: Body,
+                placement: SubtitleTextPlacement? = nil) {
         self.id = id
         self.startTime = startTime
         self.endTime = endTime
         self.body = body
+        self.placement = placement
     }
 
     /// Plain text for text and rich-text cues (rich runs concatenated); nil for bitmap cues.
@@ -670,6 +727,25 @@ public struct SubtitleCue: Identifiable, Sendable {
     public var isForced: Bool {
         if case .image(let image) = body { return image.isForced }
         return false
+    }
+}
+
+extension SubtitleCue {
+    /// Copy of this cue with only the named fields changed; everything else is carried across.
+    ///
+    /// #233 follow-up (tresby): the store operations rebuild a cue to change one field, and every
+    /// one of them did it by calling the memberwise initializer with the fields it happened to know
+    /// about. `placement` is defaulted there for source compatibility, so each of those call sites
+    /// dropped it and still compiled, and `insertCueSorted` stamps every cue entering the retained
+    /// store, which meant no embedded track could ever deliver a placement to a host. Rebuilding
+    /// through here instead makes the carry-over the default and the drop impossible to write by
+    /// accident, including for whatever field is added to the cue next.
+    func with(id: Int? = nil, endTime: Double? = nil, body: Body? = nil) -> SubtitleCue {
+        SubtitleCue(id: id ?? self.id,
+                    startTime: startTime,
+                    endTime: endTime ?? self.endTime,
+                    body: body ?? self.body,
+                    placement: placement)
     }
 }
 

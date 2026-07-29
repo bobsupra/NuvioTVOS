@@ -9,6 +9,7 @@ import UIKit
 
 #if os(tvOS)
 import AVKit
+import QuartzCore
 #endif
 
 /// HDMI HDR-mode handshake via AVDisplayManager (tvOS 11.2+). Programs AVDisplayCriteria before playback so the panel finishes its mode negotiation before the first frame. No-op stub on iOS/macOS. Lifted from Sodalite's PlayerViewModel so the engine owns the handshake; hosts no longer touch UIWindow.avDisplayManager.
@@ -268,6 +269,27 @@ final class DisplayCriteriaController {
         #endif
     }
 
+    /// Measure the refresh rate the panel is actually running at, by timing display-link ticks over
+    /// `ticks` callbacks (~0.7 s at 60 Hz). tvOS exposes no read-back of the mode a criteria write landed
+    /// on (`UIScreen.maximumFramesPerSecond` reports what the screen is capable of, not the active HDMI
+    /// mode), so this is the only evidence that separates a panel which ignored the criteria and kept the
+    /// system rate from one that took a rate not dividing the content rate (60.000 for 29.970 content).
+    /// Returns the measured rate plus the mode's nominal rate from the link's frame duration.
+    func measureRefreshRate(ticks: Int = 40) async -> (measured: Double, nominal: Double)? {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return nil }
+        let sampler = DisplayLinkSampler()
+        sampler.start(screen: window.screen)
+        for _ in 0..<120 {
+            if sampler.tickCount >= ticks { break }
+            try? await Task.sleep(for: .milliseconds(10))
+        }
+        return sampler.finish()
+        #else
+        return nil
+        #endif
+    }
+
     /// True when UIScreen.currentEDRHeadroom > 1.001 after apply() + waitForSwitch() settle. Reading headroom post-settle is the only authoritative way to distinguish Match Dynamic Range ON vs. rate-only (no public per-sub-toggle API).
     func currentPanelIsHDR() -> Bool {
         #if os(tvOS)
@@ -318,5 +340,39 @@ private final class SwitchFlag: @unchecked Sendable {
     private var value = false
     var fired: Bool { lock.lock(); defer { lock.unlock() }; return value }
     func fire() { lock.lock(); value = true; lock.unlock() }
+}
+
+/// Times display-link ticks so the caller can read the active HDMI mode's refresh rate. Enough ticks
+/// separate 59.940 from 60.000 (a 0.1% miss against 29.970 content is a repeated frame every ~16 s).
+@MainActor
+private final class DisplayLinkSampler: NSObject {
+    private var link: CADisplayLink?
+    private var firstTimestamp: CFTimeInterval = 0
+    private var lastTimestamp: CFTimeInterval = 0
+    private var nominalDuration: CFTimeInterval = 0
+    private(set) var tickCount = 0
+
+    func start(screen: UIScreen) {
+        let link = screen.displayLink(withTarget: self, selector: #selector(tick(_:)))
+        link?.add(to: .main, forMode: .common)
+        self.link = link
+    }
+
+    @objc private func tick(_ link: CADisplayLink) {
+        nominalDuration = link.targetTimestamp - link.timestamp
+        if tickCount == 0 { firstTimestamp = link.timestamp }
+        lastTimestamp = link.timestamp
+        tickCount += 1
+    }
+
+    func finish() -> (measured: Double, nominal: Double)? {
+        link?.invalidate()
+        link = nil
+        guard tickCount >= 2, lastTimestamp > firstTimestamp else { return nil }
+        return (
+            measured: Double(tickCount - 1) / (lastTimestamp - firstTimestamp),
+            nominal: nominalDuration > 0 ? 1.0 / nominalDuration : 0
+        )
+    }
 }
 #endif

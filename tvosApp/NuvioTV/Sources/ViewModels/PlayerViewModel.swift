@@ -2702,6 +2702,14 @@ class PlayerViewModel: ObservableObject {
         let season = resolvedEpisodeNumbers?.season
         let episode = resolvedEpisodeNumbers?.episode
         let completesPlayback = shouldMarkAsWatched(at: progressTime)
+        if !completesPlayback {
+            LastPlaybackStreamStore.save(
+                metaId: activeMeta.id,
+                url: activeStreamURL,
+                season: season,
+                episode: episode
+            )
+        }
         if usesTraktProgress {
             reportTraktProgress(
                 meta: activeMeta,

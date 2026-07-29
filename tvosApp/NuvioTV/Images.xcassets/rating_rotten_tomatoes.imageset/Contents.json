@@ -1,0 +1,13 @@
+{
+  "images" : [
+    {
+      "filename" : "rating_rotten_tomatoes.png",
+      "idiom" : "universal",
+      "scale" : "1x"
+    }
+  ],
+  "info" : {
+    "author" : "xcode",
+    "version" : 1
+  }
+}

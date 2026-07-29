@@ -237,6 +237,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedFirstDiscontinuity: Bool = false
 
     private let targetSegmentDurationSeconds: Double
+    /// AE#222: real audio frame handed to every muxer this producer builds, so moov (with its packet-derived
+    /// dec3/dac3/dmlp) is written at init instead of at the first cut. nil on a normal session.
+    private let audioMoovPrimeFrame: [UInt8]?
+    /// Latched when a cut deferred for want of an audio sample entry; the pump then scans forward for one
+    /// real audio frame and exits with `.needsAudioSampleEntryPrime` so the host can rebuild primed.
+    private var cutDeferredAwaitingAudioSampleEntry: Bool = false
+    private var _capturedAudioMoovPrimeFrame: [UInt8]?
+    /// Frame captured by the pump's prime scan; read by the host after the pump exits.
+    var capturedAudioMoovPrimeFrame: [UInt8]? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _capturedAudioMoovPrimeFrame
+    }
     private var currentMuxer: MP4SegmentMuxer?
     private var currentMuxerSegmentIndex: Int = .min
 
@@ -290,6 +303,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var audioWaitForVideo: Bool
     private var firstActualVideoDts: Int64 = Int64.min
     private var firstActualAudioDts: Int64 = Int64.min
+
+    /// #240: link arbitration. The pump claims the link while it is pulling from the source and
+    /// releases it while parked, so the subtitle side readers (a second full copy of the stream on
+    /// Matroska) can tell "the video path needs the bytes" from "the buffer is full". Set once
+    /// before `start()`; nil for hosts that drive the engine without one (`aetherctl`, tests).
+    var sideReaderLinkGate: SideReaderLinkGate?
 
     /// Forward-only producer restart counter; surfaced in live telemetry. Written on pump thread, read under packetCounterLock.
     var restartCount: Int {
@@ -393,6 +412,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
     private static let pregateLogInterval = 200
+    /// AE#222 prime-scan bounds. 128 MiB is ~17 s of 60 Mbit/s UHD video, well past any real interleave gap
+    /// (the reported source's audio starts ~4 s in), and the timeout covers a slow source rather than a
+    /// far-away audio track.
+    private static let moovPrimeScanByteCap = 128 * 1024 * 1024
+    private static let moovPrimeScanTimeoutSeconds: TimeInterval = 30
 
     /// Desired tfdt for each stream: 0 for baseIndex==0; plan[baseIndex].startSeconds for restarts.
     private let desiredFirstVideoTfdtPts: Int64
@@ -533,6 +557,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         case stopRequested
         case readError(code: Int32)
         case muxerFailed
+        /// AE#222: the first cut could not write moov because the audio sample entry is packet-derived
+        /// (E-AC-3/AC-3/TrueHD) and the source's first segment carries no audio packet. The pump captured a
+        /// real audio frame on its way out (`capturedAudioMoovPrimeFrame`); the host rebuilds with it as the
+        /// muxer's moov prime, which keeps the stream-copy (and any Atmos) instead of falling back.
+        case needsAudioSampleEntryPrime
         /// No AV_PKT_FLAG_KEY video packet within timeout; live only (VOD waits unbounded).
         case keyframeStarvation
         /// Backward PTS reset to session origin after unplanned reconnect: server replay-from-start, exits terminally.
@@ -550,6 +579,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .stopRequested: return "stopRequested"
             case .readError(let code): return "readError(\(code))"
             case .muxerFailed: return "muxerFailed"
+            case .needsAudioSampleEntryPrime: return "needsAudioSampleEntryPrime"
             case .keyframeStarvation: return "keyframeStarvation"
             case .sourceReplay: return "sourceReplay"
             case .segmentStall: return "segmentStall"
@@ -680,8 +710,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packedSideAudioStartPts: Int64? = nil,
         packedSideAudioFallbackDurationPts: Int64 = 0,
         bufferAheadSegments: Int = 10,
-        prefetchDiskBudgetBytes: Int = 0
+        prefetchDiskBudgetBytes: Int = 0,
+        audioMoovPrimeFrame: [UInt8]? = nil
     ) throws {
+        self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
         self.demuxer = demuxer
@@ -943,6 +975,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private func awaitBackpressureRelease(target: Int, head: Int, context: String) -> Bool {
         // Already broken on this session (e.g. a teardown-flush ensureMuxer call): stay broken, don't re-park.
         if isBackpressureWedgeBroken() { return false }
+        // #240: parked means the forward buffer is full and the link is free. Released here rather
+        // than at the call sites so it is balanced whatever the park returns.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
         // #65 Piece A: a genuine VOD wedge is the consumer fetch target frozen past the break threshold.
@@ -1016,6 +1052,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// requested.
     private func awaitPrefetchDiskBudgetRelease(head: Int, context: String) -> Bool {
         guard prefetchDiskBudgetBytes > 0 else { return true }
+        // #240: same release as the backpressure park; a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
         while !checkShouldStop() {
@@ -1138,6 +1177,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
                 maxBufferedFragmentSeconds: max(8.0, 2 * targetSegmentDurationSeconds),
+                // AE#222: only set on a session that already proved its first segment carries no audio.
+                audioMoovPrimeFrame: audioMoovPrimeFrame,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
                     if versionedInit {
@@ -1193,17 +1234,81 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
+    /// AE#222 prime scan: read forward from wherever the pump stopped until the muxed audio stream yields one
+    /// packet, and copy its bytes. That single frame is all movenc needs to build the real `dec3` / `dac3` /
+    /// `dmlp` sample entry, so the rebuilt session keeps its stream-copy (Atmos included) instead of bridging.
+    ///
+    /// Scoped to single-demuxer stream-copy audio: a bridged session's muxed frames come from the encoder, not
+    /// the source, and feeding the bridge here would consume the very encoder state a restart depends on (#99
+    /// root cause B). Bounded so a source whose audio never arrives (or arrives absurdly late) gives up and
+    /// leaves the host's fallbacks in charge instead of stalling the session on an unbounded read.
+    private func scanForAudioMoovPrimeFrame() -> [UInt8]? {
+        guard let audio = audioConfig, audio.bridge == nil, sideAudioDemuxer == nil else { return nil }
+        let deadline = Date().addingTimeInterval(Self.moovPrimeScanTimeoutSeconds)
+        var bytesRead = 0
+        var packetsRead = 0
+
+        while true {
+            if checkShouldStop() { return nil }
+            if bytesRead >= Self.moovPrimeScanByteCap || Date() > deadline {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan gave up after \(packetsRead) packet(s) / "
+                    + "\(bytesRead / (1024 * 1024)) MiB without an audio packet",
+                    category: .session
+                )
+                return nil
+            }
+            let pkt: UnsafeMutablePointer<AVPacket>?
+            do {
+                pkt = try demuxer.readPacket()
+            } catch {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan read failed: \(error)",
+                    category: .session
+                )
+                return nil
+            }
+            guard let packet = pkt else {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] AE#222 prime scan hit EOF after \(packetsRead) packet(s) "
+                    + "without an audio packet",
+                    category: .session
+                )
+                return nil
+            }
+            var owned: UnsafeMutablePointer<AVPacket>? = packet
+            defer { trackedPacketFree(&owned) }
+            packetsRead += 1
+            bytesRead += Int(max(packet.pointee.size, 0))
+
+            guard packet.pointee.stream_index == audio.sourceStreamIndex,
+                  packet.pointee.size > 0,
+                  let data = packet.pointee.data
+            else { continue }
+
+            let frame = [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+            EngineLog.emit(
+                "[HLSSegmentProducer] AE#222 prime scan captured a \(frame.count) B audio frame after "
+                + "\(packetsRead) packet(s) / \(bytesRead / (1024 * 1024)) MiB "
+                + "(srcDts=\(packet.pointee.dts))",
+                category: .session
+            )
+            return frame
+        }
+    }
+
     private func advanceMuxer(to newIdx: Int) -> MP4SegmentMuxer? {
         guard let muxer = currentMuxer else { return nil }
 
-        if let result = muxer.cutFragmentForNextSegment(newIdx) {
+        switch muxer.cutFragmentForNextSegment(newIdx) {
+        case .completed(let path, let bytesWritten):
             EngineLog.emit(
-                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(result.bytesWritten) B)",
+                "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s captured (\(bytesWritten) B)",
                 category: .session, level: .verbose
             )
             cache.adopt(index: currentMuxerSegmentIndex,
-                        stagingPath: result.path,
-                        byteCount: result.bytesWritten)
+                        stagingPath: path,
+                        byteCount: bytesWritten)
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
@@ -1217,7 +1322,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 )
                 return nil
             }
-        } else {
+        case .deferredAwaitingAudioSampleEntry:
+            // AE#222: not a failure. moov cannot carry dec3/dac3/dmlp until one audio packet has been muxed,
+            // and this source's first segment has none (its audio blocks sit behind seconds of video in file
+            // order). Nothing was written, so the pump exits to let the host rebuild with a prime frame; the
+            // scan for that frame happens on the way out.
+            cutDeferredAwaitingAudioSampleEntry = true
+            EngineLog.emit(
+                "[HLSSegmentProducer] AE#222 seg-\(currentMuxerSegmentIndex).m4s cut deferred: audio sample "
+                + "entry needs a parsed packet and none has been muxed; scanning forward for a prime frame",
+                category: .session
+            )
+            return nil
+        case .failed:
             // Failed cut: muxer has no open staging fd, every byte is silently discarded. Fatal.
             EngineLog.emit(
                 "[HLSSegmentProducer] seg-\(currentMuxerSegmentIndex).m4s cut FAILED; "
@@ -1471,6 +1588,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
         }
+        // #240: a running pump is pulling from the source. Claimed for the whole loop and released
+        // on every exit path; the two park helpers hand it back for the duration of their wait.
+        sideReaderLinkGate?.videoFetchBegan()
+        defer { sideReaderLinkGate?.videoFetchEnded() }
         let pumpStart = DispatchTime.now()
         var packetsRead = 0
         var lastError: Int32 = 0
@@ -2561,6 +2682,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
             stateLock.unlock()
             if stopped { exitReason = .stopRequested }
             else if wedged { exitReason = .backpressureWedge }
+        }
+
+        // AE#222: a cut that deferred for want of a packet-derived audio sample entry is recoverable, but only
+        // with one real audio frame in hand. Scan for it here, on the way out: the bytes this reads are the
+        // same ones the rebuilt producer will re-read for its own first segments, and every alternative
+        // (bridging to FLAC, stretching the first segment past its plan boundary) either downgrades the audio
+        // or breaks the playlist. If no frame turns up, the reason stays .muxerFailed and the host's existing
+        // fallbacks own the session.
+        if case .muxerFailed = exitReason, cutDeferredAwaitingAudioSampleEntry {
+            if let prime = scanForAudioMoovPrimeFrame() {
+                stateLock.lock()
+                _capturedAudioMoovPrimeFrame = prime
+                stateLock.unlock()
+                exitReason = .needsAudioSampleEntryPrime
+            }
         }
 
         freeMergeLookaheads()

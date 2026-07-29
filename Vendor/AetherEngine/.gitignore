@@ -34,3 +34,6 @@ scratchpad/
 
 # Isolated feature worktrees.
 .worktrees/
+
+# Local git worktrees created for feature work
+.claude/worktrees/

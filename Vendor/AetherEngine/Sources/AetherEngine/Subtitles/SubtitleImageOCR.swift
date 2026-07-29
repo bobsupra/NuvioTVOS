@@ -84,8 +84,7 @@ enum SubtitleImageOCR {
             switch cue.body {
             case .image(let image):
                 if let text = recognizeText(in: image.cgImage, language: language) {
-                    out.append(SubtitleCue(id: cue.id, startTime: cue.startTime,
-                                           endTime: cue.endTime, body: .text(text)))
+                    out.append(cue.with(body: .text(text)))
                 }
             case .text, .richText:
                 out.append(cue)

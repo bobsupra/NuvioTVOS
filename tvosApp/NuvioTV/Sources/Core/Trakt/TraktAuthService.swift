@@ -1169,7 +1169,10 @@ struct TraktProgressService {
         )
         async let watchedShowsRequest: [TraktWatchedShowDTO]? = fetchList(
             TraktWatchedShowDTO.self,
-            path: "sync/watched/shows",
+            // Trakt stopped including the season/episode breakdown in the
+            // default watched-show response. Up Next needs that progress,
+            // while the compact response only tells us that the show exists.
+            path: "sync/watched/shows?extended=progress",
             service: service
         )
         async let episodeHistoryRequest: [TraktEpisodeHistoryDTO]? = fetchList(
@@ -1202,29 +1205,23 @@ struct TraktProgressService {
         let playbackIDs = Set(seeds.map(\.contentID))
         let preferFurthestEpisode = UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
 
-        let watchedShowSeeds: [TraktProgressSeed] = watchedShows.orEmpty.compactMap { show in
-            guard let seed = nextUpSeed(
-                from: show,
-                preferFurthestEpisode: preferFurthestEpisode
-            ), !playbackIDs.contains(seed.contentID) else {
-                return nil
-            }
-            return seed
+        // Merge both watched-show progress and episode history. The former is
+        // the complete source for normal accounts; the latter is the fallback
+        // for accounts where Trakt omits `seasons`, and can also contain a
+        // newer watch than the show snapshot.
+        var upNextSeedsByContentID: [String: TraktProgressSeed] = [:]
+        for seed in watchedShows.orEmpty.compactMap({
+            nextUpSeed(from: $0, preferFurthestEpisode: preferFurthestEpisode)
+        }) {
+            guard !playbackIDs.contains(seed.contentID) else { continue }
+            upNextSeedsByContentID[seed.contentID] = seed
         }
-        seeds.append(contentsOf: watchedShowSeeds)
-        let watchedShowIDs = Set(watchedShowSeeds.map(\.contentID))
-
-        // Some Trakt accounts return watched shows with an empty `seasons`
-        // array even though episode history and stats are present. History is
-        // the authoritative fallback for choosing the next episode in that case.
-        var historySeedsByContentID: [String: TraktProgressSeed] = [:]
         for history in episodeHistory.orEmpty {
             guard let candidate = nextUpSeed(from: history),
-                  !playbackIDs.contains(candidate.contentID),
-                  !watchedShowIDs.contains(candidate.contentID) else {
+                  !playbackIDs.contains(candidate.contentID) else {
                 continue
             }
-            if let current = historySeedsByContentID[candidate.contentID] {
+            if let current = upNextSeedsByContentID[candidate.contentID] {
                 guard UpNextEpisodeSelectionPolicy.prefers(
                     candidateSeason: candidate.season ?? 0,
                     candidateEpisode: candidate.episode ?? 0,
@@ -1235,9 +1232,9 @@ struct TraktProgressService {
                     preferFurthestEpisode: preferFurthestEpisode
                 ) else { continue }
             }
-            historySeedsByContentID[candidate.contentID] = candidate
+            upNextSeedsByContentID[candidate.contentID] = candidate
         }
-        seeds.append(contentsOf: historySeedsByContentID.values)
+        seeds.append(contentsOf: upNextSeedsByContentID.values)
 
         let cutoff: Date? = {
             let days = TraktSettingsStore.continueWatchingDaysCap
@@ -1760,7 +1757,7 @@ struct TraktHistoryService {
                 path: "sync/watched/movies"
               ),
               let shows: [TraktWatchedShowDTO] = try? await service.authorizedGet(
-                path: "sync/watched/shows"
+                path: "sync/watched/shows?extended=progress"
               ) else {
             return nil
         }
@@ -1832,7 +1829,7 @@ struct TraktHistoryService {
         }
 
         if let shows: [TraktWatchedShowDTO] = try? await service.authorizedGet(
-            path: "sync/watched/shows"
+            path: "sync/watched/shows?extended=progress"
         ) {
             receivedResponse = true
             var needsHistoryFallback = false

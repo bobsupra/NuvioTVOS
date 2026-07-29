@@ -18,13 +18,20 @@ final class FileIOReader: IOReader, @unchecked Sendable {
         self.size = sz ?? 0
     }
 
+    /// #243 (local twin of the HTTP disc reader): `FileHandle.read` hands back an NSData-backed
+    /// `Data`, and this runs on FFmpeg's read callback, i.e. on a demux pump thread that spends the
+    /// whole session inside one dispatch block and never drains its autorelease pool. Without the
+    /// pool every read is stranded for the session: measured at 625 MB in-use after 624 MB read in
+    /// 32 KB chunks, i.e. one leaked byte per byte played, and 0 MB with it.
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size n: Int32) -> Int32 {
         guard let buffer, n > 0 else { return -1 }
         lock.lock(); defer { lock.unlock() }
-        guard let data = try? handle.read(upToCount: Int(n)) else { return -1 }
-        if data.isEmpty { return 0 }
-        data.copyBytes(to: buffer, count: data.count)
-        return Int32(data.count)
+        return autoreleasepool { () -> Int32 in
+            guard let data = try? handle.read(upToCount: Int(n)) else { return -1 }
+            if data.isEmpty { return 0 }
+            data.copyBytes(to: buffer, count: data.count)
+            return Int32(data.count)
+        }
     }
 
     func seek(offset: Int64, whence: Int32) -> Int64 {

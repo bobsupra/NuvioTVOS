@@ -21,7 +21,7 @@ struct SubtitleOCRPendingState: Sendable {
         for cue in pending {
             guard cue.startTime < closeAt else { kept.append(cue); continue }
             let end = cue.endTime > closeAt ? closeAt : cue.endTime
-            closed.append(SubtitleCue(id: cue.id, startTime: cue.startTime, endTime: end, body: cue.body))
+            closed.append(cue.with(endTime: end))
         }
         pending = kept
         pending.append(contentsOf: cues.filter { if case .image = $0.body { return true } else { return false } })

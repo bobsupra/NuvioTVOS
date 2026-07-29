@@ -93,7 +93,9 @@ final class Issue104SubtitleDiscardTests: XCTestCase {
                              "subtitle packets must reach the pump for the packet sink")
     }
 
-    private static let fixtureBase64 = """
+    /// Shared with Issue230PrefetchReadPositionParkTests: same topology (dense video, sparse
+    /// subtitles) is what that defect needs.
+    static let fixtureBase64 = """
         AAAAIGZ0eXBpc29tAAACAGlzb21pc28yYXZjMW1wNDEAAAgfbW9vdgAAAGxtdmhkAAAAAAAAAAAAAAAAAAAD6AAAOpgAAQAAAQAA
         AAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAABAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAwAA
         BPV0cmFrAAAAXHRraGQAAAADAAAAAAAAAAAAAAABAAAAAAAAOpgAAAAAAAAAAAAAAAAAAAAAAAEAAAAAAAAAAAAAAAAAAAABAAAA

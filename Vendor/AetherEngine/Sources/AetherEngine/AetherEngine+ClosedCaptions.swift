@@ -192,7 +192,7 @@ final class ClosedCaptionTap: @unchecked Sendable {
         if let id = openCueID, let idx = cues.firstIndex(where: { $0.id == id }) {
             let c = cues[idx]
             if c.endTime > pts, c.startTime <= pts {
-                cues[idx] = SubtitleCue(id: c.id, startTime: c.startTime, endTime: pts, body: c.body)
+                cues[idx] = c.with(endTime: pts)
             }
             openCueID = nil
         }

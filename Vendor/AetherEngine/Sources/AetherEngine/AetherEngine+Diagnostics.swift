@@ -4,6 +4,32 @@ import AVFoundation
 
 extension AetherEngine {
 
+    /// #220 diagnostic opt-in: appends a live large-block census (blocks >= 1 MB, bucketed by
+    /// size class) to the 30 s memprobe line. A flat `mallocBlocks` with a rising `mallocMB`
+    /// identifies "one large buffer is growing" but not which one; the census names the size
+    /// class so the search does not depend on having guessed the site.
+    ///
+    /// Off by default and intended for triage builds only: the walk holds every malloc zone
+    /// through `force_lock`, which briefly blocks allocating threads.
+    ///
+    /// Enabling also arms a jump trigger on its own queue (see `MallocBlockCensusTrigger`). The 30 s
+    /// memprobe cannot catch a failure that completes inside one sample, which is what every kill on
+    /// #220 turned out to be, so the counter is polled at `triggerPollHz` and the zone walk runs once
+    /// it climbs `triggerThresholdMB` above its running high-water. Pass `triggerPollHz: 0` for the
+    /// plain 30 s census with no watcher.
+    public nonisolated static func setLargeAllocationCensusEnabled(
+        _ enabled: Bool,
+        triggerThresholdMB: Int = 64,
+        triggerPollHz: Double = 8
+    ) {
+        MallocBlockCensus.isEnabled = enabled
+        if enabled {
+            MallocBlockCensus.startTriggerWatch(thresholdMB: triggerThresholdMB, pollHz: triggerPollHz)
+        } else {
+            MallocBlockCensus.stopTriggerWatch()
+        }
+    }
+
     // MARK: - Buffer probe
 
     /// Seconds of AVPlayer buffer ahead of the current playhead (sum of loadedTimeRanges beyond now). 0 on SW path / pre-start.
@@ -27,6 +53,9 @@ extension AetherEngine {
     func startMemoryProbe() {
         memoryProbeTask?.cancel()
         let sessionStart = Date()
+        // #243: the disc pull path's byte tally is session-scoped like `elapsed`, so it can be read
+        // as a rate off two probe lines.
+        HTTPDiscIOReader.resetLifetimeFetchedBytes()
         // #134: currentTime()/loadedTimeRanges are sync XPC reads; hop them off the main actor.
         let probeReadQueue = DispatchQueue(label: "engine.memprobe.avfread", qos: .utility)
         memoryProbeTask = Task { @MainActor [weak self] in
@@ -62,6 +91,7 @@ extension AetherEngine {
                 // Zero on SW path or pre-start; 30 s cadence makes non-atomic field drift irrelevant.
                 let stats = self.nativeVideoSession?.diagnosticStats()
                 let avioMB = (stats?.avioBytesFetched ?? 0) / 1024 / 1024
+                let discFetchedMB = HTTPDiscIOReader.lifetimeFetchedBytes / 1024 / 1024
                 let cacheMB = (stats?.segmentCacheBytes ?? 0) / 1024 / 1024
                 let cacheCount = stats?.segmentCacheCount ?? 0
                 let packetsWritten = stats?.producerPacketsWritten ?? 0
@@ -96,11 +126,42 @@ extension AetherEngine {
                     mallocStr = ""
                 }
 
+                // #220: the two readers of a subtitled VOD session, separately attributable.
+                // `ahead` above winHighWater (16 MB) with `susp=0` is backpressure that never
+                // engaged; the pump's own window is the control.
+                //
+                // Both paths, not just software. On a direct-play source the native path runs
+                // the HLS loopback, so `HLSVideoEngine` demuxes from the origin through an
+                // AVIOReader of its own and only the remuxed segments reach AVPlayer. Its
+                // producer parks whenever the forward buffer is full, which is exactly the
+                // shape that lets a connection ignoring the suspend keep filling the window,
+                // and the #174 field crash it was built against (HTTPS origin, boringssl in
+                // the stack) was on this path. Reporting software-only hid that.
+                let pumpWin = self.softwareHost?.ioWindowDiagnostics
+                    ?? self.nativeVideoSession?.demuxer?.ioWindowDiagnostics
+                let prefetchWin = self.subtitleForwardPrefetchDemuxer?.ioWindowDiagnostics
+                let readerStr = Self.readerWindowFragment(
+                    pump: pumpWin, prefetch: prefetchWin,
+                    pumpFetchedBytes: self.softwareHost?.demuxerBytesFetched
+                        ?? self.nativeVideoSession?.demuxerBytesFetched,
+                    prefetchFetchedBytes: self.subtitleForwardPrefetchDemuxer?.avioBytesFetched)
+
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
                     + vmStr
                     + mallocStr
+                    // #220: empty unless the host opted in. A flat mallocBlocks with a rising
+                    // mallocMB says one large buffer is growing but not which; this names the
+                    // size class. `peak` is the watcher's high-water, which survives a step the
+                    // 30 s cadence never sampled.
+                    + MallocBlockCensus.probeFragment()
+                    + (MallocBlockCensus.isEnabled ? "peakMB=\(MallocBlockCensus.peakSizeInUseMB) " : "")
                     + "avioFetchedMB=\(avioMB) "
+                    // #243: only the disc pull path fills this, and only then is it printed. On a
+                    // remote ISO every reader fork pulls through HTTPDiscIOReader, which
+                    // `avioFetchedMB` does not see at all, so without it the one path doing the
+                    // reading is the one path with no counter.
+                    + (discFetchedMB > 0 ? "discFetchedMB=\(discFetchedMB) " : "")
                     + "cacheCount=\(cacheCount) cacheMB=\(cacheMB) "
                     + "packetsWritten=\(packetsWritten) "
                     + "audioFifo=\(audioFifo) "
@@ -109,6 +170,11 @@ extension AetherEngine {
                     + "srvConns=\(srvConns) srvBytesMB=\(srvBytesMB) srvSfMB=\(srvSfMB) "
                     + "pktAlive=\(pktAlive) pktTotal=\(pktTotal) "
                     + "subCues=\(cueCount) "
+                    + readerStr
+                    // #220: the lead is the live tell. It is visible minutes before a kill and
+                    // separates "reads fast while building its lead" from "the lead never settles".
+                    + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)
+                    + "swFrames=\(self.softwareHostFramesEnqueued) "
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
@@ -182,6 +248,40 @@ extension AetherEngine {
         malloc_zone_statistics(nil, &stats)
         return (blocksInUse: Int(stats.blocks_in_use),
                 sizeInUseMB: Int(stats.size_in_use / 1024 / 1024))
+    }
+
+    /// #220: one memprobe fragment per live `AVIOReader` window. `win` is the whole buffer,
+    /// `ahead` the undrained forward extent that `appendPersistentData` gates the suspend on.
+    /// `ahead` far above winHighWater (16 MB) while `susp=0` means the backpressure never
+    /// engaged, which is a different defect from a transport overshoot past a suspend that did.
+    /// `postMB` is what the transport delivered after the suspend was issued. #174 priced that
+    /// as a bounded in-flight overshoot; a value tracking the whole window says `suspend()` is
+    /// not stopping delivery, so the high water bounds nothing at all.
+    ///
+    /// #240: `FetchedMB` per reader is the link attribution. The aggregate `avioFetchedMB` cannot
+    /// answer "who took the bandwidth", and the reporter of #240 had to infer a second reader from
+    /// connection-start lines that carried no identity. Two counters side by side answer it directly:
+    /// a session whose `prefFetchedMB` tracks `pumpFetchedMB` is reading the stream twice.
+    nonisolated static func readerWindowFragment(
+        pump: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
+        prefetch: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
+        pumpFetchedBytes: Int64? = nil,
+        prefetchFetchedBytes: Int64? = nil
+    ) -> String {
+        func fragment(
+            _ prefix: String,
+            _ w: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
+            _ fetched: Int64?
+        ) -> String {
+            guard let w else { return "" }
+            return "\(prefix)WinMB=\(w.windowBytes / 1024 / 1024) "
+                + "\(prefix)AheadMB=\(w.aheadBytes / 1024 / 1024) "
+                + "\(prefix)Susp=\(w.suspended ? 1 : 0) "
+                + "\(prefix)PostMB=\(w.postSuspendBytes / 1024 / 1024) "
+                + (fetched.map { "\(prefix)FetchedMB=\($0 / 1024 / 1024) " } ?? "")
+        }
+        return fragment("pump", pump, pumpFetchedBytes)
+            + fragment("pref", prefetch, prefetchFetchedBytes)
     }
 
     // MARK: - Live telemetry bridge

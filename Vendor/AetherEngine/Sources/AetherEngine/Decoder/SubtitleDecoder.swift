@@ -154,13 +154,18 @@ enum SubtitleDecoder {
         let isASS = codecID == AV_CODEC_ID_ASS || codecID == AV_CODEC_ID_SSA
         let keepMarkup = preserveASSMarkup && isASS
         var assHeader: String? = nil
-        if keepMarkup,
-           let extradata = codecpar.pointee.extradata,
-           codecpar.pointee.extradata_size > 0 {
+        var assPlayRes = SubtitleRectText.defaultASSPlayRes
+        if let extradata = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
             let bytes = Data(bytes: extradata, count: Int(codecpar.pointee.extradata_size))
             // Strip NUL bytes: extradata is often NUL-terminated; libass parses C-string-style and a NUL hides everything after it.
-            assHeader = String(data: bytes, encoding: .utf8)?
+            let header = String(data: bytes, encoding: .utf8)?
                 .replacingOccurrences(of: "\0", with: "")
+            if keepMarkup { assHeader = header }
+            // #233: a real ASS script declares the space its \pos coordinates live in; without one
+            // the line came from libavcodec's own conversion and uses the 384x288 default.
+            if let header, let declared = SubtitleRectText.playRes(fromASSHeader: header) {
+                assPlayRes = declared
+            }
         }
 
         guard let codec = avcodec_find_decoder(codecpar.pointee.codec_id) else {
@@ -238,12 +243,14 @@ enum SubtitleDecoder {
                 // only survives for a final composition with no successor.
                 for idx in pendingImageCueIndices where cues[idx].startTime < pktPTS && cues[idx].endTime > pktPTS {
                     let open = cues[idx]
-                    cues[idx] = SubtitleCue(id: open.id, startTime: open.startTime, endTime: pktPTS, body: open.body)
+                    cues[idx] = open.with(endTime: pktPTS)
                 }
                 pendingImageCueIndices.removeAll()
 
                 var lines: [String] = []
                 var images: [SubtitleImage] = []
+                var styledBodies: [SubtitleCue.Body] = []
+                var placement: SubtitleTextPlacement?
                 if sub.num_rects > 0, let rects = sub.rects {
                     for i in 0..<Int(sub.num_rects) {
                         guard let rect = rects[i] else { continue }
@@ -256,12 +263,31 @@ enum SubtitleDecoder {
                             ) {
                                 images.append(image)
                             }
+                        } else if keepMarkup {
+                            if let raw = lineForRect(rect) { lines.append(raw) }
+                        } else if let assLine = SubtitleRectText.rawASSLine(for: rect),
+                                  let parsed = SubtitleRectText.styledBody(fromASSEventLine: assLine,
+                                                                          playRes: assPlayRes) {
+                            // #233: SRT and WebVTT sidecars reach libavcodec's ASS conversion too,
+                            // so their markup survives here. Unstyled cues stay .text and merge
+                            // with their siblings below, exactly as the plain path did.
+                            placement = placement ?? parsed.placement
+                            if case .text(let t) = parsed.body {
+                                lines.append(t)
+                            } else {
+                                styledBodies.append(parsed.body)
+                            }
                         } else if let text = lineForRect(rect) {
                             lines.append(text)
                         }
                     }
                 }
                 avsubtitle_free(&sub)
+
+                // #233: WebVTT cue settings never reach the ASS event line (the decoder drops
+                // them), but the demuxer keeps them on the packet. An ASS `\an` / `\pos` still
+                // wins, since that came from the payload itself.
+                placement = placement ?? WebVTTCueSettings.placement(onPacket: pkt)
 
                 let merged = lines
                     .joined(separator: "\n")
@@ -271,9 +297,22 @@ enum SubtitleDecoder {
                         id: nextID,
                         startTime: startTime,
                         endTime: endTime,
-                        body: .text(merged)
+                        body: .text(merged),
+                        placement: placement
                     ))
                     nextID += 1
+                }
+                if endTime > startTime {
+                    for body in styledBodies {
+                        cues.append(SubtitleCue(
+                            id: nextID,
+                            startTime: startTime,
+                            endTime: endTime,
+                            body: body,
+                            placement: placement
+                        ))
+                        nextID += 1
+                    }
                 }
                 if endTime > startTime {
                     for image in images {

@@ -206,30 +206,76 @@ final class HTTPDiscIOReader: IOReader, @unchecked Sendable {
 
     private struct RangeResponse { let status: Int; let contentRange: String?; let body: Data }
 
+    /// #243: the pull path runs this synchronously on FFmpeg's read callback, i.e. on a demux pump
+    /// thread that lives for the whole session inside ONE dispatch block, so nothing ever drains
+    /// that thread's autorelease pool. Every response bridged out of the completion handler is then
+    /// stranded there for the session: up to 8 MB per request at the top of the adaptive window,
+    /// several requests a second, once per reader fork (main demuxer + subtitle side demuxer +
+    /// forward prefetcher), which is the ~30 MB/s of `mallocMB` growth reported on a remote UHD ISO.
+    ///
+    /// Draining per request is the fix. A per-request `URLSession` is NOT: measured against a local
+    /// range origin, 480 MB fetched leaves +968 MB in-use on a shared session and +973 MB with a
+    /// fresh session per request, and 0 MB with this pool. That also retires the older
+    /// "URLSession retains completed completion-handler bodies until invalidation" reading of the
+    /// AVIOReader leak (see `AVIOReader.persistentSession`): the owner was always the caller
+    /// thread's pool, and delegate-based delivery fixed that path by keeping the body off it.
     private static func rangeGet(url: URL, extraHeaders: [String: String], session: URLSession,
                                  timeout: TimeInterval, offset: Int64, length: Int) -> RangeResponse? {
-        var req = URLRequest(url: url, timeoutInterval: timeout)
-        req.httpMethod = "GET"
-        req.setValue(rangeHeader(offset: offset, length: length), forHTTPHeaderField: "Range")
-        for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
+        autoreleasepool {
+            var req = URLRequest(url: url, timeoutInterval: timeout)
+            req.httpMethod = "GET"
+            req.setValue(rangeHeader(offset: offset, length: length), forHTTPHeaderField: "Range")
+            for (k, v) in extraHeaders { req.setValue(v, forHTTPHeaderField: k) }
 
-        let sem = DispatchSemaphore(value: 0)
-        nonisolated(unsafe) var result: RangeResponse?
-        let task = session.dataTask(with: req) { data, response, _ in
-            if let http = response as? HTTPURLResponse {
-                result = RangeResponse(
-                    status: http.statusCode,
-                    contentRange: http.value(forHTTPHeaderField: "Content-Range"),
-                    body: data ?? Data()
-                )
+            let sem = DispatchSemaphore(value: 0)
+            nonisolated(unsafe) var result: RangeResponse?
+            let task = session.dataTask(with: req) { data, response, _ in
+                if let http = response as? HTTPURLResponse {
+                    result = RangeResponse(
+                        status: http.statusCode,
+                        contentRange: http.value(forHTTPHeaderField: "Content-Range"),
+                        body: data ?? Data()
+                    )
+                }
+                sem.signal()
             }
-            sem.signal()
+            task.resume()
+            if sem.wait(timeout: .now() + timeout + 5) == .timedOut {
+                task.cancel()
+                return nil
+            }
+            // The body escapes the pool inside a retained `Data`; the pool only balances the
+            // bridging autorelease, so the buffer still lives until `read` has copied it out.
+            Self.recordFetched(bytes: result?.body.count ?? 0)
+            return result
         }
-        task.resume()
-        if sem.wait(timeout: .now() + timeout + 5) == .timedOut {
-            task.cancel()
-            return nil
-        }
-        return result
+    }
+
+    // MARK: - Diagnostics
+
+    /// Lifetime bytes pulled by every live `HTTPDiscIOReader` of this session, for the memprobe.
+    /// The disc pull path had no byte counter at all (`avioFetchedMB` covers the AVIOReader path
+    /// only), so a report on this path could show every engine-tracked pool flat while the reader
+    /// forks pulled tens of MB/s, which is how #243 had to be argued from arithmetic instead of a
+    /// counter. Reset per session by the memory probe.
+    private static let fetchedLock = NSLock()
+    nonisolated(unsafe) private static var fetchedBytesTotal: Int64 = 0
+
+    private static func recordFetched(bytes: Int) {
+        guard bytes > 0 else { return }
+        fetchedLock.lock()
+        fetchedBytesTotal &+= Int64(bytes)
+        fetchedLock.unlock()
+    }
+
+    static var lifetimeFetchedBytes: Int64 {
+        fetchedLock.lock(); defer { fetchedLock.unlock() }
+        return fetchedBytesTotal
+    }
+
+    static func resetLifetimeFetchedBytes() {
+        fetchedLock.lock()
+        fetchedBytesTotal = 0
+        fetchedLock.unlock()
     }
 }

@@ -26,9 +26,15 @@ enum RemoteHLSMediaSelection {
     /// Reroute only the typed VOD-path misroute, and only for URL sources: custom readers have no
     /// URL for AVPlayer to open, and the AE#140 live raw-path misroute keeps its fail-closed
     /// contract (live hosts choose their own DVR/rejoin options before going native).
-    static func shouldReroute(probeFailure: Error?, isCustomSource: Bool) -> Bool {
+    ///
+    /// AE#246: the classification can arrive from either open of the same source. The load-time probe
+    /// is the usual one, but when that probe failed for an unrelated (transient) reason the loopback
+    /// path reopens the URL, and that second open is then the first to read the playlist body. Both
+    /// carry the same typed error, so both are answered here; `isLive` needs no guard because the
+    /// reader only classifies as `hlsPlaylistOnVODPath` on the non-live path.
+    static func shouldReroute(failure: Error?, isCustomSource: Bool) -> Bool {
         guard !isCustomSource,
-              let readerError = probeFailure as? AVIOReaderError,
+              let readerError = failure as? AVIOReaderError,
               case .hlsPlaylistOnVODPath = readerError else { return false }
         return true
     }

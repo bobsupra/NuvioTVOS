@@ -71,7 +71,8 @@ extension HLSVideoEngine {
             return true
         case .eof, .readError, .keyframeStarvation:
             return !sourceReopenable
-        case .stopRequested, .muxerFailed, .backpressureWedge:
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+            // AE#222 rebuilds into the same provider with a primed muxer, so production continues.
             return false
         }
     }
@@ -100,6 +101,14 @@ extension HLSVideoEngine {
         // Re-anchor the producer on AVPlayer's real position so the segments it is starved for get produced.
         if case .backpressureWedge = reason {
             handleBackpressureWedge()
+            return
+        }
+        // AE#222: the pump deferred its first cut because the audio sample entry is packet-derived
+        // (E-AC-3/AC-3/TrueHD) and this source's first segment carries no audio packet, then captured one real
+        // audio frame on its way out. Rebuild with that frame as the muxer's moov prime, which keeps the
+        // stream-copy (and any Atmos) rather than bridging to FLAC or stretching the first segment.
+        if case .needsAudioSampleEntryPrime = reason {
+            handleAudioSampleEntryPrimeNeeded(prod)
             return
         }
         // #99 failure mode B: a VOD muxer death (e.g. first cut before any bridged audio packet, so
@@ -158,7 +167,8 @@ extension HLSVideoEngine {
             provider?.markLiveProductionHalted()
         }
         switch reason {
-        case .stopRequested, .muxerFailed, .backpressureWedge:
+        case .stopRequested, .muxerFailed, .backpressureWedge, .needsAudioSampleEntryPrime:
+            // needsAudioSampleEntryPrime never reaches here (its arm above returns first).
             return
         case .sourceReplay:
             // Server restarted stream from beginning (Jellyfin transcode respawn); URL reopen would replay stale content. Delegate to host for fresh negotiation.
@@ -296,6 +306,59 @@ extension HLSVideoEngine {
             "[HLSVideoEngine] #169 VOD gate starved to EOF at seg\(prod.anchoredBaseIndex): "
             + "no keyframe at/after the plan boundary; re-anchoring on the last real keyframe "
             + "(pts=\(lastKeyPts)) -> seg\(idx) (attempt \(attempts)/\(cap))",
+            category: .session
+        )
+        requestRestart(at: idx, authoritative: true)
+    }
+
+    /// AE#222: rebuild the session with the captured audio frame as the muxer's moov prime.
+    ///
+    /// The prime is stored on the session, not just handed to the next producer, so every later restart (seek,
+    /// audio switch, revive) gets it too: the same video-first interleave defers the first cut of every fresh
+    /// muxer, not only the session's first one.
+    ///
+    /// Aimed like the other revive arms, at the pending seek target or AVPlayer's real position, so a defer
+    /// that happens after a scrub resumes where the viewer is.
+    func handleAudioSampleEntryPrimeNeeded(_ prod: HLSSegmentProducer) {
+        guard let prime = prod.capturedAudioMoovPrimeFrame, !prime.isEmpty else {
+            // No frame: the source's audio never showed up inside the scan bounds. Nothing here can keep the
+            // stream-copy, so hand the session to the existing muxerFailed recovery.
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#222 first cut deferred but no audio frame was captured; "
+                + "falling back to the muxerFailed recovery",
+                category: .session
+            )
+            if isLiveSession { return }
+            handleVODMuxerFailure()
+            return
+        }
+
+        restartLock.lock()
+        let admitted = audioSampleEntryPrimeGate.admit()
+        let attempts = audioSampleEntryPrimeGate.attempts
+        let cap = audioSampleEntryPrimeGate.maxAttempts
+        if admitted { sessionAudioMoovPrimeFrame = prime }
+        restartLock.unlock()
+
+        guard admitted else {
+            EngineLog.emit(
+                "[HLSVideoEngine] AE#222 moov-prime rebuild cap reached (\(attempts) attempts, cap \(cap)); "
+                + "falling back to the muxerFailed recovery",
+                category: .session
+            )
+            if isLiveSession { return }
+            handleVODMuxerFailure()
+            return
+        }
+
+        let frozen = currentPlaybackPositionProvider?() ?? 0
+        let anchor = AetherEngine.recoveryAnchorPosition(
+            frozenPosition: frozen, pendingSeekTarget: recoverySeekTargetProvider?(),
+            currentRendered: frozen)
+        let idx = segmentIndexForPlaylistTime(anchor)
+        EngineLog.emit(
+            "[HLSVideoEngine] AE#222 rebuilding producer + muxer with a \(prime.count) B audio moov prime at "
+            + "\(String(format: "%.2f", anchor))s -> seg\(idx) (audio stream-copy preserved)",
             category: .session
         )
         requestRestart(at: idx, authoritative: true)

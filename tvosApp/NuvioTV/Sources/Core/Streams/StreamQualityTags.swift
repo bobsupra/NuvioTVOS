@@ -163,6 +163,56 @@ enum LastStreamQualityStore {
     }
 }
 
+/// Profile-scoped memory of the exact playable link used for the latest
+/// in-progress movie or episode. Progress providers do not retain source URLs,
+/// so this stays separate from their authoritative resume position.
+enum LastPlaybackStreamStore {
+    private static let prefix = "nuvio.tv.lastPlaybackStream."
+
+    private struct Record: Codable {
+        let url: String
+        let season: Int?
+        let episode: Int?
+    }
+
+    static func save(
+        metaId: String,
+        url: String,
+        season: Int?,
+        episode: Int?,
+        profileId: String? = nil
+    ) {
+        let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !metaId.isEmpty, !url.isEmpty, URL(string: url) != nil,
+              let data = try? JSONEncoder().encode(
+                Record(url: url, season: season, episode: episode)
+              ) else { return }
+        defaults(for: profileId).set(data, forKey: prefix + metaId)
+    }
+
+    static func load(
+        metaId: String,
+        season: Int?,
+        episode: Int?,
+        profileId: String? = nil
+    ) -> String? {
+        guard let data = defaults(for: profileId).data(forKey: prefix + metaId),
+              let record = try? JSONDecoder().decode(Record.self, from: data),
+              record.season == season,
+              record.episode == episode else {
+            return nil
+        }
+        return record.url
+    }
+
+    private static func defaults(for profileId: String?) -> UserDefaults {
+        if let profileId {
+            return ProfileSettings.store(for: profileId)
+        }
+        return ProfileSettings.current
+    }
+}
+
 /// Lightweight badges shown on stream rows (not full Badger packs).
 enum StreamBadgeKind: String, CaseIterable, Identifiable {
     case dolbyVision = "DV"

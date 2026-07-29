@@ -85,6 +85,7 @@ struct Issue151SubtitleForwardPrefetchTests {
             await SubtitleForwardPrefetcher.run(
                 demuxer: demuxer, store: store,
                 streamIndices: [0], assemblyIndices: [],
+                pacingIndex: -1,   // #230: subtitle-only fixture, nothing to pace with
                 leadSeconds: 60, parkPollNanoseconds: 10_000_000,
                 playhead: { playhead.current })
         }
@@ -100,8 +101,9 @@ struct Issue151SubtitleForwardPrefetchTests {
 
         // Advance the playhead: 120 s comes into the lead window, the loop resumes and hits EOF.
         playhead.set(65)
-        let harvested = await task.value
-        #expect(harvested == 5)
+        let outcome = await task.value
+        #expect(outcome.harvested == 5)
+        #expect(outcome.exit == .endOfFile, "running out of source is an EOF, not a failure (#231)")
         let pts = store.entries(streamIndex: 0, from: 0, through: 1_000).map(\.ptsSeconds)
         #expect(pts == [2, 30, 55, 90, 120])
     }
@@ -120,12 +122,14 @@ struct Issue151SubtitleForwardPrefetchTests {
         // (harvest-then-park, matching the native readers); the 150 s packet trips the park,
         // whose playhead refresh gets nil and must end the loop instead of spinning.
         let provider = ExpiringPlayheadProvider(initial: 0)
-        let harvested = await SubtitleForwardPrefetcher.run(
+        let outcome = await SubtitleForwardPrefetcher.run(
             demuxer: demuxer, store: store,
             streamIndices: [0], assemblyIndices: [],
+            pacingIndex: -1,
             leadSeconds: 60, parkPollNanoseconds: 1_000_000,
             playhead: { provider.next() })
-        #expect(harvested == 2)
+        #expect(outcome.harvested == 2)
+        #expect(outcome.exit == .cancelled, "a vanished engine is not a restartable failure (#231)")
     }
 
     // MARK: - Engine gating + re-anchor decisions
@@ -200,7 +204,8 @@ private final class PlayheadBox: @unchecked Sendable {
 
 /// Minimal in-memory Matroska writer, the #145 fixture shape: one S_TEXT/UTF8 subtitle track, one
 /// Cluster per event. Sizes are always 8-byte EBML vints so nesting needs no length backpatching.
-private enum MatroskaSubtitleFixture {
+/// Shared with Issue231PrefetchRestartTests.
+enum MatroskaSubtitleFixture {
 
     private static func vintSize(_ n: Int) -> [UInt8] {
         var bytes: [UInt8] = [0x01]

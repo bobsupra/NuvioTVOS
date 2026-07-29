@@ -1498,6 +1498,8 @@ fileprivate final class NuvioAPIClient {
     private static let settingsFeature = "tvos_settings"
     /// Shared with Android TV (`ProfileSettingsSyncService` / `DebridSettingsDataStore`).
     private static let debridSettingsFeature = "debrid_settings"
+    /// Shared with Android TV's TMDB settings repository.
+    private static let tmdbSettingsFeature = "tmdb_settings"
 
     private let session: URLSession = .shared
     private let decoder: JSONDecoder = {
@@ -1777,7 +1779,8 @@ fileprivate final class NuvioAPIClient {
         let features = settingsJSON["features"] as? [String: Any] ?? [:]
         let tvosFeature = features[Self.settingsFeature] as? [String: Any]
         let debridFeature = features[Self.debridSettingsFeature] as? [String: Any]
-        guard tvosFeature != nil || debridFeature != nil else {
+        let tmdbFeature = features[Self.tmdbSettingsFeature] as? [String: Any]
+        guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil else {
             return false
         }
 
@@ -1786,6 +1789,7 @@ fileprivate final class NuvioAPIClient {
         }
         // Android TV stores debrid keys in a sibling feature on the same "tv" blob.
         importDebridSettings(debridFeature, localProfileId: localProfileId)
+        importTmdbSettings(tmdbFeature, localProfileId: localProfileId)
         return true
     }
 
@@ -1805,6 +1809,11 @@ fileprivate final class NuvioAPIClient {
         features[Self.debridSettingsFeature] = exportDebridSettings(
             localProfileId: localProfileId,
             existing: existingDebrid
+        )
+        let existingTmdb = features[Self.tmdbSettingsFeature] as? [String: Any]
+        features[Self.tmdbSettingsFeature] = exportTmdbSettings(
+            localProfileId: localProfileId,
+            existing: existingTmdb
         )
         settingsJSON["features"] = features
         if settingsJSON["version"] == nil { settingsJSON["version"] = 1 }
@@ -2213,6 +2222,91 @@ fileprivate final class NuvioAPIClient {
         static let preferredPrefixed = "debrid_preferred_resolver_provider_id"
     }
 
+    private enum AndroidTmdbKey {
+        static let enabled = "tmdb_enabled"
+        static let apiKey = "tmdb_api_key"
+        static let language = "tmdb_language"
+        static let useTrailers = "tmdb_use_trailers"
+        static let useArtwork = "tmdb_use_artwork"
+        static let useBasicInfo = "tmdb_use_basic_info"
+        static let useDetails = "tmdb_use_details"
+        static let useCredits = "tmdb_use_credits"
+        static let useProductions = "tmdb_use_productions"
+        static let useNetworks = "tmdb_use_networks"
+        static let useEpisodes = "tmdb_use_episodes"
+        static let useSeasonPosters = "tmdb_use_season_posters"
+        static let useMoreLikeThis = "tmdb_use_more_like_this"
+        static let useCollections = "tmdb_use_collections"
+    }
+
+    private func exportTmdbSettings(
+        localProfileId: String,
+        existing: [String: Any]?
+    ) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        var feature = existing ?? [:]
+
+        let mappings: [(String, String)] = [
+            (SettingsKey.tmdbEnabled, AndroidTmdbKey.enabled),
+            (SettingsKey.tmdbApiKey, AndroidTmdbKey.apiKey),
+            (SettingsKey.tmdbLanguage, AndroidTmdbKey.language),
+            (SettingsKey.tmdbUseTrailers, AndroidTmdbKey.useTrailers),
+            (SettingsKey.tmdbUseArtwork, AndroidTmdbKey.useArtwork),
+            (SettingsKey.tmdbUseBasicInfo, AndroidTmdbKey.useBasicInfo),
+            (SettingsKey.tmdbUseDetails, AndroidTmdbKey.useDetails),
+            (SettingsKey.tmdbUseCredits, AndroidTmdbKey.useCredits),
+            (SettingsKey.tmdbUseProductions, AndroidTmdbKey.useProductions),
+            (SettingsKey.tmdbUseNetworks, AndroidTmdbKey.useNetworks),
+            (SettingsKey.tmdbUseEpisodes, AndroidTmdbKey.useEpisodes),
+            (SettingsKey.tmdbUseSeasonPosters, AndroidTmdbKey.useSeasonPosters),
+            (SettingsKey.tmdbUseMoreLikeThis, AndroidTmdbKey.useMoreLikeThis),
+            (SettingsKey.tmdbUseCollections, AndroidTmdbKey.useCollections),
+        ]
+
+        for (localKey, androidKey) in mappings {
+            guard let value = defaults.object(forKey: localKey),
+                  let encoded = Self.encodeSettingValue(value) else {
+                continue
+            }
+            feature[androidKey] = encoded
+        }
+        return feature
+    }
+
+    private func importTmdbSettings(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote, !remote.isEmpty else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+
+        let mappings: [(String, String)] = [
+            (AndroidTmdbKey.enabled, SettingsKey.tmdbEnabled),
+            (AndroidTmdbKey.apiKey, SettingsKey.tmdbApiKey),
+            (AndroidTmdbKey.language, SettingsKey.tmdbLanguage),
+            (AndroidTmdbKey.useTrailers, SettingsKey.tmdbUseTrailers),
+            (AndroidTmdbKey.useArtwork, SettingsKey.tmdbUseArtwork),
+            (AndroidTmdbKey.useBasicInfo, SettingsKey.tmdbUseBasicInfo),
+            (AndroidTmdbKey.useDetails, SettingsKey.tmdbUseDetails),
+            (AndroidTmdbKey.useCredits, SettingsKey.tmdbUseCredits),
+            (AndroidTmdbKey.useProductions, SettingsKey.tmdbUseProductions),
+            (AndroidTmdbKey.useNetworks, SettingsKey.tmdbUseNetworks),
+            (AndroidTmdbKey.useEpisodes, SettingsKey.tmdbUseEpisodes),
+            (AndroidTmdbKey.useSeasonPosters, SettingsKey.tmdbUseSeasonPosters),
+            (AndroidTmdbKey.useMoreLikeThis, SettingsKey.tmdbUseMoreLikeThis),
+            (AndroidTmdbKey.useCollections, SettingsKey.tmdbUseCollections),
+        ]
+
+        for (androidKey, localKey) in mappings {
+            if let encoded = remote[androidKey] as? [String: Any],
+               let value = Self.decodeSettingValue(encoded) {
+                defaults.set(value, forKey: localKey)
+            } else if let value = remote[androidKey] as? String {
+                // Tolerate raw strings from older Android TV builds.
+                defaults.set(value, forKey: localKey)
+            } else if let value = remote[androidKey] as? Bool {
+                defaults.set(value, forKey: localKey)
+            }
+        }
+    }
+
     private func exportDebridSettings(
         localProfileId: String,
         existing: [String: Any]?
@@ -2396,6 +2490,7 @@ enum EpisodeMetadataEnrichment {
               let tmdbId = meta.tmdbId,
               let season,
               let episode,
+              TmdbDetailsService.useEpisodes,
               ProfileSettings.current.bool(forKey: SettingsKey.tmdbEnabled) else {
             return nil
         }
@@ -2409,7 +2504,7 @@ enum EpisodeMetadataEnrichment {
         )
         components?.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
-            URLQueryItem(name: "language", value: "en-US")
+            URLQueryItem(name: "language", value: TmdbDetailsService.preferredLanguage)
         ]
         guard let url = components?.url else { return nil }
 

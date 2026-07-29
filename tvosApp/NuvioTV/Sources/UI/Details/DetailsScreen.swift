@@ -21,6 +21,8 @@ struct DetailsScreen: View {
     var onOpenTitle: ((String, String) -> Void)? = nil
     /// Open a production company / network catalog.
     var onOpenProduction: ((MetaCompany) -> Void)? = nil
+    /// Open the movies and series associated with a TMDB person.
+    var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
     let initiallyPresentStreamPicker: Bool
     let initialStreamPickerEpisode: NuvioVideo?
     let onInitialStreamPickerPresented: (() -> Void)?
@@ -65,7 +67,8 @@ struct DetailsScreen: View {
         onPlayClick: @escaping (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
         onBack: @escaping () -> Void,
         onOpenTitle: ((String, String) -> Void)? = nil,
-        onOpenProduction: ((MetaCompany) -> Void)? = nil
+        onOpenProduction: ((MetaCompany) -> Void)? = nil,
+        onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
     ) {
         self.id = id
         self.type = type
@@ -73,6 +76,7 @@ struct DetailsScreen: View {
         self.onBack = onBack
         self.onOpenTitle = onOpenTitle
         self.onOpenProduction = onOpenProduction
+        self.onOpenPerson = onOpenPerson
         self.initiallyPresentStreamPicker = initiallyPresentStreamPicker
         self.initialStreamPickerEpisode = initialStreamPickerEpisode
         self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
@@ -134,6 +138,9 @@ struct DetailsScreen: View {
                     },
                     onOpenProduction: { company in
                         onOpenProduction?(company)
+                    },
+                    onOpenPerson: { person in
+                        onOpenPerson?(person)
                     },
                     onCommentSelect: { comment in
                         expandedComment = comment
@@ -408,6 +415,7 @@ struct DetailsScreen: View {
         }
 
         guard tmdbEnabled,
+              TmdbDetailsService.useTrailers,
               !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
               let tmdbId = meta.tmdbId else {
             return nil
@@ -421,7 +429,7 @@ struct DetailsScreen: View {
         var components = URLComponents(string: "https://api.themoviedb.org/3/\(mediaPath)/\(tmdbId)/videos")
         components?.queryItems = [
             URLQueryItem(name: "api_key", value: tmdbApiKey),
-            URLQueryItem(name: "language", value: "en-US")
+            URLQueryItem(name: "language", value: TmdbDetailsService.preferredLanguage)
         ]
         guard let url = components?.url else { return nil }
 
@@ -1421,6 +1429,7 @@ struct TvDetailsContent: View {
     let onTrailerClick: () -> Void
     var onOpenTitle: ((String, String) -> Void)? = nil
     var onOpenProduction: ((MetaCompany) -> Void)? = nil
+    var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
     var onCommentSelect: ((TraktCommentReview) -> Void)? = nil
     let onBack: () -> Void
 
@@ -1433,6 +1442,7 @@ struct TvDetailsContent: View {
     /// left when entering Details — see `restoreEpisodeFocus`.
     @State private var restoreEpisodeKey: String?
     @State private var restoreGeneration = 0
+    @State private var detailsScrollOffset: CGFloat = 0
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     /// Bumped whenever a watched mark or a progress write lands. Resume progress
@@ -1440,6 +1450,10 @@ struct TvDetailsContent: View {
     /// without this the episode strip keeps drawing the bar it rendered with —
     /// marking an episode watched cleared the stores but nothing re-read them.
     @State private var progressRevision = 0
+
+    private var detailsScrollShadowProgress: CGFloat {
+        min(max(detailsScrollOffset / 120, 0), 1)
+    }
 
     var body: some View {
         if let meta = uiState.meta {
@@ -1451,9 +1465,26 @@ struct TvDetailsContent: View {
                 ZStack(alignment: .topLeading) {
                     TvDetailsBackdrop(meta: meta)
 
+                    // Android's scrolled details state dims the cinematic
+                    // artwork behind the content while keeping the artwork
+                    // visible. This ramps in with the scroll transition.
+                    Color.black
+                        .opacity(0.78 * detailsScrollShadowProgress)
+                        .ignoresSafeArea()
+                        .allowsHitTesting(false)
+
                     ScrollViewReader { scrollProxy in
                         ScrollView(.vertical, showsIndicators: false) {
                             VStack(alignment: .leading, spacing: 34) {
+                                GeometryReader { geometry in
+                                    Color.clear
+                                        .preference(
+                                            key: TvDetailsScrollOffsetKey.self,
+                                            value: geometry.frame(in: .named("tv-details-scroll")).minY
+                                        )
+                                }
+                                .frame(height: 0)
+
                                 TvDetailsLogo(meta: meta)
                                     .padding(.bottom, 10)
 
@@ -1522,6 +1553,10 @@ struct TvDetailsContent: View {
 
                                 TvDetailsCastAndTrailer(
                                     meta: meta,
+                                    people: uiState.people,
+                                    onPersonClick: { person in
+                                        onOpenPerson?(person)
+                                    },
                                     onTrailerClick: onTrailerClick,
                                     onFocus: {
                                         withAnimation(.easeOut(duration: 0.24)) {
@@ -1551,9 +1586,13 @@ struct TvDetailsContent: View {
                                     .disabled(restoreEpisodeKey != nil)
                                 }
 
-                                if !uiState.companies.isEmpty {
+                                let productionCompanies = uiState.companies.filter { $0.kind == .production }
+                                let networks = uiState.companies.filter { $0.kind == .network }
+
+                                if !productionCompanies.isEmpty {
                                     TvDetailsProductionRow(
-                                        companies: uiState.companies,
+                                        title: "Production",
+                                        companies: productionCompanies,
                                         onSelect: { company in
                                             onOpenProduction?(company)
                                         },
@@ -1565,6 +1604,24 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.productionSection)
+                                    .disabled(restoreEpisodeKey != nil)
+                                }
+
+                                if !networks.isEmpty {
+                                    TvDetailsProductionRow(
+                                        title: "Network",
+                                        companies: networks,
+                                        onSelect: { company in
+                                            onOpenProduction?(company)
+                                        },
+                                        onFocus: {
+                                            withAnimation(.easeOut(duration: 0.24)) {
+                                                scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
+                                            }
+                                        }
+                                    )
+                                    .padding(.top, 40)
+                                    .id(TvDetailsScrollID.networkSection)
                                     .disabled(restoreEpisodeKey != nil)
                                 }
 
@@ -1585,14 +1642,20 @@ struct TvDetailsContent: View {
                                     .disabled(restoreEpisodeKey != nil)
                                 }
                             }
-                            .padding(.leading, 96)
+                            // Match Home's TV row inset so details content
+                            // lines up with the catalog cards.
+                            .padding(.leading, 48)
                             .padding(.top, 78)
                             .padding(.bottom, 96)
                             .frame(width: detailsWidth(proxy, hasEpisodes: !episodes.isEmpty), alignment: .leading)
                             .frame(minHeight: proxy.size.height, alignment: .topLeading)
                         }
                         .scrollClipDisabledIfAvailable()
+                        .coordinateSpace(name: "tv-details-scroll")
+                        .modifier(TvDetailsScrollTracker(offset: $detailsScrollOffset))
                     }
+
+                    TvDetailsScrollTransitionShadow(progress: detailsScrollShadowProgress)
                 }
             }
             .background(Color.black.ignoresSafeArea())
@@ -1739,13 +1802,68 @@ private enum TvDetailsScrollID {
     static let episodesSection = "tv-details-episodes-section"
     static let moreLikeThisSection = "tv-details-more-like-this"
     static let productionSection = "tv-details-production"
+    static let networkSection = "tv-details-network"
     static let commentsSection = "tv-details-comments"
+}
+
+private struct TvDetailsScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = nextValue()
+    }
+}
+
+private struct TvDetailsScrollTracker: ViewModifier {
+    @Binding var offset: CGFloat
+
+    func body(content: Content) -> some View {
+        if #available(tvOS 18.0, *) {
+            content.onScrollGeometryChange(for: CGFloat.self) { geometry in
+                geometry.contentOffset.y
+            } action: { _, newOffset in
+                offset = max(0, newOffset)
+            }
+        } else {
+            content.onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
+                offset = max(0, -minY)
+            }
+        }
+    }
+}
+
+private struct TvDetailsScrollTransitionShadow: View {
+    let progress: CGFloat
+
+    var body: some View {
+        VStack(spacing: 0) {
+            LinearGradient(
+                colors: [
+                    .black.opacity(0.34 * progress),
+                    .black.opacity(0.12 * progress),
+                    .clear
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+            .frame(height: 72)
+
+            Spacer(minLength: 0)
+        }
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+    }
 }
 
 private struct TvDetailsBackdrop: View {
     let meta: NuvioMeta
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
     var body: some View {
+        let backdropColor = Color.nuvioBackground(amoled: amoled, body: bodyColor)
+
         ZStack {
             if let imageUrl = meta.backgroundUrl ?? meta.posterUrl,
                let url = URL(string: imageUrl) {
@@ -1755,36 +1873,31 @@ private struct TvDetailsBackdrop: View {
                             .resizable()
                             .scaledToFill()
                     } else {
-                        Color.black
+                        backdropColor
                     }
                 }
                 .ignoresSafeArea()
             } else {
-                Color.black.ignoresSafeArea()
+                backdropColor.ignoresSafeArea()
             }
 
-            Color.black.opacity(0.20)
+            GeometryReader { proxy in
+                    LinearGradient(
+                    stops: [
+                        .init(color: backdropColor.opacity(0.95), location: 0),
+                        .init(color: backdropColor.opacity(0.86), location: 0.25),
+                        .init(color: backdropColor.opacity(0.64), location: 0.50),
+                        .init(color: backdropColor.opacity(0.34), location: 0.70),
+                        .init(color: backdropColor.opacity(0.10), location: 0.88),
+                        .init(color: .clear, location: 1)
+                    ],
+                    startPoint: .leading,
+                    endPoint: .trailing
+                )
+                .frame(width: proxy.size.width * 0.76)
+                .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+            }
 
-            LinearGradient(
-                colors: [
-                    Color.black.opacity(0.98),
-                    Color.black.opacity(0.74),
-                    Color.black.opacity(0.24),
-                    Color.black.opacity(0.66)
-                ],
-                startPoint: .leading,
-                endPoint: .trailing
-            )
-
-            LinearGradient(
-                colors: [
-                    Color.black.opacity(0.34),
-                    Color.black.opacity(0.08),
-                    Color.black.opacity(0.86)
-                ],
-                startPoint: .top,
-                endPoint: .bottom
-            )
         }
         .ignoresSafeArea()
     }
@@ -1980,12 +2093,15 @@ private struct TvDetailsSummary: View {
                     .foregroundColor(.white.opacity(0.62))
             }
 
+            if !externalRatingBadges.isEmpty {
+                TvDetailsRatingsRow(badges: externalRatingBadges)
+            }
+
             if let description = meta.description, !description.isEmpty {
-                Text(description.wrappedEveryNWords(9))
+                Text(description)
                     .font(.system(size: 30, weight: .regular))
                     .foregroundColor(.white)
                     .lineSpacing(8)
-                    .lineLimit(4)
                     .frame(maxWidth: 950, alignment: .leading)
             }
 
@@ -2083,10 +2199,120 @@ private struct TvDetailsSummary: View {
     private var releaseDisplay: String? {
         NuvioDateDisplay.formattedDate(meta.released ?? meta.releaseInfo)
     }
+
+    private var externalRatingBadges: [TvRatingBadge] {
+        let ratings = Dictionary(uniqueKeysWithValues: (meta.externalRatings ?? []).map { ($0.source, $0) })
+        return TvRatingVisual.all.compactMap { visual in
+            guard let rating = ratings[visual.source] else { return nil }
+            return TvRatingBadge(visual: visual, rating: rating)
+        }
+    }
+}
+
+private struct TvRatingBadge: Identifiable {
+    let visual: TvRatingVisual
+    let rating: NuvioExternalRating
+
+    var id: String { rating.source }
+}
+
+private struct TvRatingVisual {
+    let source: String
+    let displayName: String
+    let assetName: String
+    let iconWidth: CGFloat
+    let color: Color
+    let format: (Double) -> String
+
+    static let all: [TvRatingVisual] = [
+        TvRatingVisual(
+            source: MdbListDetailsService.providerIMDb,
+            displayName: "IMDb",
+            assetName: "rating_imdb",
+            iconWidth: 68,
+            color: Color(red: 0.96, green: 0.77, blue: 0.09),
+            format: { String(format: "%.1f", $0) }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerTMDB,
+            displayName: "TMDB",
+            assetName: "rating_tmdb",
+            iconWidth: 40,
+            color: Color(red: 0.00, green: 0.71, blue: 0.89),
+            format: { String(Int($0.rounded())) }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerTomatoes,
+            displayName: "Rotten Tomatoes",
+            assetName: "rating_rotten_tomatoes",
+            iconWidth: 38,
+            color: Color(red: 0.98, green: 0.20, blue: 0.04),
+            format: { "\(Int($0.rounded()))%" }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerAudience,
+            displayName: "Audience Score",
+            assetName: "rating_audience_score",
+            iconWidth: 31,
+            color: Color(red: 0.98, green: 0.20, blue: 0.04),
+            format: { "\(Int($0.rounded()))%" }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerMetacritic,
+            displayName: "Metacritic",
+            assetName: "rating_metacritic",
+            iconWidth: 38,
+            color: Color(red: 1.00, green: 0.80, blue: 0.20),
+            format: { String(Int($0.rounded())) }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerTrakt,
+            displayName: "Trakt",
+            assetName: "rating_trakt",
+            iconWidth: 38,
+            color: Color(red: 0.93, green: 0.11, blue: 0.14),
+            format: { String(Int($0.rounded())) }
+        ),
+        TvRatingVisual(
+            source: MdbListDetailsService.providerLetterboxd,
+            displayName: "Letterboxd",
+            assetName: "rating_letterboxd",
+            iconWidth: 38,
+            color: Color(red: 0.00, green: 0.88, blue: 0.33),
+            format: { String(format: "%.1f", $0) }
+        ),
+    ]
+}
+
+private struct TvDetailsRatingsRow: View {
+    let badges: [TvRatingBadge]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 26) {
+                ForEach(badges) { badge in
+                    HStack(spacing: 9) {
+                        Image(badge.visual.assetName)
+                            .resizable()
+                            .scaledToFit()
+                            .frame(width: badge.visual.iconWidth, height: 38)
+                            .accessibilityLabel(badge.visual.displayName)
+
+                        Text(badge.visual.format(badge.rating.value))
+                            .font(.system(size: 28, weight: .regular))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: 950, alignment: .leading)
+    }
 }
 
 private struct TvDetailsCastAndTrailer: View {
     let meta: NuvioMeta
+    let people: [TmdbPersonMetadata]
+    let onPersonClick: (TmdbPersonMetadata) -> Void
     let onTrailerClick: () -> Void
     let onFocus: () -> Void
 
@@ -2104,8 +2330,12 @@ private struct TvDetailsCastAndTrailer: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 58) {
-                    ForEach(displayPeople, id: \.self) { name in
-                        TvDetailsPersonCard(name: name, onFocus: onFocus)
+                    ForEach(displayPeople) { person in
+                        TvDetailsPersonCard(
+                            person: person,
+                            onSelect: { onPersonClick(person) },
+                            onFocus: onFocus
+                        )
                     }
                 }
                 .padding(.trailing, 80)
@@ -2114,18 +2344,26 @@ private struct TvDetailsCastAndTrailer: View {
         }
     }
 
-    private var displayPeople: [String] {
+    private var displayPeople: [TmdbPersonMetadata] {
+        if !people.isEmpty {
+            return Array(people.prefix(8))
+        }
+
         let cast = meta.cast ?? []
         if !cast.isEmpty {
-            return Array(cast.prefix(8))
+            return Array(cast.prefix(8)).map {
+                TmdbPersonMetadata(name: $0, role: nil, profileURL: nil, tmdbId: nil)
+            }
         }
 
         let creators = (meta.director ?? []) + (meta.writer ?? [])
         if !creators.isEmpty {
-            return Array(creators.prefix(8))
+            return Array(creators.prefix(8)).map {
+                TmdbPersonMetadata(name: $0, role: nil, profileURL: nil, tmdbId: nil)
+            }
         }
 
-        return ["Cast"]
+        return [TmdbPersonMetadata(name: "Cast", role: nil, profileURL: nil, tmdbId: nil)]
     }
 }
 
@@ -2222,13 +2460,14 @@ private struct TvDetailsRelatedRow: View {
 }
 
 private struct TvDetailsProductionRow: View {
+    let title: String
     let companies: [MetaCompany]
     let onSelect: (MetaCompany) -> Void
     let onFocus: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
-            Text("Production")
+            Text(title)
                 .font(.system(size: 34, weight: .semibold))
                 .foregroundColor(.white.opacity(0.9))
 
@@ -2493,13 +2732,17 @@ private struct CommentDetailOverlay: View {
 }
 
 private struct TvDetailsPersonCard: View {
-    let name: String
+    let person: TmdbPersonMetadata
+    let onSelect: () -> Void
     let onFocus: () -> Void
 
     @FocusState private var isFocused: Bool
+    @State private var profileImage: UIImage?
+
+    private static let imageCache = NSCache<NSURL, UIImage>()
 
     var body: some View {
-        Button(action: {}) {
+        Button(action: onSelect) {
             VStack(spacing: 18) {
                 Circle()
                     .frame(width: 188, height: 188)
@@ -2509,16 +2752,33 @@ private struct TvDetailsPersonCard: View {
                             .strokeBorder(Color.white.opacity(isFocused ? 0.0 : 0.22), lineWidth: 1)
                     )
                     .overlay {
-                        Text(initials)
-                            .font(.system(size: 44, weight: .medium))
-                            .foregroundColor(isFocused ? .black : .white)
+                        if let profileImage {
+                            Image(uiImage: profileImage)
+                                .resizable()
+                                .scaledToFill()
+                                .frame(width: 188, height: 188)
+                                .clipShape(Circle())
+                        } else {
+                            Text(initials)
+                                .font(.system(size: 44, weight: .medium))
+                                .foregroundColor(isFocused ? .black : .white)
+                        }
                     }
 
-                Text(name)
+                Text(person.name)
                     .font(.system(size: 24, weight: .medium))
                     .foregroundColor(isFocused ? .white : .white.opacity(0.74))
                     .lineLimit(1)
                     .frame(width: 210)
+
+                if let role = person.role,
+                   !role.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(role)
+                        .font(.system(size: 20, weight: .regular))
+                        .foregroundColor(.white.opacity(isFocused ? 0.82 : 0.55))
+                        .lineLimit(1)
+                        .frame(width: 210)
+                }
             }
             .frame(width: 220)
         }
@@ -2532,15 +2792,46 @@ private struct TvDetailsPersonCard: View {
                 onFocus()
             }
         }
+        .task(id: person.profileURL) {
+            await loadProfileImage()
+        }
     }
 
     private var initials: String {
-        let words = name
+        let words = person.name
             .split(separator: " ")
             .prefix(2)
             .compactMap { $0.first }
         let value = String(words).uppercased()
         return value.isEmpty ? "?" : value
+    }
+
+    private var profileURL: URL? {
+        guard let profileURL = person.profileURL,
+              !profileURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+        return URL(string: profileURL)
+    }
+
+    private func loadProfileImage() async {
+        guard profileImage == nil, let url = profileURL else { return }
+        let cacheKey = url as NSURL
+        if let cached = Self.imageCache.object(forKey: cacheKey) {
+            profileImage = cached
+            return
+        }
+
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let image = UIImage(data: data),
+              !Task.isCancelled else {
+            return
+        }
+
+        Self.imageCache.setObject(image, forKey: cacheKey)
+        profileImage = image
     }
 }
 
@@ -2643,7 +2934,8 @@ private struct TvDetailsEpisodes: View {
             .padding(.vertical, TvEpisodeCardLayout.verticalPadding)
             .offset(x: edgeInset - CGFloat(episodeScrollIndex) * TvEpisodeCardLayout.step)
             .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
-            .clipped()
+            // Match the cast rail: episode cards may draw through the details
+            // column up to the screen edge instead of being cut off early.
             .offset(x: -edgeInset)
             // Critically damped — same no-bounce Home strip feel.
             .animation(smoothFocus ? .spring(response: 0.3, dampingFraction: 1.0) : nil, value: episodeScrollIndex)
