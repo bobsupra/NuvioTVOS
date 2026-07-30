@@ -12,10 +12,10 @@ import UIKit
 struct DetailsScreen: View {
     let id: String
     let type: String
-    /// (streamURL, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
+    /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
     /// The last two carry series context for the player's next-episode auto-play;
     /// both are empty/nil for movies and trailers.
-    let onPlayClick: (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void
+    let onPlayClick: (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void
     let onBack: () -> Void
     /// Open another title (More Like This / production catalog).
     var onOpenTitle: ((String, String) -> Void)? = nil
@@ -64,7 +64,7 @@ struct DetailsScreen: View {
         initiallyPresentStreamPicker: Bool = false,
         initialStreamPickerEpisode: NuvioVideo? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
-        onPlayClick: @escaping (String, NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
+        onPlayClick: @escaping (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
         onBack: @escaping () -> Void,
         onOpenTitle: ((String, String) -> Void)? = nil,
         onOpenProduction: ((MetaCompany) -> Void)? = nil,
@@ -157,7 +157,7 @@ struct DetailsScreen: View {
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
-                            onPlayClick(url, meta, "", [], nil, [])
+                            onPlayClick(url, [:], meta, "", [], nil, [])
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
@@ -327,7 +327,7 @@ struct DetailsScreen: View {
         LastStreamQualityStore.save(metaId: meta.id, stream: stream)
         if let url = stream.url, !url.isEmpty {
             isStreamPickerPresented = false
-            onPlayClick(url, meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
+            onPlayClick(url, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
             return
         }
 
@@ -342,7 +342,7 @@ struct DetailsScreen: View {
                 isResolvingDebrid = false
                 if case let .success(url, _, _)? = result {
                     isStreamPickerPresented = false
-                    onPlayClick(url.absoluteString, meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
+                    onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
                 }
             }
         }
@@ -402,7 +402,7 @@ struct DetailsScreen: View {
             let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
 
             await MainActor.run {
-                onPlayClick(youtubeUrl, meta, PlaybackMarkers.trailerSubtitle, [], nil, [])
+                onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [])
             }
         }
     }
@@ -3486,6 +3486,7 @@ private struct TvStreamPickerOverlay: View {
     /// mounts while discovery is still running, so the first seed can only land
     /// on the All chip; this drives the hand-off once results exist, once.
     @State private var didSeedStreamFocus = false
+    @State private var streamBadgeSettingsRevision = 0
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
@@ -3557,9 +3558,13 @@ private struct TvStreamPickerOverlay: View {
                     }
                 }
             }
+            .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification)) { _ in
+                streamBadgeSettingsRevision &+= 1
+            }
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())
+        .id("stream-picker-\(streamBadgeSettingsRevision)")
     }
 
     /// Cached list when inputs are unchanged; live derivation only while the
@@ -3961,9 +3966,24 @@ private struct TvStreamCard: View {
     }
 
     var body: some View {
+        let badgeSettings = StreamBadgeSettingsStore.snapshot
+        let importedBadges = StreamBadgeMatcher.matchedBadges(for: stream, rules: badgeSettings.rules)
+        let fileSizeLabel = badgeSettings.showFileSizeBadges
+            ? StreamBadgeSizing.fileSizeLabel(for: stream)
+            : nil
+        let showImportedBadges = !importedBadges.isEmpty || fileSizeLabel != nil
+
         Button(action: action) {
             HStack(alignment: .center, spacing: 34) {
                 VStack(alignment: .leading, spacing: 14) {
+                    if showImportedBadges && badgeSettings.badgePlacement == .top {
+                        TvStreamImportedBadgeRow(
+                            badges: importedBadges,
+                            fileSizeLabel: fileSizeLabel,
+                            isScrolling: isFocused
+                        )
+                    }
+
                     Text(primaryName)
                         .font(.system(size: 34, weight: .bold))
                         .foregroundColor(.white)
@@ -3987,36 +4007,31 @@ private struct TvStreamCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    let badges = StreamBadgeKind.badges(for: stream)
-                    if !badges.isEmpty {
-                        HStack(spacing: 10) {
-                            ForEach(badges) { badge in
-                                Text(badge.rawValue)
-                                    .font(.system(size: 18, weight: .bold))
-                                    .foregroundColor(.white)
-                                    .padding(.horizontal, 12)
-                                    .padding(.vertical, 6)
-                                    .background(
-                                        Capsule().fill(Color.white.opacity(0.14 + badge.tint.bg * 0.08))
-                                    )
-                            }
-                        }
-                        .padding(.top, 4)
+                    if showImportedBadges && badgeSettings.badgePlacement == .bottom {
+                        TvStreamImportedBadgeRow(
+                            badges: importedBadges,
+                            fileSizeLabel: fileSizeLabel,
+                            isScrolling: isFocused
+                        )
+                            .padding(.top, 4)
                     }
                 }
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-                Spacer(minLength: 28)
+                if badgeSettings.showAddonLogo {
+                    Spacer(minLength: 28)
 
-                VStack(spacing: 18) {
-                    addonLogo
+                    VStack(spacing: 18) {
+                        addonLogo
 
-                    if let addonName = stream.addonName {
-                        Text(addonName)
-                            .font(.system(size: 22, weight: .medium))
-                            .foregroundColor(.white.opacity(0.42))
-                            .lineLimit(2)
-                            .multilineTextAlignment(.center)
-                            .frame(width: 220)
+                        if let addonName = stream.addonName {
+                            Text(addonName)
+                                .font(.system(size: 22, weight: .medium))
+                                .foregroundColor(.white.opacity(0.42))
+                                .lineLimit(2)
+                                .multilineTextAlignment(.center)
+                                .frame(width: 220)
+                        }
                     }
                 }
             }
@@ -4077,6 +4092,173 @@ private struct TvStreamCard: View {
         } else {
             fallback.frame(width: 96, height: 96)
         }
+    }
+}
+
+private struct TvStreamBadgeRowWidthKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) {
+        value = max(value, nextValue())
+    }
+}
+
+private struct TvStreamImportedBadgeRow: View {
+    let badges: [StreamBadgeFilter]
+    let fileSizeLabel: String?
+    let isScrolling: Bool
+
+    @State private var contentWidth: CGFloat = 0
+    @State private var animationStart = Date()
+
+    var body: some View {
+        GeometryReader { geometry in
+            let availableWidth = geometry.size.width
+            let shouldScroll = isScrolling && contentWidth > availableWidth + 1
+
+            Group {
+                if shouldScroll {
+                    TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                        let cycleWidth = contentWidth + 28
+                        let elapsed = max(0, timeline.date.timeIntervalSince(animationStart) - 0.8)
+                        let offset = elapsed > 0
+                            ? CGFloat(elapsed * 50).truncatingRemainder(dividingBy: cycleWidth)
+                            : 0
+
+                        HStack(spacing: 28) {
+                            badgeContent
+                            badgeContent
+                        }
+                        .fixedSize(horizontal: true, vertical: false)
+                        .offset(x: -offset)
+                    }
+                } else {
+                    badgeContent
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            .frame(width: availableWidth, alignment: .leading)
+        }
+        .clipped()
+        .frame(height: 42)
+        .onPreferenceChange(TvStreamBadgeRowWidthKey.self) { width in
+            guard width != contentWidth else { return }
+            contentWidth = width
+            animationStart = Date()
+        }
+        .onChange(of: badgeSignature) { _ in
+            animationStart = Date()
+        }
+    }
+
+    private var badgeSignature: String {
+        badges.map { "\($0.id)|\($0.imageURL)|\($0.name)" }.joined(separator: "|") + "|\(fileSizeLabel ?? "")"
+    }
+
+    private var badgeContent: some View {
+        HStack(spacing: 10) {
+            ForEach(Array(badges.enumerated()), id: \.offset) { _, badge in
+                TvStreamImportedBadge(badge: badge)
+            }
+
+            if let fileSizeLabel {
+                Text(fileSizeLabel)
+                    .font(.system(size: 18, weight: .bold))
+                    .foregroundColor(.white.opacity(0.9))
+                    .padding(.horizontal, 12)
+                    .padding(.vertical, 7)
+                    .background(
+                        Capsule().fill(Color.white.opacity(0.12))
+                    )
+                    .overlay(
+                        Capsule().stroke(Color.white.opacity(0.20), lineWidth: 1)
+                    )
+            }
+        }
+        .background(
+            GeometryReader { geometry in
+                Color.clear.preference(
+                    key: TvStreamBadgeRowWidthKey.self,
+                    value: geometry.size.width
+                )
+            }
+        )
+        .fixedSize(horizontal: true, vertical: false)
+    }
+}
+
+private struct TvStreamImportedBadge: View {
+    let badge: StreamBadgeFilter
+
+    var body: some View {
+        Group {
+            if !badge.imageURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let url = URL(string: badge.imageURL.trimmingCharacters(in: .whitespacesAndNewlines)) {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        image.resizable().scaledToFit()
+                    case .failure:
+                        fallbackText
+                    default:
+                        ProgressView().tint(.white)
+                    }
+                }
+            } else {
+                fallbackText
+            }
+        }
+        .frame(minWidth: 54, maxWidth: 150, minHeight: 30, maxHeight: 30)
+        .padding(.horizontal, 6)
+        .padding(.vertical, 4)
+        .background(background)
+        .overlay(
+            RoundedRectangle(cornerRadius: 7, style: .continuous)
+                .stroke(border, lineWidth: border == .clear ? 0 : 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 7, style: .continuous))
+    }
+
+    private var fallbackText: some View {
+        Text(badge.name)
+            .font(.system(size: 16, weight: .bold))
+            .foregroundColor(color(from: badge.textColor) ?? .white)
+            .lineLimit(1)
+            .minimumScaleFactor(0.7)
+    }
+
+    private var background: Color {
+        guard badge.tagStyle.caseInsensitiveCompare("filled") == .orderedSame,
+              let color = color(from: badge.tagColor) else {
+            return Color.white.opacity(0.10)
+        }
+        return color.opacity(0.84)
+    }
+
+    private var border: Color {
+        color(from: badge.borderColor) ?? .clear
+    }
+
+    private func color(from raw: String) -> Color? {
+        let value = raw.trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+        guard value.count == 6 || value.count == 8,
+              let number = UInt64(value, radix: 16) else { return nil }
+        let alpha: Double
+        let red: Double
+        let green: Double
+        let blue: Double
+        if value.count == 8 {
+            alpha = Double((number >> 24) & 0xff) / 255
+            red = Double((number >> 16) & 0xff) / 255
+            green = Double((number >> 8) & 0xff) / 255
+            blue = Double(number & 0xff) / 255
+        } else {
+            alpha = 1
+            red = Double((number >> 16) & 0xff) / 255
+            green = Double((number >> 8) & 0xff) / 255
+            blue = Double(number & 0xff) / 255
+        }
+        return Color(red: red, green: green, blue: blue, opacity: alpha)
     }
 }
 #endif

@@ -12,7 +12,7 @@ struct PlaybackTrackInfo: Equatable {
     /// mpv `external-filename` — the URL a `sub-add`ed track was loaded from,
     /// empty for tracks embedded in the container.
     let externalFilename: String
-    /// AVPlayer renders this track outside Nuvio's subtitle overlay, so custom
+    /// A system-rendered track sits outside Nuvio's subtitle overlay, so custom
     /// timing and appearance require a compatibility-renderer handoff.
     var isNativelyRenderedSubtitle: Bool = false
     /// Localized language name for audio cards ("Russian"), empty for subs.

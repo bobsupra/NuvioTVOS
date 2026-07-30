@@ -35,6 +35,10 @@ class SearchViewModel: ObservableObject {
     private var allResults: [NuvioMeta] = []
     private var cancellables = Set<AnyCancellable>()
     private var searchTask: Task<Void, Never>?
+    /// Small in-memory cache makes repeated queries (including backspacing)
+    /// instantaneous without keeping stale search data on disk.
+    private var cachedResults: [String: [NuvioMeta]] = [:]
+    private var cacheOrder: [String] = []
     private let recentKey = "nuvio.search.recent"
 
     init(repository: CatalogRepository = CinemetaCatalogRepository()) {
@@ -42,7 +46,7 @@ class SearchViewModel: ObservableObject {
         recentSearches = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
 
         $searchText
-            .debounce(for: .milliseconds(450), scheduler: DispatchQueue.main)
+            .debounce(for: .milliseconds(220), scheduler: DispatchQueue.main)
             .removeDuplicates()
             .sink { [weak self] text in
                 self?.performSearch(query: text)
@@ -56,11 +60,20 @@ class SearchViewModel: ObservableObject {
 
     func performSearch(query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         searchTask?.cancel()
 
         guard !trimmed.isEmpty else {
             allResults = []
             results = []
+            error = nil
+            isLoading = false
+            return
+        }
+
+        if let cached = cachedResults[cacheKey] {
+            allResults = cached
+            applyFilter()
             error = nil
             isLoading = false
             return
@@ -75,6 +88,7 @@ class SearchViewModel: ObservableObject {
                 let found = try await self.repository.search(query: trimmed)
                 if Task.isCancelled { return }
                 self.allResults = found
+                self.cache(found, for: cacheKey)
                 self.applyFilter()
                 if !found.isEmpty { self.commitRecentSearch(trimmed) }
                 self.isLoading = false
@@ -121,5 +135,15 @@ class SearchViewModel: ObservableObject {
 
     private func saveRecent() {
         UserDefaults.standard.set(recentSearches, forKey: recentKey)
+    }
+
+    private func cache(_ results: [NuvioMeta], for key: String) {
+        cacheOrder.removeAll { $0 == key }
+        cacheOrder.append(key)
+        cachedResults[key] = results
+
+        while cacheOrder.count > 12 {
+            cachedResults.removeValue(forKey: cacheOrder.removeFirst())
+        }
     }
 }

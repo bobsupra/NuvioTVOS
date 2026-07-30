@@ -6,6 +6,229 @@ import CoreGraphics
 import Libmpv
 import Metal
 import QuartzCore
+import Combine
+
+/// `sub-text` is MPV's decoded, formatting-stripped active text subtitle.
+/// Keeping a separate state object lets MPV keep decoding its selected subtitle
+/// while the SwiftUI host replaces only text cues with translated text.
+@MainActor
+final class MPVSubtitleTranslationState: ObservableObject {
+    @Published private(set) var sourceText = ""
+    @Published private(set) var translatedText: String?
+    @Published private(set) var isTranslating = false
+
+    var onFirstOutcome: ((Result<Void, Error>) -> Void)?
+
+    private var tasks: [String: Task<Void, Never>] = [:]
+    private var translatedTextBySource: [String: String] = [:]
+    private var currentSource: String?
+    private var currentSettings: AISubtitleTranslationSettings?
+    private var sessionID = UUID()
+    private var manualActivation = false
+    private var didReportOutcome = false
+    private var failedSourceTexts: Set<String> = []
+    private let maximumConcurrentRequests = 2
+
+    var isActive: Bool {
+        let settings = AISubtitleTranslationSettings.current()
+        return settings.isEnabled && !settings.apiKey.isEmpty && (settings.autoSelect || manualActivation)
+    }
+
+    var shouldDisplayOverlay: Bool {
+        isActive && !sourceText.isEmpty
+    }
+
+    var displayText: String? {
+        guard shouldDisplayOverlay else { return nil }
+        return translatedText ?? sourceText
+    }
+
+    func setManualActivation(_ enabled: Bool) {
+        manualActivation = enabled
+        refreshForCurrentText()
+    }
+
+    func update(sourceText rawText: String) {
+        let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let settings = AISubtitleTranslationSettings.current()
+        guard settings.isEnabled else {
+            deactivate()
+            return
+        }
+        guard !settings.apiKey.isEmpty else {
+            deactivate()
+            reportOnce(.failure(AISubtitleTranslationError.missingAPIKey))
+            return
+        }
+        guard settings.autoSelect || manualActivation else {
+            deactivate()
+            return
+        }
+        if currentSettings != settings {
+            tasks.values.forEach { $0.cancel() }
+            tasks = [:]
+            translatedTextBySource = [:]
+            failedSourceTexts = []
+            sessionID = UUID()
+            currentSettings = settings
+            sourceText = ""
+            currentSource = nil
+        }
+        guard text != sourceText else { return }
+        sourceText = text
+        translatedText = nil
+        isTranslating = false
+        currentSource = nil
+
+        guard !text.isEmpty else { return }
+        let source = AISubtitleTranslationState.cleaned(
+            text,
+            stripHearingImpaired: settings.stripHearingImpaired
+        )
+        currentSource = source
+        guard !source.isEmpty else {
+            translatedText = ""
+            return
+        }
+        if let cached = translatedTextBySource[source] {
+            translatedText = cached
+            return
+        }
+        if tasks[source] != nil {
+            isTranslating = true
+            return
+        }
+        guard !failedSourceTexts.contains(source) else { return }
+
+        if tasks.count >= maximumConcurrentRequests,
+           let staleSource = tasks.keys.first(where: { $0 != source }) {
+            tasks[staleSource]?.cancel()
+            tasks[staleSource] = nil
+        }
+        guard tasks.count < maximumConcurrentRequests else { return }
+        translate(source: source, settings: settings)
+    }
+
+    func reset() {
+        tasks.values.forEach { $0.cancel() }
+        tasks = [:]
+        translatedTextBySource = [:]
+        currentSource = nil
+        currentSettings = nil
+        sessionID = UUID()
+        sourceText = ""
+        translatedText = nil
+        isTranslating = false
+        manualActivation = false
+        didReportOutcome = false
+        failedSourceTexts = []
+    }
+
+    private func translate(source: String, settings: AISubtitleTranslationSettings) {
+        let activeSession = sessionID
+        let profileScope = ProfileSettings.activeProfileScope
+        isTranslating = currentSource == source
+        tasks[source] = Task { [weak self] in
+            do {
+                if let cached = await AISubtitleTranslationCache.shared.translation(
+                    for: source,
+                    targetLanguage: settings.targetLanguage,
+                    model: settings.model,
+                    stripHearingImpaired: settings.stripHearingImpaired,
+                    profileScope: profileScope
+                ) {
+                    guard !Task.isCancelled,
+                          let self,
+                          self.sessionID == activeSession else { return }
+                    self.tasks[source] = nil
+                    self.translatedTextBySource[source] = cached
+                    self.refreshCurrentPresentation()
+                    self.reportOnce(.success(()))
+                    return
+                }
+                let translated = try await GeminiSubtitleTranslator.translate(
+                    source,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey
+                )
+                let cleaned = AISubtitleTranslationState.cleaned(
+                    translated,
+                    stripHearingImpaired: settings.stripHearingImpaired
+                )
+                await AISubtitleTranslationCache.shared.store(
+                    cleaned,
+                    for: source,
+                    targetLanguage: settings.targetLanguage,
+                    model: settings.model,
+                    stripHearingImpaired: settings.stripHearingImpaired,
+                    profileScope: profileScope
+                )
+                guard !Task.isCancelled,
+                      let self,
+                      self.sessionID == activeSession else { return }
+                self.tasks[source] = nil
+                self.translatedTextBySource[source] = cleaned
+                self.refreshCurrentPresentation()
+                self.reportOnce(.success(()))
+            } catch is CancellationError {
+                guard let self, self.sessionID == activeSession else { return }
+                self.tasks[source] = nil
+                self.refreshCurrentPresentation()
+            } catch {
+                guard !Task.isCancelled,
+                      let self,
+                      self.sessionID == activeSession else { return }
+                self.tasks[source] = nil
+                self.failedSourceTexts.insert(source)
+                self.refreshCurrentPresentation()
+                self.reportOnce(.failure(error))
+            }
+        }
+    }
+
+    private func refreshForCurrentText() {
+        guard manualActivation || AISubtitleTranslationSettings.current().autoSelect else {
+            deactivate()
+            return
+        }
+        // Route through an empty sentinel so the unchanged active MPV text is
+        // reconsidered immediately after the user enables it in the panel.
+        let current = sourceText
+        sourceText = ""
+        currentSource = nil
+        update(sourceText: current)
+    }
+
+    private func deactivate() {
+        tasks.values.forEach { $0.cancel() }
+        tasks = [:]
+        translatedTextBySource = [:]
+        currentSource = nil
+        currentSettings = nil
+        sessionID = UUID()
+        sourceText = ""
+        translatedText = nil
+        isTranslating = false
+        failedSourceTexts = []
+    }
+
+    private func refreshCurrentPresentation() {
+        guard let currentSource else {
+            translatedText = nil
+            isTranslating = false
+            return
+        }
+        translatedText = translatedTextBySource[currentSource]
+        isTranslating = tasks[currentSource] != nil
+    }
+
+    private func reportOnce(_ outcome: Result<Void, Error>) {
+        guard !didReportOutcome else { return }
+        didReportOutcome = true
+        onFirstOutcome?(outcome)
+    }
+}
 
 /// State that must be committed after MPV has opened the replacement file.
 /// Keeping this as data also makes fallback restoration independently testable.
@@ -48,6 +271,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var lastAppliedDrawableSize: CGSize = .zero
     private var pendingURL: String?
     private var pendingAudioURL: String?
+    private var pendingHTTPHeaders: [String: String] = [:]
     private var pendingLoadConfiguration: MPVLoadConfiguration?
     /// Physical Apple TV can blank HDMI while matching frame rate / dynamic
     /// range. Keep the file paused until that switch finishes so playback time
@@ -57,6 +281,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var mpv: OpaquePointer?
     private lazy var eventQueue = DispatchQueue(label: "mpv-events", qos: .userInitiated)
     private var recentPlaybackLogs: [String] = []
+    let subtitleTranslationState = MPVSubtitleTranslationState()
+    private var isMPVSubtitleRendererHiddenForTranslation = false
 
     // Cached track lists
     var audioTracks: [PlaybackTrackInfo] = []
@@ -262,6 +488,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         // moment a selection actually changes. See `refreshTracks`.
         mpv_observe_property(mpv, 0, "aid", MPV_FORMAT_STRING)
         mpv_observe_property(mpv, 0, "sid", MPV_FORMAT_STRING)
+        // Available for text tracks even when `sub-visibility` is off, which
+        // lets the host overlay replace MPV's renderer without losing cues.
+        mpv_observe_property(mpv, 0, "sub-text", MPV_FORMAT_STRING)
 
         mpv_set_wakeup_callback(mpv, { ctx in
             let vc = unsafeBitCast(ctx, to: MPVPlayerViewController.self)
@@ -352,6 +581,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func loadFile(_ urlString: String) {
         pendingLoadConfiguration = nil
+        pendingHTTPHeaders = [:]
         pendingURL = urlString
         if Thread.isMainThread {
             attemptStartPendingLoad()
@@ -363,6 +593,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     func load(_ request: PlaybackLoadRequest) {
         pendingLoadConfiguration = MPVLoadConfiguration(request: request)
         pendingAudioURL = request.audioURL?.absoluteString
+        pendingHTTPHeaders = request.httpHeaders
         pendingURL = request.videoURL.absoluteString
         if Thread.isMainThread {
             attemptStartPendingLoad()
@@ -375,6 +606,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         guard let url = pendingURL, mpv != nil else { return }
         guard isViewLoaded, view.bounds.width > 1, view.bounds.height > 1 else { return }
         pendingURL = nil
+        applyHTTPHeaders(pendingHTTPHeaders)
+        pendingHTTPHeaders = [:]
+        subtitleTranslationState.reset()
+        isMPVSubtitleRendererHiddenForTranslation = false
+        setFlag("sub-visibility", true)
         lifecyclePositionMs = nil
         lifecycleDurationMs = nil
         lastVerifiedPositionMs = nil
@@ -524,8 +760,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         }
     }
 
-    /// AVPlayer must own the window's dynamic-range request while it presents
-    /// the local Dolby Vision playlist.
+    /// The system Dolby Vision renderer owns the window's dynamic-range request
+    /// while it presents the local playlist.
     func suspendDisplayCriteriaForNativePlayback() {
         clearDisplayCriteria()
     }
@@ -665,6 +901,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     func destroyPlayer() {
         NotificationCenter.default.removeObserver(self)
         pendingURL = nil
+        subtitleTranslationState.reset()
+        isMPVSubtitleRendererHiddenForTranslation = false
         pendingLoadConfiguration = nil
         startupDisplayGateActive = false
         pendingAutoplayAfterDisplayGate = false
@@ -774,6 +1012,18 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             self.bufferedMs = max(positionMs + cachedMs, 0)
         }
         currentSpeed = Float(speed > 0 ? speed : 1.0)
+        refreshSubtitleTranslation()
+    }
+
+    private func refreshSubtitleTranslation() {
+        guard mpv != nil else { return }
+        subtitleTranslationState.update(sourceText: getString("sub-text") ?? "")
+        let shouldHideRenderer = subtitleTranslationState.shouldDisplayOverlay
+        guard shouldHideRenderer != isMPVSubtitleRendererHiddenForTranslation else { return }
+        isMPVSubtitleRendererHiddenForTranslation = shouldHideRenderer
+        // MPV continues decoding `sub-text` while invisible, so original text
+        // is immediately available in the host overlay until Gemini responds.
+        setFlag("sub-visibility", !shouldHideRenderer)
     }
 
     func updateState() {
@@ -1391,6 +1641,25 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private func setStringProperty(_ name: String, _ value: String) {
         guard mpv != nil else { return }
         checkError(mpv_set_property_string(mpv, name, value))
+    }
+
+    /// `http-header-fields` is a comma-separated MPV option; commas and
+    /// backslashes in values must be escaped to keep each add-on header intact.
+    private func applyHTTPHeaders(_ headers: [String: String]) {
+        let fields = headers
+            .filter { !$0.key.isEmpty && !$0.value.isEmpty }
+            .sorted {
+                let lhs = $0.key.lowercased()
+                let rhs = $1.key.lowercased()
+                return lhs == rhs ? $0.value < $1.value : lhs < rhs
+            }
+            .map { key, value in
+                "\(key): \(value)"
+                    .replacingOccurrences(of: "\\", with: "\\\\")
+                    .replacingOccurrences(of: ",", with: "\\,")
+            }
+            .joined(separator: ",")
+        setStringProperty("http-header-fields", fields)
     }
 
     private func setDoubleProperty(_ name: String, _ value: Double) {

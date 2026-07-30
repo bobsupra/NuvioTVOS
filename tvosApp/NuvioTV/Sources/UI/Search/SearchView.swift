@@ -7,6 +7,12 @@ private enum SearchGridMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
+    static let columnCount: CGFloat = 7
+    /// Width of the seven visible cards, from the first card's leading edge to
+    /// the last card's trailing edge. Header controls use this too so their
+    /// right edge lands directly above the last card.
+    static let cardRowWidth = posterWidth * columnCount + posterGap * (columnCount - 1)
+    static let gridContentInset: CGFloat = 12
     /// Leading/trailing inset for the whole screen. With the grid's own 12pt
     /// (which keeps a focused card's 1.06 scale from clipping) this is the 48pt
     /// gutter Grid Home uses, so posters line up across the two screens.
@@ -51,11 +57,15 @@ struct SearchView: View {
 
             VStack(alignment: .leading, spacing: 24) {
                 header
+                    .frame(width: SearchGridMetrics.cardRowWidth, alignment: .leading)
+                    .padding(.horizontal, SearchGridMetrics.gridContentInset)
                     .disabled(overlayRestoreResultID != nil || discoverOverlayTransitionActive)
                     .zIndex(1)
 
                 if viewModel.hasQuery {
                     typeFilter
+                        .frame(width: SearchGridMetrics.cardRowWidth, alignment: .leading)
+                        .padding(.horizontal, SearchGridMetrics.gridContentInset)
                         .disabled(overlayRestoreResultID != nil)
                         .zIndex(1)
                     resultsContainer
@@ -162,7 +172,7 @@ struct SearchView: View {
                 searchTextInputActive = true
             } label: {
                 Color.clear
-                    .frame(width: 360, height: 86)
+                    .frame(maxWidth: .infinity, minHeight: 86)
                     .contentShape(Rectangle())
             }
             .buttonStyle(PosterCardButtonStyle())
@@ -204,7 +214,7 @@ struct SearchView: View {
         }
         .padding(.horizontal, 34)
         .frame(height: 86)
-        .frame(maxWidth: 1080, alignment: .leading)
+        .frame(maxWidth: .infinity, alignment: .leading)
         .modifier(GlassCapsule(focused: searchBarFocused || searchTextInputActive))
     }
 
@@ -292,7 +302,7 @@ struct SearchView: View {
                 }
             }
             .padding(.top, 16)
-            .padding(.horizontal, 12)
+            .padding(.horizontal, SearchGridMetrics.gridContentInset)
         }
         .focusSection()
         .defaultFocusIfAvailable($focusedResultID, defaultResultFocusID)

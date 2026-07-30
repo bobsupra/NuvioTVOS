@@ -189,6 +189,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// Sorted so an unordered set or dictionary cannot produce a spurious
     /// difference between two otherwise identical snapshots.
     var homeCatalogInputSignature: String {
+        let cinemetaEnabled = Self.isCinemetaEnabled
         let urls = Self.configuredStreamAddonManifestURLs
             .map(\.absoluteString)
             .joined(separator: "|")
@@ -199,7 +200,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: ",")
-        return "urls:[\(urls)] disabled:[\(disabled)] order:[\(order)]"
+        return "cinemeta:\(cinemetaEnabled) urls:[\(urls)] disabled:[\(disabled)] order:[\(order)]"
     }
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
     private let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
@@ -271,6 +272,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
     ) async throws -> [NuvioCatalog] {
         homeCatalogLoadWasPartial = false
         homeCatalogFailureSignature = nil
+        let cinemetaEnabled = Self.isCinemetaEnabled
         let specs: [(id: String, name: String, type: String, catalogId: String)] = [
             ("movie_top", "Popular - Movies", "movie", "top"),
             ("series_top", "Popular - Series", "series", "top"),
@@ -282,21 +284,23 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // transient failure aborted the complete Home request, leaving the
         // screen empty until switching profiles happened to start it again.
         var pages = Array<[NuvioMeta]?>(repeating: nil, count: specs.count)
-        await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
-            for (index, spec) in specs.enumerated() {
-                group.addTask {
-                    let page = try? await self.fetchCatalog(
-                        type: spec.type,
-                        catalogId: spec.catalogId,
-                        skip: nil,
-                        search: nil,
-                        genre: nil
-                    )
-                    return (index, page?.isEmpty == false ? page : nil)
+        if cinemetaEnabled {
+            await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
+                for (index, spec) in specs.enumerated() {
+                    group.addTask {
+                        let page = try? await self.fetchCatalog(
+                            type: spec.type,
+                            catalogId: spec.catalogId,
+                            skip: nil,
+                            search: nil,
+                            genre: nil
+                        )
+                        return (index, page?.isEmpty == false ? page : nil)
+                    }
                 }
-            }
-            for await (index, page) in group {
-                pages[index] = page
+                for await (index, page) in group {
+                    pages[index] = page
+                }
             }
         }
         try Task.checkCancellation()
@@ -308,6 +312,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         let disabledBuiltInKeys = TVHomeCatalogOrder.disabledCatalogKeys()
 
         func builtInCatalogs() -> [NuvioCatalog] {
+            guard cinemetaEnabled else { return [] }
             var result: [NuvioCatalog] = []
             for (index, spec) in specs.enumerated() {
                 guard let page = pages[index] else { continue }
@@ -346,7 +351,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // remain usable and are never discarded because a sibling host request
         // failed.
         let missing = pages.indices.filter { pages[$0] == nil }
-        if !missing.isEmpty {
+        if cinemetaEnabled && !missing.isEmpty {
             try await Task.sleep(nanoseconds: 600_000_000)
             try Task.checkCancellation()
             await withTaskGroup(of: (Int, [NuvioMeta]?).self) { group in
@@ -925,7 +930,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         async let movies = fetchCatalog(type: "movie", catalogId: "top", skip: nil, search: query, genre: nil)
         async let series = fetchCatalog(type: "series", catalogId: "top", skip: nil, search: query, genre: nil)
-        let results = await TmdbDetailsService.localizedMetadata(for: try await movies + series)
+        // Search must become useful as soon as Cinemeta responds. Enriching
+        // every result with a separate TMDB details request delayed the grid by
+        // one slow request per card; Details still performs full enrichment for
+        // the title the user actually opens.
+        let results = try await movies + series
         cacheMetadata(results)
         return results
     }
@@ -1020,7 +1029,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// add-ons'), for the Collections editor's source picker.
     func availableAddonCatalogs() async -> [AddonCatalogOption] {
         var options: [AddonCatalogOption] = []
-        var manifestURLs = [baseURL.appendingPathComponent("manifest.json")]
+        var manifestURLs: [URL] = []
+        if Self.isCinemetaEnabled {
+            manifestURLs.append(baseURL.appendingPathComponent("manifest.json"))
+        }
         manifestURLs.append(contentsOf: Self.configuredStreamAddonManifestURLs)
         var seenAddonIds = Set<String>()
 
@@ -1051,6 +1063,19 @@ final class CinemetaCatalogRepository: CatalogRepository {
     /// Label for the built-in rows, which are served from `baseURL` rather than
     /// from a configured manifest that could supply a name.
     static let cinemetaDisplayName = "Cinemeta"
+
+    /// A missing preference means Cinemeta is still the built-in default for
+    /// existing installs. Once the account/local add-on list contains the
+    /// Cinemeta manifest, its enabled flag is authoritative.
+    static var isCinemetaEnabled: Bool {
+        let manifestURL = "https://v3-cinemeta.strem.io/manifest.json"
+        guard let preference = configuredStreamAddonPreferences.first(where: {
+            normalizedManifestURL(from: $0.url)?.absoluteString == manifestURL
+        }) else {
+            return true
+        }
+        return preference.enabled
+    }
 
     /// Manifest cache for the configured stream add-ons, shared by the home
     /// catalog rows and the collection-folder resolver.

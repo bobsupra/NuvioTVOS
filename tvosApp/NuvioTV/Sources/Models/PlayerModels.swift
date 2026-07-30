@@ -226,6 +226,8 @@ private extension CharacterSet {
 /// same add-on fetch + smart-stream selection the details screen uses).
 struct PreparedNextStream {
     let url: URL
+    /// Per-stream HTTP headers from the add-on's proxy hints.
+    var httpHeaders: [String: String] = [:]
     /// The "S1 · E2 · Title" line the player shows and parses episode numbers from.
     let subtitleLine: String
     let subtitles: [NuvioSubtitle]

@@ -43,21 +43,21 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.1 (build 52)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.2 (build 53)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.1](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.1) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.2) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.2.1-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.1/NuvioTV-3.2.1-unsigned-release.ipa)
+[NuvioTV-3.2.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.2/NuvioTV-3.2.2-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.2.1
+### New in Beta 3.2.2
 
-- Adds TMDB and Trakt-backed collection browsing, localized metadata, person and production catalogs, configurable MDBList rating badges, and safer Stremio catalog URL encoding.
-- Improves Up Next data from Trakt and Simkl, shows same-day releases accurately, and remembers the last playable stream for URL-less Continue Watching rows.
-- Upgrades AetherEngine to 6.0.1 and FFmpegBuild to 2.4.0 with AirPlay/HLS recovery, bounded reader backpressure, subtitle link arbitration, container chapters, FLAC/E-AC-3 fixes, and hardware/software routing improvements.
-- Preserves subtitle styling and placement across ASS, SRT, WebVTT, and teletext, including software PiP rendering and retained-cue paths.
-- Adds broad regression coverage for provider collections, playback, subtitle, memory, seek, interlace, AirPlay, and muxing failures. Physical Apple TV testing is still needed.
+- Adds optional Gemini AI subtitle translation for AetherEngine and MPVKit text subtitles, with per-profile Keychain keys, local translation caching, cue prefetching, manual control, and a fallback to the original text while a translation is pending.
+- Adds Android TV-compatible stream badge packs, file-size badges, optional add-on logos, and account sync for the selected badge settings.
+- Forwards add-on-provided Stremio proxy request headers through playback and remembered direct streams, improving compatibility with protected media hosts.
+- Syncs Home catalog order and visibility edits, keeps Android-authored custom titles, supports disabling Cinemeta, and improves navigation/focus from collection, person, and production screens.
+- Makes search feel faster through lower debounce and a short-lived in-memory result cache.
 
 ### The new player
 

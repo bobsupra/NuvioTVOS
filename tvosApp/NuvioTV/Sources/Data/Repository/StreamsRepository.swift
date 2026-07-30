@@ -597,7 +597,7 @@ private struct StreamSubtitleResponse: Decodable {
     let subtitles: [StreamAddonSubtitleDTO]
 }
 
-private struct StreamAddonStreamDTO: Decodable {
+struct StreamAddonStreamDTO: Decodable {
     let url: String?
     let externalUrl: String?
     let name: String?
@@ -635,8 +635,10 @@ private struct StreamAddonStreamDTO: Decodable {
             fileIdx: fileIdx,
             sources: sources ?? [],
             filename: cleaned(behaviorHints?.filename),
+            videoSize: behaviorHints?.videoSize,
             bingeGroup: cleaned(behaviorHints?.bingeGroup),
-            isCached: behaviorHints?.cached ?? behaviorHints?.isCached
+            isCached: behaviorHints?.cached ?? behaviorHints?.isCached,
+            httpHeaders: behaviorHints?.proxyHeaders?.request
         )
     }
 
@@ -654,7 +656,7 @@ private struct StreamAddonStreamDTO: Decodable {
     }()
 }
 
-private struct StreamAddonSubtitleDTO: Decodable {
+struct StreamAddonSubtitleDTO: Decodable {
     let url: String?
     let language: String?
     let lang: String?
@@ -680,10 +682,17 @@ private struct StreamAddonSubtitleDTO: Decodable {
     }
 }
 
-private struct StreamAddonBehaviorHints: Decodable {
+struct StreamAddonBehaviorHints: Decodable {
     let videoSize: Int64?
     let filename: String?
     let bingeGroup: String?
     let cached: Bool?
     let isCached: Bool?
+    let proxyHeaders: StreamAddonProxyHeaders?
+}
+
+/// Stremio stream add-ons can require request headers for the media host.
+/// Response headers describe proxy behavior and are not sent by clients.
+struct StreamAddonProxyHeaders: Decodable {
+    let request: [String: String]?
 }

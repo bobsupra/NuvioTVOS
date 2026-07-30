@@ -24,7 +24,11 @@ final class StreamsDiscoveryTests: XCTestCase {
             infoHash: "abcdef0123456789abcdef0123456789abcdef01",
             fileIdx: 2,
             sources: ["tracker:udp://tracker.example/announce"],
-            filename: "Show.S01E01.1080p.mkv"
+            filename: "Show.S01E01.1080p.mkv",
+            httpHeaders: [
+                "Referer": "https://portal.example/",
+                "User-Agent": "ExamplePlayer/1.0"
+            ]
         )
 
         let external = [
@@ -39,6 +43,7 @@ final class StreamsDiscoveryTests: XCTestCase {
         XCTAssertEqual(merged.filename, torrent.filename)
         XCTAssertEqual(merged.addonLogoURL, torrent.addonLogoURL)
         XCTAssertEqual(merged.addonName, "Torrentio")
+        XCTAssertEqual(merged.httpHeaders, torrent.httpHeaders)
         XCTAssertEqual(merged.subtitles.count, 2)
         XCTAssertTrue(merged.subtitles.contains { $0.url == "https://example.com/b.srt" })
     }
@@ -120,6 +125,34 @@ final class StreamsDiscoveryTests: XCTestCase {
         let cached = await cache.success(for: url)
         XCTAssertEqual(cached?.id, "com.example.addon")
         XCTAssertEqual(cached?.name, "Example")
+    }
+
+    func testProxyRequestHeadersAreRetainedForPlayback() throws {
+        let data = Data(
+            #"""
+            {
+              "url": "https://media.example/stream.m3u8",
+              "name": "KhmerAve",
+              "behaviorHints": {
+                "proxyHeaders": {
+                  "request": {
+                    "Referer": "https://ok.ru/",
+                    "User-Agent": "Mozilla/5.0"
+                  },
+                  "response": { "Set-Cookie": "must-not-be-forwarded" }
+                }
+              }
+            }
+            """#.utf8
+        )
+
+        let raw = try JSONDecoder().decode(StreamAddonStreamDTO.self, from: data)
+        let stream = try XCTUnwrap(raw.toNuvioStream(addonName: "KhmerDub"))
+
+        XCTAssertEqual(
+            stream.httpHeaders,
+            ["Referer": "https://ok.ru/", "User-Agent": "Mozilla/5.0"]
+        )
     }
 
     // MARK: - Stream picker list derivation / focus isolation

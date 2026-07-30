@@ -20,7 +20,7 @@ enum PlayerEngineSetting: String, Equatable {
         }
     }
 
-    /// Migrates stored preference strings from the dual AVPlayer/MPV era.
+    /// Migrates stored preference strings from earlier engine configurations.
     static func migrated(from raw: String?) -> PlayerEngineSetting {
         let value = (raw ?? "Auto").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         switch value {
@@ -29,7 +29,7 @@ enum PlayerEngineSetting: String, Equatable {
         case "mpvkit", "mpv":
             return .mpv
         case "avplayer":
-            // Forced AVPlayer → Auto (Aether owns native AV routing).
+            // Retired engine preference → Auto.
             return .auto
         case "auto", "":
             return .auto

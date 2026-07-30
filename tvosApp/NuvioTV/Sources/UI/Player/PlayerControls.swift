@@ -673,6 +673,7 @@ struct PlayerSettingsPanel: View {
 
     private enum StyleControl: Hashable {
         case delayMinus, delayPlus
+        case aiTranslation
         case sizeMinus, sizePlus
         case bold
         case color(String)
@@ -1080,6 +1081,18 @@ struct PlayerSettingsPanel: View {
                         onMinus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs - 50) },
                         onPlus: { viewModel.setSubtitleDelayMs(viewModel.subtitleDelayMs + 50) }
                     )
+
+                    if viewModel.canManuallyToggleAISubtitleTranslation {
+                        toggleRow(
+                            title: "AI Translation",
+                            isOn: viewModel.isAISubtitleTranslationManuallyEnabled,
+                            focusKey: .aiTranslation
+                        ) {
+                            viewModel.setAISubtitleTranslationManuallyEnabled(
+                                !viewModel.isAISubtitleTranslationManuallyEnabled
+                            )
+                        }
+                    }
 
                     stepperRow(
                         title: "Font Size",

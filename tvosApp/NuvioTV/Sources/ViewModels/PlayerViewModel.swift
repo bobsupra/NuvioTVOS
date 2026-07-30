@@ -65,6 +65,8 @@ class PlayerViewModel: ObservableObject {
     /// Current mpv `sub-delay`, in milliseconds. Per-session, not persisted.
     @Published var subtitleDelayMs: Int = 0
     @Published private(set) var subtitleStyle = SubtitleStyle.current
+    /// Session-only override used when AI Subtitle auto-select is disabled.
+    @Published private(set) var isAISubtitleTranslationManuallyEnabled = false
     /// Current mpv `audio-delay`, in milliseconds. Per-session, not persisted.
     @Published var audioDelayMs: Int = 0
     /// PCM amplification in whole dB (0…10), applied as mpv software volume.
@@ -156,6 +158,7 @@ class PlayerViewModel: ObservableObject {
     private var didShutdown = false
     private var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
+    private var activeHTTPHeaders: [String: String] = [:]
     /// Episode being played, parsed from the subtitle line ("S1 · E3 · Title")
     /// DetailsScreen builds; nil for movies/trailers. Persisted with Continue
     /// Watching so the Home hero can say which episode is in progress.
@@ -294,6 +297,22 @@ class PlayerViewModel: ObservableObject {
         }
         playerController.onPlaybackSuspended = suspend
         aetherController.onPlaybackSuspended = suspend
+        aetherController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
+            switch outcome {
+            case .success:
+                self?.showPlayerToast("AI subtitles on")
+            case .failure(let error):
+                self?.showPlayerToast("AI subtitles unavailable — \(error.localizedDescription)")
+            }
+        }
+        playerController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
+            switch outcome {
+            case .success:
+                self?.showPlayerToast("AI subtitles on")
+            case .failure(let error):
+                self?.showPlayerToast("AI subtitles unavailable — \(error.localizedDescription)")
+            }
+        }
         sessionCoordinator.onHandoffToast = { [weak self] message in
             self?.hdrModeToast = message
             self?.showPlayerToast(message)
@@ -318,10 +337,24 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    func load(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle] = [], resumeFrom: Double?) {
+    func load(
+        url: URL,
+        meta: NuvioMeta,
+        subtitle: String,
+        httpHeaders: [String: String] = [:],
+        externalSubtitles: [NuvioSubtitle] = [],
+        resumeFrom: Double?
+    ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         if !hasLoaded { sessionTrackSelection = nil }
-        applyStreamState(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
+        applyStreamState(
+            url: url,
+            meta: meta,
+            subtitle: subtitle,
+            httpHeaders: httpHeaders,
+            externalSubtitles: externalSubtitles,
+            resumeFrom: resumeFrom
+        )
         guard !hasLoaded else { return }
         hasLoaded = true
 
@@ -374,6 +407,7 @@ class PlayerViewModel: ObservableObject {
 
         beginPrimaryLoad(
             for: url,
+            httpHeaders: httpHeaders,
             streamName: nil,
             streamDescription: subtitle,
             filename: url.lastPathComponent
@@ -388,6 +422,7 @@ class PlayerViewModel: ObservableObject {
     /// while Aether owns Dolby Vision (including live P7→8.1).
     private func beginPrimaryLoad(
         for url: URL,
+        httpHeaders: [String: String] = [:],
         streamName: String?,
         streamDescription: String?,
         filename: String?
@@ -398,7 +433,7 @@ class PlayerViewModel: ObservableObject {
             videoURL: url,
             audioURL: nil,
             resumePositionSeconds: pendingResumeSeconds,
-            httpHeaders: [:],
+            httpHeaders: httpHeaders,
             externalSubtitles: pendingExternalSubtitles,
             preferredAudioLanguages: preferredAudioLanguageCodes(),
             preferredSubtitleLanguages: preferredSubtitleLanguageCodes(),
@@ -452,6 +487,7 @@ class PlayerViewModel: ObservableObject {
         url: URL,
         meta: NuvioMeta,
         subtitle: String,
+        httpHeaders: [String: String] = [:],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
         preserveSessionPreferences: Bool = false
@@ -492,6 +528,7 @@ class PlayerViewModel: ObservableObject {
         self.hidePeek()
         self.activeMeta = meta
         self.activeStreamURL = url.absoluteString
+        self.activeHTTPHeaders = httpHeaders
         self.activeEpisodeNumbers = isTrailerPlayback
             ? nil
             : Self.episodeNumbers(fromSubtitle: subtitle)
@@ -532,6 +569,7 @@ class PlayerViewModel: ObservableObject {
         self.didAddExternalSubtitles = pendingExternalSubtitles.isEmpty
         self.addedExternalSubtitleURLs = []
         self.pendingSelectedExternalSubtitleURL = nil
+        self.isAISubtitleTranslationManuallyEnabled = false
         if !preserveSessionPreferences {
             self.subtitleDelayMs = 0
             self.audioDelayMs = 0
@@ -868,6 +906,7 @@ class PlayerViewModel: ObservableObject {
             url: prepared.url,
             meta: meta,
             subtitle: prepared.subtitleLine,
+            httpHeaders: prepared.httpHeaders,
             externalSubtitles: prepared.subtitles,
             resumeFrom: resumeFrom,
             preserveSessionPreferences: true
@@ -888,6 +927,7 @@ class PlayerViewModel: ObservableObject {
 
         beginPrimaryLoad(
             for: prepared.url,
+            httpHeaders: prepared.httpHeaders,
             streamName: prepared.streamName,
             streamDescription: prepared.streamDescription ?? prepared.subtitleLine,
             filename: prepared.filename
@@ -1899,6 +1939,29 @@ class PlayerViewModel: ObservableObject {
         engine.applySubtitleStyle()
     }
 
+    /// Auto-select begins translation at playback. When it is disabled, expose
+    /// an explicit per-session switch in the player without changing the
+    /// user's global integration preference.
+    var canManuallyToggleAISubtitleTranslation: Bool {
+        let settings = AISubtitleTranslationSettings.current()
+        return settings.isEnabled && !settings.apiKey.isEmpty && !settings.autoSelect
+    }
+
+    func setAISubtitleTranslationManuallyEnabled(_ enabled: Bool) {
+        let settings = AISubtitleTranslationSettings.current()
+        guard settings.isEnabled, !settings.apiKey.isEmpty else {
+            showPlayerToast("Set up AI Subtitles in Settings → Integrations")
+            return
+        }
+        isAISubtitleTranslationManuallyEnabled = enabled
+        switch activeEngineKind {
+        case .aether:
+            aetherController.subtitleTranslationState.setManualActivation(enabled)
+        case .mpv:
+            playerController.subtitleTranslationState.setManualActivation(enabled)
+        }
+    }
+
     /// Shifts subtitle timing; positive shows captions later.
     func setSubtitleDelayMs(_ ms: Int) {
         let clamped = min(max(ms, -30_000), 30_000)
@@ -1963,7 +2026,7 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    /// AVPlayer's remote-HLS legible renderer does not expose Nuvio's timing or
+    /// The system remote-HLS legible renderer does not expose Nuvio's timing or
     /// appearance controls. Preserve the requested track metadata and move the
     /// active session to the renderer that implements those controls.
     @discardableResult
@@ -2706,6 +2769,7 @@ class PlayerViewModel: ObservableObject {
             LastPlaybackStreamStore.save(
                 metaId: activeMeta.id,
                 url: activeStreamURL,
+                httpHeaders: activeHTTPHeaders,
                 season: season,
                 episode: episode
             )

@@ -26,6 +26,340 @@ final class AetherSubtitleOverlayState: ObservableObject {
     }
 }
 
+/// Keeps translation separate from the renderer's timing state: new text is
+/// swapped in only after Gemini answers, so a slow/network-failed request
+/// continues to show the original cue rather than delaying or hiding it.
+@MainActor
+final class AISubtitleTranslationState: ObservableObject {
+    @Published private var translatedTextByCueID: [Int: String] = [:]
+    @Published private var translatingCueIDs: Set<Int> = []
+
+    /// Delivered once per playback session, allowing the player to use its
+    /// established non-blocking toast presentation.
+    var onFirstOutcome: ((Result<Void, Error>) -> Void)?
+
+    private var tasks: [Int: Task<Void, Never>] = [:]
+    private var sessionID = UUID()
+    private var didReportOutcome = false
+    private var failedCueIDs: Set<Int> = []
+    private var manualActivation = false
+    private var lastCues: [SubtitleCue] = []
+    private var lastSourceTime: Double = 0
+    private var currentSettings: AISubtitleTranslationSettings?
+    private let prefetchWindowSeconds: Double = 8
+    private let maximumConcurrentRequests = 2
+
+    var isConfigured: Bool {
+        let settings = AISubtitleTranslationSettings.current()
+        return settings.isEnabled && !settings.apiKey.isEmpty
+    }
+
+    var isActive: Bool {
+        let settings = AISubtitleTranslationSettings.current()
+        return settings.isEnabled && !settings.apiKey.isEmpty && (settings.autoSelect || manualActivation)
+    }
+
+    func translatedText(for cueID: Int) -> String? {
+        guard isActive else { return nil }
+        return translatedTextByCueID[cueID]
+    }
+
+    func isTranslating(cueIDs: some Sequence<Int>) -> Bool {
+        cueIDs.contains { translatingCueIDs.contains($0) }
+    }
+
+    func setManualActivation(_ enabled: Bool) {
+        manualActivation = enabled
+        if !enabled && !AISubtitleTranslationSettings.current().autoSelect {
+            deactivate()
+            return
+        }
+        update(cues: lastCues, at: lastSourceTime)
+    }
+
+    func update(cues: [SubtitleCue], at sourceTime: Double) {
+        lastCues = cues
+        lastSourceTime = sourceTime
+
+        let settings = AISubtitleTranslationSettings.current()
+        guard settings.isEnabled else {
+            deactivate()
+            return
+        }
+        guard !settings.apiKey.isEmpty else {
+            deactivate()
+            reportOnce(.failure(AISubtitleTranslationError.missingAPIKey))
+            return
+        }
+        guard settings.autoSelect || manualActivation else {
+            deactivate()
+            return
+        }
+        if currentSettings != settings {
+            tasks.values.forEach { $0.cancel() }
+            tasks = [:]
+            translatedTextByCueID = [:]
+            translatingCueIDs = []
+            failedCueIDs = []
+            sessionID = UUID()
+            currentSettings = settings
+        }
+
+        // Cue translation cannot begin only at presentation time: a regular API
+        // round trip often exceeds the first second of a subtitle. Prefer active
+        // cues, then warm a short upcoming window, while bounding API pressure.
+        let candidateCues = cues.filter {
+            $0.endTime >= sourceTime && $0.startTime <= sourceTime + prefetchWindowSeconds
+        }
+        .sorted { lhs, rhs in
+            let lhsDistance = max(0, lhs.startTime - sourceTime)
+            let rhsDistance = max(0, rhs.startTime - sourceTime)
+            if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+            return lhs.startTime < rhs.startTime
+        }
+        for cue in candidateCues {
+            guard tasks.count < maximumConcurrentRequests else { break }
+            guard translatedTextByCueID[cue.id] == nil,
+                  tasks[cue.id] == nil,
+                  !failedCueIDs.contains(cue.id),
+                  let text = cue.text else { continue }
+            let source = Self.cleaned(text, stripHearingImpaired: settings.stripHearingImpaired)
+            guard !source.isEmpty else {
+                translatedTextByCueID[cue.id] = ""
+                continue
+            }
+            translate(cueID: cue.id, source: source, settings: settings)
+        }
+    }
+
+    func reset() {
+        tasks.values.forEach { $0.cancel() }
+        tasks = [:]
+        translatedTextByCueID = [:]
+        translatingCueIDs = []
+        sessionID = UUID()
+        didReportOutcome = false
+        failedCueIDs = []
+        manualActivation = false
+        lastCues = []
+        lastSourceTime = 0
+        currentSettings = nil
+    }
+
+    private func translate(
+        cueID: Int,
+        source: String,
+        settings: AISubtitleTranslationSettings
+    ) {
+        let activeSession = sessionID
+        let profileScope = ProfileSettings.activeProfileScope
+        translatingCueIDs.insert(cueID)
+        tasks[cueID] = Task { [weak self] in
+            do {
+                if let cached = await AISubtitleTranslationCache.shared.translation(
+                    for: source,
+                    targetLanguage: settings.targetLanguage,
+                    model: settings.model,
+                    stripHearingImpaired: settings.stripHearingImpaired,
+                    profileScope: profileScope
+                ) {
+                    guard !Task.isCancelled,
+                          let self,
+                          self.sessionID == activeSession else { return }
+                    self.translatedTextByCueID[cueID] = cached
+                    self.finish(cueID: cueID, outcome: .success(()))
+                    return
+                }
+                let translated = try await GeminiSubtitleTranslator.translate(
+                    source,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey
+                )
+                let cleaned = Self.cleaned(
+                    translated,
+                    stripHearingImpaired: settings.stripHearingImpaired
+                )
+                await AISubtitleTranslationCache.shared.store(
+                    cleaned,
+                    for: source,
+                    targetLanguage: settings.targetLanguage,
+                    model: settings.model,
+                    stripHearingImpaired: settings.stripHearingImpaired,
+                    profileScope: profileScope
+                )
+                guard !Task.isCancelled,
+                      let self,
+                      self.sessionID == activeSession else { return }
+                self.translatedTextByCueID[cueID] = cleaned
+                self.finish(cueID: cueID, outcome: .success(()))
+            } catch is CancellationError {
+                guard let self, self.sessionID == activeSession else { return }
+                self.tasks[cueID] = nil
+                self.translatingCueIDs.remove(cueID)
+            } catch {
+                guard !Task.isCancelled,
+                      let self,
+                      self.sessionID == activeSession else { return }
+                self.finish(cueID: cueID, outcome: .failure(error))
+            }
+        }
+    }
+
+    private func finish(cueID: Int, outcome: Result<Void, Error>) {
+        tasks[cueID] = nil
+        translatingCueIDs.remove(cueID)
+        if case .failure = outcome {
+            failedCueIDs.insert(cueID)
+        }
+        reportOnce(outcome)
+    }
+
+    private func reportOnce(_ outcome: Result<Void, Error>) {
+        guard !didReportOutcome else { return }
+        didReportOutcome = true
+        onFirstOutcome?(outcome)
+    }
+
+    private func deactivate() {
+        tasks.values.forEach { $0.cancel() }
+        tasks = [:]
+        failedCueIDs = []
+        currentSettings = nil
+        sessionID = UUID()
+        if !translatedTextByCueID.isEmpty { translatedTextByCueID = [:] }
+        if !translatingCueIDs.isEmpty { translatingCueIDs = [] }
+    }
+
+    /// Removes the common SDH / hearing-impaired annotations before the cue is
+    /// sent and after the model responds. Dialogue on the same cue is retained.
+    static func cleaned(_ text: String, stripHearingImpaired: Bool) -> String {
+        var result = text
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard stripHearingImpaired else { return result }
+        result = result
+            .replacingOccurrences(of: #"\[[^\]]*\]"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\([^\)]*\)"#, with: "", options: .regularExpression)
+            .replacingOccurrences(of: "[♪♫]", with: "", options: .regularExpression)
+            .replacingOccurrences(of: #"\s{2,}"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return result
+    }
+}
+
+enum AISubtitleTranslationError: LocalizedError {
+    case missingAPIKey
+    case invalidResponse
+    case service(message: String)
+
+    var errorDescription: String? {
+        switch self {
+        case .missingAPIKey:
+            return "Add a Gemini API key in Settings → Integrations → AI Subtitles."
+        case .invalidResponse:
+            return "Gemini returned no translated text."
+        case .service(let message):
+            return message
+        }
+    }
+}
+
+enum GeminiSubtitleTranslator {
+    private struct RequestBody: Encodable {
+        let contents: [Content]
+        let generationConfig: GenerationConfig
+    }
+
+    private struct Content: Encodable {
+        let parts: [Part]
+    }
+
+    private struct Part: Encodable {
+        let text: String
+    }
+
+    private struct GenerationConfig: Encodable {
+        let temperature: Double
+        let maxOutputTokens: Int
+    }
+
+    private struct ResponseBody: Decodable {
+        let candidates: [Candidate]?
+    }
+
+    private struct Candidate: Decodable {
+        let content: ResponseContent?
+    }
+
+    private struct ResponseContent: Decodable {
+        let parts: [ResponsePart]?
+    }
+
+    private struct ResponsePart: Decodable {
+        let text: String?
+    }
+
+    private struct ErrorBody: Decodable {
+        let error: APIError?
+    }
+
+    private struct APIError: Decodable {
+        let message: String?
+    }
+
+    static func translate(
+        _ source: String,
+        to targetLanguage: String,
+        model: String,
+        apiKey: String,
+        session: URLSession = .shared
+    ) async throws -> String {
+        guard let url = URL(
+            string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
+        ) else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+
+        let prompt = """
+        Translate the subtitle enclosed in <subtitle> into \(targetLanguage).
+        Return only the natural translated subtitle text. Preserve dialogue line breaks; do not add labels, explanations, quotation marks, or annotations.
+        <subtitle>
+        \(source)
+        </subtitle>
+        """
+        let body = RequestBody(
+            contents: [Content(parts: [Part(text: prompt)])],
+            generationConfig: GenerationConfig(temperature: 0.1, maxOutputTokens: 256)
+        )
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
+        request.timeoutInterval = 12
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let serviceError = try? JSONDecoder().decode(ErrorBody.self, from: data)
+            throw AISubtitleTranslationError.service(
+                message: serviceError?.error?.message ?? "Gemini request failed (HTTP \(http.statusCode))."
+            )
+        }
+        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+        let text = decoded.candidates?
+            .flatMap { $0.content?.parts ?? [] }
+            .compactMap(\.text)
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !text.isEmpty else { throw AISubtitleTranslationError.invalidResponse }
+        return text
+    }
+}
+
 @MainActor
 enum AetherExternalSubtitleIdentity {
     static func accepted(
@@ -76,6 +410,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     let engine: AetherEngine
     let playerView = AetherPlayerView()
     let subtitleOverlayState = AetherSubtitleOverlayState()
+    let subtitleTranslationState = AISubtitleTranslationState()
 
     private var cancellables = Set<AnyCancellable>()
     private var loadGeneration: UInt64 = 0
@@ -86,6 +421,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var currentHTTPHeaders: [String: String] = [:]
     private var didReportTerminalError = false
     private var sourceProbe: SourceProbe?
+    private var subtitleDelaySeconds: Double = 0
 
     // MARK: PlaybackEngineControlling surface
 
@@ -203,7 +539,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         engine.clock.$sourceTime
             .receive(on: DispatchQueue.main)
             .sink { [weak self] sourceTime in
-                self?.subtitleOverlayState.updateSourceTime(sourceTime)
+                guard let self else { return }
+                self.subtitleOverlayState.updateSourceTime(sourceTime)
+                self.subtitleTranslationState.update(
+                    cues: self.subtitleCues,
+                    at: sourceTime - self.subtitleDelaySeconds
+                )
             }
             .store(in: &cancellables)
 
@@ -224,8 +565,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         engine.$subtitleCues
             .receive(on: DispatchQueue.main)
             .sink { [weak self] cues in
-                self?.subtitleCues = cues
-                self?.subtitleOverlayState.updateCues(cues)
+                guard let self else { return }
+                self.subtitleCues = cues
+                self.subtitleOverlayState.updateCues(cues)
+                self.subtitleTranslationState.update(
+                    cues: cues,
+                    at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+                )
             }
             .store(in: &cancellables)
 
@@ -372,6 +718,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     func load(_ request: PlaybackLoadRequest, generation: UInt64) {
         loadGeneration = generation
+        subtitleDelaySeconds = request.subtitleDelaySeconds
         didReportTerminalError = false
         isPlayerLoading = true
         isPlayerEnded = false
@@ -397,6 +744,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         subtitleTracks = []
         subtitleCues = []
         subtitleOverlayState.reset()
+        subtitleTranslationState.reset()
         videoFrameSize = .zero
 
         let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
@@ -503,8 +851,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func setSubtitleDelay(_ seconds: Double) {
-        // Host overlay evaluates cues at sourceTime - delay; nothing to push into Aether.
-        _ = seconds
+        // Host overlay evaluates cues at sourceTime - delay; use the same clock
+        // for prefetching so negative subtitle delays do not miss their cue.
+        subtitleDelaySeconds = seconds
+        subtitleTranslationState.update(
+            cues: subtitleCues,
+            at: engine.clock.sourceTime - subtitleDelaySeconds
+        )
     }
 
     func setAudioDelay(_ seconds: Double) {
@@ -562,6 +915,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         engine.stop(resetDisplayCriteria: true)
         subtitleCues = []
         subtitleOverlayState.reset()
+        subtitleTranslationState.reset()
         audioTracks = []
         subtitleTracks = []
         isPlayerLoading = false

@@ -27,12 +27,4 @@ struct PlaybackEngineCapabilities: Equatable {
         supportsHTTPHeaders: true
     )
 
-    static let avPlayer = PlaybackEngineCapabilities(
-        supportsSeparateAudioURL: false,
-        supportsAudioDelay: false,
-        supportsAudioAmplification: false,
-        supportsAuthoredASS: false,
-        supportsHostSubtitleOverlay: false,
-        supportsHTTPHeaders: true
-    )
 }

@@ -1,5 +1,6 @@
 import SwiftUI
 import UIKit
+import Security
 
 enum AppFocusOutline {
     static var color: Color {
@@ -192,6 +193,14 @@ enum SettingsKey {
     static let torboxAccessToken = "nuvio.tv.settings.integrations.torboxAccessToken"
     static let premiumizeAccessToken = "nuvio.tv.settings.integrations.premiumizeAccessToken"
     static let realDebridAccessToken = "nuvio.tv.settings.integrations.realDebridAccessToken"
+    /// Gemini credentials are device-local. Subtitle text is sent directly to
+    /// Google's API only while the user has enabled AI subtitles.
+    static let aiSubtitlesEnabled = "nuvio.tv.settings.integrations.aiSubtitlesEnabled"
+    static let aiSubtitlesGeminiAPIKey = "nuvio.tv.settings.integrations.aiSubtitlesGeminiAPIKey"
+    static let aiSubtitlesGeminiModel = "nuvio.tv.settings.integrations.aiSubtitlesGeminiModel"
+    static let aiSubtitlesTargetLanguage = "nuvio.tv.settings.integrations.aiSubtitlesTargetLanguage"
+    static let aiSubtitlesAutoSelect = "nuvio.tv.settings.integrations.aiSubtitlesAutoSelect"
+    static let aiSubtitlesStripHearingImpaired = "nuvio.tv.settings.integrations.aiSubtitlesStripHearingImpaired"
     static let streamAddonManifestURL = "nuvio.tv.settings.integrations.streamAddonManifestURL"
     static let streamAddonManifestURLs = "nuvio.tv.settings.integrations.streamAddonManifestURLs"
     static let streamAddonManifestStates = "nuvio.tv.settings.integrations.streamAddonManifestStates"
@@ -202,6 +211,10 @@ enum SettingsKey {
     static let smartStreamQuality = "nuvio.tv.settings.playback.smartStreamQuality"
     static let smartSubtitleMatching = "nuvio.tv.settings.playback.smartSubtitleMatching"
     static let cachedOnlyStreams = "nuvio.tv.settings.playback.cachedOnlyStreams"
+    static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
+    static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
+    static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
+    static let streamBadgePlacement = "nuvio.tv.settings.playback.streamBadgePlacement"
     static let autoPlayNext = "nuvio.tv.settings.playback.autoPlayNext"
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
@@ -225,7 +238,9 @@ enum SettingsKey {
 
     /// API app credentials must remain on the Apple TV and never enter the
     /// account settings payload.
-    static let deviceLocal = Set([traktClientID, traktClientSecret, simklClientID])
+    static let deviceLocal = Set([
+        traktClientID, traktClientSecret, simklClientID, aiSubtitlesGeminiAPIKey
+    ])
 
     static let all = [
         profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
@@ -246,10 +261,13 @@ enum SettingsKey {
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
+        aiSubtitlesEnabled, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
+        aiSubtitlesTargetLanguage, aiSubtitlesAutoSelect, aiSubtitlesStripHearingImpaired,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
-        cachedOnlyStreams, autoPlayNext, trailersEnabled, trailerDelay, audioLanguage,
+        cachedOnlyStreams, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        autoPlayNext, trailersEnabled, trailerDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
         externalPlayerForwardSubtitles, assOverrideMode,
@@ -541,6 +559,115 @@ enum SubtitleLanguagePreferences {
         value
             .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .lowercased()
+    }
+}
+
+/// Device-local Gemini credentials. The non-secret enable/model preferences
+/// remain per-profile in UserDefaults, while the key itself stays in Keychain.
+enum AISubtitleKeyStore {
+    private static let service = "com.nuvio.tv.ai-subtitles"
+
+    static func apiKey(defaults: UserDefaults = ProfileSettings.current) -> String {
+        let scope = ProfileSettings.activeProfileScope
+        return migrateLegacyKey(from: defaults, profileScope: scope)
+    }
+
+    /// Moves a legacy UserDefaults key into the named Keychain namespace. This
+    /// is internal so profile activation can migrate the pre-profile store
+    /// before its value is intentionally excluded from settings copies.
+    @discardableResult
+    static func migrateLegacyKey(from defaults: UserDefaults, profileScope: String) -> String {
+        if let secureKey = read(profileScope: profileScope) {
+            defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
+            return secureKey
+        }
+        let legacyKey = (defaults.string(forKey: SettingsKey.aiSubtitlesGeminiAPIKey) ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !legacyKey.isEmpty else { return "" }
+        guard save(legacyKey, profileScope: profileScope) else { return "" }
+        defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
+        return legacyKey
+    }
+
+    @discardableResult
+    static func save(_ key: String, profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
+        let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return remove(profileScope: profileScope)
+        }
+
+        let data = Data(trimmed.utf8)
+        var addQuery = keychainQuery(for: profileScope)
+        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+        addQuery[kSecValueData as String] = data
+        let status = SecItemAdd(addQuery as CFDictionary, nil)
+        if status == errSecDuplicateItem {
+            return SecItemUpdate(
+                keychainQuery(for: profileScope) as CFDictionary,
+                [kSecValueData as String: data] as CFDictionary
+            ) == errSecSuccess
+        }
+        return status == errSecSuccess
+    }
+
+    @discardableResult
+    static func remove(profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
+        let status = SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
+        return status == errSecSuccess || status == errSecItemNotFound
+    }
+
+    private static func read(profileScope: String) -> String? {
+        var query = keychainQuery(for: profileScope)
+        query[kSecReturnData as String] = kCFBooleanTrue
+        query[kSecMatchLimit as String] = kSecMatchLimitOne
+        var item: CFTypeRef?
+        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+              let data = item as? Data else { return nil }
+        return String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func keychainQuery(for profileScope: String) -> [String: Any] {
+        [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: "gemini.\(profileScope)"
+        ]
+    }
+}
+
+/// Runtime configuration shared by the settings screen and the player cue
+/// translator. The key remains device-local; it is never included in profile
+/// sync payloads.
+struct AISubtitleTranslationSettings: Equatable {
+    static let defaultModel = "gemini-3.6-flash"
+    static let availableModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+
+    let isEnabled: Bool
+    let apiKey: String
+    let model: String
+    let targetLanguage: String
+    let autoSelect: Bool
+    let stripHearingImpaired: Bool
+
+    static func current(defaults: UserDefaults = ProfileSettings.current) -> Self {
+        let preferredLanguage = SubtitleLanguagePreferences.orderedFromDefaults(defaults: defaults).first
+            ?? SubtitleLanguagePreferences.preferredAudioLanguage(defaults: defaults)
+            ?? "English"
+        let configuredTarget = defaults.string(forKey: SettingsKey.aiSubtitlesTargetLanguage) ?? "Preferred Subtitle"
+        return Self(
+            isEnabled: defaults.bool(forKey: SettingsKey.aiSubtitlesEnabled),
+            apiKey: AISubtitleKeyStore.apiKey(defaults: defaults),
+            model: normalizedModel(defaults.string(forKey: SettingsKey.aiSubtitlesGeminiModel)),
+            targetLanguage: configuredTarget == "Preferred Subtitle" ? preferredLanguage : configuredTarget,
+            autoSelect: defaults.object(forKey: SettingsKey.aiSubtitlesAutoSelect) as? Bool ?? true,
+            stripHearingImpaired: defaults.object(forKey: SettingsKey.aiSubtitlesStripHearingImpaired) as? Bool ?? true
+        )
+    }
+
+    static func normalizedModel(_ storedModel: String?) -> String {
+        let model = (storedModel ?? defaultModel).trimmingCharacters(in: .whitespacesAndNewlines)
+        return availableModels.contains(model) ? model : defaultModel
     }
 }
 
@@ -1994,18 +2121,6 @@ private struct IntegrationSettingsView: View {
     @State private var simklClientIDDraft: String
     @AppStorage(SettingsKey.tmdbEnabled) private var tmdbEnabled = false
     @AppStorage(SettingsKey.tmdbApiKey) private var tmdbApiKey = ""
-    @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
-    @AppStorage(SettingsKey.tmdbUseTrailers) private var tmdbUseTrailers = true
-    @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
-    @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
-    @AppStorage(SettingsKey.tmdbUseDetails) private var tmdbUseDetails = true
-    @AppStorage(SettingsKey.tmdbUseCredits) private var tmdbUseCredits = true
-    @AppStorage(SettingsKey.tmdbUseProductions) private var tmdbUseProductions = true
-    @AppStorage(SettingsKey.tmdbUseNetworks) private var tmdbUseNetworks = true
-    @AppStorage(SettingsKey.tmdbUseEpisodes) private var tmdbUseEpisodes = true
-    @AppStorage(SettingsKey.tmdbUseSeasonPosters) private var tmdbUseSeasonPosters = true
-    @AppStorage(SettingsKey.tmdbUseMoreLikeThis) private var tmdbUseMoreLikeThis = true
-    @AppStorage(SettingsKey.tmdbUseCollections) private var tmdbUseCollections = true
     @AppStorage(SettingsKey.mdbListEnabled) private var mdbListEnabled = false
     @AppStorage(SettingsKey.mdbListApiKey) private var mdbListApiKey = ""
     @AppStorage(SettingsKey.debridProvider) private var debridProvider = "None"
@@ -2013,6 +2128,7 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
     @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
+    @AppStorage(SettingsKey.aiSubtitlesEnabled) private var aiSubtitlesEnabled = false
     @State private var debridAccountToConnect: DebridAccountProvider?
     @State private var showingTraktLogin = false
     @State private var showingTraktSettings = false
@@ -2020,6 +2136,7 @@ private struct IntegrationSettingsView: View {
     @State private var showingSimklSettings = false
     @State private var showingTmdbOptions = false
     @State private var showingMdbListOptions = false
+    @State private var showingAISubtitleOptions = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -2125,87 +2242,36 @@ private struct IntegrationSettingsView: View {
                     fallback: "Optional API keys for richer metadata and rating badges"
                 )
             ) {
-                SettingsToggleRow(
-                    title: L10n.string("settings_tmdb_enable_enrichment", fallback: "Enable TMDB Enrichment"),
-                    subtitle: L10n.string(
-                        "settings_tmdb_enable_enrichment_description",
-                        fallback: "Use TMDB as a metadata source to enhance add-on data"
-                    ),
-                    isOn: $tmdbEnabled,
-                    accentColor: accentColor,
-                    enabled: tmdbHasApiKey
-                )
-                if !tmdbHasApiKey {
-                    SettingsInfoRow(
-                        title: L10n.string("settings_tmdb_personal_api_key", fallback: "Personal API key"),
-                        value: L10n.string("settings_tmdb_add_api_key_first", fallback: "Add your API key below first")
-                    )
+                SettingsActionRow(
+                    title: "TMDB",
+                    subtitle: "Get an API key at themoviedb.org/settings/api",
+                    value: tmdbEnabled && tmdbHasApiKey ? "On" : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingTmdbOptions = true
                 }
 
-                SettingsTextFieldRow(
-                    title: L10n.string("settings_tmdb_personal_api_key", fallback: "Personal API key"),
-                    subtitle: L10n.string(
-                        "tvos_settings_stored_locally_on_this_apple_tv",
-                        fallback: "Stored locally on this Apple TV"
-                    ),
-                    placeholder: L10n.string("settings_tmdb_api_key_label", fallback: "API Key"),
-                    text: $tmdbApiKey,
-                    isSecure: true,
-                    onCommit: normalizeTmdbApiKey
-                )
-
-                if tmdbHasApiKey {
-                    SettingsActionRow(
-                        title: L10n.string("settings_tmdb_options", fallback: "TMDB Options"),
-                        subtitle: L10n.string(
-                            "settings_tmdb_options_description",
-                            fallback: "Choose the language and TMDB features used"
-                        ),
-                        value: L10n.string("settings_open", fallback: "Open"),
-                        accentColor: accentColor
-                    ) {
-                        showingTmdbOptions = true
-                    }
+                SettingsActionRow(
+                    title: "MDBList",
+                    subtitle: "Get a free API key at mdblist.com/preferences",
+                    value: mdbListEnabled && mdbListHasApiKey ? "On" : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingMdbListOptions = true
                 }
+            }
 
-                SettingsToggleRow(
-                    title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
-                    subtitle: L10n.string(
-                        "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
-                        fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
-                    ),
-                    isOn: $mdbListEnabled,
-                    accentColor: accentColor,
-                    enabled: mdbListHasApiKey
-                )
-
-                if !mdbListHasApiKey {
-                    SettingsInfoRow(
-                        title: L10n.string("mdblist_dialog_title", fallback: "MDBList API Key"),
-                        value: L10n.string("settings_tmdb_add_api_key_first", fallback: "Add your API key below first")
-                    )
-                }
-
-                SettingsTextFieldRow(
-                    title: L10n.string("mdblist_dialog_title", fallback: "MDBList API Key"),
-                    subtitle: L10n.string("tvos_settings_stored_locally_on_this_apple_tv", fallback: "Stored locally on this Apple TV"),
-                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $mdbListApiKey,
-                    isSecure: true
-                )
-
-                if mdbListHasApiKey {
-                    SettingsActionRow(
-                        title: L10n.string("settings_mdblist_options", fallback: "MDBList Options"),
-                        subtitle: L10n.string(
-                            "settings_mdblist_options_description",
-                            fallback: "Choose the MDBList features used"
-                        ),
-                        value: L10n.string("settings_open", fallback: "Open"),
-                        accentColor: accentColor
-                    ) {
-                        showingMdbListOptions = true
-                    }
+            SettingsGroup(
+                title: "AI Subtitles",
+                subtitle: "Translate active subtitle cues live with your Gemini API key"
+            ) {
+                SettingsActionRow(
+                    title: "AI Subtitle Translation",
+                    subtitle: "Uses Gemini only while you watch; original subtitles stay visible until each translation is ready",
+                    value: aiSubtitlesEnabled && aiSubtitlesHasApiKey ? "On" : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingAISubtitleOptions = true
                 }
             }
 
@@ -2254,13 +2320,10 @@ private struct IntegrationSettingsView: View {
             traktViewModel.loadConnectedData()
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
-            normalizeTmdbApiKey()
-            normalizeMdbListApiKey()
         }
         .onChange(of: tmdbApiKey) { _ in
             if !tmdbHasApiKey {
                 tmdbEnabled = false
-                showingTmdbOptions = false
             }
         }
         .onChange(of: mdbListApiKey) { _ in
@@ -2314,6 +2377,10 @@ private struct IntegrationSettingsView: View {
             MdbListOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .sheet(isPresented: $showingAISubtitleOptions) {
+            AISubtitleOptionsSheet(accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
         .onChange(of: traktViewModel.mode) { mode in
             if mode == .connected { showingTraktLogin = false }
         }
@@ -2322,51 +2389,16 @@ private struct IntegrationSettingsView: View {
         }
     }
 
-    private var tmdbLanguageOptions: [String] {
-        AppLanguage.pickerLanguages
-            .filter { $0 != .system }
-            .map(\.nativeDisplayName)
-    }
-
     private var tmdbHasApiKey: Bool {
         !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-
-    private var tmdbControlsEnabled: Bool {
-        tmdbEnabled && tmdbHasApiKey
-    }
-
-    private func normalizeTmdbApiKey() {
-        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tmdbHasApiKey {
-            tmdbEnabled = false
-        }
     }
 
     private var mdbListHasApiKey: Bool {
         !mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
-    private func normalizeMdbListApiKey() {
-        mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !mdbListHasApiKey {
-            mdbListEnabled = false
-        }
-    }
-
-    private var tmdbLanguageSelection: Binding<String> {
-        Binding(
-            get: {
-                let language = AppLanguage.fromStored(tmdbLanguage)
-                return (language == .system ? AppLanguage.english : language).nativeDisplayName
-            },
-            set: { displayName in
-                let language = AppLanguage.pickerLanguages.first {
-                    $0 != .system && $0.nativeDisplayName == displayName
-                } ?? .english
-                tmdbLanguage = language.tag
-            }
-        )
+    private var aiSubtitlesHasApiKey: Bool {
+        !AISubtitleKeyStore.apiKey().isEmpty
     }
 
     private func isConnected(_ provider: DebridAccountProvider) -> Bool {
@@ -2436,16 +2468,35 @@ private struct TmdbOptionsSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(L10n.string("settings_tmdb_options", fallback: "TMDB Options"))
+                        Text("TMDB")
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
 
-                        Text(L10n.string(
-                            "settings_tmdb_options_description",
-                            fallback: "Choose the language and TMDB features used"
-                        ))
+                        Text("Set up TMDB, then choose the metadata features to use.")
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: "TMDB Setup",
+                        subtitle: "Create an API key at themoviedb.org/settings/api"
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: "TMDB API Key",
+                            subtitle: "Paste the key from TMDB — stored only on this Apple TV",
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $tmdbApiKey,
+                            isSecure: true,
+                            onCommit: normalizeTmdbApiKey
+                        )
+
+                        SettingsToggleRow(
+                            title: "Enable TMDB",
+                            subtitle: "Use TMDB to enrich add-on metadata",
+                            isOn: $tmdbEnabled,
+                            accentColor: accentColor,
+                            enabled: tmdbHasApiKey
+                        )
                     }
 
                     SettingsGroup(
@@ -2593,6 +2644,12 @@ private struct TmdbOptionsSheet: View {
             }
             .focusSection()
         }
+        .onAppear(perform: normalizeTmdbApiKey)
+        .onChange(of: tmdbApiKey) { _ in
+            if !tmdbHasApiKey {
+                tmdbEnabled = false
+            }
+        }
         .onExitCommand { dismiss() }
     }
 
@@ -2608,6 +2665,13 @@ private struct TmdbOptionsSheet: View {
 
     private var tmdbControlsEnabled: Bool {
         tmdbEnabled && tmdbHasApiKey
+    }
+
+    private func normalizeTmdbApiKey() {
+        tmdbApiKey = tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !tmdbHasApiKey {
+            tmdbEnabled = false
+        }
     }
 
     private var tmdbLanguageSelection: Binding<String> {
@@ -2650,31 +2714,31 @@ private struct MdbListOptionsSheet: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     VStack(alignment: .leading, spacing: 6) {
-                        Text(L10n.string("settings_mdblist_options", fallback: "MDBList Options"))
+                        Text("MDBList")
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
 
-                        Text(L10n.string(
-                            "settings_mdblist_options_description",
-                            fallback: "Choose the MDBList features used"
-                        ))
+                        Text("Set up MDBList, then choose the rating badges to show.")
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
                     }
 
                     SettingsGroup(
-                        title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
-                        subtitle: L10n.string(
-                            "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
-                            fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
-                        )
+                        title: "MDBList Setup",
+                        subtitle: "Create a free API key at mdblist.com/preferences"
                     ) {
+                        SettingsNativeTextFieldRow(
+                            title: "MDBList API Key",
+                            subtitle: "Paste the key from MDBList — stored only on this Apple TV",
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $mdbListApiKey,
+                            isSecure: true,
+                            onCommit: normalizeMdbListApiKey
+                        )
+
                         SettingsToggleRow(
-                            title: L10n.string("mdblist_title", fallback: "MDBList Ratings"),
-                            subtitle: L10n.string(
-                                "tvos_settings_show_ratings_from_imdb_tmdb_rotten_tomat_b0d57bb8",
-                                fallback: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and Metacritic"
-                            ),
+                            title: "Enable MDBList Ratings",
+                            subtitle: "Show ratings from IMDb, TMDB, Rotten Tomatoes, and more",
                             isOn: $mdbListEnabled,
                             accentColor: accentColor,
                             enabled: mdbListHasApiKey
@@ -2741,6 +2805,12 @@ private struct MdbListOptionsSheet: View {
             }
             .focusSection()
         }
+        .onAppear(perform: normalizeMdbListApiKey)
+        .onChange(of: mdbListApiKey) { _ in
+            if !mdbListHasApiKey {
+                mdbListEnabled = false
+            }
+        }
         .onExitCommand { dismiss() }
     }
 
@@ -2750,6 +2820,160 @@ private struct MdbListOptionsSheet: View {
 
     private var mdbListControlsEnabled: Bool {
         mdbListEnabled && mdbListHasApiKey
+    }
+
+    private func normalizeMdbListApiKey() {
+        mdbListApiKey = mdbListApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !mdbListHasApiKey {
+            mdbListEnabled = false
+        }
+    }
+}
+
+private struct AISubtitleOptionsSheet: View {
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @AppStorage(SettingsKey.aiSubtitlesEnabled) private var isEnabled = false
+    @AppStorage(SettingsKey.aiSubtitlesGeminiModel) private var model = AISubtitleTranslationSettings.defaultModel
+    @AppStorage(SettingsKey.aiSubtitlesTargetLanguage) private var targetLanguage = "Preferred Subtitle"
+    @AppStorage(SettingsKey.aiSubtitlesAutoSelect) private var autoSelect = true
+    @AppStorage(SettingsKey.aiSubtitlesStripHearingImpaired) private var stripHearingImpaired = true
+    @State private var apiKey = ""
+    @State private var isKeyStored = false
+    @State private var keyStorageError: String?
+
+    private let models = AISubtitleTranslationSettings.availableModels
+    private let languages = ["Preferred Subtitle"] + SubtitleLanguagePreferences.supportedLanguages
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 7) {
+                        Text("AI Subtitle Translation")
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text("Gemini translates text cues as they appear. Your key and subtitle text are sent directly to Google only while this feature is on.")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+
+                    SettingsGroup(
+                        title: "Gemini Setup",
+                        subtitle: "Create a free key in Google AI Studio; it stays on this Apple TV"
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: "Gemini API Key",
+                            subtitle: "Paste a Google AI Studio API key",
+                            placeholder: "Not set",
+                            text: $apiKey,
+                            isSecure: true,
+                            onCommit: persistKey
+                        )
+
+                        Text("Use the Apple TV keyboard or a paired iPhone keyboard. Your key is stored securely in this Apple TV's Keychain.")
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white.opacity(0.56))
+                            .fixedSize(horizontal: false, vertical: true)
+
+                        if let keyStorageError {
+                            Text(keyStorageError)
+                                .font(.system(size: 17, weight: .medium))
+                                .foregroundColor(.red.opacity(0.9))
+                        }
+
+                        SettingsOptionRow(
+                            title: "Gemini Model",
+                            subtitle: "Flash models keep cue translations fast",
+                            selection: $model,
+                            options: models,
+                            accentColor: accentColor
+                        )
+
+                        SettingsToggleRow(
+                            title: "Enable AI Translation",
+                            subtitle: "Off by default. When off, no subtitle text leaves this Apple TV.",
+                            isOn: $isEnabled,
+                            accentColor: accentColor,
+                            enabled: hasAPIKey
+                        )
+                    }
+
+                    if translationControlsEnabled {
+                        SettingsGroup(
+                            title: "Translation",
+                            subtitle: "Choose how live translated subtitles behave"
+                        ) {
+                            SettingsOptionRow(
+                                title: "Translate To",
+                                subtitle: "Preferred Subtitle follows the first preferred subtitle language",
+                                selection: $targetLanguage,
+                                options: languages,
+                                accentColor: accentColor
+                            )
+
+                            SettingsToggleRow(
+                                title: "Auto-select Mode",
+                                subtitle: "Start translating automatically on compatible playback",
+                                isOn: $autoSelect,
+                                accentColor: accentColor,
+                                enabled: true
+                            )
+
+                            SettingsToggleRow(
+                                title: "Strip Hearing-impaired Annotations",
+                                subtitle: "Remove sound and music annotations from translated text",
+                                isOn: $stripHearingImpaired,
+                                accentColor: accentColor,
+                                enabled: true
+                            )
+                        }
+                    }
+                }
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        .onAppear(perform: loadKey)
+        .onChange(of: apiKey) { _ in
+            persistKey()
+        }
+        .onExitCommand { dismiss() }
+    }
+
+    private var hasAPIKey: Bool {
+        isKeyStored && !apiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var translationControlsEnabled: Bool {
+        isEnabled && hasAPIKey
+    }
+
+    private func loadKey() {
+        apiKey = AISubtitleKeyStore.apiKey()
+        isKeyStored = !apiKey.isEmpty
+        model = AISubtitleTranslationSettings.normalizedModel(model)
+    }
+
+    private func persistKey() {
+        let trimmed = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if apiKey != trimmed {
+            apiKey = trimmed
+            return
+        }
+        isKeyStored = AISubtitleKeyStore.save(trimmed)
+        keyStorageError = isKeyStored || trimmed.isEmpty
+            ? nil
+            : "This Apple TV could not save the Gemini API key securely."
+        if !hasAPIKey { isEnabled = false }
     }
 }
 
@@ -4364,6 +4588,9 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnlyStreams = false
+    @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
+    @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
+    @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
@@ -4376,6 +4603,11 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Always"
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Strip"
+
+    @State private var streamBadgeURL = ""
+    @State private var streamBadgeImportError: String?
+    @State private var isImportingStreamBadges = false
+    @State private var streamBadgeSettingsRevision = 0
 
     private let engines = ["Auto", "AetherEngine", "MPVKit"]
     private let externalPlayers = ExternalPlayer.settingsOptions
@@ -4486,6 +4718,8 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
+            streamBadgesSettings
+
             SettingsGroup(
                 title: L10n.string("tvos_playback_audio_subtitles", fallback: "Audio & Subtitles"),
                 subtitle: L10n.string(
@@ -4562,6 +4796,9 @@ private struct PlaybackSettingsView: View {
                 .disabled(!trailersEnabled)
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification)) { _ in
+            streamBadgeSettingsRevision &+= 1
+        }
         .onAppear {
             let canonical = PlayerEngineSetting.migrated(from: playerEngine).settingsRawValue
             if playerEngine != canonical {
@@ -4586,6 +4823,116 @@ private struct PlaybackSettingsView: View {
         guard !ordered.isEmpty else { return L10n.string("tvos_settings_system", fallback: "System") }
         guard ordered.count > 2 else { return ordered.joined(separator: ", ") }
         return "\(ordered[0]), \(ordered[1]) +\(ordered.count - 2)"
+    }
+
+    private var streamBadgesSettings: some View {
+        // Keep the view dependent on badge-store updates, but do not replace its
+        // identity: replacing it after a placement change sends tvOS focus back
+        // to the first row in the group.
+        _ = streamBadgeSettingsRevision
+        let importedRules = StreamBadgeSettingsStore.snapshot.rules
+        let placementBinding = Binding<String>(
+            get: { streamBadgePlacement == StreamBadgePlacement.top.rawValue ? "Top" : "Bottom" },
+            set: { value in
+                let placement: StreamBadgePlacement = value == "Top" ? .top : .bottom
+                streamBadgePlacement = placement.rawValue
+                StreamBadgeSettingsStore.setPlacement(placement)
+            }
+        )
+
+        return SettingsGroup(
+            title: "Stream Badges",
+            subtitle: "Show the same stream badge packs and source details as Android TV"
+        ) {
+            SettingsToggleRow(
+                title: "File Size Badges",
+                subtitle: "Show the stream file size when the add-on provides it",
+                isOn: $showFileSizeBadges,
+                accentColor: accentColor
+            )
+
+            SettingsOptionRow(
+                title: "Badge Placement",
+                subtitle: "Place imported badges and file sizes above or below the stream details",
+                selection: placementBinding,
+                options: ["Top", "Bottom"],
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: "Add-on Logo",
+                subtitle: "Show the source add-on logo beside each stream",
+                isOn: $showAddonLogo,
+                accentColor: accentColor
+            )
+
+            SettingsActionRow(
+                title: "Install Gold Badge Pack",
+                subtitle: "Install the Android TV Gold pack without entering a URL",
+                value: isImportingStreamBadges ? "Installing…" : "Install",
+                accentColor: accentColor,
+                action: importGoldBadgePack
+            )
+            .opacity(isImportingStreamBadges ? 0.55 : 1)
+            .disabled(isImportingStreamBadges)
+
+            SettingsNativeTextFieldRow(
+                title: "Badge Pack URL",
+                subtitle: streamBadgeImportError ?? "Paste an Android TV-compatible JSON URL; it imports when you press Done (up to 3)",
+                placeholder: "https://…",
+                text: $streamBadgeURL,
+                fieldWidth: 520,
+                onCommit: importStreamBadgePack
+            )
+            .opacity(isImportingStreamBadges ? 0.55 : 1)
+            .disabled(isImportingStreamBadges)
+
+            if importedRules.imports.isEmpty {
+                SettingsInfoRow(title: "Imported Packs", value: "None")
+            } else {
+                ForEach(importedRules.imports) { imported in
+                    StreamBadgePackSettingsRow(
+                        badgePack: imported,
+                        accentColor: accentColor,
+                        onEnabledChange: { isEnabled in
+                            StreamBadgeSettingsStore.setSourceEnabled(
+                                imported.sourceUrl,
+                                isEnabled: isEnabled
+                            )
+                        },
+                        onDelete: {
+                            StreamBadgeSettingsStore.removeSource(imported.sourceUrl)
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    private func importStreamBadgePack() {
+        importStreamBadgePack(from: streamBadgeURL, clearDraft: true)
+    }
+
+    private func importGoldBadgePack() {
+        importStreamBadgePack(from: StreamBadgeSettingsStore.goldBadgePackURL, clearDraft: false)
+    }
+
+    private func importStreamBadgePack(from rawURL: String, clearDraft: Bool) {
+        let url = rawURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !isImportingStreamBadges, !url.isEmpty else { return }
+        isImportingStreamBadges = true
+        streamBadgeImportError = nil
+        Task { @MainActor in
+            do {
+                _ = try await StreamBadgeSettingsStore.importRules(from: url)
+                if clearDraft {
+                    streamBadgeURL = ""
+                }
+            } catch {
+                streamBadgeImportError = error.localizedDescription
+            }
+            isImportingStreamBadges = false
+        }
     }
 }
 
@@ -5321,6 +5668,8 @@ private struct AdvancedSettingsView: View {
         // Reset only the active profile's settings, not other profiles'.
         let defaults = ProfileSettings.current
         SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        AISubtitleKeyStore.remove()
+        Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: ProfileSettings.activeProfileScope) }
     }
 }
 
@@ -5333,7 +5682,7 @@ private struct AboutSettingsView: View {
             SettingsGroup(title: L10n.string("tvos_settings_nuviotv", fallback: "NuvioTV"), subtitle: L10n.string("tvos_settings_build_and_runtime_information", fallback: "Build and runtime information")) {
                 SettingsInfoRow(title: L10n.string("tvos_settings_app_version", fallback: "App Version"), value: appVersion)
                 SettingsInfoRow(title: L10n.string("tvos_settings_engine_core", fallback: "Engine Core"), value: L10n.string("tvos_settings_pure_swift", fallback: "Pure Swift"))
-                SettingsInfoRow(title: L10n.string("tvos_settings_playback_stack", fallback: "Playback Stack"), value: L10n.string("tvos_settings_avplayer_mpvkit", fallback: "AetherEngine / MPVKit"))
+                SettingsInfoRow(title: L10n.string("tvos_settings_playback_stack", fallback: "Playback Stack"), value: "AetherEngine / MPVKit")
                 SettingsInfoRow(title: L10n.string("tvos_settings_catalog_protocol", fallback: "Catalog Protocol"), value: L10n.string("tvos_settings_stremio_compatible", fallback: "Stremio compatible"))
             }
 
@@ -5344,7 +5693,7 @@ private struct AboutSettingsView: View {
                     fallback: "Data sources, acknowledgements, and open-source licenses"
                 )
             ) {
-                Text(L10n.string("tvos_settings_this_software_uses_swiftui_avplayer_mpvk_78048fa2", fallback: "This software uses SwiftUI, AetherEngine, MPVKit (libmpv), and Stremio-compatible catalog APIs."))
+                Text("This software uses SwiftUI, AetherEngine, MPVKit (libmpv), and Stremio-compatible catalog APIs.")
                     .font(.system(size: 21, weight: .medium))
                     .foregroundColor(.white.opacity(0.72))
                     .fixedSize(horizontal: false, vertical: true)
@@ -5464,7 +5813,7 @@ private struct LicensesAttributionsSheet: View {
         ),
         LicenseEntry(
             id: "apple-media",
-            title: L10n.string("tvos_settings_avfoundation_avplayer", fallback: "Apple media frameworks"),
+            title: "Apple media frameworks",
             body: "AVFoundation, VideoToolbox, Core Media, and AudioToolbox system APIs used by AetherEngine's native and hardware-accelerated paths.",
             license: "Apple system frameworks"
         )
@@ -5891,6 +6240,68 @@ private struct SyncedAddonSettingsRow: View {
     }
 }
 
+/// Mirrors installed add-ons: selecting a pack enables or disables it, while
+/// the adjacent trash button removes the downloaded rules altogether.
+private struct StreamBadgePackSettingsRow: View {
+    let badgePack: StreamBadgeImport
+    let accentColor: Color
+    let onEnabledChange: (Bool) -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        HStack(spacing: 14) {
+            Button(action: { onEnabledChange(!badgePack.isActive) }) {
+                SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                    Image(systemName: "tag.fill")
+                        .font(.system(size: 25, weight: .semibold))
+                        .foregroundColor(badgePack.isActive ? accentColor : .white.opacity(0.38))
+                        .frame(width: 48, height: 48)
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text(packName)
+                            .font(.system(size: 22, weight: .semibold))
+                            .foregroundColor(badgePack.isActive ? .white : .white.opacity(0.46))
+                            .lineLimit(1)
+
+                        Text("\(badgePack.enabledFilterCount) badge rules · \(badgePack.sourceUrl)")
+                            .font(.system(size: 16, weight: .medium))
+                            .foregroundColor(.white.opacity(badgePack.isActive ? 0.56 : 0.36))
+                            .lineLimit(2)
+                    }
+
+                    Spacer(minLength: 20)
+
+                    Text(badgePack.isActive ? "Active" : "Disabled")
+                        .font(.system(size: 18, weight: .bold))
+                        .foregroundColor(badgePack.isActive ? .white.opacity(0.7) : .white.opacity(0.42))
+                        .lineLimit(1)
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+            .entryLockable()
+
+            AddonReorderButton(systemImage: "trash", disabled: false, action: onDelete)
+        }
+    }
+
+    private var packName: String {
+        if badgePack.sourceUrl.caseInsensitiveCompare(StreamBadgeSettingsStore.goldBadgePackURL) == .orderedSame {
+            return "Gold Badge Pack"
+        }
+        let filename = URL(string: badgePack.sourceUrl)?
+            .deletingPathExtension()
+            .lastPathComponent
+            .replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .capitalized ?? ""
+        return filename.isEmpty ? "Badge Pack" : filename
+    }
+}
+
 /// Chevron button for moving an add-on up/down in the priority order.
 private struct AddonReorderButton: View {
     let systemImage: String
@@ -5977,6 +6388,7 @@ private struct HomeCatalogOrderSection: View {
         rows.swapAt(index, target)
         TVHomeCatalogOrder.save(rows.map(\.id))
         TVHomeCatalogOrder.writeSnapshotRows(rows)
+        NuvioSyncManager.current?.noteHomeCatalogSettingsChangedLocally()
     }
 }
 
@@ -8183,6 +8595,7 @@ private struct SettingsNativeTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
 
@@ -8206,6 +8619,7 @@ private struct SettingsNativeTextFieldRow: View {
                 .submitLabel(.done)
                 .textInputAutocapitalization(.never)
                 .autocorrectionDisabled()
+                .onSubmit(onCommit)
                 .frame(width: fieldWidth, height: 48)
                 // Keep the reliable native editor in the focus hierarchy, but
                 // hide tvOS's hard-coded white focus pill.

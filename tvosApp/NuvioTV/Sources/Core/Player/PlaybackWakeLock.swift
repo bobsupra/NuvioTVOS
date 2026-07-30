@@ -4,7 +4,7 @@ import UIKit
 /// Keeps Apple TV awake for the full player session.
 ///
 /// Custom MPV Metal rendering is not treated as "system video playback" the way
-/// `AVPlayerViewController` is, so tvOS can still honor Settings → General →
+/// a system video controller is, so tvOS can still honor Settings → General →
 /// Sleep After (often 15–30 minutes) unless the app explicitly disables the
 /// idle timer. Status-based toggling was too fragile: brief non-playing states
 /// re-enabled sleep while video continued.

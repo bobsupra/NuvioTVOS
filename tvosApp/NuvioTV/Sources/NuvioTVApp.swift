@@ -23,7 +23,7 @@ enum TVScreen {
     case profileSelection
     case main
     case details(id: String, type: String)
-    case player(url: URL, meta: NuvioMeta, subtitle: String, externalSubtitles: [NuvioSubtitle], resumeFrom: Double?)
+    case player(url: URL, meta: NuvioMeta, subtitle: String, httpHeaders: [String: String], externalSubtitles: [NuvioSubtitle], resumeFrom: Double?)
     case cloudLibrary
     /// Browse titles inside one collection folder (catalogs grouped under it).
     case collectionFolder(TVCollectionFolderItem, collectionTitle: String)
@@ -37,6 +37,11 @@ private enum PlaybackOrigin {
     case main
     case details
     case cloudLibrary
+}
+
+private enum DetailsReturnDestination {
+    case main
+    case collectionFolder(TVCollectionFolderItem, collectionTitle: String)
 }
 
 enum TVTab: String, CaseIterable, Identifiable {
@@ -129,8 +134,11 @@ struct ContentView: View {
     @State private var personBrowseReturn: (id: String, type: String)?
     /// Titles to walk back through when Details opened Details ("More like
     /// this"). Empty means the current Details is the root of its chain and back
-    /// belongs to Home.
+    /// belongs to its recorded return destination.
     @State private var detailsBackStack: [(id: String, type: String)] = []
+    /// Where the root Details screen should return. This is normally Home, but
+    /// a title opened from a collection must return to that collection.
+    @State private var detailsReturnDestination: DetailsReturnDestination = .main
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
@@ -393,7 +401,7 @@ struct ContentView: View {
         switch activeScreen {
         case .details:
             leaveDetails()
-        case let .player(_, meta, subtitle, _, _):
+        case let .player(_, meta, subtitle, _, _, _):
             dismissPlayer(meta: meta, subtitle: subtitle)
         case .cloudLibrary, .collectionFolder:
             withAnimation(.easeInOut(duration: 0.24)) {
@@ -423,13 +431,19 @@ struct ContentView: View {
     }
 
     /// Backs out of Details to the title it was opened from (a "More like this"
-    /// chain), or to Home when this Details is the root of its chain.
+    /// chain), or to the screen that opened the root Details.
     private func leaveDetails() {
         withAnimation(.easeInOut(duration: 0.24)) {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
             } else {
-                activeScreen = .main
+                switch detailsReturnDestination {
+                case .main:
+                    activeScreen = .main
+                case let .collectionFolder(folder, collectionTitle):
+                    activeScreen = .collectionFolder(folder, collectionTitle: collectionTitle)
+                }
+                detailsReturnDestination = .main
             }
         }
     }
@@ -437,8 +451,13 @@ struct ContentView: View {
     /// Opens Details as a fresh navigation (Home, search, a card menu, a deep
     /// link). Any "More like this" chain belongs to the flow being left, so the
     /// back stack starts empty and back from here returns to Home.
-    private func openDetailsRoot(id: String, type: String) {
+    private func openDetailsRoot(
+        id: String,
+        type: String,
+        returnDestination: DetailsReturnDestination = .main
+    ) {
         detailsBackStack.removeAll()
+        detailsReturnDestination = returnDestination
         activeScreen = .details(id: id, type: type)
     }
 
@@ -680,7 +699,7 @@ struct ContentView: View {
         playbackCurrentEpisode = context.current
 
         let profileId = profileViewModel.activeProfile?.id
-        let storedStreamUrl = item.isUpNextEntry
+        let storedStream = item.isUpNextEntry
             ? nil
             : LastPlaybackStreamStore.load(
                 metaId: item.meta.id,
@@ -688,16 +707,19 @@ struct ContentView: View {
                 episode: item.episode,
                 profileId: profileId
             )
-        let streamUrl = [item.streamUrl, storedStreamUrl]
-            .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        let itemStreamURL = item.streamUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        let streamURL = [itemStreamURL, storedStream?.url]
+            .compactMap { $0 }
             .first { !$0.isEmpty } ?? ""
-        if !streamUrl.isEmpty, let url = URL(string: streamUrl) {
+        let httpHeaders = streamURL == storedStream?.url ? (storedStream?.httpHeaders ?? [:]) : [:]
+        if !streamURL.isEmpty, let url = URL(string: streamURL) {
             presentPlayback(
                 url: url,
                 meta: item.meta,
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
-                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item)
+                resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                httpHeaders: httpHeaders
             )
             return
         }
@@ -733,7 +755,8 @@ struct ContentView: View {
                     meta: item.meta,
                     subtitle: prepared.subtitleLine,
                     externalSubtitles: prepared.subtitles,
-                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item)
+                    resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
+                    httpHeaders: prepared.httpHeaders
                 )
             } else {
                 // Keep the manual picker available when no add-on returns a
@@ -807,6 +830,7 @@ struct ContentView: View {
         subtitle: String,
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
+        httpHeaders: [String: String] = [:],
         origin: PlaybackOrigin = .main
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
@@ -831,6 +855,7 @@ struct ContentView: View {
             url: url,
             meta: meta,
             subtitle: subtitle,
+            httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
             origin: origin
@@ -841,6 +866,7 @@ struct ContentView: View {
         url: URL,
         meta: NuvioMeta,
         subtitle: String,
+        httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
         origin: PlaybackOrigin
@@ -852,6 +878,7 @@ struct ContentView: View {
                 url: url,
                 meta: meta,
                 subtitle: subtitle,
+                httpHeaders: httpHeaders,
                 externalSubtitles: externalSubtitles,
                 resumeFrom: resumeFrom
             )
@@ -890,11 +917,12 @@ struct ContentView: View {
                     .zIndex(1)
             }
 
-            if case .player(let url, let meta, let subtitle, let externalSubtitles, let resumeFrom) = activeScreen {
+            if case .player(let url, let meta, let subtitle, let httpHeaders, let externalSubtitles, let resumeFrom) = activeScreen {
                 playerScreen(
                     url: url,
                     meta: meta,
                     subtitle: subtitle,
+                    httpHeaders: httpHeaders,
                     externalSubtitles: externalSubtitles,
                     resumeFrom: resumeFrom
                 )
@@ -915,7 +943,14 @@ struct ContentView: View {
                     repository: CinemetaCatalogRepository(),
                     onSelect: { meta in
                         withAnimation(.easeInOut(duration: 0.28)) {
-                            openDetailsRoot(id: meta.id, type: meta.type)
+                            openDetailsRoot(
+                                id: meta.id,
+                                type: meta.type,
+                                returnDestination: .collectionFolder(
+                                    folder,
+                                    collectionTitle: collectionTitle
+                                )
+                            )
                         }
                     },
                     onBack: {
@@ -932,9 +967,17 @@ struct ContentView: View {
                 ProductionBrowseView(
                     company: company,
                     onSelect: { title in
-                        productionBrowseReturn = nil
                         withAnimation(.easeInOut(duration: 0.28)) {
-                            openDetailsRoot(id: title.id, type: title.type)
+                            if let ret = productionBrowseReturn {
+                                // Keep the originating Details screen in the
+                                // same navigation chain. Otherwise backing out
+                                // of the selected title falls all the way home.
+                                detailsBackStack.append((id: ret.id, type: ret.type))
+                                activeScreen = .details(id: title.id, type: title.type)
+                            } else {
+                                openDetailsRoot(id: title.id, type: title.type)
+                            }
+                            productionBrowseReturn = nil
                         }
                     },
                     onBack: {
@@ -956,9 +999,17 @@ struct ContentView: View {
                 PersonBrowseView(
                     person: person,
                     onSelect: { title in
-                        personBrowseReturn = nil
                         withAnimation(.easeInOut(duration: 0.28)) {
-                            openDetailsRoot(id: title.id, type: title.type)
+                            if let ret = personBrowseReturn {
+                                // Keep the originating Details screen in the
+                                // same navigation chain. Otherwise backing out
+                                // of the selected title falls all the way home.
+                                detailsBackStack.append((id: ret.id, type: ret.type))
+                                activeScreen = .details(id: title.id, type: title.type)
+                            } else {
+                                openDetailsRoot(id: title.id, type: title.type)
+                            }
+                            personBrowseReturn = nil
                         }
                     },
                     onBack: {
@@ -1148,7 +1199,7 @@ struct ContentView: View {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
             },
-            onPlayClick: { streamUrlString, meta, subtitle, externalSubtitles, currentEpisode, episodes in
+            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
@@ -1161,6 +1212,7 @@ struct ContentView: View {
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
                         resumeFrom: isTrailer ? nil : Self.resumePosition(for: meta, episode: currentEpisode),
+                        httpHeaders: httpHeaders,
                         origin: .details
                     )
                 }
@@ -1282,6 +1334,7 @@ struct ContentView: View {
                 )
                 return PreparedNextStream(
                     url: url,
+                    httpHeaders: candidate.httpHeaders ?? [:],
                     subtitleLine: subtitleLine,
                     subtitles: candidate.subtitles,
                     streamName: candidate.name,
@@ -1298,6 +1351,7 @@ struct ContentView: View {
             )
             return PreparedNextStream(
                 url: url,
+                httpHeaders: candidate.httpHeaders ?? [:],
                 subtitleLine: subtitleLine,
                 subtitles: candidate.subtitles,
                 streamName: candidate.name,
@@ -1358,6 +1412,7 @@ struct ContentView: View {
             )
             return PreparedNextStream(
                 url: url,
+                httpHeaders: stream.httpHeaders ?? [:],
                 subtitleLine: subtitleLine,
                 subtitles: stream.subtitles,
                 streamName: stream.name,
@@ -1374,6 +1429,7 @@ struct ContentView: View {
         )
         return PreparedNextStream(
             url: url,
+            httpHeaders: stream.httpHeaders ?? [:],
             subtitleLine: subtitleLine,
             subtitles: stream.subtitles,
             streamName: stream.name,
@@ -1420,6 +1476,7 @@ struct ContentView: View {
         url: URL,
         meta: NuvioMeta,
         subtitle: String,
+        httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?
     ) -> some View {
@@ -1430,6 +1487,7 @@ struct ContentView: View {
             url: url,
             meta: meta,
             subtitle: subtitle,
+            httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
             episodes: isTrailer ? [] : playbackEpisodes,
@@ -3224,7 +3282,9 @@ struct TVHomeView: View {
         let collectionSections = await loadCollectionSections()
         guard store.isCurrentLoad(generation, for: identity) else { return }
         let previouslyLoadedCatalogSections = store.sections.filter {
-            !$0.isCollectionRow && !$0.isLoadingPlaceholder
+            !$0.isCollectionRow
+                && !$0.isLoadingPlaceholder
+                && isHomeCatalogSectionFromEnabledSource($0)
         }
         // Seeded before the first publish so a cold Home shows its rows'
         // titles and spinning cards immediately, rather than assembling itself
@@ -3388,7 +3448,11 @@ struct TVHomeView: View {
         // Rows this load still owes, drawn as skeletons in their saved position.
         let published = Set(composed.map(\.id))
         let skeletons = homeLoadingPlaceholders.filter { !published.contains($0.id) }
-        guard !composed.isEmpty || !skeletons.isEmpty else { return }
+        guard !composed.isEmpty || !skeletons.isEmpty else {
+            store.sections = []
+            store.hero = nil
+            return
+        }
         let visible = skeletons.isEmpty
             ? composed
             : TVHomeCatalogOrder.apply(to: composed + skeletons)
@@ -3432,7 +3496,8 @@ struct TVHomeView: View {
             guard !published.contains(row.id),
                   !row.id.hasPrefix(TVHomeSection.collectionIdPrefix),
                   row.id != TVHomeSection.continueWatchingId,
-                  !hiddenCollections.contains(row.id) else {
+                  !hiddenCollections.contains(row.id),
+                  isHomeCatalogSnapshotRowFromEnabledSource(row) else {
                 return nil
             }
             if let settingsKey = row.settingsKey, hiddenCatalogs.contains(settingsKey) {
@@ -3446,6 +3511,23 @@ struct TVHomeView: View {
                 isLoadingPlaceholder: true
             )
         }
+    }
+
+    /// A disabled provider must not leave its previous rows or loading
+    /// placeholders visible while the replacement Home tree is being built.
+    /// Built-in rows have no `addonId`, but their persisted settings key still
+    /// carries Cinemeta's manifest id.
+    private func isHomeCatalogSectionFromEnabledSource(_ section: TVHomeSection) -> Bool {
+        guard section.contentType != nil, section.catalogId != nil else { return true }
+        guard section.addonId == nil else { return true }
+        return CinemetaCatalogRepository.isCinemetaEnabled
+    }
+
+    private func isHomeCatalogSnapshotRowFromEnabledSource(
+        _ row: TVHomeCatalogOrder.SnapshotRow
+    ) -> Bool {
+        guard !CinemetaCatalogRepository.isCinemetaEnabled else { return true }
+        return !(row.settingsKey?.hasPrefix("\(CinemetaCatalogRepository.cinemetaAddonId)_") ?? false)
     }
 
     /// Drops every skeleton, from the pending list and from what is on screen.
@@ -3993,13 +4075,33 @@ enum TVHomeCatalogOrder {
     static func savedOrder() -> [String] {
         guard let data = ProfileSettings.current.data(forKey: SettingsKey.homeCatalogOrder),
               let keys = try? JSONDecoder().decode([String].self, from: data) else { return [] }
-        return keys
+        return normalizedOrder(keys)
     }
 
     static func save(_ keys: [String]) {
+        let keys = normalizedOrder(keys)
         guard let data = try? JSONEncoder().encode(keys) else { return }
         ProfileSettings.current.set(data, forKey: SettingsKey.homeCatalogOrder)
         NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    /// Home sections use `addon_<catalog-key>` ids while the account layout
+    /// uses the catalog key without that UI prefix. Store the canonical form
+    /// locally too, so a locally saved reorder survives the next catalog load.
+    private static func normalizedOrder(_ keys: [String]) -> [String] {
+        var seen = Set<String>()
+        return keys.compactMap { rawKey in
+            let key = sectionOrderKey(rawKey)
+            guard !key.isEmpty, seen.insert(key).inserted else { return nil }
+            return key
+        }
+    }
+
+    private static func sectionOrderKey(_ id: String) -> String {
+        if id.hasPrefix("addon_") {
+            return String(id.dropFirst("addon_".count))
+        }
+        return id
     }
 
     /// Account catalog keys (`<addonId>_<type>_<catalogId>`) the user has hidden
@@ -4038,7 +4140,7 @@ enum TVHomeCatalogOrder {
         let syncedKeys: [String] = {
             guard let data = ProfileSettings.current.data(forKey: SettingsKey.homeCatalogSyncedOrder),
                   let keys = try? JSONDecoder().decode([String].self, from: data) else { return [] }
-            return keys
+            return normalizedOrder(keys)
         }()
         // Prefer the local Settings reorder; otherwise honor the account layout
         // (including `collection_<id>` slots among catalogs).
@@ -4052,10 +4154,7 @@ enum TVHomeCatalogOrder {
         // prefix. Collection rows already use `collection_<id>`.
         func orderKey(for section: TVHomeSection) -> String {
             if section.isCollectionRow { return section.id }
-            if section.id.hasPrefix("addon_") {
-                return String(section.id.dropFirst("addon_".count))
-            }
-            return section.id
+            return sectionOrderKey(section.id)
         }
         let known = sections
             .filter { indexByKey[orderKey(for: $0)] != nil }
@@ -4072,6 +4171,9 @@ enum TVHomeCatalogOrder {
         let id: String
         let title: String
         let addonName: String?
+        let addonId: String?
+        let contentType: String?
+        let catalogId: String?
         /// Nil for a row that cannot be hidden (Continue Watching).
         let settingsKey: String?
     }
@@ -4096,6 +4198,9 @@ enum TVHomeCatalogOrder {
                 id: $0.id,
                 title: $0.title,
                 addonName: $0.addonName,
+                addonId: $0.addonId,
+                contentType: $0.contentType,
+                catalogId: $0.catalogId,
                 settingsKey: $0.catalogSettingsKey
             )
         }
@@ -4123,6 +4228,9 @@ enum TVHomeCatalogOrder {
         let payload = rows.map { row -> [String: String] in
             var entry = ["id": row.id, "title": row.title]
             if let addonName = row.addonName { entry["addon"] = addonName }
+            if let addonId = row.addonId { entry["addonId"] = addonId }
+            if let contentType = row.contentType { entry["type"] = contentType }
+            if let catalogId = row.catalogId { entry["catalogId"] = catalogId }
             if let settingsKey = row.settingsKey { entry["key"] = settingsKey }
             return entry
         }
@@ -4142,8 +4250,71 @@ enum TVHomeCatalogOrder {
                 id: id,
                 title: title,
                 addonName: row["addon"],
+                addonId: row["addonId"],
+                contentType: row["type"],
+                catalogId: row["catalogId"],
                 settingsKey: row["key"]
             )
+        }
+    }
+
+    /// Builds the account payload for the current Home catalog snapshot.
+    /// Home's `addon_...` ids are UI-only; sync receives the source add-on id,
+    /// media type, catalog id, enabled state, and saved row order.
+    static func syncItems() -> [[String: Any]] {
+        var items: [[String: Any]] = []
+        for row in snapshotRows() {
+            guard let settingsKey = row.settingsKey else { continue }
+
+            if settingsKey.hasPrefix(TVHomeSection.collectionIdPrefix) {
+                let collectionId = String(settingsKey.dropFirst(TVHomeSection.collectionIdPrefix.count))
+                guard !collectionId.isEmpty else { continue }
+                items.append([
+                    "addon_id": "",
+                    "type": "",
+                    "catalog_id": "",
+                    "enabled": isRowEnabled(row),
+                    "order": items.count,
+                    "custom_title": "",
+                    "is_collection": true,
+                    "collection_id": collectionId
+                ])
+                continue
+            }
+
+            let source = catalogSyncSource(for: row)
+            guard !source.addonId.isEmpty,
+                  !source.contentType.isEmpty,
+                  !source.catalogId.isEmpty else { continue }
+            items.append([
+                "addon_id": source.addonId,
+                "type": source.contentType,
+                "catalog_id": source.catalogId,
+                "enabled": isRowEnabled(row),
+                "order": items.count,
+                "custom_title": "",
+                "is_collection": false,
+                "collection_id": ""
+            ])
+        }
+        return items
+    }
+
+    private static func catalogSyncSource(
+        for row: SnapshotRow
+    ) -> (addonId: String, contentType: String, catalogId: String) {
+        if let addonId = row.addonId,
+           let contentType = row.contentType,
+           let catalogId = row.catalogId {
+            return (addonId, contentType, catalogId)
+        }
+
+        switch row.id {
+        case "movie_top": return (CinemetaCatalogRepository.cinemetaAddonId, "movie", "top")
+        case "series_top": return (CinemetaCatalogRepository.cinemetaAddonId, "series", "top")
+        case "movie_rating": return (CinemetaCatalogRepository.cinemetaAddonId, "movie", "imdbRating")
+        case "series_rating": return (CinemetaCatalogRepository.cinemetaAddonId, "series", "imdbRating")
+        default: return ("", "", "")
         }
     }
 
@@ -5830,6 +6001,7 @@ struct CollectionFolderBrowseView: View {
                                 isLoadingMore: row.isLoadingMore,
                                 layoutMode: homeLayout,
                                 showPosterLabels: posterLabels,
+                                externalFocus: $focusedItemID,
                                 onApproachEnd: { item in
                                     loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
                                 },
@@ -5841,6 +6013,7 @@ struct CollectionFolderBrowseView: View {
                     .padding(.bottom, 60)
                 }
                 .focusSection()
+                .defaultFocusIfAvailable($focusedItemID, firstFocusID)
             }
         }
     }
@@ -5873,10 +6046,22 @@ struct CollectionFolderBrowseView: View {
             Color.clear.frame(height: 60)
         }
         .focusSection()
-        .defaultFocusIfAvailable($focusedItemID, displayedGridItems.first?.id)
+        .defaultFocusIfAvailable($focusedItemID, firstFocusID)
         .id(selectedTabIndex)
     }
 
+    private var firstFocusID: String? {
+        if usesRows {
+            guard let row = catalogRows.first(where: { !$0.items.isEmpty }),
+                  let item = row.items.first else {
+                return nil
+            }
+            return "\(row.id)\u{1}\(item.id)"
+        }
+        return displayedGridItems.first?.id
+    }
+
+    @MainActor
     private func load() async {
         isLoading = true
         errorMessage = nil
@@ -5935,6 +6120,12 @@ struct CollectionFolderBrowseView: View {
             errorMessage = firstFailure.localizedDescription
         }
         isLoading = false
+
+        // The first card does not exist during the loading render, so the
+        // default-focus modifier cannot select it by itself. Re-arm focus once
+        // the catalog has been inserted into the view hierarchy.
+        await Task.yield()
+        focusedItemID = firstFocusID
     }
 
     private var isGridLoadingMore: Bool {
@@ -6048,6 +6239,7 @@ private struct CollectionFolderHomeStyleRow: View {
     var isLoadingMore: Bool = false
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
+    var externalFocus: FocusState<String?>.Binding? = nil
     let onApproachEnd: (NuvioMeta) -> Void
     let onSelect: (NuvioMeta) -> Void
 
@@ -6123,6 +6315,8 @@ private struct CollectionFolderHomeStyleRow: View {
                                 landscapeFocusedId = nil
                             }
                         },
+                        externalFocus: externalFocus,
+                        externalFocusValue: cardKey,
                         layoutMode: rowHomeLayout,
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowSmoothFocus,

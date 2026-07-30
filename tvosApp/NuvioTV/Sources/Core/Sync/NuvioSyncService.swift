@@ -52,6 +52,7 @@ final class NuvioSyncManager: ObservableObject {
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
+    private var homeCatalogPushTask: Task<Void, Never>?
     private var profileSelectionRefreshTask: Task<Void, Never>?
     private var completedInitialPullKeys: Set<String> = []
     /// When each account+profile last finished a pull, so a screen re-entry can
@@ -84,6 +85,7 @@ final class NuvioSyncManager: ObservableObject {
     deinit {
         pullTask?.cancel()
         pushTask?.cancel()
+        homeCatalogPushTask?.cancel()
         profileSelectionRefreshTask?.cancel()
         observers.forEach(NotificationCenter.default.removeObserver)
     }
@@ -144,6 +146,13 @@ final class NuvioSyncManager: ObservableObject {
             Task { @MainActor in self?.schedulePush() }
         })
         observers.append(center.addObserver(
+            forName: StreamBadgeSettingsStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.schedulePush() }
+        })
+        observers.append(center.addObserver(
             forName: Self.addonOrderChangedNotification,
             object: nil,
             queue: .main
@@ -195,6 +204,52 @@ final class NuvioSyncManager: ObservableObject {
     /// again — without waiting for an account pull to publish the same change.
     func noteHomeCatalogSettingsChangedLocally() {
         homeCatalogRevision &+= 1
+        scheduleHomeCatalogPush()
+    }
+
+    /// Debounces Home layout edits so moving a row several times only sends the
+    /// final order. The initial account pull must finish first; otherwise a
+    /// local snapshot could replace remote settings that tvOS has not loaded.
+    private func scheduleHomeCatalogPush() {
+        guard !isApplyingRemote,
+              AuthConfig.isConfigured,
+              authManager?.isAuthenticated == true,
+              let key = currentSyncKey(),
+              completedInitialPullKeys.contains(key) else { return }
+
+        homeCatalogPushTask?.cancel()
+        homeCatalogPushTask = Task { @MainActor [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 500_000_000)
+            } catch {
+                return
+            }
+            guard let self,
+                  !Task.isCancelled,
+                  let key = self.currentSyncKey(),
+                  self.completedInitialPullKeys.contains(key) else { return }
+            await self.pushHomeCatalogSettings()
+        }
+    }
+
+    private func pushHomeCatalogSettings() async {
+        guard let target = await currentSyncTarget(),
+              let key = currentSyncKey(),
+              completedInitialPullKeys.contains(key) else { return }
+        let items = TVHomeCatalogOrder.syncItems()
+        do {
+            try ensureStillSyncing()
+            try await client.pushHomeCatalogSettings(
+                session: target.session,
+                remoteProfileId: target.remoteProfileId,
+                items: items
+            )
+            Self.catalogSettingsSyncDiagnostic = "pushed \(items.count) item(s)"
+        } catch is CancellationError {
+            return
+        } catch {
+            print("Nuvio home catalog settings push failed: \(error.localizedDescription)")
+        }
     }
 
     func authStateChanged(_ state: AuthState) {
@@ -232,6 +287,7 @@ final class NuvioSyncManager: ObservableObject {
             pullTask?.cancel()
             pullTask = nil
             pushTask?.cancel()
+            homeCatalogPushTask?.cancel()
             profileSelectionRefreshTask?.cancel()
             profileSelectionRefreshTask = nil
             completedInitialPullKeys.removeAll()
@@ -306,6 +362,7 @@ final class NuvioSyncManager: ObservableObject {
         // A delayed snapshot captured the previous profile and must not resume
         // by reading the newly-active profile's global stores.
         pushTask?.cancel()
+        homeCatalogPushTask?.cancel()
 
         // A profile the account has already pulled this session has all its data
         // on disk, so switching to it is a local operation — the Android client
@@ -1495,7 +1552,9 @@ private enum SyncClientIdentity {
 fileprivate final class NuvioAPIClient {
     private static let pullPageSize = 500
     private static let settingsPlatform = "tv"
+    private static let mobileSettingsPlatform = "mobile"
     private static let settingsFeature = "tvos_settings"
+    private static let streamBadgeSettingsFeature = "stream_badge_settings"
     /// Shared with Android TV (`ProfileSettingsSyncService` / `DebridSettingsDataStore`).
     private static let debridSettingsFeature = "debrid_settings"
     /// Shared with Android TV's TMDB settings repository.
@@ -1508,6 +1567,8 @@ fileprivate final class NuvioAPIClient {
         return decoder
     }()
     private var lastPulledProfileSettingsJSON: [String: Any]?
+    private var lastPulledMobileProfileSettingsJSON: [String: Any]?
+    private var lastPulledHomeCatalogSettingsJSON: [String: Any]?
 
     func pullProfiles(session: AuthSession) async throws -> [RemoteProfile] {
         let rows: LossyRows<RemoteProfile> = try await rpcRows(
@@ -1643,27 +1704,104 @@ fileprivate final class NuvioAPIClient {
     /// Home-catalog settings platforms in priority order — the shared blob the
     /// mobile/Google-TV apps now write, then the legacy per-platform rows.
     private static let homeCatalogSyncPlatforms = ["home_catalog_shared", "tv", "mobile"]
+    private static let homeCatalogSharedSyncPlatform = "home_catalog_shared"
 
     /// Pulls the account's Home catalog layout (which catalogs show on Home and
     /// in what order), mirroring Android's `HomeCatalogSettingsSyncService`.
     /// Returns the first platform that has any items, preferring the shared blob.
     func pullHomeCatalogSettings(session: AuthSession, remoteProfileId: Int) async throws -> HomeCatalogSyncPayload? {
+        lastPulledHomeCatalogSettingsJSON = nil
         for platform in Self.homeCatalogSyncPlatforms {
             // Each platform is queried independently so one failing (or absent
             // on older backends) can't stop the others from being tried.
-            guard let data = try? await rpcData(
-                "sync_pull_home_catalog_settings",
+            guard let settingsJSON = try? await pullHomeCatalogSettingsJSON(
                 session: session,
-                params: ["p_profile_id": remoteProfileId, "p_platform": platform]
+                remoteProfileId: remoteProfileId,
+                platform: platform
             ) else { continue }
-            guard let rows = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-                  let settingsJSON = rows.first?["settings_json"] as? [String: Any] else {
-                continue
-            }
+            lastPulledHomeCatalogSettingsJSON = settingsJSON
             let payload = HomeCatalogSyncPayload(dictionary: settingsJSON)
             if !payload.items.isEmpty { return payload }
         }
         return nil
+    }
+
+    func pushHomeCatalogSettings(
+        session: AuthSession,
+        remoteProfileId: Int,
+        items: [[String: Any]]
+    ) async throws {
+        // Match Android's shared-payload merge: catalog edits replace only the
+        // items while preserving standalone Home settings owned by other apps.
+        var settingsJSON = (try? await pullHomeCatalogSettingsJSON(
+            session: session,
+            remoteProfileId: remoteProfileId,
+            platform: Self.homeCatalogSharedSyncPlatform
+        )) ?? lastPulledHomeCatalogSettingsJSON ?? [:]
+        let remoteItems = settingsJSON["items"] as? [[String: Any]] ?? []
+        settingsJSON["items"] = Self.mergeHomeCatalogItems(
+            local: items,
+            remote: remoteItems
+        )
+        try await rpcVoid(
+            "sync_push_home_catalog_settings",
+            session: session,
+            params: [
+                "p_profile_id": remoteProfileId,
+                "p_platform": Self.homeCatalogSharedSyncPlatform,
+                "p_settings_json": settingsJSON
+            ]
+        )
+        lastPulledHomeCatalogSettingsJSON = settingsJSON
+    }
+
+    private func pullHomeCatalogSettingsJSON(
+        session: AuthSession,
+        remoteProfileId: Int,
+        platform: String
+    ) async throws -> [String: Any]? {
+        let data = try await rpcData(
+            "sync_pull_home_catalog_settings",
+            session: session,
+            params: ["p_profile_id": remoteProfileId, "p_platform": platform]
+        )
+        guard let rows = try JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return nil
+        }
+        return rows.first?["settings_json"] as? [String: Any]
+    }
+
+    private static func mergeHomeCatalogItems(
+        local: [[String: Any]],
+        remote: [[String: Any]]
+    ) -> [[String: Any]] {
+        var remoteByKey: [String: [String: Any]] = [:]
+        for item in remote {
+            let key = homeCatalogItemKey(item)
+            guard !key.isEmpty, remoteByKey[key] == nil else { continue }
+            remoteByKey[key] = item
+        }
+        return local.map { item in
+            guard let remoteItem = remoteByKey[homeCatalogItemKey(item)] else { return item }
+            var merged = remoteItem
+            for (key, value) in item {
+                // tvOS has no custom-title editor; preserve a title authored on
+                // Android instead of replacing it with the local empty default.
+                if key == "custom_title", (value as? String)?.isEmpty == true { continue }
+                merged[key] = value
+            }
+            return merged
+        }
+    }
+
+    private static func homeCatalogItemKey(_ item: [String: Any]) -> String {
+        let isCollection = (item["is_collection"] as? Bool)
+            ?? (item["is_collection"] as? NSNumber)?.boolValue
+            ?? false
+        if isCollection {
+            return "collection:\(item["collection_id"] as? String ?? "")"
+        }
+        return "catalog:\(item["addon_id"] as? String ?? ""):\(item["type"] as? String ?? ""):\(item["catalog_id"] as? String ?? "")"
     }
 
     /// Applies the pulled Home catalog layout: records the add-on catalog order
@@ -1762,25 +1900,35 @@ fileprivate final class NuvioAPIClient {
         remoteProfileId: Int,
         localProfileId: String
     ) async throws -> Bool {
-        let raw = try await rpcJSONObject(
-            "sync_pull_profile_settings_blob",
+        lastPulledProfileSettingsJSON = nil
+        lastPulledMobileProfileSettingsJSON = nil
+
+        let settingsJSON = try await pullProfileSettingsJSON(
             session: session,
-            params: [
-                "p_profile_id": remoteProfileId,
-                "p_platform": Self.settingsPlatform
-            ]
+            remoteProfileId: remoteProfileId,
+            platform: Self.settingsPlatform
         )
-        guard let rows = raw as? [[String: Any]],
-              let settingsJSON = rows.first?["settings_json"] as? [String: Any] else {
-            lastPulledProfileSettingsJSON = nil
-            return false
-        }
         lastPulledProfileSettingsJSON = settingsJSON
-        let features = settingsJSON["features"] as? [String: Any] ?? [:]
+        // Android TV keeps this feature in its mobile-compatible settings blob.
+        // Pull it independently so badge packs/settings follow the account even
+        // when tvOS has never written a tv blob for this profile.
+        let mobileSettingsJSON = try? await pullProfileSettingsJSON(
+            session: session,
+            remoteProfileId: remoteProfileId,
+            platform: Self.mobileSettingsPlatform
+        )
+        lastPulledMobileProfileSettingsJSON = mobileSettingsJSON
+
+        let features = settingsJSON?["features"] as? [String: Any] ?? [:]
+        let mobileFeatures = mobileSettingsJSON?["features"] as? [String: Any] ?? [:]
         let tvosFeature = features[Self.settingsFeature] as? [String: Any]
         let debridFeature = features[Self.debridSettingsFeature] as? [String: Any]
         let tmdbFeature = features[Self.tmdbSettingsFeature] as? [String: Any]
-        guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil else {
+        // Prefer mobile: Android TV writes there, while tvOS also mirrors the
+        // feature into the tv blob for clients that only read that platform.
+        let streamBadgeFeature = (mobileFeatures[Self.streamBadgeSettingsFeature] as? [String: Any])
+            ?? (features[Self.streamBadgeSettingsFeature] as? [String: Any])
+        guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil else {
             return false
         }
 
@@ -1790,7 +1938,25 @@ fileprivate final class NuvioAPIClient {
         // Android TV stores debrid keys in a sibling feature on the same "tv" blob.
         importDebridSettings(debridFeature, localProfileId: localProfileId)
         importTmdbSettings(tmdbFeature, localProfileId: localProfileId)
+        importStreamBadgeSettings(streamBadgeFeature, localProfileId: localProfileId)
         return true
+    }
+
+    private func pullProfileSettingsJSON(
+        session: AuthSession,
+        remoteProfileId: Int,
+        platform: String
+    ) async throws -> [String: Any]? {
+        let raw = try await rpcJSONObject(
+            "sync_pull_profile_settings_blob",
+            session: session,
+            params: [
+                "p_profile_id": remoteProfileId,
+                "p_platform": platform
+            ]
+        )
+        guard let rows = raw as? [[String: Any]] else { return nil }
+        return rows.first?["settings_json"] as? [String: Any]
     }
 
     func pushProfileSettings(
@@ -1804,6 +1970,7 @@ fileprivate final class NuvioAPIClient {
         var settingsJSON = lastPulledProfileSettingsJSON ?? [:]
         var features = settingsJSON["features"] as? [String: Any] ?? [:]
         features[Self.settingsFeature] = exportSettings(localProfileId: localProfileId)
+        features[Self.streamBadgeSettingsFeature] = exportStreamBadgeSettings(localProfileId: localProfileId)
         // Keep Android stream-filter keys; overlay API keys + preferred resolver.
         let existingDebrid = features[Self.debridSettingsFeature] as? [String: Any]
         features[Self.debridSettingsFeature] = exportDebridSettings(
@@ -1826,6 +1993,35 @@ fileprivate final class NuvioAPIClient {
                 "p_settings_json": settingsJSON
             ]
         )
+
+        // Keep the Android/mobile-compatible feature in its own blob as well.
+        // Other mobile settings remain untouched by merging the latest remote
+        // document before replacing only stream_badge_settings.
+        do {
+            var mobileSettingsJSON = try await pullProfileSettingsJSON(
+                session: session,
+                remoteProfileId: remoteProfileId,
+                platform: Self.mobileSettingsPlatform
+            ) ?? lastPulledMobileProfileSettingsJSON ?? [:]
+            var mobileFeatures = mobileSettingsJSON["features"] as? [String: Any] ?? [:]
+            mobileFeatures[Self.streamBadgeSettingsFeature] = exportStreamBadgeSettings(localProfileId: localProfileId)
+            mobileSettingsJSON["features"] = mobileFeatures
+            if mobileSettingsJSON["version"] == nil { mobileSettingsJSON["version"] = 1 }
+            try await rpcVoid(
+                "sync_push_profile_settings_blob",
+                session: session,
+                params: [
+                    "p_profile_id": remoteProfileId,
+                    "p_platform": Self.mobileSettingsPlatform,
+                    "p_settings_json": mobileSettingsJSON
+                ]
+            )
+            lastPulledMobileProfileSettingsJSON = mobileSettingsJSON
+        } catch {
+            // tvOS settings sync remains successful if an older backend does
+            // not expose the mobile platform row/RPC yet.
+            print("Nuvio stream badge mobile sync skipped: \(error.localizedDescription)")
+        }
     }
 
     func pullLibrary(session: AuthSession, remoteProfileId: Int) async throws -> [LibraryStoreItem] {
@@ -2156,6 +2352,52 @@ fileprivate final class NuvioAPIClient {
         }
         if data.isEmpty { return Data("null".utf8) }
         return data
+    }
+
+    private func exportStreamBadgeSettings(localProfileId: String) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let mappings: [(String, String)] = [
+            (SettingsKey.streamBadgeRules, "stream_badge_rules"),
+            (SettingsKey.showFileSizeBadges, "show_file_size_badges"),
+            (SettingsKey.showAddonLogo, "show_addon_logo"),
+            (SettingsKey.streamBadgePlacement, "stream_badge_placement")
+        ]
+        var feature: [String: Any] = [:]
+        for (localKey, remoteKey) in mappings {
+            guard let value = defaults.object(forKey: localKey),
+                  let encoded = Self.encodeSettingValue(value) else { continue }
+            feature[remoteKey] = encoded
+        }
+        return feature
+    }
+
+    private func importStreamBadgeSettings(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let mappings: [(String, String)] = [
+            ("stream_badge_rules", SettingsKey.streamBadgeRules),
+            ("show_file_size_badges", SettingsKey.showFileSizeBadges),
+            ("show_addon_logo", SettingsKey.showAddonLogo),
+            ("stream_badge_placement", SettingsKey.streamBadgePlacement)
+        ]
+
+        // Android's replaceFromSyncPayload clears the feature before applying
+        // the remote values, so omitted optional values do not leave stale
+        // settings from the previous profile/account behind.
+        mappings.forEach { _, localKey in
+            defaults.removeObject(forKey: localKey)
+        }
+        for (remoteKey, localKey) in mappings {
+            if let encoded = remote[remoteKey] as? [String: Any],
+               let value = Self.decodeSettingValue(encoded) {
+                defaults.set(value, forKey: localKey)
+            } else if let value = remote[remoteKey] as? String {
+                defaults.set(value, forKey: localKey)
+            } else if let value = remote[remoteKey] as? Bool {
+                defaults.set(value, forKey: localKey)
+            }
+        }
+        StreamBadgeSettingsStore.postChanged()
     }
 
     private func exportSettings(localProfileId: String) -> [String: Any] {

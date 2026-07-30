@@ -534,10 +534,17 @@ struct NuvioStream: Identifiable, Codable {
     let sources: [String]
     /// Suggested filename for the wanted file, used by some debrid file pickers.
     let filename: String?
+    /// Stremio `behaviorHints.videoSize`, retained for the Android-compatible
+    /// stream file-size badge.
+    let videoSize: Int64?
     /// Stremio `behaviorHints.bingeGroup` — same release group for episode autoplay.
     let bingeGroup: String?
     /// Explicit cached flag from the add-on when present; otherwise inferred from text.
     let isCached: Bool?
+    /// Per-stream request headers supplied by a Stremio add-on through
+    /// `behaviorHints.proxyHeaders.request`. Some hosts reject playback without
+    /// the add-on's Referer or User-Agent.
+    let httpHeaders: [String: String]?
 
     init(
         url: String?,
@@ -550,8 +557,10 @@ struct NuvioStream: Identifiable, Codable {
         fileIdx: Int? = nil,
         sources: [String] = [],
         filename: String? = nil,
+        videoSize: Int64? = nil,
         bingeGroup: String? = nil,
-        isCached: Bool? = nil
+        isCached: Bool? = nil,
+        httpHeaders: [String: String]? = nil
     ) {
         self.url = url
         self.name = name
@@ -563,8 +572,10 @@ struct NuvioStream: Identifiable, Codable {
         self.fileIdx = fileIdx
         self.sources = sources
         self.filename = filename
+        self.videoSize = videoSize
         self.bingeGroup = bingeGroup
         self.isCached = isCached
+        self.httpHeaders = httpHeaders
     }
 
     /// A stream that has no direct URL but carries a torrent info-hash: it must
@@ -584,8 +595,8 @@ struct NuvioStream: Identifiable, Codable {
         NuvioStream(
             url: url, name: name, description: description, addonName: addonName,
             subtitles: subtitles, addonLogoURL: logo, infoHash: infoHash,
-            fileIdx: fileIdx, sources: sources, filename: filename,
-            bingeGroup: bingeGroup, isCached: isCached
+            fileIdx: fileIdx, sources: sources, filename: filename, videoSize: videoSize,
+            bingeGroup: bingeGroup, isCached: isCached, httpHeaders: httpHeaders
         )
     }
 
@@ -609,8 +620,10 @@ struct NuvioStream: Identifiable, Codable {
             fileIdx: fileIdx,
             sources: sources,
             filename: filename,
+            videoSize: videoSize,
             bingeGroup: bingeGroup,
-            isCached: isCached
+            isCached: isCached,
+            httpHeaders: httpHeaders
         )
     }
 }
@@ -4208,9 +4221,9 @@ enum WatchedStore {
 /// `UserDefaults` reads (subtitle style/language, reset) use `.current`.
 ///
 /// A new profile is seeded with a copy of the active profile's settings at
-/// creation, then diverges independently. Existing installs whose settings live
-/// in `.standard` migrate that snapshot into each profile the first time it is
-/// used, so nobody loses their preferences when profiles arrive.
+    /// creation, then diverges independently. Existing installs whose settings live
+    /// in `.standard` migrate that snapshot into each profile the first time it is
+    /// used, so nobody loses their preferences when profiles arrive.
 enum ProfileSettings {
     private static let suitePrefix = "nuvio.tv.profile.settings"
     private static let seededFlag = "nuvio.tv.profile.settings.seeded"
@@ -4218,6 +4231,10 @@ enum ProfileSettings {
     /// Settings store for the active profile. `.standard` until one is loaded
     /// (e.g. on the login / "Who's watching?" screens).
     private(set) static var current: UserDefaults = .standard
+    private(set) static var activeProfileID: String?
+
+    /// Stable Keychain namespace for secrets belonging to the active profile.
+    static var activeProfileScope: String { activeProfileID ?? "default" }
 
     /// The suite backing a given profile id, or `.standard` when there is none.
     /// `UserDefaults(suiteName:)` returns the same shared store for a name, so
@@ -4236,8 +4253,14 @@ enum ProfileSettings {
     static func setActiveProfile(_ profileId: String?) {
         guard let id = profileId, !id.isEmpty else { return }
         let suite = store(for: id)
+        let needsSeed = !suite.bool(forKey: seededFlag)
         seedFromGlobalIfNeeded(suite)
         current = suite
+        activeProfileID = id
+        AISubtitleKeyStore.migrateLegacyKey(from: suite, profileScope: id)
+        if needsSeed {
+            AISubtitleKeyStore.migrateLegacyKey(from: .standard, profileScope: id)
+        }
         // Must run after `current` is pointed at the profile, and after the
         // watch-state stores have been scoped, because it inspects this
         // profile's Trakt/Simkl credentials.
@@ -4246,6 +4269,7 @@ enum ProfileSettings {
 
     static func clearActiveProfile() {
         current = .standard
+        activeProfileID = nil
     }
 
     /// Deletes the given profiles' settings suites and the pre-profile copies
@@ -4254,11 +4278,16 @@ enum ProfileSettings {
     /// writing into a removed suite.
     static func eraseAll(profileIds: [String]) {
         current = .standard
+        activeProfileID = nil
         let simklTokenStorage = SimklKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
             simklTokenStorage.setAccessToken(nil, for: id)
+            AISubtitleKeyStore.remove(profileScope: id)
+            Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: id) }
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
         }
+        AISubtitleKeyStore.remove(profileScope: "default")
+        Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: "default") }
         SimklAuthStore.clearAuth(
             profileScope: "default",
             store: .standard,
@@ -4277,6 +4306,10 @@ enum ProfileSettings {
     static func seedNewProfile(_ profileId: String, copyingFrom source: UserDefaults? = nil) {
         let destination = store(for: profileId)
         copySettings(from: source ?? current, to: destination)
+        // Secrets never cross profile boundaries. Keep AI translation disabled
+        // until this profile explicitly supplies its own Keychain credential.
+        destination.set(false, forKey: SettingsKey.aiSubtitlesEnabled)
+        destination.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
         destination.set(true, forKey: seededFlag)
     }
 
@@ -4288,7 +4321,7 @@ enum ProfileSettings {
 
     private static func copySettings(from source: UserDefaults, to destination: UserDefaults) {
         guard source != destination else { return }
-        for key in SettingsKey.all {
+        for key in SettingsKey.all where key != SettingsKey.aiSubtitlesGeminiAPIKey {
             if let value = source.object(forKey: key) {
                 destination.set(value, forKey: key)
             } else {

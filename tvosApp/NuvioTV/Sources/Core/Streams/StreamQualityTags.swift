@@ -171,6 +171,9 @@ enum LastPlaybackStreamStore {
 
     private struct Record: Codable {
         let url: String
+        /// Optional for compatibility with records saved before stream headers
+        /// were persisted.
+        let httpHeaders: [String: String]?
         let season: Int?
         let episode: Int?
     }
@@ -178,6 +181,7 @@ enum LastPlaybackStreamStore {
     static func save(
         metaId: String,
         url: String,
+        httpHeaders: [String: String] = [:],
         season: Int?,
         episode: Int?,
         profileId: String? = nil
@@ -185,7 +189,12 @@ enum LastPlaybackStreamStore {
         let url = url.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !metaId.isEmpty, !url.isEmpty, URL(string: url) != nil,
               let data = try? JSONEncoder().encode(
-                Record(url: url, season: season, episode: episode)
+                Record(
+                    url: url,
+                    httpHeaders: httpHeaders.isEmpty ? nil : httpHeaders,
+                    season: season,
+                    episode: episode
+                )
               ) else { return }
         defaults(for: profileId).set(data, forKey: prefix + metaId)
     }
@@ -195,14 +204,14 @@ enum LastPlaybackStreamStore {
         season: Int?,
         episode: Int?,
         profileId: String? = nil
-    ) -> String? {
+    ) -> (url: String, httpHeaders: [String: String])? {
         guard let data = defaults(for: profileId).data(forKey: prefix + metaId),
               let record = try? JSONDecoder().decode(Record.self, from: data),
               record.season == season,
               record.episode == episode else {
             return nil
         }
-        return record.url
+        return (record.url, record.httpHeaders ?? [:])
     }
 
     private static func defaults(for profileId: String?) -> UserDefaults {
@@ -248,5 +257,397 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
 
     static func badges(for stream: NuvioStream) -> [StreamBadgeKind] {
         badges(for: StreamQualityTags.parse(stream: stream))
+    }
+}
+
+// MARK: - Android TV stream badges
+
+/// The image-backed badge pack format used by Android TV. Keeping the wire
+/// shape here lets tvOS consume the same hosted JSON without making the stream
+/// model carry presentation-only state.
+struct StreamBadgeFilter: Codable, Equatable {
+    var id: String = ""
+    var groupId: String = ""
+    var name: String = ""
+    var pattern: String = ""
+    var imageURL: String = ""
+    var isEnabled: Bool = true
+    var tagColor: String = ""
+    var tagStyle: String = ""
+    var textColor: String = ""
+    var borderColor: String = ""
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        groupId = try container.decodeIfPresent(String.self, forKey: .groupId) ?? ""
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        pattern = try container.decodeIfPresent(String.self, forKey: .pattern) ?? ""
+        imageURL = try container.decodeIfPresent(String.self, forKey: .imageURL)
+            ?? (try container.decodeIfPresent(String.self, forKey: .imageUrl)) ?? ""
+        isEnabled = try container.decodeIfPresent(Bool.self, forKey: .isEnabled) ?? true
+        tagColor = try container.decodeIfPresent(String.self, forKey: .tagColor) ?? ""
+        tagStyle = try container.decodeIfPresent(String.self, forKey: .tagStyle) ?? ""
+        textColor = try container.decodeIfPresent(String.self, forKey: .textColor) ?? ""
+        borderColor = try container.decodeIfPresent(String.self, forKey: .borderColor) ?? ""
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(groupId, forKey: .groupId)
+        try container.encode(name, forKey: .name)
+        try container.encode(pattern, forKey: .pattern)
+        try container.encode(imageURL, forKey: .imageURL)
+        try container.encode(isEnabled, forKey: .isEnabled)
+        try container.encode(tagColor, forKey: .tagColor)
+        try container.encode(tagStyle, forKey: .tagStyle)
+        try container.encode(textColor, forKey: .textColor)
+        try container.encode(borderColor, forKey: .borderColor)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, groupId, name, pattern, imageURL, imageUrl, isEnabled, tagColor, tagStyle, textColor, borderColor
+    }
+}
+
+struct StreamBadgeGroup: Codable, Equatable {
+    var id: String = ""
+    var name: String = ""
+    var color: String = ""
+    var isExpanded: Bool = true
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decodeIfPresent(String.self, forKey: .id) ?? ""
+        name = try container.decodeIfPresent(String.self, forKey: .name) ?? ""
+        color = try container.decodeIfPresent(String.self, forKey: .color) ?? ""
+        isExpanded = try container.decodeIfPresent(Bool.self, forKey: .isExpanded) ?? true
+    }
+
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(id, forKey: .id)
+        try container.encode(name, forKey: .name)
+        try container.encode(color, forKey: .color)
+        try container.encode(isExpanded, forKey: .isExpanded)
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case id, name, color, isExpanded
+    }
+}
+
+struct StreamBadgeImport: Codable, Equatable, Identifiable {
+    var sourceUrl: String
+    var filters: [StreamBadgeFilter]
+    var groups: [StreamBadgeGroup] = []
+    var isActive: Bool = true
+
+    var id: String { sourceUrl }
+    var enabledFilterCount: Int { filters.filter(\.isEnabled).count }
+}
+
+struct StreamBadgeRules: Codable, Equatable {
+    static let importLimit = 3
+    var imports: [StreamBadgeImport] = []
+
+    var activeImport: StreamBadgeImport? {
+        imports.first(where: { $0.isActive })
+    }
+
+    func normalized() -> StreamBadgeRules {
+        var result: [StreamBadgeImport] = []
+        for item in imports {
+            let url = item.sourceUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+            let filters = item.filters.filter {
+                !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+                !$0.pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            }
+            guard !url.isEmpty, !filters.isEmpty else { continue }
+            let normalized = StreamBadgeImport(
+                sourceUrl: url,
+                filters: filters,
+                groups: item.groups,
+                isActive: item.isActive
+            )
+            if let index = result.firstIndex(where: { $0.sourceUrl.caseInsensitiveCompare(url) == .orderedSame }) {
+                result[index] = normalized
+            } else if result.count < Self.importLimit {
+                result.append(normalized)
+            }
+        }
+        return StreamBadgeRules(imports: result)
+    }
+
+    func upserting(_ item: StreamBadgeImport, activate: Bool = true) -> StreamBadgeRules {
+        var next = normalized().imports
+        var item = item
+        item.sourceUrl = item.sourceUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        item.isActive = activate
+        if let index = next.firstIndex(where: { $0.sourceUrl.caseInsensitiveCompare(item.sourceUrl) == .orderedSame }) {
+            next[index] = item
+        } else {
+            next.append(item)
+        }
+        if activate {
+            next = next.map { current in
+                var current = current
+                current.isActive = current.sourceUrl.caseInsensitiveCompare(item.sourceUrl) == .orderedSame
+                return current
+            }
+        }
+        return StreamBadgeRules(imports: next).normalized()
+    }
+
+    func settingActive(sourceUrl: String) -> StreamBadgeRules {
+        let sourceUrl = sourceUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard imports.contains(where: { $0.sourceUrl.caseInsensitiveCompare(sourceUrl) == .orderedSame }) else {
+            return normalized()
+        }
+        return StreamBadgeRules(imports: imports.map { item in
+            var item = item
+            item.isActive = item.sourceUrl.caseInsensitiveCompare(sourceUrl) == .orderedSame
+            return item
+        }).normalized()
+    }
+
+    /// Disabling the selected pack leaves its rules installed but stops badges
+    /// from rendering. Enabling a pack makes it the selected source, preserving
+    /// the Android TV one-pack-at-a-time behaviour.
+    func settingEnabled(sourceUrl: String, isEnabled: Bool) -> StreamBadgeRules {
+        guard isEnabled else {
+            return StreamBadgeRules(imports: imports.map { item in
+                var item = item
+                if item.sourceUrl.caseInsensitiveCompare(sourceUrl) == .orderedSame {
+                    item.isActive = false
+                }
+                return item
+            }).normalized()
+        }
+        return settingActive(sourceUrl: sourceUrl)
+    }
+
+    func removing(sourceUrl: String) -> StreamBadgeRules {
+        StreamBadgeRules(
+            imports: imports.filter { $0.sourceUrl.caseInsensitiveCompare(sourceUrl.trimmingCharacters(in: .whitespacesAndNewlines)) != .orderedSame }
+        ).normalized()
+    }
+}
+
+private struct StreamBadgePayload: Decodable {
+    let filters: [StreamBadgeFilter]
+    let groups: [StreamBadgeGroup]
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        filters = try container.decodeIfPresent([StreamBadgeFilter].self, forKey: .filters) ?? []
+        groups = try container.decodeIfPresent([StreamBadgeGroup].self, forKey: .groups) ?? []
+    }
+
+    private enum CodingKeys: String, CodingKey {
+        case filters
+        case groups
+    }
+}
+
+private enum StreamBadgeRulesParser {
+    static func parse(sourceUrl: String, data: Data) throws -> StreamBadgeImport {
+        let payload = try JSONDecoder().decode(StreamBadgePayload.self, from: data)
+        let filters = payload.filters.filter {
+            !$0.name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty &&
+            !$0.pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        guard !filters.isEmpty else {
+            throw NSError(domain: "NuvioStreamBadges", code: 1, userInfo: [NSLocalizedDescriptionKey: "Badge import did not contain any usable filters."])
+        }
+        return StreamBadgeImport(
+            sourceUrl: sourceUrl.trimmingCharacters(in: .whitespacesAndNewlines),
+            filters: filters,
+            groups: payload.groups
+        )
+    }
+}
+
+enum StreamBadgePlacement: String, Codable, CaseIterable {
+    case top = "TOP"
+    case bottom = "BOTTOM"
+}
+
+struct StreamBadgeSettingsSnapshot: Equatable {
+    var rules: StreamBadgeRules
+    var showFileSizeBadges: Bool
+    var showAddonLogo: Bool
+    var badgePlacement: StreamBadgePlacement
+}
+
+/// Profile-scoped storage and URL importer for Android TV-compatible badges.
+enum StreamBadgeSettingsStore {
+    static let changedNotification = Notification.Name("NuvioStreamBadgeSettingsChanged")
+    static let goldBadgePackURL = "https://raw.githubusercontent.com/djgenesis/badges/refs/heads/main/gold_badges_complete.json"
+
+    static var snapshot: StreamBadgeSettingsSnapshot {
+        let defaults = ProfileSettings.current
+        let rules: StreamBadgeRules
+        if let data = defaults.string(forKey: SettingsKey.streamBadgeRules)?.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(StreamBadgeRules.self, from: data) {
+            rules = decoded.normalized()
+        } else {
+            rules = StreamBadgeRules()
+        }
+        let placement = StreamBadgePlacement(
+            rawValue: defaults.string(forKey: SettingsKey.streamBadgePlacement) ?? StreamBadgePlacement.bottom.rawValue
+        ) ?? .bottom
+        return StreamBadgeSettingsSnapshot(
+            rules: rules,
+            showFileSizeBadges: defaults.object(forKey: SettingsKey.showFileSizeBadges) as? Bool ?? true,
+            showAddonLogo: defaults.object(forKey: SettingsKey.showAddonLogo) as? Bool ?? false,
+            badgePlacement: placement
+        )
+    }
+
+    static func saveRules(_ rules: StreamBadgeRules) {
+        let rules = rules.normalized()
+        let defaults = ProfileSettings.current
+        if rules.imports.isEmpty {
+            defaults.removeObject(forKey: SettingsKey.streamBadgeRules)
+        } else if let data = try? JSONEncoder().encode(rules), let value = String(data: data, encoding: .utf8) {
+            defaults.set(value, forKey: SettingsKey.streamBadgeRules)
+        }
+        postChanged()
+    }
+
+    static func setPlacement(_ placement: StreamBadgePlacement) {
+        ProfileSettings.current.set(placement.rawValue, forKey: SettingsKey.streamBadgePlacement)
+        postChanged()
+    }
+
+    static func setShowFileSizeBadges(_ enabled: Bool) {
+        ProfileSettings.current.set(enabled, forKey: SettingsKey.showFileSizeBadges)
+        postChanged()
+    }
+
+    static func setShowAddonLogo(_ enabled: Bool) {
+        ProfileSettings.current.set(enabled, forKey: SettingsKey.showAddonLogo)
+        postChanged()
+    }
+
+    static func setActiveSource(_ sourceUrl: String) {
+        saveRules(snapshot.rules.settingActive(sourceUrl: sourceUrl))
+    }
+
+    static func setSourceEnabled(_ sourceUrl: String, isEnabled: Bool) {
+        saveRules(snapshot.rules.settingEnabled(sourceUrl: sourceUrl, isEnabled: isEnabled))
+    }
+
+    static func removeSource(_ sourceUrl: String) {
+        saveRules(snapshot.rules.removing(sourceUrl: sourceUrl))
+    }
+
+    static func importRules(from rawUrl: String) async throws -> StreamBadgeRules {
+        let trimmedUrl = rawUrl.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The tvOS Simulator's remote-keyboard bridge can turn the colon in a
+        // pasted scheme into `>`. Treat that one input artifact as its intended
+        // `://` separator so a valid HTTPS pack URL still imports.
+        let normalizedUrl: String
+        if trimmedUrl.hasPrefix("https>//") {
+            normalizedUrl = "https://" + trimmedUrl.dropFirst("https>//".count)
+        } else if trimmedUrl.hasPrefix("http>//") {
+            normalizedUrl = "http://" + trimmedUrl.dropFirst("http>//".count)
+        } else {
+            normalizedUrl = trimmedUrl
+        }
+        guard let url = URL(string: normalizedUrl),
+              let scheme = url.scheme?.lowercased(), scheme == "http" || scheme == "https" else {
+            throw NSError(domain: "NuvioStreamBadges", code: 2, userInfo: [NSLocalizedDescriptionKey: "Badge URL must start with http:// or https://."])
+        }
+        let (data, response) = try await URLSession.shared.data(from: url)
+        if let response = response as? HTTPURLResponse, !(200..<300).contains(response.statusCode) {
+            throw NSError(domain: "NuvioStreamBadges", code: response.statusCode, userInfo: [NSLocalizedDescriptionKey: "Badge server returned HTTP \(response.statusCode)."])
+        }
+        let imported = try StreamBadgeRulesParser.parse(sourceUrl: normalizedUrl, data: data)
+        let current = snapshot.rules
+        if !current.imports.contains(where: { $0.sourceUrl.caseInsensitiveCompare(normalizedUrl) == .orderedSame }),
+           current.imports.count >= StreamBadgeRules.importLimit {
+            throw NSError(domain: "NuvioStreamBadges", code: 3, userInfo: [NSLocalizedDescriptionKey: "You can import up to 3 badge URLs."])
+        }
+        let rules = current.upserting(imported)
+        saveRules(rules)
+        return rules
+    }
+
+    static func postChanged() {
+        DispatchQueue.main.async {
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        }
+    }
+}
+
+enum StreamBadgeMatcher {
+    static func matchedBadges(for stream: NuvioStream, rules: StreamBadgeRules) -> [StreamBadgeFilter] {
+        guard let active = rules.normalized().activeImport else { return [] }
+        let candidates = matchCandidates(for: stream)
+        guard !candidates.isEmpty else { return [] }
+        var result: [StreamBadgeFilter] = []
+        var seen = Set<String>()
+        for filter in active.filters where filter.isEnabled {
+            guard let regex = try? NSRegularExpression(pattern: filter.pattern) else { continue }
+            let matched = candidates.contains { candidate in
+                let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+                return regex.firstMatch(in: candidate, range: range) != nil
+            }
+            guard matched else { continue }
+            let key = (filter.imageURL.isEmpty ? filter.name : filter.imageURL).lowercased()
+            if seen.insert(key).inserted { result.append(filter) }
+        }
+        return result
+    }
+
+    static func matchCandidates(for stream: NuvioStream) -> [String] {
+        let values = [
+            stream.filename,
+            stream.name,
+            stream.description,
+            stream.url,
+            stream.infoHash,
+            stream.addonName,
+            stream.sources.joined(separator: " ")
+        ].compactMap { value -> String? in
+            guard let value else { return nil }
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            return trimmed.isEmpty ? nil : trimmed
+        }
+        guard values.count > 1 else { return values }
+        return values + [values.joined(separator: " ")]
+    }
+}
+
+enum StreamBadgeSizing {
+    static func fileSizeBytes(for stream: NuvioStream) -> Int64? {
+        if let videoSize = stream.videoSize, videoSize > 0 { return videoSize }
+        let text = [stream.name, stream.description, stream.filename]
+            .compactMap { $0 }
+            .joined(separator: " ")
+        let pattern = #"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)"#
+        guard let match = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else { return nil }
+        let token = String(text[match])
+        let numberText = token.components(separatedBy: CharacterSet(charactersIn: "0123456789.").inverted)
+            .first(where: { Double($0) != nil }) ?? "0"
+        let number = Double(numberText.replacingOccurrences(of: ",", with: ".")) ?? 0
+        let upper = token.uppercased()
+        let multiplier: Double = upper.contains("TB") ? 1_099_511_627_776 :
+            upper.contains("GB") ? 1_073_741_824 :
+            upper.contains("MB") ? 1_048_576 : 1_024
+        let bytes = Int64(number * multiplier)
+        return bytes > 0 ? bytes : nil
+    }
+
+    static func fileSizeLabel(for stream: NuvioStream) -> String? {
+        guard let bytes = fileSizeBytes(for: stream) else { return nil }
+        let gib = Double(bytes) / 1_073_741_824
+        if gib >= 1 {
+            return String(format: "Size %.1f GB", gib)
+        }
+        return "Size \(Int((Double(bytes) / 1_048_576).rounded())) MB"
     }
 }

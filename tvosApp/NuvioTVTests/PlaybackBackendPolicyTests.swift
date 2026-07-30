@@ -1,7 +1,102 @@
+import Foundation
 import XCTest
 @testable import NuvioTV
 
 final class PlaybackBackendPolicyTests: XCTestCase {
+
+    func testAISubtitleSettingsMigratesRetiredModelToSupportedDefault() {
+        XCTAssertEqual(
+            AISubtitleTranslationSettings.normalizedModel("gemini-2.0-flash"),
+            AISubtitleTranslationSettings.defaultModel
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationSettings.normalizedModel("gemini-3.5-flash-lite"),
+            "gemini-3.5-flash-lite"
+        )
+    }
+
+    func testGeminiTranslatorSendsKeyInHeaderRatherThanURL() async throws {
+        GeminiURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-goog-api-key"), "test-api-key")
+            let components = try XCTUnwrap(URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false))
+            XCTAssertTrue(components.queryItems?.isEmpty ?? true)
+            XCTAssertEqual(request.httpMethod, "POST")
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            return (response, Data(#"{"candidates":[{"content":{"parts":[{"text":"Hei"}]}}]}"#.utf8))
+        }
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        let translated = try await GeminiSubtitleTranslator.translate(
+            "Hello",
+            to: "Norwegian",
+            model: AISubtitleTranslationSettings.defaultModel,
+            apiKey: "test-api-key",
+            session: URLSession(configuration: configuration)
+        )
+
+        XCTAssertEqual(translated, "Hei")
+    }
+
+    func testAISubtitleCachePersistsAndSeparatesTranslationSettings() async {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("ai-subtitle-cache-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let writer = AISubtitleTranslationCache(directory: directory)
+        await writer.store(
+            "Hei",
+            for: "Hello",
+            targetLanguage: "Norwegian",
+            model: "gemini-3.6-flash",
+            stripHearingImpaired: true,
+            profileScope: "profile-a"
+        )
+
+        let reader = AISubtitleTranslationCache(directory: directory)
+        let cached = await reader.translation(
+            for: "Hello",
+            targetLanguage: "Norwegian",
+            model: "gemini-3.6-flash",
+            stripHearingImpaired: true,
+            profileScope: "profile-a"
+        )
+        let otherLanguage = await reader.translation(
+            for: "Hello",
+            targetLanguage: "German",
+            model: "gemini-3.6-flash",
+            stripHearingImpaired: true,
+            profileScope: "profile-a"
+        )
+        let otherProfile = await reader.translation(
+            for: "Hello",
+            targetLanguage: "Norwegian",
+            model: "gemini-3.6-flash",
+            stripHearingImpaired: true,
+            profileScope: "profile-b"
+        )
+
+        XCTAssertEqual(cached, "Hei")
+        XCTAssertNil(otherLanguage)
+        XCTAssertNil(otherProfile)
+    }
+
+    @MainActor
+    func testAISubtitleCleaningPreservesDialogue() {
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                "[MUSIC] Hello (door closes) ♪",
+                stripHearingImpaired: true
+            ),
+            "Hello"
+        )
+    }
 
     func testAutoSelectsAetherWithFallback() {
         let result = PlaybackBackendPolicy.resolve(
@@ -187,6 +282,31 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(size.width, 1024, accuracy: 0.001)
         XCTAssertEqual(size.height, 576, accuracy: 0.001)
     }
+}
+
+private final class GeminiURLProtocolStub: URLProtocol {
+    static var handler: ((URLRequest) throws -> (HTTPURLResponse, Data))?
+
+    override class func canInit(with request: URLRequest) -> Bool { true }
+
+    override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
+
+    override func startLoading() {
+        guard let handler = Self.handler else {
+            client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+            return
+        }
+        do {
+            let (response, data) = try handler(request)
+            client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
+            client?.urlProtocol(self, didLoad: data)
+            client?.urlProtocolDidFinishLoading(self)
+        } catch {
+            client?.urlProtocol(self, didFailWithError: error)
+        }
+    }
+
+    override func stopLoading() {}
 }
 
 final class WatchedIdentityPolicyTests: XCTestCase {

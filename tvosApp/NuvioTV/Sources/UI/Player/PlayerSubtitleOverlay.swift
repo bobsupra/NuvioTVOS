@@ -5,6 +5,7 @@ import AetherEngine
 /// Placed above the video surface and below transport controls.
 struct PlayerSubtitleOverlay: View {
     @ObservedObject var playback: AetherSubtitleOverlayState
+    @ObservedObject var translation: AISubtitleTranslationState
     let subtitleDelaySeconds: Double
     let videoNaturalSize: CGSize
     let aspectMode: PlayerAspectMode
@@ -65,6 +66,19 @@ struct PlayerSubtitleOverlay: View {
                     ForEach(activeTextCues) { cue in
                         textBody(cue)
                     }
+                    if translation.isTranslating(cueIDs: activeTextCues.map(\.id)) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "sparkles")
+                            Text("AI")
+                            ProgressView()
+                                .controlSize(.mini)
+                        }
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.black.opacity(0.36), in: Capsule())
+                    }
                 }
                 .frame(
                     width: max(videoRect.width - horizontalMargin * 2, 1),
@@ -86,9 +100,13 @@ struct PlayerSubtitleOverlay: View {
     private func textBody(_ cue: SubtitleCue) -> some View {
         switch cue.body {
         case .text(let string):
-            outlinedText(string)
+            outlinedText(translation.translatedText(for: cue.id) ?? string)
         case .richText(let runs):
-            outlinedRichText(runs)
+            if let translated = translation.translatedText(for: cue.id) {
+                outlinedText(translated)
+            } else {
+                outlinedRichText(runs)
+            }
         case .image:
             EmptyView()
         }
@@ -142,6 +160,100 @@ struct PlayerSubtitleOverlay: View {
     }
 
     /// Computes the on-screen video rectangle for the active aspect mode.
+    private func displayedVideoRect(container: CGSize, video: CGSize, mode: PlayerAspectMode) -> CGRect {
+        guard video.width > 1, video.height > 1,
+              container.width > 1, container.height > 1 else {
+            return CGRect(origin: .zero, size: container)
+        }
+        let videoAspect = video.width / video.height
+        let containerAspect = container.width / container.height
+        switch mode {
+        case .stretch:
+            return CGRect(origin: .zero, size: container)
+        case .fit:
+            if videoAspect > containerAspect {
+                let h = container.width / videoAspect
+                return CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
+            } else {
+                let w = container.height * videoAspect
+                return CGRect(x: (container.width - w) / 2, y: 0, width: w, height: container.height)
+            }
+        case .fill:
+            if videoAspect > containerAspect {
+                let w = container.height * videoAspect
+                return CGRect(x: (container.width - w) / 2, y: 0, width: w, height: container.height)
+            } else {
+                let h = container.width / videoAspect
+                return CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
+            }
+        }
+    }
+}
+
+/// MPV decodes its active text subtitle through `sub-text`. When AI
+/// translation is active MPV's own renderer stays hidden, and this host layer
+/// immediately renders the original text until the translated replacement is
+/// available. Bitmap subtitles remain entirely under MPV's renderer.
+struct MPVSubtitleOverlay: View {
+    @ObservedObject var translation: MPVSubtitleTranslationState
+    let videoNaturalSize: CGSize
+    let aspectMode: PlayerAspectMode
+    let style: SubtitleStyle
+
+    private var textSize: CGFloat {
+        min(max(CGFloat(style.textSize) / 100 * 42, 24), 92)
+    }
+    private var textColor: Color { Color(hex: style.textColorHex) }
+    private var outlineColor: Color { Color(hex: style.outlineColorHex) }
+    private var textOpacity: Double { Double(min(max(style.textOpacity, 0), 100)) / 100 }
+    private var outlineWidth: CGFloat { style.outlineEnabled ? 2 : 0 }
+    private var bottomOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
+    private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
+    private var fontWeight: Font.Weight { style.bold ? .bold : .regular }
+
+    var body: some View {
+        GeometryReader { geo in
+            if let text = translation.displayText {
+                let videoRect = displayedVideoRect(
+                    container: geo.size,
+                    video: videoNaturalSize,
+                    mode: aspectMode
+                )
+                VStack(spacing: 8) {
+                    Text(text)
+                        .font(.system(size: textSize, weight: fontWeight))
+                        .foregroundStyle(textColor.opacity(textOpacity))
+                        .tracking(CGFloat(style.letterSpacing))
+                        .multilineTextAlignment(.center)
+                        .subtitleOutline(color: outlineColor, width: outlineWidth)
+                    if translation.isTranslating {
+                        HStack(spacing: 5) {
+                            Image(systemName: "sparkles")
+                            Text("AI")
+                            ProgressView().controlSize(.mini)
+                        }
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.72))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(.black.opacity(0.36), in: Capsule())
+                    }
+                }
+                .frame(
+                    width: max(videoRect.width - horizontalMargin * 2, 1),
+                    height: max(videoRect.height - bottomOffset, 1),
+                    alignment: .bottom
+                )
+                .position(
+                    x: videoRect.midX,
+                    y: videoRect.minY + max(videoRect.height - bottomOffset, 1) / 2
+                )
+            }
+        }
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
+    }
+
     private func displayedVideoRect(container: CGSize, video: CGSize, mode: PlayerAspectMode) -> CGRect {
         guard video.width > 1, video.height > 1,
               container.width > 1, container.height > 1 else {

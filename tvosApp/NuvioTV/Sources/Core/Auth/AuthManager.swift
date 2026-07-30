@@ -79,6 +79,16 @@ final class AuthManager: ObservableObject {
     /// leftover session so the login gate shows.
     private func clearLeftoverSessionOnFreshInstall() {
         let defaults = UserDefaults.standard
+
+        #if DEBUG && targetEnvironment(simulator)
+        // `simctl install` can replace the app data container during an
+        // iterative debug build even though the simulator Keychain survives.
+        // Keep the Keychain session in that development-only case so a rebuild
+        // does not repeatedly force the developer through TV sign-in.
+        defaults.set(true, forKey: Self.installMarkerKey)
+        return
+        #endif
+
         guard !defaults.bool(forKey: Self.installMarkerKey) else { return }
         defaults.set(true, forKey: Self.installMarkerKey)
         store.clear()

@@ -8,6 +8,7 @@ struct PlayerView: View {
     let url: URL
     let meta: NuvioMeta
     let subtitle: String
+    let httpHeaders: [String: String]
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
     /// Episode context for the in-player Next Episode card. Empty for movies/trailers.
@@ -54,11 +55,22 @@ struct PlayerView: View {
             }
             .ignoresSafeArea()
 
-            // Host subtitle overlay for Aether (MPV renders its own subs).
+            // Aether exposes timed cues directly. MPV exposes its current text
+            // cue; its native renderer is hidden only while that cue is being
+            // replaced by the AI subtitle overlay.
             if viewModel.activeEngineKind == .aether {
                 PlayerSubtitleOverlay(
                     playback: viewModel.aetherController.subtitleOverlayState,
+                    translation: viewModel.aetherController.subtitleTranslationState,
                     subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
+                    videoNaturalSize: viewModel.videoNaturalSize,
+                    aspectMode: viewModel.aspectMode,
+                    style: viewModel.subtitleStyle
+                )
+                .ignoresSafeArea()
+            } else {
+                MPVSubtitleOverlay(
+                    translation: viewModel.playerController.subtitleTranslationState,
                     videoNaturalSize: viewModel.videoNaturalSize,
                     aspectMode: viewModel.aspectMode,
                     style: viewModel.subtitleStyle
@@ -341,7 +353,14 @@ struct PlayerView: View {
             // Hold for the full player session (not only .playing/.buffering).
             // Status flicker previously re-enabled Sleep After mid-watch.
             PlaybackWakeLock.acquire()
-            viewModel.load(url: url, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles, resumeFrom: resumeFrom)
+            viewModel.load(
+                url: url,
+                meta: meta,
+                subtitle: subtitle,
+                httpHeaders: httpHeaders,
+                externalSubtitles: externalSubtitles,
+                resumeFrom: resumeFrom
+            )
             if subtitle != PlaybackMarkers.trailerSubtitle {
                 viewModel.fetchExternalSubtitles(
                     contentId: subtitleContentId,
