@@ -33,6 +33,15 @@ final class AppleTVCapabilityTests: XCTestCase {
         XCTAssertTrue(appleTVHD.isPlayable(tags: tags))
     }
 
+    func testAppleTVHDAcceptsHDRipRelease() {
+        // Regression: "HDRip" ("high definition rip") is an SDR release tag,
+        // not HDR content. It must not get caught by the HDR-only exclusion
+        // above (see StreamQualityTagsTests.testHDRipIsNotDetectedAsHDR for
+        // the underlying tag-parsing fix).
+        let tags = StreamQualityTags.parse(name: "Movie 1080p HDRip x264")
+        XCTAssertTrue(appleTVHD.isPlayable(tags: tags))
+    }
+
     func testAppleTVHDAcceptsUntaggedStream() {
         // A stream with no parseable resolution/HDR markers should never be
         // blocked outright by capability filtering alone.

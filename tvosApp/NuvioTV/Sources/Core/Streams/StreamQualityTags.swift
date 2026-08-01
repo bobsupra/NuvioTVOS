@@ -35,8 +35,12 @@ struct StreamQualityTags: Equatable, Codable {
             " profile 5", "profile 5", " profile 7", "profile 7", " profile 8", "profile 8",
             " dv ", "dv.", ".dv.", "[dv]", "(dv)"
         ]) || text.range(of: #"\bdv\b"#, options: .regularExpression) != nil
-        tags.isHDR = tags.isDolbyVision || textContainsAny(text, [
-            "hdr10+", "hdr10", "hdr", "hlg", "pq10"
+        // Whole-word match: a plain substring check on "hdr" would false-positive
+        // on SDR releases tagged "HDRip" ("high definition rip", unrelated to HDR
+        // color). "hdr10" alone (word-bounded) already covers "hdr10+" text, since
+        // the "+" is itself a non-word character and satisfies the boundary.
+        tags.isHDR = tags.isDolbyVision || textContainsAnyWholeWord(text, [
+            "hdr10", "hdr", "hlg", "pq10"
         ])
         tags.isAtmos = textContainsAny(text, [
             "atmos", "truehd atmos", "ddp atmos", "eac3 atmos", "dd+ atmos"
@@ -110,6 +114,17 @@ struct StreamQualityTags: Equatable, Codable {
 
     private static func textContainsAny(_ text: String, _ needles: [String]) -> Bool {
         needles.contains { text.contains($0) }
+    }
+
+    /// Like `textContainsAny`, but requires each needle to appear as its own
+    /// token (word-boundary match) rather than anywhere as a substring, so a
+    /// short tag like "hdr" doesn't match inside an unrelated longer word
+    /// (e.g. "HDRip").
+    private static func textContainsAnyWholeWord(_ text: String, _ needles: [String]) -> Bool {
+        needles.contains { needle in
+            let escaped = NSRegularExpression.escapedPattern(for: needle)
+            return text.range(of: "\\b\(escaped)\\b", options: .regularExpression) != nil
+        }
     }
 }
 

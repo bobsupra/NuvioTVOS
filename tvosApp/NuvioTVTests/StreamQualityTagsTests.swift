@@ -14,6 +14,22 @@ final class StreamQualityTagsTests: XCTestCase {
         XCTAssertTrue(tags.isAtmos)
     }
 
+    func testHDRipIsNotDetectedAsHDR() {
+        // "HDRip" ("high definition rip") is an SDR release tag; a naive
+        // substring match on "hdr" would false-positive on it.
+        let tags = StreamQualityTags.parse(name: "Movie 1080p HDRip x264")
+        XCTAssertFalse(tags.isHDR)
+        XCTAssertFalse(tags.isDolbyVision)
+    }
+
+    func testHDRTokensStillDetectedAsHDR() {
+        XCTAssertTrue(StreamQualityTags.parse(name: "Movie 2160p HDR x265").isHDR)
+        XCTAssertTrue(StreamQualityTags.parse(name: "Movie 2160p HDR10 x265").isHDR)
+        XCTAssertTrue(StreamQualityTags.parse(name: "Movie 2160p HDR10+ x265").isHDR)
+        XCTAssertTrue(StreamQualityTags.parse(name: "Movie 2160p HLG x265").isHDR)
+        XCTAssertTrue(StreamQualityTags.parse(name: "Movie 2160p PQ10 x265").isHDR)
+    }
+
     func testParsesCachedMarkers() {
         let cached = StreamQualityTags.parse(name: "⚡ 1080p RD+", description: "Cached")
         XCTAssertTrue(cached.isCached)
