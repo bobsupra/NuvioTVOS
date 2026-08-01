@@ -169,11 +169,25 @@ struct DetailsScreen: View {
             }
 
             #if os(tvOS)
-            if isStreamPickerPresented, let meta = viewModel.uiState.meta {
-                // Mount the picker straight away and let its own panel show the
-                // loading state. Gating it behind the first group/stream meant a
-                // separate full-screen spinner flashed first, then swapped for
-                // the picker's — the same message twice.
+            if let expandedComment {
+                CommentDetailOverlay(
+                    comment: expandedComment,
+                    onDismiss: { self.expandedComment = nil }
+                )
+                .transition(.opacity)
+                .zIndex(20)
+            }
+
+            #endif
+        }
+        .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
+        #if os(tvOS)
+        // Present sources in an isolated full-screen focus hierarchy. Keeping
+        // this overlay inside the details screen's vertical ScrollView ancestry
+        // lets tvOS apply focus-visibility corrections to the shared host,
+        // occasionally translating the filters and stream panel below screen.
+        .fullScreenCover(isPresented: $isStreamPickerPresented) {
+            if let meta = viewModel.uiState.meta {
                 TvStreamPickerOverlay(
                     meta: meta,
                     episode: pendingEpisode,
@@ -191,23 +205,11 @@ struct DetailsScreen: View {
                         isStreamPickerPresented = false
                     }
                 )
-                .transition(.opacity)
-                .zIndex(10)
+                .ignoresSafeArea()
+            } else {
+                Color.black.ignoresSafeArea()
             }
-
-            if let expandedComment {
-                CommentDetailOverlay(
-                    comment: expandedComment,
-                    onDismiss: { self.expandedComment = nil }
-                )
-                .transition(.opacity)
-                .zIndex(20)
-            }
-
-            #endif
         }
-        .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
-        #if os(tvOS)
         // Menu-press safety net. While the stream picker is up, focus can be
         // in limbo for a few frames (details content is disabled, the picker
         // hasn't committed focus yet); a Menu press then skips the picker's
@@ -1251,10 +1253,12 @@ enum SmartPlaybackSelector {
         // decoded frames then use MoltenVK/libplacebo's PBO upload path, which
         // MTLSimDriver can terminate as XPC API misuse. Prefer another stream;
         // physical Apple TV keeps AV1 available through its real Metal driver.
-        return !isAV1LabeledStream(stream)
-        #else
-        return true
+        if isAV1LabeledStream(stream) { return false }
         #endif
+        // Apple TV HD cannot hardware-decode 4K/HDR/Dolby Vision sources.
+        return AppleTVCapability.current.isPlayable(
+            tags: StreamQualityTags.parse(stream: stream)
+        )
     }
 
 }
@@ -1923,7 +1927,7 @@ private struct TvDetailsLogo: View {
                 titleFallback
             }
         }
-        .frame(width: 520, height: 150, alignment: .leading)
+        .frame(width: 560, height: 162, alignment: .leading)
     }
 
     private var titleFallback: some View {
@@ -1933,7 +1937,7 @@ private struct TvDetailsLogo: View {
             .lineLimit(2)
             .minimumScaleFactor(0.74)
             .shadow(color: .black.opacity(0.65), radius: 14, y: 6)
-            .frame(maxWidth: 520, alignment: .leading)
+            .frame(maxWidth: 560, alignment: .leading)
     }
 }
 
@@ -3477,6 +3481,10 @@ private struct TvStreamPickerOverlay: View {
     /// never when focus moves between cards.
     @State private var displayedStreams: [NuvioStream] = []
     @State private var displayedStreamsCacheKey: StreamPickerListCacheKey?
+    /// Badge matching is regex-heavy, so derive it with the stream-list cache
+    /// instead of from SwiftUI card initializers during focus updates.
+    @State private var streamCardPresentations: [String: TvStreamCardPresentation] = [:]
+    @State private var streamBadgeSettingsRevision: UInt64 = 0
     // A single focus state for the whole picker (filter chips + stream cards),
     // keyed by string. Filter chips use the "filter::" prefix; stream cards use
     // their natural id. One shared state makes programmatic focus moves reliable
@@ -3486,7 +3494,7 @@ private struct TvStreamPickerOverlay: View {
     /// mounts while discovery is still running, so the first seed can only land
     /// on the All chip; this drives the hand-off once results exist, once.
     @State private var didSeedStreamFocus = false
-    @State private var streamBadgeSettingsRevision = 0
+    @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
@@ -3504,28 +3512,56 @@ private struct TvStreamPickerOverlay: View {
         )
     }
 
+    private var streamCardPresentationCacheKey: TvStreamCardPresentationCacheKey {
+        TvStreamCardPresentationCacheKey(
+            listKey: displayedStreamsCacheKey,
+            badgeSettingsRevision: streamBadgeSettingsRevision
+        )
+    }
+
     var body: some View {
         GeometryReader { proxy in
+            // Keep the picker anchored to a stable top inset. A centered stack
+            // can be displaced when tvOS gives the full-screen cover an
+            // oversized height while its focus hierarchy is settling; that
+            // leaves the filters and the first stream card below the viewport.
+            let canvasWidth = min(proxy.size.width, 1_920)
+            let canvasHeight = min(proxy.size.height, 1_080)
+            let summaryWidth = min(canvasWidth * 0.34, 620)
+            let panelWidth = min(canvasWidth * 0.56, 1_080)
+            let panelHeight = min(max(canvasHeight - 300, 440), 720)
+            let panelStackHeight = panelHeight + 118
+
             ZStack {
                 TvDetailsBackdrop(meta: meta)
 
-                HStack(alignment: .center, spacing: 74) {
-                    leftSummary
-                        .frame(width: min(proxy.size.width * 0.34, 620), alignment: .leading)
-                        .padding(.top, proxy.size.height * 0.20)
+                // The summary and picker are independent layers. Their former
+                // shared HStack let the summary's async logo/intrinsic height
+                // move the picker during tvOS focus layout.
+                leftSummary
+                    .frame(width: summaryWidth, alignment: .leading)
+                    .position(
+                        x: 96 + summaryWidth / 2,
+                        y: canvasHeight * 0.425
+                    )
 
-                    VStack(alignment: .leading, spacing: 36) {
-                        filterRow
+                VStack(alignment: .leading, spacing: 28) {
+                    filterRow
+                        // A horizontal ScrollView has no intrinsic cross-axis
+                        // size, so constrain it independently of focus changes.
+                        .frame(height: 90)
 
-                        streamPanel
-                            .frame(
-                                width: min(proxy.size.width * 0.56, 1080),
-                                height: min(proxy.size.height * 0.72, 760)
-                            )
-                    }
-                    .frame(maxWidth: .infinity, alignment: .trailing)
+                    streamPanel
+                        .frame(
+                            width: panelWidth,
+                            height: panelHeight
+                        )
                 }
-                .padding(.horizontal, 96)
+                .frame(width: panelWidth, height: panelStackHeight, alignment: .top)
+                .position(
+                    x: canvasWidth - 64 - panelWidth / 2,
+                    y: 168 + panelStackHeight / 2
+                )
             }
             // The picker mounts before discovery finishes, so this seed usually
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
@@ -3559,38 +3595,30 @@ private struct TvStreamPickerOverlay: View {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification)) { _ in
+                streamCardPresentations.removeAll(keepingCapacity: true)
+                streamBadgeSettings = StreamBadgeSettingsStore.snapshot
                 streamBadgeSettingsRevision &+= 1
             }
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())
-        .id("stream-picker-\(streamBadgeSettingsRevision)")
+        .task(id: streamCardPresentationCacheKey, priority: .utility) {
+            await rebuildStreamCardPresentations()
+        }
     }
 
-    /// Cached list when inputs are unchanged; live derivation only while the
-    /// cache is stale (filter/sort/progressive results). Focus never invalidates
-    /// the key, so focus movement hits the cache path.
+    /// Rendering always uses the cached list. A progressive source revision may
+    /// leave it one SwiftUI update behind while `onChange` refreshes the cache,
+    /// which is preferable to repeating the full filter pass during body layout.
     private var activeDisplayedStreams: [NuvioStream] {
-        let key = listCacheKey
-        if key == displayedStreamsCacheKey {
-            return displayedStreams
-        }
-        return StreamPickerListBuilder.displayedStreams(
-            streams: streams,
-            groups: groups,
-            selectedAddonId: selectedAddonId,
-            sortOption: sortOption,
-            includeDebrid: includeDebrid,
-            cachedOnly: cachedOnly
-        )
+        displayedStreams
     }
 
     /// Rebuilds the cached list only when derivation inputs actually change.
     private func refreshDisplayedStreamsIfNeeded() {
         let key = listCacheKey
         guard key != displayedStreamsCacheKey else { return }
-        displayedStreamsCacheKey = key
-        displayedStreams = StreamPickerListBuilder.displayedStreams(
+        let refreshedStreams = StreamPickerListBuilder.displayedStreams(
             streams: streams,
             groups: groups,
             selectedAddonId: selectedAddonId,
@@ -3598,6 +3626,37 @@ private struct TvStreamPickerOverlay: View {
             includeDebrid: includeDebrid,
             cachedOnly: cachedOnly
         )
+        displayedStreams = refreshedStreams
+        displayedStreamsCacheKey = key
+    }
+
+    @MainActor
+    private func rebuildStreamCardPresentations() async {
+        let cacheKey = streamCardPresentationCacheKey
+        let streamsToBuild = activeDisplayedStreams
+        let settings = streamBadgeSettings
+        let missingStreams = streamsToBuild.filter {
+            streamCardPresentations[$0.id] == nil
+        }
+        guard !missingStreams.isEmpty else { return }
+
+        // Preserve completed cards as add-ons publish progressively. Larger
+        // batches reduce whole-overlay SwiftUI invalidations while still giving
+        // cancellation a chance between chunks when a new revision arrives.
+        for startIndex in stride(from: 0, to: missingStreams.count, by: 16) {
+            guard !Task.isCancelled else { return }
+            let endIndex = min(startIndex + 16, missingStreams.count)
+            let batch = Array(missingStreams[startIndex..<endIndex])
+            let batchPresentations = await TvStreamCardPresentationBuilder.shared.build(
+                streams: batch,
+                settings: settings
+            )
+            guard !Task.isCancelled,
+                  cacheKey == streamCardPresentationCacheKey else { return }
+            var updatedPresentations = streamCardPresentations
+            updatedPresentations.merge(batchPresentations) { _, new in new }
+            streamCardPresentations = updatedPresentations
+        }
     }
 
     private var leftSummary: some View {
@@ -3693,6 +3752,7 @@ private struct TvStreamPickerOverlay: View {
     private var streamPanel: some View {
         // Resolve once per panel body — focus changes hit the cache path only.
         let streamsToShow = activeDisplayedStreams
+        let badgeSettings = streamBadgeSettings
         return ZStack {
             if isLoading && streamsToShow.isEmpty && selectedGroupError == nil {
                 VStack(spacing: 24) {
@@ -3741,6 +3801,8 @@ private struct TvStreamPickerOverlay: View {
                             // old/new cards pay for outline/scale updates.
                             TvStreamCard(
                                 stream: stream,
+                                presentation: streamCardPresentations[stream.id]
+                                    ?? TvStreamCardPresentation(pending: badgeSettings),
                                 externalFocus: $focusedItem,
                                 action: { onSelect(stream) }
                             )
@@ -3779,6 +3841,7 @@ private struct TvStreamPickerOverlay: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black.opacity(0.55))
             }
+
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         // Keep outer panel Liquid Glass; cards use a cheap solid/material fill.
@@ -3938,8 +4001,63 @@ private struct TvStreamFilterButton: View {
     }
 }
 
+private struct TvStreamCardPresentationCacheKey: Equatable {
+    let listKey: StreamPickerListCacheKey?
+    let badgeSettingsRevision: UInt64
+}
+
+private struct TvStreamCardPresentation {
+    let importedBadges: [StreamBadgeFilter]
+    let fileSizeLabel: String?
+    let badgePlacement: StreamBadgePlacement
+    let showAddonLogo: Bool
+
+    init(stream: NuvioStream, badgeSettings: StreamBadgeSettingsSnapshot) {
+        importedBadges = StreamBadgeMatcher.matchedBadges(
+            for: stream,
+            rules: badgeSettings.rules
+        )
+        fileSizeLabel = badgeSettings.showFileSizeBadges
+            ? StreamBadgeSizing.fileSizeLabel(for: stream)
+            : nil
+        badgePlacement = badgeSettings.badgePlacement
+        showAddonLogo = badgeSettings.showAddonLogo
+    }
+
+    init(pending badgeSettings: StreamBadgeSettingsSnapshot) {
+        importedBadges = []
+        fileSizeLabel = nil
+        badgePlacement = badgeSettings.badgePlacement
+        showAddonLogo = badgeSettings.showAddonLogo
+    }
+}
+
+private actor TvStreamCardPresentationBuilder {
+    static let shared = TvStreamCardPresentationBuilder()
+
+    func build(
+        streams: [NuvioStream],
+        settings: StreamBadgeSettingsSnapshot
+    ) -> [String: TvStreamCardPresentation] {
+        var presentations: [String: TvStreamCardPresentation] = [:]
+        presentations.reserveCapacity(streams.count)
+        for stream in streams {
+            guard !Task.isCancelled else { return [:] }
+            presentations[stream.id] = TvStreamCardPresentation(
+                stream: stream,
+                badgeSettings: settings
+            )
+        }
+        return presentations
+    }
+}
+
 private struct TvStreamCard: View {
     let stream: NuvioStream
+    private let importedBadges: [StreamBadgeFilter]
+    private let fileSizeLabel: String?
+    private let badgePlacement: StreamBadgePlacement
+    private let showAddonLogo: Bool
     let externalFocus: FocusState<String?>.Binding
     let action: () -> Void
 
@@ -3953,10 +4071,15 @@ private struct TvStreamCard: View {
 
     init(
         stream: NuvioStream,
+        presentation: TvStreamCardPresentation,
         externalFocus: FocusState<String?>.Binding,
         action: @escaping () -> Void
     ) {
         self.stream = stream
+        self.importedBadges = presentation.importedBadges
+        self.fileSizeLabel = presentation.fileSizeLabel
+        self.badgePlacement = presentation.badgePlacement
+        self.showAddonLogo = presentation.showAddonLogo
         self.externalFocus = externalFocus
         self.action = action
         let lines = Self.nameLines(for: stream)
@@ -3966,17 +4089,12 @@ private struct TvStreamCard: View {
     }
 
     var body: some View {
-        let badgeSettings = StreamBadgeSettingsStore.snapshot
-        let importedBadges = StreamBadgeMatcher.matchedBadges(for: stream, rules: badgeSettings.rules)
-        let fileSizeLabel = badgeSettings.showFileSizeBadges
-            ? StreamBadgeSizing.fileSizeLabel(for: stream)
-            : nil
         let showImportedBadges = !importedBadges.isEmpty || fileSizeLabel != nil
 
         Button(action: action) {
             HStack(alignment: .center, spacing: 34) {
                 VStack(alignment: .leading, spacing: 14) {
-                    if showImportedBadges && badgeSettings.badgePlacement == .top {
+                    if showImportedBadges && badgePlacement == .top {
                         TvStreamImportedBadgeRow(
                             badges: importedBadges,
                             fileSizeLabel: fileSizeLabel,
@@ -4007,7 +4125,7 @@ private struct TvStreamCard: View {
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
-                    if showImportedBadges && badgeSettings.badgePlacement == .bottom {
+                    if showImportedBadges && badgePlacement == .bottom {
                         TvStreamImportedBadgeRow(
                             badges: importedBadges,
                             fileSizeLabel: fileSizeLabel,
@@ -4018,7 +4136,7 @@ private struct TvStreamCard: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                if badgeSettings.showAddonLogo {
+                if showAddonLogo {
                     Spacer(minLength: 28)
 
                     VStack(spacing: 18) {
@@ -4113,46 +4231,57 @@ private struct TvStreamImportedBadgeRow: View {
 
     var body: some View {
         GeometryReader { geometry in
-            let availableWidth = geometry.size.width
-            let shouldScroll = isScrolling && contentWidth > availableWidth + 1
+            ViewThatFits(in: .horizontal) {
+                // `fixedSize` gives this candidate its intrinsic width. It is
+                // selected unchanged when every badge fits in the viewport.
+                badgeContent
 
-            Group {
-                if shouldScroll {
-                    TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
-                        let cycleWidth = contentWidth + 28
-                        let elapsed = max(0, timeline.date.timeIntervalSince(animationStart) - 0.8)
-                        let offset = elapsed > 0
-                            ? CGFloat(elapsed * 50).truncatingRemainder(dividingBy: cycleWidth)
-                            : 0
-
-                        HStack(spacing: 28) {
-                            badgeContent
-                            badgeContent
-                        }
-                        .fixedSize(horizontal: true, vertical: false)
-                        .offset(x: -offset)
-                    }
-                } else {
-                    badgeContent
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                }
+                // This fallback is selected only when the intrinsic row does
+                // not fit, avoiding unreliable preference-width comparisons.
+                overflowContent
             }
-            .frame(width: availableWidth, alignment: .leading)
+            .frame(width: geometry.size.width, alignment: .leading)
+            .compositingGroup()
+            .onAppear {
+                animationStart = Date()
+            }
+            .onChange(of: geometry.size.width) { width in
+                _ = width
+                animationStart = Date()
+            }
+            .onChange(of: isScrolling) { _ in
+                animationStart = Date()
+            }
         }
+        .frame(maxWidth: .infinity, alignment: .leading)
         .clipped()
         .frame(height: 42)
         .onPreferenceChange(TvStreamBadgeRowWidthKey.self) { width in
-            guard width != contentWidth else { return }
+            guard abs(width - contentWidth) > 0.5 else { return }
             contentWidth = width
-            animationStart = Date()
-        }
-        .onChange(of: badgeSignature) { _ in
             animationStart = Date()
         }
     }
 
-    private var badgeSignature: String {
-        badges.map { "\($0.id)|\($0.imageURL)|\($0.name)" }.joined(separator: "|") + "|\(fileSizeLabel ?? "")"
+    @ViewBuilder
+    private var overflowContent: some View {
+        if isScrolling {
+            TimelineView(.animation(minimumInterval: 1.0 / 30.0)) { timeline in
+                let cycleWidth = max(contentWidth + 28, 1)
+                let elapsed = max(0, timeline.date.timeIntervalSince(animationStart))
+                let offset = CGFloat(elapsed * 70)
+                    .truncatingRemainder(dividingBy: cycleWidth)
+
+                HStack(spacing: 28) {
+                    badgeContent
+                    badgeContent
+                }
+                .fixedSize(horizontal: true, vertical: false)
+                .offset(x: -offset)
+            }
+        } else {
+            badgeContent
+        }
     }
 
     private var badgeContent: some View {
@@ -4175,6 +4304,7 @@ private struct TvStreamImportedBadgeRow: View {
                     )
             }
         }
+        .fixedSize(horizontal: true, vertical: false)
         .background(
             GeometryReader { geometry in
                 Color.clear.preference(
@@ -4183,8 +4313,8 @@ private struct TvStreamImportedBadgeRow: View {
                 )
             }
         )
-        .fixedSize(horizontal: true, vertical: false)
     }
+
 }
 
 private struct TvStreamImportedBadge: View {

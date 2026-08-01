@@ -32,22 +32,40 @@ final class AetherSubtitleOverlayState: ObservableObject {
 @MainActor
 final class AISubtitleTranslationState: ObservableObject {
     @Published private var translatedTextByCueID: [Int: String] = [:]
+    @Published private var translatedTextBySource: [String: String] = [:]
     @Published private var translatingCueIDs: Set<Int> = []
 
-    /// Delivered once per playback session, allowing the player to use its
-    /// established non-blocking toast presentation.
+    /// Delivers the first successful translation and the first later failure
+    /// separately, so quota errors are not hidden by an earlier success toast.
     var onFirstOutcome: ((Result<Void, Error>) -> Void)?
 
-    private var tasks: [Int: Task<Void, Never>] = [:]
+    private struct PendingCue: Sendable {
+        let id: Int
+        let source: String
+        let sourceIdentity: String
+    }
+
+    private var batchTask: Task<Void, Never>?
+    private var delayedBatchTask: Task<Void, Never>?
+    private var priorityTasks: [Int: Task<Void, Never>] = [:]
     private var sessionID = UUID()
-    private var didReportOutcome = false
+    private var didReportSuccess = false
+    private var didReportFailure = false
     private var failedCueIDs: Set<Int> = []
     private var manualActivation = false
     private var lastCues: [SubtitleCue] = []
     private var lastSourceTime: Double = 0
     private var currentSettings: AISubtitleTranslationSettings?
-    private let prefetchWindowSeconds: Double = 8
-    private let maximumConcurrentRequests = 2
+    private var nextBatchStartAt = Date.distantPast
+    private var retryAttempt = 0
+    // Translate a short startup/seek window one cue at a time so text becomes
+    // visible as each response arrives. Then resume low-overhead bulk batches.
+    private let playbackPriorityBatchSize = 8
+    private let maximumConcurrentPriorityRequests = 4
+    private var remainingPriorityCueIDs: [Int] = []
+    private var needsPriorityPrefetch = true
+    private let batchSize = 40
+    private let minimumBatchInterval: TimeInterval = 2
 
     var isConfigured: Bool {
         let settings = AISubtitleTranslationSettings.current()
@@ -59,9 +77,10 @@ final class AISubtitleTranslationState: ObservableObject {
         return settings.isEnabled && !settings.apiKey.isEmpty && (settings.autoSelect || manualActivation)
     }
 
-    func translatedText(for cueID: Int) -> String? {
+    func translatedText(for cue: SubtitleCue) -> String? {
         guard isActive else { return nil }
-        return translatedTextByCueID[cueID]
+        let settings = currentSettings ?? AISubtitleTranslationSettings.current()
+        return translation(for: cue, settings: settings)
     }
 
     func isTranslating(cueIDs: some Sequence<Int>) -> Bool {
@@ -78,8 +97,18 @@ final class AISubtitleTranslationState: ObservableObject {
     }
 
     func update(cues: [SubtitleCue], at sourceTime: Double) {
+        let didSeek = abs(sourceTime - lastSourceTime) > 10
         lastCues = cues
         lastSourceTime = sourceTime
+        if didSeek {
+            cancelTranslationWork()
+            translatingCueIDs = []
+            failedCueIDs = []
+            sessionID = UUID()
+            nextBatchStartAt = .distantPast
+            remainingPriorityCueIDs = []
+            needsPriorityPrefetch = true
+        }
 
         let settings = AISubtitleTranslationSettings.current()
         guard settings.isEnabled else {
@@ -88,7 +117,7 @@ final class AISubtitleTranslationState: ObservableObject {
         }
         guard !settings.apiKey.isEmpty else {
             deactivate()
-            reportOnce(.failure(AISubtitleTranslationError.missingAPIKey))
+            report(.failure(AISubtitleTranslationError.missingAPIKey))
             return
         }
         guard settings.autoSelect || manualActivation else {
@@ -96,139 +125,356 @@ final class AISubtitleTranslationState: ObservableObject {
             return
         }
         if currentSettings != settings {
-            tasks.values.forEach { $0.cancel() }
-            tasks = [:]
+            cancelTranslationWork()
             translatedTextByCueID = [:]
+            translatedTextBySource = [:]
             translatingCueIDs = []
             failedCueIDs = []
             sessionID = UUID()
             currentSettings = settings
+            retryAttempt = 0
+            nextBatchStartAt = .distantPast
+            remainingPriorityCueIDs = []
+            needsPriorityPrefetch = true
         }
 
-        // Cue translation cannot begin only at presentation time: a regular API
-        // round trip often exceeds the first second of a subtitle. Prefer active
-        // cues, then warm a short upcoming window, while bounding API pressure.
-        let candidateCues = cues.filter {
-            $0.endTime >= sourceTime && $0.startTime <= sourceTime + prefetchWindowSeconds
-        }
-        .sorted { lhs, rhs in
-            let lhsDistance = max(0, lhs.startTime - sourceTime)
-            let rhsDistance = max(0, rhs.startTime - sourceTime)
-            if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
-            return lhs.startTime < rhs.startTime
-        }
-        for cue in candidateCues {
-            guard tasks.count < maximumConcurrentRequests else { break }
-            guard translatedTextByCueID[cue.id] == nil,
-                  tasks[cue.id] == nil,
-                  !failedCueIDs.contains(cue.id),
-                  let text = cue.text else { continue }
-            let source = Self.cleaned(text, stripHearingImpaired: settings.stripHearingImpaired)
-            guard !source.isEmpty else {
-                translatedTextByCueID[cue.id] = ""
-                continue
-            }
-            translate(cueID: cue.id, source: source, settings: settings)
-        }
+        startNextBatchIfNeeded(settings: settings)
     }
 
     func reset() {
-        tasks.values.forEach { $0.cancel() }
-        tasks = [:]
+        cancelTranslationWork()
         translatedTextByCueID = [:]
+        translatedTextBySource = [:]
         translatingCueIDs = []
         sessionID = UUID()
-        didReportOutcome = false
+        didReportSuccess = false
+        didReportFailure = false
         failedCueIDs = []
         manualActivation = false
         lastCues = []
         lastSourceTime = 0
         currentSettings = nil
+        retryAttempt = 0
+        nextBatchStartAt = .distantPast
+        remainingPriorityCueIDs = []
+        needsPriorityPrefetch = true
     }
 
-    private func translate(
-        cueID: Int,
-        source: String,
-        settings: AISubtitleTranslationSettings
-    ) {
+    private func startNextBatchIfNeeded(settings: AISubtitleTranslationSettings) {
+        guard batchTask == nil, delayedBatchTask == nil else { return }
+        let now = Date()
+        guard now >= nextBatchStartAt else {
+            scheduleNextBatch(at: nextBatchStartAt, settings: settings)
+            return
+        }
+
+        let candidateCues = lastCues
+            .filter { cue in
+                cue.endTime >= lastSourceTime &&
+                translation(for: cue, settings: settings) == nil &&
+                    !failedCueIDs.contains(cue.id) &&
+                    cue.text != nil
+            }
+            .sorted { lhs, rhs in
+                let lhsDistance = max(0, lhs.startTime - lastSourceTime)
+                let rhsDistance = max(0, rhs.startTime - lastSourceTime)
+                if lhsDistance != rhsDistance { return lhsDistance < rhsDistance }
+                return lhs.startTime < rhs.startTime
+            }
+            .compactMap { cue -> PendingCue? in
+                guard let text = cue.text else { return nil }
+                let source = Self.cleaned(text, stripHearingImpaired: settings.stripHearingImpaired)
+                guard !source.isEmpty else {
+                    translatedTextByCueID[cue.id] = ""
+                    return nil
+                }
+                return PendingCue(
+                    id: cue.id,
+                    source: source,
+                    sourceIdentity: Self.normalizedSource(source)
+                )
+            }
+        guard !candidateCues.isEmpty else { return }
+
+        if needsPriorityPrefetch && remainingPriorityCueIDs.isEmpty {
+            remainingPriorityCueIDs = Array(candidateCues.prefix(playbackPriorityBatchSize).map(\.id))
+            needsPriorityPrefetch = false
+        }
+        let candidateCueIDs = Set(candidateCues.map(\.id))
+        remainingPriorityCueIDs.removeAll { !candidateCueIDs.contains($0) }
+        let availableCues = candidateCues.filter { !translatingCueIDs.contains($0.id) }
+
+        if !remainingPriorityCueIDs.isEmpty {
+            startPriorityTranslations(from: availableCues, settings: settings)
+            return
+        }
+        let pendingCues = Array(availableCues.prefix(batchSize))
+        guard !pendingCues.isEmpty else { return }
+
+        translatingCueIDs.formUnion(pendingCues.map(\.id))
         let activeSession = sessionID
         let profileScope = ProfileSettings.activeProfileScope
-        translatingCueIDs.insert(cueID)
-        tasks[cueID] = Task { [weak self] in
+        batchTask = Task { [weak self] in
             do {
-                if let cached = await AISubtitleTranslationCache.shared.translation(
-                    for: source,
-                    targetLanguage: settings.targetLanguage,
-                    model: settings.model,
-                    stripHearingImpaired: settings.stripHearingImpaired,
-                    profileScope: profileScope
-                ) {
-                    guard !Task.isCancelled,
-                          let self,
-                          self.sessionID == activeSession else { return }
-                    self.translatedTextByCueID[cueID] = cached
-                    self.finish(cueID: cueID, outcome: .success(()))
-                    return
+                var translations: [Int: String] = [:]
+                var uncachedCues: [PendingCue] = []
+                for cue in pendingCues {
+                    if let cached = await AISubtitleTranslationCache.shared.translation(
+                        for: cue.source,
+                        targetLanguage: settings.targetLanguage,
+                        model: settings.cacheModelIdentifier,
+                        stripHearingImpaired: settings.stripHearingImpaired,
+                        profileScope: profileScope
+                    ) {
+                        translations[cue.id] = cached
+                    } else {
+                        uncachedCues.append(cue)
+                    }
                 }
-                let translated = try await GeminiSubtitleTranslator.translate(
-                    source,
-                    to: settings.targetLanguage,
-                    model: settings.model,
-                    apiKey: settings.apiKey
-                )
-                let cleaned = Self.cleaned(
-                    translated,
-                    stripHearingImpaired: settings.stripHearingImpaired
-                )
-                await AISubtitleTranslationCache.shared.store(
-                    cleaned,
-                    for: source,
-                    targetLanguage: settings.targetLanguage,
-                    model: settings.model,
-                    stripHearingImpaired: settings.stripHearingImpaired,
-                    profileScope: profileScope
-                )
+
+                if !uncachedCues.isEmpty {
+                    let translated = try await AISubtitleTranslator.translateBatch(
+                        uncachedCues.map { .init(id: $0.id, text: $0.source) },
+                        settings: settings
+                    )
+                    for cue in uncachedCues {
+                        guard let text = translated[cue.id] else {
+                            throw AISubtitleTranslationError.invalidResponse
+                        }
+                        let cleaned = Self.cleaned(
+                            text,
+                            stripHearingImpaired: settings.stripHearingImpaired
+                        )
+                        translations[cue.id] = cleaned
+                        await AISubtitleTranslationCache.shared.store(
+                            cleaned,
+                            for: cue.source,
+                            targetLanguage: settings.targetLanguage,
+                            model: settings.cacheModelIdentifier,
+                            stripHearingImpaired: settings.stripHearingImpaired,
+                            profileScope: profileScope
+                        )
+                    }
+                }
                 guard !Task.isCancelled,
                       let self,
                       self.sessionID == activeSession else { return }
-                self.translatedTextByCueID[cueID] = cleaned
-                self.finish(cueID: cueID, outcome: .success(()))
+                self.finishBatch(
+                    cues: pendingCues,
+                    translations: translations,
+                    outcome: .success(())
+                )
             } catch is CancellationError {
                 guard let self, self.sessionID == activeSession else { return }
-                self.tasks[cueID] = nil
-                self.translatingCueIDs.remove(cueID)
+                self.batchTask = nil
+                self.translatingCueIDs.subtract(pendingCues.map(\.id))
             } catch {
                 guard !Task.isCancelled,
                       let self,
                       self.sessionID == activeSession else { return }
-                self.finish(cueID: cueID, outcome: .failure(error))
+                self.finishBatch(
+                    cues: pendingCues,
+                    translations: [:],
+                    outcome: .failure(error)
+                )
             }
         }
     }
 
-    private func finish(cueID: Int, outcome: Result<Void, Error>) {
-        tasks[cueID] = nil
-        translatingCueIDs.remove(cueID)
-        if case .failure = outcome {
-            failedCueIDs.insert(cueID)
+    private func startPriorityTranslations(
+        from availableCues: [PendingCue],
+        settings: AISubtitleTranslationSettings
+    ) {
+        let availablePriorityCues = availableCues.filter { cue in
+            remainingPriorityCueIDs.contains(cue.id) && priorityTasks[cue.id] == nil
         }
-        reportOnce(outcome)
+        let slots = maximumConcurrentPriorityRequests - priorityTasks.count
+        guard slots > 0 else { return }
+
+        let activeSession = sessionID
+        let profileScope = ProfileSettings.activeProfileScope
+        for cue in availablePriorityCues.prefix(slots) {
+            translatingCueIDs.insert(cue.id)
+            priorityTasks[cue.id] = Task { [weak self] in
+                do {
+                    let translated: String
+                    if let cached = await AISubtitleTranslationCache.shared.translation(
+                        for: cue.source,
+                        targetLanguage: settings.targetLanguage,
+                        model: settings.cacheModelIdentifier,
+                        stripHearingImpaired: settings.stripHearingImpaired,
+                        profileScope: profileScope
+                    ) {
+                        translated = cached
+                    } else {
+                        let response = try await AISubtitleTranslator.translate(cue.source, settings: settings)
+                        translated = Self.cleaned(
+                            response,
+                            stripHearingImpaired: settings.stripHearingImpaired
+                        )
+                        await AISubtitleTranslationCache.shared.store(
+                            translated,
+                            for: cue.source,
+                            targetLanguage: settings.targetLanguage,
+                            model: settings.cacheModelIdentifier,
+                            stripHearingImpaired: settings.stripHearingImpaired,
+                            profileScope: profileScope
+                        )
+                    }
+                    guard !Task.isCancelled,
+                          let self,
+                          self.sessionID == activeSession else { return }
+                    self.finishPriorityCue(cue, translated: translated, outcome: .success(()))
+                } catch is CancellationError {
+                    guard let self, self.sessionID == activeSession else { return }
+                    self.priorityTasks[cue.id] = nil
+                    self.translatingCueIDs.remove(cue.id)
+                    self.startNextBatchIfNeeded(
+                        settings: self.currentSettings ?? AISubtitleTranslationSettings.current()
+                    )
+                } catch {
+                    guard !Task.isCancelled,
+                          let self,
+                          self.sessionID == activeSession else { return }
+                    self.finishPriorityCue(cue, translated: nil, outcome: .failure(error))
+                }
+            }
+        }
     }
 
-    private func reportOnce(_ outcome: Result<Void, Error>) {
-        guard !didReportOutcome else { return }
-        didReportOutcome = true
-        onFirstOutcome?(outcome)
+    private func finishPriorityCue(
+        _ cue: PendingCue,
+        translated: String?,
+        outcome: Result<Void, Error>
+    ) {
+        priorityTasks[cue.id] = nil
+        translatingCueIDs.remove(cue.id)
+        switch outcome {
+        case .success:
+            if let translated {
+                translatedTextByCueID[cue.id] = translated
+                translatedTextBySource[cue.sourceIdentity] = translated
+            }
+            remainingPriorityCueIDs.removeAll { $0 == cue.id }
+            retryAttempt = 0
+            report(outcome)
+            startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
+        case .failure(let error):
+            if let retryDelay = Self.retryDelay(for: error, attempt: retryAttempt) {
+                retryAttempt += 1
+                nextBatchStartAt = Date().addingTimeInterval(retryDelay)
+                report(outcome)
+                scheduleNextBatch(
+                    at: nextBatchStartAt,
+                    settings: currentSettings ?? AISubtitleTranslationSettings.current()
+                )
+            } else {
+                failedCueIDs.insert(cue.id)
+                remainingPriorityCueIDs.removeAll { $0 == cue.id }
+                retryAttempt = 0
+                report(outcome)
+                startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
+            }
+        }
+    }
+
+    private func finishBatch(
+        cues: [PendingCue],
+        translations: [Int: String],
+        outcome: Result<Void, Error>
+    ) {
+        batchTask = nil
+        translatingCueIDs.subtract(cues.map(\.id))
+        switch outcome {
+        case .success:
+            translatedTextByCueID.merge(translations) { _, replacement in replacement }
+            for cue in cues {
+                if let translated = translations[cue.id] {
+                    translatedTextBySource[cue.sourceIdentity] = translated
+                }
+            }
+            retryAttempt = 0
+            nextBatchStartAt = Date().addingTimeInterval(minimumBatchInterval)
+            report(outcome)
+            startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
+        case .failure(let error):
+            if let retryDelay = Self.retryDelay(for: error, attempt: retryAttempt) {
+                retryAttempt += 1
+                nextBatchStartAt = Date().addingTimeInterval(retryDelay)
+                report(outcome)
+                scheduleNextBatch(at: nextBatchStartAt, settings: currentSettings ?? AISubtitleTranslationSettings.current())
+            } else {
+                failedCueIDs.formUnion(cues.map(\.id))
+                retryAttempt = 0
+                report(outcome)
+                startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
+            }
+        }
+    }
+
+    private func scheduleNextBatch(at date: Date, settings: AISubtitleTranslationSettings) {
+        delayedBatchTask?.cancel()
+        let activeSession = sessionID
+        let delay = max(0, date.timeIntervalSinceNow)
+        delayedBatchTask = Task { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            guard !Task.isCancelled,
+                  let self,
+                  self.sessionID == activeSession else { return }
+            self.delayedBatchTask = nil
+            self.startNextBatchIfNeeded(settings: settings)
+        }
+    }
+
+    private func report(_ outcome: Result<Void, Error>) {
+        switch outcome {
+        case .success where !didReportSuccess:
+            didReportSuccess = true
+            onFirstOutcome?(outcome)
+        case .failure where !didReportFailure:
+            didReportFailure = true
+            onFirstOutcome?(outcome)
+        default:
+            break
+        }
     }
 
     private func deactivate() {
-        tasks.values.forEach { $0.cancel() }
-        tasks = [:]
+        cancelTranslationWork()
         failedCueIDs = []
         currentSettings = nil
         sessionID = UUID()
+        retryAttempt = 0
+        nextBatchStartAt = .distantPast
+        remainingPriorityCueIDs = []
+        needsPriorityPrefetch = true
         if !translatedTextByCueID.isEmpty { translatedTextByCueID = [:] }
+        if !translatedTextBySource.isEmpty { translatedTextBySource = [:] }
         if !translatingCueIDs.isEmpty { translatingCueIDs = [] }
+    }
+
+    private func cancelTranslationWork() {
+        batchTask?.cancel()
+        delayedBatchTask?.cancel()
+        priorityTasks.values.forEach { $0.cancel() }
+        batchTask = nil
+        delayedBatchTask = nil
+        priorityTasks = [:]
+    }
+
+    private static func retryDelay(for error: Error, attempt: Int) -> TimeInterval? {
+        if let error = error as? AISubtitleTranslationError,
+           error.isRetryable {
+            if let retryAfter = error.retryAfter {
+                return retryAfter
+            }
+            return min(60, pow(2, Double(min(attempt, 5))) * 4)
+        }
+        if let error = error as? URLError,
+           error.code != .cancelled {
+            return min(60, pow(2, Double(min(attempt, 5))) * 4)
+        }
+        return nil
     }
 
     /// Removes the common SDH / hearing-impaired annotations before the cue is
@@ -246,26 +492,121 @@ final class AISubtitleTranslationState: ObservableObject {
             .trimmingCharacters(in: .whitespacesAndNewlines)
         return result
     }
+
+    /// Aether can recreate a cue with a new ID after seeking. Keep the
+    /// on-screen translation associated with its normalized source text too.
+    static func normalizedSource(_ text: String) -> String {
+        text
+            .replacingOccurrences(of: #"\s+"#, with: " ", options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private func translation(
+        for cue: SubtitleCue,
+        settings: AISubtitleTranslationSettings
+    ) -> String? {
+        if let translated = translatedTextByCueID[cue.id] {
+            return translated
+        }
+        guard let source = cue.text else { return nil }
+        let cleaned = Self.cleaned(source, stripHearingImpaired: settings.stripHearingImpaired)
+        return translatedTextBySource[Self.normalizedSource(cleaned)]
+    }
 }
 
 enum AISubtitleTranslationError: LocalizedError {
     case missingAPIKey
     case invalidResponse
-    case service(message: String)
+    case service(statusCode: Int, message: String, retryAfter: TimeInterval?)
+
+    var isRetryable: Bool {
+        switch self {
+        case .service(let statusCode, _, _):
+            return statusCode == 429 || (500...599).contains(statusCode)
+        case .missingAPIKey, .invalidResponse:
+            return false
+        }
+    }
+
+    var retryAfter: TimeInterval? {
+        guard case .service(_, _, let retryAfter) = self else { return nil }
+        return retryAfter
+    }
 
     var errorDescription: String? {
         switch self {
         case .missingAPIKey:
-            return "Add a Gemini API key in Settings → Integrations → AI Subtitles."
+            return "Add an API key for the selected provider in Settings → Integrations → AI Subtitles."
         case .invalidResponse:
-            return "Gemini returned no translated text."
-        case .service(let message):
+            return "The AI subtitle provider returned no translated text."
+        case .service(_, let message, _):
             return message
         }
     }
 }
 
+struct AISubtitleTranslationItem: Sendable {
+    let id: Int
+    let text: String
+}
+
+enum AISubtitleTranslator {
+    static func translate(
+        _ source: String,
+        settings: AISubtitleTranslationSettings,
+        session: URLSession = .shared
+    ) async throws -> String {
+        guard !settings.apiKey.isEmpty else { throw AISubtitleTranslationError.missingAPIKey }
+        switch settings.provider {
+        case .gemini:
+            return try await GeminiSubtitleTranslator.translate(
+                source,
+                to: settings.targetLanguage,
+                model: settings.model,
+                apiKey: settings.apiKey,
+                session: session
+            )
+        case .openRouter:
+            return try await OpenRouterSubtitleTranslator.translate(
+                source,
+                to: settings.targetLanguage,
+                model: settings.model,
+                apiKey: settings.apiKey,
+                session: session
+            )
+        }
+    }
+
+    static func translateBatch(
+        _ items: [AISubtitleTranslationItem],
+        settings: AISubtitleTranslationSettings,
+        session: URLSession = .shared
+    ) async throws -> [Int: String] {
+        guard !settings.apiKey.isEmpty else { throw AISubtitleTranslationError.missingAPIKey }
+        switch settings.provider {
+        case .gemini:
+            return try await GeminiSubtitleTranslator.translateBatch(
+                items,
+                to: settings.targetLanguage,
+                model: settings.model,
+                apiKey: settings.apiKey,
+                session: session
+            )
+        case .openRouter:
+            return try await OpenRouterSubtitleTranslator.translateBatch(
+                items,
+                to: settings.targetLanguage,
+                model: settings.model,
+                apiKey: settings.apiKey,
+                session: session
+            )
+        }
+    }
+}
+
 enum GeminiSubtitleTranslator {
+    typealias BatchItem = AISubtitleTranslationItem
+
     private struct RequestBody: Encodable {
         let contents: [Content]
         let generationConfig: GenerationConfig
@@ -282,6 +623,20 @@ enum GeminiSubtitleTranslator {
     private struct GenerationConfig: Encodable {
         let temperature: Double
         let maxOutputTokens: Int
+        let responseMimeType: String?
+
+        private enum CodingKeys: String, CodingKey {
+            case temperature
+            case maxOutputTokens
+            case responseMimeType
+        }
+
+        func encode(to encoder: Encoder) throws {
+            var container = encoder.container(keyedBy: CodingKeys.self)
+            try container.encode(temperature, forKey: .temperature)
+            try container.encode(maxOutputTokens, forKey: .maxOutputTokens)
+            try container.encodeIfPresent(responseMimeType, forKey: .responseMimeType)
+        }
     }
 
     private struct ResponseBody: Decodable {
@@ -308,6 +663,16 @@ enum GeminiSubtitleTranslator {
         let message: String?
     }
 
+    private struct BatchInput: Encodable {
+        let id: Int
+        let text: String
+    }
+
+    private struct BatchOutput: Decodable {
+        let id: Int
+        let text: String
+    }
+
     static func translate(
         _ source: String,
         to targetLanguage: String,
@@ -315,28 +680,100 @@ enum GeminiSubtitleTranslator {
         apiKey: String,
         session: URLSession = .shared
     ) async throws -> String {
-        guard let url = URL(
-            string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
-        ) else {
-            throw AISubtitleTranslationError.invalidResponse
-        }
-
         let prompt = """
-        Translate the subtitle enclosed in <subtitle> into \(targetLanguage).
-        Return only the natural translated subtitle text. Preserve dialogue line breaks; do not add labels, explanations, quotation marks, or annotations.
+        Translate the film or television subtitle enclosed in <subtitle> into \(targetLanguage).
+        Return only natural subtitle text. Preserve meaning, dialogue tone, character voice, proper names, and line breaks; do not add labels, explanations, quotation marks, or annotations.
         <subtitle>
         \(source)
         </subtitle>
         """
         let body = RequestBody(
             contents: [Content(parts: [Part(text: prompt)])],
-            generationConfig: GenerationConfig(temperature: 0.1, maxOutputTokens: 256)
+            generationConfig: GenerationConfig(
+                temperature: 0.1,
+                maxOutputTokens: 256,
+                responseMimeType: nil
+            )
         )
+        let text = try await generate(
+            body,
+            model: model,
+            apiKey: apiKey,
+            timeout: 12,
+            session: session
+        )
+        guard !text.isEmpty else { throw AISubtitleTranslationError.invalidResponse }
+        return text
+    }
+
+    static func translateBatch(
+        _ items: [BatchItem],
+        to targetLanguage: String,
+        model: String,
+        apiKey: String,
+        session: URLSession = .shared
+    ) async throws -> [Int: String] {
+        guard !items.isEmpty else { return [:] }
+        let source = try String(
+            decoding: JSONEncoder().encode(items.map { BatchInput(id: $0.id, text: $0.text) }),
+            as: UTF8.self
+        )
+        let prompt = """
+        Translate every film or television subtitle in the JSON array into \(targetLanguage).
+        Return only a JSON array. Each output object must contain the original integer `id` and its translated `text`.
+        Include every input id exactly once. Use neighbouring cues only to resolve dialogue context. Preserve meaning, tone, character voice, proper names, and line breaks. Do not add labels, explanations, quotation marks, or annotations.
+        <subtitles>
+        \(source)
+        </subtitles>
+        """
+        let body = RequestBody(
+            contents: [Content(parts: [Part(text: prompt)])],
+            generationConfig: GenerationConfig(
+                temperature: 0.1,
+                maxOutputTokens: 4_096,
+                responseMimeType: "application/json"
+            )
+        )
+        let response = try await generate(
+            body,
+            model: model,
+            apiKey: apiKey,
+            timeout: 30,
+            session: session
+        )
+        let outputs = try JSONDecoder().decode([BatchOutput].self, from: Data(response.utf8))
+        let expectedIDs = Set(items.map(\.id))
+        var translations: [Int: String] = [:]
+        for output in outputs {
+            let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard expectedIDs.contains(output.id), !text.isEmpty, translations[output.id] == nil else {
+                throw AISubtitleTranslationError.invalidResponse
+            }
+            translations[output.id] = text
+        }
+        guard translations.count == expectedIDs.count else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+        return translations
+    }
+
+    private static func generate(
+        _ body: RequestBody,
+        model: String,
+        apiKey: String,
+        timeout: TimeInterval,
+        session: URLSession
+    ) async throws -> String {
+        guard let url = URL(
+            string: "https://generativelanguage.googleapis.com/v1beta/models/\(model):generateContent"
+        ) else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue(apiKey, forHTTPHeaderField: "x-goog-api-key")
-        request.timeoutInterval = 12
+        request.timeoutInterval = timeout
         request.httpBody = try JSONEncoder().encode(body)
 
         let (data, response) = try await session.data(for: request)
@@ -346,17 +783,226 @@ enum GeminiSubtitleTranslator {
         guard (200...299).contains(http.statusCode) else {
             let serviceError = try? JSONDecoder().decode(ErrorBody.self, from: data)
             throw AISubtitleTranslationError.service(
-                message: serviceError?.error?.message ?? "Gemini request failed (HTTP \(http.statusCode))."
+                statusCode: http.statusCode,
+                message: serviceError?.error?.message ?? "Gemini request failed (HTTP \(http.statusCode)).",
+                retryAfter: retryAfter(from: http)
             )
         }
         let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
-        let text = decoded.candidates?
+        return decoded.candidates?
             .flatMap { $0.content?.parts ?? [] }
             .compactMap(\.text)
             .joined()
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        return TimeInterval(value)
+    }
+}
+
+enum OpenRouterSubtitleTranslator {
+    private static let endpoint = URL(string: "https://openrouter.ai/api/v1/chat/completions")!
+    private static let systemPrompt = "You are an expert film and television subtitle translator. Translate only dialogue and on-screen text. Preserve meaning, tone, character voice, proper names, and subtitle line breaks. Do not add explanations, summaries, censoring, or annotations. Follow the requested output format exactly."
+
+    private struct RequestBody: Encodable {
+        let model: String
+        let messages: [Message]
+        let temperature: Double
+        let maxTokens: Int
+        let reasoning: Reasoning?
+
+        private enum CodingKeys: String, CodingKey {
+            case model, messages, temperature, reasoning
+            case maxTokens = "max_tokens"
+        }
+    }
+
+    private struct Reasoning: Encodable {
+        let enabled: Bool
+    }
+
+    private struct Message: Encodable {
+        let role: String
+        let content: String
+    }
+
+    private struct ResponseBody: Decodable {
+        let choices: [Choice]?
+    }
+
+    private struct Choice: Decodable {
+        let message: ResponseMessage?
+    }
+
+    private struct ResponseMessage: Decodable {
+        let content: String?
+    }
+
+    private struct ErrorBody: Decodable {
+        let error: APIError?
+    }
+
+    private struct APIError: Decodable {
+        let message: String?
+    }
+
+    private struct BatchInput: Encodable {
+        let id: Int
+        let text: String
+    }
+
+    private struct BatchOutput: Decodable {
+        let id: Int
+        let text: String
+    }
+
+    static func translate(
+        _ source: String,
+        to targetLanguage: String,
+        model: String,
+        apiKey: String,
+        session: URLSession = .shared
+    ) async throws -> String {
+        let prompt = """
+        Translate the film or television subtitle enclosed in <subtitle> into \(targetLanguage).
+        Return only natural subtitle text. Preserve meaning, dialogue tone, character voice, proper names, and line breaks; do not add labels, explanations, quotation marks, or annotations.
+        <subtitle>
+        \(source)
+        </subtitle>
+        """
+        let text = try await complete(
+            model: model,
+            prompt: prompt,
+            apiKey: apiKey,
+            maxTokens: 256,
+            timeout: 12,
+            session: session
+        )
         guard !text.isEmpty else { throw AISubtitleTranslationError.invalidResponse }
         return text
+    }
+
+    static func translateBatch(
+        _ items: [AISubtitleTranslationItem],
+        to targetLanguage: String,
+        model: String,
+        apiKey: String,
+        session: URLSession = .shared
+    ) async throws -> [Int: String] {
+        guard !items.isEmpty else { return [:] }
+        let source = try String(
+            decoding: JSONEncoder().encode(items.map { BatchInput(id: $0.id, text: $0.text) }),
+            as: UTF8.self
+        )
+        let prompt = """
+        Translate every film or television subtitle in the JSON array into \(targetLanguage).
+        Return only a JSON array. Each output object must contain the original integer `id` and its translated `text`.
+        Include every input id exactly once. Use neighbouring cues only to resolve dialogue context. Preserve meaning, tone, character voice, proper names, and line breaks. Do not add labels, explanations, quotation marks, or annotations.
+        <subtitles>
+        \(source)
+        </subtitles>
+        """
+        let response = try await complete(
+            model: model,
+            prompt: prompt,
+            apiKey: apiKey,
+            maxTokens: batchOutputTokenLimit(for: items),
+            timeout: 30,
+            session: session
+        )
+        let outputs = try JSONDecoder().decode(
+            [BatchOutput].self,
+            from: Data(stripMarkdownCodeFence(from: response).utf8)
+        )
+        let expectedIDs = Set(items.map(\.id))
+        var translations: [Int: String] = [:]
+        for output in outputs {
+            let text = output.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard expectedIDs.contains(output.id), !text.isEmpty, translations[output.id] == nil else {
+                throw AISubtitleTranslationError.invalidResponse
+            }
+            translations[output.id] = text
+        }
+        guard translations.count == expectedIDs.count else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+        return translations
+    }
+
+    private static func complete(
+        model: String,
+        prompt: String,
+        apiKey: String,
+        maxTokens: Int,
+        timeout: TimeInterval,
+        session: URLSession
+    ) async throws -> String {
+        let body = RequestBody(
+            model: model,
+            messages: [
+                Message(role: "system", content: systemPrompt),
+                Message(role: "user", content: prompt),
+            ],
+            temperature: 0.1,
+            maxTokens: maxTokens,
+            reasoning: disablesReasoning(for: model) ? Reasoning(enabled: false) : nil
+        )
+        var request = URLRequest(url: endpoint)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(apiKey)", forHTTPHeaderField: "Authorization")
+        request.timeoutInterval = timeout
+        request.httpBody = try JSONEncoder().encode(body)
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            let serviceError = try? JSONDecoder().decode(ErrorBody.self, from: data)
+            throw AISubtitleTranslationError.service(
+                statusCode: http.statusCode,
+                message: serviceError?.error?.message ?? "OpenRouter request failed (HTTP \(http.statusCode)).",
+                retryAfter: retryAfter(from: http)
+            )
+        }
+        let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
+        return decoded.choices?
+            .compactMap { $0.message?.content }
+            .joined()
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+    }
+
+    /// Translation does not benefit from hidden reasoning. Qwen's reasoning
+    /// tokens are billed as output, so those requests explicitly disable it.
+    /// The dynamic completion cap also prevents a short batch from consuming
+    /// the former blanket 4,096-token allowance.
+    static func batchOutputTokenLimit(for items: [AISubtitleTranslationItem]) -> Int {
+        let sourceBytes = items.reduce(0) { $0 + $1.text.utf8.count }
+        let estimatedSourceTokens = max(1, sourceBytes / 3)
+        let jsonOverhead = items.count * 8 + 160
+        let estimatedOutputTokens = Int(Double(estimatedSourceTokens) * 1.8) + jsonOverhead
+        return min(2_048, max(512, estimatedOutputTokens))
+    }
+
+    static func disablesReasoning(for model: String) -> Bool {
+        model.lowercased().contains("qwen3.7-flash")
+    }
+
+    private static func stripMarkdownCodeFence(from text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("```") else { return trimmed }
+        let withoutOpeningFence = trimmed.drop { $0 != "\n" }.dropFirst()
+        return String(withoutOpeningFence)
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
+        guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
+        return TimeInterval(value)
     }
 }
 

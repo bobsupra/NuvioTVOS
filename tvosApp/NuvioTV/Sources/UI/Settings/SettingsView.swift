@@ -193,11 +193,13 @@ enum SettingsKey {
     static let torboxAccessToken = "nuvio.tv.settings.integrations.torboxAccessToken"
     static let premiumizeAccessToken = "nuvio.tv.settings.integrations.premiumizeAccessToken"
     static let realDebridAccessToken = "nuvio.tv.settings.integrations.realDebridAccessToken"
-    /// Gemini credentials are device-local. Subtitle text is sent directly to
-    /// Google's API only while the user has enabled AI subtitles.
+    /// AI subtitle credentials are device-local. Subtitle text is sent to the
+    /// selected provider only while the user has enabled AI subtitles.
     static let aiSubtitlesEnabled = "nuvio.tv.settings.integrations.aiSubtitlesEnabled"
+    static let aiSubtitlesProvider = "nuvio.tv.settings.integrations.aiSubtitlesProvider"
     static let aiSubtitlesGeminiAPIKey = "nuvio.tv.settings.integrations.aiSubtitlesGeminiAPIKey"
     static let aiSubtitlesGeminiModel = "nuvio.tv.settings.integrations.aiSubtitlesGeminiModel"
+    static let aiSubtitlesOpenRouterModel = "nuvio.tv.settings.integrations.aiSubtitlesOpenRouterModel"
     static let aiSubtitlesTargetLanguage = "nuvio.tv.settings.integrations.aiSubtitlesTargetLanguage"
     static let aiSubtitlesAutoSelect = "nuvio.tv.settings.integrations.aiSubtitlesAutoSelect"
     static let aiSubtitlesStripHearingImpaired = "nuvio.tv.settings.integrations.aiSubtitlesStripHearingImpaired"
@@ -261,7 +263,8 @@ enum SettingsKey {
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
         debridProvider, debridApiKey, torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
-        aiSubtitlesEnabled, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
+        aiSubtitlesEnabled, aiSubtitlesProvider, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
+        aiSubtitlesOpenRouterModel,
         aiSubtitlesTargetLanguage, aiSubtitlesAutoSelect, aiSubtitlesStripHearingImpaired,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
@@ -562,14 +565,56 @@ enum SubtitleLanguagePreferences {
     }
 }
 
-/// Device-local Gemini credentials. The non-secret enable/model preferences
-/// remain per-profile in UserDefaults, while the key itself stays in Keychain.
+enum AISubtitleProvider: String, CaseIterable, Identifiable {
+    case gemini = "Gemini"
+    case openRouter = "OpenRouter"
+
+    var id: String { rawValue }
+
+    var setupSubtitle: String {
+        switch self {
+        case .gemini:
+            return "Create a free key in Google AI Studio; it stays on this Apple TV"
+        case .openRouter:
+            return "Use an OpenRouter API key; it stays on this Apple TV"
+        }
+    }
+
+    var apiKeyTitle: String { "\(rawValue) API Key" }
+
+    var apiKeySubtitle: String {
+        switch self {
+        case .gemini:
+            return "Paste a Google AI Studio API key"
+        case .openRouter:
+            return "Paste an OpenRouter API key"
+        }
+    }
+
+    var privacyDescription: String {
+        switch self {
+        case .gemini:
+            return "Gemini translates subtitle cues as they appear. Your key and subtitle text are sent directly to Google only while this feature is on."
+        case .openRouter:
+            return "OpenRouter translates subtitle cues as they appear. Your key and subtitle text are sent to OpenRouter and its selected model provider only while this feature is on."
+        }
+    }
+}
+
+/// Device-local AI subtitle credentials. The non-secret enable/model
+/// preferences remain per-profile in UserDefaults, while keys stay in Keychain.
 enum AISubtitleKeyStore {
     private static let service = "com.nuvio.tv.ai-subtitles"
 
-    static func apiKey(defaults: UserDefaults = ProfileSettings.current) -> String {
+    static func apiKey(
+        for provider: AISubtitleProvider,
+        defaults: UserDefaults = ProfileSettings.current
+    ) -> String {
         let scope = ProfileSettings.activeProfileScope
-        return migrateLegacyKey(from: defaults, profileScope: scope)
+        if provider == .gemini {
+            return migrateLegacyKey(from: defaults, profileScope: scope)
+        }
+        return read(for: provider, profileScope: scope) ?? ""
     }
 
     /// Moves a legacy UserDefaults key into the named Keychain namespace. This
@@ -577,33 +622,37 @@ enum AISubtitleKeyStore {
     /// before its value is intentionally excluded from settings copies.
     @discardableResult
     static func migrateLegacyKey(from defaults: UserDefaults, profileScope: String) -> String {
-        if let secureKey = read(profileScope: profileScope) {
+        if let secureKey = read(for: .gemini, profileScope: profileScope) {
             defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
             return secureKey
         }
         let legacyKey = (defaults.string(forKey: SettingsKey.aiSubtitlesGeminiAPIKey) ?? "")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard !legacyKey.isEmpty else { return "" }
-        guard save(legacyKey, profileScope: profileScope) else { return "" }
+        guard save(legacyKey, for: .gemini, profileScope: profileScope) else { return "" }
         defaults.removeObject(forKey: SettingsKey.aiSubtitlesGeminiAPIKey)
         return legacyKey
     }
 
     @discardableResult
-    static func save(_ key: String, profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
+    static func save(
+        _ key: String,
+        for provider: AISubtitleProvider,
+        profileScope: String = ProfileSettings.activeProfileScope
+    ) -> Bool {
         let trimmed = key.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
-            return remove(profileScope: profileScope)
+            return remove(for: provider, profileScope: profileScope)
         }
 
         let data = Data(trimmed.utf8)
-        var addQuery = keychainQuery(for: profileScope)
+        var addQuery = keychainQuery(for: provider, profileScope: profileScope)
         addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
         addQuery[kSecValueData as String] = data
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         if status == errSecDuplicateItem {
             return SecItemUpdate(
-                keychainQuery(for: profileScope) as CFDictionary,
+                keychainQuery(for: provider, profileScope: profileScope) as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
             ) == errSecSuccess
         }
@@ -611,13 +660,23 @@ enum AISubtitleKeyStore {
     }
 
     @discardableResult
-    static func remove(profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
-        let status = SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
+    static func remove(
+        for provider: AISubtitleProvider,
+        profileScope: String = ProfileSettings.activeProfileScope
+    ) -> Bool {
+        let status = SecItemDelete(keychainQuery(for: provider, profileScope: profileScope) as CFDictionary)
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
-    private static func read(profileScope: String) -> String? {
-        var query = keychainQuery(for: profileScope)
+    @discardableResult
+    static func remove(profileScope: String = ProfileSettings.activeProfileScope) -> Bool {
+        AISubtitleProvider.allCases.reduce(true) { result, provider in
+            remove(for: provider, profileScope: profileScope) && result
+        }
+    }
+
+    private static func read(for provider: AISubtitleProvider, profileScope: String) -> String? {
+        var query = keychainQuery(for: provider, profileScope: profileScope)
         query[kSecReturnData as String] = kCFBooleanTrue
         query[kSecMatchLimit as String] = kSecMatchLimitOne
         var item: CFTypeRef?
@@ -627,11 +686,14 @@ enum AISubtitleKeyStore {
             .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func keychainQuery(for profileScope: String) -> [String: Any] {
+    private static func keychainQuery(
+        for provider: AISubtitleProvider,
+        profileScope: String
+    ) -> [String: Any] {
         [
             kSecClass as String: kSecClassGenericPassword,
             kSecAttrService as String: service,
-            kSecAttrAccount as String: "gemini.\(profileScope)"
+            kSecAttrAccount as String: "\(provider.rawValue.lowercased()).\(profileScope)"
         ]
     }
 }
@@ -642,8 +704,10 @@ enum AISubtitleKeyStore {
 struct AISubtitleTranslationSettings: Equatable {
     static let defaultModel = "gemini-3.6-flash"
     static let availableModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    static let defaultOpenRouterModel = "google/gemini-2.5-flash"
 
     let isEnabled: Bool
+    let provider: AISubtitleProvider
     let apiKey: String
     let model: String
     let targetLanguage: String
@@ -655,10 +719,21 @@ struct AISubtitleTranslationSettings: Equatable {
             ?? SubtitleLanguagePreferences.preferredAudioLanguage(defaults: defaults)
             ?? "English"
         let configuredTarget = defaults.string(forKey: SettingsKey.aiSubtitlesTargetLanguage) ?? "Preferred Subtitle"
+        let provider = AISubtitleProvider(
+            rawValue: defaults.string(forKey: SettingsKey.aiSubtitlesProvider) ?? ""
+        ) ?? .gemini
+        let model: String
+        switch provider {
+        case .gemini:
+            model = normalizedModel(defaults.string(forKey: SettingsKey.aiSubtitlesGeminiModel))
+        case .openRouter:
+            model = normalizedOpenRouterModel(defaults.string(forKey: SettingsKey.aiSubtitlesOpenRouterModel))
+        }
         return Self(
             isEnabled: defaults.bool(forKey: SettingsKey.aiSubtitlesEnabled),
-            apiKey: AISubtitleKeyStore.apiKey(defaults: defaults),
-            model: normalizedModel(defaults.string(forKey: SettingsKey.aiSubtitlesGeminiModel)),
+            provider: provider,
+            apiKey: AISubtitleKeyStore.apiKey(for: provider, defaults: defaults),
+            model: model,
             targetLanguage: configuredTarget == "Preferred Subtitle" ? preferredLanguage : configuredTarget,
             autoSelect: defaults.object(forKey: SettingsKey.aiSubtitlesAutoSelect) as? Bool ?? true,
             stripHearingImpaired: defaults.object(forKey: SettingsKey.aiSubtitlesStripHearingImpaired) as? Bool ?? true
@@ -669,6 +744,13 @@ struct AISubtitleTranslationSettings: Equatable {
         let model = (storedModel ?? defaultModel).trimmingCharacters(in: .whitespacesAndNewlines)
         return availableModels.contains(model) ? model : defaultModel
     }
+
+    static func normalizedOpenRouterModel(_ storedModel: String?) -> String {
+        let model = (storedModel ?? defaultOpenRouterModel).trimmingCharacters(in: .whitespacesAndNewlines)
+        return model.isEmpty ? defaultOpenRouterModel : model
+    }
+
+    var cacheModelIdentifier: String { "\(provider.rawValue):\(model)" }
 }
 
 enum SettingsAccent: String, CaseIterable, Identifiable {
@@ -2263,11 +2345,11 @@ private struct IntegrationSettingsView: View {
 
             SettingsGroup(
                 title: "AI Subtitles",
-                subtitle: "Translate active subtitle cues live with your Gemini API key"
+                subtitle: "Translate active subtitle cues live with Gemini or OpenRouter"
             ) {
                 SettingsActionRow(
                     title: "AI Subtitle Translation",
-                    subtitle: "Uses Gemini only while you watch; original subtitles stay visible until each translation is ready",
+                    subtitle: "Uses your selected provider only while you watch; original subtitles stay visible until each translation is ready",
                     value: aiSubtitlesEnabled && aiSubtitlesHasApiKey ? "On" : L10n.string("settings_open", fallback: "Open"),
                     accentColor: accentColor
                 ) {
@@ -2398,7 +2480,7 @@ private struct IntegrationSettingsView: View {
     }
 
     private var aiSubtitlesHasApiKey: Bool {
-        !AISubtitleKeyStore.apiKey().isEmpty
+        !AISubtitleTranslationSettings.current().apiKey.isEmpty
     }
 
     private func isConnected(_ provider: DebridAccountProvider) -> Bool {
@@ -2837,7 +2919,9 @@ private struct AISubtitleOptionsSheet: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.aiSubtitlesEnabled) private var isEnabled = false
-    @AppStorage(SettingsKey.aiSubtitlesGeminiModel) private var model = AISubtitleTranslationSettings.defaultModel
+    @AppStorage(SettingsKey.aiSubtitlesProvider) private var provider = AISubtitleProvider.gemini.rawValue
+    @AppStorage(SettingsKey.aiSubtitlesGeminiModel) private var geminiModel = AISubtitleTranslationSettings.defaultModel
+    @AppStorage(SettingsKey.aiSubtitlesOpenRouterModel) private var openRouterModel = AISubtitleTranslationSettings.defaultOpenRouterModel
     @AppStorage(SettingsKey.aiSubtitlesTargetLanguage) private var targetLanguage = "Preferred Subtitle"
     @AppStorage(SettingsKey.aiSubtitlesAutoSelect) private var autoSelect = true
     @AppStorage(SettingsKey.aiSubtitlesStripHearingImpaired) private var stripHearingImpaired = true
@@ -2845,7 +2929,8 @@ private struct AISubtitleOptionsSheet: View {
     @State private var isKeyStored = false
     @State private var keyStorageError: String?
 
-    private let models = AISubtitleTranslationSettings.availableModels
+    private let providers = AISubtitleProvider.allCases.map(\.rawValue)
+    private let geminiModels = AISubtitleTranslationSettings.availableModels
     private let languages = ["Preferred Subtitle"] + SubtitleLanguagePreferences.supportedLanguages
 
     var body: some View {
@@ -2859,19 +2944,27 @@ private struct AISubtitleOptionsSheet: View {
                         Text("AI Subtitle Translation")
                             .font(.system(size: 36, weight: .bold))
                             .foregroundColor(.white)
-                        Text("Gemini translates text cues as they appear. Your key and subtitle text are sent directly to Google only while this feature is on.")
+                        Text(selectedProvider.privacyDescription)
                             .font(.system(size: 20, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
                             .fixedSize(horizontal: false, vertical: true)
                     }
 
                     SettingsGroup(
-                        title: "Gemini Setup",
-                        subtitle: "Create a free key in Google AI Studio; it stays on this Apple TV"
+                        title: "AI Provider",
+                        subtitle: selectedProvider.setupSubtitle
                     ) {
+                        SettingsOptionRow(
+                            title: "Provider",
+                            subtitle: "Choose where subtitle text is translated",
+                            selection: $provider,
+                            options: providers,
+                            accentColor: accentColor
+                        )
+
                         SettingsNativeTextFieldRow(
-                            title: "Gemini API Key",
-                            subtitle: "Paste a Google AI Studio API key",
+                            title: selectedProvider.apiKeyTitle,
+                            subtitle: selectedProvider.apiKeySubtitle,
                             placeholder: "Not set",
                             text: $apiKey,
                             isSecure: true,
@@ -2889,13 +2982,23 @@ private struct AISubtitleOptionsSheet: View {
                                 .foregroundColor(.red.opacity(0.9))
                         }
 
-                        SettingsOptionRow(
-                            title: "Gemini Model",
-                            subtitle: "Flash models keep cue translations fast",
-                            selection: $model,
-                            options: models,
-                            accentColor: accentColor
-                        )
+                        if selectedProvider == .gemini {
+                            SettingsOptionRow(
+                                title: "Gemini Model",
+                                subtitle: "Flash models keep cue translations fast",
+                                selection: $geminiModel,
+                                options: geminiModels,
+                                accentColor: accentColor
+                            )
+                        } else {
+                            SettingsNativeTextFieldRow(
+                                title: "OpenRouter Model",
+                                subtitle: "Use any OpenRouter model ID, for example google/gemini-2.5-flash",
+                                placeholder: AISubtitleTranslationSettings.defaultOpenRouterModel,
+                                text: $openRouterModel,
+                                onCommit: normalizeOpenRouterModel
+                            )
+                        }
 
                         SettingsToggleRow(
                             title: "Enable AI Translation",
@@ -2937,6 +3040,7 @@ private struct AISubtitleOptionsSheet: View {
                         }
                     }
                 }
+                .frame(width: 1_000, alignment: .leading)
                 .padding(.horizontal, 52)
                 .padding(.vertical, 38)
             }
@@ -2945,6 +3049,10 @@ private struct AISubtitleOptionsSheet: View {
         .onAppear(perform: loadKey)
         .onChange(of: apiKey) { _ in
             persistKey()
+        }
+        .onChange(of: provider) { _ in
+            keyStorageError = nil
+            loadKey()
         }
         .onExitCommand { dismiss() }
     }
@@ -2957,10 +3065,16 @@ private struct AISubtitleOptionsSheet: View {
         isEnabled && hasAPIKey
     }
 
+    private var selectedProvider: AISubtitleProvider {
+        AISubtitleProvider(rawValue: provider) ?? .gemini
+    }
+
     private func loadKey() {
-        apiKey = AISubtitleKeyStore.apiKey()
+        provider = selectedProvider.rawValue
+        apiKey = AISubtitleKeyStore.apiKey(for: selectedProvider)
         isKeyStored = !apiKey.isEmpty
-        model = AISubtitleTranslationSettings.normalizedModel(model)
+        geminiModel = AISubtitleTranslationSettings.normalizedModel(geminiModel)
+        normalizeOpenRouterModel()
     }
 
     private func persistKey() {
@@ -2969,11 +3083,15 @@ private struct AISubtitleOptionsSheet: View {
             apiKey = trimmed
             return
         }
-        isKeyStored = AISubtitleKeyStore.save(trimmed)
+        isKeyStored = AISubtitleKeyStore.save(trimmed, for: selectedProvider)
         keyStorageError = isKeyStored || trimmed.isEmpty
             ? nil
-            : "This Apple TV could not save the Gemini API key securely."
+            : "This Apple TV could not save the \(selectedProvider.rawValue) API key securely."
         if !hasAPIKey { isEnabled = false }
+    }
+
+    private func normalizeOpenRouterModel() {
+        openRouterModel = AISubtitleTranslationSettings.normalizedOpenRouterModel(openRouterModel)
     }
 }
 

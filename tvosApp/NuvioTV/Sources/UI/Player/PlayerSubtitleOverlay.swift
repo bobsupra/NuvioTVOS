@@ -100,9 +100,9 @@ struct PlayerSubtitleOverlay: View {
     private func textBody(_ cue: SubtitleCue) -> some View {
         switch cue.body {
         case .text(let string):
-            outlinedText(translation.translatedText(for: cue.id) ?? string)
+            outlinedText(translation.translatedText(for: cue) ?? string)
         case .richText(let runs):
-            if let translated = translation.translatedText(for: cue.id) {
+            if let translated = translation.translatedText(for: cue) {
                 outlinedText(translated)
             } else {
                 outlinedRichText(runs)

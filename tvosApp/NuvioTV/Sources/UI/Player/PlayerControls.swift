@@ -54,7 +54,9 @@ struct PlayerControls: View {
             }
         }
         .onAppear {
-            DispatchQueue.main.async { focusedControl = .timeline }
+            DispatchQueue.main.async {
+                focusedControl = viewModel.isLiveStream ? .play : .timeline
+            }
         }
         .onChange(of: viewModel.showControls) { isVisible in
             // Don't steal focus while the pause metadata sheet owns the remote.
@@ -62,7 +64,14 @@ struct PlayerControls: View {
                !viewModel.showPauseOverlay,
                !isSkipSegmentFocused,
                !isNextEpisodeFocused {
-                DispatchQueue.main.async { focusedControl = .timeline }
+                DispatchQueue.main.async {
+                    focusedControl = viewModel.isLiveStream ? .play : .timeline
+                }
+            }
+        }
+        .onChange(of: viewModel.isLiveStream) { isLive in
+            if isLive, focusedControl == .timeline {
+                DispatchQueue.main.async { focusedControl = .play }
             }
         }
         .onChange(of: viewModel.showPauseOverlay) { visible in
@@ -153,11 +162,11 @@ struct PlayerControls: View {
                 moveFocus(to: .play)
             }
         case .down:
-            if origin != .timeline {
+            if origin != .timeline, !viewModel.isLiveStream {
                 moveFocus(to: .timeline)
             }
         case .left:
-            if origin == .timeline {
+            if origin == .timeline, !viewModel.isLiveStream {
                 viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
                 // Keep focus pinned while seeking / hold-to-seek.
                 moveFocus(to: .timeline)
@@ -166,7 +175,7 @@ struct PlayerControls: View {
                 moveFocus(to: transportFocusOrder[index - 1])
             }
         case .right:
-            if origin == .timeline {
+            if origin == .timeline, !viewModel.isLiveStream {
                 viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
                 moveFocus(to: .timeline)
             } else if let index = transportFocusOrder.firstIndex(of: origin),
@@ -330,7 +339,31 @@ struct PlayerControls: View {
         focusedControl == .timeline
     }
 
+    @ViewBuilder
     private var timelineBar: some View {
+        if viewModel.isLiveStream {
+            liveStatusBar
+        } else {
+            finiteTimelineBar
+        }
+    }
+
+    private var liveStatusBar: some View {
+        HStack(spacing: 11) {
+            Circle()
+                .fill(Color.red)
+                .frame(width: 12, height: 12)
+                .shadow(color: .red.opacity(0.65), radius: 7)
+            Text("LIVE")
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(.white.opacity(0.9))
+            Spacer()
+        }
+        .frame(height: 44)
+        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
+    }
+
+    private var finiteTimelineBar: some View {
         VStack(spacing: 8) {
             let duration = max(viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration, 0.001)
             let buffered = viewModel.clock.buffered

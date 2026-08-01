@@ -10,6 +10,7 @@ struct ProductionBrowseView: View {
     @State private var isLoading = true
     @State private var errorMessage: String?
     @FocusState private var focusedId: String?
+    @FocusState private var placeholderFocused: Bool
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -62,6 +63,10 @@ struct ProductionBrowseView: View {
                 }
             }
             .padding(.top, 48)
+
+            if titles.isEmpty {
+                placeholderFocusAnchor
+            }
         }
         .onExitCommand(perform: onBack)
         .task(id: company.id) {
@@ -118,6 +123,20 @@ struct ProductionBrowseView: View {
             .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
     }
 
+    /// Loading/error/empty states otherwise contain no focusable view. Without
+    /// a responder, tvOS treats Menu as unhandled and suspends the app instead
+    /// of delivering it to this screen's `onExitCommand`.
+    private var placeholderFocusAnchor: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .focusable(true)
+            .focused($placeholderFocused)
+            .focusEffectDisabledIfAvailable()
+            .onAppear {
+                DispatchQueue.main.async { placeholderFocused = true }
+            }
+    }
+
     private func load() async {
         isLoading = true
         errorMessage = nil
@@ -139,6 +158,7 @@ struct PersonBrowseView: View {
     @State private var titles: [RelatedTitle] = []
     @State private var isLoading = true
     @FocusState private var focusedId: String?
+    @FocusState private var placeholderFocused: Bool
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -219,6 +239,10 @@ struct PersonBrowseView: View {
                 }
             }
             .padding(.top, 48)
+
+            if titles.isEmpty {
+                placeholderFocusAnchor
+            }
         }
         .onExitCommand(perform: onBack)
         .task(id: person.id) {
@@ -236,6 +260,17 @@ struct PersonBrowseView: View {
             .frame(width: 96, height: 96)
             .background(Color.white.opacity(0.16))
             .clipShape(Circle())
+    }
+
+    private var placeholderFocusAnchor: some View {
+        Color.clear
+            .frame(width: 1, height: 1)
+            .focusable(true)
+            .focused($placeholderFocused)
+            .focusEffectDisabledIfAvailable()
+            .onAppear {
+                DispatchQueue.main.async { placeholderFocused = true }
+            }
     }
 }
 

@@ -14,6 +14,8 @@
 		AE10B004 /* PlaybackEngineState.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F004 /* PlaybackEngineState.swift */; };
 		AE10B005 /* PlaybackEngineCapabilities.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F005 /* PlaybackEngineCapabilities.swift */; };
 		AE10B006 /* PlaybackBackendPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F006 /* PlaybackBackendPolicy.swift */; };
+		AE10B00E /* AppleTVCapability.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00E /* AppleTVCapability.swift */; };
+		AE10B00F /* AppleTVCapabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00F /* AppleTVCapabilityTests.swift */; };
 		AE10B007 /* AetherPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F007 /* AetherPlaybackController.swift */; };
 		AE10B008 /* PlaybackSessionCoordinator.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F008 /* PlaybackSessionCoordinator.swift */; };
 		AE10B009 /* MPVPlaybackController.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F009 /* MPVPlaybackController.swift */; };
@@ -153,6 +155,8 @@
 		AE10F004 /* PlaybackEngineState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineState.swift; sourceTree = "<group>"; };
 		AE10F005 /* PlaybackEngineCapabilities.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineCapabilities.swift; sourceTree = "<group>"; };
 		AE10F006 /* PlaybackBackendPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackBackendPolicy.swift; sourceTree = "<group>"; };
+		AE10F00E /* AppleTVCapability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/AppleTVCapability.swift; sourceTree = "<group>"; };
+		AE10F00F /* AppleTVCapabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleTVCapabilityTests.swift; sourceTree = "<group>"; };
 		AE10F007 /* AetherPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/AetherPlaybackController.swift; sourceTree = "<group>"; };
 		AE10F008 /* PlaybackSessionCoordinator.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift; sourceTree = "<group>"; };
 		AE10F009 /* MPVPlaybackController.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/MPVPlaybackController.swift; sourceTree = "<group>"; };
@@ -351,6 +355,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				AE10F004 /* PlaybackEngineState.swift */,
 				AE10F005 /* PlaybackEngineCapabilities.swift */,
 				AE10F006 /* PlaybackBackendPolicy.swift */,
+				AE10F00E /* AppleTVCapability.swift */,
 				AE10F007 /* AetherPlaybackController.swift */,
 				AE10F008 /* PlaybackSessionCoordinator.swift */,
 				AE10F009 /* MPVPlaybackController.swift */,
@@ -473,6 +478,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			isa = PBXGroup;
 			children = (
 				AE10F00B /* PlaybackBackendPolicyTests.swift */,
+				AE10F00F /* AppleTVCapabilityTests.swift */,
 				T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */,
 				T0D300E3 /* StreamQualityTagsTests.swift */,
 				T0D300E4 /* CatalogDecodingTests.swift */,
@@ -491,8 +497,8 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				08A4A3CD28434E44B6B9DE2E /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
-				AE00SP010000000000000001 /* Thin Aether Simulator Frameworks */,
 				AE00CP010000000000000001 /* Embed Frameworks */,
+				AE00SP010000000000000001 /* Thin Aether Simulator Frameworks */,
 				13B07F8E1A680F5B00A75B9A /* Resources */,
 				7E51000000000000000000C3 /* Embed App Extensions */,
 			);
@@ -707,6 +713,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				AE10B004 /* PlaybackEngineState.swift in Sources */,
 				AE10B005 /* PlaybackEngineCapabilities.swift in Sources */,
 				AE10B006 /* PlaybackBackendPolicy.swift in Sources */,
+				AE10B00E /* AppleTVCapability.swift in Sources */,
 				AE10B007 /* AetherPlaybackController.swift in Sources */,
 				AE10B008 /* PlaybackSessionCoordinator.swift in Sources */,
 				AE10B009 /* MPVPlaybackController.swift in Sources */,
@@ -770,6 +777,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildActionMask = 2147483647;
 			files = (
 				AE10B00B /* PlaybackBackendPolicyTests.swift in Sources */,
+				AE10B00F /* AppleTVCapabilityTests.swift in Sources */,
 				T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */,
 				T0D310E3 /* StreamQualityTagsTests.swift in Sources */,
 				T0D310E4 /* CatalogDecodingTests.swift in Sources */,
@@ -787,7 +795,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
@@ -796,7 +804,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -821,14 +829,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -961,7 +969,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -969,7 +977,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -986,7 +994,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -994,7 +1002,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1012,14 +1020,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1039,14 +1047,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 53;
+				CURRENT_PROJECT_VERSION = 54;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.2;
+				MARKETING_VERSION = 3.2.3;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;

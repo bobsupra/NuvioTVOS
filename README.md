@@ -43,21 +43,21 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.2 (build 53)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.3 (build 54)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.2](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.2) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2.3](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.3) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.2.2-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.2/NuvioTV-3.2.2-unsigned-release.ipa)
+[NuvioTV-3.2.3-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.3/NuvioTV-3.2.3-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.2.2
+### New in Beta 3.2.3
 
-- Adds optional Gemini AI subtitle translation for AetherEngine and MPVKit text subtitles, with per-profile Keychain keys, local translation caching, cue prefetching, manual control, and a fallback to the original text while a translation is pending.
-- Adds Android TV-compatible stream badge packs, file-size badges, optional add-on logos, and account sync for the selected badge settings.
-- Forwards add-on-provided Stremio proxy request headers through playback and remembered direct streams, improving compatibility with protected media hosts.
-- Syncs Home catalog order and visibility edits, keeps Android-authored custom titles, supports disabling Cinemeta, and improves navigation/focus from collection, person, and production screens.
-- Makes search feel faster through lower debounce and a short-lived in-memory result cache.
+- Adds OpenRouter as an AI subtitle provider alongside Gemini, with profile-scoped Keychain keys, model selection, cue-priority prefetching, batching, retries, and original-text fallback.
+- Improves live-TV playback with a dedicated LIVE timeline state, delayed buffering indication, and no VOD resume/skip behavior for live channels.
+- Makes stream selection more reliable and responsive with cached badge/presentation work, coherent stream revisions, stable full-screen picker layout, Apple TV capability filtering, and clearer HDR token parsing.
+- Makes Home vertical navigation behave like horizontal navigation: immediate focus routing, stable row containers, full visible card pages, and less work during GG-profile scrolling.
+- Fixes player transport focus routing, Details/production empty-state Menu handling, and focus restoration when returning to Home.
 
 ### The new player
 

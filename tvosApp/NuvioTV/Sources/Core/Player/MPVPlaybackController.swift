@@ -133,7 +133,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
                 if let cached = await AISubtitleTranslationCache.shared.translation(
                     for: source,
                     targetLanguage: settings.targetLanguage,
-                    model: settings.model,
+                    model: settings.cacheModelIdentifier,
                     stripHearingImpaired: settings.stripHearingImpaired,
                     profileScope: profileScope
                 ) {
@@ -146,11 +146,9 @@ final class MPVSubtitleTranslationState: ObservableObject {
                     self.reportOnce(.success(()))
                     return
                 }
-                let translated = try await GeminiSubtitleTranslator.translate(
+                let translated = try await AISubtitleTranslator.translate(
                     source,
-                    to: settings.targetLanguage,
-                    model: settings.model,
-                    apiKey: settings.apiKey
+                    settings: settings
                 )
                 let cleaned = AISubtitleTranslationState.cleaned(
                     translated,
@@ -160,7 +158,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
                     cleaned,
                     for: source,
                     targetLanguage: settings.targetLanguage,
-                    model: settings.model,
+                    model: settings.cacheModelIdentifier,
                     stripHearingImpaired: settings.stripHearingImpaired,
                     profileScope: profileScope
                 )

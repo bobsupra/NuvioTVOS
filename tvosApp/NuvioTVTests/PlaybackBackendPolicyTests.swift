@@ -44,6 +44,83 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(translated, "Hei")
     }
 
+    func testGeminiBatchTranslatorPreservesCueIDs() async throws {
+        GeminiURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.value(forHTTPHeaderField: "x-goog-api-key"), "test-api-key")
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            let payload = #"{"candidates":[{"content":{"parts":[{"text":"[{\"id\":7,\"text\":\"Hei\"},{\"id\":9,\"text\":\"Ha det\"}]"}]}}]}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        let translated = try await GeminiSubtitleTranslator.translateBatch(
+            [
+                .init(id: 7, text: "Hello"),
+                .init(id: 9, text: "Goodbye"),
+            ],
+            to: "Norwegian",
+            model: AISubtitleTranslationSettings.defaultModel,
+            apiKey: "test-api-key",
+            session: URLSession(configuration: configuration)
+        )
+
+        XCTAssertEqual(translated, [7: "Hei", 9: "Ha det"])
+    }
+
+    func testOpenRouterBatchTranslatorUsesBearerTokenAndPreservesCueIDs() async throws {
+        GeminiURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url?.absoluteString, "https://openrouter.ai/api/v1/chat/completions")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-api-key")
+            XCTAssertNil(request.value(forHTTPHeaderField: "x-goog-api-key"))
+            XCTAssertEqual(request.httpMethod, "POST")
+            let requestBody = try XCTUnwrap(request.httpBody)
+            let requestJSON = try XCTUnwrap(
+                JSONSerialization.jsonObject(with: requestBody) as? [String: Any]
+            )
+            let reasoning = try XCTUnwrap(requestJSON["reasoning"] as? [String: Any])
+            XCTAssertEqual(reasoning["enabled"] as? Bool, false)
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 200,
+                httpVersion: nil,
+                headerFields: ["Content-Type": "application/json"]
+            )!
+            let payload = #"{"choices":[{"message":{"content":"```json\n[{\"id\":7,\"text\":\"Hei\"},{\"id\":9,\"text\":\"Ha det\"}]\n```"}}]}"#
+            return (response, Data(payload.utf8))
+        }
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        XCTAssertEqual(
+            OpenRouterSubtitleTranslator.batchOutputTokenLimit(
+                for: [.init(id: 7, text: "Hello"), .init(id: 9, text: "Goodbye")]
+            ),
+            512
+        )
+        XCTAssertTrue(OpenRouterSubtitleTranslator.disablesReasoning(for: "qwen/qwen3.7-flash"))
+        XCTAssertFalse(OpenRouterSubtitleTranslator.disablesReasoning(for: "google/gemini-2.5-flash"))
+        let translated = try await OpenRouterSubtitleTranslator.translateBatch(
+            [
+                .init(id: 7, text: "Hello"),
+                .init(id: 9, text: "Goodbye"),
+            ],
+            to: "Norwegian",
+            model: "qwen/qwen3.7-flash",
+            apiKey: "test-api-key",
+            session: URLSession(configuration: configuration)
+        )
+
+        XCTAssertEqual(translated, [7: "Hei", 9: "Ha det"])
+    }
+
     func testAISubtitleCachePersistsAndSeparatesTranslationSettings() async {
         let directory = FileManager.default.temporaryDirectory
             .appendingPathComponent("ai-subtitle-cache-\(UUID().uuidString)", isDirectory: true)
@@ -95,6 +172,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 stripHearingImpaired: true
             ),
             "Hello"
+        )
+    }
+
+    @MainActor
+    func testAISubtitleNormalizedSourceIgnoresCueLayoutChangesAfterSeek() {
+        XCTAssertEqual(
+            AISubtitleTranslationState.normalizedSource("Welcome,\n  home!"),
+            AISubtitleTranslationState.normalizedSource("Welcome, home!")
         )
     }
 

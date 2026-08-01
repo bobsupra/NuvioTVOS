@@ -19,6 +19,8 @@ class DetailsViewModel: ObservableObject {
     private var streamObserveTask: Task<Void, Never>?
     private var enrichmentTask: Task<Void, Never>?
     private var observedRequestKey: String?
+    private var lastAppliedStreamsRequestKey: String?
+    private var lastAppliedStreamsRevision: UInt64?
 
     init(repository: CatalogRepository) {
         self.repository = repository
@@ -177,6 +179,8 @@ class DetailsViewModel: ObservableObject {
             episode: se.episode
         )
         observedRequestKey = key
+        lastAppliedStreamsRequestKey = nil
+        lastAppliedStreamsRevision = nil
 
         StreamsRepository.shared.load(
             type: type,
@@ -215,12 +219,22 @@ class DetailsViewModel: ObservableObject {
         guard observedRequestKey == expectedKey else { return }
         // Accept cached/completed state for our key, or empty transitional state.
         if let key = snapshot.requestKey, key != expectedKey { return }
+        guard snapshot.requestKey != lastAppliedStreamsRequestKey
+                || snapshot.revision != lastAppliedStreamsRevision else { return }
 
-        uiState.streamGroups = snapshot.groups
-        uiState.streams = snapshot.allStreams
-        uiState.streamsRevision = snapshot.revision
-        uiState.isLoadingStreams = snapshot.isAnyLoading || !snapshot.hasResolvedTargets
-        uiState.streamsEmptyReason = snapshot.emptyStateReason
+        lastAppliedStreamsRequestKey = snapshot.requestKey
+        lastAppliedStreamsRevision = snapshot.revision
+
+        // Publish one coherent state change per repository revision. Mutating
+        // five members of the @Published struct separately caused five complete
+        // details-tree invalidations on every 80 ms observer poll.
+        var nextState = uiState
+        nextState.streamGroups = snapshot.groups
+        nextState.streams = snapshot.allStreams
+        nextState.streamsRevision = snapshot.revision
+        nextState.isLoadingStreams = snapshot.isAnyLoading || !snapshot.hasResolvedTargets
+        nextState.streamsEmptyReason = snapshot.emptyStateReason
+        uiState = nextState
     }
 
     private func prepareRepositoryStreams(forId streamId: String, type: String) {

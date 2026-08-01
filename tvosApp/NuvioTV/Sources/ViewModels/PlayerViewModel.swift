@@ -57,6 +57,9 @@ class PlayerViewModel: ObservableObject {
     @Published private(set) var wheelEngaged = false
     @Published var title: String = ""
     @Published var subtitle: String = ""
+    /// Live channels use a sliding timeline rather than a finite media duration.
+    /// Expose that distinction so transport chrome can avoid a misleading scrubber.
+    @Published private(set) var isLiveStream = false
     /// Every external subtitle the stream offered (all languages), browsable in
     /// the player's subtitle panel and loaded into mpv on demand.
     @Published var availableExternalSubtitles: [NuvioSubtitle] = []
@@ -159,6 +162,11 @@ class PlayerViewModel: ObservableObject {
     private var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
     private var activeHTTPHeaders: [String: String] = [:]
+    private var livePlaybackHasStarted = false
+    private var liveBufferingBeganAt: Date?
+    /// HLS playlist refreshes briefly report loading during healthy playback.
+    /// Only surface a spinner when that state persists long enough to be a stall.
+    private static let liveBufferingIndicatorDelay: TimeInterval = 1.25
     /// Episode being played, parsed from the subtitle line ("S1 · E3 · Title")
     /// DetailsScreen builds; nil for movies/trailers. Persisted with Continue
     /// Watching so the Home hero can say which episode is in progress.
@@ -480,6 +488,15 @@ class PlayerViewModel: ObservableObject {
         return SubtitleLanguagePreferences.orderedFromDefaults()
     }
 
+    private static func isLiveContentType(_ type: String) -> Bool {
+        switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "channel", "live", "livetv", "live-tv":
+            return true
+        default:
+            return false
+        }
+    }
+
     /// Applies all per-stream state for a title/episode. Shared by the initial
     /// `load` and the in-place `replaceStream` used for a seamless next-episode
     /// advance, so both paths reset resume/track/subtitle state identically.
@@ -513,6 +530,9 @@ class PlayerViewModel: ObservableObject {
         isLoadingExternalSubtitles = false
         self.title = meta.name
         self.subtitle = subtitle
+        self.isLiveStream = Self.isLiveContentType(meta.type)
+        self.livePlaybackHasStarted = false
+        self.liveBufferingBeganAt = nil
         self.status = .buffering
         self.isAwaitingStreamStart = true
         // A replaced file keeps the previous file's position/duration cached in
@@ -545,7 +565,7 @@ class PlayerViewModel: ObservableObject {
         )
         self.activeTrackSelectionKey = selectionKey
         self.pendingTrackSelection = effectiveSelection
-        self.pendingResumeSeconds = isTrailerPlayback ? nil : resumeFrom
+        self.pendingResumeSeconds = (isTrailerPlayback || isLiveStream) ? nil : resumeFrom
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
         self.explicitSeekProgressCheckpoint = nil
@@ -1140,7 +1160,8 @@ class PlayerViewModel: ObservableObject {
                 >= Self.explicitSeekSettleWindow
             return !seekConfirmed && !protectionExpired
         }()
-        if c.hasCoherentTimeSample,
+        if !isLiveStream,
+           c.hasCoherentTimeSample,
            !c.isPlayerLoading,
            !c.isAtEndOfFile,
            latestTime.duration > 0,
@@ -1157,7 +1178,8 @@ class PlayerViewModel: ObservableObject {
         // During `loadfile replace`, the controller deliberately marks its time
         // sample incoherent while its numeric properties still contain the old
         // file's final position. Do not republish that stale timeline.
-        if c.hasCoherentTimeSample,
+        if !isLiveStream,
+           c.hasCoherentTimeSample,
            !isPreSeekSettlingSample,
            latestTime.duration > 0,
            latestTime.current >= 0,
@@ -1190,15 +1212,18 @@ class PlayerViewModel: ObservableObject {
         if subtitle != PlaybackMarkers.trailerSubtitle,
            detectReplacementStream(c) { return }
 
-        applyPendingResumeIfNeeded()
         addPendingExternalSubtitlesIfNeeded()
-        updateSkipIntervalState()
+        if !isLiveStream {
+            applyPendingResumeIfNeeded()
+            updateSkipIntervalState()
+        }
 
         if c.isPlayerEnded {
             // Only a genuine watch-through counts. A stream that dies early
             // (expired link, decode error) also reports "ended", and that must
             // neither mark the title watched nor wipe the resume point.
-            if let activeMeta, subtitle != PlaybackMarkers.trailerSubtitle,
+            if !isLiveStream,
+               let activeMeta, subtitle != PlaybackMarkers.trailerSubtitle,
                time.duration >= 60, time.current / time.duration >= 0.85 {
                 markWatchedIfNeeded()
                 if usesTraktProgress {
@@ -1233,7 +1258,7 @@ class PlayerViewModel: ObservableObject {
                     }
                 }
             }
-        } else {
+        } else if !isLiveStream {
             saveProgressIfNeeded()
             updateNextEpisodeState()
         }
@@ -1253,13 +1278,30 @@ class PlayerViewModel: ObservableObject {
 
         let previousStatus = status
 
+        if isLiveStream {
+            if c.isPlayerPlaying, !c.isPlayerLoading {
+                livePlaybackHasStarted = true
+            }
+            if !c.isPlayerLoading {
+                liveBufferingBeganAt = nil
+            }
+        }
+
         let engineStatus: PlayerStatus
         if !c.currentErrorMessage.isEmpty {
             engineStatus = .error(c.currentErrorMessage)
         } else if c.isPlayerEnded {
             engineStatus = .ended
         } else if c.isPlayerLoading {
-            engineStatus = .buffering
+            if isLiveStream, livePlaybackHasStarted {
+                let beganAt = liveBufferingBeganAt ?? Date()
+                liveBufferingBeganAt = beganAt
+                engineStatus = Date().timeIntervalSince(beganAt) >= Self.liveBufferingIndicatorDelay
+                    ? .buffering
+                    : .playing
+            } else {
+                engineStatus = .buffering
+            }
         } else if c.isPlayerPlaying {
             engineStatus = .playing
         } else {
@@ -1294,7 +1336,9 @@ class PlayerViewModel: ObservableObject {
 
         // A genuine stream is playing: reset failover budget for the next
         // independent failure later in the session.
-        if status == .playing, time.duration >= 60, !didDetectReplacementStream {
+        if status == .playing,
+           (isLiveStream || time.duration >= 60),
+           !didDetectReplacementStream {
             reloadAttempts = 0
             failedStreamURLs.removeAll()
         }
@@ -1443,6 +1487,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func seek(to seconds: Double) {
+        guard !isLiveStream else { return }
         let duration = time.duration > 0 ? time.duration : clock.duration
         let target = duration > 0
             ? min(max(seconds, 0), max(duration - 0.25, 0))
@@ -1465,6 +1510,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func playbackDidSuspend(positionMs: Int64, durationMs: Int64) {
+        guard !isLiveStream else { return }
         let sourcePositionMs = positionMs
         let sourceDurationMs = durationMs
         guard !didShutdown,
@@ -1518,6 +1564,10 @@ class PlayerViewModel: ObservableObject {
     /// (`nudgeSeek`), not fixed-size hard seeks — so holding feels at least as
     /// fast as mashing the button.
     private func beginRepeatingNudge(base: Double) {
+        guard !isLiveStream else {
+            revealControls()
+            return
+        }
         stopRepeatingNudge(commit: false)
         // Keep any pending delta from the initial press; continue the streak.
         applyNudge(base, holdMode: true)
@@ -1601,7 +1651,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func beginScrub() {
-        guard hasStartedPlayback, !showSettingsPanel else { return }
+        guard !isLiveStream, hasStartedPlayback, !showSettingsPanel else { return }
         hidePeek()
         commitPendingSeekIfNeeded()
         // Scrubbing replaces the pause sheet for the gesture.
@@ -1838,6 +1888,10 @@ class PlayerViewModel: ObservableObject {
     /// acceleration, previewed by `pendingSeekDelta` / SeekHUD. Hold-to-seek
     /// uses the same path via `beginRepeatingNudge`.
     func nudgeSeek(_ base: Double) {
+        guard !isLiveStream else {
+            revealControls()
+            return
+        }
         applyNudge(base, holdMode: false)
     }
 
@@ -2706,6 +2760,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func saveProgress(force: Bool) {
+        guard !isLiveStream else { return }
         // Never persist progress during an Aether→MPV handoff.
         if sessionCoordinator.isProgressSaveSuspended { return }
         let checkpointTime = explicitSeekProgressCheckpoint.flatMap { checkpoint in

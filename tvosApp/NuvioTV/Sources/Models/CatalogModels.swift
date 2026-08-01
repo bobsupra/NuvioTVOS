@@ -482,7 +482,7 @@ enum ContentReleasePolicy {
         return Int(value.prefix(4))
     }
 
-    private static func todayIsoDay() -> String {
+    static func todayIsoDay() -> String {
         let components = Calendar(identifier: .gregorian)
             .dateComponents(in: TimeZone.current, from: Date())
         guard let year = components.year,

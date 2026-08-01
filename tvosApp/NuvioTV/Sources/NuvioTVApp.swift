@@ -240,10 +240,14 @@ struct ContentView: View {
         .onChange(of: profileViewModel.activeProfile?.id) { _ in
             AppLocaleManager.shared.reloadFromProfileStore()
         }
-        // Home publishes its first sections once the new profile's rows are
-        // built; that is the moment there is something whole to reveal.
-        .onChange(of: homeStore.sections.count) { count in
-            guard isPreparingProfile, count > 0 else { return }
+        // Keep the profile cover up until the progressive catalog stream has
+        // finished. Revealing Home when its first row arrived let the user page
+        // that row while later catalog updates were still replacing it; if a
+        // focused, paged-in card disappeared during the replacement, tvOS moved
+        // focus to the row above. `hasLoaded` flips only after the final tree is
+        // published, so the first interactive frame is stable.
+        .onChange(of: homeStore.hasLoaded) { loaded in
+            guard isPreparingProfile, loaded else { return }
             profileGateContentReady()
         }
         // Backing out of the switch must not leave the cover behind.
@@ -1835,24 +1839,15 @@ private struct TVMainTabView: View {
         return activeProfile?.id == "guest" ? activeProfile : nil
     }
 
-    /// Name shown on the fallback profile tab (tvOS < 27), mirroring the
-    /// sidebar header's display-name logic.
+    /// Name shown on the profile tab, mirroring the sidebar header's
+    /// display-name logic.
     private var profileTabTitle: String {
         guard let displayedProfile else { return "Nuvio Guest" }
         return ProfileDisplayName.resolve(profile: displayedProfile, settingsName: settingsProfileName)
     }
 
     var body: some View {
-        if #available(tvOS 27.0, *) {
-            tabs
-                .tabViewStyle(.sidebarAdaptable)
-                .tabViewSidebarHeader {
-                    TVSidebarProfileHeader(
-                        profile: displayedProfile,
-                        action: onSwitchProfile
-                    )
-                }
-        } else if #available(tvOS 18.0, *) {
+        if #available(tvOS 18.0, *) {
             tabs
                 .tabViewStyle(.sidebarAdaptable)
         } else {
@@ -1862,27 +1857,26 @@ private struct TVMainTabView: View {
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {
-            // tvOS 27 surfaces the profile in the sidebar header; older tvOS has
-            // no sidebar-header API, so expose the profile as a dedicated tab.
+            // Keep profile switching as a regular tab on every supported tvOS
+            // version. This compiles with the tvOS 26.5 SDK and remains visible
+            // when the app is sideloaded onto tvOS 27.
             // The tab label carries the profile name + avatar icon so the menu
             // shows who's signed in instead of a generic "Profile" entry. Its
             // content stays empty: selecting it goes straight to profile
             // switching, while editing now lives in Settings.
-            if #unavailable(tvOS 27.0) {
-                Color.clear
-                    .tabItem {
-                        Label {
-                            Text(profileTabTitle)
-                        } icon: {
-                            if let avatar = profileTabAvatar.image {
-                                Image(uiImage: avatar).renderingMode(.original)
-                            } else {
-                                Image(systemName: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId))
-                            }
+            Color.clear
+                .tabItem {
+                    Label {
+                        Text(profileTabTitle)
+                    } icon: {
+                        if let avatar = profileTabAvatar.image {
+                            Image(uiImage: avatar).renderingMode(.original)
+                        } else {
+                            Image(systemName: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId))
                         }
                     }
-                    .tag(TVTab.profile)
-            }
+                }
+                .tag(TVTab.profile)
 
             TVHomeView(
                 store: homeStore,
@@ -2239,6 +2233,12 @@ struct TVHomeView: View {
     @State private var continueWatchingCardIDs: [String] = []
     @Environment(\.isEnabled) private var isEnabled
     @State private var focusedRowIndex = 0
+    /// Explicit destination for an Up/Down move between manually positioned
+    /// rows. A row below the vertical clip may be mounted but still invisible
+    /// to tvOS spatial focus until it has held focus once, which otherwise
+    /// creates a one-way wall partway down Home.
+    @State private var verticalMoveTargetCardID: String?
+    @State private var verticalMoveGeneration = 0
     /// Measured height per section id (collection vs catalog rows differ).
     @State private var measuredRowHeights: [String: CGFloat] = [:]
     @State private var verticalOffset: CGFloat = 0
@@ -2250,6 +2250,10 @@ struct TVHomeView: View {
     /// there would let `defaultFocus` reclaim focus the moment Menu tries to
     /// hand it to the sidebar.
     @State private var isGridHeroFocused = false
+    /// Suppress the one focus/layout animation caused by returning to Home from
+    /// another tab. Normal left/right focus animations remain enabled.
+    @State private var suppressReturnFocusAnimations = false
+    @State private var returnFocusAnimationGeneration = 0
 
     private var tmdbHomeSettingsKey: String {
         "\(tmdbEnabled)|\(tmdbLanguage)|\(tmdbUseArtwork)|\(tmdbUseBasicInfo)"
@@ -2376,7 +2380,7 @@ struct TVHomeView: View {
                         // later section titles sit from the row above.
                         VStack(spacing: TVHomeLayout.sectionSpacing) {
                             ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                                if shouldMaterializeHomeRow(index, sectionId: section.id, total: sections.count) {
+                                if shouldMaterializeHomeRow(index, sectionId: section.id, sections: sections) {
                                     if section.isLoadingPlaceholder {
                                         TVLoadingCatalogRow(title: section.title)
                                             .background(
@@ -2404,13 +2408,11 @@ struct TVHomeView: View {
                                             },
                                             onFocus: { folder in
                                                 if focusedRowIndex != index {
-                                                    focusedRowIndex = index
-                                                    verticalOffset = offsetForRow(index, in: sections)
+                                                    scrollHomeRows(to: index, in: sections)
                                                 }
                                                 // Row window + card focus update immediately; hero /
                                                 // full-screen backdrop wait for settle so horizontal
                                                 // paging does not thrash decode + layout each step.
-                                                focusedSectionId = section.id
                                                 overlayRestoreCardID = nil
                                                 let cardKey = "\(section.id)\u{1}\(folder.id)"
                                                 focusedCardID = cardKey
@@ -2421,6 +2423,9 @@ struct TVHomeView: View {
                                                 onOpenCollectionFolder(folder, section.title)
                                             }
                                         )
+                                        .onMoveCommand { direction in
+                                            moveFocusVertically(from: index, direction: direction)
+                                        }
                                         .background(
                                             GeometryReader { rowGeo in
                                                 Color.clear.preference(
@@ -2444,6 +2449,7 @@ struct TVHomeView: View {
                                         landscapeFocusedId: landscapeFocusedId(for: section.id),
                                         externalFocus: $focusedCardID,
                                         restrictFocusToCardKey: overlayRestoreCardID,
+                                        suppressFocusAnimations: suppressReturnFocusAnimations,
                                         onInitialFocusRequested: {
                                             didRequestInitialCardFocus = true
                                         },
@@ -2453,12 +2459,10 @@ struct TVHomeView: View {
                                             // moves keep the offset rock-steady so
                                             // lower rows don't flicker at the clip.
                                             if focusedRowIndex != index {
-                                                focusedRowIndex = index
-                                                verticalOffset = offsetForRow(index, in: sections)
+                                                scrollHomeRows(to: index, in: sections)
                                             }
                                             // Immediate: focus engine + row window.
                                             // Deferred: hero text + full-screen backdrop.
-                                            focusedSectionId = section.id
                                             focusedCardID = "\(section.id)\u{1}\(meta.id)"
                                             settleCatalogFocus(on: meta, in: section.id)
                                             scheduleLandscapeFocus(cardKey: "\(section.id)\u{1}\(meta.id)")
@@ -2478,12 +2482,16 @@ struct TVHomeView: View {
                                                 // Details takes ownership of the
                                                 // focus engine, avoiding a one-
                                                 // frame outline flicker on entry.
-                                                overlayRestoreCardID = "\(section.id)\u{1}\(meta.id)"
+                                                let cardKey = "\(section.id)\u{1}\(meta.id)"
+                                                overlayRestoreCardID = cardKey
                                                 onNavigateToDetails(meta.id, meta.type)
                                             }
                                         },
                                         onLongPress: longPressHandler(for: section.id)
                                     )
+                                    .onMoveCommand { direction in
+                                        moveFocusVertically(from: index, direction: direction)
+                                    }
                                     .background(
                                         GeometryReader { rowGeo in
                                             Color.clear.preference(
@@ -2503,7 +2511,6 @@ struct TVHomeView: View {
                         .padding(.top, TVHomeLayout.rowsTopPadding)
                         .frame(width: proxy.size.width, alignment: .topLeading)
                         .offset(y: verticalOffset)
-                        .animation(smoothFocus ? TVHomeLayout.scrollSpring : nil, value: verticalOffset)
                         }
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
@@ -2551,6 +2558,12 @@ struct TVHomeView: View {
             #if DEBUG
             print("[ContinueWatching] Home appeared source=\(selectedProgressSource.rawValue)")
             #endif
+            // A TabView may recreate Home instead of keeping it mounted. Arm
+            // before its saved focus is restored so the first layout pass is
+            // already non-animated.
+            if isActive, store.lastFocusedCardID != nil {
+                armReturnFocusAnimationSuppression()
+            }
             // Classic was never a distinct layout; collapse legacy values to Modern.
             if homeLayout == "Classic" { homeLayout = "Modern" }
             refreshContinueWatching()
@@ -2591,10 +2604,33 @@ struct TVHomeView: View {
         // to Home does not reliably produce another onAppear.
         .onChange(of: isActive) { active in
             if active {
+                // A tab switch can also toggle the environment's `isEnabled`.
+                // That is not an overlay dismissal, so discard any focus lock
+                // accidentally captured while Home was becoming inactive.
+                if overlayRestoreCardID != nil {
+                    overlayRestoreGeneration &+= 1
+                    overlayRestoreCardID = nil
+                }
+                // Usually armed while leaving Home. Re-arm here as a fallback
+                // for TabView implementations that recreate the selected tab.
+                if !suppressReturnFocusAnimations {
+                    armReturnFocusAnimationSuppression()
+                }
+                if focusedCardID != nil {
+                    releaseReturnFocusAnimationSuppression()
+                }
                 #if DEBUG
                 logRowWindow("home became active")
                 #endif
                 scheduleContinueWatchingRefresh()
+            } else {
+                // Details and Player leave Home selected; a real tab change
+                // must never carry their one-card restoration lock back Home.
+                overlayRestoreGeneration &+= 1
+                overlayRestoreCardID = nil
+                // Arm before tvOS removes card focus. Waiting until Home becomes
+                // active again is too late: focus restoration has already begun.
+                armReturnFocusAnimationSuppression()
             }
         }
         .onChange(of: continueWatchingSort) { _ in
@@ -2671,6 +2707,9 @@ struct TVHomeView: View {
             if let newValue {
                 store.lastFocusedCardID = newValue
                 shouldRestoreHomeFocus = false
+                if isActive {
+                    releaseReturnFocusAnimationSuppression()
+                }
                 // Restoration complete -- lift the focus restriction.
                 if isEnabled, newValue == overlayRestoreCardID {
                     overlayRestoreCardID = nil
@@ -2696,6 +2735,13 @@ struct TVHomeView: View {
         // card is unfocusable (the Settings sidebar trick), so the engine can
         // only land back on the saved card -- no scroll-to-top flash.
         .onChange(of: isEnabled) { enabled in
+            // TabView may disable an unselected Home tab. Only Details/Player
+            // restoration happens while Home is still the selected tab.
+            guard isActive else {
+                overlayRestoreGeneration &+= 1
+                overlayRestoreCardID = nil
+                return
+            }
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreCardID = focusedCardID ?? store.lastFocusedCardID
@@ -2790,7 +2836,6 @@ struct TVHomeView: View {
                             onInitialFocusRequested: { didRequestInitialCardFocus = true },
                             onFocus: { folder in
                                 focusedRowIndex = index
-                                focusedSectionId = section.id
                                 overlayRestoreCardID = nil
                                 focusedCardID = "\(section.id)\u{1}\(folder.id)"
                                 settleFolderFocus(folder, in: section.id)
@@ -2813,10 +2858,10 @@ struct TVHomeView: View {
                             landscapeFocusedId: nil,
                             externalFocus: $focusedCardID,
                             restrictFocusToCardKey: overlayRestoreCardID,
+                            suppressFocusAnimations: suppressReturnFocusAnimations,
                             onInitialFocusRequested: { didRequestInitialCardFocus = true },
                             onFocus: { meta in
                                 focusedRowIndex = index
-                                focusedSectionId = section.id
                                 focusedCardID = "\(section.id)\u{1}\(meta.id)"
                                 settleCatalogFocus(on: meta, in: section.id)
                             },
@@ -2839,7 +2884,6 @@ struct TVHomeView: View {
                             onInitialFocusRequested: { didRequestInitialCardFocus = true },
                             onFocus: { meta in
                                 focusedRowIndex = index
-                                focusedSectionId = section.id
                                 focusedCardID = "\(section.id)\u{1}\(meta.id)"
                                 settleCatalogFocus(on: meta, in: section.id)
                             },
@@ -2983,10 +3027,21 @@ struct TVHomeView: View {
     /// section is nowhere in the list, mount every row rather than guessing. One
     /// pass of extra rows in a rare case is a far better trade than a Home the
     /// user cannot navigate out of.
-    private func shouldMaterializeHomeRow(_ index: Int, sectionId: String, total: Int) -> Bool {
+    private func shouldMaterializeHomeRow(
+        _ index: Int,
+        sectionId: String,
+        sections: [TVHomeSection]
+    ) -> Bool {
+        let total = sections.count
         guard total > 0 else { return false }
 
-        let sections = visibleSections.filter(\.hasContent)
+        // A normal Home (including GG's 20 sections) is small enough to keep
+        // its row containers stable. Sliding the row window on every Up/Down
+        // press removed and recreated hundreds of focusable UIKit descendants,
+        // stalling the main thread before the offset animation could start.
+        // Card-level virtualization below keeps the retained rows lightweight.
+        if total <= 24 { return true }
+
         let focusedSection = focusedCardID.flatMap { key in
             key.split(separator: "\u{1}", maxSplits: 1).first.map(String.init)
         } ?? focusedSectionId
@@ -3015,6 +3070,88 @@ struct TVHomeView: View {
         let rowPrefix = "\(sectionId)\u{1}"
         return initialFocusCardKey?.hasPrefix(rowPrefix) == true
             || overlayRestoreCardID?.hasPrefix(rowPrefix) == true
+            || verticalMoveTargetCardID?.hasPrefix(rowPrefix) == true
+    }
+
+    /// Routes vertical focus by row identity instead of asking tvOS spatial
+    /// focus to discover a card beyond `VerticalEdgeClip`. Loading skeletons
+    /// are skipped because they intentionally contain no focusable controls.
+    private func moveFocusVertically(from sourceIndex: Int, direction: MoveCommandDirection) {
+        let delta: Int
+        switch direction {
+        case .up:
+            delta = -1
+        case .down:
+            delta = 1
+        default:
+            return
+        }
+
+        let sections = visibleSections.filter(\.hasContent)
+        guard sections.indices.contains(sourceIndex), overlayRestoreCardID == nil else { return }
+
+        var targetIndex = sourceIndex + delta
+        while sections.indices.contains(targetIndex), sections[targetIndex].isLoadingPlaceholder {
+            targetIndex += delta
+        }
+        guard sections.indices.contains(targetIndex) else { return }
+
+        let targetSection = sections[targetIndex]
+        let targetCardID: String
+        if !targetSection.collectionFolders.isEmpty {
+            let cardIndex = min(
+                max(rowScrollStore.index(for: targetSection.id), 0),
+                targetSection.collectionFolders.count - 1
+            )
+            rowScrollStore.setIndex(cardIndex, for: targetSection.id)
+            targetCardID = "\(targetSection.id)\u{1}\(targetSection.collectionFolders[cardIndex].id)"
+        } else {
+            guard !targetSection.items.isEmpty else { return }
+            let cardIndex = min(
+                max(rowScrollStore.index(for: targetSection.id), 0),
+                targetSection.items.count - 1
+            )
+            rowScrollStore.setIndex(cardIndex, for: targetSection.id)
+            targetCardID = "\(targetSection.id)\u{1}\(targetSection.items[cardIndex].id)"
+        }
+
+        verticalMoveGeneration &+= 1
+        let generation = verticalMoveGeneration
+        verticalMoveTargetCardID = targetCardID
+
+        // Match horizontal paging: move focus immediately and let the focused
+        // card's callback drive the row offset. Reassert once on the next turn
+        // so a late spatial-focus update cannot undo a fast Up/Down press.
+        focusedCardID = targetCardID
+        DispatchQueue.main.async {
+            guard verticalMoveGeneration == generation else { return }
+            focusedCardID = targetCardID
+            verticalMoveTargetCardID = nil
+        }
+    }
+
+    /// Moves the vertical strip from the destination card's focus callback,
+    /// exactly like `TVCatalogRow` updates its horizontal `scrollIndex`.
+    /// Keeping animation inside the user-driven update prevents geometry and
+    /// restoration corrections from accidentally animating the whole stack.
+    private func scrollHomeRows(to index: Int, in sections: [TVHomeSection]) {
+        let targetOffset = offsetForRow(index, in: sections)
+        let updateScrollPosition = {
+            focusedRowIndex = index
+            verticalOffset = targetOffset
+        }
+
+        if smoothFocus && !suppressReturnFocusAnimations {
+            withAnimation(TVHomeLayout.scrollSpring) {
+                updateScrollPosition()
+            }
+        } else {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                updateScrollPosition()
+            }
+        }
     }
 
     /// Vertical translation that lands the row at `index` flush under the hero.
@@ -3062,11 +3199,14 @@ struct TVHomeView: View {
         // each focus update. Keep the original copy-on-write item arrays intact.
         guard hideUnreleased else { return allSections }
 
+        let today = ContentReleasePolicy.todayIsoDay()
         return allSections.map { section in
             // Collection folder rows don't carry title posters; leave them intact.
             if !section.collectionFolders.isEmpty { return section }
             var copy = section
-            copy.items = section.items.filter(isVisible)
+            copy.items = section.items.filter {
+                !ContentReleasePolicy.isUnreleased($0, today: today)
+            }
             return copy
         }
     }
@@ -3627,7 +3767,7 @@ struct TVHomeView: View {
     /// feel responsive when parked, long enough that continuous left/right/up/down
     /// focus does not kick off decode/crossfade every step.
     private var heroSettleNanoseconds: UInt64 {
-        fastNavigation ? 120_000_000 : 250_000_000
+        fastNavigation ? 120_000_000 : 300_000_000
     }
 
     /// Catalog title focus: card strip + row offset are immediate; hero/backdrop
@@ -3662,7 +3802,14 @@ struct TVHomeView: View {
 
             if hasFolderPending {
                 guard let folder = focusWork.pendingFocusedFolder,
-                      folder.id == targetFolderId else { return }
+                      folder.id == targetFolderId,
+                      let targetSectionId,
+                      focusWork.pendingSectionId == targetSectionId else { return }
+                // The section is part of the hero state: Continue Watching can
+                // change the episode line and description for the same title.
+                // Publish it with the settled card, not with the first focus
+                // callback during a rapid move.
+                focusedSectionId = targetSectionId
                 // Publish folder hero only when it actually changes.
                 if focusedCollectionFolder?.id != folder.id {
                     focusedCollectionFolder = folder
@@ -3674,9 +3821,12 @@ struct TVHomeView: View {
             }
 
             guard let settledMeta = focusWork.pendingFocusedMeta,
-                  settledMeta.id == targetMetaId else { return }
+                  settledMeta.id == targetMetaId,
+                  let targetSectionId,
+                  focusWork.pendingSectionId == targetSectionId else { return }
 
             // Leaving a folder hero: clear only after settle so backdrop stays frozen.
+            focusedSectionId = targetSectionId
             if focusedCollectionFolder != nil {
                 focusedCollectionFolder = nil
             }
@@ -3773,6 +3923,13 @@ struct TVHomeView: View {
     }
 
     private func scheduleLandscapeFocus(cardKey: String) {
+        guard !suppressReturnFocusAnimations else {
+            focusWork.pendingLandscapeFocusedId = nil
+            landscapeFocusedId = nil
+            focusWork.landscapeFocusTask?.cancel()
+            return
+        }
+
         guard trailersEnabled else {
             focusWork.pendingLandscapeFocusedId = nil
             landscapeFocusedId = nil
@@ -3799,6 +3956,30 @@ struct TVHomeView: View {
             }
 
             landscapeFocusedId = targetKey
+        }
+    }
+
+    private func armReturnFocusAnimationSuppression() {
+        returnFocusAnimationGeneration &+= 1
+        var transaction = Transaction()
+        transaction.animation = nil
+        withTransaction(transaction) {
+            suppressReturnFocusAnimations = true
+            landscapeFocusedId = nil
+        }
+        focusWork.pendingLandscapeFocusedId = nil
+        focusWork.landscapeFocusTask?.cancel()
+    }
+
+    private func releaseReturnFocusAnimationSuppression() {
+        guard suppressReturnFocusAnimations else { return }
+        let generation = returnFocusAnimationGeneration
+
+        // Let the restored card and row settle for a couple of frames while
+        // animations are disabled, then restore normal navigation motion.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
+            guard isActive, returnFocusAnimationGeneration == generation else { return }
+            suppressReturnFocusAnimations = false
         }
     }
 
@@ -3862,7 +4043,7 @@ struct TVHomeView: View {
             sections.firstIndex(where: { $0.id == id })
         }
         let materialized = sections.indices.filter {
-            shouldMaterializeHomeRow($0, sectionId: sections[$0].id, total: sections.count)
+            shouldMaterializeHomeRow($0, sectionId: sections[$0].id, sections: sections)
         }
         print("[HomeRows] \(reason): focusedCardID=\(focusedCardID ?? "nil") "
             + "focusedSectionId=\(focusedSectionId ?? "nil") focusedRowIndex=\(focusedRowIndex) "
@@ -4438,7 +4619,10 @@ final class TVHomeStore: ObservableObject {
     }
 }
 
-private let TVHomeRowPrefetchThreshold = 6
+// Android triggers pagination from the last visible card, six cards from the
+// end. tvOS triggers from the focused card instead, so include the roughly six
+// cards already visible ahead of focus to give network requests the same runway.
+private let TVHomeRowPrefetchThreshold = 12
 
 /// Hero header while a collection folder card is focused.
 /// Full-screen backdrop is driven by `homeBackdropURL` (folder hero backdrop).
@@ -4720,7 +4904,7 @@ private struct TVGridHeroSlideshowView: View {
         VStack(alignment: .leading, spacing: 10) {
             if let logoURL = item.logoUrl, !logoURL.isEmpty {
                 CachedHeroLogo(url: logoURL, title: item.name)
-                    .frame(maxHeight: 80, alignment: .leading)
+                    .frame(maxHeight: 88, alignment: .leading)
             } else {
                 Text(item.name)
                     .font(.custom("Inter-Bold", size: 46))
@@ -4794,7 +4978,7 @@ private struct CachedHeroLogo: View {
     }
 
     var body: some View {
-        // Size to the logo's intrinsic aspect (capped at 440×114) instead of a
+        // Size to the logo's intrinsic aspect (capped at 520×136) instead of a
         // fixed 114pt slot. A short/wide wordmark centered in a tall frame left
         // a dead band under the title before the first catalog row; text
         // fallback must not reserve that slot either.
@@ -4815,7 +4999,7 @@ private struct CachedHeroLogo: View {
                             .id(loadedURL)
                     }
                 }
-                .frame(maxWidth: 440, maxHeight: 114, alignment: .bottomLeading)
+                .frame(maxWidth: 520, maxHeight: 136, alignment: .bottomLeading)
             } else {
                 Text(title)
                     .font(.custom("Inter-Bold", size: 54))
@@ -4931,6 +5115,9 @@ private struct TVCatalogRow: View {
     /// sidebar trick. Used during overlay-dismiss focus restoration so the
     /// engine can only land on the saved card, never flashing the first one.
     var restrictFocusToCardKey: String? = nil
+    /// Suppresses the one focus/layout animation caused by returning to Home
+    /// from another tab. Normal left/right focus animation remains enabled.
+    var suppressFocusAnimations: Bool = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (NuvioMeta) -> Void
     let onBlur: (NuvioMeta) -> Void
@@ -4938,10 +5125,10 @@ private struct TVCatalogRow: View {
     let onSelect: (NuvioMeta) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
-    // Index of the card whose leading edge is pinned under the title. Driven by
-    // focus and intentionally NOT reset on blur, so the row keeps its position
-    // when focus moves to another row and comes back (tvOS focus memory).
-    @State private var scrollIndex: Int = 0
+    // Nil means this row was just remounted: render from the cached index on its
+    // very first frame instead of briefly drawing at zero. That first-frame jump
+    // can make tvOS choose the adjacent poster during rapid vertical reversal.
+    @State private var scrollIndex: Int?
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
@@ -4959,6 +5146,34 @@ private struct TVCatalogRow: View {
     // card ever becomes landscape, and that never changes the leading edge of
     // cards before it, so the step is always the portrait width + spacing.
     private var step: CGFloat { compactPosterWidth + rowSpacing }
+
+    private var effectiveScrollIndex: Int {
+        scrollIndex ?? initialScrollIndex
+    }
+
+    /// Keep a complete visible page ahead plus four cards behind for fast
+    /// reverse movement. This fills the row even when the focused Modern card
+    /// expands to landscape, while retained row containers keep Up/Down smooth.
+    private func materializedCardIndices(visibleCardCount: Int) -> [Int] {
+        guard !items.isEmpty else { return [] }
+        let focusIndex = min(max(effectiveScrollIndex, 0), items.count - 1)
+        var lowerBound = max(0, focusIndex - 4)
+        var upperBound = min(items.count - 1, focusIndex + visibleCardCount)
+
+        // Focus restoration targets must exist even if the stored horizontal
+        // index has not caught up with the saved card yet.
+        let rowPrefix = "\(id)\u{1}"
+        for key in [initialFocusCardKey, restrictFocusToCardKey] {
+            guard let key, key.hasPrefix(rowPrefix) else { continue }
+            let itemID = String(key.dropFirst(rowPrefix.count))
+            if let targetIndex = items.firstIndex(where: { $0.id == itemID }) {
+                lowerBound = min(lowerBound, targetIndex)
+                upperBound = max(upperBound, targetIndex)
+            }
+        }
+
+        return Array(lowerBound...upperBound)
+    }
 
     // Card height (315) + vertical breathing room for the focus border/shadow.
     private var stripHeight: CGFloat {
@@ -4982,6 +5197,7 @@ private struct TVCatalogRow: View {
                 .font(.custom("Inter-Bold", size: 30))
                 .foregroundColor(.white)
                 .padding(.leading, TVLayout.rowLeading)
+                .offset(y: 8)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .zIndex(1)
 
@@ -4989,11 +5205,6 @@ private struct TVCatalogRow: View {
                 .zIndex(0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .onAppear {
-            if scrollIndex != initialScrollIndex {
-                scrollIndex = initialScrollIndex
-            }
-        }
     }
 
     // A definite-size clipping window for the cards. A GeometryReader imposes
@@ -5009,9 +5220,15 @@ private struct TVCatalogRow: View {
             let rowPosterLabels = posterLabels
             let rowSmoothFocus = smoothFocus
             let rowFocusHighlighter = focusHighlighter
+            let rowCardFocusAnimations = rowSmoothFocus && !suppressFocusAnimations
+            let rowPosterWidth: CGFloat = rowHomeLayout == "Compact" ? 170 : 210
+            let rowCardSpacing: CGFloat = rowHomeLayout == "Compact" ? 22 : 28
+            let visibleCardCount = max(1, Int(ceil(stripWidth / (rowPosterWidth + rowCardSpacing))) + 1)
+            let materializedIndices = materializedCardIndices(visibleCardCount: visibleCardCount)
 
-            HStack(alignment: .bottom, spacing: rowHomeLayout == "Compact" ? 22 : 28) {
-                ForEach(items) { item in
+            HStack(alignment: .bottom, spacing: rowCardSpacing) {
+                ForEach(materializedIndices, id: \.self) { itemIndex in
+                    let item = items[itemIndex]
                     let cardKey = "\(id)\u{1}\(item.id)"
                     let shouldRequestInitialFocus = cardKey == initialFocusCardKey
                     let progressItem = progressByItemId[item.id]
@@ -5029,10 +5246,21 @@ private struct TVCatalogRow: View {
                         shouldRequestInitialFocus: shouldRequestInitialFocus,
                         onInitialFocusRequested: shouldRequestInitialFocus ? onInitialFocusRequested : nil,
                         onFocus: { focused in
-                            if let index = items.firstIndex(where: { $0.id == focused.id }) {
-                                if scrollIndex != index {
-                                    scrollIndex = index
-                                    onScrollIndexChange(index)
+                            if effectiveScrollIndex != itemIndex {
+                                let updateScrollPosition = {
+                                    scrollIndex = itemIndex
+                                    onScrollIndexChange(itemIndex)
+                                }
+                                if rowSmoothFocus && !suppressFocusAnimations {
+                                    withAnimation(TVHomeLayout.scrollSpring) {
+                                        updateScrollPosition()
+                                    }
+                                } else {
+                                    var transaction = Transaction()
+                                    transaction.animation = nil
+                                    withTransaction(transaction) {
+                                        updateScrollPosition()
+                                    }
                                 }
                             }
                             onApproachEnd(focused)
@@ -5046,7 +5274,7 @@ private struct TVCatalogRow: View {
                         onLongPress: onLongPress,
                         layoutMode: rowHomeLayout,
                         showPosterLabels: rowPosterLabels,
-                        smoothFocusAnimations: rowSmoothFocus,
+                        smoothFocusAnimations: rowCardFocusAnimations,
                         focusHighlighterEnabled: rowFocusHighlighter,
                         retainFocusAppearance: restrictFocusToCardKey == cardKey,
                         isWatched: isWatched(item)
@@ -5056,6 +5284,7 @@ private struct TVCatalogRow: View {
                     .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
                 }
             }
+            .padding(.leading, CGFloat(materializedIndices.first ?? 0) * (rowPosterWidth + rowCardSpacing))
             .padding(.vertical, TVHomeLayout.stripVerticalPadding)
             // Pin the focused card's leading edge directly under the title
             // (TVLayout.rowLeading) by translating the strip left scrollIndex steps.
@@ -5064,7 +5293,7 @@ private struct TVCatalogRow: View {
             // tvOS overrides ScrollViewReader.scrollTo (no-op once a card is
             // already on-screen, which the focus engine guarantees), so we
             // position manually -- mirroring the Android TV BringIntoViewSpec.
-            .offset(x: edgeInset + TVLayout.rowLeading - CGFloat(scrollIndex) * ((rowHomeLayout == "Compact" ? 170 : 210) + (rowHomeLayout == "Compact" ? 22 : 28)))
+            .offset(x: edgeInset + TVLayout.rowLeading - CGFloat(effectiveScrollIndex) * (rowPosterWidth + rowCardSpacing))
             .frame(
                 width: stripWidth,
                 height: (rowHomeLayout == "Compact" ? 255 : 315)
@@ -5074,8 +5303,9 @@ private struct TVCatalogRow: View {
             )
             .clipped()
             .offset(x: -edgeInset)
-            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: scrollIndex)
-            .animation(rowSmoothFocus ? TVHomeLayout.scrollSpring : nil, value: landscapeFocusedId)
+            // `scrollIndex` is animated explicitly in the focus callback so
+            // user navigation still springs while restoration can snap quietly.
+            .animation(rowCardFocusAnimations ? TVHomeLayout.scrollSpring : nil, value: landscapeFocusedId)
         }
         .frame(height: stripHeight)
     }

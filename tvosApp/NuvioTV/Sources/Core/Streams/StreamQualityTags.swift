@@ -35,9 +35,9 @@ struct StreamQualityTags: Equatable, Codable {
             " profile 5", "profile 5", " profile 7", "profile 7", " profile 8", "profile 8",
             " dv ", "dv.", ".dv.", "[dv]", "(dv)"
         ]) || text.range(of: #"\bdv\b"#, options: .regularExpression) != nil
-        tags.isHDR = tags.isDolbyVision || textContainsAny(text, [
-            "hdr10+", "hdr10", "hdr", "hlg", "pq10"
-        ])
+        // Match HDR markers as standalone release tokens. `HDRip` is a common
+        // SDR release label (High Definition rip), not an HDR transfer.
+        tags.isHDR = tags.isDolbyVision || textContainsHDRToken(text)
         tags.isAtmos = textContainsAny(text, [
             "atmos", "truehd atmos", "ddp atmos", "eac3 atmos", "dd+ atmos"
         ])
@@ -110,6 +110,13 @@ struct StreamQualityTags: Equatable, Codable {
 
     private static func textContainsAny(_ text: String, _ needles: [String]) -> Bool {
         needles.contains { text.contains($0) }
+    }
+
+    private static func textContainsHDRToken(_ text: String) -> Bool {
+        text.range(
+            of: #"(?<![a-z0-9])(?:hdr10\+?|hdr|hlg|pq10)(?![a-z0-9])"#,
+            options: .regularExpression
+        ) != nil
     }
 }
 
@@ -486,24 +493,45 @@ enum StreamBadgeSettingsStore {
     static let changedNotification = Notification.Name("NuvioStreamBadgeSettingsChanged")
     static let goldBadgePackURL = "https://raw.githubusercontent.com/djgenesis/badges/refs/heads/main/gold_badges_complete.json"
 
+    private static var cachedSnapshot: StreamBadgeSettingsSnapshot?
+    private static var cachedProfileScope: String?
+    private static var cachedRulesValue: String?
+
     static var snapshot: StreamBadgeSettingsSnapshot {
+        let profileScope = ProfileSettings.activeProfileScope
         let defaults = ProfileSettings.current
+        let storedRules = defaults.string(forKey: SettingsKey.streamBadgeRules)
+        let storedPlacement = defaults.string(forKey: SettingsKey.streamBadgePlacement)
+        let storedFileSize = defaults.object(forKey: SettingsKey.showFileSizeBadges) as? Bool ?? true
+        let storedAddonLogo = defaults.object(forKey: SettingsKey.showAddonLogo) as? Bool ?? false
+        let placement = StreamBadgePlacement(rawValue: storedPlacement ?? StreamBadgePlacement.bottom.rawValue) ?? .bottom
+
+        if cachedProfileScope == profileScope,
+           cachedRulesValue == storedRules,
+           let cachedSnapshot,
+           cachedSnapshot.showFileSizeBadges == storedFileSize,
+           cachedSnapshot.showAddonLogo == storedAddonLogo,
+           cachedSnapshot.badgePlacement == placement {
+            return cachedSnapshot
+        }
+
         let rules: StreamBadgeRules
-        if let data = defaults.string(forKey: SettingsKey.streamBadgeRules)?.data(using: .utf8),
+        if let data = storedRules?.data(using: .utf8),
            let decoded = try? JSONDecoder().decode(StreamBadgeRules.self, from: data) {
             rules = decoded.normalized()
         } else {
             rules = StreamBadgeRules()
         }
-        let placement = StreamBadgePlacement(
-            rawValue: defaults.string(forKey: SettingsKey.streamBadgePlacement) ?? StreamBadgePlacement.bottom.rawValue
-        ) ?? .bottom
-        return StreamBadgeSettingsSnapshot(
+        let snapshot = StreamBadgeSettingsSnapshot(
             rules: rules,
-            showFileSizeBadges: defaults.object(forKey: SettingsKey.showFileSizeBadges) as? Bool ?? true,
-            showAddonLogo: defaults.object(forKey: SettingsKey.showAddonLogo) as? Bool ?? false,
+            showFileSizeBadges: storedFileSize,
+            showAddonLogo: storedAddonLogo,
             badgePlacement: placement
         )
+        cachedProfileScope = profileScope
+        cachedRulesValue = storedRules
+        cachedSnapshot = snapshot
+        return snapshot
     }
 
     static func saveRules(_ rules: StreamBadgeRules) {
@@ -577,6 +605,9 @@ enum StreamBadgeSettingsStore {
     }
 
     static func postChanged() {
+        cachedSnapshot = nil
+        cachedProfileScope = nil
+        cachedRulesValue = nil
         DispatchQueue.main.async {
             NotificationCenter.default.post(name: changedNotification, object: nil)
         }
@@ -584,23 +615,108 @@ enum StreamBadgeSettingsStore {
 }
 
 enum StreamBadgeMatcher {
+    private struct CachedRegex {
+        let expression: NSRegularExpression
+        let requiresIndividualCandidates: Bool
+    }
+
+    private static var regexCache: [String: CachedRegex] = [:]
+    private static var invalidPatterns: Set<String> = []
+    private static let regexCacheLimit = 512
+
     static func matchedBadges(for stream: NuvioStream, rules: StreamBadgeRules) -> [StreamBadgeFilter] {
-        guard let active = rules.normalized().activeImport else { return [] }
+        // Store snapshots are normalized before they reach the picker. Avoid
+        // normalizing the complete badge pack again for every stream card.
+        guard let active = rules.activeImport else { return [] }
         let candidates = matchCandidates(for: stream)
-        guard !candidates.isEmpty else { return [] }
+        guard let combinedCandidate = candidates.last else { return [] }
+        let combinedRange = NSRange(
+            combinedCandidate.startIndex..<combinedCandidate.endIndex,
+            in: combinedCandidate
+        )
         var result: [StreamBadgeFilter] = []
         var seen = Set<String>()
         for filter in active.filters where filter.isEnabled {
-            guard let regex = try? NSRegularExpression(pattern: filter.pattern) else { continue }
-            let matched = candidates.contains { candidate in
-                let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
-                return regex.firstMatch(in: candidate, range: range) != nil
+            guard let cached = regularExpression(for: filter.pattern) else { continue }
+            var matched = cached.expression.firstMatch(
+                in: combinedCandidate,
+                range: combinedRange
+            ) != nil
+
+            // Joining fields preserves ordinary word/spacing boundaries and
+            // reduces the normal path from up to eight regex scans to one.
+            // Explicit start/end anchors still need the original per-field
+            // behavior when the combined candidate does not match.
+            if !matched, cached.requiresIndividualCandidates, candidates.count > 1 {
+                matched = candidates.dropLast().contains { candidate in
+                    let range = NSRange(candidate.startIndex..<candidate.endIndex, in: candidate)
+                    return cached.expression.firstMatch(in: candidate, range: range) != nil
+                }
             }
             guard matched else { continue }
             let key = (filter.imageURL.isEmpty ? filter.name : filter.imageURL).lowercased()
             if seen.insert(key).inserted { result.append(filter) }
         }
         return result
+    }
+
+    private static func regularExpression(for pattern: String) -> CachedRegex? {
+        if let cached = regexCache[pattern] {
+            return cached
+        }
+        if invalidPatterns.contains(pattern) {
+            return nil
+        }
+
+        guard let regex = try? NSRegularExpression(pattern: pattern) else {
+            invalidPatterns.insert(pattern)
+            return nil
+        }
+
+        let cached = CachedRegex(
+            expression: regex,
+            requiresIndividualCandidates: hasFieldBoundaryAnchor(pattern)
+        )
+
+        if regexCache.count >= regexCacheLimit {
+            regexCache.removeAll(keepingCapacity: true)
+            invalidPatterns.removeAll(keepingCapacity: true)
+        }
+        regexCache[pattern] = cached
+        return cached
+    }
+
+    /// Detect anchors that change meaning when separately searchable stream
+    /// fields are joined. Carets inside character classes and escaped literals
+    /// are deliberately ignored.
+    private static func hasFieldBoundaryAnchor(_ pattern: String) -> Bool {
+        var isEscaped = false
+        var isInsideCharacterClass = false
+
+        for scalar in pattern.unicodeScalars {
+            if isEscaped {
+                if !isInsideCharacterClass,
+                   scalar == "A" || scalar == "Z" || scalar == "z" || scalar == "G" {
+                    return true
+                }
+                isEscaped = false
+                continue
+            }
+
+            switch scalar {
+            case "\\":
+                isEscaped = true
+            case "[":
+                isInsideCharacterClass = true
+            case "]":
+                isInsideCharacterClass = false
+            case "^", "$" where !isInsideCharacterClass:
+                return true
+            default:
+                break
+            }
+        }
+        return false
     }
 
     static func matchCandidates(for stream: NuvioStream) -> [String] {

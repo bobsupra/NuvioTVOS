@@ -58,6 +58,10 @@ struct PosterCard: View {
     @FocusState private var isFocused: Bool
     @State private var didRequestInitialFocus = false
     @State private var landscapeArtworkPrepared = false
+    /// Rapid navigation should not start a separate backdrop/episode-art decode
+    /// for every card passed over. Arm that preload only after focus has settled,
+    /// matching Home's hero debounce.
+    @State private var landscapePreloadArmed = false
     #endif
 
     var body: some View {
@@ -81,8 +85,19 @@ struct PosterCard: View {
                 if focused {
                     onFocus?(meta)
                 } else {
+                    landscapePreloadArmed = false
                     onBlur?(meta)
                 }
+            }
+            .task(id: isFocused) {
+                guard isFocused else { return }
+                do {
+                    try await Task.sleep(nanoseconds: 300_000_000)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled, isFocused else { return }
+                landscapePreloadArmed = true
             }
             .onAppear {
                 guard shouldRequestInitialFocus, !didRequestInitialFocus else {
@@ -278,24 +293,23 @@ struct PosterCard: View {
     private var continueProgressOverlay: some View {
         if let continueProgress, !continueIsUpNext {
             let progress = CGFloat(min(max(continueProgress, 0), 1))
-            GeometryReader { geo in
-                let width = max(0, geo.size.width - 44)
+            let width = max(0, cardWidth - 44)
 
-                VStack {
-                    Spacer()
-                    ZStack(alignment: .leading) {
-                        Capsule()
-                            .fill(Color.white.opacity(0.38))
-                            .frame(width: width, height: 8)
+            VStack {
+                Spacer(minLength: 0)
+                ZStack(alignment: .leading) {
+                    Capsule()
+                        .fill(Color.white.opacity(0.38))
+                        .frame(width: width, height: 8)
 
-                        Capsule()
-                            .fill(Color.white)
-                            .frame(width: max(8, width * progress), height: 8)
-                    }
-                    .padding(.leading, 22)
-                    .padding(.bottom, 16)
+                    Capsule()
+                        .fill(Color.white)
+                        .frame(width: max(8, width * progress), height: 8)
                 }
+                .padding(.leading, 22)
+                .padding(.bottom, 16)
             }
+            .frame(width: cardWidth, height: cardHeight, alignment: .bottomLeading)
         }
     }
 
@@ -347,11 +361,11 @@ struct PosterCard: View {
     }
 
     private var landscapeLogoWidth: CGFloat {
-        250
+        275
     }
 
     private var landscapeLogoHeight: CGFloat {
-        76
+        84
     }
 
     private var cardCornerRadius: CGFloat {
@@ -371,7 +385,7 @@ struct PosterCard: View {
     }
 
     private var landscapePreloadURL: String? {
-        isFocused ? landscapeArtworkURL : nil
+        landscapePreloadArmed || isLandscape ? landscapeArtworkURL : nil
     }
 
     private var artworkDecodeWidth: CGFloat {
@@ -862,13 +876,19 @@ private actor PosterArtworkCache {
             // Disk before network, like Coil. The bytes are keyed by URL alone,
             // so one stored poster serves every size a card asks for.
             if let stored = await PosterDiskCache.shared.data(for: url),
-               let image = downsamplePosterImage(data: stored, maxPixelSize: boundedPixelSize) {
+               let image = await PosterDecodeLimiter.shared.image(
+                   from: stored,
+                   maxPixelSize: boundedPixelSize
+               ) {
                 return image
             }
 
             guard let data = await downloadPosterData(url: url) else { return nil }
             await PosterDiskCache.shared.store(data, for: url)
-            return downsamplePosterImage(data: data, maxPixelSize: boundedPixelSize)
+            return await PosterDecodeLimiter.shared.image(
+                from: data,
+                maxPixelSize: boundedPixelSize
+            )
         }
 
         inFlight[key as String] = task
@@ -879,6 +899,49 @@ private actor PosterArtworkCache {
             cache.setObject(image, forKey: key, cost: image.decodedByteCost)
         }
         return image
+    }
+}
+
+/// Coil naturally keeps decode work bounded. Match that behavior so mounting a
+/// newly visible Home shelf cannot fan out into a burst of AppleJPEG workers.
+private actor PosterDecodeLimiter {
+    static let shared = PosterDecodeLimiter(maxConcurrentDecodes: 3)
+
+    private let maxConcurrentDecodes: Int
+    private var activeDecodes = 0
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    init(maxConcurrentDecodes: Int) {
+        self.maxConcurrentDecodes = max(1, maxConcurrentDecodes)
+    }
+
+    func image(from data: Data, maxPixelSize: Int) async -> UIImage? {
+        await acquire()
+        defer { release() }
+
+        guard !Task.isCancelled else { return nil }
+        return await Task.detached(priority: .utility) {
+            downsamplePosterImage(data: data, maxPixelSize: maxPixelSize)
+        }.value
+    }
+
+    private func acquire() async {
+        if activeDecodes < maxConcurrentDecodes {
+            activeDecodes += 1
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waiters.append(continuation)
+        }
+    }
+
+    private func release() {
+        if waiters.isEmpty {
+            activeDecodes -= 1
+        } else {
+            waiters.removeFirst().resume()
+        }
     }
 }
 
