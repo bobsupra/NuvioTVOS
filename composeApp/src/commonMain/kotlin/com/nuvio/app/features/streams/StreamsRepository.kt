@@ -104,6 +104,7 @@ object StreamsRepository {
         val playerSettings = PlayerSettingsRepository.uiState.value
         val debridSettings = DebridSettingsRepository.snapshot()
         val streamBadgeRules = StreamBadgeSettingsRepository.snapshot()
+        val streamBadgeFilters = StreamBadgeMatcher.compile(streamBadgeRules)
         val autoPlayMode = playerSettings.streamAutoPlayMode
         val isAutoPlayEnabled = !manualSelection && autoPlayMode != StreamAutoPlayMode.MANUAL &&
             !(autoPlayMode == StreamAutoPlayMode.REGEX_MATCH &&
@@ -143,7 +144,7 @@ object StreamsRepository {
             )
             val presentedGroup = StreamBadgePresentation.apply(
                 groups = listOf(group),
-                rules = streamBadgeRules,
+                filters = streamBadgeFilters,
             ).firstOrNull() ?: group
             _uiState.value = StreamsUiState(
                 requestToken = requestToken,
@@ -253,7 +254,7 @@ object StreamsRepository {
             fun presentStreamGroup(group: AddonStreamGroup): AddonStreamGroup {
                 val badgeGroup = StreamBadgePresentation.apply(
                     groups = listOf(group),
-                    rules = streamBadgeRules,
+                    filters = streamBadgeFilters,
                 ).firstOrNull() ?: group
                 return DebridStreamPresentation.apply(
                     groups = listOf(badgeGroup),
@@ -799,4 +800,3 @@ object StreamsRepository {
         _uiState.update { it.copy(showDirectAutoPlayOverlay = visible, overlayMessage = message) }
     }
 }
-

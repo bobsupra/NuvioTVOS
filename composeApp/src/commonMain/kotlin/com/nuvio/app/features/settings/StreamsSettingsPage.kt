@@ -16,6 +16,8 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.text.KeyboardActions
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Delete
 import androidx.compose.material.icons.rounded.Visibility
@@ -42,6 +44,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
@@ -244,6 +247,24 @@ private fun BadgeUrlManagerDialog(
     var isImporting by rememberSaveable { mutableStateOf(false) }
     var previewImport by remember { mutableStateOf<StreamBadgeImport?>(null) }
 
+    fun importDraftUrl() {
+        if (isImporting) return
+        scope.launch {
+            isImporting = true
+            errorMessage = null
+            when (val result = StreamBadgeSettingsRepository.importStreamBadgeRulesFromUrl(draftUrl)) {
+                is StreamBadgeImportResult.Success -> {
+                    draftUrl = ""
+                    isImporting = false
+                }
+                is StreamBadgeImportResult.Error -> {
+                    errorMessage = result.message
+                    isImporting = false
+                }
+            }
+        }
+    }
+
     BasicAlertDialog(onDismissRequest = onDismiss) {
         SettingsDialogSurface(title = stringResource(Res.string.settings_stream_badge_urls_title)) {
             Text(
@@ -263,6 +284,8 @@ private fun BadgeUrlManagerDialog(
                 minLines = 2,
                 maxLines = 4,
                 enabled = !isImporting,
+                keyboardOptions = KeyboardOptions(imeAction = ImeAction.Done),
+                keyboardActions = KeyboardActions(onDone = { importDraftUrl() }),
                 colors = OutlinedTextFieldDefaults.colors(
                     focusedBorderColor = tokens.colors.borderFocus.copy(alpha = tokens.opacity.strong),
                     unfocusedBorderColor = tokens.colors.borderDefault.copy(alpha = tokens.opacity.medium),
@@ -288,22 +311,7 @@ private fun BadgeUrlManagerDialog(
                 )
                 Button(
                     enabled = !isImporting && draftUrl.isNotBlank(),
-                    onClick = {
-                        scope.launch {
-                            isImporting = true
-                            errorMessage = null
-                            when (val result = StreamBadgeSettingsRepository.importStreamBadgeRulesFromUrl(draftUrl)) {
-                                is StreamBadgeImportResult.Success -> {
-                                    draftUrl = ""
-                                    isImporting = false
-                                }
-                                is StreamBadgeImportResult.Error -> {
-                                    errorMessage = result.message
-                                    isImporting = false
-                                }
-                            }
-                        }
-                    },
+                    onClick = ::importDraftUrl,
                 ) {
                     if (isImporting) {
                         CircularProgressIndicator(

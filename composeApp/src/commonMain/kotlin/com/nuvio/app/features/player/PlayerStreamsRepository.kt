@@ -158,6 +158,7 @@ object PlayerStreamsRepository {
         stateFlow.value = StreamsUiState()
 
         val streamBadgeRules = StreamBadgeSettingsRepository.snapshot()
+        val streamBadgeFilters = StreamBadgeMatcher.compile(streamBadgeRules)
         val embeddedStreams = MetaDetailsRepository.findEmbeddedStreams(videoId)
         if (embeddedStreams.isNotEmpty()) {
             log.d { "Using ${embeddedStreams.size} embedded streams for type=$type id=$videoId" }
@@ -169,7 +170,7 @@ object PlayerStreamsRepository {
             )
             val presentedGroup = StreamBadgePresentation.apply(
                 groups = listOf(group),
-                rules = streamBadgeRules,
+                filters = streamBadgeFilters,
             ).firstOrNull() ?: group
             stateFlow.value = StreamsUiState(
                 groups = listOf(presentedGroup),
@@ -270,7 +271,7 @@ object PlayerStreamsRepository {
             fun presentStreamGroup(group: AddonStreamGroup): AddonStreamGroup {
                 val badgeGroup = StreamBadgePresentation.apply(
                     groups = listOf(group),
-                    rules = streamBadgeRules,
+                    filters = streamBadgeFilters,
                 ).firstOrNull() ?: group
                 return DebridStreamPresentation.apply(
                     groups = listOf(badgeGroup),
@@ -507,5 +508,4 @@ private fun StreamsUiState.streamDiagnostics(): String {
 
 private fun com.nuvio.app.features.addons.ManagedAddon.streamAddonInstanceId(manifestId: String): String =
     "addon:$manifestId:$manifestUrl"
-
 

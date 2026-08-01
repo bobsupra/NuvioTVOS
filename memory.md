@@ -442,3 +442,46 @@ the release version and `BUILD` with the next integer build number.
    tag, version/build, test count, byte size, SHA-256, and a concise grouped
    change list. Call out any physical-device behavior that still needs real
    Apple TV validation.
+
+## Future exact-ID IPA creation for the physical Apple TV
+
+Last verified: 2026-08-01 with NuvioTV 3.2.2 (build 53).
+
+Use this procedure when creating a future IPA that the user can install over
+the existing beta app instead of receiving a second app:
+
+1. Preserve the exact main-app bundle identifier in the packaged app:
+   `CFBundleIdentifier = com.nuvio.app.tv`.
+2. Create the device-signed installation IPA separately from the unsigned
+   GitHub release artifact. Use a name such as
+   `NuvioTV-X.Y.Z-BUILD-exact-id-signed.ipa` so the two cannot be confused.
+3. Sign with a currently valid tvOS provisioning profile and its matching
+   certificate/private key. The working free-provisioning arrangement keeps
+   both `CFBundleIdentifier` and `ALTBundleIdentifier` set to
+   `com.nuvio.app.tv`; its profile/application-identifier may contain Apple's
+   generated suffix. Never commit or print the signing key or credentials.
+4. Verify the final IPA before installation:
+   - version and build are the intended release
+   - `CFBundleIdentifier` is exactly `com.nuvio.app.tv`
+   - `ALTBundleIdentifier`, when present, is `com.nuvio.app.tv`
+   - the embedded profile contains the target Apple TV UDID and has not expired
+   - `codesign --verify --deep --strict` succeeds on the extracted app
+   - record the byte size and SHA-256
+5. Deliver the verified exact-ID IPA to the user. Do not open, control, or
+   install it through Sideloadly unless the user explicitly asks. Mention in
+   the handoff that this already-signed IPA should be installed with
+   Sideloadly's **Normal Install** mode; Apple ID Sideload can re-sign it,
+   rewrite the identifier to a suffixed ID, and install a duplicate app.
+6. Free provisioning expires. Generate a fresh matching profile/signature for
+   later IPAs rather than reusing an expired package. The profile used for the
+   verified build expires on 2026-08-06.
+7. Top Shelf needs its own valid extension provisioning profile. If one is not
+   available, omit `PlugIns/TopShelf.appex` from the sideloaded package and
+   state that limitation in the handoff; do not leave an incorrectly signed
+   extension in the IPA.
+
+Verified reference artifact:
+
+- `build/NuvioTV-3.2.2-53-exact-id-signed.ipa`
+- SHA-256:
+  `bac3d45ad2694b04645bef533cf00a7725da837b08bcbd218707d4d62a888f0e`

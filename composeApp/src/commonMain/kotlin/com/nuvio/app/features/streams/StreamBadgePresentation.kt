@@ -1,8 +1,13 @@
 package com.nuvio.app.features.streams
 
 object StreamBadgePresentation {
-    fun apply(groups: List<AddonStreamGroup>, rules: StreamBadgeRules): List<AddonStreamGroup> {
-        val filters = StreamBadgeMatcher.compile(rules)
+    fun apply(groups: List<AddonStreamGroup>, rules: StreamBadgeRules): List<AddonStreamGroup> =
+        apply(groups, StreamBadgeMatcher.compile(rules))
+
+    fun apply(
+        groups: List<AddonStreamGroup>,
+        filters: List<CompiledStreamBadgeFilter>,
+    ): List<AddonStreamGroup> {
         if (filters.isEmpty()) return groups
         return groups.map { group ->
             group.copy(
