@@ -306,20 +306,10 @@ class PlayerViewModel: ObservableObject {
         playerController.onPlaybackSuspended = suspend
         aetherController.onPlaybackSuspended = suspend
         aetherController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
-            switch outcome {
-            case .success:
-                self?.showPlayerToast("AI subtitles on")
-            case .failure(let error):
-                self?.showPlayerToast("AI subtitles unavailable — \(error.localizedDescription)")
-            }
+            self?.handleAISubtitleTranslationOutcome(outcome)
         }
         playerController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
-            switch outcome {
-            case .success:
-                self?.showPlayerToast("AI subtitles on")
-            case .failure(let error):
-                self?.showPlayerToast("AI subtitles unavailable — \(error.localizedDescription)")
-            }
+            self?.handleAISubtitleTranslationOutcome(outcome)
         }
         sessionCoordinator.onHandoffToast = { [weak self] message in
             self?.hdrModeToast = message
@@ -1102,6 +1092,23 @@ class PlayerViewModel: ObservableObject {
             if self.playerToast == message {
                 self.playerToast = nil
             }
+        }
+    }
+
+    static func shouldShowAISubtitleOutcome(subtitle: String, isLiveStream: Bool) -> Bool {
+        !isLiveStream && subtitle != PlaybackMarkers.trailerSubtitle
+    }
+
+    private func handleAISubtitleTranslationOutcome(_ outcome: Result<Void, Error>) {
+        guard Self.shouldShowAISubtitleOutcome(
+            subtitle: subtitle,
+            isLiveStream: isLiveStream
+        ) else { return }
+        switch outcome {
+        case .success:
+            showPlayerToast("AI subtitles on")
+        case .failure(let error):
+            showPlayerToast("AI subtitles unavailable — \(error.localizedDescription)")
         }
     }
 
@@ -1998,7 +2005,10 @@ class PlayerViewModel: ObservableObject {
     /// user's global integration preference.
     var canManuallyToggleAISubtitleTranslation: Bool {
         let settings = AISubtitleTranslationSettings.current()
-        return settings.isEnabled && !settings.apiKey.isEmpty && !settings.autoSelect
+        return settings.isEnabled
+            && !settings.apiKey.isEmpty
+            && !settings.autoSelect
+            && Self.shouldShowAISubtitleOutcome(subtitle: subtitle, isLiveStream: isLiveStream)
     }
 
     func setAISubtitleTranslationManuallyEnabled(_ enabled: Bool) {

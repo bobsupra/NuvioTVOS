@@ -712,6 +712,9 @@ struct PlayerSettingsPanel: View {
         case color(String)
         case opacityMinus, opacityPlus
         case outline
+        case background
+        case backgroundColor(String)
+        case backgroundOpacityMinus, backgroundOpacityPlus
     }
 
     private enum AudioControl: Hashable {
@@ -734,6 +737,7 @@ struct PlayerSettingsPanel: View {
 
     /// Swatches shown in the Text Color row (white, gray, yellow, blue, red, green).
     private static let palette = ["#FFFFFF", "#C7C7C7", "#F2C94C", "#56CCF2", "#EB5757", "#6FCF97"]
+    private static let backgroundPalette = ["#000000", "#303030", "#FFFFFF", "#1F3A5F", "#5A1F2B", "#214D35"]
 
     @State private var tab: Tab = .subtitles
     @State private var selectedLanguage: String?
@@ -1154,6 +1158,25 @@ struct PlayerSettingsPanel: View {
                     toggleRow(title: "Outline", isOn: style.outlineEnabled, focusKey: .outline) {
                         updateStyle { $0.outlineEnabled.toggle() }
                     }
+
+                    toggleRow(title: "Background", isOn: style.backgroundEnabled, focusKey: .background) {
+                        updateStyle { $0.backgroundEnabled.toggle() }
+                    }
+
+                    backgroundColorRow
+                        .opacity(style.backgroundEnabled ? 1 : 0.46)
+                        .disabled(!style.backgroundEnabled)
+
+                    stepperRow(
+                        title: "Background Opacity",
+                        value: "\(style.backgroundOpacity)%",
+                        minusKey: .backgroundOpacityMinus,
+                        plusKey: .backgroundOpacityPlus,
+                        onMinus: { updateStyle { $0.backgroundOpacity = max($0.backgroundOpacity - 5, 10) } },
+                        onPlus: { updateStyle { $0.backgroundOpacity = min($0.backgroundOpacity + 5, 100) } }
+                    )
+                    .opacity(style.backgroundEnabled ? 1 : 0.46)
+                    .disabled(!style.backgroundEnabled)
                 }
                 .padding(.vertical, 6)
                 .padding(.bottom, 26)
@@ -1174,6 +1197,10 @@ struct PlayerSettingsPanel: View {
         defaults.set(style.textColorHex, forKey: SubtitleStyleKey.textColor)
         defaults.set(style.textOpacity, forKey: SubtitleStyleKey.textOpacity)
         defaults.set(style.outlineEnabled, forKey: SubtitleStyleKey.outlineEnabled)
+        defaults.set(style.outlineColorHex, forKey: SubtitleStyleKey.outlineColor)
+        defaults.set(style.backgroundEnabled, forKey: SubtitleStyleKey.backgroundEnabled)
+        defaults.set(style.backgroundColorHex, forKey: SubtitleStyleKey.backgroundColor)
+        defaults.set(style.backgroundOpacity, forKey: SubtitleStyleKey.backgroundOpacity)
         viewModel.applySubtitleStyle()
     }
 
@@ -1270,6 +1297,44 @@ struct PlayerSettingsPanel: View {
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focus, equals: .style(.color(hex)))
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.14 : 1)
+        .zIndex(isFocused ? 1 : 0)
+        .animation(.easeOut(duration: 0.14), value: isFocused)
+    }
+
+    private var backgroundColorRow: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            styleLabel("Background Color")
+            HStack(spacing: 20) {
+                ForEach(Self.backgroundPalette, id: \.self) { hex in
+                    backgroundColorSwatch(hex)
+                }
+            }
+        }
+    }
+
+    private func backgroundColorSwatch(_ hex: String) -> some View {
+        let isFocused = focus == .style(.backgroundColor(hex))
+        let isSelected = style.backgroundColorHex.caseInsensitiveCompare(hex) == .orderedSame
+        return Button {
+            updateStyle { $0.backgroundColorHex = hex }
+        } label: {
+            Circle()
+                .fill(Color(hex: hex))
+                .frame(width: 52, height: 52)
+                .overlay(Circle().strokeBorder(Color.white.opacity(0.22), lineWidth: 1))
+                .overlay(
+                    Circle()
+                        .strokeBorder(
+                            isFocused ? Color.white : (isSelected ? Color.white.opacity(0.75) : .clear),
+                            lineWidth: isFocused ? AppFocusOutline.width : 3
+                        )
+                        .padding(-6)
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focus, equals: .style(.backgroundColor(hex)))
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.14 : 1)
         .zIndex(isFocused ? 1 : 0)

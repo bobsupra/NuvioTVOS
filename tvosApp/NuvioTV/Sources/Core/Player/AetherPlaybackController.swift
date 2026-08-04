@@ -52,19 +52,18 @@ final class AISubtitleTranslationState: ObservableObject {
     private var didReportSuccess = false
     private var didReportFailure = false
     private var failedCueIDs: Set<Int> = []
+    private var hasPermanentProviderFailure = false
     private var manualActivation = false
     private var lastCues: [SubtitleCue] = []
     private var lastSourceTime: Double = 0
     private var currentSettings: AISubtitleTranslationSettings?
     private var nextBatchStartAt = Date.distantPast
-    private var retryAttempt = 0
     // Translate a short startup/seek window one cue at a time so text becomes
     // visible as each response arrives. Then resume low-overhead bulk batches.
     private let playbackPriorityBatchSize = 8
     private let maximumConcurrentPriorityRequests = 4
     private var remainingPriorityCueIDs: [Int] = []
     private var needsPriorityPrefetch = true
-    private let batchSize = 40
     private let minimumBatchInterval: TimeInterval = 2
 
     var isConfigured: Bool {
@@ -115,6 +114,15 @@ final class AISubtitleTranslationState: ObservableObject {
             deactivate()
             return
         }
+        guard cues.contains(where: { cue in
+            guard let text = cue.text else { return false }
+            return !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }) else {
+            // Do not validate credentials or announce AI translation until the
+            // selected track has supplied actual text cues.
+            deactivate()
+            return
+        }
         guard !settings.apiKey.isEmpty else {
             deactivate()
             report(.failure(AISubtitleTranslationError.missingAPIKey))
@@ -130,9 +138,9 @@ final class AISubtitleTranslationState: ObservableObject {
             translatedTextBySource = [:]
             translatingCueIDs = []
             failedCueIDs = []
+            hasPermanentProviderFailure = false
             sessionID = UUID()
             currentSettings = settings
-            retryAttempt = 0
             nextBatchStartAt = .distantPast
             remainingPriorityCueIDs = []
             needsPriorityPrefetch = true
@@ -150,18 +158,20 @@ final class AISubtitleTranslationState: ObservableObject {
         didReportSuccess = false
         didReportFailure = false
         failedCueIDs = []
+        hasPermanentProviderFailure = false
         manualActivation = false
         lastCues = []
         lastSourceTime = 0
         currentSettings = nil
-        retryAttempt = 0
         nextBatchStartAt = .distantPast
         remainingPriorityCueIDs = []
         needsPriorityPrefetch = true
     }
 
     private func startNextBatchIfNeeded(settings: AISubtitleTranslationSettings) {
-        guard batchTask == nil, delayedBatchTask == nil else { return }
+        guard !hasPermanentProviderFailure,
+              batchTask == nil,
+              delayedBatchTask == nil else { return }
         let now = Date()
         guard now >= nextBatchStartAt else {
             scheduleNextBatch(at: nextBatchStartAt, settings: settings)
@@ -208,7 +218,14 @@ final class AISubtitleTranslationState: ObservableObject {
             startPriorityTranslations(from: availableCues, settings: settings)
             return
         }
-        let pendingCues = Array(availableCues.prefix(batchSize))
+        let pendingIDs = Set(
+            AISubtitleBatching.batches(
+                availableCues.map { .init(id: $0.id, text: $0.source) }
+            )
+            .first?
+            .map(\.id) ?? []
+        )
+        let pendingCues = availableCues.filter { pendingIDs.contains($0.id) }
         guard !pendingCues.isEmpty else { return }
 
         translatingCueIDs.formUnion(pendingCues.map(\.id))
@@ -233,10 +250,11 @@ final class AISubtitleTranslationState: ObservableObject {
                 }
 
                 if !uncachedCues.isEmpty {
-                    let translated = try await AISubtitleTranslator.translateBatch(
-                        uncachedCues.map { .init(id: $0.id, text: $0.source) },
-                        settings: settings
-                    )
+                    let translated = try await AISubtitleBatchRecovery.translate(
+                        uncachedCues.map { .init(id: $0.id, text: $0.source) }
+                    ) { items in
+                        try await AISubtitleTranslator.translateBatch(items, settings: settings)
+                    }
                     for cue in uncachedCues {
                         guard let text = translated[cue.id] else {
                             throw AISubtitleTranslationError.invalidResponse
@@ -356,23 +374,16 @@ final class AISubtitleTranslationState: ObservableObject {
                 translatedTextBySource[cue.sourceIdentity] = translated
             }
             remainingPriorityCueIDs.removeAll { $0 == cue.id }
-            retryAttempt = 0
             report(outcome)
             startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
         case .failure(let error):
-            if let retryDelay = Self.retryDelay(for: error, attempt: retryAttempt) {
-                retryAttempt += 1
-                nextBatchStartAt = Date().addingTimeInterval(retryDelay)
-                report(outcome)
-                scheduleNextBatch(
-                    at: nextBatchStartAt,
-                    settings: currentSettings ?? AISubtitleTranslationSettings.current()
-                )
-            } else {
-                failedCueIDs.insert(cue.id)
-                remainingPriorityCueIDs.removeAll { $0 == cue.id }
-                retryAttempt = 0
-                report(outcome)
+            failedCueIDs.insert(cue.id)
+            remainingPriorityCueIDs.removeAll { $0 == cue.id }
+            if (error as? AISubtitleTranslationError)?.isPermanentLimitError == true {
+                stopTranslationAfterPermanentProviderFailure()
+            }
+            report(outcome)
+            if !hasPermanentProviderFailure {
                 startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
             }
         }
@@ -393,20 +404,16 @@ final class AISubtitleTranslationState: ObservableObject {
                     translatedTextBySource[cue.sourceIdentity] = translated
                 }
             }
-            retryAttempt = 0
             nextBatchStartAt = Date().addingTimeInterval(minimumBatchInterval)
             report(outcome)
             startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
         case .failure(let error):
-            if let retryDelay = Self.retryDelay(for: error, attempt: retryAttempt) {
-                retryAttempt += 1
-                nextBatchStartAt = Date().addingTimeInterval(retryDelay)
-                report(outcome)
-                scheduleNextBatch(at: nextBatchStartAt, settings: currentSettings ?? AISubtitleTranslationSettings.current())
-            } else {
-                failedCueIDs.formUnion(cues.map(\.id))
-                retryAttempt = 0
-                report(outcome)
+            failedCueIDs.formUnion(cues.map(\.id))
+            if (error as? AISubtitleTranslationError)?.isPermanentLimitError == true {
+                stopTranslationAfterPermanentProviderFailure()
+            }
+            report(outcome)
+            if !hasPermanentProviderFailure {
                 startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
             }
         }
@@ -442,9 +449,9 @@ final class AISubtitleTranslationState: ObservableObject {
     private func deactivate() {
         cancelTranslationWork()
         failedCueIDs = []
+        hasPermanentProviderFailure = false
         currentSettings = nil
         sessionID = UUID()
-        retryAttempt = 0
         nextBatchStartAt = .distantPast
         remainingPriorityCueIDs = []
         needsPriorityPrefetch = true
@@ -462,19 +469,12 @@ final class AISubtitleTranslationState: ObservableObject {
         priorityTasks = [:]
     }
 
-    private static func retryDelay(for error: Error, attempt: Int) -> TimeInterval? {
-        if let error = error as? AISubtitleTranslationError,
-           error.isRetryable {
-            if let retryAfter = error.retryAfter {
-                return retryAfter
-            }
-            return min(60, pow(2, Double(min(attempt, 5))) * 4)
-        }
-        if let error = error as? URLError,
-           error.code != .cancelled {
-            return min(60, pow(2, Double(min(attempt, 5))) * 4)
-        }
-        return nil
+    private func stopTranslationAfterPermanentProviderFailure() {
+        hasPermanentProviderFailure = true
+        cancelTranslationWork()
+        translatingCueIDs = []
+        remainingPriorityCueIDs = []
+        nextBatchStartAt = .distantPast
     }
 
     /// Removes the common SDH / hearing-impaired annotations before the cue is
@@ -522,8 +522,32 @@ enum AISubtitleTranslationError: LocalizedError {
     var isRetryable: Bool {
         switch self {
         case .service(let statusCode, _, _):
-            return statusCode == 429 || (500...599).contains(statusCode)
+            return !isPermanentLimitError
+                && (statusCode == 429 || (500...599).contains(statusCode))
         case .missingAPIKey, .invalidResponse:
+            return false
+        }
+    }
+
+    var isPermanentLimitError: Bool {
+        guard case .service(_, let message, let retryAfter) = self else { return false }
+        // Providers commonly describe temporary RPM/TPM throttles as a
+        // "quota" error. A retry hint means the condition is temporary.
+        guard retryAfter == nil else { return false }
+        return Self.isPermanentQuotaOrBillingLimit(message)
+    }
+
+    var shouldSplitBatch: Bool {
+        switch self {
+        case .invalidResponse:
+            return true
+        case .service(let statusCode, let message, _):
+            let normalized = message.lowercased()
+            return statusCode == 413
+                || ((400...499).contains(statusCode)
+                    && ["too large", "context length", "token limit", "maximum tokens", "request size"]
+                        .contains { normalized.contains($0) })
+        case .missingAPIKey:
             return false
         }
     }
@@ -538,10 +562,28 @@ enum AISubtitleTranslationError: LocalizedError {
         case .missingAPIKey:
             return "Add an API key for the selected provider in Settings → Integrations → AI Subtitles."
         case .invalidResponse:
-            return "The AI subtitle provider returned no translated text."
+            return "The AI subtitle provider returned no translated text. Original subtitles will remain visible."
+        case .service where isPermanentLimitError:
+            return "AI subtitle translation stopped because the provider reported a quota, billing, credit, or daily limit. Original subtitles will remain visible."
         case .service(_, let message, _):
             return message
         }
+    }
+
+    private static func isPermanentQuotaOrBillingLimit(_ message: String) -> Bool {
+        let normalized = message.lowercased()
+        return [
+            "billing",
+            "credit",
+            "daily limit",
+            "daily-limit",
+            "daily quota",
+            "quota exhausted",
+            "quota_exhausted",
+            "insufficient quota",
+            "insufficient funds",
+            "payment required",
+        ].contains { normalized.contains($0) }
     }
 }
 
@@ -550,56 +592,305 @@ struct AISubtitleTranslationItem: Sendable {
     let text: String
 }
 
+/// Batches always end at a cue boundary. The estimates deliberately reserve
+/// room for the translation prompt, JSON envelope, and a longer translated
+/// response, not just the source text sent to the provider.
+enum AISubtitleBatching {
+    static let maximumCueCount = 40
+    static let maximumEstimatedRequestBytes = 24_000
+    static let maximumEstimatedRequestTokens = 6_000
+
+    static func batches(_ items: [AISubtitleTranslationItem]) -> [[AISubtitleTranslationItem]] {
+        guard !items.isEmpty else { return [] }
+        var result: [[AISubtitleTranslationItem]] = []
+        var batch: [AISubtitleTranslationItem] = []
+
+        for item in items {
+            let candidate = batch + [item]
+            if !batch.isEmpty && !fits(candidate) {
+                result.append(batch)
+                batch = [item]
+            } else {
+                batch = candidate
+            }
+        }
+        if !batch.isEmpty { result.append(batch) }
+        return result
+    }
+
+    static func splitInHalf(_ items: [AISubtitleTranslationItem]) -> (
+        [AISubtitleTranslationItem], [AISubtitleTranslationItem]
+    ) {
+        let midpoint = items.count / 2
+        return (Array(items[..<midpoint]), Array(items[midpoint...]))
+    }
+
+    static func estimatedInputTokens(for items: [AISubtitleTranslationItem]) -> Int {
+        let sourceBytes = items.reduce(0) { $0 + $1.text.utf8.count }
+        // Subtitle text is mostly Latin but names and CJK content can cost
+        // more; three bytes per token is a conservative lightweight estimate.
+        return (sourceBytes + 2) / 3
+    }
+
+    static func estimatedRequestBytes(for items: [AISubtitleTranslationItem]) -> Int {
+        let sourceBytes = items.reduce(0) { $0 + $1.text.utf8.count }
+        let jsonAndIDOverhead = items.count * 48
+        let promptReserve = 1_800
+        let outputReserve = Int(Double(sourceBytes) * 1.8) + items.count * 64
+        return promptReserve + sourceBytes + jsonAndIDOverhead + outputReserve
+    }
+
+    static func estimatedRequestTokens(for items: [AISubtitleTranslationItem]) -> Int {
+        let input = estimatedInputTokens(for: items)
+        let promptAndJSONReserve = 420 + items.count * 12
+        let translatedOutputReserve = Int(Double(input) * 1.8)
+        return promptAndJSONReserve + input + translatedOutputReserve
+    }
+
+    static func outputTokenLimit(for items: [AISubtitleTranslationItem]) -> Int {
+        let sourceTokens = estimatedInputTokens(for: items)
+        let jsonOverhead = items.count * 8 + 160
+        let output = Int(Double(sourceTokens) * 1.8) + jsonOverhead
+        return min(2_048, max(512, output))
+    }
+
+    private static func fits(_ items: [AISubtitleTranslationItem]) -> Bool {
+        // A single cue cannot be split further. Send it by itself so a
+        // provider-specific size error can be surfaced without dropping it.
+        guard items.count > 1 else { return true }
+        return items.count <= maximumCueCount
+            && estimatedRequestBytes(for: items) <= maximumEstimatedRequestBytes
+            && estimatedRequestTokens(for: items) <= maximumEstimatedRequestTokens
+    }
+}
+
+enum AISubtitleBatchRecovery {
+    static let maximumInvalidResponseSplitDepth = 2
+
+    static func translate(
+        _ items: [AISubtitleTranslationItem],
+        operation: @escaping ([AISubtitleTranslationItem]) async throws -> [Int: String]
+    ) async throws -> [Int: String] {
+        try await translate(
+            items,
+            invalidResponseSplitDepth: 0,
+            operation: operation
+        )
+    }
+
+    private static func translate(
+        _ items: [AISubtitleTranslationItem],
+        invalidResponseSplitDepth: Int,
+        operation: @escaping ([AISubtitleTranslationItem]) async throws -> [Int: String]
+    ) async throws -> [Int: String] {
+        do {
+            let translations = try await operation(items)
+            try validate(translations, for: items)
+            return translations
+        } catch is CancellationError {
+            throw CancellationError()
+        } catch {
+            guard items.count > 1,
+                  let translationError = error as? AISubtitleTranslationError,
+                  translationError.shouldSplitBatch else {
+                throw error
+            }
+            let nextInvalidResponseSplitDepth: Int
+            if case .invalidResponse = translationError {
+                guard invalidResponseSplitDepth < maximumInvalidResponseSplitDepth else {
+                    throw error
+                }
+                nextInvalidResponseSplitDepth = invalidResponseSplitDepth + 1
+            } else {
+                // Explicit request-size/context errors may keep splitting down
+                // to one cue; malformed model output gets only a small budget.
+                nextInvalidResponseSplitDepth = invalidResponseSplitDepth
+            }
+            let (first, second) = AISubtitleBatching.splitInHalf(items)
+            let firstTranslations = try await translate(
+                first,
+                invalidResponseSplitDepth: nextInvalidResponseSplitDepth,
+                operation: operation
+            )
+            let secondTranslations = try await translate(
+                second,
+                invalidResponseSplitDepth: nextInvalidResponseSplitDepth,
+                operation: operation
+            )
+            var combined = firstTranslations
+            for (id, text) in secondTranslations {
+                guard combined[id] == nil else {
+                    throw AISubtitleTranslationError.invalidResponse
+                }
+                combined[id] = text
+            }
+            try validate(combined, for: items)
+            return combined
+        }
+    }
+
+    private static func validate(
+        _ translations: [Int: String],
+        for items: [AISubtitleTranslationItem]
+    ) throws {
+        let expectedIDs = Set(items.map(\.id))
+        guard expectedIDs.count == items.count,
+              translations.count == expectedIDs.count,
+              Set(translations.keys) == expectedIDs,
+              translations.values.allSatisfy({ !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
+    }
+}
+
+enum AISubtitleRetryPolicy {
+    static let maximumAttempts = 5
+
+    /// `completedAttempts` includes the failed request that just completed.
+    static func delay(for error: Error, completedAttempts: Int) -> TimeInterval? {
+        guard completedAttempts < maximumAttempts else { return nil }
+        if let error = error as? AISubtitleTranslationError,
+           error.isRetryable {
+            if let retryAfter = error.retryAfter { return retryAfter }
+        } else if let error = error as? URLError,
+                  error.code != .cancelled {
+            // Network transport errors have no server retry hint.
+        } else {
+            return nil
+        }
+        return min(60, pow(2, Double(completedAttempts - 1)) * 4)
+    }
+
+    static func retryAfter(from headerValue: String, now: Date = Date()) -> TimeInterval? {
+        let trimmed = headerValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let seconds = TimeInterval(trimmed), seconds >= 0 { return seconds }
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "EEE, dd MMM yyyy HH:mm:ss zzz"
+        guard let date = formatter.date(from: trimmed) else { return nil }
+        return max(0, date.timeIntervalSince(now))
+    }
+}
+
+actor AISubtitleRequestPacer {
+    struct Scope: Hashable, Sendable {
+        let provider: String
+        let model: String
+    }
+
+    static let shared = AISubtitleRequestPacer()
+
+    private let minimumSpacing: TimeInterval
+    private var nextStartByScope: [Scope: Date] = [:]
+    private var acquisitionCountByScope: [Scope: Int] = [:]
+
+    init(minimumSpacing: TimeInterval = 0.35) {
+        self.minimumSpacing = max(0, minimumSpacing)
+    }
+
+    func acquire(provider: String, model: String) async throws {
+        let scope = Scope(provider: provider.lowercased(), model: model.lowercased())
+        let now = Date()
+        let scheduled = max(now, nextStartByScope[scope] ?? now)
+        nextStartByScope[scope] = scheduled.addingTimeInterval(minimumSpacing)
+        acquisitionCountByScope[scope, default: 0] += 1
+        let delay = scheduled.timeIntervalSince(now)
+        if delay > 0 {
+            try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+        }
+        try Task.checkCancellation()
+    }
+
+    func acquisitionCount(provider: String, model: String) -> Int {
+        acquisitionCountByScope[
+            Scope(provider: provider.lowercased(), model: model.lowercased())
+        ] ?? 0
+    }
+}
+
 enum AISubtitleTranslator {
     static func translate(
         _ source: String,
         settings: AISubtitleTranslationSettings,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        pacer: AISubtitleRequestPacer = .shared
     ) async throws -> String {
         guard !settings.apiKey.isEmpty else { throw AISubtitleTranslationError.missingAPIKey }
-        switch settings.provider {
-        case .gemini:
-            return try await GeminiSubtitleTranslator.translate(
-                source,
-                to: settings.targetLanguage,
-                model: settings.model,
-                apiKey: settings.apiKey,
-                session: session
-            )
-        case .openRouter:
-            return try await OpenRouterSubtitleTranslator.translate(
-                source,
-                to: settings.targetLanguage,
-                model: settings.model,
-                apiKey: settings.apiKey,
-                session: session
-            )
+        return try await execute(settings: settings, pacer: pacer) {
+            switch settings.provider {
+            case .gemini:
+                return try await GeminiSubtitleTranslator.translate(
+                    source,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey,
+                    session: session
+                )
+            case .openRouter:
+                return try await OpenRouterSubtitleTranslator.translate(
+                    source,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey,
+                    session: session
+                )
+            }
         }
     }
 
     static func translateBatch(
         _ items: [AISubtitleTranslationItem],
         settings: AISubtitleTranslationSettings,
-        session: URLSession = .shared
+        session: URLSession = .shared,
+        pacer: AISubtitleRequestPacer = .shared
     ) async throws -> [Int: String] {
         guard !settings.apiKey.isEmpty else { throw AISubtitleTranslationError.missingAPIKey }
-        switch settings.provider {
-        case .gemini:
-            return try await GeminiSubtitleTranslator.translateBatch(
-                items,
-                to: settings.targetLanguage,
-                model: settings.model,
-                apiKey: settings.apiKey,
-                session: session
-            )
-        case .openRouter:
-            return try await OpenRouterSubtitleTranslator.translateBatch(
-                items,
-                to: settings.targetLanguage,
-                model: settings.model,
-                apiKey: settings.apiKey,
-                session: session
-            )
+        return try await execute(settings: settings, pacer: pacer) {
+            switch settings.provider {
+            case .gemini:
+                return try await GeminiSubtitleTranslator.translateBatch(
+                    items,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey,
+                    session: session
+                )
+            case .openRouter:
+                return try await OpenRouterSubtitleTranslator.translateBatch(
+                    items,
+                    to: settings.targetLanguage,
+                    model: settings.model,
+                    apiKey: settings.apiKey,
+                    session: session
+                )
+            }
+        }
+    }
+
+    private static func execute<T>(
+        settings: AISubtitleTranslationSettings,
+        pacer: AISubtitleRequestPacer,
+        operation: @escaping () async throws -> T
+    ) async throws -> T {
+        var completedAttempts = 0
+        while true {
+            try Task.checkCancellation()
+            try await pacer.acquire(provider: settings.provider.rawValue, model: settings.model)
+            do {
+                return try await operation()
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                completedAttempts += 1
+                guard let delay = AISubtitleRetryPolicy.delay(
+                    for: error,
+                    completedAttempts: completedAttempts
+                ) else {
+                    throw error
+                }
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
         }
     }
 }
@@ -730,7 +1021,7 @@ enum GeminiSubtitleTranslator {
             contents: [Content(parts: [Part(text: prompt)])],
             generationConfig: GenerationConfig(
                 temperature: 0.1,
-                maxOutputTokens: 4_096,
+                maxOutputTokens: AISubtitleBatching.outputTokenLimit(for: items),
                 responseMimeType: "application/json"
             )
         )
@@ -741,7 +1032,9 @@ enum GeminiSubtitleTranslator {
             timeout: 30,
             session: session
         )
-        let outputs = try JSONDecoder().decode([BatchOutput].self, from: Data(response.utf8))
+        guard let outputs = try? JSONDecoder().decode([BatchOutput].self, from: Data(response.utf8)) else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
         let expectedIDs = Set(items.map(\.id))
         var translations: [Int: String] = [:]
         for output in outputs {
@@ -798,7 +1091,7 @@ enum GeminiSubtitleTranslator {
 
     private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
         guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
-        return TimeInterval(value)
+        return AISubtitleRetryPolicy.retryAfter(from: value)
     }
 }
 
@@ -912,10 +1205,12 @@ enum OpenRouterSubtitleTranslator {
             timeout: 30,
             session: session
         )
-        let outputs = try JSONDecoder().decode(
+        guard let outputs = try? JSONDecoder().decode(
             [BatchOutput].self,
             from: Data(stripMarkdownCodeFence(from: response).utf8)
-        )
+        ) else {
+            throw AISubtitleTranslationError.invalidResponse
+        }
         let expectedIDs = Set(items.map(\.id))
         var translations: [Int: String] = [:]
         for output in outputs {
@@ -980,11 +1275,7 @@ enum OpenRouterSubtitleTranslator {
     /// The dynamic completion cap also prevents a short batch from consuming
     /// the former blanket 4,096-token allowance.
     static func batchOutputTokenLimit(for items: [AISubtitleTranslationItem]) -> Int {
-        let sourceBytes = items.reduce(0) { $0 + $1.text.utf8.count }
-        let estimatedSourceTokens = max(1, sourceBytes / 3)
-        let jsonOverhead = items.count * 8 + 160
-        let estimatedOutputTokens = Int(Double(estimatedSourceTokens) * 1.8) + jsonOverhead
-        return min(2_048, max(512, estimatedOutputTokens))
+        AISubtitleBatching.outputTokenLimit(for: items)
     }
 
     static func disablesReasoning(for model: String) -> Bool {
@@ -1002,7 +1293,7 @@ enum OpenRouterSubtitleTranslator {
 
     private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
         guard let value = response.value(forHTTPHeaderField: "Retry-After") else { return nil }
-        return TimeInterval(value)
+        return AISubtitleRetryPolicy.retryAfter(from: value)
     }
 }
 

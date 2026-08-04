@@ -2416,6 +2416,8 @@ struct NuvioCollectionFolder: Decodable, Identifiable {
     var heroBackdropUrl: String?
     var heroVideoUrl: String?
     var titleLogoUrl: String?
+    /// Optional tvOS presentation hint used by curated collection templates.
+    var presentationStyle: String?
     /// Android `tileShape`: POSTER / LANDSCAPE / SQUARE.
     var tileShape: CollectionTileShape
     var sources: [NuvioCollectionSource]
@@ -2426,9 +2428,11 @@ struct NuvioCollectionFolder: Decodable, Identifiable {
         case id, title, coverImageUrl, coverEmoji, tileShape, sources, catalogSources
         case focusGifUrl, focusGifEnabled, hideTitle
         case heroBackdropUrl, heroVideoUrl, titleLogoUrl
+        case presentationStyle
         case cover_image_url, cover_emoji, tile_shape, catalog_sources
         case focus_gif_url, focus_gif_enabled, hide_title
         case hero_backdrop_url, hero_video_url, title_logo_url
+        case presentation_style
     }
 
     init(from decoder: Decoder) throws {
@@ -2453,6 +2457,8 @@ struct NuvioCollectionFolder: Decodable, Identifiable {
             ?? c.decodeIfPresent(String.self, forKey: .hero_video_url)
         titleLogoUrl = try c.decodeIfPresent(String.self, forKey: .titleLogoUrl)
             ?? c.decodeIfPresent(String.self, forKey: .title_logo_url)
+        presentationStyle = try c.decodeIfPresent(String.self, forKey: .presentationStyle)
+            ?? c.decodeIfPresent(String.self, forKey: .presentation_style)
         let shapeRaw = try c.decodeIfPresent(String.self, forKey: .tileShape)
             ?? c.decodeIfPresent(String.self, forKey: .tile_shape)
         tileShape = CollectionTileShape.fromStored(shapeRaw)
@@ -2674,12 +2680,14 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
     let coverEmoji: String?
     let focusGifUrl: String?
     let focusGifEnabled: Bool
+    let hideTitle: Bool
     /// Full-screen Modern Home backdrop when this folder is focused.
     let heroBackdropUrl: String?
     /// Optional looping hero trailer URL (Android Modern Home; not yet played on tvOS).
     let heroVideoUrl: String?
     /// Optional wordmark shown in the hero title area instead of plain text.
     let titleLogoUrl: String?
+    let presentationStyle: String?
     let tileShape: CollectionTileShape
     let sources: [NuvioCollectionSource]
     /// Parent collection view mode (Tabs / Rows / Follow layout).
@@ -2701,9 +2709,11 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
         self.coverEmoji = folder.coverEmoji
         self.focusGifUrl = folder.focusGifUrl
         self.focusGifEnabled = folder.focusGifEnabled
+        self.hideTitle = folder.hideTitle
         self.heroBackdropUrl = folder.heroBackdropUrl
         self.heroVideoUrl = folder.heroVideoUrl
         self.titleLogoUrl = folder.titleLogoUrl
+        self.presentationStyle = folder.presentationStyle
         self.tileShape = folder.tileShape
         self.sources = sources
         self.viewMode = viewMode
@@ -2720,7 +2730,14 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
     /// Backdrop for the full-screen Home layer — matches Android
     /// `firstNonBlank(heroBackdropUrl, coverImageUrl)`.
     var preferredHeroBackdropURLString: String? {
-        for candidate in [heroBackdropUrl, coverImageUrl] {
+        // Cinematic templates use transparent/wordmark artwork as their tile;
+        // do not enlarge that logo into the full-screen Home backdrop.
+        let style = presentationStyle?.uppercased()
+        let usesLogoTile = style == "STREAMING_SERVICE" || style == "STUDIO_FRANCHISE"
+        let candidates = usesLogoTile
+            ? [heroBackdropUrl]
+            : [heroBackdropUrl, coverImageUrl]
+        for candidate in candidates {
             let url = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !url.isEmpty { return url }
         }
@@ -2737,11 +2754,13 @@ struct TVCollectionFolderItem: Identifiable, Hashable {
         lhs.id == rhs.id
             && lhs.focusGifUrl == rhs.focusGifUrl
             && lhs.focusGifEnabled == rhs.focusGifEnabled
+            && lhs.hideTitle == rhs.hideTitle
             && lhs.tileShape == rhs.tileShape
             && lhs.coverEmoji == rhs.coverEmoji
             && lhs.coverImageUrl == rhs.coverImageUrl
             && lhs.heroBackdropUrl == rhs.heroBackdropUrl
             && lhs.titleLogoUrl == rhs.titleLogoUrl
+            && lhs.presentationStyle == rhs.presentationStyle
             && lhs.sources == rhs.sources
             && lhs.viewMode == rhs.viewMode
             && lhs.showAllTab == rhs.showAllTab
@@ -2845,7 +2864,459 @@ enum CollectionsStore {
     /// (view modes, tile shapes, TMDB sources, …) survive the round-trip.
     static func rawCollections() -> [[String: Any]] {
         guard let data = UserDefaults.standard.data(forKey: storageKey) else { return [] }
-        return parseCollectionsArray(from: data) ?? []
+        let rows = parseCollectionsArray(from: data) ?? []
+        let streamingMigration = migrateStreamingServicesTemplate(in: rows)
+        let studiosMigration = migrateStudiosFranchisesTemplate(in: streamingMigration.rows)
+        let genresMigration = migrateDiscoverGenresTemplate(in: studiosMigration.rows)
+        if (streamingMigration.changed || studiosMigration.changed || genresMigration.changed),
+           let migratedData = try? JSONSerialization.data(withJSONObject: genresMigration.rows) {
+            UserDefaults.standard.set(migratedData, forKey: storageKey)
+        }
+        return genresMigration.rows
+    }
+
+    /// Keeps previously added Streaming Services collections in sync with
+    /// one-time template additions while preserving later user customization.
+    private static func migrateStreamingServicesTemplate(
+        in rows: [[String: Any]]
+    ) -> (rows: [[String: Any]], changed: Bool) {
+        var migrated = rows
+        var changed = false
+
+        for collectionIndex in migrated.indices {
+            var collection = migrated[collectionIndex]
+            let version = (collection["templateVersion"] as? NSNumber)?.intValue
+                ?? (collection["templateVersion"] as? Int)
+                ?? 0
+            guard version < 6,
+                  var folders = collection["folders"] as? [[String: Any]],
+                  folders.contains(where: {
+                      ($0["presentationStyle"] as? String)?.uppercased() == "STREAMING_SERVICE"
+                  }) else { continue }
+
+            if version < 2 {
+                for folderIndex in folders.indices {
+                    guard (folders[folderIndex]["presentationStyle"] as? String)?.uppercased()
+                        == "STREAMING_SERVICE" else { continue }
+                    var sources = (folders[folderIndex]["sources"] as? [[String: Any]]) ?? []
+                    let titles = Set(sources.compactMap { $0["title"] as? String })
+
+                    if !titles.contains("Recent Movies"),
+                       var recentMovies = sources.first(where: {
+                           ($0["provider"] as? String)?.lowercased() == "tmdb"
+                               && ($0["mediaType"] as? String)?.lowercased() == "movie"
+                       }) {
+                        recentMovies["title"] = "Recent Movies"
+                        recentMovies["sortBy"] = "primary_release_date.desc"
+                        sources.append(recentMovies)
+                    }
+
+                    if !titles.contains("Recent Shows"),
+                       var recentShows = sources.first(where: {
+                           ($0["provider"] as? String)?.lowercased() == "tmdb"
+                               && ["tv", "series", "show"].contains(
+                                   ($0["mediaType"] as? String)?.lowercased() ?? ""
+                               )
+                       }) {
+                        recentShows["title"] = "Recent Shows"
+                        recentShows["sortBy"] = "first_air_date.desc"
+                        sources.append(recentShows)
+                    }
+                    folders[folderIndex]["sources"] = sources
+                }
+            }
+
+            let hasCrunchyroll = folders.contains { isCrunchyrollStreamingServiceFolder($0) }
+            if !hasCrunchyroll {
+                folders.append(crunchyrollStreamingServiceFolder())
+            }
+            if version < 4 {
+                for folderIndex in folders.indices
+                where isCrunchyrollStreamingServiceFolder(folders[folderIndex]) {
+                    folders[folderIndex]["coverImageUrl"] = crunchyrollLogoURL
+                    folders[folderIndex]["titleLogoUrl"] = crunchyrollLogoURL
+                }
+            }
+            if version < 6 {
+                for folderIndex in folders.indices {
+                    let title = folders[folderIndex]["title"] as? String ?? ""
+                    if let backdropPath = streamingServiceBackdropPath(for: title) {
+                        folders[folderIndex]["heroBackdropUrl"] = studioTemplateImageURL(
+                            backdropPath,
+                            width: "w1280"
+                        )
+                    }
+                }
+            }
+
+            collection["templateID"] = "streaming-services"
+            collection["templateVersion"] = 6
+            collection["folders"] = folders
+            migrated[collectionIndex] = collection
+            changed = true
+        }
+        return (migrated, changed)
+    }
+
+    private static let crunchyrollLogoURL =
+        "https://upload.wikimedia.org/wikipedia/commons/0/08/Crunchyroll_Logo.png"
+
+    private static func streamingServiceBackdropPath(for title: String) -> String? {
+        switch title.lowercased() {
+        case "netflix": return "/aVvRQJ2Ckhlym4uh0YGc166CUoP.jpg"
+        case "prime video", "amazon prime video": return "/JYgqp8g2kI3SEus9XBDSHukfBN.jpg"
+        case "disney+", "disney plus": return "/14QbnygCuTO0vl7CAFmPf1fgZfV.jpg"
+        case "max", "hbo max": return "/577eXC8wFQT0eUrJcgznSiFPRmk.jpg"
+        case "apple tv+", "apple tv plus": return "/uTWhbLc7Bj4qNSdW3ZvZKL8cOHv.jpg"
+        case "hulu": return "/q3pCsNvJ7CmdJUz2sJEEUY3pOPC.jpg"
+        case "paramount+", "paramount plus": return "/zQCOimbHIq5BrLHThidw2bThZem.jpg"
+        case "peacock": return "/obtdxPgmfykYwVnvuYXC5f2xKlQ.jpg"
+        case "crunchyroll": return "/1RgPyOhN4DRs225BGTlHJqCudII.jpg"
+        default: return nil
+        }
+    }
+
+    private static func isCrunchyrollStreamingServiceFolder(_ folder: [String: Any]) -> Bool {
+        if (folder["title"] as? String)?.caseInsensitiveCompare("Crunchyroll") == .orderedSame {
+            return true
+        }
+        let sources = folder["sources"] as? [[String: Any]] ?? []
+        return sources.contains { source in
+            let filters = source["filters"] as? [String: Any]
+            return (filters?["withWatchProviders"] as? String) == "283"
+                || (filters?["withWatchProviders"] as? NSNumber)?.intValue == 283
+        }
+    }
+
+    private static func crunchyrollStreamingServiceFolder() -> [String: Any] {
+        let filters: [String: Any] = [
+            "withWatchProviders": "283",
+            "watchRegion": "US"
+        ]
+        return [
+            "id": UUID().uuidString,
+            "title": "Crunchyroll",
+            "coverImageUrl": crunchyrollLogoURL,
+            "titleLogoUrl": crunchyrollLogoURL,
+            "presentationStyle": "STREAMING_SERVICE",
+            "tileShape": "LANDSCAPE",
+            "hideTitle": true,
+            "focusGifEnabled": false,
+            "sources": [
+                [
+                    "provider": "tmdb",
+                    "tmdbSourceType": "DISCOVER",
+                    "title": "Movies • Popular",
+                    "mediaType": "movie",
+                    "sortBy": "popularity.desc",
+                    "filters": filters
+                ],
+                [
+                    "provider": "tmdb",
+                    "tmdbSourceType": "DISCOVER",
+                    "title": "Series • Popular",
+                    "mediaType": "tv",
+                    "sortBy": "popularity.desc",
+                    "filters": filters
+                ],
+                [
+                    "provider": "tmdb",
+                    "tmdbSourceType": "DISCOVER",
+                    "title": "Recent Movies",
+                    "mediaType": "movie",
+                    "sortBy": "primary_release_date.desc",
+                    "filters": filters
+                ],
+                [
+                    "provider": "tmdb",
+                    "tmdbSourceType": "DISCOVER",
+                    "title": "Recent Shows",
+                    "mediaType": "tv",
+                    "sortBy": "first_air_date.desc",
+                    "filters": filters
+                ]
+            ]
+        ]
+    }
+
+    private struct StudioTemplateConfiguration {
+        let logoPath: String
+        let backdropPath: String
+        let movieSourceType: String
+        let movieID: Int?
+        let seriesSourceType: String
+        let seriesID: Int?
+        let filters: [String: Any]?
+    }
+
+    /// Upgrades the first Studios & Franchises template to the cinematic,
+    /// four-catalog presentation without requiring users to recreate it.
+    private static func migrateStudiosFranchisesTemplate(
+        in rows: [[String: Any]]
+    ) -> (rows: [[String: Any]], changed: Bool) {
+        var migrated = rows
+        var changed = false
+
+        for collectionIndex in migrated.indices {
+            var collection = migrated[collectionIndex]
+            let version = (collection["templateVersion"] as? NSNumber)?.intValue
+                ?? (collection["templateVersion"] as? Int)
+                ?? 0
+            let templateID = (collection["templateID"] as? String)?.lowercased()
+            let title = collection["title"] as? String
+            let isStudiosTemplate = templateID == "studios-franchises"
+                || title?.caseInsensitiveCompare("Studios & Franchises") == .orderedSame
+            guard isStudiosTemplate,
+                  version < 3,
+                  var folders = collection["folders"] as? [[String: Any]] else { continue }
+
+            if version < 2 {
+                for folderIndex in folders.indices {
+                    let folderTitle = folders[folderIndex]["title"] as? String ?? ""
+                    guard let configuration = studioTemplateConfiguration(for: folderTitle) else { continue }
+                    let logoURL = studioTemplateImageURL(configuration.logoPath, width: "w500")
+
+                    folders[folderIndex]["coverImageUrl"] = logoURL
+                    folders[folderIndex]["titleLogoUrl"] = logoURL
+                    folders[folderIndex]["heroBackdropUrl"] = studioTemplateImageURL(
+                        configuration.backdropPath,
+                        width: "w1280"
+                    )
+                    folders[folderIndex]["presentationStyle"] = "STUDIO_FRANCHISE"
+                    folders[folderIndex]["tileShape"] = "LANDSCAPE"
+                    folders[folderIndex]["hideTitle"] = true
+                    folders[folderIndex]["focusGifEnabled"] = false
+                    folders[folderIndex]["sources"] = studioTemplateCatalogSources(configuration)
+                }
+            }
+            if version < 3 {
+                folders.removeAll { folder in
+                    let title = folder["title"] as? String ?? ""
+                    return title.caseInsensitiveCompare("Harry Potter") == .orderedSame
+                        || title.caseInsensitiveCompare("Wizarding World") == .orderedSame
+                }
+            }
+
+            collection["templateID"] = "studios-franchises"
+            collection["templateVersion"] = 3
+            collection["viewMode"] = "ROWS"
+            collection["showAllTab"] = false
+            collection["folders"] = folders
+            migrated[collectionIndex] = collection
+            changed = true
+        }
+        return (migrated, changed)
+    }
+
+    private static func studioTemplateConfiguration(
+        for title: String
+    ) -> StudioTemplateConfiguration? {
+        let company: (Int, String, String)?
+        switch title.lowercased() {
+        case "a24":
+            company = (41077, "/1ZXsGaFPgrgS6ZZGS37AqD5uU12.png", "/wjwMC7u3xWKkrronolBqsIy4L0L.jpg")
+        case "pixar":
+            company = (3, "/1TjvGVDMYsj6JBxOAkUHpPEwLf7.png", "/8sSKdEmlmqF4kJUd28SqthXC4yZ.jpg")
+        case "warner bros.", "warner bros":
+            company = (174, "/zhD3hhtKB5qyv7ZeL4uLpNxgMVU.png", "/cu3lhUReOdqFAo5K1jesoftwiBj.jpg")
+        case "universal", "universal pictures":
+            company = (33, "/8lvHyhjr8oUKOOy2dKXoALWKdp0.png", "/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg")
+        case "marvel", "marvel studios":
+            company = (420, "/hUzeosd33nzE5MCNsZxCGEKTXaQ.png", "/qeQJx07rK2xm8SD2sJxFKhE7gs0.jpg")
+        case "dc", "dc entertainment":
+            company = (9993, "/2Tc1P3Ac8M479naPp1kYT3izLS5.png", "/rWYtghaUJSDvQm4jmXiCPXBHUdQ.jpg")
+        case "hbo":
+            return StudioTemplateConfiguration(
+                logoPath: "/tuomPhY2UtuPTqqFnKMVHvSb724.png",
+                backdropPath: "/577eXC8wFQT0eUrJcgznSiFPRmk.jpg",
+                movieSourceType: "COMPANY",
+                movieID: 3268,
+                seriesSourceType: "NETWORK",
+                seriesID: 49,
+                filters: nil
+            )
+        default:
+            company = nil
+        }
+
+        guard let company else { return nil }
+        return StudioTemplateConfiguration(
+            logoPath: company.1,
+            backdropPath: company.2,
+            movieSourceType: "COMPANY",
+            movieID: company.0,
+            seriesSourceType: "COMPANY",
+            seriesID: company.0,
+            filters: nil
+        )
+    }
+
+    private static func studioTemplateCatalogSources(
+        _ configuration: StudioTemplateConfiguration
+    ) -> [[String: Any]] {
+        [
+            studioTemplateSource(
+                title: "Movies • Popular",
+                sourceType: configuration.movieSourceType,
+                id: configuration.movieID,
+                mediaType: "movie",
+                sortBy: "popularity.desc",
+                filters: configuration.filters
+            ),
+            studioTemplateSource(
+                title: "Series • Popular",
+                sourceType: configuration.seriesSourceType,
+                id: configuration.seriesID,
+                mediaType: "tv",
+                sortBy: "popularity.desc",
+                filters: configuration.filters
+            ),
+            studioTemplateSource(
+                title: "Recent Movies",
+                sourceType: configuration.movieSourceType,
+                id: configuration.movieID,
+                mediaType: "movie",
+                sortBy: "primary_release_date.desc",
+                filters: configuration.filters
+            ),
+            studioTemplateSource(
+                title: "Recent Shows",
+                sourceType: configuration.seriesSourceType,
+                id: configuration.seriesID,
+                mediaType: "tv",
+                sortBy: "first_air_date.desc",
+                filters: configuration.filters
+            )
+        ]
+    }
+
+    private static func studioTemplateSource(
+        title: String,
+        sourceType: String,
+        id: Int?,
+        mediaType: String,
+        sortBy: String,
+        filters: [String: Any]?
+    ) -> [String: Any] {
+        var source: [String: Any] = [
+            "provider": "tmdb",
+            "tmdbSourceType": sourceType,
+            "title": title,
+            "mediaType": mediaType,
+            "sortBy": sortBy
+        ]
+        if let id { source["tmdbId"] = id }
+        if let filters { source["filters"] = filters }
+        return source
+    }
+
+    private static func studioTemplateImageURL(_ path: String, width: String) -> String {
+        "https://image.tmdb.org/t/p/\(width)\(path)"
+    }
+
+    /// Keeps existing Discover by Genre templates in sync with backdrop and
+    /// four-catalog additions while leaving later user edits alone.
+    private static func migrateDiscoverGenresTemplate(
+        in rows: [[String: Any]]
+    ) -> (rows: [[String: Any]], changed: Bool) {
+        var migrated = rows
+        var changed = false
+
+        for collectionIndex in migrated.indices {
+            var collection = migrated[collectionIndex]
+            let version = (collection["templateVersion"] as? NSNumber)?.intValue
+                ?? (collection["templateVersion"] as? Int)
+                ?? 0
+            let templateID = (collection["templateID"] as? String)?.lowercased()
+            let title = collection["title"] as? String
+            let isGenreTemplate = templateID == "discover-genres"
+                || title?.caseInsensitiveCompare("Discover by Genre") == .orderedSame
+            guard isGenreTemplate,
+                  version < 3,
+                  var folders = collection["folders"] as? [[String: Any]] else { continue }
+
+            if version < 2 {
+                for folderIndex in folders.indices {
+                    let folderTitle = folders[folderIndex]["title"] as? String ?? ""
+                    guard let backdropPath = discoverGenreBackdropPath(for: folderTitle) else { continue }
+                    folders[folderIndex]["heroBackdropUrl"] = studioTemplateImageURL(
+                        backdropPath,
+                        width: "w1280"
+                    )
+                }
+            }
+
+            if version < 3 {
+                for folderIndex in folders.indices {
+                    let folderTitle = folders[folderIndex]["title"] as? String ?? ""
+                    var sources = folders[folderIndex]["sources"] as? [[String: Any]] ?? []
+
+                    if !sources.contains(where: { ($0["mediaType"] as? String)?.lowercased() == "tv" }),
+                       let keyword = discoverGenreSeriesKeyword(for: folderTitle) {
+                        sources.append([
+                            "provider": "tmdb",
+                            "tmdbSourceType": "DISCOVER",
+                            "title": "Series • Popular",
+                            "mediaType": "tv",
+                            "sortBy": "popularity.desc",
+                            "filters": ["withKeywords": keyword]
+                        ])
+                    }
+
+                    let titles = Set(sources.compactMap { $0["title"] as? String })
+                    if !titles.contains("Recent Movies"),
+                       var recentMovies = sources.first(where: {
+                           ($0["mediaType"] as? String)?.lowercased() == "movie"
+                       }) {
+                        recentMovies["title"] = "Recent Movies"
+                        recentMovies["sortBy"] = "primary_release_date.desc"
+                        sources.append(recentMovies)
+                    }
+                    if !titles.contains("Recent Shows"),
+                       var recentShows = sources.first(where: {
+                           ($0["mediaType"] as? String)?.lowercased() == "tv"
+                       }) {
+                        recentShows["title"] = "Recent Shows"
+                        recentShows["sortBy"] = "first_air_date.desc"
+                        sources.append(recentShows)
+                    }
+                    folders[folderIndex]["sources"] = sources
+                }
+            }
+
+            collection["templateID"] = "discover-genres"
+            collection["templateVersion"] = 3
+            collection["folders"] = folders
+            migrated[collectionIndex] = collection
+            changed = true
+        }
+        return (migrated, changed)
+    }
+
+    private static func discoverGenreSeriesKeyword(for title: String) -> String? {
+        switch title.lowercased() {
+        case "horror": return "315058"
+        case "romance": return "9840"
+        default: return nil
+        }
+    }
+
+    private static func discoverGenreBackdropPath(for title: String) -> String? {
+        switch title.lowercased() {
+        case "action & adventure": return "/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg"
+        case "animation": return "/1RgPyOhN4DRs225BGTlHJqCudII.jpg"
+        case "comedy": return "/xWBiXclrRmTggQHMRsIn84YHavs.jpg"
+        case "crime": return "/qO55CD8tgVL1T4WKn6zYFFiD6lL.jpg"
+        case "documentary": return "/eCP3PAiu442zkJWczdLdvALePNK.jpg"
+        case "drama": return "/Af907x5h9W1wVis8XrSd7ynTWuy.jpg"
+        case "family": return "/kxQiIJ4gVcD3K6o14MJ72p5yRcE.jpg"
+        case "horror": return "/rZfmzpixLKLR3Hg2u0WgC7XLFl8.jpg"
+        case "mystery & thriller": return "/flxau5Iu7bChQHsESqvGZ3FQRaI.jpg"
+        case "romance": return "/1oKLEA9JOhvaBwLpqjROisvWMy7.jpg"
+        case "sci-fi & fantasy": return "/qeQJx07rK2xm8SD2sJxFKhE7gs0.jpg"
+        case "war & history": return "/cu3lhUReOdqFAo5K1jesoftwiBj.jpg"
+        default: return nil
+        }
     }
 
     /// Accepts a JSON array, or a JSON string that itself encodes an array

@@ -13,6 +13,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             AISubtitleTranslationSettings.normalizedModel("gemini-3.5-flash-lite"),
             "gemini-3.5-flash-lite"
         )
+        XCTAssertEqual(
+            AISubtitleTranslationSettings.normalizedModel("gemma-4-26b-a4b-it"),
+            "gemma-4-26b-a4b-it"
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationSettings.normalizedModel("gemma-3-27b-it"),
+            AISubtitleTranslationSettings.defaultModel
+        )
     }
 
     func testGeminiTranslatorSendsKeyInHeaderRatherThanURL() async throws {
@@ -80,7 +88,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer test-api-key")
             XCTAssertNil(request.value(forHTTPHeaderField: "x-goog-api-key"))
             XCTAssertEqual(request.httpMethod, "POST")
-            let requestBody = try XCTUnwrap(request.httpBody)
+            let requestBody = try XCTUnwrap(GeminiURLProtocolStub.body(from: request))
             let requestJSON = try XCTUnwrap(
                 JSONSerialization.jsonObject(with: requestBody) as? [String: Any]
             )
@@ -131,7 +139,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             "Hei",
             for: "Hello",
             targetLanguage: "Norwegian",
-            model: "gemini-3.6-flash",
+            model: "Gemini:gemini-3.6-flash",
             stripHearingImpaired: true,
             profileScope: "profile-a"
         )
@@ -140,28 +148,36 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         let cached = await reader.translation(
             for: "Hello",
             targetLanguage: "Norwegian",
-            model: "gemini-3.6-flash",
+            model: "Gemini:gemini-3.6-flash",
             stripHearingImpaired: true,
             profileScope: "profile-a"
         )
         let otherLanguage = await reader.translation(
             for: "Hello",
             targetLanguage: "German",
-            model: "gemini-3.6-flash",
+            model: "Gemini:gemini-3.6-flash",
             stripHearingImpaired: true,
             profileScope: "profile-a"
         )
         let otherProfile = await reader.translation(
             for: "Hello",
             targetLanguage: "Norwegian",
-            model: "gemini-3.6-flash",
+            model: "Gemini:gemini-3.6-flash",
             stripHearingImpaired: true,
             profileScope: "profile-b"
+        )
+        let otherProvider = await reader.translation(
+            for: "Hello",
+            targetLanguage: "Norwegian",
+            model: "OpenRouter:gemini-3.6-flash",
+            stripHearingImpaired: true,
+            profileScope: "profile-a"
         )
 
         XCTAssertEqual(cached, "Hei")
         XCTAssertNil(otherLanguage)
         XCTAssertNil(otherProfile)
+        XCTAssertNil(otherProvider)
     }
 
     @MainActor
@@ -180,6 +196,355 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(
             AISubtitleTranslationState.normalizedSource("Welcome,\n  home!"),
             AISubtitleTranslationState.normalizedSource("Welcome, home!")
+        )
+    }
+
+    func testAISubtitleBatchesRespectCueCountBudgetAndCueOrder() {
+        let countLimited = (1...41).map { AISubtitleTranslationItem(id: $0, text: "Hi") }
+        let byteLimited = [
+            AISubtitleTranslationItem(id: 101, text: String(repeating: "a", count: 5_000)),
+            AISubtitleTranslationItem(id: 102, text: String(repeating: "b", count: 5_000)),
+            AISubtitleTranslationItem(id: 103, text: "After long cues"),
+        ]
+
+        let countBatches = AISubtitleBatching.batches(countLimited)
+        let byteBatches = AISubtitleBatching.batches(byteLimited)
+
+        XCTAssertEqual(countBatches.map(\.count), [40, 1])
+        XCTAssertEqual(countBatches.flatMap { $0.map(\.id) }, countLimited.map(\.id))
+        XCTAssertEqual(byteBatches.map { $0.map(\.id) }, [[101], [102, 103]])
+        XCTAssertTrue(AISubtitleBatching.estimatedRequestBytes(for: byteLimited) > AISubtitleBatching.maximumEstimatedRequestBytes)
+    }
+
+    func testBatchResponseValidationRejectsMissingDuplicateAndMalformedIDs() async {
+        let invalidResponses = [
+            #"[{"id":7,"text":"Hei"}]"#,
+            #"[{"id":7,"text":"Hei"},{"id":7,"text":"Hei igjen"}]"#,
+            #"[{"id":99,"text":"Hei"},{"id":9,"text":"Ha det"}]"#,
+            "not JSON",
+        ]
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        for responseText in invalidResponses {
+            GeminiURLProtocolStub.handler = { request in
+                let response = HTTPURLResponse(
+                    url: try XCTUnwrap(request.url),
+                    statusCode: 200,
+                    httpVersion: nil,
+                    headerFields: ["Content-Type": "application/json"]
+                )!
+                let payload: [String: Any] = [
+                    "candidates": [["content": ["parts": [["text": responseText]]]]]
+                ]
+                return (response, try JSONSerialization.data(withJSONObject: payload))
+            }
+
+            do {
+                _ = try await GeminiSubtitleTranslator.translateBatch(
+                    [.init(id: 7, text: "Hello"), .init(id: 9, text: "Goodbye")],
+                    to: "Norwegian",
+                    model: AISubtitleTranslationSettings.defaultModel,
+                    apiKey: "test-api-key",
+                    session: URLSession(configuration: configuration)
+                )
+                XCTFail("Expected invalid batch response to be rejected")
+            } catch let error as AISubtitleTranslationError {
+                guard case .invalidResponse = error else {
+                    return XCTFail("Unexpected translation error: \(error)")
+                }
+            } catch {
+                XCTFail("Unexpected error: \(error)")
+            }
+        }
+    }
+
+    func testRetryPolicyHonorsRetryAfterAndStopsAfterFiveAttempts() {
+        let throttled = AISubtitleTranslationError.service(
+            statusCode: 429,
+            message: "Too many requests",
+            retryAfter: 17
+        )
+        let temporary = AISubtitleTranslationError.service(
+            statusCode: 503,
+            message: "Service unavailable",
+            retryAfter: nil
+        )
+
+        XCTAssertEqual(AISubtitleRetryPolicy.retryAfter(from: "17"), 17)
+        XCTAssertEqual(AISubtitleRetryPolicy.delay(for: throttled, completedAttempts: 1), 17)
+        XCTAssertEqual(AISubtitleRetryPolicy.delay(for: temporary, completedAttempts: 1), 4)
+        XCTAssertNotNil(AISubtitleRetryPolicy.delay(for: temporary, completedAttempts: 4))
+        XCTAssertNil(AISubtitleRetryPolicy.delay(for: temporary, completedAttempts: 5))
+    }
+
+    func testTranslatorHonorsRetryAfterAndStopsAfterFiveTemporaryFailures() async {
+        let attempts = RequestCounter()
+        GeminiURLProtocolStub.handler = { request in
+            attempts.increment()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 503,
+                httpVersion: nil,
+                headerFields: ["Retry-After": "0"]
+            )!
+            return (response, Data(#"{"error":{"message":"temporary outage"}}"#.utf8))
+        }
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        do {
+            _ = try await AISubtitleTranslator.translate(
+                "Hello",
+                settings: aiSettings(model: "retry-test"),
+                session: URLSession(configuration: configuration),
+                pacer: AISubtitleRequestPacer(minimumSpacing: 0)
+            )
+            XCTFail("Expected retry exhaustion")
+        } catch let error as AISubtitleTranslationError {
+            guard case .service(let statusCode, _, _) = error else {
+                return XCTFail("Unexpected translation error: \(error)")
+            }
+            XCTAssertEqual(statusCode, 503)
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+        XCTAssertEqual(attempts.value, AISubtitleRetryPolicy.maximumAttempts)
+    }
+
+    func testRetryPolicyDoesNotRetryQuotaBillingOrDailyLimitErrors() {
+        for message in ["quota exhausted", "billing account inactive", "daily limit reached"] {
+            let error = AISubtitleTranslationError.service(
+                statusCode: 429,
+                message: message,
+                retryAfter: nil
+            )
+            XCTAssertFalse(error.isRetryable)
+            XCTAssertNil(AISubtitleRetryPolicy.delay(for: error, completedAttempts: 1))
+            XCTAssertTrue(error.localizedDescription.contains("Original subtitles will remain visible"))
+        }
+    }
+
+    func testTemporaryQuotaThrottleWithRetryAfterRemainsRetryable() {
+        let error = AISubtitleTranslationError.service(
+            statusCode: 429,
+            message: "Quota exceeded for requests per minute",
+            retryAfter: 12
+        )
+
+        XCTAssertTrue(error.isRetryable)
+        XCTAssertFalse(error.isPermanentLimitError)
+        XCTAssertEqual(AISubtitleRetryPolicy.delay(for: error, completedAttempts: 1), 12)
+    }
+
+    func testTranslatorDoesNotRetryPermanentQuotaErrors() async {
+        let attempts = RequestCounter()
+        GeminiURLProtocolStub.handler = { request in
+            attempts.increment()
+            let response = HTTPURLResponse(
+                url: try XCTUnwrap(request.url),
+                statusCode: 429,
+                httpVersion: nil,
+                headerFields: [:]
+            )!
+            return (response, Data(#"{"error":{"message":"daily quota exceeded"}}"#.utf8))
+        }
+        defer { GeminiURLProtocolStub.handler = nil }
+
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [GeminiURLProtocolStub.self]
+        do {
+            _ = try await AISubtitleTranslator.translate(
+                "Hello",
+                settings: aiSettings(model: "quota-test"),
+                session: URLSession(configuration: configuration),
+                pacer: AISubtitleRequestPacer(minimumSpacing: 0)
+            )
+            XCTFail("Expected quota failure")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("Original subtitles will remain visible"))
+        }
+        XCTAssertEqual(attempts.value, 1)
+    }
+
+    func testOversizedBatchSplitsAtCueBoundariesAndRecovers() async throws {
+        let items = (1...4).map { AISubtitleTranslationItem(id: $0, text: "Cue \($0)") }
+        let recorder = BatchAttemptRecorder()
+
+        let translations = try await AISubtitleBatchRecovery.translate(items) { batch in
+            await recorder.record(batch.map(\.id))
+            if batch.count > 1 {
+                throw AISubtitleTranslationError.service(
+                    statusCode: 413,
+                    message: "Request too large",
+                    retryAfter: nil
+                )
+            }
+            return Dictionary(uniqueKeysWithValues: batch.map { ($0.id, "T\($0.id)") })
+        }
+
+        XCTAssertEqual(translations, [1: "T1", 2: "T2", 3: "T3", 4: "T4"])
+        let attempts = await recorder.calls()
+        XCTAssertEqual(attempts, [[1, 2, 3, 4], [1, 2], [1], [2], [3, 4], [3], [4]])
+    }
+
+    func testMalformedBatchResponseSplittingIsBounded() async {
+        let items = (1...8).map { AISubtitleTranslationItem(id: $0, text: "Cue \($0)") }
+        let recorder = BatchAttemptRecorder()
+
+        do {
+            _ = try await AISubtitleBatchRecovery.translate(items) { batch in
+                await recorder.record(batch.map(\.id))
+                throw AISubtitleTranslationError.invalidResponse
+            }
+            XCTFail("Expected malformed responses to exhaust the split budget")
+        } catch let error as AISubtitleTranslationError {
+            guard case .invalidResponse = error else {
+                return XCTFail("Unexpected translation error: \(error)")
+            }
+        } catch {
+            XCTFail("Unexpected error: \(error)")
+        }
+
+        let attempts = await recorder.calls()
+        XCTAssertEqual(attempts, [[1, 2, 3, 4, 5, 6, 7, 8], [1, 2, 3, 4], [1, 2]])
+    }
+
+    @MainActor
+    func testMPVCancellationAndSettingsChangesRejectStaleResults() async throws {
+        let pacer = AISubtitleRequestPacer(minimumSpacing: 0)
+        let state = MPVSubtitleTranslationState(requestPacer: pacer) { source, _, _ in
+            if source == "Old" || source == "Before settings" {
+                try await Task.sleep(nanoseconds: 40_000_000)
+                return "stale"
+            }
+            return "fresh"
+        }
+        let initial = aiSettings(model: "test-model-a")
+        let changed = aiSettings(model: "test-model-b")
+
+        state.update(sourceText: "Old", settings: initial)
+        state.cancelPendingTranslations()
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertNil(state.translatedText)
+        XCTAssertEqual(state.sourceText, "Old")
+
+        state.update(sourceText: "Before settings", settings: initial)
+        state.update(sourceText: "New", settings: changed)
+        try await Task.sleep(nanoseconds: 80_000_000)
+        XCTAssertEqual(state.sourceText, "New")
+        XCTAssertEqual(state.translatedText, "fresh")
+    }
+
+    @MainActor
+    func testMPVRequestsUseTheSharedProviderModelLimiter() async throws {
+        let model = "mpv-limiter-\(UUID().uuidString)"
+        let settings = aiSettings(model: model)
+        let before = await AISubtitleRequestPacer.shared.acquisitionCount(
+            provider: settings.provider.rawValue,
+            model: model
+        )
+        let state = MPVSubtitleTranslationState { _, requestSettings, pacer in
+            try await pacer.acquire(
+                provider: requestSettings.provider.rawValue,
+                model: requestSettings.model
+            )
+            return "translated"
+        }
+        XCTAssertTrue(state.requestPacer === AISubtitleRequestPacer.shared)
+
+        state.update(sourceText: "Limiter \(UUID().uuidString)", settings: settings)
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        let after = await AISubtitleRequestPacer.shared.acquisitionCount(
+            provider: settings.provider.rawValue,
+            model: model
+        )
+        XCTAssertEqual(after, before + 1)
+    }
+
+    @MainActor
+    func testMPVReportsFirstSuccessAndFirstLaterFailure() async throws {
+        let state = MPVSubtitleTranslationState(
+            requestPacer: AISubtitleRequestPacer(minimumSpacing: 0)
+        ) { source, _, _ in
+            if source == "First" { return "Første" }
+            throw AISubtitleTranslationError.service(
+                statusCode: 429,
+                message: "daily quota exceeded",
+                retryAfter: nil
+            )
+        }
+        var outcomes: [String] = []
+        state.onFirstOutcome = { outcome in
+            switch outcome {
+            case .success: outcomes.append("success")
+            case .failure: outcomes.append("failure")
+            }
+        }
+
+        state.update(sourceText: "First", settings: aiSettings(model: "outcome-test"))
+        try await Task.sleep(nanoseconds: 40_000_000)
+        state.update(sourceText: "Second", settings: aiSettings(model: "outcome-test"))
+        try await Task.sleep(nanoseconds: 40_000_000)
+
+        XCTAssertEqual(outcomes, ["success", "failure"])
+    }
+
+    @MainActor
+    func testMPVEmptySubtitleDoesNotReportMissingAPIKey() {
+        let state = MPVSubtitleTranslationState()
+        var outcomeCount = 0
+        state.onFirstOutcome = { _ in outcomeCount += 1 }
+        let settings = AISubtitleTranslationSettings(
+            isEnabled: true,
+            provider: .gemini,
+            apiKey: "",
+            model: "empty-cue-test",
+            targetLanguage: "Norwegian",
+            autoSelect: true,
+            stripHearingImpaired: true
+        )
+
+        state.update(sourceText: "", settings: settings)
+
+        XCTAssertEqual(outcomeCount, 0)
+        XCTAssertFalse(state.shouldDisplayOverlay)
+    }
+
+    @MainActor
+    func testAISubtitleOutcomeToastIsSuppressedForTrailersAndLiveStreams() {
+        XCTAssertFalse(
+            PlayerViewModel.shouldShowAISubtitleOutcome(
+                subtitle: PlaybackMarkers.trailerSubtitle,
+                isLiveStream: false
+            )
+        )
+        XCTAssertFalse(
+            PlayerViewModel.shouldShowAISubtitleOutcome(
+                subtitle: "Live channel",
+                isLiveStream: true
+            )
+        )
+        XCTAssertTrue(
+            PlayerViewModel.shouldShowAISubtitleOutcome(
+                subtitle: "Episode 1",
+                isLiveStream: false
+            )
+        )
+    }
+
+    private func aiSettings(model: String) -> AISubtitleTranslationSettings {
+        AISubtitleTranslationSettings(
+            isEnabled: true,
+            provider: .gemini,
+            apiKey: "test-api-key",
+            model: model,
+            targetLanguage: "Norwegian",
+            autoSelect: true,
+            stripHearingImpaired: true
         )
     }
 
@@ -376,6 +741,22 @@ private final class GeminiURLProtocolStub: URLProtocol {
 
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
+    static func body(from request: URLRequest) -> Data? {
+        if let body = request.httpBody { return body }
+        guard let stream = request.httpBodyStream else { return nil }
+        stream.open()
+        defer { stream.close() }
+        var data = Data()
+        var buffer = [UInt8](repeating: 0, count: 4_096)
+        while stream.hasBytesAvailable {
+            let count = stream.read(&buffer, maxLength: buffer.count)
+            guard count >= 0 else { return nil }
+            guard count > 0 else { break }
+            data.append(buffer, count: count)
+        }
+        return data.isEmpty ? nil : data
+    }
+
     override func startLoading() {
         guard let handler = Self.handler else {
             client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
@@ -392,6 +773,35 @@ private final class GeminiURLProtocolStub: URLProtocol {
     }
 
     override func stopLoading() {}
+}
+
+private actor BatchAttemptRecorder {
+    private var attempts: [[Int]] = []
+
+    func record(_ ids: [Int]) {
+        attempts.append(ids)
+    }
+
+    func calls() -> [[Int]] {
+        attempts
+    }
+}
+
+private final class RequestCounter: @unchecked Sendable {
+    private let lock = NSLock()
+    private var count = 0
+
+    func increment() {
+        lock.lock()
+        count += 1
+        lock.unlock()
+    }
+
+    var value: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return count
+    }
 }
 
 final class WatchedIdentityPolicyTests: XCTestCase {

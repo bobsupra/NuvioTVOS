@@ -290,10 +290,14 @@ enum SubtitleStyleKey {
     static let textOpacity = "nuvio.tv.settings.subtitleStyle.textOpacity"
     static let outlineEnabled = "nuvio.tv.settings.subtitleStyle.outlineEnabled"
     static let outlineColor = "nuvio.tv.settings.subtitleStyle.outlineColor"
+    static let backgroundEnabled = "nuvio.tv.settings.subtitleStyle.backgroundEnabled"
+    static let backgroundColor = "nuvio.tv.settings.subtitleStyle.backgroundColor"
+    static let backgroundOpacity = "nuvio.tv.settings.subtitleStyle.backgroundOpacity"
 
     static let all = [
         textSize, bold, bottomOffset, horizontalMargin, letterSpacing,
-        textColor, textOpacity, outlineEnabled, outlineColor
+        textColor, textOpacity, outlineEnabled, outlineColor,
+        backgroundEnabled, backgroundColor, backgroundOpacity
     ]
 }
 
@@ -307,6 +311,9 @@ enum SubtitleStyleDefaults {
     static let textOpacity = 100     // percent, 20...100
     static let outlineEnabled = true
     static let outlineColor = "#000000"
+    static let backgroundEnabled = false
+    static let backgroundColor = "#000000"
+    static let backgroundOpacity = 65
 }
 
 /// Curated swatch palette shared by the text-color and outline-color pickers.
@@ -330,6 +337,9 @@ struct SubtitleStyle {
     var textOpacity: Int
     var outlineEnabled: Bool
     var outlineColorHex: String
+    var backgroundEnabled: Bool
+    var backgroundColorHex: String
+    var backgroundOpacity: Int
 
     static var current: SubtitleStyle {
         let defaults = ProfileSettings.current
@@ -351,7 +361,10 @@ struct SubtitleStyle {
             textColorHex: stringValue(SubtitleStyleKey.textColor, SubtitleStyleDefaults.textColor),
             textOpacity: intValue(SubtitleStyleKey.textOpacity, SubtitleStyleDefaults.textOpacity),
             outlineEnabled: boolValue(SubtitleStyleKey.outlineEnabled, SubtitleStyleDefaults.outlineEnabled),
-            outlineColorHex: stringValue(SubtitleStyleKey.outlineColor, SubtitleStyleDefaults.outlineColor)
+            outlineColorHex: stringValue(SubtitleStyleKey.outlineColor, SubtitleStyleDefaults.outlineColor),
+            backgroundEnabled: boolValue(SubtitleStyleKey.backgroundEnabled, SubtitleStyleDefaults.backgroundEnabled),
+            backgroundColorHex: stringValue(SubtitleStyleKey.backgroundColor, SubtitleStyleDefaults.backgroundColor),
+            backgroundOpacity: intValue(SubtitleStyleKey.backgroundOpacity, SubtitleStyleDefaults.backgroundOpacity)
         )
     }
 
@@ -371,6 +384,8 @@ struct SubtitleStyle {
     var subColor: String { Self.mpvColor(hex: textColorHex, opacity: textOpacity) }
     /// `sub-outline-color` — always fully opaque.
     var subOutlineColor: String { Self.mpvColor(hex: outlineColorHex, opacity: 100) }
+    /// `sub-back-color` — used by libmpv's background-box border style.
+    var subBackgroundColor: String { Self.mpvColor(hex: backgroundColorHex, opacity: backgroundOpacity) }
 
     /// mpv expects colors as `#AARRGGBB`. Opacity is a 0–100 percentage.
     static func mpvColor(hex: String, opacity: Int) -> String {
@@ -703,7 +718,15 @@ enum AISubtitleKeyStore {
 /// sync payloads.
 struct AISubtitleTranslationSettings: Equatable {
     static let defaultModel = "gemini-3.6-flash"
-    static let availableModels = ["gemini-3.6-flash", "gemini-3.5-flash-lite"]
+    /// Gemini and Gemma models that support the Gemini API's
+    /// `generateContent` endpoint used for subtitle translation.
+    static let availableModels = [
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-3.1-flash-lite",
+        "gemma-4-26b-a4b-it",
+        "gemma-4-31b-it"
+    ]
     static let defaultOpenRouterModel = "google/gemini-2.5-flash"
 
     let isEnabled: Bool
@@ -935,6 +958,7 @@ struct SettingsView: View {
 
     @State private var selectedCategory: SettingsCategory = .account
     @State private var presentedLanguagePicker: LanguagePickerKind?
+    @State private var presentedProfilePinMode: ProfilePinSheetMode?
     @FocusState private var focusedCategory: SettingsCategory?
     @FocusState private var focusedLanguagePreference: LanguagePickerKind?
     /// Whether focus has entered the current category's detail pane at least once.
@@ -1020,8 +1044,8 @@ struct SettingsView: View {
                 // it came from. Cleared once focus enters so re-entry isn't blocked.
                 .environment(\.settingsEntryLocked, focusedCategory != nil && !detailVisited)
             }
-            .disabled(presentedLanguagePicker != nil)
-            .allowsHitTesting(presentedLanguagePicker == nil)
+            .disabled(presentedLanguagePicker != nil || presentedProfilePinMode != nil)
+            .allowsHitTesting(presentedLanguagePicker == nil && presentedProfilePinMode == nil)
 
             if let picker = presentedLanguagePicker {
                 LanguagePickerWindow(
@@ -1039,9 +1063,34 @@ struct SettingsView: View {
                 .transition(.opacity.combined(with: .scale(scale: 0.96)))
                 .zIndex(1)
             }
+
+            if let mode = presentedProfilePinMode, let profile = activeProfile {
+                ProfilePinManagementView(
+                    mode: mode,
+                    profileName: ProfileDisplayName.resolve(
+                        profile: profile,
+                        settingsName: profile.name
+                    ),
+                    onVerify: { pin in
+                        await onVerifyProfilePin?(profile.id, pin) == true
+                    },
+                    onSave: { pin, currentPin in
+                        await onChangeProfilePin?(profile.id, pin, currentPin) == true
+                    },
+                    onDismiss: {
+                        presentedProfilePinMode = nil
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(2)
+                .onExitCommand {
+                    presentedProfilePinMode = nil
+                }
+            }
         }
         .background(Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea())
         .animation(.easeOut(duration: 0.16), value: presentedLanguagePicker != nil)
+        .animation(.easeInOut(duration: 0.18), value: presentedProfilePinMode != nil)
     }
 
     private var audioLanguageSelection: Binding<[String]> {
@@ -1226,7 +1275,10 @@ struct SettingsView: View {
                 onChangeProfilePin: onChangeProfilePin,
                 onVerifyProfilePin: onVerifyProfilePin,
                 onSignIn: onSignIn,
-                onSignOut: onSignOut
+                onSignOut: onSignOut,
+                onPresentPin: { mode in
+                    presentedProfilePinMode = mode
+                }
             )
         case .appearance:
             AppearanceSettingsView(
@@ -1352,13 +1404,13 @@ private struct AccountSettingsView: View {
     let onVerifyProfilePin: ((String, String) async -> Bool)?
     let onSignIn: (() -> Void)?
     let onSignOut: (() -> Void)?
+    let onPresentPin: (ProfilePinSheetMode) -> Void
 
     @AppStorage(SettingsKey.profileName) private var profileName = "Nuvio User"
     @AppStorage(SettingsKey.profileAutoSelectLast) private var autoSelectLastProfile = true
     @AppStorage(SettingsKey.accountSyncWatchState) private var syncWatchState = true
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
-    @State private var pinSheetMode: ProfilePinSheetMode?
 
     private var accountStatusText: String {
         guard isAuthenticated else {
@@ -1424,6 +1476,7 @@ private struct AccountSettingsView: View {
                     placeholder: L10n.string("profile_name_placeholder", fallback: "Profile name"),
                     text: $editableProfileName,
                     fieldWidth: 340,
+                    centerDisplayText: true,
                     onCommit: saveProfileName
                 )
                 .settingsEntryAnchor(activeProfile != nil && onChangeProfileName != nil)
@@ -1551,22 +1604,6 @@ private struct AccountSettingsView: View {
                 }
             }
         }
-        .sheet(item: $pinSheetMode) { mode in
-            if let profile = activeProfile {
-                ProfilePinManagementView(
-                    mode: mode,
-                    profileName: displayProfileName,
-                    onVerify: { pin in
-                        await onVerifyProfilePin?(profile.id, pin) == true
-                    },
-                    onSave: { pin, currentPin in
-                        await onChangeProfilePin?(profile.id, pin, currentPin) == true
-                    }
-                ) {
-                    pinSheetMode = nil
-                }
-            }
-        }
     }
 
     private var displayProfileName: String {
@@ -1587,7 +1624,7 @@ private struct AccountSettingsView: View {
             get: { isPinProtected },
             set: { requestedValue in
                 guard requestedValue != isPinProtected else { return }
-                pinSheetMode = requestedValue ? .enable : .disable
+                onPresentPin(requestedValue ? .enable : .disable)
             }
         )
     }
@@ -1608,14 +1645,14 @@ private struct AccountSettingsView: View {
     }
 }
 
-private enum ProfilePinSheetMode: String, Identifiable {
+enum ProfilePinSheetMode: String, Identifiable {
     case enable
     case disable
 
     var id: String { rawValue }
 }
 
-private struct ProfilePinManagementView: View {
+struct ProfilePinManagementView: View {
     let mode: ProfilePinSheetMode
     let profileName: String
     let onVerify: (String) async -> Bool
@@ -1677,6 +1714,10 @@ private struct ProfilePinManagementView: View {
             .frame(width: 520)
             .padding(48)
             .loginGlassPanel()
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            }
             .shadow(color: .black.opacity(0.38), radius: 32, y: 18)
         }
     }
@@ -1771,7 +1812,7 @@ private struct ProfilePinManagementView: View {
     }
 }
 
-private struct PinDeleteButton: View {
+struct PinDeleteButton: View {
     let action: () -> Void
     @FocusState private var isFocused: Bool
 
@@ -1791,7 +1832,7 @@ private struct PinDeleteButton: View {
     }
 }
 
-private struct PinSheetActionButton: View {
+struct PinSheetActionButton: View {
     let title: String
     let action: () -> Void
     @FocusState private var isFocused: Bool
@@ -2985,7 +3026,7 @@ private struct AISubtitleOptionsSheet: View {
                         if selectedProvider == .gemini {
                             SettingsOptionRow(
                                 title: "Gemini Model",
-                                subtitle: "Flash models keep cue translations fast",
+                                subtitle: "Compact Gemini and Gemma models keep translations fast and affordable",
                                 selection: $geminiModel,
                                 options: geminiModels,
                                 accentColor: accentColor
@@ -3337,7 +3378,7 @@ private struct DebridDeviceAuthorizationSheet: View {
         .frame(width: 960)
         .padding(.horizontal, 88)
         .padding(.vertical, 64)
-        .background(Color(red: 0.11, green: 0.11, blue: 0.11))
+        .loginGlassPanel()
         .task(id: provider.id) {
             if !isConnected { viewModel.connect(provider) }
         }
@@ -3493,6 +3534,8 @@ private struct TraktConnectedSettingsSheet: View {
     let accentColor: Color
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @State private var now = Date()
     @State private var showingDisconnectConfirmation = false
 
@@ -3500,7 +3543,8 @@ private struct TraktConnectedSettingsSheet: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.055, green: 0.055, blue: 0.055).ignoresSafeArea()
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 ScrollView {
@@ -3607,31 +3651,14 @@ private struct TraktConnectedSettingsSheet: View {
                     }
 
                     }
-                    .frame(maxWidth: 1120)
-                    .padding(.horizontal, 64)
-                    .padding(.top, 52)
-                    .padding(.bottom, 24)
+                    .frame(width: 1_000, alignment: .leading)
+                    .padding(.horizontal, 52)
+                    .padding(.vertical, 38)
                 }
-
-                HStack {
-                    Button { dismiss() } label: {
-                        Text(L10n.string("tvos_settings_back", fallback: "Back"))
-                            .font(.system(size: 24, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 34)
-                            .padding(.vertical, 16)
-                            .background(Color.white.opacity(0.14), in: Capsule())
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-
-                    Spacer()
-                }
-                .frame(maxWidth: 1120)
-                .padding(.horizontal, 64)
-                .padding(.bottom, 40)
+                .focusSection()
             }
         }
+        .onExitCommand { dismiss() }
         .task {
             viewModel.reload()
             viewModel.loadConnectedData()
@@ -3660,26 +3687,13 @@ private struct TraktConnectedSettingsSheet: View {
     }
 
     private var header: some View {
-        HStack(spacing: 20) {
-            ZStack {
-                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                    .fill(Color(red: 0.94, green: 0.10, blue: 0.17))
-                Text("trakt")
-                    .font(.system(size: 27, weight: .black))
-                    .foregroundColor(.white)
-            }
-            .frame(width: 108, height: 76)
-
-            VStack(alignment: .leading, spacing: 6) {
-                Text("Trakt")
-                    .font(.system(size: 42, weight: .bold))
-                    .foregroundColor(.white)
-                Text("Connected as \(connectedUsername)")
-                    .font(.system(size: 21, weight: .medium))
-                    .foregroundColor(.white.opacity(0.62))
-            }
-
-            Spacer()
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Trakt")
+                .font(.system(size: 36, weight: .bold))
+                .foregroundColor(.white)
+            Text("Connected as \(connectedUsername). Manage sync, metadata, and account options.")
+                .font(.system(size: 20, weight: .medium))
+                .foregroundColor(.white.opacity(0.62))
         }
     }
 
@@ -4062,6 +4076,8 @@ private struct SimklConnectedSettingsSheet: View {
     let accentColor: Color
 
     @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @State private var showingDisconnectConfirmation = false
     @State private var showingHistoryTransferSources = false
     @State private var showingLibraryTransferSources = false
@@ -4069,32 +4085,22 @@ private struct SimklConnectedSettingsSheet: View {
 
     var body: some View {
         ZStack {
-            Color(red: 0.055, green: 0.055, blue: 0.055).ignoresSafeArea()
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
 
             VStack(spacing: 0) {
                 ScrollView {
                     VStack(alignment: .leading, spacing: 24) {
-                        HStack(spacing: 20) {
-                            ZStack {
-                                RoundedRectangle(cornerRadius: 22, style: .continuous)
-                                    .fill(Color(red: 0.08, green: 0.55, blue: 0.82))
-                                Text("SIMKL")
-                                    .font(.system(size: 27, weight: .black))
-                                    .foregroundColor(.white)
-                            }
-                            .frame(width: 112, height: 76)
+                        VStack(alignment: .leading, spacing: 7) {
+                            Text("Simkl")
+                                .font(.system(size: 36, weight: .bold))
+                                .foregroundColor(.white)
 
-                            VStack(alignment: .leading, spacing: 7) {
-                                Text(viewModel.username?.isEmpty == false
-                                    ? "Connected as \(viewModel.username ?? "Simkl User")"
-                                    : "Simkl Connected")
-                                    .font(.system(size: 34, weight: .bold))
-                                    .foregroundColor(.white)
-
-                                Text("This Simkl account is linked to the current Nuvio profile.")
-                                    .font(.system(size: 19, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.62))
-                            }
+                            Text(viewModel.username?.isEmpty == false
+                                ? "Connected as \(viewModel.username ?? "Simkl User"). Manage sync, transfers, and account options."
+                                : "Manage Simkl sync, transfers, and account options.")
+                                .font(.system(size: 20, weight: .medium))
+                                .foregroundColor(.white.opacity(0.62))
                         }
 
                         SettingsGroup(
@@ -4335,31 +4341,14 @@ private struct SimklConnectedSettingsSheet: View {
                                 .foregroundColor(.red.opacity(0.9))
                         }
                     }
-                    .frame(maxWidth: 1120)
-                    .padding(.horizontal, 64)
-                    .padding(.top, 52)
-                    .padding(.bottom, 24)
+                    .frame(width: 1_000, alignment: .leading)
+                    .padding(.horizontal, 52)
+                    .padding(.vertical, 38)
                 }
-
-                HStack {
-                    Button { dismiss() } label: {
-                        Text(L10n.string("tvos_settings_back", fallback: "Back"))
-                            .font(.system(size: 24, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 34)
-                            .padding(.vertical, 16)
-                            .background(Color.white.opacity(0.14), in: Capsule())
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-
-                    Spacer()
-                }
-                .frame(maxWidth: 1120)
-                .padding(.horizontal, 64)
-                .padding(.bottom, 40)
+                .focusSection()
             }
         }
+        .onExitCommand { dismiss() }
         .task {
             viewModel.reload()
             viewModel.loadConnectedData()
@@ -5079,6 +5068,9 @@ struct SubtitleStyleEditor: View {
     @AppStorage(SubtitleStyleKey.textOpacity) private var textOpacity = SubtitleStyleDefaults.textOpacity
     @AppStorage(SubtitleStyleKey.outlineEnabled) private var outlineEnabled = SubtitleStyleDefaults.outlineEnabled
     @AppStorage(SubtitleStyleKey.outlineColor) private var outlineColor = SubtitleStyleDefaults.outlineColor
+    @AppStorage(SubtitleStyleKey.backgroundEnabled) private var backgroundEnabled = SubtitleStyleDefaults.backgroundEnabled
+    @AppStorage(SubtitleStyleKey.backgroundColor) private var backgroundColor = SubtitleStyleDefaults.backgroundColor
+    @AppStorage(SubtitleStyleKey.backgroundOpacity) private var backgroundOpacity = SubtitleStyleDefaults.backgroundOpacity
 
     private var style: SubtitleStyle {
         SubtitleStyle(
@@ -5090,13 +5082,16 @@ struct SubtitleStyleEditor: View {
             textColorHex: textColor,
             textOpacity: textOpacity,
             outlineEnabled: outlineEnabled,
-            outlineColorHex: outlineColor
+            outlineColorHex: outlineColor,
+            backgroundEnabled: backgroundEnabled,
+            backgroundColorHex: backgroundColor,
+            backgroundOpacity: backgroundOpacity
         )
     }
 
     /// Concatenation of every value; `.onChange` on it fires `onChange` once per edit.
     private var changeToken: String {
-        "\(textSize)|\(bold)|\(bottomOffset)|\(horizontalMargin)|\(letterSpacing)|\(textColor)|\(textOpacity)|\(outlineEnabled)|\(outlineColor)"
+        "\(textSize)|\(bold)|\(bottomOffset)|\(horizontalMargin)|\(letterSpacing)|\(textColor)|\(textOpacity)|\(outlineEnabled)|\(outlineColor)|\(backgroundEnabled)|\(backgroundColor)|\(backgroundOpacity)"
     }
 
     var body: some View {
@@ -5206,6 +5201,51 @@ struct SubtitleStyleEditor: View {
                 .disabled(!outlineEnabled)
             }
 
+            SettingsGroup(
+                title: L10n.string("subtitle_background", fallback: "Background"),
+                subtitle: L10n.string(
+                    "tvos_settings_subtitle_background_subtitle",
+                    fallback: "A backdrop behind captions for improved readability"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("subtitle_background", fallback: "Background"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_background_toggle",
+                        fallback: "Draw a padded box behind subtitle text"
+                    ),
+                    isOn: $backgroundEnabled,
+                    accentColor: accentColor
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("subtitle_background_color", fallback: "Background Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_background_color_subtitle",
+                        fallback: "Color of the subtitle backdrop"
+                    ),
+                    selection: $backgroundColor,
+                    accentColor: accentColor
+                )
+                .opacity(backgroundEnabled ? 1 : 0.46)
+                .disabled(!backgroundEnabled)
+
+                SettingsStepperRow(
+                    title: L10n.string("subtitle_background_opacity", fallback: "Background Opacity"),
+                    subtitle: L10n.string(
+                        "tvos_settings_subtitle_background_opacity_subtitle",
+                        fallback: "Transparency of the subtitle backdrop"
+                    ),
+                    value: $backgroundOpacity,
+                    range: 10...100,
+                    step: 5,
+                    suffix: "%",
+                    accentColor: accentColor
+                )
+                .opacity(backgroundEnabled ? 1 : 0.46)
+                .disabled(!backgroundEnabled)
+            }
+
             SettingsGroup(title: L10n.string("subtitle_style_reset", fallback: "Reset"), subtitle: L10n.string("tvos_settings_restore_the_default_subtitle_appearance", fallback: "Restore the default subtitle appearance")) {
                 SettingsActionRow(
                     title: L10n.string("subtitle_reset_defaults", fallback: "Reset Defaults"),
@@ -5228,6 +5268,9 @@ struct SubtitleStyleEditor: View {
         textOpacity = SubtitleStyleDefaults.textOpacity
         outlineEnabled = SubtitleStyleDefaults.outlineEnabled
         outlineColor = SubtitleStyleDefaults.outlineColor
+        backgroundEnabled = SubtitleStyleDefaults.backgroundEnabled
+        backgroundColor = SubtitleStyleDefaults.backgroundColor
+        backgroundOpacity = SubtitleStyleDefaults.backgroundOpacity
     }
 }
 
@@ -5312,7 +5355,23 @@ private struct SubtitlePreviewCard: View {
         }
     }
 
+    @ViewBuilder
     private var styledSubtitle: some View {
+        if style.backgroundEnabled {
+            styledSubtitleText
+                .padding(.horizontal, 14)
+                .padding(.vertical, 7)
+                .background(
+                    Color(hex: style.backgroundColorHex)
+                        .opacity(Double(min(max(style.backgroundOpacity, 0), 100)) / 100),
+                    in: RoundedRectangle(cornerRadius: 8, style: .continuous)
+                )
+        } else {
+            styledSubtitleText
+        }
+    }
+
+    private var styledSubtitleText: some View {
         let font = Font.system(size: fontSize, weight: style.bold ? .heavy : .semibold)
         let fill = Color(hex: style.textColorHex).opacity(Double(style.textOpacity) / 100.0)
         let outline = Color(hex: style.outlineColorHex)
@@ -6596,6 +6655,7 @@ private struct CollectionsSettingsSection: View {
                 canExport: !collections.isEmpty,
                 onExport: exportCollections,
                 onImport: { activeSheet = .importCollections },
+                onTemplates: { activeSheet = .templates },
                 onNew: { activeSheet = .editor(nil) }
             )
 
@@ -6636,6 +6696,13 @@ private struct CollectionsSettingsSection: View {
                 case .importCollections:
                     ImportCollectionsSheet(accentColor: accentColor) { imported in
                         importCollections(imported)
+                    }
+                case .templates:
+                    CollectionTemplatesFlowSheet(accentColor: accentColor) { payload in
+                        collections.append(payload)
+                        CollectionsStore.saveLocalEdit(collections)
+                        let title = (payload["title"] as? String) ?? "Collection"
+                        showToast("Added \(title) to Home")
                     }
                 case .editor(let index):
                     CollectionEditorSheet(
@@ -6748,11 +6815,13 @@ private struct CollectionsSettingsSection: View {
 
 private enum CollectionsSheet: Identifiable {
     case importCollections
+    case templates
     case editor(Int?)
 
     var id: String {
         switch self {
         case .importCollections: return "import"
+        case .templates: return "templates"
         case .editor(let index): return "editor-\(index.map(String.init) ?? "new")"
         }
     }
@@ -6770,6 +6839,7 @@ private struct CollectionsActionBar: View {
     let canExport: Bool
     let onExport: () -> Void
     let onImport: () -> Void
+    let onTemplates: () -> Void
     let onNew: () -> Void
 
     var body: some View {
@@ -6789,6 +6859,13 @@ private struct CollectionsActionBar: View {
                 action: onImport
             )
             CollectionsGlassButton(
+                title: "Templates",
+                systemImage: "rectangle.stack.badge.plus",
+                prominent: false,
+                disabled: false,
+                action: onTemplates
+            )
+            CollectionsGlassButton(
                 title: L10n.string("tvos_settings_new_collection", fallback: "New Collection"),
                 systemImage: "plus",
                 prominent: true,
@@ -6797,8 +6874,7 @@ private struct CollectionsActionBar: View {
             )
         }
         .padding(28)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .loginGlassPanel()
+        .frame(maxWidth: .infinity, alignment: .center)
     }
 }
 
@@ -6854,6 +6930,771 @@ private struct CollectionsGlassButton: View {
     private var borderColor: Color {
         if focused { return AppFocusOutline.color }
         return Color.white.opacity(prominent ? 0.20 : 0.14)
+    }
+}
+
+// MARK: Collection templates
+
+/// Starts from a curated collection, then hands the draft to the normal editor
+/// so every service, source, logo, and Home option remains user-editable.
+private struct CollectionTemplatesFlowSheet: View {
+    let accentColor: Color
+    let onSave: ([String: Any]) -> Void
+
+    private enum Template {
+        case streamingServices
+        case studiosAndFranchises
+        case discoverByGenre
+    }
+
+    @Environment(\.dismiss) private var dismiss
+    @State private var selectedTemplate: Template?
+    @State private var logoURLs = StreamingServicesCollectionTemplate.fallbackLogoURLs
+
+    var body: some View {
+        Group {
+            if let selectedTemplate {
+                CollectionEditorSheet(
+                    accentColor: accentColor,
+                    existing: payload(for: selectedTemplate),
+                    createsNew: true,
+                    onSave: onSave
+                )
+            } else {
+                ZStack {
+                    Color.black.opacity(0.62)
+                        .ignoresSafeArea()
+
+                    VStack(alignment: .leading, spacing: 28) {
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Collection Templates")
+                                .font(.system(size: 38, weight: .bold))
+                                .foregroundColor(.white)
+                            Text("Choose a ready-made collection, customize it if you want, then add it to Home.")
+                                .font(.system(size: 21, weight: .medium))
+                                .foregroundColor(.white.opacity(0.6))
+                        }
+
+                        StreamingServicesTemplateCard(logoURLs: logoURLs) {
+                            selectedTemplate = .streamingServices
+                        }
+
+                        CollectionTemplateSummaryCard(
+                            title: "Studios & Franchises",
+                            subtitle: "Production houses and cinematic universes",
+                            systemImage: "building.2.fill",
+                            previews: ["A24", "HBO", "Pixar", "Warner", "Universal", "Marvel", "DC"]
+                        ) {
+                            selectedTemplate = .studiosAndFranchises
+                        }
+
+                        CollectionTemplateSummaryCard(
+                            title: "Discover by Genre",
+                            subtitle: "Browse popular movies and series by genre",
+                            systemImage: "square.grid.2x2.fill",
+                            previews: ["Action", "Comedy", "Drama", "Horror", "Sci-Fi", "Animation", "Crime", "More"]
+                        ) {
+                            selectedTemplate = .discoverByGenre
+                        }
+
+                        HStack {
+                            Spacer()
+                            CollectionsGlassButton(
+                                title: L10n.string("action_cancel", fallback: "Cancel"),
+                                action: { dismiss() }
+                            )
+                        }
+                    }
+                    .frame(width: 1040)
+                    .padding(.horizontal, 56)
+                    .padding(.vertical, 46)
+                    .loginGlassPanel()
+                }
+                .onExitCommand { dismiss() }
+            }
+        }
+        .task {
+            logoURLs = await StreamingServicesCollectionTemplate.resolveLogoURLs()
+        }
+    }
+
+    private func payload(for template: Template) -> [String: Any] {
+        switch template {
+        case .streamingServices:
+            return StreamingServicesCollectionTemplate.payload(logoURLs: logoURLs)
+        case .studiosAndFranchises:
+            return StudiosFranchisesCollectionTemplate.payload()
+        case .discoverByGenre:
+            return DiscoverGenresCollectionTemplate.payload()
+        }
+    }
+}
+
+private struct StreamingServicesTemplateCard: View {
+    let logoURLs: [Int: String]
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 22) {
+                HStack(alignment: .center, spacing: 18) {
+                    Image(systemName: "play.rectangle.on.rectangle.fill")
+                        .font(.system(size: 32, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text("Streaming Services")
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundColor(isFocused ? .black : .white)
+                        Text("Netflix, Prime Video, Disney+, Max, Apple TV+, Hulu, Paramount+, Peacock and Crunchyroll")
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(isFocused ? .black.opacity(0.62) : .white.opacity(0.58))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 20)
+
+                    Text("Customize")
+                        .font(.system(size: 21, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white.opacity(0.88))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(isFocused ? .black : .white.opacity(0.72))
+                }
+
+                HStack(spacing: 12) {
+                    ForEach(StreamingServicesCollectionTemplate.services) { service in
+                        StreamingServiceLogoTile(
+                            serviceName: service.name,
+                            logoURL: logoURLs[service.providerID]
+                        )
+                    }
+                }
+            }
+            .padding(26)
+            .background(
+                isFocused ? Color.white : Color.white.opacity(0.075),
+                in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .strokeBorder(
+                        isFocused ? AppFocusOutline.color : Color.white.opacity(0.16),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1
+                    )
+            )
+            .scaleEffect(isFocused ? 1.015 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+    }
+}
+
+private struct StreamingServiceLogoTile: View {
+    let serviceName: String
+    let logoURL: String?
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(Color.black.opacity(0.78))
+
+            if let logoURL, let url = URL(string: logoURL) {
+                AsyncImage(url: url) { phase in
+                    if case .success(let image) = phase {
+                        image
+                            .resizable()
+                            .scaledToFit()
+                            .padding(12)
+                    } else {
+                        fallback
+                    }
+                }
+            } else {
+                fallback
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .frame(height: 76)
+        .clipShape(RoundedRectangle(cornerRadius: 14, style: .continuous))
+    }
+
+    private var fallback: some View {
+        Text(serviceName)
+            .font(.system(size: 15, weight: .bold))
+            .foregroundColor(.white)
+            .multilineTextAlignment(.center)
+            .minimumScaleFactor(0.65)
+            .padding(8)
+    }
+}
+
+private struct CollectionTemplateSummaryCard: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let previews: [String]
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            VStack(alignment: .leading, spacing: 18) {
+                HStack(alignment: .center, spacing: 18) {
+                    Image(systemName: systemImage)
+                        .font(.system(size: 32, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white)
+
+                    VStack(alignment: .leading, spacing: 5) {
+                        Text(title)
+                            .font(.system(size: 30, weight: .bold))
+                            .foregroundColor(isFocused ? .black : .white)
+                        Text(subtitle)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(isFocused ? .black.opacity(0.62) : .white.opacity(0.58))
+                            .lineLimit(1)
+                    }
+
+                    Spacer(minLength: 20)
+
+                    Text("Customize")
+                        .font(.system(size: 21, weight: .semibold))
+                        .foregroundColor(isFocused ? .black : .white.opacity(0.88))
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(isFocused ? .black : .white.opacity(0.72))
+                }
+
+                HStack(spacing: 10) {
+                    ForEach(previews, id: \.self) { preview in
+                        Text(preview)
+                            .font(.system(size: 15, weight: .bold))
+                            .foregroundColor(isFocused ? .black.opacity(0.78) : .white.opacity(0.82))
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.7)
+                            .frame(maxWidth: .infinity)
+                            .frame(height: 48)
+                            .background(
+                                isFocused ? Color.black.opacity(0.08) : Color.white.opacity(0.07),
+                                in: RoundedRectangle(cornerRadius: 12, style: .continuous)
+                            )
+                    }
+                }
+            }
+            .padding(24)
+            .background(
+                isFocused ? Color.white : Color.white.opacity(0.075),
+                in: RoundedRectangle(cornerRadius: 28, style: .continuous)
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 28, style: .continuous)
+                    .strokeBorder(
+                        isFocused ? AppFocusOutline.color : Color.white.opacity(0.16),
+                        lineWidth: isFocused ? AppFocusOutline.width : 1
+                    )
+            )
+            .scaleEffect(isFocused ? 1.015 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+    }
+}
+
+private enum StreamingServicesCollectionTemplate {
+    struct Service: Identifiable, Sendable {
+        let name: String
+        let providerID: Int
+        let networkID: Int
+        let fallbackLogoPath: String
+        let backdropPath: String
+
+        var id: Int { providerID }
+    }
+
+    static let services: [Service] = [
+        Service(name: "Netflix", providerID: 8, networkID: 213, fallbackLogoPath: "/pbpMk2JmcoNnQwx5JGpXngfoWtp.jpg", backdropPath: "/aVvRQJ2Ckhlym4uh0YGc166CUoP.jpg"),
+        Service(name: "Prime Video", providerID: 9, networkID: 1024, fallbackLogoPath: "/pvske1MyAoymrs5bguRfVqYiM9a.jpg", backdropPath: "/JYgqp8g2kI3SEus9XBDSHukfBN.jpg"),
+        Service(name: "Disney+", providerID: 337, networkID: 2739, fallbackLogoPath: "/97yvRBw1GzX7fXprcF80er19ot.jpg", backdropPath: "/14QbnygCuTO0vl7CAFmPf1fgZfV.jpg"),
+        Service(name: "Max", providerID: 1899, networkID: 3186, fallbackLogoPath: "/jbe4gVSfRlbPTdESXhEKpornsfu.jpg", backdropPath: "/577eXC8wFQT0eUrJcgznSiFPRmk.jpg"),
+        Service(name: "Apple TV+", providerID: 350, networkID: 2552, fallbackLogoPath: "/2E03IAZsX4ZaUqM7tXlctEPMGWS.jpg", backdropPath: "/uTWhbLc7Bj4qNSdW3ZvZKL8cOHv.jpg"),
+        Service(name: "Hulu", providerID: 15, networkID: 453, fallbackLogoPath: "/bxBlRPEPpMVDc4jMhSrTf2339DW.jpg", backdropPath: "/q3pCsNvJ7CmdJUz2sJEEUY3pOPC.jpg"),
+        Service(name: "Paramount+", providerID: 531, networkID: 4330, fallbackLogoPath: "/h5DcR0J2EESLitnhR8xLG1QymTE.jpg", backdropPath: "/zQCOimbHIq5BrLHThidw2bThZem.jpg"),
+        Service(name: "Peacock", providerID: 386, networkID: 3353, fallbackLogoPath: "/2aGrp1xw3qhwCYvNGAJZPdjfeeX.jpg", backdropPath: "/obtdxPgmfykYwVnvuYXC5f2xKlQ.jpg"),
+        Service(name: "Crunchyroll", providerID: 283, networkID: 1112, fallbackLogoPath: "https://upload.wikimedia.org/wikipedia/commons/0/08/Crunchyroll_Logo.png", backdropPath: "/1RgPyOhN4DRs225BGTlHJqCudII.jpg")
+    ]
+
+    static var fallbackLogoURLs: [Int: String] {
+        Dictionary(uniqueKeysWithValues: services.map {
+            ($0.providerID, tmdbImageURL(path: $0.fallbackLogoPath))
+        })
+    }
+
+    static func payload(logoURLs: [Int: String]) -> [String: Any] {
+        let folders: [[String: Any]] = services.map { service in
+            let logoURL = logoURLs[service.providerID]
+                ?? tmdbImageURL(path: service.fallbackLogoPath)
+            let filters: [String: Any] = [
+                "withWatchProviders": String(service.providerID),
+                "watchRegion": "US"
+            ]
+            return [
+                "id": UUID().uuidString,
+                "title": service.name,
+                "coverImageUrl": logoURL,
+                "titleLogoUrl": logoURL,
+                "heroBackdropUrl": tmdbBackdropURL(path: service.backdropPath),
+                "presentationStyle": "STREAMING_SERVICE",
+                "tileShape": "LANDSCAPE",
+                "hideTitle": true,
+                "focusGifEnabled": false,
+                "sources": [
+                    [
+                        "provider": "tmdb",
+                        "tmdbSourceType": "DISCOVER",
+                        "title": "Movies • Popular",
+                        "mediaType": "movie",
+                        "sortBy": "popularity.desc",
+                        "filters": filters
+                    ],
+                    [
+                        "provider": "tmdb",
+                        "tmdbSourceType": "DISCOVER",
+                        "title": "Series • Popular",
+                        "mediaType": "tv",
+                        "sortBy": "popularity.desc",
+                        "filters": filters
+                    ],
+                    [
+                        "provider": "tmdb",
+                        "tmdbSourceType": "DISCOVER",
+                        "title": "Recent Movies",
+                        "mediaType": "movie",
+                        "sortBy": "primary_release_date.desc",
+                        "filters": filters
+                    ],
+                    [
+                        "provider": "tmdb",
+                        "tmdbSourceType": "DISCOVER",
+                        "title": "Recent Shows",
+                        "mediaType": "tv",
+                        "sortBy": "first_air_date.desc",
+                        "filters": filters
+                    ]
+                ]
+            ]
+        }
+
+        return [
+            "templateID": "streaming-services",
+            "templateVersion": 6,
+            "title": "Streaming Services",
+            "pinToTop": false,
+            "focusGlowEnabled": true,
+            "viewMode": "ROWS",
+            "showAllTab": false,
+            "folders": folders
+        ]
+    }
+
+    static func resolveLogoURLs() async -> [Int: String] {
+        var resolved = fallbackLogoURLs
+        let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        guard !key.isEmpty else { return resolved }
+
+        if let providers = await fetchWatchProviders(apiKey: key) {
+            for provider in providers {
+                guard let path = provider.logoPath,
+                      services.contains(where: { $0.providerID == provider.providerID }) else { continue }
+                resolved[provider.providerID] = tmdbImageURL(path: path)
+            }
+        }
+
+        await withTaskGroup(of: (Int, String?).self) { group in
+            for service in services {
+                group.addTask {
+                    let logo = await fetchNetworkLogo(networkID: service.networkID, apiKey: key)
+                    return (service.providerID, logo)
+                }
+            }
+            for await (providerID, logoURL) in group {
+                if let logoURL { resolved[providerID] = logoURL }
+            }
+        }
+        if let crunchyroll = services.first(where: { $0.providerID == 283 }) {
+            resolved[crunchyroll.providerID] = tmdbImageURL(path: crunchyroll.fallbackLogoPath)
+        }
+        return resolved
+    }
+
+    private static func fetchWatchProviders(apiKey: String) async -> [WatchProvider]? {
+        var components = URLComponents(string: "https://api.themoviedb.org/3/watch/providers/movie")!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: TmdbDetailsService.preferredLanguage)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(WatchProviderResponse.self, from: data) else {
+            return nil
+        }
+        return decoded.results
+    }
+
+    private static func fetchNetworkLogo(networkID: Int, apiKey: String) async -> String? {
+        var components = URLComponents(string: "https://api.themoviedb.org/3/network/\(networkID)")!
+        components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(NetworkLogoResponse.self, from: data),
+              let path = decoded.logoPath else {
+            return nil
+        }
+        return tmdbImageURL(path: path)
+    }
+
+    private static func tmdbImageURL(path: String) -> String {
+        if path.hasPrefix("https://") { return path }
+        return "https://image.tmdb.org/t/p/w500\(path)"
+    }
+
+    private static func tmdbBackdropURL(path: String) -> String {
+        "https://image.tmdb.org/t/p/w1280\(path)"
+    }
+
+    private struct WatchProviderResponse: Decodable {
+        let results: [WatchProvider]
+    }
+
+    private struct WatchProvider: Decodable {
+        let providerID: Int
+        let logoPath: String?
+
+        enum CodingKeys: String, CodingKey {
+            case providerID = "provider_id"
+            case logoPath = "logo_path"
+        }
+    }
+
+    private struct NetworkLogoResponse: Decodable {
+        let logoPath: String?
+
+        enum CodingKeys: String, CodingKey {
+            case logoPath = "logo_path"
+        }
+    }
+}
+
+private enum StudiosFranchisesCollectionTemplate {
+    static func payload() -> [String: Any] {
+        let folders: [[String: Any]] = [
+            companyFolder(
+                title: "A24",
+                companyID: 41077,
+                logoPath: "/1ZXsGaFPgrgS6ZZGS37AqD5uU12.png",
+                backdropPath: "/wjwMC7u3xWKkrronolBqsIy4L0L.jpg"
+            ),
+            brandFolder(
+                title: "HBO",
+                logoPath: "/tuomPhY2UtuPTqqFnKMVHvSb724.png",
+                backdropPath: "/577eXC8wFQT0eUrJcgznSiFPRmk.jpg",
+                sources: fourCatalogSources(
+                    movieSourceType: "COMPANY",
+                    movieID: 3268,
+                    seriesSourceType: "NETWORK",
+                    seriesID: 49
+                )
+            ),
+            companyFolder(
+                title: "Pixar",
+                companyID: 3,
+                logoPath: "/1TjvGVDMYsj6JBxOAkUHpPEwLf7.png",
+                backdropPath: "/8sSKdEmlmqF4kJUd28SqthXC4yZ.jpg"
+            ),
+            companyFolder(
+                title: "Warner Bros.",
+                companyID: 174,
+                logoPath: "/zhD3hhtKB5qyv7ZeL4uLpNxgMVU.png",
+                backdropPath: "/cu3lhUReOdqFAo5K1jesoftwiBj.jpg"
+            ),
+            companyFolder(
+                title: "Universal",
+                companyID: 33,
+                logoPath: "/8lvHyhjr8oUKOOy2dKXoALWKdp0.png",
+                backdropPath: "/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg"
+            ),
+            companyFolder(
+                title: "Marvel",
+                companyID: 420,
+                logoPath: "/hUzeosd33nzE5MCNsZxCGEKTXaQ.png",
+                backdropPath: "/qeQJx07rK2xm8SD2sJxFKhE7gs0.jpg"
+            ),
+            companyFolder(
+                title: "DC",
+                companyID: 9993,
+                logoPath: "/2Tc1P3Ac8M479naPp1kYT3izLS5.png",
+                backdropPath: "/rWYtghaUJSDvQm4jmXiCPXBHUdQ.jpg"
+            )
+        ]
+
+        return [
+            "templateID": "studios-franchises",
+            "templateVersion": 3,
+            "title": "Studios & Franchises",
+            "pinToTop": false,
+            "focusGlowEnabled": true,
+            "viewMode": "ROWS",
+            "showAllTab": false,
+            "folders": folders
+        ]
+    }
+
+    private static func companyFolder(
+        title: String,
+        companyID: Int,
+        logoPath: String,
+        backdropPath: String
+    ) -> [String: Any] {
+        brandFolder(
+            title: title,
+            logoPath: logoPath,
+            backdropPath: backdropPath,
+            sources: fourCatalogSources(
+                movieSourceType: "COMPANY",
+                movieID: companyID,
+                seriesSourceType: "COMPANY",
+                seriesID: companyID
+            )
+        )
+    }
+
+    private static func brandFolder(
+        title: String,
+        logoPath: String,
+        backdropPath: String,
+        sources: [[String: Any]]
+    ) -> [String: Any] {
+        let logoURL = tmdbImageURL(path: logoPath)
+        return [
+            "id": UUID().uuidString,
+            "title": title,
+            "coverImageUrl": logoURL,
+            "titleLogoUrl": logoURL,
+            "heroBackdropUrl": tmdbBackdropURL(path: backdropPath),
+            "presentationStyle": "STUDIO_FRANCHISE",
+            "tileShape": "LANDSCAPE",
+            "hideTitle": true,
+            "focusGifEnabled": false,
+            "sources": sources
+        ]
+    }
+
+    private static func fourCatalogSources(
+        movieSourceType: String,
+        movieID: Int?,
+        seriesSourceType: String,
+        seriesID: Int?,
+        filters: [String: Any]? = nil
+    ) -> [[String: Any]] {
+        [
+            tmdbSource(
+                title: "Movies • Popular",
+                sourceType: movieSourceType,
+                id: movieID,
+                mediaType: "movie",
+                sortBy: "popularity.desc",
+                filters: filters
+            ),
+            tmdbSource(
+                title: "Series • Popular",
+                sourceType: seriesSourceType,
+                id: seriesID,
+                mediaType: "tv",
+                sortBy: "popularity.desc",
+                filters: filters
+            ),
+            tmdbSource(
+                title: "Recent Movies",
+                sourceType: movieSourceType,
+                id: movieID,
+                mediaType: "movie",
+                sortBy: "primary_release_date.desc",
+                filters: filters
+            ),
+            tmdbSource(
+                title: "Recent Shows",
+                sourceType: seriesSourceType,
+                id: seriesID,
+                mediaType: "tv",
+                sortBy: "first_air_date.desc",
+                filters: filters
+            )
+        ]
+    }
+
+    private static func tmdbSource(
+        title: String,
+        sourceType: String,
+        id: Int?,
+        mediaType: String,
+        sortBy: String,
+        filters: [String: Any]?
+    ) -> [String: Any] {
+        var source: [String: Any] = [
+            "provider": "tmdb",
+            "tmdbSourceType": sourceType,
+            "title": title,
+            "mediaType": mediaType,
+            "sortBy": sortBy
+        ]
+        if let id { source["tmdbId"] = id }
+        if let filters { source["filters"] = filters }
+        return source
+    }
+
+    private static func tmdbImageURL(path: String) -> String {
+        "https://image.tmdb.org/t/p/w500\(path)"
+    }
+
+    private static func tmdbBackdropURL(path: String) -> String {
+        "https://image.tmdb.org/t/p/w1280\(path)"
+    }
+}
+
+private enum DiscoverGenresCollectionTemplate {
+    private struct GenreGroup {
+        let title: String
+        let emoji: String
+        let movieGenres: String?
+        let seriesGenres: String?
+        let seriesKeywords: String?
+        let backdropPath: String
+
+        init(
+            title: String,
+            emoji: String,
+            movieGenres: String?,
+            seriesGenres: String?,
+            seriesKeywords: String? = nil,
+            backdropPath: String
+        ) {
+            self.title = title
+            self.emoji = emoji
+            self.movieGenres = movieGenres
+            self.seriesGenres = seriesGenres
+            self.seriesKeywords = seriesKeywords
+            self.backdropPath = backdropPath
+        }
+    }
+
+    private static let groups: [GenreGroup] = [
+        GenreGroup(title: "Action & Adventure", emoji: "💥", movieGenres: "28|12", seriesGenres: "10759", backdropPath: "/sSIzzVhhLfgLKVBcAUv0X6cLYz9.jpg"),
+        GenreGroup(title: "Animation", emoji: "🎨", movieGenres: "16", seriesGenres: "16", backdropPath: "/1RgPyOhN4DRs225BGTlHJqCudII.jpg"),
+        GenreGroup(title: "Comedy", emoji: "😂", movieGenres: "35", seriesGenres: "35", backdropPath: "/xWBiXclrRmTggQHMRsIn84YHavs.jpg"),
+        GenreGroup(title: "Crime", emoji: "🕵️", movieGenres: "80", seriesGenres: "80", backdropPath: "/qO55CD8tgVL1T4WKn6zYFFiD6lL.jpg"),
+        GenreGroup(title: "Documentary", emoji: "🎥", movieGenres: "99", seriesGenres: "99", backdropPath: "/eCP3PAiu442zkJWczdLdvALePNK.jpg"),
+        GenreGroup(title: "Drama", emoji: "🎭", movieGenres: "18", seriesGenres: "18", backdropPath: "/Af907x5h9W1wVis8XrSd7ynTWuy.jpg"),
+        GenreGroup(title: "Family", emoji: "👨‍👩‍👧‍👦", movieGenres: "10751", seriesGenres: "10751", backdropPath: "/kxQiIJ4gVcD3K6o14MJ72p5yRcE.jpg"),
+        GenreGroup(title: "Horror", emoji: "👻", movieGenres: "27", seriesGenres: nil, seriesKeywords: "315058", backdropPath: "/rZfmzpixLKLR3Hg2u0WgC7XLFl8.jpg"),
+        GenreGroup(title: "Mystery & Thriller", emoji: "🔎", movieGenres: "9648|53", seriesGenres: "9648", backdropPath: "/flxau5Iu7bChQHsESqvGZ3FQRaI.jpg"),
+        GenreGroup(title: "Romance", emoji: "❤️", movieGenres: "10749", seriesGenres: nil, seriesKeywords: "9840", backdropPath: "/1oKLEA9JOhvaBwLpqjROisvWMy7.jpg"),
+        GenreGroup(title: "Sci-Fi & Fantasy", emoji: "🚀", movieGenres: "878|14", seriesGenres: "10765", backdropPath: "/qeQJx07rK2xm8SD2sJxFKhE7gs0.jpg"),
+        GenreGroup(title: "War & History", emoji: "⚔️", movieGenres: "10752|36", seriesGenres: "10768", backdropPath: "/cu3lhUReOdqFAo5K1jesoftwiBj.jpg")
+    ]
+
+    static func payload() -> [String: Any] {
+        [
+            "templateID": "discover-genres",
+            "templateVersion": 3,
+            "title": "Discover by Genre",
+            "pinToTop": false,
+            "focusGlowEnabled": true,
+            "viewMode": "ROWS",
+            "showAllTab": false,
+            "folders": groups.map { folder(for: $0) }
+        ]
+    }
+
+    private static func folder(for group: GenreGroup) -> [String: Any] {
+        var sources: [[String: Any]] = []
+        if let movieGenres = group.movieGenres {
+            let filters: [String: Any] = ["withGenres": movieGenres]
+            sources.append(source(
+                title: "Movies • Popular",
+                mediaType: "movie",
+                sortBy: "popularity.desc",
+                filters: filters
+            ))
+            sources.append(source(
+                title: "Recent Movies",
+                mediaType: "movie",
+                sortBy: "primary_release_date.desc",
+                filters: filters
+            ))
+        }
+        let seriesFilters: [String: Any]?
+        if let seriesGenres = group.seriesGenres {
+            seriesFilters = ["withGenres": seriesGenres]
+        } else if let seriesKeywords = group.seriesKeywords {
+            seriesFilters = ["withKeywords": seriesKeywords]
+        } else {
+            seriesFilters = nil
+        }
+        if let seriesFilters {
+            sources.insert(source(
+                title: "Series • Popular",
+                mediaType: "tv",
+                sortBy: "popularity.desc",
+                filters: seriesFilters
+            ), at: min(1, sources.count))
+            sources.append(source(
+                title: "Recent Shows",
+                mediaType: "tv",
+                sortBy: "first_air_date.desc",
+                filters: seriesFilters
+            ))
+        }
+        return [
+            "id": UUID().uuidString,
+            "title": group.title,
+            "coverEmoji": group.emoji,
+            "heroBackdropUrl": tmdbBackdropURL(path: group.backdropPath),
+            "tileShape": "SQUARE",
+            "hideTitle": false,
+            "focusGifEnabled": false,
+            "sources": sources
+        ]
+    }
+
+    private static func source(
+        title: String,
+        mediaType: String,
+        sortBy: String,
+        filters: [String: Any]
+    ) -> [String: Any] {
+        [
+            "provider": "tmdb",
+            "tmdbSourceType": "DISCOVER",
+            "title": title,
+            "mediaType": mediaType,
+            "sortBy": sortBy,
+            "filters": filters
+        ]
+    }
+
+    private static func tmdbBackdropURL(path: String) -> String {
+        "https://image.tmdb.org/t/p/w1280\(path)"
     }
 }
 
@@ -6922,6 +7763,7 @@ private struct CollectionSettingsRow: View {
 private struct CollectionEditorSheet: View {
     let accentColor: Color
     let existing: [String: Any]?
+    var createsNew = false
     let onSave: ([String: Any]) -> Void
 
     @Environment(\.dismiss) private var dismiss
@@ -6933,7 +7775,7 @@ private struct CollectionEditorSheet: View {
     @State private var folders: [[String: Any]] = []
     @State private var sourcePicker: FolderSourcePicker?
 
-    private var isNew: Bool { existing == nil }
+    private var isNew: Bool { existing == nil || createsNew }
 
     /// Which source-add flow is open for a folder index (Android: Catalog / TMDB / Trakt).
     private enum FolderSourcePicker: Identifiable {
@@ -7193,7 +8035,7 @@ private struct CollectionEditorSheet: View {
             }
         }
         var payload: [String: Any] = [
-            "id": (existing?["id"] as? String) ?? UUID().uuidString,
+            "id": createsNew ? UUID().uuidString : ((existing?["id"] as? String) ?? UUID().uuidString),
             "title": trimmed,
             "pinToTop": pinToTop,
             "focusGlowEnabled": focusGlowEnabled,
@@ -7203,6 +8045,11 @@ private struct CollectionEditorSheet: View {
         ]
         if let backdrop = existing?["backdropImageUrl"] as? String {
             payload["backdropImageUrl"] = backdrop
+        }
+        for key in ["templateID", "templateVersion"] {
+            if let value = existing?[key] {
+                payload[key] = value
+            }
         }
         onSave(payload)
         dismiss()
@@ -8668,6 +9515,7 @@ private struct SettingsTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var centerDisplayText = false
     var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
@@ -8693,6 +9541,7 @@ private struct SettingsTextFieldRow: View {
                     focused: isFocused,
                     isEditing: $isEditing,
                     fieldWidth: fieldWidth,
+                    centerDisplayText: centerDisplayText,
                     onCommit: onCommit
                 )
             }
@@ -8770,13 +9619,15 @@ private struct SettingsNativeTextFieldRow: View {
 /// capsule. A hidden, off-screen UITextField drives editing (a native focused
 /// TextField/SecureField on tvOS always paints its own white pill); the owning
 /// row supplies focus and toggles `isEditing` when clicked.
-private struct SettingsGlassTextField: View {
+struct SettingsGlassTextField: View {
     @Binding var text: String
     let placeholder: String
     var isSecure: Bool = false
     var focused: Bool
     @Binding var isEditing: Bool
     var fieldWidth: CGFloat = 300
+    var centerDisplayText = false
+    var keyboardType: UIKeyboardType = .default
     var onCommit: () -> Void = {}
 
     var body: some View {
@@ -8785,6 +9636,7 @@ private struct SettingsGlassTextField: View {
                 text: $text,
                 isEditing: $isEditing,
                 isSecure: isSecure,
+                keyboardType: keyboardType,
                 onCommit: onCommit
             )
                 .frame(width: 1, height: 1)
@@ -8796,10 +9648,10 @@ private struct SettingsGlassTextField: View {
                 .foregroundColor(text.isEmpty ? .white.opacity(0.45) : .white)
                 .lineLimit(1)
                 .frame(
-                    width: fieldWidth - (text.isEmpty ? 0 : 32),
-                    alignment: text.isEmpty ? .center : .leading
+                    width: fieldWidth - (displayTextIsCentered ? 0 : 32),
+                    alignment: displayTextIsCentered ? .center : .leading
                 )
-                .padding(.horizontal, text.isEmpty ? 0 : 16)
+                .padding(.horizontal, displayTextIsCentered ? 0 : 16)
                 .allowsHitTesting(false)
         }
         .frame(width: fieldWidth, height: 48)
@@ -8810,12 +9662,17 @@ private struct SettingsGlassTextField: View {
         guard !text.isEmpty else { return placeholder }
         return isSecure ? String(repeating: "•", count: text.count) : text
     }
+
+    private var displayTextIsCentered: Bool {
+        text.isEmpty || centerDisplayText
+    }
 }
 
 private struct HiddenSettingsTextField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
     var isSecure: Bool = false
+    var keyboardType: UIKeyboardType = .default
     var onCommit: () -> Void = {}
 
     func makeUIView(context: Context) -> HiddenSettingsUITextField {
@@ -8826,6 +9683,7 @@ private struct HiddenSettingsTextField: UIViewRepresentable {
         textField.tintColor = .clear
         textField.returnKeyType = .done
         textField.keyboardAppearance = .dark
+        textField.keyboardType = keyboardType
         textField.autocorrectionType = .no
         textField.autocapitalizationType = .none
         textField.isSecureTextEntry = isSecure

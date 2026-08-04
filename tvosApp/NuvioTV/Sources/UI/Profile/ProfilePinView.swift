@@ -3,7 +3,6 @@ import SwiftUI
 public struct ProfilePinView: View {
     @ObservedObject var viewModel: ProfileViewModel
     @State private var enteredPin = ""
-    @FocusState private var focusedControl: ProfilePinControl?
 
     public init(viewModel: ProfileViewModel) {
         self.viewModel = viewModel
@@ -11,20 +10,18 @@ public struct ProfilePinView: View {
 
     public var body: some View {
         ZStack {
-            Color.black.opacity(0.78)
+            Color.black.opacity(0.52)
                 .ignoresSafeArea()
 
-            VStack(spacing: 22) {
-                VStack(spacing: 10) {
-                    Text("Enter PIN")
-                        .font(.system(size: 38, weight: .bold))
-                        .foregroundColor(.white)
+            VStack(spacing: 24) {
+                Text("Enter PIN")
+                    .font(.system(size: 34, weight: .bold))
+                    .foregroundColor(.white)
 
-                    Text(instructions)
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundColor(.white.opacity(0.64))
-                        .multilineTextAlignment(.center)
-                }
+                Text(instructions)
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.64))
+                    .multilineTextAlignment(.center)
 
                 HStack(spacing: 18) {
                     ForEach(0..<4, id: \.self) { index in
@@ -35,57 +32,50 @@ public struct ProfilePinView: View {
                 }
                 .padding(.vertical, 4)
 
-                Group {
-                    if viewModel.isLoading {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text("Verifying…")
-                        }
-                        .foregroundColor(.white.opacity(0.72))
-                    } else {
-                        Text(viewModel.pinError ?? " ")
-                            .foregroundColor(.red)
-                    }
-                }
-                .font(.system(size: 18, weight: .semibold))
-                .frame(height: 24)
+                Text(viewModel.isLoading ? "Verifying…" : (viewModel.pinError ?? " "))
+                    .font(.system(size: 18, weight: .semibold))
+                    .foregroundColor(viewModel.isLoading ? .white.opacity(0.72) : .red)
+                    .frame(height: 24)
 
                 LazyVGrid(
                     columns: Array(repeating: GridItem(.fixed(80)), count: 3),
                     spacing: 18
                 ) {
                     ForEach(1...9, id: \.self) { number in
-                        digitButton(number)
+                        PinButton(number: "\(number)") {
+                            addPinDigit("\(number)")
+                        }
                     }
 
-                    Color.clear
-                        .frame(width: 80, height: 80)
+                    PinButton(number: "", isDisabled: true) {}
+                    PinButton(number: "0") { addPinDigit("0") }
 
-                    digitButton(0)
-                    deleteButton
+                    PinDeleteButton(action: deleteDigit)
                 }
 
-                actionButton(title: "Cancel", control: .cancel) {
+                PinSheetActionButton(title: "Cancel") {
                     guard !viewModel.isLoading else { return }
                     dismiss()
                 }
                 .padding(.top, 4)
             }
-            .frame(width: 500)
-            .padding(44)
+            .frame(width: 520)
+            .padding(48)
             .loginGlassPanel()
-            .shadow(color: .black.opacity(0.45), radius: 36, y: 18)
+            .overlay {
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            }
+            .shadow(color: .black.opacity(0.38), radius: 32, y: 18)
         }
-        .transition(.opacity.combined(with: .scale(scale: 0.97)))
+        .transition(.opacity)
         .onAppear {
             enteredPin = ""
             viewModel.pinError = nil
-            focusedControl = .digit(1)
         }
         .onChange(of: viewModel.pinError) { _, error in
             if error != nil {
                 enteredPin = ""
-                focusedControl = .digit(1)
             }
         }
     }
@@ -98,67 +88,6 @@ public struct ProfilePinView: View {
             return "Enter the 4-digit profile PIN."
         }
         return "Enter the 4-digit PIN for \(profile.name)."
-    }
-
-    private func digitButton(_ number: Int) -> some View {
-        let control = ProfilePinControl.digit(number)
-        return Button {
-            addPinDigit(String(number))
-        } label: {
-            Text(String(number))
-                .font(.system(size: 38, weight: .medium))
-                .foregroundColor(focusedControl == control ? .black : .white)
-                .frame(width: 80, height: 80)
-                .loginGlassCapsule(highlighted: focusedControl == control)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($focusedControl, equals: control)
-        .focusEffectDisabledIfAvailable()
-        .disabled(viewModel.isLoading)
-        .scaleEffect(focusedControl == control ? 1.06 : 1)
-        .animation(.easeOut(duration: 0.12), value: focusedControl)
-    }
-
-    private var deleteButton: some View {
-        let control = ProfilePinControl.delete
-        return Button {
-            guard !viewModel.isLoading, !enteredPin.isEmpty else { return }
-            enteredPin.removeLast()
-            viewModel.pinError = nil
-        } label: {
-            Image(systemName: "delete.left")
-                .font(.system(size: 30, weight: .semibold))
-                .foregroundColor(focusedControl == control ? .black : .white)
-                .frame(width: 80, height: 80)
-                .loginGlassCapsule(highlighted: focusedControl == control)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($focusedControl, equals: control)
-        .focusEffectDisabledIfAvailable()
-        .disabled(viewModel.isLoading)
-        .scaleEffect(focusedControl == control ? 1.06 : 1)
-        .animation(.easeOut(duration: 0.12), value: focusedControl)
-    }
-
-    private func actionButton(
-        title: String,
-        control: ProfilePinControl,
-        action: @escaping () -> Void
-    ) -> some View {
-        Button(action: action) {
-            Text(title)
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundColor(focusedControl == control ? .black : .white)
-                .padding(.horizontal, 30)
-                .frame(height: 56)
-                .loginGlassCapsule(highlighted: focusedControl == control)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focused($focusedControl, equals: control)
-        .focusEffectDisabledIfAvailable()
-        .disabled(viewModel.isLoading)
-        .scaleEffect(focusedControl == control ? 1.04 : 1)
-        .animation(.easeOut(duration: 0.12), value: focusedControl)
     }
 
     private func addPinDigit(_ digit: String) {
@@ -175,12 +104,12 @@ public struct ProfilePinView: View {
         enteredPin = ""
         viewModel.pinError = nil
     }
-}
 
-private enum ProfilePinControl: Hashable {
-    case digit(Int)
-    case delete
-    case cancel
+    private func deleteDigit() {
+        guard !viewModel.isLoading, !enteredPin.isEmpty else { return }
+        enteredPin.removeLast()
+        viewModel.pinError = nil
+    }
 }
 
 struct PinButton: View {

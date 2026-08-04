@@ -96,31 +96,35 @@ public struct UserProfileView: View {
                     Spacer().frame(height: 56)
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .disabled(viewModel.isPinEntryVisible)
+                .disabled(viewModel.isPinEntryVisible || showingAddProfile)
 
                 if viewModel.isPinEntryVisible {
                     ProfilePinView(viewModel: viewModel)
                 }
-            }
-            .onAppear { AvatarCatalogStore.shared.loadIfNeeded() }
-            .sheet(isPresented: $showingAddProfile) {
-                AddProfileView(
-                    isPresented: $showingAddProfile,
-                    name: $newProfileName,
-                    pin: $newProfilePin,
-                    avatarId: $newProfileAvatarId
-                ) {
-                    viewModel.createProfile(
-                        name: newProfileName,
-                        pin: newProfilePin.isEmpty ? nil : newProfilePin,
-                        avatarId: newProfileAvatarId,
-                        onCreated: onProfileCreated
-                    )
-                    newProfileName = ""
-                    newProfilePin = ""
-                    newProfileAvatarId = ProfileAvatarCatalog.defaultId
+
+                if showingAddProfile {
+                    AddProfileView(
+                        isPresented: $showingAddProfile,
+                        name: $newProfileName,
+                        pin: $newProfilePin,
+                        avatarId: $newProfileAvatarId
+                    ) {
+                        viewModel.createProfile(
+                            name: newProfileName,
+                            pin: newProfilePin.isEmpty ? nil : newProfilePin,
+                            avatarId: newProfileAvatarId,
+                            onCreated: onProfileCreated
+                        )
+                        newProfileName = ""
+                        newProfilePin = ""
+                        newProfileAvatarId = ProfileAvatarCatalog.defaultId
+                    }
+                    .transition(.opacity)
+                    .zIndex(2)
                 }
             }
+            .animation(.easeInOut(duration: 0.18), value: showingAddProfile)
+            .onAppear { AvatarCatalogStore.shared.loadIfNeeded() }
         }
     }
 
@@ -483,39 +487,169 @@ struct AddProfileView: View {
     @Binding var avatarId: String
     var onSave: () -> Void
 
+    @FocusState private var focusedField: Field?
+    @State private var showingPinSheet = false
+
+    fileprivate enum Field {
+        case name
+    }
+
+    private var canSave: Bool {
+        !name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && (pin.isEmpty || pin.count == 4)
+    }
+
     var body: some View {
-        NavigationView {
-            Form {
-                Section(header: Text("Profile Info")) {
-                    TextField("Name", text: $name)
-                    SecureField("PIN (Optional)", text: $pin)
-                        .keyboardType(.numberPad)
-                        .onChange(of: pin) { value in
-                            let digits = value.filter { $0 >= "0" && $0 <= "9" }
-                            pin = String(digits.prefix(4))
+        ZStack {
+            ProfileBackground()
+                .ignoresSafeArea()
+
+            VStack(alignment: .leading, spacing: 28) {
+                HStack(alignment: .center, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Add Profile")
+                            .font(.system(size: 42, weight: .bold))
+                            .foregroundColor(.white)
+
+                        Text("Create a profile for another viewer")
+                            .font(.system(size: 22, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    Spacer()
+
+                    ProfileAvatarView(avatarId: avatarId, size: 112)
+                }
+
+                VStack(alignment: .leading, spacing: 14) {
+                    Text("Profile Info")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.62))
+
+                    HStack(spacing: 18) {
+                        AddProfileTextField(
+                            placeholder: "Name",
+                            text: $name,
+                            focusedField: $focusedField,
+                            field: .name
+                        )
+
+                        AddProfilePinButton(pinIsSet: !pin.isEmpty) {
+                            showingPinSheet = true
                         }
+                    }
                 }
 
-                Section(header: Text("Avatar")) {
-                    AvatarPickerGrid(selectedAvatarId: $avatarId)
-                }
+                Text("Avatar")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.62))
 
-                Button("Save") {
-                    onSave()
-                    isPresented = false
-                }
-                .disabled(name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                    || (!pin.isEmpty && pin.count != 4))
-            }
-            .navigationTitle("Add Profile")
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Cancel") {
+                AvatarPickerGrid(selectedAvatarId: $avatarId, scrollsGrid: true)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+
+                HStack(spacing: 16) {
+                    ProfileAvatarPickerButton(title: "Cancel", systemImage: "xmark") {
+                        isPresented = false
+                    }
+
+                    ProfileAvatarPickerButton(
+                        title: "Save",
+                        systemImage: "checkmark",
+                        prominent: true,
+                        disabled: !canSave
+                    ) {
+                        onSave()
                         isPresented = false
                     }
                 }
             }
+            .padding(.horizontal, 84)
+            .padding(.vertical, 62)
+            .frame(maxWidth: 1180, maxHeight: .infinity)
+            .disabled(showingPinSheet)
+
+            if showingPinSheet {
+                ProfilePinManagementView(
+                    mode: .enable,
+                    profileName: name.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        ? "this profile"
+                        : name.trimmingCharacters(in: .whitespacesAndNewlines),
+                    onVerify: { _ in true },
+                    onSave: { newPin, _ in
+                        pin = newPin ?? ""
+                        return true
+                    },
+                    onDismiss: {
+                        showingPinSheet = false
+                    }
+                )
+                .transition(.opacity)
+                .zIndex(1)
+            }
         }
+        .animation(.easeInOut(duration: 0.18), value: showingPinSheet)
+        .onExitCommand(perform: handleExitCommand)
+        .onAppear {
+            DispatchQueue.main.async { focusedField = .name }
+        }
+    }
+
+    private func handleExitCommand() {
+        if showingPinSheet {
+            showingPinSheet = false
+        } else {
+            isPresented = false
+        }
+    }
+}
+
+private struct AddProfileTextField: View {
+    let placeholder: String
+    @Binding var text: String
+    var focusedField: FocusState<AddProfileView.Field?>.Binding
+    let field: AddProfileView.Field
+
+    @State private var isEditing = false
+
+    var body: some View {
+        Button {
+            isEditing = true
+        } label: {
+            SettingsGlassTextField(
+                text: $text,
+                placeholder: placeholder,
+                focused: focusedField.wrappedValue == field,
+                isEditing: $isEditing,
+                fieldWidth: 490,
+                centerDisplayText: true
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused(focusedField, equals: field)
+        .focusEffectDisabledIfAvailable()
+    }
+}
+
+private struct AddProfilePinButton: View {
+    let pinIsSet: Bool
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Label(
+                pinIsSet ? "PIN Set" : "Set PIN (Optional)",
+                systemImage: pinIsSet ? "lock.fill" : "lock"
+            )
+            .font(.system(size: 20, weight: .semibold))
+            .foregroundColor(.white.opacity(pinIsSet ? 1 : 0.62))
+            .frame(width: 490, height: 48)
+            .modifier(GlassCapsule(focused: isFocused))
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
     }
 }
 

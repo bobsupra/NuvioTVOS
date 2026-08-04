@@ -8,11 +8,16 @@ import Metal
 import QuartzCore
 import Combine
 
-/// `sub-text` is MPV's decoded, formatting-stripped active text subtitle.
-/// Keeping a separate state object lets MPV keep decoding its selected subtitle
-/// while the SwiftUI host replaces only text cues with translated text.
+/// MPV exposes an external subtitle filename for applicable tracks, but this
+/// bridge does not expose a complete parsed cue list. `sub-text` is therefore
+/// the only safe input here: translate one active cue at a time while the host
+/// overlay keeps the original visible until the response arrives.
 @MainActor
 final class MPVSubtitleTranslationState: ObservableObject {
+    typealias TranslationRequest = (
+        String, AISubtitleTranslationSettings, AISubtitleRequestPacer
+    ) async throws -> String
+
     @Published private(set) var sourceText = ""
     @Published private(set) var translatedText: String?
     @Published private(set) var isTranslating = false
@@ -25,9 +30,24 @@ final class MPVSubtitleTranslationState: ObservableObject {
     private var currentSettings: AISubtitleTranslationSettings?
     private var sessionID = UUID()
     private var manualActivation = false
-    private var didReportOutcome = false
+    private var didReportSuccess = false
+    private var didReportFailure = false
     private var failedSourceTexts: Set<String> = []
+    private var hasPermanentProviderFailure = false
+    private var needsReevaluation = false
     private let maximumConcurrentRequests = 2
+    let requestPacer: AISubtitleRequestPacer
+    private let requestTranslation: TranslationRequest
+
+    init(
+        requestPacer: AISubtitleRequestPacer = .shared,
+        requestTranslation: @escaping TranslationRequest = { source, settings, pacer in
+            try await AISubtitleTranslator.translate(source, settings: settings, pacer: pacer)
+        }
+    ) {
+        self.requestPacer = requestPacer
+        self.requestTranslation = requestTranslation
+    }
 
     var isActive: Bool {
         let settings = AISubtitleTranslationSettings.current()
@@ -49,15 +69,34 @@ final class MPVSubtitleTranslationState: ObservableObject {
     }
 
     func update(sourceText rawText: String) {
+        update(sourceText: rawText, settings: AISubtitleTranslationSettings.current())
+    }
+
+    func update(sourceText rawText: String, settings: AISubtitleTranslationSettings) {
         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let settings = AISubtitleTranslationSettings.current()
+        guard !text.isEmpty else {
+            // Empty `sub-text` is normal between cues and for streams without
+            // subtitles. Never validate credentials or show an AI toast for it.
+            if !settings.isEnabled
+                || settings.apiKey.isEmpty
+                || !(settings.autoSelect || manualActivation)
+                || currentSettings != settings {
+                deactivate()
+            } else {
+                sourceText = ""
+                currentSource = nil
+                translatedText = nil
+                isTranslating = false
+            }
+            return
+        }
         guard settings.isEnabled else {
             deactivate()
             return
         }
         guard !settings.apiKey.isEmpty else {
             deactivate()
-            reportOnce(.failure(AISubtitleTranslationError.missingAPIKey))
+            report(.failure(AISubtitleTranslationError.missingAPIKey))
             return
         }
         guard settings.autoSelect || manualActivation else {
@@ -69,12 +108,15 @@ final class MPVSubtitleTranslationState: ObservableObject {
             tasks = [:]
             translatedTextBySource = [:]
             failedSourceTexts = []
+            hasPermanentProviderFailure = false
             sessionID = UUID()
             currentSettings = settings
             sourceText = ""
             currentSource = nil
+            needsReevaluation = false
         }
-        guard text != sourceText else { return }
+        guard text != sourceText || needsReevaluation else { return }
+        needsReevaluation = false
         sourceText = text
         translatedText = nil
         isTranslating = false
@@ -98,6 +140,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
             isTranslating = true
             return
         }
+        guard !hasPermanentProviderFailure else { return }
         guard !failedSourceTexts.contains(source) else { return }
 
         if tasks.count >= maximumConcurrentRequests,
@@ -120,8 +163,23 @@ final class MPVSubtitleTranslationState: ObservableObject {
         translatedText = nil
         isTranslating = false
         manualActivation = false
-        didReportOutcome = false
+        didReportSuccess = false
+        didReportFailure = false
         failedSourceTexts = []
+        hasPermanentProviderFailure = false
+        needsReevaluation = false
+    }
+
+    /// Seeking invalidates in-flight results without dropping the visible
+    /// source cue. The next `sub-text` refresh starts fresh work for it.
+    func cancelPendingTranslations() {
+        tasks.values.forEach { $0.cancel() }
+        tasks = [:]
+        sessionID = UUID()
+        currentSource = nil
+        translatedText = nil
+        isTranslating = false
+        needsReevaluation = true
     }
 
     private func translate(source: String, settings: AISubtitleTranslationSettings) {
@@ -143,13 +201,10 @@ final class MPVSubtitleTranslationState: ObservableObject {
                     self.tasks[source] = nil
                     self.translatedTextBySource[source] = cached
                     self.refreshCurrentPresentation()
-                    self.reportOnce(.success(()))
+                    self.report(.success(()))
                     return
                 }
-                let translated = try await AISubtitleTranslator.translate(
-                    source,
-                    settings: settings
-                )
+                let translated = try await requestTranslation(source, settings, requestPacer)
                 let cleaned = AISubtitleTranslationState.cleaned(
                     translated,
                     stripHearingImpaired: settings.stripHearingImpaired
@@ -168,7 +223,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
                 self.tasks[source] = nil
                 self.translatedTextBySource[source] = cleaned
                 self.refreshCurrentPresentation()
-                self.reportOnce(.success(()))
+                self.report(.success(()))
             } catch is CancellationError {
                 guard let self, self.sessionID == activeSession else { return }
                 self.tasks[source] = nil
@@ -179,8 +234,13 @@ final class MPVSubtitleTranslationState: ObservableObject {
                       self.sessionID == activeSession else { return }
                 self.tasks[source] = nil
                 self.failedSourceTexts.insert(source)
+                if (error as? AISubtitleTranslationError)?.isPermanentLimitError == true {
+                    self.hasPermanentProviderFailure = true
+                    self.tasks.values.forEach { $0.cancel() }
+                    self.tasks = [:]
+                }
                 self.refreshCurrentPresentation()
-                self.reportOnce(.failure(error))
+                self.report(.failure(error))
             }
         }
     }
@@ -209,6 +269,8 @@ final class MPVSubtitleTranslationState: ObservableObject {
         translatedText = nil
         isTranslating = false
         failedSourceTexts = []
+        hasPermanentProviderFailure = false
+        needsReevaluation = false
     }
 
     private func refreshCurrentPresentation() {
@@ -221,10 +283,17 @@ final class MPVSubtitleTranslationState: ObservableObject {
         isTranslating = tasks[currentSource] != nil
     }
 
-    private func reportOnce(_ outcome: Result<Void, Error>) {
-        guard !didReportOutcome else { return }
-        didReportOutcome = true
-        onFirstOutcome?(outcome)
+    private func report(_ outcome: Result<Void, Error>) {
+        switch outcome {
+        case .success where !didReportSuccess:
+            didReportSuccess = true
+            onFirstOutcome?(outcome)
+        case .failure where !didReportFailure:
+            didReportFailure = true
+            onFirstOutcome?(outcome)
+        default:
+            break
+        }
     }
 }
 
@@ -650,12 +719,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        subtitleTranslationState.cancelPendingTranslations()
         rememberExplicitSeek(to: ms)
         command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute"])
     }
 
     func seekByMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        subtitleTranslationState.cancelPendingTranslations()
         rememberExplicitSeek(to: positionMs + ms)
         command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "relative"])
     }
@@ -890,10 +961,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         setStringProperty("sub-margin-y", String(style.subMarginY))
         setStringProperty("sub-margin-x", String(style.subMarginX))
         setStringProperty("sub-spacing", String(style.subSpacing))
-        setStringProperty("sub-shadow-offset", "0")
-        setStringProperty("sub-border-style", "outline-and-shadow")
+        setStringProperty("sub-shadow-offset", style.backgroundEnabled ? "4" : "0")
+        setStringProperty("sub-border-style", style.backgroundEnabled ? "background-box" : "outline-and-shadow")
         setStringProperty("sub-color", style.subColor)
         setStringProperty("sub-outline-color", style.subOutlineColor)
+        setStringProperty("sub-back-color", style.subBackgroundColor)
     }
 
     func destroyPlayer() {
@@ -1528,6 +1600,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                     // view is attached to a UIWindow on physical Apple TV.
                     DispatchQueue.main.async { self.scheduleDisplayCriteriaProbe() }
                 case MPV_EVENT_END_FILE:
+                    DispatchQueue.main.async {
+                        self.subtitleTranslationState.cancelPendingTranslations()
+                    }
                     if let data = eventPtr.pointee.data {
                         let endFile = UnsafePointer<mpv_event_end_file>(OpaquePointer(data)).pointee
                         if endFile.reason == MPV_END_FILE_REASON_EOF {

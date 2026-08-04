@@ -119,6 +119,7 @@ struct PlayerSubtitleOverlay: View {
             .tracking(CGFloat(style.letterSpacing))
             .multilineTextAlignment(.center)
             .subtitleOutline(color: outlineColor, width: outlineWidth)
+            .subtitleBackground(style: style)
     }
 
     private func outlinedRichText(_ runs: [SubtitleTextRun]) -> some View {
@@ -130,6 +131,7 @@ struct PlayerSubtitleOverlay: View {
         }
         .multilineTextAlignment(.center)
         .subtitleOutline(color: outlineColor, width: outlineWidth)
+        .subtitleBackground(style: style)
     }
 
     private func runColor(_ run: SubtitleTextRun) -> Color {
@@ -226,6 +228,7 @@ struct MPVSubtitleOverlay: View {
                         .tracking(CGFloat(style.letterSpacing))
                         .multilineTextAlignment(.center)
                         .subtitleOutline(color: outlineColor, width: outlineWidth)
+                        .subtitleBackground(style: style)
                     if translation.isTranslating {
                         HStack(spacing: 5) {
                             Image(systemName: "sparkles")
@@ -281,6 +284,32 @@ struct MPVSubtitleOverlay: View {
                 return CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
             }
         }
+    }
+}
+
+private struct SubtitleBackgroundModifier: ViewModifier {
+    let style: SubtitleStyle
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if style.backgroundEnabled {
+            content
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(
+                    Color(hex: style.backgroundColorHex)
+                        .opacity(Double(min(max(style.backgroundOpacity, 0), 100)) / 100),
+                    in: RoundedRectangle(cornerRadius: 7, style: .continuous)
+                )
+        } else {
+            content
+        }
+    }
+}
+
+private extension View {
+    func subtitleBackground(style: SubtitleStyle) -> some View {
+        modifier(SubtitleBackgroundModifier(style: style))
     }
 }
 

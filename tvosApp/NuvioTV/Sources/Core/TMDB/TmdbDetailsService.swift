@@ -70,6 +70,27 @@ struct RelatedTitle: Identifiable, Equatable {
     let year: String?
     let rating: Double?
     let overview: String?
+    let backdropURL: String?
+
+    init(
+        id: String,
+        type: String,
+        name: String,
+        posterURL: String?,
+        year: String?,
+        rating: Double?,
+        overview: String?,
+        backdropURL: String? = nil
+    ) {
+        self.id = id
+        self.type = type
+        self.name = name
+        self.posterURL = posterURL
+        self.year = year
+        self.rating = rating
+        self.overview = overview
+        self.backdropURL = backdropURL
+    }
 
     var asMeta: NuvioMeta {
         NuvioMeta(
@@ -81,7 +102,7 @@ struct RelatedTitle: Identifiable, Equatable {
             // for every IMDb id, so use it immediately instead of showing an
             // empty poster while optional metadata enrichment runs.
             posterUrl: resolvedPosterURL,
-            backgroundUrl: nil,
+            backgroundUrl: backdropURL,
             logoUrl: nil,
             imdbId: id.hasPrefix("tt") ? id : nil,
             tmdbId: id.hasPrefix("tmdb:") ? Int(id.dropFirst(5)) : nil,
@@ -122,6 +143,21 @@ struct RelatedTitle: Identifiable, Equatable {
         }
         return posterURL
     }
+}
+
+/// Network metadata and the sorted TV rails shown by the network catalog.
+struct TmdbNetworkBrowseData: Equatable {
+    let name: String
+    let logoURL: String?
+    let originCountry: String?
+    let headquarters: String?
+    let rails: [TmdbNetworkBrowseRail]
+}
+
+struct TmdbNetworkBrowseRail: Identifiable, Equatable {
+    let id: String
+    let title: String
+    let items: [RelatedTitle]
 }
 
 /// TMDB helpers for details enrichment: production companies, more-like-this,
@@ -434,6 +470,68 @@ enum TmdbDetailsService {
         }
     }
 
+    /// Loads the network identity plus the same sorted rails used by Android TV.
+    /// Networks are TV-only in TMDB, so this intentionally does not request movie
+    /// results or make a separate request for each title.
+    static func fetchNetworkBrowse(company: MetaCompany) async -> TmdbNetworkBrowseData? {
+        guard company.kind == .network,
+              isEnabled,
+              let apiKey,
+              let networkId = company.tmdbId,
+              networkId > 0 else {
+            return nil
+        }
+
+        async let header = fetchNetworkHeader(networkId: networkId, fallback: company)
+        async let popular = discover(
+            endpoint: "discover/tv",
+            companyParam: "with_networks",
+            companyId: networkId,
+            mediaType: "series",
+            page: 1,
+            apiKey: apiKey,
+            sortBy: "popularity.desc"
+        )
+        async let topRated = discover(
+            endpoint: "discover/tv",
+            companyParam: "with_networks",
+            companyId: networkId,
+            mediaType: "series",
+            page: 1,
+            apiKey: apiKey,
+            sortBy: "vote_average.desc",
+            voteCountFloor: 100
+        )
+        async let recent = discover(
+            endpoint: "discover/tv",
+            companyParam: "with_networks",
+            companyId: networkId,
+            mediaType: "series",
+            page: 1,
+            apiKey: apiKey,
+            sortBy: "first_air_date.desc"
+        )
+
+        let resolvedHeader = await header
+        let popularTitles = await popular
+        let topRatedTitles = await topRated
+        let recentTitles = await recent
+        let rails = [
+            TmdbNetworkBrowseRail(id: "popular", title: "Series • Popular", items: popularTitles),
+            TmdbNetworkBrowseRail(id: "top-rated", title: "Series • Top Rated", items: topRatedTitles),
+            TmdbNetworkBrowseRail(id: "recent", title: "Series • Recent", items: recentTitles)
+        ].filter { !$0.items.isEmpty }
+
+        guard resolvedHeader != nil || !rails.isEmpty else { return nil }
+        return TmdbNetworkBrowseData(
+            name: resolvedHeader?.name ?? company.name,
+            logoURL: resolvedHeader?.logoURL ?? company.logoURL,
+            originCountry: resolvedHeader?.originCountry,
+            headquarters: resolvedHeader?.headquarters,
+            rails: rails
+        )
+    }
+
     static func discoverTitles(person: TmdbPersonMetadata) async -> [RelatedTitle] {
         guard useCredits,
               isEnabled,
@@ -593,7 +691,9 @@ enum TmdbDetailsService {
         companyId: Int,
         mediaType: String,
         page: Int,
-        apiKey: String
+        apiKey: String,
+        sortBy: String = "popularity.desc",
+        voteCountFloor: Int? = nil
     ) async -> [RelatedTitle] {
         var components = URLComponents(
             url: apiBase.appendingPathComponent(endpoint),
@@ -602,10 +702,13 @@ enum TmdbDetailsService {
         components.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
             URLQueryItem(name: companyParam, value: String(companyId)),
-            URLQueryItem(name: "sort_by", value: "popularity.desc"),
+            URLQueryItem(name: "sort_by", value: sortBy),
             URLQueryItem(name: "page", value: String(page)),
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
+        if let voteCountFloor {
+            components.queryItems?.append(URLQueryItem(name: "vote_count.gte", value: String(voteCountFloor)))
+        }
         guard let url = components.url,
               let (data, response) = try? await URLSession.shared.data(from: url),
               let http = response as? HTTPURLResponse,
@@ -617,6 +720,39 @@ enum TmdbDetailsService {
         return decoded.results.prefix(40).compactMap {
             mapDiscoverItemFast($0, defaultType: mediaType)
         }
+    }
+
+    private static func fetchNetworkHeader(
+        networkId: Int,
+        fallback: MetaCompany
+    ) async -> TmdbNetworkHeader? {
+        guard let apiKey else { return nil }
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("network/\(networkId)"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: preferredLanguage)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(TmdbNetworkDetailsResponse.self, from: data) else {
+            return TmdbNetworkHeader(
+                name: fallback.name,
+                logoURL: fallback.logoURL,
+                originCountry: nil,
+                headquarters: nil
+            )
+        }
+        return TmdbNetworkHeader(
+            name: nonEmpty(decoded.name) ?? fallback.name,
+            logoURL: imageURL(decoded.logoPath, size: "w500") ?? fallback.logoURL,
+            originCountry: nonEmpty(decoded.originCountry),
+            headquarters: nonEmpty(decoded.headquarters)
+        )
     }
 
     /// Fast mapping without per-item external_ids network calls.
@@ -644,7 +780,8 @@ enum TmdbDetailsService {
             posterURL: poster,
             year: year,
             rating: item.voteAverage.flatMap { $0 > 0 ? $0 : nil },
-            overview: item.overview?.trimmingCharacters(in: .whitespacesAndNewlines)
+            overview: item.overview?.trimmingCharacters(in: .whitespacesAndNewlines),
+            backdropURL: imageURL(item.backdropPath, size: "w1280")
         )
     }
 
@@ -775,6 +912,26 @@ private struct TmdbDetailsResponse: Decodable {
         case networks
         case createdBy = "created_by"
     }
+}
+
+private struct TmdbNetworkDetailsResponse: Decodable {
+    let name: String?
+    let headquarters: String?
+    let originCountry: String?
+    let logoPath: String?
+
+    enum CodingKeys: String, CodingKey {
+        case name, headquarters
+        case originCountry = "origin_country"
+        case logoPath = "logo_path"
+    }
+}
+
+private struct TmdbNetworkHeader {
+    let name: String
+    let logoURL: String?
+    let originCountry: String?
+    let headquarters: String?
 }
 
 private struct TmdbCreditsResponse: Decodable {

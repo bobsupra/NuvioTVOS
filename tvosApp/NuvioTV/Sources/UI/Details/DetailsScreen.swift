@@ -1488,6 +1488,7 @@ struct TvDetailsContent: View {
                                         )
                                 }
                                 .frame(height: 0)
+                                .id(TvDetailsScrollID.topSection)
 
                                 TvDetailsLogo(meta: meta)
                                     .padding(.bottom, 10)
@@ -1526,7 +1527,15 @@ struct TvDetailsContent: View {
                                     onWatchlistClick: onWatchlistClick,
                                     onWatchedClick: onWatchedClick,
                                     onTrailerClick: onTrailerClick,
-                                    focus: $actionFocus
+                                    focus: $actionFocus,
+                                    onFocus: {
+                                        // The initial Play focus is already at the top;
+                                        // only animate when returning from a lower section.
+                                        guard detailsScrollOffset > 1 else { return }
+                                        withAnimation(.easeOut(duration: 0.3)) {
+                                            scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
+                                        }
+                                    }
                                 )
                                 .padding(.bottom, 6)
                                 // Unfocusable while an episode is being restored
@@ -1542,7 +1551,7 @@ struct TvDetailsContent: View {
                                         seriesRating: meta.rating,
                                         continueItem: continueItem,
                                         onFocus: {
-                                            withAnimation(.easeOut(duration: 0.24)) {
+                                            withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                                             }
                                         },
@@ -1563,7 +1572,7 @@ struct TvDetailsContent: View {
                                     },
                                     onTrailerClick: onTrailerClick,
                                     onFocus: {
-                                        withAnimation(.easeOut(duration: 0.24)) {
+                                        withAnimation(.easeOut(duration: 0.3)) {
                                             scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
                                         }
                                     }
@@ -1580,7 +1589,7 @@ struct TvDetailsContent: View {
                                             onOpenTitle?(item.id, item.type)
                                         },
                                         onFocus: {
-                                            withAnimation(.easeOut(duration: 0.24)) {
+                                            withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
                                             }
                                         }
@@ -1593,24 +1602,6 @@ struct TvDetailsContent: View {
                                 let productionCompanies = uiState.companies.filter { $0.kind == .production }
                                 let networks = uiState.companies.filter { $0.kind == .network }
 
-                                if !productionCompanies.isEmpty {
-                                    TvDetailsProductionRow(
-                                        title: "Production",
-                                        companies: productionCompanies,
-                                        onSelect: { company in
-                                            onOpenProduction?(company)
-                                        },
-                                        onFocus: {
-                                            withAnimation(.easeOut(duration: 0.24)) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
-                                            }
-                                        }
-                                    )
-                                    .padding(.top, 40)
-                                    .id(TvDetailsScrollID.productionSection)
-                                    .disabled(restoreEpisodeKey != nil)
-                                }
-
                                 if !networks.isEmpty {
                                     TvDetailsProductionRow(
                                         title: "Network",
@@ -1619,13 +1610,31 @@ struct TvDetailsContent: View {
                                             onOpenProduction?(company)
                                         },
                                         onFocus: {
-                                            withAnimation(.easeOut(duration: 0.24)) {
+                                            withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
                                             }
                                         }
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.networkSection)
+                                    .disabled(restoreEpisodeKey != nil)
+                                }
+
+                                if !productionCompanies.isEmpty {
+                                    TvDetailsProductionRow(
+                                        title: "Production",
+                                        companies: productionCompanies,
+                                        onSelect: { company in
+                                            onOpenProduction?(company)
+                                        },
+                                        onFocus: {
+                                            withAnimation(.easeOut(duration: 0.3)) {
+                                                scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
+                                            }
+                                        }
+                                    )
+                                    .padding(.top, 40)
+                                    .id(TvDetailsScrollID.productionSection)
                                     .disabled(restoreEpisodeKey != nil)
                                 }
 
@@ -1636,7 +1645,7 @@ struct TvDetailsContent: View {
                                             onCommentSelect?(comment)
                                         },
                                         onFocus: {
-                                            withAnimation(.easeOut(duration: 0.24)) {
+                                            withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
                                             }
                                         }
@@ -1802,6 +1811,7 @@ struct TvDetailsContent: View {
 }
 
 private enum TvDetailsScrollID {
+    static let topSection = "tv-details-top-section"
     static let castSection = "tv-details-cast-section"
     static let episodesSection = "tv-details-episodes-section"
     static let moreLikeThisSection = "tv-details-more-like-this"
@@ -1959,6 +1969,7 @@ private struct TvDetailsActionRow: View {
     let onWatchedClick: () -> Void
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
+    let onFocus: () -> Void
 
     var body: some View {
         HStack(spacing: 26) {
@@ -1971,6 +1982,7 @@ private struct TvDetailsActionRow: View {
                 focus: focus,
                 tag: .play,
                 action: onPlayClick,
+                onFocus: onFocus,
                 longPressAction: onPlayLongPress
             )
 
@@ -1984,7 +1996,8 @@ private struct TvDetailsActionRow: View {
                 isPrimary: false,
                 focus: focus,
                 tag: .watchlist,
-                action: onWatchlistClick
+                action: onWatchlistClick,
+                onFocus: onFocus
             )
 
             TvDetailsActionButton(
@@ -1997,7 +2010,8 @@ private struct TvDetailsActionRow: View {
                 isPrimary: false,
                 focus: focus,
                 tag: .watched,
-                action: onWatchedClick
+                action: onWatchedClick,
+                onFocus: onFocus
             )
 
             TvDetailsActionButton(
@@ -2008,7 +2022,8 @@ private struct TvDetailsActionRow: View {
                 isPrimary: false,
                 focus: focus,
                 tag: .trailer,
-                action: onTrailerClick
+                action: onTrailerClick,
+                onFocus: onFocus
             )
         }
     }
@@ -2023,6 +2038,7 @@ private struct TvDetailsActionButton: View {
     var focus: FocusState<DetailsActionFocus?>.Binding
     let tag: DetailsActionFocus
     let action: () -> Void
+    let onFocus: () -> Void
     var longPressAction: (() -> Void)? = nil
 
     private var isFocused: Bool { focus.wrappedValue == tag }
@@ -2053,6 +2069,9 @@ private struct TvDetailsActionButton: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .onChange(of: isFocused) { focused in
+            if focused { onFocus() }
+        }
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.55).onEnded { _ in
                 longPressAction?()
@@ -2415,6 +2434,7 @@ private struct TvDetailsRelatedRow: View {
 
     @State private var scrollIndex = 0
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
 
@@ -2441,7 +2461,7 @@ private struct TvDetailsRelatedRow: View {
                             onFocus()
                         },
                         layoutMode: homeLayout,
-                        showPosterLabels: true,
+                        showPosterLabels: posterLabels,
                         smoothFocusAnimations: smoothFocus,
                         focusHighlighterEnabled: focusHighlighter
                     ) {
@@ -2476,7 +2496,7 @@ private struct TvDetailsProductionRow: View {
                 .foregroundColor(.white.opacity(0.9))
 
             ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 22) {
+                HStack(alignment: .top, spacing: 22) {
                     ForEach(companies) { company in
                         TvDetailsCompanyCard(company: company, onSelect: { onSelect(company) }, onFocus: onFocus)
                     }
@@ -2538,7 +2558,9 @@ private struct TvDetailsCompanyCard: View {
                     .font(.system(size: 20, weight: .medium))
                     .foregroundColor(.white.opacity(0.75))
                     .lineLimit(2)
-                    .frame(width: 200)
+                    // Reserve room for the longest label so one-line names do
+                    // not change the vertical position of neighboring cards.
+                    .frame(width: 200, height: 52, alignment: .top)
                     .multilineTextAlignment(.center)
             }
         }
