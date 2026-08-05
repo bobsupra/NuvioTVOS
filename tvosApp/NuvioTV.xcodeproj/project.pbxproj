@@ -795,7 +795,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
@@ -804,7 +804,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -829,14 +829,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				OTHER_LDFLAGS = (
 					"$(inherited)",
 					"-ObjC",
@@ -969,7 +969,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -977,7 +977,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -994,7 +994,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 			buildSettings = {
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1002,7 +1002,7 @@ C0D300140000000000000014 /* PlayerView.swift */,
 					"@executable_path/Frameworks",
 					"@executable_path/../../Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1020,14 +1020,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
@@ -1047,14 +1047,14 @@ C0D300140000000000000014 /* PlayerView.swift */,
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGNING_ALLOWED = NO;
 				CODE_SIGNING_REQUIRED = NO;
-				CURRENT_PROJECT_VERSION = 55;
+				CURRENT_PROJECT_VERSION = 56;
 				GENERATE_INFOPLIST_FILE = YES;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
 					"@loader_path/Frameworks",
 				);
-				MARKETING_VERSION = 3.2.4;
+				MARKETING_VERSION = 3.2.5;
 				PRODUCT_BUNDLE_IDENTIFIER = com.nuvio.app.tv.tests;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;

@@ -97,6 +97,20 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertFalse(url.absoluteString.contains("%2520"))
     }
 
+    func testStremioCatalogURLPreservesConfiguredManifestQuery() throws {
+        let manifest = try XCTUnwrap(URL(string: "https://example.com/config/abc/manifest.json?token=secret"))
+        let url = try StremioCatalogURLBuilder.url(
+            baseURL: manifest.deletingLastPathComponent(),
+            type: "movie",
+            catalogId: "top"
+        )
+
+        XCTAssertEqual(
+            url.absoluteString,
+            "https://example.com/config/abc/catalog/movie/top.json?token=secret"
+        )
+    }
+
     func testAcceptsSpecCompliantStringArray() throws {
         let people = try decoder.decode(
             FlexibleStringArray.self,

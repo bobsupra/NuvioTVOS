@@ -8,6 +8,9 @@
 import CryptoKit
 import ImageIO
 import SwiftUI
+#if os(tvOS)
+import AVKit
+#endif
 #if canImport(UIKit)
 import UIKit
 #endif
@@ -58,6 +61,11 @@ struct PosterCard: View {
     @FocusState private var isFocused: Bool
     @State private var didRequestInitialFocus = false
     @State private var landscapeArtworkPrepared = false
+    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
+    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @State private var isTrailerPreviewActive = false
+    @State private var isTrailerPreviewReady = false
+    @State private var didFinishTrailerPreview = false
     /// Rapid navigation should not start a separate backdrop/episode-art decode
     /// for every card passed over. Arm that preload only after focus has settled,
     /// matching Home's hero debounce.
@@ -84,11 +92,20 @@ struct PosterCard: View {
             .onChange(of: isFocused) { focused in
                 if focused {
                     onFocus?(meta)
+                    didFinishTrailerPreview = false
                 } else {
                     landscapePreloadArmed = false
+                    cancelTrailerPreview()
                     onBlur?(meta)
                 }
             }
+            // A task keyed to the real rendered state cannot miss the landscape
+            // transition. It is cancelled automatically if focus/landscape or
+            // the setting changes before the full delay has elapsed.
+            .task(id: trailerActivationIdentity) {
+                await activateTrailerPreviewAfterDelay()
+            }
+            .onDisappear(perform: cancelTrailerPreview)
             .task(id: isFocused) {
                 guard isFocused else { return }
                 do {
@@ -149,9 +166,33 @@ struct PosterCard: View {
             }
             .frame(width: cardWidth, height: cardHeight)
             .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+            #if os(tvOS)
+            // Cross-fade the landscape artwork away only once the resolved
+            // trailer is ready to draw, avoiding a black frame on slow links.
+            .opacity(isTrailerPreviewVisible ? 0 : 1)
+            .overlay {
+                if isFocused && trailersEnabled && !didFinishTrailerPreview {
+                    TrailerPreviewPlayer(
+                        meta: meta,
+                        isActive: effectiveLandscape && isTrailerPreviewActive,
+                        onPlaybackReady: {
+                            guard isTrailerPreviewActive else { return }
+                            isTrailerPreviewReady = true
+                        },
+                        onPlaybackFinished: finishTrailerPreview
+                    )
+                    .transition(.opacity)
+                }
+            }
+            .animation(.easeInOut(duration: 0.32), value: isTrailerPreviewVisible)
+            .animation(.easeInOut(duration: 0.32), value: didFinishTrailerPreview)
+            #endif
             .overlay(alignment: .bottomLeading) {
                 if effectiveLandscape {
                     landscapeOverlay
+                        #if os(tvOS)
+                        .opacity(isTrailerPreviewVisible ? 0 : 1)
+                        #endif
                 }
             }
             .overlay(alignment: .bottomLeading) {
@@ -420,6 +461,42 @@ struct PosterCard: View {
     private var showsPosterTitle: Bool {
         effectivePosterLabels
     }
+
+    private var trailerActivationIdentity: String {
+        "\(isFocused)\u{1f}\(effectiveLandscape)\u{1f}\(trailersEnabled)\u{1f}\(trailerDelay)"
+    }
+
+    private var isTrailerPreviewVisible: Bool {
+        isTrailerPreviewActive && isTrailerPreviewReady && !didFinishTrailerPreview
+    }
+
+    @MainActor
+    private func activateTrailerPreviewAfterDelay() async {
+        isTrailerPreviewActive = false
+        isTrailerPreviewReady = false
+        didFinishTrailerPreview = false
+        guard isFocused, effectiveLandscape, trailersEnabled else { return }
+
+        let delay = max(1, trailerDelay)
+        do {
+            try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
+        } catch {
+            return
+        }
+        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled else { return }
+        isTrailerPreviewActive = true
+    }
+
+    private func cancelTrailerPreview() {
+        isTrailerPreviewActive = false
+        isTrailerPreviewReady = false
+    }
+
+    private func finishTrailerPreview() {
+        isTrailerPreviewActive = false
+        isTrailerPreviewReady = false
+        didFinishTrailerPreview = true
+    }
     #else
     private var cardWidth: CGFloat {
         150
@@ -492,6 +569,116 @@ struct PosterCard: View {
 }
 
 #if os(tvOS)
+/// Video preview for a settled, landscape Home card. The player is
+/// created only after the configured trailer delay and is released as soon as
+/// focus leaves, so scrolling never leaves background trailer audio or decoders.
+private struct TrailerPreviewPlayer: View {
+    let meta: NuvioMeta
+    /// Resolution begins as soon as the card gains focus; playback waits for
+    /// Home's configured delay to promote the card to landscape.
+    let isActive: Bool
+    let onPlaybackReady: () -> Void
+    let onPlaybackFinished: () -> Void
+
+    @State private var player = AVPlayer()
+    @State private var hasResolvedPreview = false
+    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
+    private let resolver = YouTubeTrailerResolver()
+
+    var body: some View {
+        VideoPlayer(player: player)
+            // Keep the landscape artwork visible while the trailer URL is
+            // resolving, rather than replacing it with an empty black player.
+            .opacity(isVisible ? 1 : 0)
+            .animation(.easeInOut(duration: 0.32), value: isVisible)
+            .allowsHitTesting(false)
+            .task(id: previewIdentity) {
+                await startPreview()
+            }
+            .onChange(of: isActive) { active in
+                if active {
+                    player.play()
+                    if hasResolvedPreview { onPlaybackReady() }
+                } else {
+                    player.pause()
+                }
+            }
+            .onChange(of: trailerPreviewSound) { soundEnabled in
+                applySoundPreference(soundEnabled)
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)
+            ) { notification in
+                guard let item = notification.object as? AVPlayerItem,
+                      item == player.currentItem else {
+                    return
+                }
+                onPlaybackFinished()
+            }
+            .onDisappear {
+                hasResolvedPreview = false
+                player.pause()
+                player.replaceCurrentItem(with: nil)
+            }
+    }
+
+    private var previewIdentity: String {
+        "\(meta.id)\u{1f}\(meta.trailerYtIds?.joined(separator: ",") ?? "")"
+    }
+
+    private var isVisible: Bool {
+        isActive && hasResolvedPreview
+    }
+
+    private func startPreview() async {
+        hasResolvedPreview = false
+        let trailerMeta: NuvioMeta
+        if meta.trailerYtIds?.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) == true {
+            trailerMeta = meta
+        } else if let refreshed = try? await CinemetaCatalogRepository().refreshMetadata(
+            id: meta.id,
+            type: meta.type
+        ) {
+            trailerMeta = refreshed
+        } else {
+            return
+        }
+
+        guard let youtubeVideoId = trailerMeta.trailerYtIds?
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty }),
+            let streamURL = await resolver.resolvePreview(
+                youtubeVideoId: youtubeVideoId,
+                title: trailerMeta.name,
+                year: trailerMeta.year.map(String.init)
+            ),
+            let url = URL(string: streamURL),
+            !Task.isCancelled else {
+            return
+        }
+
+        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        applySoundPreference(trailerPreviewSound)
+        hasResolvedPreview = true
+        if isActive {
+            onPlaybackReady()
+            player.play()
+        }
+    }
+
+    private func applySoundPreference(_ soundEnabled: Bool) {
+        player.isMuted = !soundEnabled
+        player.volume = soundEnabled ? 1 : 0
+        guard soundEnabled else { return }
+
+        // Home previews do not pass through PlayerView, which normally
+        // activates the movie-playback audio session for full-screen video.
+        let session = AVAudioSession.sharedInstance()
+        try? session.setCategory(.playback, mode: .moviePlayback)
+        try? session.setActive(true)
+    }
+}
+
 /// Poster tile for the full-width grids — Search results and the Grid Home
 /// previews — so both read as one card: art that lifts and outlines on focus,
 /// plus the two-line title/subtitle pair when poster labels are on.
@@ -1067,7 +1254,7 @@ private extension UIImage {
 }
 #endif
 
-private struct WatchedCheckmarkIcon: View {
+struct WatchedCheckmarkIcon: View {
     var size: CGFloat = 38
 
     var body: some View {

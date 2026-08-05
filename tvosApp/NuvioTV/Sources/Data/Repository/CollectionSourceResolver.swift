@@ -529,12 +529,19 @@ enum StremioCatalogURLBuilder {
         }
         path += ".json"
 
-        let base = baseURL.absoluteString.hasSuffix("/")
-            ? String(baseURL.absoluteString.dropLast())
-            : baseURL.absoluteString
-        guard let url = URL(string: "\(base)/\(path)") else {
+        // Configured add-ons commonly keep a token in the manifest URL's
+        // query. Concatenating onto `absoluteString` puts the catalog path
+        // after `?token=…`, where the server reads it as part of the token
+        // instead of the request path. Work with URLComponents so that path,
+        // query, and fragment retain their proper roles.
+        guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw URLError(.badURL)
         }
+        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        components.percentEncodedPath = "/" + ([basePath, path]
+            .filter { !$0.isEmpty }
+            .joined(separator: "/"))
+        guard let url = components.url else { throw URLError(.badURL) }
         return url
     }
 

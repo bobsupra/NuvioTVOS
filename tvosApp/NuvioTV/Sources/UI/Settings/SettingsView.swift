@@ -219,7 +219,10 @@ enum SettingsKey {
     static let streamBadgePlacement = "nuvio.tv.settings.playback.streamBadgePlacement"
     static let autoPlayNext = "nuvio.tv.settings.playback.autoPlayNext"
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
+    static let trailerPreviewSound = "nuvio.tv.settings.playback.trailerPreviewSound"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
+    static let focusedPosterBackdropEnabled = "nuvio.tv.settings.playback.focusedPosterBackdropEnabled"
+    static let focusedPosterBackdropDelay = "nuvio.tv.settings.playback.focusedPosterBackdropDelay"
     static let audioLanguage = "nuvio.tv.settings.playback.audioLanguage"
     static let subtitleLanguages = "nuvio.tv.settings.playback.subtitleLanguages"
     static let subtitleLanguage = "nuvio.tv.settings.playback.subtitleLanguage"
@@ -270,7 +273,8 @@ enum SettingsKey {
         streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
         cachedOnlyStreams, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        autoPlayNext, trailersEnabled, trailerDelay, audioLanguage,
+        autoPlayNext, trailersEnabled, trailerPreviewSound, trailerDelay,
+        focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
         externalPlayerForwardSubtitles, assOverrideMode,
@@ -1663,6 +1667,7 @@ struct ProfilePinManagementView: View {
     @State private var pendingPin: String?
     @State private var errorMessage: String?
     @State private var isWorking = false
+    @FocusState private var focusedPinKey: String?
 
     var body: some View {
         ZStack {
@@ -1697,16 +1702,22 @@ struct ProfilePinManagementView: View {
                     spacing: 18
                 ) {
                     ForEach(1...9, id: \.self) { number in
-                        PinButton(number: "\(number)") {
+                        PinButton(
+                            number: "\(number)",
+                            focus: $focusedPinKey,
+                            focusKey: "pin-\(number)"
+                        ) {
                             addDigit("\(number)")
                         }
                     }
 
-                    PinButton(number: "", isDisabled: true) {}
-                    PinButton(number: "0") { addDigit("0") }
+                    PinButton(number: "", isDisabled: true, focus: $focusedPinKey, focusKey: "pin-empty") {}
+                    PinButton(number: "0", focus: $focusedPinKey, focusKey: "pin-0") { addDigit("0") }
 
                     PinDeleteButton(action: deleteDigit)
                 }
+                .focusSection()
+                .defaultFocusIfAvailable($focusedPinKey, "pin-1")
 
                 PinSheetActionButton(title: L10n.string("action_cancel", fallback: "Cancel"), action: onDismiss)
                     .padding(.top, 4)
@@ -1719,6 +1730,13 @@ struct ProfilePinManagementView: View {
                     .stroke(Color.white.opacity(0.12), lineWidth: 1)
             }
             .shadow(color: .black.opacity(0.38), radius: 32, y: 18)
+        }
+        .onAppear {
+            DispatchQueue.main.async { focusedPinKey = "pin-1" }
+        }
+        .onExitCommand {
+            guard !isWorking else { return }
+            onDismiss()
         }
     }
 
@@ -1981,6 +1999,8 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
+    @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
+    @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
 
     /// Classic was never a distinct layout (behaved like Modern).
     private let layouts = ["Modern", "Compact", "Grid View"]
@@ -2053,6 +2073,45 @@ private struct LayoutDiscoverySettingsView: View {
                     isOn: $catalogAddonNames,
                     accentColor: accentColor
                 )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_focused_poster", fallback: "Focused Poster"),
+                subtitle: L10n.string(
+                    "tvos_settings_focused_poster_description",
+                    fallback: "Expand focused posters into backdrop cards"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_expand_focused_poster_to_backdrop",
+                        fallback: "Expand Focused Poster to Backdrop"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_expand_focused_poster_after_idle_delay",
+                        fallback: "Expand focused poster after idle delay"
+                    ),
+                    isOn: $focusedPosterBackdropEnabled,
+                    accentColor: accentColor
+                )
+
+                SettingsStepperRow(
+                    title: L10n.string(
+                        "tvos_settings_backdrop_expand_delay",
+                        fallback: "Backdrop Expand Delay"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_how_long_before_expanding_focused_cards",
+                        fallback: "How long to wait before expanding focused cards"
+                    ),
+                    value: $focusedPosterBackdropDelay,
+                    range: 2...15,
+                    step: 1,
+                    suffix: "s",
+                    accentColor: accentColor
+                )
+                .opacity(focusedPosterBackdropEnabled ? 1 : 0.46)
+                .disabled(!focusedPosterBackdropEnabled)
             }
 
             HomeCatalogOrderSection(accentColor: accentColor)
@@ -4700,6 +4759,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
+    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
     @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
@@ -4890,6 +4950,15 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
 
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
+                    subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
+                    isOn: $trailerPreviewSound,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
                     subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
@@ -4902,6 +4971,7 @@ private struct PlaybackSettingsView: View {
                 .opacity(trailersEnabled ? 1 : 0.46)
                 .disabled(!trailersEnabled)
             }
+
         }
         .onReceive(NotificationCenter.default.publisher(for: StreamBadgeSettingsStore.changedNotification)) { _ in
             streamBadgeSettingsRevision &+= 1

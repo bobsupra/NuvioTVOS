@@ -85,6 +85,10 @@ struct ContentView: View {
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
     @State private var resolvedInitialScreen = false
+    /// `nil` until tvOS has actually backgrounded the app, so the initial
+    /// `.active` callback is never treated as a resume.
+    @State private var backgroundedAt: Date?
+    private static let profileSelectionBackgroundGracePeriod: TimeInterval = 10 * 60
     // Holds the who's-watching screen back until the post-sign-in profile pull
     // lands, so freshly imported profile names show instead of local stubs.
     @State private var awaitingPostLoginSync = false
@@ -119,6 +123,9 @@ struct ContentView: View {
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
     /// card). Presented as an overlay over the tab view, like Details/Player.
     @State private var cardMenuMeta: NuvioMeta?
+    /// Where Details opened from the quick-actions menu should return. Collection
+    /// cards keep their browser in the navigation chain instead of falling Home.
+    @State private var cardMenuReturnDestination: DetailsReturnDestination = .main
     /// Continue Watching entry whose quick-actions menu is showing. Held apart
     /// from `cardMenuMeta` because a resume card offers resume actions (play
     /// manually / restart / remove) rather than the generic title actions.
@@ -337,9 +344,45 @@ struct ContentView: View {
             syncManager.activeProfileChanged(profile)
         }
         .onChange(of: scenePhase) { phase in
-            if phase == .active {
+            switch phase {
+            case .background:
+                backgroundedAt = Date()
+            case .active:
                 syncManager.refreshAccountIfIdle()
+                presentProfileSelectionAfterBackgroundIfNeeded()
+            default:
+                break
             }
+        }
+    }
+
+    /// Mirrors the cold-start profile decision when returning to the foreground:
+    /// after a ten-minute background grace period, a remembered, unprotected
+    /// profile resumes directly; otherwise the who's-watching screen requires
+    /// an explicit profile choice.
+    private func presentProfileSelectionAfterBackgroundIfNeeded() {
+        guard let backgroundedAt else { return }
+        self.backgroundedAt = nil
+        guard Date().timeIntervalSince(backgroundedAt) >= Self.profileSelectionBackgroundGracePeriod else {
+            return
+        }
+        guard resolvedInitialScreen, !isOnProfileSelection else { return }
+        if case .login = activeScreen { return }
+
+        let autoSelectLast = ProfileSettings.current.object(
+            forKey: SettingsKey.profileAutoSelectLast
+        ) as? Bool ?? true
+        guard !(autoSelectLast && profileViewModel.activeProfile?.isPinProtected == false) else {
+            return
+        }
+
+        continueWatchingPlaybackTask?.cancel()
+        continueWatchingPlaybackTask = nil
+        isResolvingContinueWatchingStream = false
+        cardMenuMeta = nil
+        continueWatchingMenuItem = nil
+        withAnimation(.easeInOut(duration: 0.28)) {
+            activeScreen = .profileSelection
         }
     }
 
@@ -383,6 +426,33 @@ struct ContentView: View {
         }
     }
 
+    /// Keep a collection browser mounted beneath the Details chain it opened.
+    /// Its loaded rows, horizontal positions, focus memory, and watched badges
+    /// then survive the round trip instead of being rebuilt on every Back press.
+    private var presentedCollectionFolder: (
+        folder: TVCollectionFolderItem,
+        collectionTitle: String
+    )? {
+        if case let .collectionFolder(folder, collectionTitle) = activeScreen {
+            return (folder, collectionTitle)
+        }
+
+        switch activeScreen {
+        case .details, .player, .productionBrowse, .personBrowse:
+            if case let .collectionFolder(folder, collectionTitle) = detailsReturnDestination {
+                return (folder, collectionTitle)
+            }
+        default:
+            break
+        }
+        return nil
+    }
+
+    private var isCollectionFolderActive: Bool {
+        if case .collectionFolder = activeScreen { return true }
+        return false
+    }
+
     /// Dismisses the current overlay to the same destination its own back action
     /// would (Player returns to Details for series/trailers, otherwise Home).
     /// Used only by the root Menu-button safety net; changing `activeScreen`
@@ -396,6 +466,7 @@ struct ContentView: View {
         }
         if cardMenuMeta != nil {
             withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
+            cardMenuReturnDestination = .main
             return
         }
         if continueWatchingMenuItem != nil {
@@ -940,7 +1011,9 @@ struct ContentView: View {
                     .zIndex(1)
             }
 
-            if case .collectionFolder(let folder, let collectionTitle) = activeScreen {
+            if let collectionContext = presentedCollectionFolder {
+                let folder = collectionContext.folder
+                let collectionTitle = collectionContext.collectionTitle
                 CollectionFolderBrowseView(
                     folder: folder,
                     collectionTitle: collectionTitle,
@@ -955,6 +1028,15 @@ struct ContentView: View {
                                     collectionTitle: collectionTitle
                                 )
                             )
+                        }
+                    },
+                    onLongPress: { meta in
+                        cardMenuReturnDestination = .collectionFolder(
+                            folder,
+                            collectionTitle: collectionTitle
+                        )
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            cardMenuMeta = meta
                         }
                     },
                     onBack: {
@@ -973,8 +1055,9 @@ struct ContentView: View {
                         }
                     }
                 )
+                .disabled(!isCollectionFolderActive || cardMenuMeta != nil)
                 .transition(.opacity)
-                .zIndex(1)
+                .zIndex(isCollectionFolderActive ? 1 : 0)
             }
 
             if case .productionBrowse(let company) = activeScreen {
@@ -1056,11 +1139,17 @@ struct ContentView: View {
                         // the same transaction the menu clears.
                         withAnimation(.easeInOut(duration: 0.28)) {
                             cardMenuMeta = nil
-                            openDetailsRoot(id: menuMeta.id, type: menuMeta.type)
+                            openDetailsRoot(
+                                id: menuMeta.id,
+                                type: menuMeta.type,
+                                returnDestination: cardMenuReturnDestination
+                            )
+                            cardMenuReturnDestination = .main
                         }
                     },
                     onDismiss: {
                         withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
+                        cardMenuReturnDestination = .main
                     }
                 )
                 .transition(.opacity)
@@ -1198,6 +1287,7 @@ struct ContentView: View {
                 resumePlayback(item)
             },
             onLongPressCard: { meta in
+                cardMenuReturnDestination = .main
                 withAnimation(.easeInOut(duration: 0.2)) {
                     cardMenuMeta = meta
                 }
@@ -2201,8 +2291,8 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
-    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
-    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
+    @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
@@ -2425,7 +2515,8 @@ struct TVHomeView: View {
                                             },
                                             initialFocusCardKey: initialFocusCardKey,
                                             externalFocus: $focusedCardID,
-                                            restrictFocusToCardKey: overlayRestoreCardID,
+                                            restrictFocusToCardKey: homeRowFocusRestriction(for: section),
+                                            retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                             suppressFocusAnimations: suppressReturnFocusAnimations,
                                             onInitialFocusRequested: {
                                                 didRequestInitialCardFocus = true
@@ -2472,7 +2563,8 @@ struct TVHomeView: View {
                                         initialFocusCardKey: initialFocusCardKey,
                                         landscapeFocusedId: landscapeFocusedId(for: section.id),
                                         externalFocus: $focusedCardID,
-                                        restrictFocusToCardKey: overlayRestoreCardID,
+                                        restrictFocusToCardKey: homeRowFocusRestriction(for: section),
+                                        retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                         suppressFocusAnimations: suppressReturnFocusAnimations,
                                         onInitialFocusRequested: {
                                             didRequestInitialCardFocus = true
@@ -2696,7 +2788,7 @@ struct TVHomeView: View {
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
-            let reordered = TVHomeCatalogOrder.apply(to: store.sections)
+            let reordered = homeOrderedSections(store.sections)
             if reordered.map(\.id) != store.sections.map(\.id) {
                 store.sections = reordered
             }
@@ -2726,6 +2818,12 @@ struct TVHomeView: View {
             if loading {
                 requestLoadingFocus()
             }
+        }
+        .onChange(of: focusedPosterBackdropEnabled) { enabled in
+            guard !enabled else { return }
+            focusWork.pendingLandscapeFocusedId = nil
+            focusWork.landscapeFocusTask?.cancel()
+            landscapeFocusedId = nil
         }
         .onChange(of: focusedCardID) { newValue in
             if let newValue {
@@ -2861,6 +2959,7 @@ struct TVHomeView: View {
                             initialFocusCardKey: initialFocusCardKey,
                             externalFocus: $focusedCardID,
                             restrictFocusToCardKey: overlayRestoreCardID,
+                            retainFocusAppearanceForCardKey: overlayRestoreCardID,
                             suppressFocusAnimations: suppressReturnFocusAnimations,
                             onInitialFocusRequested: { didRequestInitialCardFocus = true },
                             onFocus: { folder in
@@ -2887,6 +2986,7 @@ struct TVHomeView: View {
                             landscapeFocusedId: nil,
                             externalFocus: $focusedCardID,
                             restrictFocusToCardKey: overlayRestoreCardID,
+                            retainFocusAppearanceForCardKey: overlayRestoreCardID,
                             suppressFocusAnimations: suppressReturnFocusAnimations,
                             onInitialFocusRequested: { didRequestInitialCardFocus = true },
                             onFocus: { meta in
@@ -3105,9 +3205,43 @@ struct TVHomeView: View {
             || verticalMoveTargetCardID?.hasPrefix(rowPrefix) == true
     }
 
-    /// Routes vertical focus by row identity instead of asking tvOS spatial
-    /// focus to discover a card beyond `VerticalEdgeClip`. Loading skeletons
-    /// are skipped because they intentionally contain no focusable controls.
+    /// Settings-style entry lock for catalog rows. While one row owns focus,
+    /// every other row exposes only its horizontally anchored card to tvOS.
+    /// That makes the native spatial hop land beneath the catalog title before
+    /// `onMoveCommand` runs; entering the row then unlocks all of its cards.
+    private func homeRowFocusRestriction(for section: TVHomeSection) -> String? {
+        if let overlayRestoreCardID {
+            return overlayRestoreCardID
+        }
+
+        guard let focusedCardID,
+              let currentSectionId = focusedCardID
+                .split(separator: "\u{1}", maxSplits: 1)
+                .first
+                .map(String.init),
+              currentSectionId != section.id else {
+            return nil
+        }
+
+        if !section.collectionFolders.isEmpty {
+            let index = min(
+                max(rowScrollStore.index(for: section.id), 0),
+                section.collectionFolders.count - 1
+            )
+            return "\(section.id)\u{1}\(section.collectionFolders[index].id)"
+        }
+
+        guard !section.items.isEmpty else { return nil }
+        let index = min(
+            max(rowScrollStore.index(for: section.id), 0),
+            section.items.count - 1
+        )
+        return "\(section.id)\u{1}\(section.items[index].id)"
+    }
+
+    /// Routes vertical focus to the target row's anchored card: whichever card
+    /// is currently positioned beneath that row's catalog title. Loading
+    /// skeletons are skipped because they contain no focusable controls.
     private func moveFocusVertically(from sourceIndex: Int, direction: MoveCommandDirection) {
         let delta: Int
         switch direction {
@@ -3607,6 +3741,19 @@ struct TVHomeView: View {
         return loadedSections
     }
 
+    /// Pinning is an invariant above the user/catalog order: saved cross-device
+    /// row positions may arrange the remainder, but can never push a pinned
+    /// collection below a catalog.
+    private func homeOrderedSections(_ sections: [TVHomeSection]) -> [TVHomeSection] {
+        let pinnedCollections = sections.filter {
+            $0.isCollectionRow && $0.isPinnedCollection
+        }
+        let remainder = sections.filter {
+            !($0.isCollectionRow && $0.isPinnedCollection)
+        }
+        return pinnedCollections + TVHomeCatalogOrder.apply(to: remainder)
+    }
+
     @MainActor
     private func publishHomeSections(
         catalogSections: [TVHomeSection],
@@ -3615,7 +3762,7 @@ struct TVHomeView: View {
     ) {
         let pinned = collectionSections.filter(\.isPinnedCollection)
         let unpinned = collectionSections.filter { !$0.isPinnedCollection }
-        let composed = TVHomeCatalogOrder.apply(to: pinned + catalogSections + unpinned)
+        let composed = homeOrderedSections(pinned + catalogSections + unpinned)
 
         // Rows this load still owes, drawn as skeletons in their saved position.
         let published = Set(composed.map(\.id))
@@ -3627,7 +3774,7 @@ struct TVHomeView: View {
         }
         let visible = skeletons.isEmpty
             ? composed
-            : TVHomeCatalogOrder.apply(to: composed + skeletons)
+            : homeOrderedSections(composed + skeletons)
 
         // "Empty" means nothing real was on screen yet — skeletons must not
         // count, or the focus seeding below would be skipped once the first
@@ -3773,7 +3920,7 @@ struct TVHomeView: View {
         let catalogRows = store.sections.filter { !$0.isCollectionRow }
         let pinned = fresh.filter(\.isPinnedCollection)
         let unpinned = fresh.filter { !$0.isPinnedCollection }
-        let merged = TVHomeCatalogOrder.apply(to: pinned + catalogRows + unpinned)
+        let merged = homeOrderedSections(pinned + catalogRows + unpinned)
         TVHomeCatalogOrder.writeSnapshot(merged)
         // Compare ids *and* folder tile shapes / titles so edits like switching
         // Poster ↔ Landscape actually re-render Home (id-only checks skip them).
@@ -3955,14 +4102,7 @@ struct TVHomeView: View {
     }
 
     private func scheduleLandscapeFocus(cardKey: String) {
-        guard !suppressReturnFocusAnimations else {
-            focusWork.pendingLandscapeFocusedId = nil
-            landscapeFocusedId = nil
-            focusWork.landscapeFocusTask?.cancel()
-            return
-        }
-
-        guard trailersEnabled else {
+        guard !suppressReturnFocusAnimations, focusedPosterBackdropEnabled else {
             focusWork.pendingLandscapeFocusedId = nil
             landscapeFocusedId = nil
             focusWork.landscapeFocusTask?.cancel()
@@ -3979,7 +4119,7 @@ struct TVHomeView: View {
         focusWork.landscapeFocusTask?.cancel()
 
         let targetKey = cardKey
-        let delaySeconds = max(1, trailerDelay)
+        let delaySeconds = max(1, focusedPosterBackdropDelay)
         focusWork.landscapeFocusTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
             guard !Task.isCancelled,
@@ -4012,6 +4152,14 @@ struct TVHomeView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.12) {
             guard isActive, returnFocusAnimationGeneration == generation else { return }
             suppressReturnFocusAnimations = false
+
+            // Switching tabs leaves `focusedCardID` intact, so coming back
+            // from Settings does not emit PosterCard's normal onFocus callback.
+            // Restart the landscape settle timer for that retained card once
+            // the no-animation restoration window has finished.
+            if let focusedCardID {
+                scheduleLandscapeFocus(cardKey: focusedCardID)
+            }
         }
     }
 
@@ -5146,6 +5294,9 @@ private struct TVCatalogRow: View {
     /// sidebar trick. Used during overlay-dismiss focus restoration so the
     /// engine can only land on the saved card, never flashing the first one.
     var restrictFocusToCardKey: String? = nil
+    /// Separate from focus restriction so row-entry locks do not draw a focus
+    /// outline; only overlay restoration retains focused appearance.
+    var retainFocusAppearanceForCardKey: String? = nil
     /// Suppresses the one focus/layout animation caused by returning to Home
     /// from another tab. Normal left/right focus animation remains enabled.
     var suppressFocusAnimations: Bool = false
@@ -5307,7 +5458,7 @@ private struct TVCatalogRow: View {
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowCardFocusAnimations,
                         focusHighlighterEnabled: rowFocusHighlighter,
-                        retainFocusAppearance: restrictFocusToCardKey == cardKey,
+                        retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
                         isWatched: isWatched(item)
                     ) {
                         onSelect(item)
@@ -5717,6 +5868,7 @@ private struct TVCollectionFolderRow: View {
     let initialFocusCardKey: String?
     var externalFocus: FocusState<String?>.Binding? = nil
     var restrictFocusToCardKey: String? = nil
+    var retainFocusAppearanceForCardKey: String? = nil
     var suppressFocusAnimations = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (TVCollectionFolderItem) -> Void
@@ -5848,7 +6000,7 @@ private struct TVCollectionFolderRow: View {
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowSmoothFocus,
                         focusHighlighterEnabled: rowFocusHighlighter,
-                        retainFocusAppearance: restrictFocusToCardKey == cardKey,
+                        retainFocusAppearance: retainFocusAppearanceForCardKey == cardKey,
                         onSelect: { onSelect(folder) }
                     )
                     .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
@@ -6179,6 +6331,7 @@ struct CollectionFolderBrowseView: View {
     let collectionTitle: String
     let repository: CatalogRepository
     let onSelect: (NuvioMeta) -> Void
+    let onLongPress: (NuvioMeta) -> Void
     let onBack: () -> Void
 
     @State private var items: [NuvioMeta] = []
@@ -6187,6 +6340,10 @@ struct CollectionFolderBrowseView: View {
     @State private var errorMessage: String?
     @State private var selectedTabIndex = 0
     @FocusState private var focusedItemID: String?
+    @State private var lastFocusedItemID: String?
+    @State private var focusRestoreGeneration = 0
+    @State private var watchedTitleKeys: Set<String> = []
+    @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
@@ -6262,7 +6419,30 @@ struct CollectionFolderBrowseView: View {
         }
         .onExitCommand(perform: onBack)
         .task {
+            refreshWatchedTitles()
             await load()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
+            refreshWatchedTitles()
+        }
+        .onChange(of: focusedItemID) { newValue in
+            if let newValue { lastFocusedItemID = newValue }
+        }
+        .onChange(of: isEnabled) { enabled in
+            if !enabled {
+                focusRestoreGeneration &+= 1
+                if let focusedItemID { lastFocusedItemID = focusedItemID }
+            } else if let target = lastFocusedItemID {
+                let generation = focusRestoreGeneration
+                DispatchQueue.main.async {
+                    guard focusRestoreGeneration == generation else { return }
+                    focusedItemID = target
+                }
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    guard focusRestoreGeneration == generation else { return }
+                    focusedItemID = target
+                }
+            }
         }
     }
 
@@ -6343,9 +6523,11 @@ struct CollectionFolderBrowseView: View {
                                 layoutMode: collectionRowLayoutMode,
                                 showPosterLabels: posterLabels,
                                 externalFocus: $focusedItemID,
+                                watchedTitleKeys: watchedTitleKeys,
                                 onApproachEnd: { item in
                                     loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
                                 },
+                                onLongPress: onLongPress,
                                 onSelect: onSelect
                             )
                         }
@@ -6532,9 +6714,11 @@ struct CollectionFolderBrowseView: View {
                                 layoutMode: collectionRowLayoutMode,
                                 showPosterLabels: posterLabels,
                                 externalFocus: $focusedItemID,
+                                watchedTitleKeys: watchedTitleKeys,
                                 onApproachEnd: { item in
                                     loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
                                 },
+                                onLongPress: onLongPress,
                                 onSelect: onSelect
                             )
                         }
@@ -6554,7 +6738,9 @@ struct CollectionFolderBrowseView: View {
                 ForEach(displayedGridItems) { item in
                     CollectionFolderResultCard(
                         meta: item,
-                        externalFocus: $focusedItemID
+                        externalFocus: $focusedItemID,
+                        isWatched: isTitleWatched(item),
+                        onLongPress: { onLongPress(item) }
                     ) {
                         onSelect(item)
                     }
@@ -6589,6 +6775,18 @@ struct CollectionFolderBrowseView: View {
             return "\(row.id)\u{1}\(item.id)"
         }
         return displayedGridItems.first?.id
+    }
+
+    private func refreshWatchedTitles() {
+        watchedTitleKeys = Set(
+            WatchedStore.visibleItems()
+                .filter { $0.season == nil && $0.episode == nil }
+                .map { "\($0.meta.type.lowercased())\u{1f}\($0.meta.id)" }
+        )
+    }
+
+    private func isTitleWatched(_ meta: NuvioMeta) -> Bool {
+        watchedTitleKeys.contains("\(meta.type.lowercased())\u{1f}\(meta.id)")
     }
 
     @MainActor
@@ -6802,7 +7000,9 @@ private struct CollectionFolderHomeStyleRow: View {
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
     var externalFocus: FocusState<String?>.Binding? = nil
+    let watchedTitleKeys: Set<String>
     let onApproachEnd: (NuvioMeta) -> Void
+    let onLongPress: (NuvioMeta) -> Void
     let onSelect: (NuvioMeta) -> Void
 
     /// Stable row id so composite card keys stay unique across strips.
@@ -6814,8 +7014,8 @@ private struct CollectionFolderHomeStyleRow: View {
     @State private var landscapeFocusTask: Task<Void, Never>?
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
-    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
-    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.focusedPosterBackdropEnabled) private var focusedPosterBackdropEnabled = true
+    @AppStorage(SettingsKey.focusedPosterBackdropDelay) private var focusedPosterBackdropDelay = 3
 
     private var posterWidth: CGFloat {
         layoutMode == "Compact" ? 170 : 210
@@ -6850,6 +7050,13 @@ private struct CollectionFolderHomeStyleRow: View {
             landscapeFocusTask?.cancel()
             landscapeFocusTask = nil
             pendingLandscapeFocusedId = nil
+        }
+        .onChange(of: focusedPosterBackdropEnabled) { enabled in
+            guard !enabled else { return }
+            pendingLandscapeFocusedId = nil
+            landscapeFocusTask?.cancel()
+            landscapeFocusTask = nil
+            landscapeFocusedId = nil
         }
     }
 
@@ -6886,10 +7093,14 @@ private struct CollectionFolderHomeStyleRow: View {
                         },
                         externalFocus: externalFocus,
                         externalFocusValue: cardKey,
+                        onLongPress: onLongPress,
                         layoutMode: rowHomeLayout,
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowSmoothFocus,
-                        focusHighlighterEnabled: rowFocusHighlighter
+                        focusHighlighterEnabled: rowFocusHighlighter,
+                        isWatched: watchedTitleKeys.contains(
+                            "\(item.type.lowercased())\u{1f}\(item.id)"
+                        )
                     ) {
                         onSelect(item)
                     }
@@ -6919,10 +7130,10 @@ private struct CollectionFolderHomeStyleRow: View {
         .frame(height: stripHeight)
     }
 
-    /// Match Home exactly: wait for the user's configured trailer delay before
-    /// expanding the settled portrait card, and cancel when focus moves away.
+    /// Wait for the configured backdrop delay before expanding the settled
+    /// portrait card, and cancel when focus moves away.
     private func scheduleLandscapeFocus(cardKey: String) {
-        guard layoutMode == "Modern", trailersEnabled else {
+        guard layoutMode == "Modern", focusedPosterBackdropEnabled else {
             pendingLandscapeFocusedId = nil
             landscapeFocusedId = nil
             landscapeFocusTask?.cancel()
@@ -6936,7 +7147,7 @@ private struct CollectionFolderHomeStyleRow: View {
         landscapeFocusTask?.cancel()
 
         let targetKey = cardKey
-        let delaySeconds = max(1, trailerDelay)
+        let delaySeconds = max(1, focusedPosterBackdropDelay)
         landscapeFocusTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
             guard !Task.isCancelled,
@@ -6960,6 +7171,8 @@ private struct CollectionFolderHomeStyleRow: View {
 private struct CollectionFolderResultCard: View {
     let meta: NuvioMeta
     var externalFocus: FocusState<String?>.Binding? = nil
+    var isWatched: Bool? = nil
+    var onLongPress: (() -> Void)? = nil
     let action: () -> Void
 
     @FocusState private var focused: Bool
@@ -6990,7 +7203,11 @@ private struct CollectionFolderResultCard: View {
                 )
                 .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
                 .overlay(alignment: .topTrailing) {
-                    WatchedCheckmarkBadge(meta: meta)
+                    if let isWatched {
+                        if isWatched { WatchedCheckmarkIcon() }
+                    } else {
+                        WatchedCheckmarkBadge(meta: meta)
+                    }
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
@@ -7024,6 +7241,11 @@ private struct CollectionFolderResultCard: View {
         .focused($focused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: meta.id))
         .focusEffectDisabledIfAvailable()
+        .simultaneousGesture(
+            LongPressGesture(minimumDuration: 0.45).onEnded { _ in
+                onLongPress?()
+            }
+        )
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
         .zIndex(focused ? 1 : 0)
     }

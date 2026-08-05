@@ -3,6 +3,7 @@ import SwiftUI
 public struct ProfilePinView: View {
     @ObservedObject var viewModel: ProfileViewModel
     @State private var enteredPin = ""
+    @FocusState private var focusedPinKey: String?
 
     public init(viewModel: ProfileViewModel) {
         self.viewModel = viewModel
@@ -42,16 +43,22 @@ public struct ProfilePinView: View {
                     spacing: 18
                 ) {
                     ForEach(1...9, id: \.self) { number in
-                        PinButton(number: "\(number)") {
+                        PinButton(
+                            number: "\(number)",
+                            focus: $focusedPinKey,
+                            focusKey: "pin-\(number)"
+                        ) {
                             addPinDigit("\(number)")
                         }
                     }
 
-                    PinButton(number: "", isDisabled: true) {}
-                    PinButton(number: "0") { addPinDigit("0") }
+                    PinButton(number: "", isDisabled: true, focus: $focusedPinKey, focusKey: "pin-empty") {}
+                    PinButton(number: "0", focus: $focusedPinKey, focusKey: "pin-0") { addPinDigit("0") }
 
                     PinDeleteButton(action: deleteDigit)
                 }
+                .focusSection()
+                .defaultFocusIfAvailable($focusedPinKey, "pin-1")
 
                 PinSheetActionButton(title: "Cancel") {
                     guard !viewModel.isLoading else { return }
@@ -69,9 +76,11 @@ public struct ProfilePinView: View {
             .shadow(color: .black.opacity(0.38), radius: 32, y: 18)
         }
         .transition(.opacity)
+        .onExitCommand(perform: dismiss)
         .onAppear {
             enteredPin = ""
             viewModel.pinError = nil
+            DispatchQueue.main.async { focusedPinKey = "pin-1" }
         }
         .onChange(of: viewModel.pinError) { _, error in
             if error != nil {
@@ -100,6 +109,7 @@ public struct ProfilePinView: View {
     }
 
     private func dismiss() {
+        guard !viewModel.isLoading else { return }
         viewModel.isPinEntryVisible = false
         enteredPin = ""
         viewModel.pinError = nil
@@ -115,21 +125,39 @@ public struct ProfilePinView: View {
 struct PinButton: View {
     let number: String
     var isDisabled: Bool = false
+    var focus: FocusState<String?>.Binding
+    let focusKey: String
     let action: () -> Void
-    @FocusState private var isFocused: Bool
+
+    private var isFocused: Bool { focus.wrappedValue == focusKey }
 
     var body: some View {
         Button(action: action) {
             Text(number)
                 .font(.title)
-                .foregroundColor(isFocused ? .black : .white)
+                .foregroundColor(.white)
                 .frame(width: 80, height: 80)
-                .loginGlassCapsule(highlighted: isFocused)
+                .background(
+                    Circle()
+                        .fill(
+                            LinearGradient(
+                                colors: isFocused
+                                    ? [.white.opacity(0.32), .white.opacity(0.18)]
+                                    : [.white.opacity(0.12), .white.opacity(0.08)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                )
+                .overlay(
+                    Circle()
+                        .stroke(Color.white.opacity(isFocused ? 0.48 : 0.18), lineWidth: 1)
+                )
                 .opacity(isDisabled ? 0 : 1)
         }
         .buttonStyle(PosterCardButtonStyle())
         .disabled(isDisabled)
-        .focused($isFocused)
+        .focused(focus, equals: focusKey)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.06 : 1)
         .animation(.easeOut(duration: 0.12), value: isFocused)

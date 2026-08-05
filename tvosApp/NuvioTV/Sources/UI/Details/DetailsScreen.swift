@@ -610,7 +610,38 @@ actor YouTubeTrailerResolver {
         return await resolveWithBackend(youtubeUrl: youtubeUrl, title: title, year: year)
     }
 
-    private func resolveWithInnertube(videoId: String, forceRefreshConfig: Bool) async -> TrailerPlaybackSource? {
+    /// Returns a single URL that AVPlayer can render inside a Home card. Full
+    /// trailer playback prefers the highest-quality separate video/audio pair;
+    /// previews instead need an integrated HLS or progressive stream.
+    func resolvePreview(youtubeVideoId: String, title: String?, year: String?) async -> String? {
+        guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
+
+        if let source = await resolveWithInnertube(
+            videoId: youtubeVideoId,
+            forceRefreshConfig: false,
+            preferIntegratedStream: true
+        ) {
+            return source.videoUrl
+        }
+
+        cachedConfig = nil
+        if let source = await resolveWithInnertube(
+            videoId: youtubeVideoId,
+            forceRefreshConfig: true,
+            preferIntegratedStream: true
+        ) {
+            return source.videoUrl
+        }
+
+        let youtubeUrl = "https://www.youtube.com/watch?v=\(youtubeVideoId)"
+        return await resolveWithBackend(youtubeUrl: youtubeUrl, title: title, year: year)?.videoUrl
+    }
+
+    private func resolveWithInnertube(
+        videoId: String,
+        forceRefreshConfig: Bool,
+        preferIntegratedStream: Bool = false
+    ) async -> TrailerPlaybackSource? {
         guard let config = try? await watchConfig(forceRefresh: forceRefreshConfig) else { return nil }
         var hlsCandidates: [HlsCandidate] = []
         var progressive: [StreamCandidate] = []
@@ -701,6 +732,26 @@ actor YouTubeTrailerResolver {
                     )
                 }
             }
+        }
+
+        if preferIntegratedStream,
+           let progressiveUrl = progressive
+            // YouTube's `formats` entries are muxed video+audio. Their usual
+            // 360p rendition matches the 315pt Home preview and is substantially
+            // more reliable in AVPlayer than its demuxed HLS master.
+            .filter({ $0.height > 0 })
+            .sorted(by: sortStreamCandidates)
+            .first?.url {
+            return TrailerPlaybackSource(videoUrl: progressiveUrl, audioUrl: nil)
+        }
+
+        if preferIntegratedStream,
+           let hls = hlsCandidates
+            .filter({ $0.height >= Self.minimumHeight })
+            .sorted(by: sortHlsCandidates)
+            .first {
+            // Preserve the master so its alternate audio group remains linked.
+            return TrailerPlaybackSource(videoUrl: hls.manifestUrl, audioUrl: nil)
         }
 
         if let video = adaptiveVideo
@@ -1420,6 +1471,16 @@ struct StreamPickerListCacheKey: Equatable {
     var cachedOnly: Bool = false
 }
 
+private enum TvDetailsFocusSection: Hashable {
+    case actions
+    case episodes
+    case cast
+    case related
+    case network
+    case production
+    case comments
+}
+
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
     let onPlayClick: () -> Void
@@ -1438,9 +1499,14 @@ struct TvDetailsContent: View {
     let onBack: () -> Void
 
     @FocusState private var actionFocus: DetailsActionFocus?
+    @FocusState private var castHeaderFocus: DetailsCastHeaderFocus?
     /// Which episode control holds focus, as `TvEpisodeFocus` keys. Owned here
     /// rather than per card so focus can be put back on a specific episode.
     @FocusState private var episodeFocus: String?
+    /// The section that currently owns focus. Other sections expose only their
+    /// remembered entry anchor, matching Settings' pre-spatial focus lock.
+    @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
+    @State private var detailsFocusMoveGeneration = 0
     /// Episode control to re-focus once the stream picker closes, captured when
     /// this content gets disabled. Same approach Home uses for the card you
     /// left when entering Details — see `restoreEpisodeFocus`.
@@ -1528,7 +1594,9 @@ struct TvDetailsContent: View {
                                     onWatchedClick: onWatchedClick,
                                     onTrailerClick: onTrailerClick,
                                     focus: $actionFocus,
+                                    entryLocked: focusedDetailsSection != .actions,
                                     onFocus: {
+                                        focusedDetailsSection = .actions
                                         // The initial Play focus is already at the top;
                                         // only animate when returning from a lower section.
                                         guard detailsScrollOffset > 1 else { return }
@@ -1540,7 +1608,10 @@ struct TvDetailsContent: View {
                                 .padding(.bottom, 6)
                                 // Unfocusable while an episode is being restored
                                 // to, so the engine can't claim these instead.
-                                .disabled(restoreEpisodeKey != nil)
+                                .disabled(
+                                    restoreEpisodeKey != nil
+                                        || !isDetailsFocusReachable(.actions)
+                                )
 
                                 TvDetailsSummary(meta: meta, simkl: uiState.simklRatings)
 
@@ -1551,6 +1622,7 @@ struct TvDetailsContent: View {
                                         seriesRating: meta.rating,
                                         continueItem: continueItem,
                                         onFocus: {
+                                            focusedDetailsSection = .episodes
                                             withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                                             }
@@ -1558,10 +1630,14 @@ struct TvDetailsContent: View {
                                         onSelect: onEpisodeSelected,
                                         onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
                                         episodeFocus: $episodeFocus,
-                                        restrictFocusToKey: restoreEpisodeKey
+                                        restrictFocusToKey: restoreEpisodeKey,
+                                        entryLocked: focusedDetailsSection != .episodes,
+                                        onMoveUpFromSeason: focusPlayFromEpisodes,
+                                        onMoveDownFromEpisode: focusCastHeaderFromEpisodes
                                     )
                                     .padding(.top, 24)
                                     .id(TvDetailsScrollID.episodesSection)
+                                    .disabled(!isDetailsFocusReachable(.episodes))
                                 }
 
                                 TvDetailsCastAndTrailer(
@@ -1571,7 +1647,10 @@ struct TvDetailsContent: View {
                                         onOpenPerson?(person)
                                     },
                                     onTrailerClick: onTrailerClick,
+                                    headerFocus: $castHeaderFocus,
+                                    entryLocked: focusedDetailsSection != .cast,
                                     onFocus: {
+                                        focusedDetailsSection = .cast
                                         withAnimation(.easeOut(duration: 0.3)) {
                                             scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
                                         }
@@ -1579,16 +1658,21 @@ struct TvDetailsContent: View {
                                 )
                                 .padding(.top, 34)
                                 .id(TvDetailsScrollID.castSection)
-                                .disabled(restoreEpisodeKey != nil)
+                                .disabled(
+                                    restoreEpisodeKey != nil
+                                        || !isDetailsFocusReachable(.cast)
+                                )
 
                                 if !uiState.moreLikeThis.isEmpty {
                                     TvDetailsRelatedRow(
                                         title: "More Like This",
                                         items: uiState.moreLikeThis,
+                                        entryLocked: focusedDetailsSection != .related,
                                         onSelect: { item in
                                             onOpenTitle?(item.id, item.type)
                                         },
                                         onFocus: {
+                                            focusedDetailsSection = .related
                                             withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
                                             }
@@ -1596,7 +1680,10 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.moreLikeThisSection)
-                                    .disabled(restoreEpisodeKey != nil)
+                                    .disabled(
+                                        restoreEpisodeKey != nil
+                                            || !isDetailsFocusReachable(.related)
+                                    )
                                 }
 
                                 let productionCompanies = uiState.companies.filter { $0.kind == .production }
@@ -1606,10 +1693,12 @@ struct TvDetailsContent: View {
                                     TvDetailsProductionRow(
                                         title: "Network",
                                         companies: networks,
+                                        entryLocked: focusedDetailsSection != .network,
                                         onSelect: { company in
                                             onOpenProduction?(company)
                                         },
                                         onFocus: {
+                                            focusedDetailsSection = .network
                                             withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
                                             }
@@ -1617,17 +1706,22 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.networkSection)
-                                    .disabled(restoreEpisodeKey != nil)
+                                    .disabled(
+                                        restoreEpisodeKey != nil
+                                            || !isDetailsFocusReachable(.network)
+                                    )
                                 }
 
                                 if !productionCompanies.isEmpty {
                                     TvDetailsProductionRow(
                                         title: "Production",
                                         companies: productionCompanies,
+                                        entryLocked: focusedDetailsSection != .production,
                                         onSelect: { company in
                                             onOpenProduction?(company)
                                         },
                                         onFocus: {
+                                            focusedDetailsSection = .production
                                             withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
                                             }
@@ -1635,16 +1729,21 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.productionSection)
-                                    .disabled(restoreEpisodeKey != nil)
+                                    .disabled(
+                                        restoreEpisodeKey != nil
+                                            || !isDetailsFocusReachable(.production)
+                                    )
                                 }
 
                                 if !uiState.comments.isEmpty {
                                     TvDetailsCommentsRow(
                                         comments: uiState.comments,
+                                        entryLocked: focusedDetailsSection != .comments,
                                         onSelect: { comment in
                                             onCommentSelect?(comment)
                                         },
                                         onFocus: {
+                                            focusedDetailsSection = .comments
                                             withAnimation(.easeOut(duration: 0.3)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
                                             }
@@ -1652,7 +1751,10 @@ struct TvDetailsContent: View {
                                     )
                                     .padding(.top, 40)
                                     .id(TvDetailsScrollID.commentsSection)
-                                    .disabled(restoreEpisodeKey != nil)
+                                    .disabled(
+                                        restoreEpisodeKey != nil
+                                            || !isDetailsFocusReachable(.comments)
+                                    )
                                 }
                             }
                             // Match Home's TV row inset so details content
@@ -1678,6 +1780,7 @@ struct TvDetailsContent: View {
             // button. Move it onto Play explicitly once the content appears
             // (async so it runs after the focus engine's own first pass).
             .onAppear {
+                focusedDetailsSection = .actions
                 DispatchQueue.main.async { actionFocus = .play }
             }
             // Opening the stream picker disables this content, and on the way
@@ -1739,6 +1842,61 @@ struct TvDetailsContent: View {
                 restoreEpisodeKey = nil
             }
         }
+    }
+
+    /// Route the season strip back to the primary action explicitly. tvOS has
+    /// no spatial candidate above later season pills because Play sits at the
+    /// far-left edge, so geometry alone can leave focus stuck on Season 2/3.
+    private func focusPlayFromEpisodes() {
+        detailsFocusMoveGeneration &+= 1
+        let generation = detailsFocusMoveGeneration
+        focusedDetailsSection = .actions
+        actionFocus = .play
+        DispatchQueue.main.async {
+            guard detailsFocusMoveGeneration == generation else { return }
+            actionFocus = .play
+        }
+    }
+
+    /// Episodes enter the next section through its heading, matching the
+    /// Settings-style focus graph instead of jumping over it to a person card.
+    private func focusCastHeaderFromEpisodes() {
+        detailsFocusMoveGeneration &+= 1
+        let generation = detailsFocusMoveGeneration
+        focusedDetailsSection = .cast
+        castHeaderFocus = .creatorAndCast
+        DispatchQueue.main.async {
+            guard detailsFocusMoveGeneration == generation else { return }
+            castHeaderFocus = .creatorAndCast
+        }
+    }
+
+    /// Settings has one destination pane; Details has a vertical chain of
+    /// sections. Keep only the current section and its immediate neighbors in
+    /// the focus graph so tvOS cannot skip Cast and land two rows away.
+    private var detailsFocusOrder: [TvDetailsFocusSection] {
+        var order: [TvDetailsFocusSection] = [.actions]
+        if let meta = uiState.meta, !(meta.videos ?? []).isEmpty {
+            order.append(.episodes)
+        }
+        order.append(.cast)
+        if !uiState.moreLikeThis.isEmpty { order.append(.related) }
+        if uiState.companies.contains(where: { $0.kind == .network }) {
+            order.append(.network)
+        }
+        if uiState.companies.contains(where: { $0.kind == .production }) {
+            order.append(.production)
+        }
+        if !uiState.comments.isEmpty { order.append(.comments) }
+        return order
+    }
+
+    private func isDetailsFocusReachable(_ section: TvDetailsFocusSection) -> Bool {
+        guard let currentIndex = detailsFocusOrder.firstIndex(of: focusedDetailsSection),
+              let sectionIndex = detailsFocusOrder.firstIndex(of: section) else {
+            return true
+        }
+        return abs(sectionIndex - currentIndex) <= 1
     }
 
     // Give series more horizontal room so the episode cards aren't cramped.
@@ -1958,6 +2116,10 @@ private enum DetailsActionFocus: Hashable {
     case play, watchlist, watched, trailer
 }
 
+private enum DetailsCastHeaderFocus: Hashable {
+    case creatorAndCast, trailer
+}
+
 private struct TvDetailsActionRow: View {
     let isInWatchlist: Bool
     let isWatched: Bool
@@ -1969,6 +2131,7 @@ private struct TvDetailsActionRow: View {
     let onWatchedClick: () -> Void
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
+    let entryLocked: Bool
     let onFocus: () -> Void
 
     var body: some View {
@@ -1999,6 +2162,7 @@ private struct TvDetailsActionRow: View {
                 action: onWatchlistClick,
                 onFocus: onFocus
             )
+            .disabled(entryLocked)
 
             TvDetailsActionButton(
                 title: nil,
@@ -2013,6 +2177,7 @@ private struct TvDetailsActionRow: View {
                 action: onWatchedClick,
                 onFocus: onFocus
             )
+            .disabled(entryLocked)
 
             TvDetailsActionButton(
                 title: nil,
@@ -2025,6 +2190,7 @@ private struct TvDetailsActionRow: View {
                 action: onTrailerClick,
                 onFocus: onFocus
             )
+            .disabled(entryLocked)
         }
     }
 }
@@ -2337,28 +2503,50 @@ private struct TvDetailsCastAndTrailer: View {
     let people: [TmdbPersonMetadata]
     let onPersonClick: (TmdbPersonMetadata) -> Void
     let onTrailerClick: () -> Void
+    var headerFocus: FocusState<DetailsCastHeaderFocus?>.Binding
+    let entryLocked: Bool
     let onFocus: () -> Void
+
+    @State private var focusedPersonIndex = 0
 
     var body: some View {
         VStack(alignment: .leading, spacing: 28) {
             HStack(spacing: 18) {
-                TvDetailsSectionButton(title: "Creator and Cast", isSelected: false, onFocus: onFocus) {}
+                TvDetailsSectionButton(
+                    title: "Creator and Cast",
+                    isSelected: false,
+                    focus: headerFocus,
+                    tag: .creatorAndCast,
+                    onFocus: onFocus
+                ) {}
 
                 Text("|")
                     .font(.system(size: 36, weight: .medium))
                     .foregroundColor(.white.opacity(0.38))
 
-                TvDetailsSectionButton(title: "Trailer", isSelected: false, onFocus: onFocus, action: onTrailerClick)
+                TvDetailsSectionButton(
+                    title: "Trailer",
+                    isSelected: false,
+                    focus: headerFocus,
+                    tag: .trailer,
+                    onFocus: onFocus,
+                    action: onTrailerClick
+                )
+                    .disabled(entryLocked)
             }
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 58) {
-                    ForEach(displayPeople) { person in
+                    ForEach(Array(displayPeople.enumerated()), id: \.element.id) { index, person in
                         TvDetailsPersonCard(
                             person: person,
                             onSelect: { onPersonClick(person) },
-                            onFocus: onFocus
+                            onFocus: {
+                                focusedPersonIndex = index
+                                onFocus()
+                            }
                         )
+                        .disabled(entryLocked)
                     }
                 }
                 .padding(.trailing, 80)
@@ -2393,10 +2581,12 @@ private struct TvDetailsCastAndTrailer: View {
 private struct TvDetailsSectionButton: View {
     let title: String
     let isSelected: Bool
+    var focus: FocusState<DetailsCastHeaderFocus?>.Binding
+    let tag: DetailsCastHeaderFocus
     let onFocus: () -> Void
     let action: () -> Void
 
-    @FocusState private var isFocused: Bool
+    private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
         Button(action: action) {
@@ -2407,7 +2597,7 @@ private struct TvDetailsSectionButton: View {
                 .frame(height: 64)
         }
         .buttonStyle(PosterCardButtonStyle())
-        .focused($isFocused)
+        .focused(focus, equals: tag)
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.035 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
@@ -2429,6 +2619,7 @@ private enum TvDetailsHorizontalStrip {
 private struct TvDetailsRelatedRow: View {
     let title: String
     let items: [RelatedTitle]
+    let entryLocked: Bool
     let onSelect: (RelatedTitle) -> Void
     let onFocus: () -> Void
 
@@ -2467,6 +2658,7 @@ private struct TvDetailsRelatedRow: View {
                     ) {
                         onSelect(item)
                     }
+                    .disabled(entryLocked && index != scrollIndex)
                 }
             }
             .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
@@ -2486,8 +2678,19 @@ private struct TvDetailsRelatedRow: View {
 private struct TvDetailsProductionRow: View {
     let title: String
     let companies: [MetaCompany]
+    let entryLocked: Bool
     let onSelect: (MetaCompany) -> Void
     let onFocus: () -> Void
+
+    @State private var focusedCompanyIndex = 0
+
+    private var entryCompanyIndex: Int {
+        if companies.indices.contains(focusedCompanyIndex),
+           companies[focusedCompanyIndex].tmdbId != nil {
+            return focusedCompanyIndex
+        }
+        return companies.firstIndex { $0.tmdbId != nil } ?? 0
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -2497,8 +2700,16 @@ private struct TvDetailsProductionRow: View {
 
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(alignment: .top, spacing: 22) {
-                    ForEach(companies) { company in
-                        TvDetailsCompanyCard(company: company, onSelect: { onSelect(company) }, onFocus: onFocus)
+                    ForEach(Array(companies.enumerated()), id: \.element.id) { index, company in
+                        TvDetailsCompanyCard(
+                            company: company,
+                            onSelect: { onSelect(company) },
+                            onFocus: {
+                                focusedCompanyIndex = index
+                                onFocus()
+                            }
+                        )
+                        .disabled(entryLocked && index != entryCompanyIndex)
                     }
                 }
                 .padding(.trailing, 80)
@@ -2579,6 +2790,7 @@ private struct TvDetailsCompanyCard: View {
 
 private struct TvDetailsCommentsRow: View {
     let comments: [TraktCommentReview]
+    let entryLocked: Bool
     let onSelect: (TraktCommentReview) -> Void
     let onFocus: () -> Void
 
@@ -2609,6 +2821,7 @@ private struct TvDetailsCommentsRow: View {
                             onFocus()
                         }
                     )
+                    .disabled(entryLocked && index != scrollIndex)
                 }
             }
             .padding(.vertical, TvDetailsHorizontalStrip.verticalPadding)
@@ -2875,9 +3088,12 @@ private struct TvDetailsEpisodes: View {
     /// While set, only the control with this key can take focus — see the
     /// restore in `TvDetailsContent`.
     let restrictFocusToKey: String?
+    let entryLocked: Bool
+    let onMoveUpFromSeason: () -> Void
+    let onMoveDownFromEpisode: () -> Void
 
     @State private var selectedSeason: Int
-    @State private var episodeScrollIndex = 0
+    @State private var episodeScrollIndex: Int
     @State private var watchedEpisodeKeys: Set<String>
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
 
@@ -2890,7 +3106,10 @@ private struct TvDetailsEpisodes: View {
         onSelect: @escaping (NuvioVideo) -> Void,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         episodeFocus: FocusState<String?>.Binding,
-        restrictFocusToKey: String?
+        restrictFocusToKey: String?,
+        entryLocked: Bool,
+        onMoveUpFromSeason: @escaping () -> Void,
+        onMoveDownFromEpisode: @escaping () -> Void
     ) {
         self.meta = meta
         self.episodes = episodes
@@ -2901,8 +3120,25 @@ private struct TvDetailsEpisodes: View {
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.episodeFocus = episodeFocus
         self.restrictFocusToKey = restrictFocusToKey
-        _selectedSeason = State(initialValue: Self.defaultSeason(episodes))
-        _watchedEpisodeKeys = State(initialValue: WatchedStore.watchedEpisodeKeys(meta: meta))
+        self.entryLocked = entryLocked
+        self.onMoveUpFromSeason = onMoveUpFromSeason
+        self.onMoveDownFromEpisode = onMoveDownFromEpisode
+        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        let initialEpisode = Self.initialEpisode(
+            episodes: episodes,
+            continueItem: continueItem,
+            watchedKeys: watchedKeys
+        )
+        let initialSeason = initialEpisode?.season ?? Self.defaultSeason(episodes)
+        let initialSeasonEpisodes = episodes
+            .filter { $0.season == initialSeason }
+            .sorted { $0.episode < $1.episode }
+        let initialIndex = initialEpisode.flatMap { target in
+            initialSeasonEpisodes.firstIndex(where: { $0.id == target.id })
+        } ?? 0
+        _selectedSeason = State(initialValue: initialSeason)
+        _episodeScrollIndex = State(initialValue: initialIndex)
+        _watchedEpisodeKeys = State(initialValue: watchedKeys)
     }
 
     var body: some View {
@@ -2953,7 +3189,8 @@ private struct TvDetailsEpisodes: View {
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
                         focus: episodeFocus,
-                        restrictFocusToKey: restrictFocusToKey
+                        restrictFocusToKey: effectiveFocusRestriction,
+                        onMoveDown: onMoveDownFromEpisode
                     )
                 }
             }
@@ -2979,6 +3216,7 @@ private struct TvDetailsEpisodes: View {
                             title: seasonTitle(season),
                             isSelected: season == selectedSeason,
                             onFocus: onFocus,
+                            onMoveUp: onMoveUpFromSeason,
                             action: {
                                 selectedSeason = season
                                 episodeScrollIndex = 0
@@ -2992,7 +3230,7 @@ private struct TvDetailsEpisodes: View {
             .scrollClipDisabledIfAvailable()
             // The pills are the strip's other focus target, and the one the
             // engine picked when an episode's picker closed.
-            .disabled(restrictFocusToKey != nil)
+            .disabled(effectiveFocusRestriction != nil)
         } else {
             Text(seasonTitle(selectedSeason))
                 .font(.system(size: 32, weight: .semibold))
@@ -3015,6 +3253,13 @@ private struct TvDetailsEpisodes: View {
             .sorted { $0.episode < $1.episode }
     }
 
+    private var effectiveFocusRestriction: String? {
+        if let restrictFocusToKey { return restrictFocusToKey }
+        guard entryLocked, !seasonEpisodes.isEmpty else { return nil }
+        let index = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
+        return TvEpisodeFocus.card(seasonEpisodes[index].id)
+    }
+
     /// A season counts as watched only when every episode in it is, which is
     /// what makes the menu item a genuine toggle rather than a re-mark.
     private var isSeasonWatched: Bool {
@@ -3028,6 +3273,41 @@ private struct TvDetailsEpisodes: View {
             (seasonSortKey($0), $0) < (seasonSortKey($1), $1)
         }
         return seasons.first(where: { $0 > 0 }) ?? seasons.first ?? 1
+    }
+
+    /// Open a series where viewing actually left off. Continue Watching / Up
+    /// Next is authoritative; if it is unavailable, advance one episode beyond
+    /// the latest watched entry (or keep the last entry when the series is done).
+    private static func initialEpisode(
+        episodes: [NuvioVideo],
+        continueItem: ContinueWatchingItem?,
+        watchedKeys: Set<String>
+    ) -> NuvioVideo? {
+        let ordered = episodes.sorted {
+            (seasonSortKey($0.season), $0.episode)
+                < (seasonSortKey($1.season), $1.episode)
+        }
+
+        if let numbers = continueItem?.episodeNumbers,
+           let progressEpisode = ordered.first(where: {
+               $0.season == numbers.season && $0.episode == numbers.episode
+           }) {
+            return progressEpisode
+        }
+
+        guard let latestWatchedIndex = ordered.lastIndex(where: {
+            watchedKeys.contains("\($0.season):\($0.episode)")
+        }) else {
+            return nil
+        }
+
+        if latestWatchedIndex + 1 < ordered.count,
+           let nextEpisode = ordered[(latestWatchedIndex + 1)...].first(where: {
+               !watchedKeys.contains("\($0.season):\($0.episode)")
+           }) {
+            return nextEpisode
+        }
+        return ordered[latestWatchedIndex]
     }
 
     private func seasonTitle(_ season: Int) -> String {
@@ -3074,6 +3354,7 @@ private struct TvSeasonPill: View {
     let title: String
     let isSelected: Bool
     let onFocus: () -> Void
+    let onMoveUp: () -> Void
     let action: () -> Void
 
     @FocusState private var isFocused: Bool
@@ -3096,6 +3377,9 @@ private struct TvSeasonPill: View {
         .onChange(of: isFocused) { focused in
             if focused { onFocus() }
         }
+        .onMoveCommand { direction in
+            if direction == .up { onMoveUp() }
+        }
     }
 }
 
@@ -3115,6 +3399,7 @@ private struct TvEpisodeCard: View {
     let action: () -> Void
     var focus: FocusState<String?>.Binding
     let restrictFocusToKey: String?
+    let onMoveDown: () -> Void
 
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
     private var watchedKey: String { TvEpisodeFocus.watched(video.id) }
@@ -3267,6 +3552,9 @@ private struct TvEpisodeCard: View {
             .onChange(of: isWatchedControlFocused) { focused in
                 if focused { onFocus() }
             }
+        }
+        .onMoveCommand { direction in
+            if direction == .down { onMoveDown() }
         }
     }
 

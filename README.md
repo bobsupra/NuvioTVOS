@@ -7,7 +7,7 @@
   <h1>Nuvio TV for tvOS</h1>
 
   <p>
-    A native Apple TV port of Nuvio, forked from the mobile app so the living-room experience can be developed independently.
+    A modern Apple TV media player powered by the Stremio addon ecosystem.
     <br />
     SwiftUI tvOS shell - Stremio-compatible catalogs - AetherEngine / MPVKit playback
   </p>
@@ -43,20 +43,19 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.4 (build 55)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.5 (build 56)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.4](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.4) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2.5](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.5) is the latest tvOS release. Download the unsigned IPA here:
 
-[NuvioTV-3.2.4-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.4/NuvioTV-3.2.4-unsigned-release.ipa)
+[NuvioTV-3.2.5-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.5/NuvioTV-3.2.5-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.2.4
+### New in Beta 3.2.5
 
-- Makes AI subtitles more resilient with size-aware batches, bounded split recovery, provider/model pacing, permanent quota handling, and safe MPV seek cancellation.
-- Adds subtitle background color and opacity controls, plus matching Aether and MPV rendering.
-- Adds customizable Streaming Services, Studios & Franchises, and Discover by Genre collection templates, with curated Home layouts and existing-template migrations.
-- Adds cinematic TMDB network browsing with popular, top-rated, and recent series rails, and refreshes profile PIN, add-profile, and account-integration presentation.
+- Adds focused-poster backdrop controls, video trailer previews, and optional preview audio for a richer Home browsing experience.
+- Improves Home, collection-browser, Details, episode, and PIN focus routing and restoration.
+- Preserves configured Stremio add-on query tokens when building catalog requests.
 
 ### The new player
 
