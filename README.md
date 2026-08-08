@@ -53,7 +53,7 @@ The unsigned release IPA remains available for a separate signing workflow:
 
 [NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa)
 
-Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
+The signed IPA above is the recommended install. The unsigned IPA requires a compatible tvOS development or sideloading signing workflow.
 
 ### New in Beta 3.2.6
 
@@ -78,22 +78,19 @@ The Client ID and Client Secret are stored only on that Apple TV; they are delib
 
 ### Simkl sign-in with your own API app
 
-Nuvio also supports Simkl's TV PIN flow with a user-provided Client ID.
+Nuvio supports Simkl TV PIN login with a user-provided Client ID.
 
 1. Create an application in [Simkl developer settings](https://simkl.com/settings/developer/).
 2. Use `urn:ietf:wg:oauth:2.0:oob` as the redirect URI when configuring the application.
 3. On Apple TV, go to **Settings → Integrations → Simkl** and enter its Client ID.
 4. Choose **Connect with Simkl**, scan the QR code, and enter the displayed PIN at `simkl.com/pin`.
 
-Simkl's PIN exchange does not require a Client Secret and does not send the redirect URI. The Client ID stays on the Apple TV and is excluded from Nuvio account/profile sync; the long-lived access token is stored in the device Keychain for the current profile.
-
-Once connected, Simkl can be selected independently as the Library and Watch Progress source. Nuvio imports Simkl watched history, uses Plan to Watch for the library, loads paused playback into Continue Watching, and sends start, pause, and stop scrobbles from the player.
-
-The connected Simkl screen can also transfer watched history from the active Nuvio Sync profile or a connected Trakt account. Transfers are additive, preserve watched dates and episode numbers, and display live completion progress.
+Simkl's PIN flow does not need a Client Secret. The Client ID stays on that Apple TV and is excluded from Nuvio sync; the access token is stored in the current profile's Keychain.
 
 ### Notes
 
-The release IPA is unsigned and must be signed by a compatible tvOS development or sideloading workflow before installation. Stream availability still depends on configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured. The Apple TV Simulator cannot play AV1. ASS/SSA custom positioning/typesetting is flattened to the app subtitle style.
+- Stream availability depends on your configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured.
+- The Apple TV Simulator cannot play AV1. ASS/SSA positioning and typesetting use the app subtitle style.
 
 ## About
 
@@ -122,32 +119,13 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 
 ## Contributor Notes
 
-This tvOS app is still early and needs real device/simulator testing. The list below is not complete; contributors should run the app, compare it with the Android TV version, and call out anything that feels broken, rough, or missing.
+Most of the early tvOS gaps are now fixed. Contributions are welcome—please test on a real Apple TV or simulator and open an issue for anything that still feels rough.
 
-Current tvOS status:
+- The main remaining known issue is occasional stutter while scrolling horizontally, especially in artwork-heavy rows.
+- Add-on, debrid, Cloud Library, and Top Shelf integrations benefit from real-account/device testing. AllDebrid and Debrid-Link are not supported yet; Cloud Library supports Premiumize and TorBox.
+- For large UI or experience changes, open a discussion first so the app stays consistent with Apple TV conventions.
 
-- Library basics now work, including adding/removing titles, watched-state persistence, consistent poster sizing, and watched checkmark badges on cards.
-- Search has received initial polish and bug fixes, including consistent poster sizing and watched checkmark badges.
-- Trailer playback now opens in the player, resolves YouTube trailer streams at 1080p or better when available, supports adaptive video/audio streams, and returns to the title details page afterward.
-- Home focus/hero behavior has been improved with smoother card focus, cached hero logo loading, and crossfaded hero/backdrop transitions.
-- Player polish now covers saved audio/subtitle selections, screensaver prevention during playback, and steadier Play/Pause focus.
-- Movie stutter is resolved with **Frame Rate Matching** (Settings → Playback) when the Apple TV system setting **Match Content** is also enabled.
-
-Known areas that still need work:
-
-- Nuvio addon UI flows have not been fully tested on tvOS yet.
-- Search still needs more real-world testing and bug fixing.
-- Library still needs more sorting/grouping validation and real-world testing.
-- Vertical and horizontal scrolling still need more tuning on real devices.
-- Home layout supports Modern and Compact sizing; Classic was removed because it was never distinct. Full Android grid/layout modes are not ported yet.
-- AllDebrid and Debrid-Link have no resolvers and are not offered in the account-link UI.
-- Cloud Library currently supports Premiumize and TorBox only.
-- Top Shelf, debrid resolving, and Cloud Library still need more real-device validation across accounts/providers.
-- If login still returns to the Apple TV Home screen on a real device, please send the device console or crash log.
-
-The tvOS app is developed independently around Apple TV conventions, Siri Remote navigation, and real-device feedback. The optional local `NuvioTVandroid/` reference checkout is intentionally excluded from this repository and is not required to build or contribute to the tvOS app.
-
-Useful new features are welcome. For large UI redesigns or major experience changes, please open a discussion or vote first so contributors can agree on direction before the app moves away from the current TV design.
+If login returns to the Apple TV Home screen, please include a device console or crash log in the report. The optional `NuvioTVandroid/` reference checkout is not required to build or contribute.
 
 ## Requirements
 
