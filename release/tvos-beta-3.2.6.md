@@ -1,8 +1,6 @@
 ## tvOS Beta 3.2.6
 
-> **Recommended install:** [NuvioTV-3.2.6-57-pyksel-signed.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-57-pyksel-signed.ipa) is signed for bundle identifier `com.pyksel.nuviotvos`. Install this already-signed IPA with a normal IPA install workflow; do not re-sign it with a different identifier.
-
-The companion `NuvioTV-3.2.6-unsigned-release.ipa` is provided for users who need their own signing workflow.
+> **Install:** [NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa) requires a compatible tvOS development or sideloading signing workflow before installation.
 
 ### Cheaper AI subtitle translation
 
@@ -17,9 +15,9 @@ The companion `NuvioTV-3.2.6-unsigned-release.ipa` is provided for users who nee
 - Adds a short startup hold when an active AI subtitle cue is still resolving, so playback can begin with translated text instead of immediately racing ahead.
 - Improves Top Shelf integration, stream metadata, player wake handling, and playback settings including selectable next-episode countdowns.
 
-### App identity and profiles
+### App identity
 
-- Signs the recommended installation IPA for `com.pyksel.nuviotvos`, with matching app-group entitlements for the app and Top Shelf extension.
+- Updates `com.pyksel.nuviotvos` and matching app-group entitlements for the app and Top Shelf extension.
 - Adds an option to require a profile selection whenever the app returns from the background.
 
 ### Tests

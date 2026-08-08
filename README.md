@@ -45,15 +45,11 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 The tree currently targets **version 3.2.6 (build 57)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.6) is the latest tvOS release. The recommended signed IPA uses bundle identifier `com.pyksel.nuviotvos`:
-
-[NuvioTV-3.2.6-57-pyksel-signed.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-57-pyksel-signed.ipa)
-
-The unsigned release IPA remains available for a separate signing workflow:
+[Beta 3.2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.6) is the latest tvOS release:
 
 [NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa)
 
-The signed IPA above is the recommended install. The unsigned IPA requires a compatible tvOS development or sideloading signing workflow.
+The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
 ### New in Beta 3.2.6
 
