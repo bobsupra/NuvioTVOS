@@ -29,4 +29,22 @@ final class SMBURLTests: XCTestCase {
     func testRejectsMissingFilePath() {
         XCTAssertThrowsError(try SMBURL.parse("smb://nas.local/onlyshare"))
     }
+
+    /// AE#283: hosts render a caught error with `localizedDescription`. Without LocalizedError
+    /// conformance that answers "The operation couldn't be completed. (ParseError error 1.)" and the
+    /// parser's message, the only thing that says what is wrong with the URL, never reaches the user.
+    func testParseErrorCarriesItsMessage() {
+        XCTAssertThrowsError(try SMBURL.parse("http://nas.local/x/y")) { error in
+            XCTAssertTrue(error.localizedDescription.contains("not an smb:// URL"),
+                          "unexpected rendering: \(error.localizedDescription)")
+            XCTAssertEqual(error.localizedDescription, String(describing: error))
+        }
+    }
+
+    func testSMBErrorCarriesItsMessage() {
+        let error: any Error = SMBConnection.SMBError(message: "share not found")
+        XCTAssertTrue(error.localizedDescription.contains("share not found"),
+                      "unexpected rendering: \(error.localizedDescription)")
+        XCTAssertEqual(error.localizedDescription, String(describing: error))
+    }
 }

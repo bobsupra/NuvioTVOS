@@ -7,7 +7,8 @@
 //
 // CLI:
 //   aetherctl hlsfixture <input.ts> [--port 8090] [--segment-seconds 4]
-//                        [--master] [--discontinuity-at N] [--slow-refresh]
+//                        [--master] [--codecs STR] [--resolution WxH]
+//                        [--discontinuity-at N] [--slow-refresh]
 //                        [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
 //
 // Slicing
@@ -24,6 +25,12 @@
 //                 advances on a real-time timer of --segment-seconds per step.
 // /segN.ts      - the N-th chunk (N modulo chunk count).
 // /master.m3u8  - (--master) two variants: low (404) and high -> media.m3u8.
+//                 --codecs / --resolution add CODECS= / RESOLUTION= to both
+//                 EXT-X-STREAM-INF lines. Without them AVFoundation reports no
+//                 video attributes for the variants, and every decision that
+//                 reads them (the #168 carriage watchdog, the #293 probe gate)
+//                 sees a master that advertises no video at all: the fixture
+//                 then does not carry the case under test.
 //
 // Fault knobs
 // -----------
@@ -65,7 +72,7 @@ func runHLSFixture(args: [String]) -> Int32 {
     guard !rest.isEmpty, !rest[0].hasPrefix("-") else {
         print("ERROR: hlsfixture requires <input.ts> as first argument")
         print("Usage: aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]")
-        print("       [--master] [--discontinuity-at N] [--slow-refresh]")
+        print("       [--master] [--codecs STR] [--resolution WxH] [--discontinuity-at N] [--slow-refresh]")
         print("       [--drop-segment N] [--encrypted] [--fmp4] [--self-test]")
         return 64
     }
@@ -81,6 +88,8 @@ func runHLSFixture(args: [String]) -> Int32 {
     let discAt        = takeIntFlag("--discontinuity-at", from: &rest)
     let dropSeg       = takeIntFlag("--drop-segment", from: &rest)
     let withMaster    = takeFlag("--master",       from: &rest)
+    let codecs        = takeStringFlag("--codecs", from: &rest)
+    let resolution    = takeStringFlag("--resolution", from: &rest)
     let slowRefresh   = takeFlag("--slow-refresh", from: &rest)
     let encrypted     = takeFlag("--encrypted",    from: &rest)
     let fmp4          = takeFlag("--fmp4",         from: &rest)
@@ -103,6 +112,8 @@ func runHLSFixture(args: [String]) -> Int32 {
         slices: slices,
         segmentSeconds: segSeconds,
         withMaster: withMaster,
+        codecs: codecs,
+        resolution: resolution,
         discontinuityAt: discAt,
         slowRefresh: slowRefresh,
         dropSegment: dropSeg,
@@ -243,6 +254,10 @@ struct HLSFixtureConfig {
     let slices: [[UInt8]]
     let segmentSeconds: Int
     let withMaster: Bool
+    /// CODECS / RESOLUTION for the master's variants. nil leaves them off, which is what a variant
+    /// with no `AVAssetVariant.videoAttributes` looks like to AVFoundation.
+    var codecs: String? = nil
+    var resolution: String? = nil
     let discontinuityAt: Int?
     let slowRefresh: Bool
     let dropSegment: Int?
@@ -405,6 +420,9 @@ final class HLSFixtureServer: @unchecked Sendable {
     // MARK: - Request routing
 
     private func handleRequest(fd: Int32, path: String) {
+        // One line per request: which requests a load actually costs is the observable a request
+        // count claim needs (a probe that must not run is proven by the absence of its fetch).
+        print("[HLSFixture] REQ \(path)")
         switch path {
         case "/master.m3u8" where config.withMaster:
             let body = masterPlaylist()
@@ -476,12 +494,15 @@ final class HLSFixtureServer: @unchecked Sendable {
     }
 
     private func masterPlaylist() -> String {
-        [
+        var attributes = ""
+        if let codecs = config.codecs { attributes += ",CODECS=\"\(codecs)\"" }
+        if let resolution = config.resolution { attributes += ",RESOLUTION=\(resolution)" }
+        return [
             "#EXTM3U",
             "#EXT-X-VERSION:3",
-            "#EXT-X-STREAM-INF:BANDWIDTH=100000",
+            "#EXT-X-STREAM-INF:BANDWIDTH=100000\(attributes)",
             "low.m3u8",
-            "#EXT-X-STREAM-INF:BANDWIDTH=5000000",
+            "#EXT-X-STREAM-INF:BANDWIDTH=5000000\(attributes)",
             "media.m3u8",
         ].joined(separator: "\n") + "\n"
     }
@@ -562,11 +583,22 @@ final class HLSFixtureServer: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum FixtureError: Error {
+    enum FixtureError: Error, CustomStringConvertible, LocalizedError {
         case socketCreate(errno: Int32)
         case bind(errno: Int32)
         case listen(errno: Int32)
         case getsockname(errno: Int32)
+
+        var description: String {
+            switch self {
+            case .socketCreate(let e): "HLSFixture: socket() failed (errno=\(e))"
+            case .bind(let e): "HLSFixture: bind() failed (errno=\(e))"
+            case .listen(let e): "HLSFixture: listen() failed (errno=\(e))"
+            case .getsockname(let e): "HLSFixture: getsockname() failed (errno=\(e))"
+            }
+        }
+
+        var errorDescription: String? { description }
     }
 }
 

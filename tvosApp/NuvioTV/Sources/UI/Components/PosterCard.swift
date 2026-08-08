@@ -673,9 +673,7 @@ private struct TrailerPreviewPlayer: View {
 
         // Home previews do not pass through PlayerView, which normally
         // activates the movie-playback audio session for full-screen video.
-        let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playback, mode: .moviePlayback)
-        try? session.setActive(true)
+        PlaybackAudioSession.activateMoviePlayback()
     }
 }
 

@@ -24,3 +24,36 @@ enum PresentationAxis {
         displayTime + origin
     }
 }
+
+/// Which source PTS maps to display-0 for a session (AE#105, AE#270).
+///
+/// `duration` is 0-based for every source, so the published playhead has to be too, and the origin is
+/// the source PTS that `duration` is measured from. A VOD loopback session takes it from the container
+/// (`HLSVideoEngine.sourceStartSeconds`) the moment the session starts; this policy decides what the
+/// producer's later shift publications may do to it:
+///
+/// - A disc title re-reads it from every publish: its raw PTS starts at clip 0's STC base, that same
+///   base is what each publish carries, and a title switch inside one session moves it (AE#105).
+/// - Any other VOD source keeps what it has. The first publish still seeds it when nothing else did,
+///   but later publishes fold producer drift into the shift (1.96 s on the measured run), so following
+///   them would drag the display axis around under a picture that has not moved.
+/// - Live keeps origin 0: its public axis is the source axis by contract, which is what the live edge
+///   and the DVR window are expressed against.
+///
+/// Without the VOD latch the published clock kept the origin in it: a 60 s-origin transport stream
+/// opened its scrubber at 1:02 of a ten-minute item, and at broadcast scale a seek target computed on
+/// that axis resolved outside the item and landed at the start of the file (AE#270).
+enum PresentationOriginPolicy {
+
+    /// - Parameter latched: origin already latched for this session, nil before the first publish.
+    static func origin(
+        latched: Double?,
+        publishedShift: Double,
+        isLive: Bool,
+        isDisc: Bool
+    ) -> Double {
+        if isLive { return 0 }
+        if isDisc { return publishedShift }
+        return latched ?? publishedShift
+    }
+}

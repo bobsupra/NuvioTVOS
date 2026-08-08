@@ -12,7 +12,11 @@ public struct SMBURL: Sendable {
     public let user: String
     public let password: String
 
-    public struct ParseError: Error { public let message: String }
+    public struct ParseError: Error, CustomStringConvertible, LocalizedError {
+        public let message: String
+        public var description: String { "SMB URL: \(message)" }
+        public var errorDescription: String? { description }
+    }
 
     public static func parse(_ raw: String) throws -> SMBURL {
         guard let comps = URLComponents(string: raw), comps.scheme == "smb" else {

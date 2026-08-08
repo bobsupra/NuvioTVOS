@@ -357,6 +357,36 @@ extension AetherEngine {
         (suppressDisplayCriteria || audioOnlyPath) ? .clearStale : .applyFresh
     }
 
+    /// #274: how long the post-load play-gate blind-polls for a panel switch to start.
+    ///
+    /// The gate exists for one case: a sole-writer host (`suppressDisplayCriteria`) whose criteria write
+    /// lands during the load, from AVKit's auto path reading dvcC off the live AVPlayerItem. DV P5 has no
+    /// HDR10 base layer, so its first frame must not hit a panel that is still SDR, and 1000 ms is the
+    /// budget that made that land (5d60dbb2). Every other session paid the same 1000 ms for a switch that
+    /// could not arrive, which is dead startup time, not safety:
+    ///
+    /// - Engine-writer sessions wrote their criteria synchronously *before* `loadNative`. Whatever switch
+    ///   that write triggers has started long before the gate runs (and `.willSwitch` already settled it in
+    ///   the pre-flight), so a second full blind poll buys nothing.
+    /// - SDR content reaches no dynamic-range switch at all. The only write anyone can still make is
+    ///   rate-only, and the engine already declines to gate its own rate-only writes (`apply()` returns
+    ///   `.applied` with no pre-flight wait) because those switches are sub-second.
+    ///
+    /// `formatKnown` is false when the open-time probe failed: the real range is then unknown and a DV write
+    /// may still be inbound, so a suppressed host keeps the full budget.
+    nonisolated static func playGateGrace(
+        criteriaUnchanged: Bool,
+        engineIsCriteriaWriter: Bool,
+        formatKnown: Bool,
+        effectiveFormat: VideoFormat
+    ) -> DisplayCriteriaController.StartGrace {
+        // #133: the criteria were already active, nothing was written, nothing can settle.
+        if criteriaUnchanged { return .skip }
+        if engineIsCriteriaWriter { return .brief }
+        guard formatKnown else { return .full }
+        return effectiveFormat == .sdr ? .brief : .full
+    }
+
     /// Whitelist (not blacklist) of AVPlayer-native audio codecs: AAC, MP3, MP2, ALAC, AC-3/E-AC-3, LPCM, FLAC (native since iOS/tvOS 11). Anything else falls back to `AudioPlaybackHost` (FFmpeg).
     nonisolated static func avPlayerCanDecodeAudio(_ codecID: AVCodecID) -> Bool {
         switch codecID {

@@ -1,4 +1,5 @@
 import Foundation
+import AetherLibavutil
 
 /// FFmpeg error sentinels whose C macros (`AVERROR_EOF`, `AVERROR(EAGAIN)`, `AVERROR_INVALIDDATA`) Swift cannot import directly.
 enum FFmpegErr {
@@ -12,4 +13,14 @@ enum FFmpegErr {
     /// DTS-HD MA XLL frame that residual-codes channels without a usable core) reject a single packet
     /// with this while staying usable for the next one (#64).
     static let einval: Int32 = -22
+
+    /// FFmpeg's own text for an AVERROR code, with the raw number appended so a report never loses it
+    /// ("Invalid data found when processing input (-1094995529)"). Falls back to the bare number when
+    /// libavutil has no string for the code.
+    static func text(for code: Int32) -> String {
+        var buffer = [CChar](repeating: 0, count: 128)
+        guard av_strerror(code, &buffer, buffer.count) == 0 else { return "\(code)" }
+        let message = String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+        return message.isEmpty ? "\(code)" : "\(message) (\(code))"
+    }
 }

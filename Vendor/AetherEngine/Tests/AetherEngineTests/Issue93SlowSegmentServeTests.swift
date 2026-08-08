@@ -222,6 +222,10 @@ struct Issue93SlowSegmentServeTests {
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         precondition(fd >= 0)
         defer { close(fd) }
+        // A send() into a server that already hung up raises SIGPIPE, which kills the test
+        // process outright rather than failing this test.
+        var noSigPipe: Int32 = 1
+        setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in()
         addr.sin_family = sa_family_t(AF_INET)
         addr.sin_port = port.bigEndian

@@ -80,6 +80,19 @@ final class SMBIOReaderTests: XCTestCase {
         XCTAssertEqual(src.closeCount, 1)
     }
 
+    func testDiscImageProbeDefaultsOnAndIndependentReaderPreservesOptOut() throws {
+        let defaultReader = SMBIOReader(source: FakeByteRangeSource(payload))
+        XCTAssertTrue(defaultReader.discImageProbeEnabled)
+
+        let ordinaryMediaReader = SMBIOReader(
+            source: FakeByteRangeSource(payload),
+            discImageProbeEnabled: false
+        )
+        XCTAssertFalse(ordinaryMediaReader.discImageProbeEnabled)
+        let independent = try XCTUnwrap(ordinaryMediaReader.makeIndependentReader())
+        XCTAssertFalse(independent.discImageProbeEnabled)
+    }
+
     func testNegativeSeekDoesNotCorruptCursor() {
         let r = SMBIOReader(source: FakeByteRangeSource(payload))
         XCTAssertEqual(r.seek(offset: 10, whence: SEEK_SET), 10)

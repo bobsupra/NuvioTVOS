@@ -15,6 +15,10 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     private var isFullyClosed = false
     private(set) var isSeekable: Bool = true
 
+    var timeSeekableReader: TimeSeekableIOReader? {
+        reader as? TimeSeekableIOReader
+    }
+
     var cumulativeBytesFetched: Int64 { 0 }  // custom readers don't track network bytes
 
     /// #112 round 9: same demux-thread-only contract as AVIOReader's deadline. Armed by
@@ -68,7 +72,8 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         context = ctx
 
         // SEEK_SET to 0 is a no-op for seekable, refused by forward-only (returns negative).
-        isSeekable = reader.seek(offset: 0, whence: 0) >= 0
+        isSeekable = timeSeekableReader != nil
+            || reader.seek(offset: 0, whence: 0) >= 0
     }
 
     func markClosed() {

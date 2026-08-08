@@ -1,5 +1,5 @@
 name: "Used by submission"
-description: "Ship an app built on AetherEngine? Submit it for the README's Used by list."
+description: "Ship an app built on AetherEngine? Submit it for the Used by list in the README and on the docs site."
 title: "[Used by] <your app name>"
 labels: ["used-by-submission"]
 body:
@@ -7,7 +7,7 @@ body:
     attributes:
       value: |
         Thanks for building on AetherEngine. Fill this in and a maintainer will review it.
-        Once approved, your app is added to the Used by list in the README automatically via a pull request.
+        Once approved, your app is added to the Used by list in the README automatically via a pull request, and the docs site at aetherengine.superuser404.de picks it up on its next build.
   - type: input
     id: app-name
     attributes:

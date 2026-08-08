@@ -27,9 +27,69 @@ struct Issue220BoundedRangeTests {
         _ = reader.read(into: buf, size: 256 * 1024)
 
         let ranges = server.requestedRanges
-        let bounded = try #require(ranges.first(where: { $0.end != nil }),
-                                   "every VOD request was open-ended: \(ranges)")
+        // The claim is about the DATA connection, the one that streams playback bytes from the
+        // read position. Since #281 an open also issues a small speculative tail fetch, which is
+        // bounded too but deliberately not range-sized, so it is identified by its offset rather
+        // than by being the first bounded request to arrive.
+        let bounded = try #require(ranges.first(where: { $0.start == 0 && $0.end != nil }),
+                                   "the data connection was open-ended: \(ranges)")
         #expect(bounded.end! - bounded.start + 1 == AVIOReader.persistentRangeBytes)
+    }
+
+    /// A range that has been delivered IN FULL clears `activeTask` exactly as a dropped one does,
+    /// and the no-connection branch used to reconnect at the READ position regardless, which
+    /// resets `winStart` and drops everything still resident. A consumer slower than the transfer
+    /// therefore re-fetched what it had just been handed. Measured with aetherctl against a
+    /// Range-logging origin: a 764450 B trailing `moov` cost three connections and 1.97x its own
+    /// size in delivered bytes, one 256 KB AVIO buffer at a time.
+    @Test("a completed range is read out of the window, not fetched again")
+    func completedRangeIsNotRefetched() async throws {
+        let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
+        defer { server.stop() }
+        // A small first range so it completes long before the reader has consumed it, which is the
+        // parse-pass shape: the transfer wins the race against the consumer.
+        let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
+                                boundedInitialFetch: 512 * 1024)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 64 * 1024)
+        defer { buf.deallocate() }
+        _ = reader.read(into: buf, size: 64 * 1024)
+        // Let the bounded range finish and its completion callback clear activeTask.
+        for _ in 0..<100 where reader.hasLiveConnectionForTesting {
+            try? await Task.sleep(nanoseconds: 10_000_000)
+        }
+        let requestsBefore = server.rangeRequestCount
+
+        // Still inside the delivered range, so nothing here needs the network.
+        #expect(reader.read(into: buf, size: 64 * 1024) == 64 * 1024)
+
+        #expect(server.rangeRequestCount == requestsBefore,
+                "a completed range was re-fetched instead of read: \(server.requestedRanges)")
+    }
+
+    /// A position at or past the last byte has nothing to connect for. The EOF decision used to sit
+    /// below the reconnect, so this opened `bytes=<fileSize>-` first and took an empty 206 whose
+    /// reconnect reset `winStart` past the end, dropping a window the parse was still reading.
+    @Test("a read at the end of the file does not open a connection for it")
+    func readAtEOFDoesNotConnect() async throws {
+        let size: Int64 = 512 * 1024 * 1024
+        let server = try #require(ThrottledOriginServer(totalSize: size))
+        defer { server.stop() }
+        let reader = makeReader(server)
+        defer { reader.markClosed(); reader.close() }
+        try reader.open()
+
+        let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
+        defer { buf.deallocate() }
+        _ = reader.read(into: buf, size: 4096)
+        let requestsBefore = server.rangeRequestCount
+
+        #expect(reader.seek(offset: size, whence: SEEK_SET) == size)
+        #expect(reader.read(into: buf, size: 4096) == FFmpegErr.eof)
+        #expect(server.rangeRequestCount == requestsBefore,
+                "a read at EOF opened a connection: \(server.requestedRanges)")
     }
 
     /// The point of the whole change: a sequential read has to cross range boundaries without

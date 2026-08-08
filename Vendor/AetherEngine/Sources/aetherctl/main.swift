@@ -71,6 +71,7 @@ func printUsage() {
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--seconds N] [--live] [--dvr-window N] [--subs <codec-or-lang>]
+                 [--start-position S]
                      [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -449,6 +450,9 @@ if first == "play" {
     var rest = Array(args.dropFirst(2))
     let seconds = takeDoubleFlag("--seconds", from: &rest) ?? 30.0
     let live = takeFlag("--live", from: &rest)
+    // AE#293: the nativeRemoteHLS bypass, the path the #168 carriage watchdog and the carriage probe
+    // live on. Pair with --live; without it the m3u8 goes to the raw live path, which rejects it.
+    let nativeHLS = takeFlag("--native-hls", from: &rest)
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -461,14 +465,24 @@ if first == "play" {
     let playForceSW = takeFlag("--sw", from: &rest)
     let censusThresholdMB = takeIntFlag("--census-threshold-mb", from: &rest)
     let censusHz = takeDoubleFlag("--census-hz", from: &rest)
+    // Slow-CDN simulation, same hook as `serve` / `seektest`: a local file lets the producer race
+    // minutes ahead, which is the one regime where producer scheduling cannot matter (AE#286).
+    let playThrottleKbps = takeIntFlag("--throttle-kbps", from: &rest)
+    // Resume anchor, the same one load(startPosition:) takes. AE#287 needs it: the reporter's hard
+    // park only reproduces when a rebuilt session opens exactly at the video-exhaustion boundary.
+    let playStartPosition = takeDoubleFlag("--start-position", from: &rest)
     rejectStrayFlags(rest, subcommand: "play")
+    if let playThrottleKbps {
+        AetherEngine.setSourceThrottleKbpsForTesting(playThrottleKbps)
+        print("[aetherctl] source throttle: \(playThrottleKbps) kbit/s (slow-CDN simulation)")
+    }
     guard let urlArg = rest.first else {
         print("ERROR: play requires a <url> argument")
         print("")
         printUsage()
         exit(64)
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz))
 }
 

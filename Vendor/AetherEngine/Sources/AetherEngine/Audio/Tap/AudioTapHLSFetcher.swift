@@ -5,7 +5,19 @@ import Foundation
 /// retry path). Best-effort: transient failures surface as thrown errors the reader treats as a
 /// sleep-and-retry, never a playback stall.
 final class AudioTapHLSFetcher: @unchecked Sendable {
-    enum FetchError: Error { case http(Int), invalidPlaylist(String), unresolvable }
+    enum FetchError: Error, CustomStringConvertible, LocalizedError {
+        case http(Int), invalidPlaylist(String), unresolvable
+
+        var description: String {
+            switch self {
+            case .http(let status): "AudioTapHLSFetcher: HTTP \(status)"
+            case .invalidPlaylist(let reason): "AudioTapHLSFetcher: invalid playlist (\(reason))"
+            case .unresolvable: "AudioTapHLSFetcher: unresolvable URI"
+            }
+        }
+
+        var errorDescription: String? { description }
+    }
 
     private let session: URLSession
     /// Same per-stream headers the player's AVURLAsset sends (#119); header-enforcing origins

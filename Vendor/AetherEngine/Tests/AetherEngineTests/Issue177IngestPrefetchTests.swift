@@ -115,6 +115,15 @@ struct Issue177IngestPrefetchTests {
             while !stopped {
                 let conn = accept(listenFD, nil, nil)
                 guard conn >= 0 else { return }
+                // SO_NOSIGPIPE, or a hung-up peer takes the whole test process with it. serve()
+                // parks in the scripted delay before it writes the body, and a cancelled or drained
+                // fetch closes in exactly that window: the write then raises SIGPIPE, whose default
+                // action kills the process. That death leaves no crash report and no failing test,
+                // only a truncated event stream and `swift test` exit 1, so it reads as a random
+                // CI ghost rather than as this socket.
+                var noSigPipe: Int32 = 1
+                setsockopt(conn, SOL_SOCKET, SO_NOSIGPIPE, &noSigPipe,
+                           socklen_t(MemoryLayout<Int32>.size))
                 Thread.detachNewThread { [weak self] in
                     self?.serve(conn)
                 }

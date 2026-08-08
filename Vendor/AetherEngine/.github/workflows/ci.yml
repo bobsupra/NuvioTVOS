@@ -31,6 +31,12 @@ jobs:
       - name: swift build
         run: swift build
 
+      # A test process that dies mid-run reads as exit 1 with no ✘, no backtrace and no swift-testing
+      # summary: `swift test` collapses every abnormal child exit to a plain 1, and a signal takes the
+      # buffered tail of the event stream with it. What was in flight is whatever the log still lists
+      # as started but never finished. Three such deaths were an unguarded socket write raising
+      # SIGPIPE from a test origin server (see the SO_NOSIGPIPE note in Issue177IngestPrefetchTests),
+      # so nothing hangs and no time limit would have caught it.
       - name: swift test
         run: swift test
 

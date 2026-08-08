@@ -27,6 +27,17 @@ final class NativeAVPlayerHost {
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
+
+    /// Set per load; gates the AE#287 premature-end recovery, which only makes sense for a fixed-length
+    /// presentation. A live session has no advertised end to fall short of.
+    private var isLiveSession: Bool = false
+    /// AE#287 bookkeeping, cleared with the item in `unloadCurrentItem`.
+    private var prematureEndRecoveryAttempts: Int = 0
+    private var lastPrematureEndRecoveryPlayhead: Double?
+    /// True across the re-seek of a premature-end recovery. AVPlayer drops to `.paused` for its
+    /// duration, and publishing that transient would bounce the engine through `.paused` and back for
+    /// what the viewer must not even notice; the real status is republished when the recovery settles.
+    private var prematureEndRecoveryInFlight = false
     /// Mirrors avPlayer.timeControlStatus so the engine can reconcile when AVKit's transport bar, Control Center, or hardware buttons toggle the player externally (without this, engine state goes stale and play/pause presses are swallowed).
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
     /// Monotonic count of AVPlayerItem playbackStalled notifications (#93 residual): the engine
@@ -67,6 +78,19 @@ final class NativeAVPlayerHost {
     /// Set per load; the watchdog itself starts at readyToPlay (a dead origin never reaches it).
     private var carriageWatchdogArmed = false
     private var carriageWatchdogTask: Task<Void, Never>?
+    /// Watchdog poll cadence. The pure `Watchdog`'s grace is expressed in ticks of this length, so the
+    /// grace a probe verdict removes is reported in the same unit.
+    static let carriageWatchdogTickSeconds = 0.5
+
+    /// #293: what the playlist/PMT probe established about this load's carriage. The probe starts with
+    /// the mount rather than at readyToPlay, so the verdict is usually already in when the watchdog arms
+    /// and the reroute no longer waits out a grace whose conclusion is known.
+    private var carriageProbeEvidence: RemoteHLSIngestFallback.CarriageEvidence = .pending
+    private var carriageProbeTask: Task<Void, Never>?
+    /// #296: cadence and ceiling of the wait that holds the probe's deferred segment-head read until
+    /// readyToPlay. 20 s is well past the point where a mount that has not become ready is going to.
+    static let carriageProbeReadinessTickSeconds = 0.05
+    static let carriageProbeReadinessTicks = 400
 
     /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine drives the bounded
     /// retry loop this is true, so a startup failure (`.failed` with any code, including a
@@ -227,11 +251,12 @@ final class NativeAVPlayerHost {
     /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false, isLive: Bool = false) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.surfaceEndFailures = surfaceEndFailures
         self.carriageWatchdogArmed = armVideoCarriageWatchdog
+        self.isLiveSession = isLive
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
         let sid = sessionID
@@ -274,6 +299,12 @@ final class NativeAVPlayerHost {
             item.nowPlayingInfo = pendingNowPlayingInfo.isEmpty ? nil : pendingNowPlayingInfo
         }
         #endif
+        // #293: run the carriage probe alongside the mount. Nothing is serialized in front of first
+        // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
+        // ready by the time the watchdog arms.
+        if armVideoCarriageWatchdog {
+            startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders)
+        }
         playerItem = item
         accessLogCount = 0
         failureMessage = nil
@@ -406,6 +437,8 @@ final class NativeAVPlayerHost {
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
                 guard let self = self else { return }
+                // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
+                if status == .paused, self.prematureEndRecoveryInFlight { return }
                 self.timeControlStatus = status
                 // First .playing: re-sample route after 2.5s settle -- AVKit only negotiates HDMI format on playback start (issue #24).
                 if status == .playing { self.hasEverPlayed = true }
@@ -520,7 +553,11 @@ final class NativeAVPlayerHost {
         ) { [weak self] _ in
             EngineLog.emit("[NativeAVPlayerHost] #\(sid) didPlayToEndTime", category: .engine)
             Task { @MainActor in
-                self?.didReachEnd = true
+                guard let self else { return }
+                // AE#287: AVPlayer ends a VOD the moment its video renderer runs dry, even with the
+                // audio-only tail still ahead. Recover before `.ended` latches; it is terminal.
+                if await self.recoverFromPrematureEnd() { return }
+                self.didReachEnd = true
             }
         }
         notificationObservers.append(didEndObs)
@@ -845,6 +882,75 @@ final class NativeAVPlayerHost {
         didReachEnd = true
     }
 
+    /// The mirror of `markEndOfMediaReached` (AetherEngine#287): suppress an end-of-item event that
+    /// AVPlayer's own seekable range contradicts, and resume instead of completing.
+    ///
+    /// A VOD whose selected audio track outruns its video track makes AVPlayer fire didPlayToEndTime
+    /// the moment the video renderer runs dry, tens of seconds short of the advertised duration and
+    /// well inside the range it still reports as seekable. Forwarding that as `didReachEnd` latches the terminal
+    /// `.ended` (#63/#164), after which the tail is unreachable for the rest of the session. Re-seeking
+    /// to the SAME position re-arms the renderers and the tail plays out to an organic end at the real
+    /// duration, dropping nothing (measured; `play()` alone leaves the clock frozen at the boundary).
+    ///
+    /// Returns true when the end was suppressed and playback resumed, false when the caller should
+    /// complete the item as usual. Both the attempt cap and the forward-progress rule live in
+    /// `AetherEngine.prematureEndRecoveryQualifies`, so a recovery that cannot work costs one re-seek
+    /// and then completes exactly as it does today.
+    private func recoverFromPrematureEnd() async -> Bool {
+        // Only resume what the viewer was playing: an item that ends while the transport is parked
+        // must stay parked.
+        guard playIntent, !didReachEnd else { return false }
+        let playhead = avPlayer.currentTime().seconds
+        let seekEnd = seekableRangeEndSeconds
+        guard AetherEngine.prematureEndRecoveryQualifies(
+            isLive: isLiveSession,
+            duration: duration,
+            playhead: playhead,
+            seekableEnd: seekEnd,
+            attemptsUsed: prematureEndRecoveryAttempts,
+            lastAttemptPlayhead: lastPrematureEndRecoveryPlayhead
+        ) else { return false }
+
+        prematureEndRecoveryAttempts += 1
+        lastPrematureEndRecoveryPlayhead = playhead
+        prematureEndRecoveryInFlight = true
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) AE#287 premature end: playhead="
+            + "\(String(format: "%.3f", playhead))s duration=\(String(format: "%.3f", duration))s "
+            + "seekableEnd=\(String(format: "%.3f", seekEnd ?? -1))s "
+            + "loadedEnd=\(String(format: "%.3f", loadedRangeEndSeconds ?? -1))s; "
+            + "\(String(format: "%.1f", duration - playhead))s of the presentation lies past the end "
+            + "AVPlayer reported, re-seeking in place (attempt \(prematureEndRecoveryAttempts))",
+            category: .engine)
+        await seek(to: playhead)
+        avPlayer.play()
+        prematureEndRecoveryInFlight = false
+        timeControlStatus = avPlayer.timeControlStatus
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sessionID) AE#287 resumed: rate=\(avPlayer.rate) "
+            + "t=\(String(format: "%.3f", avPlayer.currentTime().seconds))s",
+            category: .engine)
+        return true
+    }
+
+    /// End of AVPlayer's last seekable time range, in item seconds: the extent of the presentation it
+    /// parsed from the playlist. Read from the item rather than the `seekableEnd` KVO mirror, which
+    /// exists to keep the LIVE edge off a tick-cadence read (#134); this is one read at a rare event.
+    private var seekableRangeEndSeconds: Double? {
+        guard let last = playerItem?.seekableTimeRanges.last?.timeRangeValue else { return nil }
+        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
+        return end.isFinite ? end : nil
+    }
+
+    /// Raw end of AVPlayer's last loaded time range, in item seconds; diagnostics only. It is NOT the
+    /// #287 witness: measured at a premature end, AVPlayer has already trimmed this range back to the
+    /// exhaustion point, so it corroborates the mistake instead of refuting it.
+    private var loadedRangeEndSeconds: Double? {
+        guard let last = playerItem?.loadedTimeRanges.last?.timeRangeValue else { return nil }
+        let end = CMTimeGetSeconds(CMTimeAdd(last.start, last.duration))
+        return end.isFinite ? end : nil
+    }
+
     /// Resolve only when the seek physically lands (loopback source lands seeks seconds after the call; issue #37).
     /// seekInFlight suppresses the periodic observer across the wait; only the latest seekGeneration clears it.
     func seek(to seconds: Double) async {
@@ -1032,6 +1138,10 @@ final class NativeAVPlayerHost {
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failureMessage/didReachEnd corrupt the new session (issue #15).
         failureMessage = nil
         didReachEnd = false
+        // AE#287: the recovery budget is per item, not per host.
+        prematureEndRecoveryAttempts = 0
+        lastPrematureEndRecoveryPlayhead = nil
+        prematureEndRecoveryInFlight = false
         didSampleSettledRoute = false
         // #168: a reused host must not report the prior session's dynamic range before the new item resolves.
         detectedVideoFormat = nil
@@ -1041,6 +1151,9 @@ final class NativeAVPlayerHost {
         carriageWatchdogTask = nil
         carriageWatchdogArmed = false
         remoteHLSVideoCarriageRejected = false
+        carriageProbeTask?.cancel()
+        carriageProbeTask = nil
+        carriageProbeEvidence = .pending
         // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
         hasEverPlayed = false
         // #93 recovery reload: same content, same position, playback must continue. Skip the
@@ -1133,11 +1246,89 @@ final class NativeAVPlayerHost {
         }
     }
 
-    /// AetherEngine#168 follow-up: after readyToPlay, poll `item.tracks` at a 0.5 s cadence against the
+    /// AE#293: read the carriage off the source itself (playlist plus, where the playlists cannot settle
+    /// it, the first segment's PMT) while the native mount runs, so the #168 verdict does not cost a mount
+    /// plus the watchdog grace on every first open. Gated on AVFoundation's own master parse, which is
+    /// already fetched and therefore free: only a codec the HLS Authoring Spec sanctions in fMP4 alone, or
+    /// a source with no master evidence at all, reaches the network here. The verdict feeds the same
+    /// watchdog; it never fires on its own.
+    ///
+    /// AE#296: the two stages run at different times, because they cost different things. Playlists are
+    /// not what a per-token connection cap counts, so the playlist stage runs against the mount; a segment
+    /// fetch is, so it waits for readyToPlay (see `awaitReadyForDeferredProbe`).
+    @MainActor
+    private func startCarriageProbe(asset: AVURLAsset, url: URL, httpHeaders: [String: String]) {
+        let sid = sessionID
+        carriageProbeTask = Task { @MainActor [weak self] in
+            let variants = (try? await asset.load(.variants)) ?? []
+            guard self?.sessionID == sid, !Task.isCancelled else { return }
+            let advertises = RemoteHLSIngestFallback.advertisesVideo(
+                variantHasVideoAttributes: variants.map { $0.videoAttributes != nil })
+            let codecs = variants.compactMap { $0.videoAttributes }.flatMap { $0.codecTypes }
+            guard RemoteHLSIngestFallback.shouldProbeCarriage(
+                advertisesVideo: advertises, advertisedVideoCodecs: codecs) else { return }
+            let evidence = await HLSCarriageProbe.classifyFromPlaylists(
+                playlistURL: url,
+                httpHeaders: httpHeaders,
+                advertisesFragmentedMP4OnlyVideo:
+                    RemoteHLSIngestFallback.advertisesFragmentedMP4OnlyVideo(codecs)
+            )
+            guard let self, !Task.isCancelled, self.sessionID == sid else { return }
+            switch evidence {
+            case .settled(let verdict):
+                self.publishCarriageProbeVerdict(verdict, sid: sid, from: "playlist")
+            case .needsSegmentHead(let segmentURL):
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sid) carriage probe: the playlists cannot settle this one, "
+                    + "so the segment head waits for readyToPlay rather than compete with the mount (#296)",
+                    category: .engine
+                )
+                guard await self.awaitReadyForDeferredProbe(sid: sid) else { return }
+                let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
+                    url: segmentURL, httpHeaders: httpHeaders)
+                guard !Task.isCancelled, self.sessionID == sid else { return }
+                self.publishCarriageProbeVerdict(verdict, sid: sid, from: "segment PMT")
+            }
+        }
+    }
+
+    @MainActor
+    private func publishCarriageProbeVerdict(
+        _ verdict: MPEGTransportStreamCodecProbe.Verdict, sid: Int, from source: String
+    ) {
+        carriageProbeEvidence = verdict == .hevcInMPEGTS ? .transportStreamHEVC : .nativeCapable
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) carriage probe: \(verdict) from \(source) evidence (#293)",
+            category: .engine
+        )
+    }
+
+    /// AE#296: hold the deferred segment-head read until the item is ready. The verdict cannot be acted on
+    /// before then anyway (the watchdog arms at readyToPlay), so waiting costs nothing and removes the one
+    /// window where the read is expensive: a connection lost while the mount is establishing its own can
+    /// cost the mount, one lost here can only cost the verdict, on a session that is already black. A
+    /// session that never reaches readyToPlay, or whose watchdog disarms first, spends no media byte at
+    /// all. Returns false when the wait was overtaken by cancellation, a new session or the ceiling.
+    @MainActor
+    private func awaitReadyForDeferredProbe(sid: Int) async -> Bool {
+        var ticksWaited = 0
+        while !isReady {
+            guard !Task.isCancelled,
+                  sessionID == sid,
+                  ticksWaited < Self.carriageProbeReadinessTicks else { return false }
+            ticksWaited += 1
+            try? await Task.sleep(
+                nanoseconds: UInt64(Self.carriageProbeReadinessTickSeconds * 1_000_000_000))
+        }
+        return !Task.isCancelled && sessionID == sid
+    }
+
+    /// AetherEngine#168 follow-up: after readyToPlay, poll `item.tracks` at the tick cadence against the
     /// pure `RemoteHLSIngestFallback.Watchdog`. Advertisement evidence comes from `AVURLAsset.variants`,
     /// AVFoundation's own already-fetched master-playlist parse, so this adds no origin connect (IPTV
     /// tokens / WAFs). Publishes `remoteHLSVideoCarriageRejected` once when an advertised video rendition
-    /// never builds an item track (HEVC-in-MPEG-TS carriage); every healthy or judgeless outcome disarms.
+    /// never builds an item track (HEVC-in-MPEG-TS carriage), or as soon as the #293 probe has read that
+    /// carriage off the source; every healthy or judgeless outcome disarms.
     @MainActor
     private func startVideoCarriageWatchdog(item: AVPlayerItem) {
         let sid = sessionID
@@ -1154,10 +1345,16 @@ final class NativeAVPlayerHost {
             while !Task.isCancelled {
                 guard let self, self.playerItem === item else { return }
                 let videoTrackCount = item.tracks.filter { $0.assetTrack?.mediaType == .video }.count
-                switch watchdog.tick(videoTrackCount: videoTrackCount, variantsAdvertiseVideo: advertises) {
+                let evidence = self.carriageProbeEvidence
+                switch watchdog.tick(
+                    videoTrackCount: videoTrackCount,
+                    variantsAdvertiseVideo: advertises,
+                    carriageEvidence: evidence
+                ) {
                 case .keepWaiting:
                     break
                 case .disarm:
+                    self.carriageProbeTask?.cancel()
                     EngineLog.emit(
                         "[NativeAVPlayerHost] #\(sid) carriage watchdog disarmed "
                         + "(videoTracks=\(videoTrackCount) advertised=\(advertises.map { "\($0)" } ?? "unknown"))",
@@ -1165,16 +1362,28 @@ final class NativeAVPlayerHost {
                     )
                     return
                 case .fire:
-                    EngineLog.emit(
-                        "[NativeAVPlayerHost] #\(sid) master advertises video "
-                        + "(\(variants.count) variant(s)) but AVPlayer built no video track after grace; "
-                        + "HEVC-in-MPEG-TS carriage suspected (#168)",
-                        category: .engine
-                    )
+                    if evidence == .transportStreamHEVC {
+                        let saved = watchdog.remainingGraceSeconds(tickInterval: Self.carriageWatchdogTickSeconds)
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) the source's own PMT declares HEVC in MPEG-TS, "
+                            + "so AVPlayer will build no video track; rerouting "
+                            + "\(String(format: "%.1f", saved))s before the watchdog grace would have "
+                            + "concluded the same (#293)",
+                            category: .engine
+                        )
+                    } else {
+                        EngineLog.emit(
+                            "[NativeAVPlayerHost] #\(sid) master advertises video "
+                            + "(\(variants.count) variant(s)) but AVPlayer built no video track after grace; "
+                            + "HEVC-in-MPEG-TS carriage suspected (#168)",
+                            category: .engine
+                        )
+                    }
                     self.remoteHLSVideoCarriageRejected = true
                     return
                 }
-                try? await Task.sleep(nanoseconds: 500_000_000)
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.carriageWatchdogTickSeconds * 1_000_000_000))
             }
         }
     }

@@ -356,22 +356,27 @@ struct ContentView: View {
         }
     }
 
-    /// Mirrors the cold-start profile decision when returning to the foreground:
-    /// after a ten-minute background grace period, a remembered, unprotected
-    /// profile resumes directly; otherwise the who's-watching screen requires
-    /// an explicit profile choice.
+    /// Mirrors the cold-start profile decision when returning to the foreground.
+    /// Normally, the who's-watching screen appears after a ten-minute background
+    /// grace period. When remembering the last profile is disabled, the profile
+    /// setting can instead require a choice on every return.
     private func presentProfileSelectionAfterBackgroundIfNeeded() {
         guard let backgroundedAt else { return }
         self.backgroundedAt = nil
-        guard Date().timeIntervalSince(backgroundedAt) >= Self.profileSelectionBackgroundGracePeriod else {
-            return
-        }
         guard resolvedInitialScreen, !isOnProfileSelection else { return }
         if case .login = activeScreen { return }
 
         let autoSelectLast = ProfileSettings.current.object(
             forKey: SettingsKey.profileAutoSelectLast
         ) as? Bool ?? true
+        let requireSelectionOnEveryReturn = ProfileSettings.current.object(
+            forKey: SettingsKey.profileRequireSelectionAfterBackground
+        ) as? Bool ?? false
+        let hasExceededGracePeriod = Date().timeIntervalSince(backgroundedAt)
+            >= Self.profileSelectionBackgroundGracePeriod
+        let shouldRequireSelection = hasExceededGracePeriod
+            || (!autoSelectLast && requireSelectionOnEveryReturn)
+        guard shouldRequireSelection else { return }
         guard !(autoSelectLast && profileViewModel.activeProfile?.isPinProtected == false) else {
             return
         }
@@ -1600,6 +1605,7 @@ struct ContentView: View {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
         let autoPlayNext = store.object(forKey: SettingsKey.autoPlayNext) as? Bool ?? true
+        let autoPlayNextCountdown = store.object(forKey: SettingsKey.autoPlayNextCountdown) as? Int ?? 10
         PlayerView(
             url: url,
             meta: meta,
@@ -1610,6 +1616,7 @@ struct ContentView: View {
             episodes: isTrailer ? [] : playbackEpisodes,
             currentEpisode: isTrailer ? nil : playbackCurrentEpisode,
             autoPlayNextEnabled: autoPlayNext,
+            autoPlayNextCountdownSeconds: autoPlayNextCountdown,
             resolveNextStream: (isTrailer || !meta.isSeries) ? nil : { episode in
                 await Self.resolveNextEpisodeStream(episode: episode, profileId: profileViewModel.activeProfile?.id)
             },

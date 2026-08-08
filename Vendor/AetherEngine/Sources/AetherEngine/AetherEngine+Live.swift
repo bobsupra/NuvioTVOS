@@ -8,11 +8,8 @@ extension AetherEngine {
         guard isLive, let session = nativeVideoSession else { return nil }
         // seekableLiveRange is output-time + seam shift; segment table and tfdt live on raw output. Resolve newest seam (inverts $currentTime fold).
         let outputSeconds: Double
-        if let seam = liveShiftSeams.last(where: { seconds - $0.shift >= $0.activateAt }) {
-            outputSeconds = seconds - seam.shift
-        } else {
-            outputSeconds = seconds - playlistShiftSeconds
-        }
+        outputSeconds = presentationAxis.itemSeconds(forSourceSeconds: seconds)
+            ?? (seconds - playlistShiftSeconds)
         let gen = loadGeneration
         let source = await Task.detached(priority: .userInitiated) { [session] in
             session.scrubThumbnailSource(atSeconds: outputSeconds)

@@ -31,7 +31,8 @@ final class Issue105PresentationAxisTests: XCTestCase {
         XCTAssertLessThanOrEqual(display, duration)
     }
 
-    /// Normal files and live use origin 0, so the display axis is byte-identical to the source axis (no-op).
+    /// Live, and any source whose PTS axis already starts at 0, use origin 0, so the display axis is
+    /// byte-identical to the source axis (no-op). Which sources get a non-zero origin is AE#270's policy.
     func test_zeroOriginIsIdentity() {
         for pts in [0.0, 12.5, 3_600.0, 7_508.9] {
             XCTAssertEqual(PresentationAxis.display(sourcePTS: pts, origin: 0), pts, accuracy: 0.0)

@@ -7,11 +7,22 @@ struct DiscFile: Equatable, Sendable {
     let length: Int       // bytes
 }
 
-enum DiscError: Error, Equatable {
+enum DiscError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case notISO9660
     case notUDF
     case directoryNotFound(String)
     case malformed(String)
+
+    var description: String {
+        switch self {
+        case .notISO9660: "Disc: not an ISO9660 filesystem"
+        case .notUDF: "Disc: not a UDF filesystem"
+        case .directoryNotFound(let path): "Disc: directory not found (\(path))"
+        case .malformed(let reason): "Disc: malformed structure (\(reason))"
+        }
+    }
+
+    var errorDescription: String? { description }
 }
 
 /// Read-only ISO9660 (ECMA-119) reader for the DVD-Video bridge filesystem.

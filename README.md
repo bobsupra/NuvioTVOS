@@ -43,19 +43,23 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.5 (build 56)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.6 (build 57)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.5](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.5) is the latest tvOS release. Download the unsigned IPA here:
+[Beta 3.2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.6) is the latest tvOS release. The recommended signed IPA uses bundle identifier `com.pyksel.nuviotvos`:
 
-[NuvioTV-3.2.5-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.5/NuvioTV-3.2.5-unsigned-release.ipa)
+[NuvioTV-3.2.6-57-pyksel-signed.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-57-pyksel-signed.ipa)
+
+The unsigned release IPA remains available for a separate signing workflow:
+
+[NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa)
 
 Important: release IPAs are often unsigned because no tvOS signing identity is configured on the build machine.
 
-### New in Beta 3.2.5
+### New in Beta 3.2.6
 
-- Adds focused-poster backdrop controls, video trailer previews, and optional preview audio for a richer Home browsing experience.
-- Improves Home, collection-browser, Details, episode, and PIN focus routing and restoration.
-- Preserves configured Stremio add-on query tokens when building catalog requests.
+- Makes AI subtitle translation substantially cheaper by keeping a small adaptive look-ahead buffer, batching cache writes, and disabling unnecessary model reasoning.
+- Updates the built-in AetherEngine playback stack to 6.7.0, with playback, subtitle, stream, Top Shelf, and diagnostics improvements.
+- Adds configurable next-episode countdown and return-to-profile behavior, while updating signing for the `com.pyksel.nuviotvos` app identity.
 
 ### The new player
 

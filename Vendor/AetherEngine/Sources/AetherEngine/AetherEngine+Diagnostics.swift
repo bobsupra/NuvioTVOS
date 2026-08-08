@@ -146,6 +146,14 @@ extension AetherEngine {
                         ?? self.nativeVideoSession?.demuxerBytesFetched,
                     prefetchFetchedBytes: self.subtitleForwardPrefetchDemuxer?.avioBytesFetched)
 
+                // #303: the software path's own read-ahead, and what the display did with it.
+                // `avBufAhead` covers the AVPlayer path only, and `frameAhead` is the native
+                // producer-shift fold that reads 0 here whatever the buffer is doing, so a software
+                // session used to leave a trace with no cushion figure in it at all.
+                let swStr = Self.softwareReadAheadFragment(
+                    cushionSeconds: self.softwareHost?.displayCushionSeconds,
+                    metrics: await self.softwareHost?.loadRenderMetrics())
+
                 let line = "[AetherEngine] memprobe t=\(elapsed)s "
                     + "rss=\(rssMB)MB "
                     + vmStr
@@ -175,20 +183,29 @@ extension AetherEngine {
                     // separates "reads fast while building its lead" from "the lead never settles".
                     + SubtitlePrefetchTelemetry.probeFragment(playhead: self.sourceTime)
                     + "swFrames=\(self.softwareHostFramesEnqueued) "
+                    + swStr
                     + "audioTracks=\(self.audioTracks.count) "
                     + "subTracks=\(self.subtitleTracks.count) "
                     + "subActive=\(self.isSubtitleActive) "
                     + "avBufAhead=\(String(format: "%.1f", bufferAheadSec))s "
                     + "avBufBehind=\(String(format: "%.1f", bufferBehindSec))s "
-                    // #65 shift-coherence: frameAhead/prodShift/hostShift all 0 while avBufAhead holds
-                    // multiple seconds is the bidirectional-seek-burst signature (presented frame ahead of
-                    // the folded clock). seams=1 is the degenerate VOD seam history (no positional fold).
+                    // Shift coherence: prodShift is the producer edge, hostShift the shift the clock folds
+                    // with, and frameAhead their difference. Since #260 a VOD restart records a seam instead
+                    // of collapsing the history, so a non-zero frameAhead now means the producer has moved to
+                    // a new epoch while AVPlayer still presents the previous one, which is a real state and
+                    // not a defect on its own; seams counts the epochs still on record.
                     + "frameAhead=\(String(format: "%.2f", self.frameAhead))s "
                     + "prodShift=\(String(format: "%.2f", self.activeProducerShiftSeconds))s "
                     + "hostShift=\(String(format: "%.2f", self.playlistShiftSeconds))s "
-                    + "seams=\(self.liveShiftSeams.count)"
+                    + "seams=\(self.presentationAxis.seams.count)"
 
                 EngineLog.emit(line, category: .engine)
+
+                // #250: the steady-state cadence for the subtitle-resolution statement. It rides
+                // the memprobe rather than the 2 Hz drain tick because it states a span, and a
+                // span restated four times a second per channel buries the transitions that carry
+                // the information. Silent when no subtitle drain target is active.
+                self.emitSubtitleResolutionStatements(reason: .tick)
             }
         }
     }
@@ -284,6 +301,26 @@ extension AetherEngine {
             + fragment("pref", prefetch, prefetchFetchedBytes)
     }
 
+    /// #303: the software path's read-ahead, and the display's own account of what it did with it.
+    /// Empty on a native session, so the line does not carry three fields that can only read zero
+    /// there. Each half is independently optional: the cushion exists as soon as a frame has been
+    /// enqueued, while the metrics need an OS and a queue target that can answer for them.
+    nonisolated static func softwareReadAheadFragment(
+        cushionSeconds: Double?,
+        metrics: SampleBufferRenderer.RenderMetrics?
+    ) -> String {
+        var out = ""
+        if let cushionSeconds {
+            out += "swAhead=\(String(format: "%.2f", cushionSeconds))s "
+        }
+        if let metrics {
+            out += "swDropped=\(metrics.dropped)/\(metrics.total) "
+            if metrics.corrupted > 0 { out += "swCorrupt=\(metrics.corrupted) " }
+            out += "swDelay=\(String(format: "%.2f", metrics.accumulatedDelay))s "
+        }
+        return out
+    }
+
     // MARK: - Live telemetry bridge
 
     /// Single write-through point: sampler never reaches into `EngineDiagnostics` directly.
@@ -309,7 +346,17 @@ extension AetherEngine {
     }
 
     /// Frames the SW host enqueued into AVSampleBufferDisplayLayer. Zero on native path or pre-start.
-    var softwareHostFramesEnqueued: Int {
+    ///
+    /// #288: the software-path answer to "is there a picture, or is this audio into a black view".
+    /// `AVPlayerItemVideoOutput.hasNewPixelBuffer` answers it on the native path, but a software
+    /// session has no AVPlayer at all, so a host watchdog built on that probe alone reads every
+    /// dav1d/libavcodec session as picture-less and kills healthy playback. Pair it with
+    /// `currentAVPlayer == nil` to pick the backend, then watch this counter for movement.
+    ///
+    /// Monotonic within a session only: it belongs to the current SW host, and a `load()` that
+    /// builds a new one restarts it at zero. A watchdog measuring deltas must treat a decrease as
+    /// a new session, not as a stall.
+    public var softwareHostFramesEnqueued: Int {
         softwareHost?.framesEnqueued ?? 0
     }
 

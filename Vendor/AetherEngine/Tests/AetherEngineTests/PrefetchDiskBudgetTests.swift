@@ -14,19 +14,19 @@ struct PrefetchBudgetSizingTests {
 
     @Test("Opt-in windows drop the 2 GiB cap and keep a quarter of free space")
     func optInDropsTheDefaultCap() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: 100 << 30,
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: 100 << 30,
                                                        capRelaxed: true) == 25 << 30)
     }
 
     @Test("Opt-in budget still clamps to a quarter of a tight volume")
     func optInStillClampsToQuarterOfFreeDisk() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: 4 << 30,
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: 4 << 30,
                                                        capRelaxed: true) == 1 << 30)
     }
 
     @Test("Opt-in budget keeps the conservative cap when capacity is unknown")
     func optInUnknownCapacityFallsBackToTheCap() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: nil,
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: nil,
                                                        capRelaxed: true) == 2 << 30)
     }
 

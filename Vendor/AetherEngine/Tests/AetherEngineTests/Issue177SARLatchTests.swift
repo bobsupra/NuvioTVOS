@@ -24,17 +24,17 @@ struct Issue177SARLatchTests {
 
     @Test("garbage codec-context SAR (1088:1) is rejected by the sanity gate")
     func garbageSARRejected() {
-        #expect(SoftwareVideoDecoder.saneSAR(rational(1088, 1)) == nil)
-        #expect(SoftwareVideoDecoder.saneSAR(rational(1, 1088)) == nil)
-        #expect(SoftwareVideoDecoder.saneSAR(rational(0, 1)) == nil)
-        #expect(SoftwareVideoDecoder.saneSAR(rational(-4, 3)) == nil)
-        #expect(SoftwareVideoDecoder.saneSAR(rational(4, 0)) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(1088, 1)) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(1, 1088)) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(0, 1)) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(-4, 3)) == nil)
+        #expect(PixelAspectPolicy.saneSAR(rational(4, 0)) == nil)
     }
 
     @Test("legit anamorphic SARs pass the gate")
     func legitSARsPass() {
         for sar in [rational(64, 45), rational(8, 9), rational(32, 27), rational(16, 11), rational(1, 1)] {
-            let sane = SoftwareVideoDecoder.saneSAR(sar)
+            let sane = PixelAspectPolicy.saneSAR(sar)
             #expect(sane?.num == sar.num)
             #expect(sane?.den == sar.den)
         }
@@ -45,7 +45,8 @@ struct Issue177SARLatchTests {
     @Test("frame SAR wins over codec context and stream")
     func frameWins() {
         let resolved = SoftwareVideoDecoder.resolveSAR(
-            frame: rational(16, 11), codecCtx: rational(4, 3), stream: rational(1, 1))
+            frame: rational(16, 11), codecCtx: rational(4, 3), stream: rational(1, 1),
+            width: 720, height: 576)
         #expect(resolved?.num == 16)
         #expect(resolved?.den == 11)
     }
@@ -53,7 +54,8 @@ struct Issue177SARLatchTests {
     @Test("garbage frame and ctx fall through to the stream SAR")
     func fallsThroughToStream() {
         let resolved = SoftwareVideoDecoder.resolveSAR(
-            frame: rational(0, 1), codecCtx: rational(1088, 1), stream: rational(64, 45))
+            frame: rational(0, 1), codecCtx: rational(1088, 1), stream: rational(64, 45),
+            width: 720, height: 576)
         #expect(resolved?.num == 64)
         #expect(resolved?.den == 45)
     }
@@ -61,7 +63,8 @@ struct Issue177SARLatchTests {
     @Test("codec context SAR is consulted between frame and stream")
     func ctxBetweenFrameAndStream() {
         let resolved = SoftwareVideoDecoder.resolveSAR(
-            frame: rational(0, 0), codecCtx: rational(8, 9), stream: rational(1, 1))
+            frame: rational(0, 0), codecCtx: rational(8, 9), stream: rational(1, 1),
+            width: 720, height: 480)
         #expect(resolved?.num == 8)
         #expect(resolved?.den == 9)
     }
@@ -69,7 +72,8 @@ struct Issue177SARLatchTests {
     @Test("nothing sane anywhere resolves to nil")
     func nothingSaneIsNil() {
         #expect(SoftwareVideoDecoder.resolveSAR(
-            frame: rational(0, 1), codecCtx: rational(1088, 1), stream: rational(0, 0)) == nil)
+            frame: rational(0, 1), codecCtx: rational(1088, 1), stream: rational(0, 0),
+            width: 720, height: 576) == nil)
     }
 
     // MARK: - Per-stream latch

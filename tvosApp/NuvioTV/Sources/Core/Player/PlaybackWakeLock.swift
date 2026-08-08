@@ -1,6 +1,25 @@
 import AVFoundation
 import UIKit
 
+/// `AVAudioSession` category and activation changes can block while the system
+/// reconfigures audio routes. Keep them off the main actor so a preview or
+/// player start never stalls SwiftUI focus and animation work.
+enum PlaybackAudioSession {
+    private static let queue = DispatchQueue(label: "tv.nuvio.audio-session")
+
+    static func activateMoviePlayback() {
+        queue.async {
+            let session = AVAudioSession.sharedInstance()
+            do {
+                try session.setCategory(.playback, mode: .moviePlayback)
+                try session.setActive(true)
+            } catch {
+                print("[PlaybackAudioSession] activate failed: \(error.localizedDescription)")
+            }
+        }
+    }
+}
+
 /// Keeps Apple TV awake for the full player session.
 ///
 /// Custom MPV Metal rendering is not treated as "system video playback" the way
@@ -60,12 +79,6 @@ enum PlaybackWakeLock {
     }
 
     private static func activateAudioSession() {
-        let session = AVAudioSession.sharedInstance()
-        do {
-            try session.setCategory(.playback, mode: .moviePlayback)
-            try session.setActive(true)
-        } catch {
-            print("[PlaybackWakeLock] AVAudioSession activate failed: \(error.localizedDescription)")
-        }
+        PlaybackAudioSession.activateMoviePlayback()
     }
 }

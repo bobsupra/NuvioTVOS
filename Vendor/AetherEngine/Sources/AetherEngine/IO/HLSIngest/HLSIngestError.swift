@@ -1,7 +1,7 @@
 import Foundation
 
 /// Terminal errors from the live HLS ingest. Every case causes a host fallback to the Jellyfin-mediated path. Phase-1 limits (encryption, fMP4) fall back deliberately rather than half-work.
-public enum HLSIngestError: Error, Equatable, CustomStringConvertible {
+public enum HLSIngestError: Error, Equatable, CustomStringConvertible, LocalizedError {
     case playlistUnreachable(status: Int)
     case playlistInvalid(reason: String)
     /// SAMPLE-AES / SAMPLE-AES-CTR, or AES-128 tag with no URI. Plain AES-128 clear-key is handled by `HLSSegmentDecryptor`.
@@ -25,4 +25,9 @@ public enum HLSIngestError: Error, Equatable, CustomStringConvertible {
         case .demuxedAudioNotSupported: "demuxedAudioNotSupported"
         }
     }
+
+    /// AE#283: without this, `localizedDescription` at the load boundary collapses every case to
+    /// "The operation couldn't be completed. (HLSIngestError error 0.)" and the HTTP status the
+    /// reader already resolved is lost.
+    public var errorDescription: String? { description }
 }

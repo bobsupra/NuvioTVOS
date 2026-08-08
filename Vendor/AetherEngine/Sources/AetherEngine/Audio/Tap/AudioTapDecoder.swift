@@ -30,7 +30,20 @@ final class AudioTapDecoder: @unchecked Sendable {
     private var pending: [Float] = []
     private var pendingStartPTS: Double = 0
 
-    enum TapDecoderError: Error { case noCodecParameters, unsupportedCodec, allocFailed, openFailed }
+    enum TapDecoderError: Error, CustomStringConvertible, LocalizedError {
+        case noCodecParameters, unsupportedCodec, allocFailed, openFailed
+
+        var description: String {
+            switch self {
+            case .noCodecParameters: "AudioTapDecoder: stream has no codec parameters"
+            case .unsupportedCodec: "AudioTapDecoder: no decoder for the tap codec"
+            case .allocFailed: "AudioTapDecoder: avcodec_alloc_context3 failed"
+            case .openFailed: "AudioTapDecoder: decoder open failed"
+            }
+        }
+
+        var errorDescription: String? { description }
+    }
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else { throw TapDecoderError.noCodecParameters }

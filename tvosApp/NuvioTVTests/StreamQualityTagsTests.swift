@@ -112,7 +112,7 @@ final class StreamQualityTagsTests: XCTestCase {
     func testCachedOnlyFilter() {
         let cached = NuvioStream(
             url: "https://cdn.example/c.mkv",
-            name: "1080p RD+ Cached",
+            name: "4K RD+ Cached",
             description: "⚡",
             addonName: "Torrentio",
             isCached: true
@@ -137,6 +137,24 @@ final class StreamQualityTagsTests: XCTestCase {
         )
         XCTAssertTrue(playable.contains(where: { $0.id == cached.id }))
         XCTAssertFalse(playable.contains(where: { $0.id == plain.id }))
+        XCTAssertFalse(playable.contains(where: { $0.id == uncached.id }))
+    }
+
+    func testCachedOnlyFilterReturnsNoStreamsWhenNoCachedSourcesExist() {
+        let uncached = NuvioStream(
+            url: "https://cdn.example/u.mkv",
+            name: "1080p WEB-DL",
+            description: "12 GB",
+            addonName: "Torrentio"
+        )
+
+        let playable = SmartPlaybackSelector.playableStreams(
+            from: [uncached],
+            includeDebrid: false,
+            cachedOnly: true
+        )
+
+        XCTAssertTrue(playable.isEmpty)
     }
 
     func testBadges() {

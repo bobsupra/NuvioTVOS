@@ -36,6 +36,7 @@ extension AetherEngine {
         subtitleOCRSidecarFillTask?.cancel()
         subtitleOCRSidecarFillTask = nil
         subtitleOCRDecoder = nil
+        subtitleOCRLastTickUptime = nil   // #271
     }
 
     /// Load/stop teardown: forget covered-region state too (new session, new axis).
@@ -56,11 +57,16 @@ extension AetherEngine {
             closed.append(contentsOf: pending.expired(asOf: playhead))
             subtitleOCRPendingStates[ordinal] = pending
         }
+        // #271: same rule as the overlay drainer, a tick that ran long is not a seek.
+        let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
+        let elapsed = subtitleOCRLastTickUptime.map { tickUptime - $0 } ?? 0
+        subtitleOCRLastTickUptime = tickUptime
         let plan = SubtitleOverlayDrainer.drainPlan(
             cursor: subtitleOCRCursors[ordinal], playhead: playhead,
             lead: Self.subtitleOCRLeadSeconds,
             backscan: Self.subtitleDrainBackscanSeconds,
-            jumpThreshold: Self.subtitleDrainJumpThresholdSeconds)
+            jumpThreshold: Self.subtitleDrainJumpThresholdSeconds,
+            elapsedSinceLastPlan: elapsed)
         let window: (from: Double, through: Double)
         switch plan {
         case .idle:
@@ -79,7 +85,15 @@ extension AetherEngine {
         guard let decoder = subtitleOCRDecoder else { return closed }
         let entries = packetStore.entries(streamIndex: streamIndex,
                                           from: window.from, through: window.through)
-        let batch = entries.prefix(Self.subtitleOCRMaxPacketsPerTick)
+        // #271: the cap has to fall on a PTS boundary. The cursor is a bare PTS advanced by
+        // `lastDecodedPts.nextUp`, so a cut inside a same-PTS run skips its remainder instead of
+        // resuming it next tick. One composition per PTS is the norm on a bitmap track, but a
+        // container that splits a display set across packets (see splitDisplaySetSubtitleStreamIndices)
+        // shares one, and half a display set OCRs to nothing.
+        let batchEnd = SubtitleOverlayDrainer.batchEnd(
+            count: entries.count, cap: Self.subtitleOCRMaxPacketsPerTick,
+            ptsAt: { entries[$0].ptsSeconds })
+        let batch = entries[..<batchEnd]
         var lastDecoded = subtitleOCRCursors[ordinal]?.lastDecodedPts
         for entry in batch {
             if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder) {

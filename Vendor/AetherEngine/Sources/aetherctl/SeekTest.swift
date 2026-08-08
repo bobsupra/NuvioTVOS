@@ -1,4 +1,5 @@
 import Foundation
+import Combine
 import AetherEngine
 
 // MARK: - seektest: rapid-seek burst repro (issue #35)
@@ -86,6 +87,12 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     }
     defer { engine.stop() }
 
+    // #38 follow-up: record the seek-lifecycle stream for the whole run. The level signal cannot show
+    // whether a falling edge was a landing, a give-up or a supersede; the ledger below can.
+    let seekEvents = UncheckedBox<[SeekEvent]>([])
+    let seekEventSub = engine.seekEvents.sink { event in seekEvents.value.append(event) }
+    defer { seekEventSub.cancel() }
+
     var options = LoadOptions()
     options.suppressDisplayCriteria = true
     options.matchContentEnabled = false
@@ -147,6 +154,20 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
           + (bounceAfterTarget ? "YES  <-- FAIL" : "no  <-- PASS"))
     print("  #38 isSeeking observed in-flight=\(sawSeeking ? "yes" : "NO") ended-cleared=\(endedCleared ? "yes" : "NO")  "
           + ((sawSeeking && endedCleared) ? "<-- PASS" : "<-- FAIL"))
+    // #38 follow-up: the falling edge alone cannot say what happened; the probe seek must produce a
+    // .began and a matching .landed, and that landing must name a position at the target.
+    let probeSeekEvents = seekEvents.value.filter { $0.origin == .programmatic }
+    let probeBegan = probeSeekEvents.last { $0.outcome == .began }
+    let probeTerminator = probeBegan.flatMap { began in
+        probeSeekEvents.first { $0.id == began.id && $0.isTerminal }
+    }
+    var probeLandedAtTarget = false
+    if case .landed(let rendered)? = probeTerminator?.outcome {
+        probeLandedAtTarget = abs(rendered - probeLo) <= tol
+    }
+    print("  #38 event pair: \(probeBegan.map { "began@\(String(format: "%.1f", $0.target))" } ?? "NONE") -> "
+          + (probeTerminator.map { "\($0)" } ?? "NO TERMINATOR")
+          + "  " + (probeLandedAtTarget ? "<-- PASS" : "<-- FAIL"))
 
     struct Sample { let wall: Double; let ct: Double; let src: Double; let playing: Bool }
     var samples: [Sample] = []
@@ -297,6 +318,27 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         print("     are consistent with healthy playback, so they do NOT confirm Root B on their own. Re-run with a")
         print("     LONGER high-bitrate file, or rely on the reporter device trace ('#65 ledger' + 'PARK' lines).")
     }
+    // #38 follow-up ledger: every `.began` must reach a terminal event, and a `.stalled` may still be
+    // followed by a late `.landed` under the same id (the edge no level signal can carry). An unpaired
+    // `.began` is a stranded in-flight window: exactly what a sync host would wait on forever.
+    // Tear the session down first: a scrub landing watch armed at the end of the burst is terminated by
+    // the teardown, and reading the ledger before it would report that as an unpaired `.began`.
+    engine.stop()
+    let events = seekEvents.value
+    let begun = Set(events.filter { $0.outcome == .began }.map(\.id))
+    let terminated = Set(events.filter { $0.isTerminal }.map(\.id))
+    let stalledIDs = Set(events.filter { $0.outcome == .stalled }.map(\.id))
+    let lateLandings = events.filter {
+        if case .landed = $0.outcome { return stalledIDs.contains($0.id) }
+        return false
+    }
+    print("")
+    print("=== #38 SEEK EVENT LEDGER ===")
+    print("  began=\(begun.count) terminated=\(terminated.count) stalled=\(stalledIDs.count) "
+          + "late-landings=\(lateLandings.count)")
+    let unpaired = begun.subtracting(terminated).sorted()
+    print("  unpaired begans: " + (unpaired.isEmpty ? "none  <-- PASS" : "\(unpaired)  <-- FAIL"))
+    for event in events.suffix(12) { print("    \(event)") }
     print("")
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")
     return 0

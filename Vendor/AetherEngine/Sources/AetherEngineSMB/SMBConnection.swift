@@ -18,7 +18,11 @@ import SMBClient
 /// request/response round-trip internally, so `@unchecked Sendable` is safe for
 /// this access pattern (as it was for the AMSMB2 backend).
 public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
-    public struct SMBError: Error { public let message: String }
+    public struct SMBError: Error, CustomStringConvertible, LocalizedError {
+        public let message: String
+        public var description: String { "SMB: \(message)" }
+        public var errorDescription: String? { description }
+    }
 
     private let client: SMBClient
     private let reader: FileReader

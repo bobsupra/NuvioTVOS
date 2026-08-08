@@ -100,6 +100,79 @@ extension HLSVideoEngine {
         return plan
     }
 
+    /// Backoff applied to every boundary of a plan built from a source's DECLARED segment starts.
+    ///
+    /// The manifest axis (EXTINF sums) and the container's real PTS are two measurements of the same
+    /// boundary, and they differ by whatever the segmenter rounded. A boundary that lands even a
+    /// millisecond PAST its own IRAP is worse than one that lands early: the producer's scan-forward
+    /// gate takes the first keyframe at-or-after the boundary, so it skips the whole segment and opens
+    /// a GOP late. Pulling each boundary slightly below its segment start keeps the IRAP inside the
+    /// segment it is supposed to open. Capped below half the shortest segment so a backed-off boundary
+    /// can never reach back to the PREVIOUS segment's IRAP.
+    static func segmentedPlanBoundaryBackoff(shortestSegmentSeconds: Double) -> Double {
+        guard shortestSegmentSeconds > 0 else { return 0 }
+        return min(0.5, shortestSegmentSeconds / 2)
+    }
+
+    /// Plan built from a segmented source's own boundaries (AE#268: the HLS VOD ingest's EXTINF sums).
+    ///
+    /// A segmented source declares where its random-access points are, and those are the only
+    /// boundaries the plan may advertise. The uniform fallback ignores that and lays a 4 s grid over a
+    /// source whose GOP can be much longer: on the reporter's 10 s-GOP MPEG-TS VOD only every fifth
+    /// grid boundary coincided with an IRAP, so a restart at any other index opened its gate up to 8 s
+    /// (two whole plan segments) late, and every downstream index mapping skewed by that overshoot
+    /// until AVPlayer starved on a segment that never arrived (CoreMediaErrorDomain -12889). Boundaries
+    /// that ARE the source's own segment starts make the overshoot structurally zero.
+    ///
+    /// `startPts0` anchors the source axis exactly like the other two builders (plan time 0 = the
+    /// content start), so `startSeconds` stays 0-based and every consumer's source <-> item mapping is
+    /// unchanged.
+    static func buildSegmentedSourcePlan(
+        segmentStartsSeconds: [Double],
+        videoTimeBase: AVRational,
+        sourceDurationSeconds: Double,
+        startPts0: Int64
+    ) -> [Segment] {
+        guard segmentStartsSeconds.count >= 2, sourceDurationSeconds > 0,
+              videoTimeBase.num > 0, videoTimeBase.den > 0 else { return [] }
+        let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
+        guard tb > 0 else { return [] }
+        let starts = segmentStartsSeconds
+        guard starts[0] == 0 else { return [] }
+
+        var shortest = Double.greatestFiniteMagnitude
+        for i in 1..<starts.count {
+            let span = starts[i] - starts[i - 1]
+            guard span > 0 else { return [] }  // non-monotonic manifest: leave the source on the fallback
+            shortest = Swift.min(shortest, span)
+        }
+        // The manifest's own duration ends the final segment. A duration that does not even reach the
+        // last start is not usable (an estimate on a truncated container), so that case falls back to
+        // one more segment rather than a zero-length tail.
+        let lastStart = starts[starts.count - 1]
+        let end = sourceDurationSeconds > lastStart ? sourceDurationSeconds : lastStart + shortest
+        let backoff = segmentedPlanBoundaryBackoff(shortestSegmentSeconds: shortest)
+
+        // Segment 0 keeps the content start itself: there is nothing below it to back off toward, and
+        // the head-of-stream gate has no restart target anyway.
+        func boundaryPts(_ i: Int) -> Int64 {
+            i == 0 ? startPts0 : startPts0 + Int64((starts[i] - backoff) / tb)
+        }
+
+        var plan: [Segment] = []
+        plan.reserveCapacity(starts.count)
+        for i in 0..<starts.count {
+            let endSeconds = i + 1 < starts.count ? starts[i + 1] : end
+            plan.append(Segment(
+                startPts: boundaryPts(i),
+                endPts: i + 1 < starts.count ? boundaryPts(i + 1) : startPts0 + Int64(end / tb),
+                startSeconds: starts[i],
+                durationSeconds: Swift.max(0.001, endSeconds - starts[i])
+            ))
+        }
+        return plan
+    }
+
     /// Keyframe-aligned plan mirroring libavformat's hls muxer cut algorithm: segment N ends at the first keyframe where `(keyframe_pts - start_pts) >= (N+1) * targetDuration`. Absolute thresholds match the muxer; relative per-segment thresholds diverged on irregular GOPs.
     static func buildKeyframeSegmentPlan(
         keyframes: [Int64],

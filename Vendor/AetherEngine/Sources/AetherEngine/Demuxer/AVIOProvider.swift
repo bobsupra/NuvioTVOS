@@ -40,4 +40,14 @@ protocol AVIOProvider: AnyObject {
 
     /// Free the `AVIOContext` and release the underlying source. Idempotent.
     func close()
+
+    /// #281: the demuxer's header + stream-info pass is done, so any further seek is playback, not
+    /// parsing. A provider that keeps cold-start state (AVIOReader parks a discarded window for the
+    /// parse seek's return trip) releases it here. Default no-op: a provider without that state,
+    /// like the custom-reader bridge, ignores it.
+    func markOpenPhaseFinished()
+}
+
+extension AVIOProvider {
+    func markOpenPhaseFinished() {}
 }

@@ -6,7 +6,7 @@ import AVFAudio
 /// (SegmentCache / VideoSegmentProvider are internal); precedent: PacketTimingProbe (#93).
 public enum AudioTapProbe {
 
-    public enum ProbeError: Error, CustomStringConvertible {
+    public enum ProbeError: Error, CustomStringConvertible, LocalizedError {
         case noCacheOrProvider
         case noInitSegment
         case wavWriteFailed(String)
@@ -17,6 +17,8 @@ public enum AudioTapProbe {
             case .wavWriteFailed(let p): return "WAV write failed at \(p)"
             }
         }
+
+        public var errorDescription: String? { description }
     }
 
     public static func run(url: URL, durationSeconds: Double, outPath: String) throws -> String {

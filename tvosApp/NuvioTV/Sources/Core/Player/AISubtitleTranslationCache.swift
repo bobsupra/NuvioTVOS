@@ -7,6 +7,11 @@ import Foundation
 actor AISubtitleTranslationCache {
     static let shared = AISubtitleTranslationCache()
 
+    struct PendingTranslation: Sendable {
+        let translatedText: String
+        let source: String
+    }
+
     private struct Entry: Codable {
         let translatedText: String
         let createdAt: Date
@@ -63,20 +68,41 @@ actor AISubtitleTranslationCache {
         stripHearingImpaired: Bool,
         profileScope: String
     ) {
-        guard !translatedText.isEmpty else { return }
-        let key = Self.key(
-            source: source,
+        store(
+            [PendingTranslation(translatedText: translatedText, source: source)],
             targetLanguage: targetLanguage,
             model: model,
-            stripHearingImpaired: stripHearingImpaired
+            stripHearingImpaired: stripHearingImpaired,
+            profileScope: profileScope
         )
+    }
+
+    /// Stores a completed provider batch with one trim, encode, and atomic
+    /// disk write instead of rewriting the whole profile cache per cue.
+    func store(
+        _ translations: [PendingTranslation],
+        targetLanguage: String,
+        model: String,
+        stripHearingImpaired: Bool,
+        profileScope: String
+    ) {
+        let translations = translations.filter { !$0.translatedText.isEmpty }
+        guard !translations.isEmpty else { return }
         var store = loadStore(for: profileScope)
         let now = Date()
-        store.entries[key] = Entry(
-            translatedText: translatedText,
-            createdAt: now,
-            lastAccessedAt: now
-        )
+        for translation in translations {
+            let key = Self.key(
+                source: translation.source,
+                targetLanguage: targetLanguage,
+                model: model,
+                stripHearingImpaired: stripHearingImpaired
+            )
+            store.entries[key] = Entry(
+                translatedText: translation.translatedText,
+                createdAt: now,
+                lastAccessedAt: now
+            )
+        }
         trim(&store)
         stores[profileScope] = store
         persist(store, for: profileScope)

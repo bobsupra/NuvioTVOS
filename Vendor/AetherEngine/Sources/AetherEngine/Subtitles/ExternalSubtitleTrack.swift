@@ -18,10 +18,21 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
     public var httpHeaders: [String: String]?
     /// File-extension override ("srt", "ass", "vtt", "ssa") for URLs whose path hides the format.
     public var formatHint: String?
+    /// Absolute `AVStream` index of the subtitle stream to decode inside the container at `url`
+    /// (#266), for URLs that are containers holding several subtitle streams: register one track
+    /// per stream, each with its own index. nil decodes the container's first subtitle stream.
+    /// An index that is out of range or names a non-subtitle stream fails the decode instead of
+    /// falling back, which would be indistinguishable from leaving it nil.
+    ///
+    /// This indexes the container at `url`, NOT the played media: it is unrelated to the embedded
+    /// stream indices that `TrackInfo.id` carries for the main demuxer.
+    public var sourceStreamIndex: Int32?
 
     public init(url: URL, name: String? = nil, language: String? = nil,
                 isForced: Bool = false, isHearingImpaired: Bool = false, isDefault: Bool = false,
-                httpHeaders: [String: String]? = nil, formatHint: String? = nil) {
+                httpHeaders: [String: String]? = nil, formatHint: String? = nil,
+                sourceStreamIndex: Int32? = nil) {
+        self.sourceStreamIndex = sourceStreamIndex
         self.url = url
         self.name = name
         self.language = language

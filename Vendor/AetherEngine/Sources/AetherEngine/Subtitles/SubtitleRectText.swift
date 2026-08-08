@@ -73,12 +73,18 @@ enum SubtitleRectText {
     static let defaultASSPlayRes = CGSize(width: 384, height: 288)
 
     /// Play resolution declared by an ASS `[Script Info]` header, or nil when it declares none.
+    ///
+    /// The header arrives as codec extradata byte for byte as the muxer stored it, and muxed ASS
+    /// is conventionally CRLF, so the line endings are not ours to assume (#261). Splitting on
+    /// `isNewline` covers CRLF, LF and lone CR, and the trims are newline-inclusive so a stray CR
+    /// cannot reach `Double(_:)`, which returns nil for `"718\r"` and silently costs the whole
+    /// declaration.
     static func playRes(fromASSHeader header: String) -> CGSize? {
         func value(_ key: String) -> Double? {
-            for line in header.split(separator: "\n", omittingEmptySubsequences: false) {
-                let l = line.trimmingCharacters(in: .whitespaces)
+            for line in header.split(whereSeparator: \.isNewline) {
+                let l = line.trimmingCharacters(in: .whitespacesAndNewlines)
                 guard l.lowercased().hasPrefix(key.lowercased() + ":") else { continue }
-                return Double(l.dropFirst(key.count + 1).trimmingCharacters(in: .whitespaces))
+                return Double(l.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines))
             }
             return nil
         }
@@ -289,6 +295,70 @@ enum SubtitleRectText {
     /// can land in a whitespace-only run of its own and break the chain (`line` / whitespace run /
     /// `line`).
     private static func collapseInteriorBlankLines(_ runs: [SubtitleTextRun]) -> [SubtitleTextRun] {
+        rewritingFlattened(runs) { chars, keep in
+            var i = 0
+            while i < chars.count {
+                guard chars[i].isNewline else { i += 1; continue }
+                // Scan past horizontal whitespace and further newlines; everything up to and
+                // including the last newline found is one blank-row gap and collapses onto the
+                // first newline.
+                var probe = i + 1
+                var lastNewline = i
+                while probe < chars.count {
+                    let c = chars[probe]
+                    if c.isNewline { lastNewline = probe }
+                    else if !c.isWhitespace { break }
+                    probe += 1
+                }
+                if lastNewline > i {
+                    for k in (i + 1)...lastNewline { keep[k] = false }
+                }
+                i = lastNewline + 1
+            }
+        }
+    }
+
+    /// Trim the column padding off both ends of every row of a raw teletext grid dump (#233).
+    ///
+    /// On a page libzvbi does not flag as a subtitle page, `gen_sub_ass` writes each row at full
+    /// column width (`decode_string(row, 0, columns)`, with `\h` for every grid space) and appends
+    /// `" \N"` after it. `edgeTrimmed` only reaches the outer edges of the whole sequence, so the
+    /// padding on the inside of every line break survives: a two-row caption arrives with trailing
+    /// spaces on row 1 and leading spaces on row 2, which pushes a centred row off centre and makes
+    /// the cue's background box wider than its text.
+    ///
+    /// Deliberately does NOT run on flagged pages, where the padding is the opposite of noise: there
+    /// `gen_sub_ass` already trims each row and the residue it leaves is the relative indentation
+    /// that carries the alignment it chose (`leading = min_leading` for left, `trailing =
+    /// min_trailing` for right, both for its non-centrable centre case). See `teletextBody`.
+    private static func trimGridRows(_ runs: [SubtitleTextRun]) -> [SubtitleTextRun] {
+        rewritingFlattened(runs) { chars, keep in
+            // A row holds no newline by construction, so any whitespace inside one is horizontal.
+            func trimRow(from start: Int, to end: Int) {
+                var head = start
+                while head < end, chars[head].isWhitespace { keep[head] = false; head += 1 }
+                var tail = end - 1
+                while tail >= head, chars[tail].isWhitespace { keep[tail] = false; tail -= 1 }
+            }
+            var rowStart = 0
+            for (index, ch) in chars.enumerated() where ch.isNewline {
+                trimRow(from: rowStart, to: index)
+                rowStart = index + 1
+            }
+            trimRow(from: rowStart, to: chars.count)
+        }
+    }
+
+    /// Let `marking` decide which characters survive on the FLATTENED sequence, then re-split the
+    /// survivors along the original run boundaries.
+    ///
+    /// Both whitespace passes need the flattening rather than a per-run walk: the padding of a
+    /// teletext row carries the spacing attribute that changes colour, so it lands in a
+    /// whitespace-only run of its own and a per-run or adjacent-pair check steps right over it.
+    private static func rewritingFlattened(
+        _ runs: [SubtitleTextRun],
+        marking: ([Character], inout [Bool]) -> Void
+    ) -> [SubtitleTextRun] {
         var chars: [Character] = []
         var owner: [Int] = []
         for (index, run) in runs.enumerated() {
@@ -299,24 +369,7 @@ enum SubtitleRectText {
         }
 
         var keep = [Bool](repeating: true, count: chars.count)
-        var i = 0
-        while i < chars.count {
-            guard chars[i].isNewline else { i += 1; continue }
-            // Scan past horizontal whitespace and further newlines; everything up to and including
-            // the last newline found is one blank-row gap and collapses onto the first newline.
-            var probe = i + 1
-            var lastNewline = i
-            while probe < chars.count {
-                let c = chars[probe]
-                if c.isNewline { lastNewline = probe }
-                else if !c.isWhitespace { break }
-                probe += 1
-            }
-            if lastNewline > i {
-                for k in (i + 1)...lastNewline { keep[k] = false }
-            }
-            i = lastNewline + 1
-        }
+        marking(chars, &keep)
 
         var texts = [String](repeating: "", count: runs.count)
         for (index, ch) in chars.enumerated() where keep[index] {
@@ -335,16 +388,34 @@ enum SubtitleRectText {
         return body(for: parsed.runs).map { ($0, parsed.placement) }
     }
 
-    /// Teletext variant (#107): identical, plus the interior blank-line fold libzvbi's row joining
-    /// requires, plus the grid-row placement fallback below. Both are deliberately teletext-only,
-    /// since a blank line in an ASS or SRT cue can be intentional and a leading one is never a row
-    /// ordinal.
+    /// Teletext variant (#107, #233): identical, plus the two whitespace passes libzvbi's raw grid
+    /// dump requires and the grid-row placement fallback below. All three are deliberately
+    /// teletext-only, since a blank line in an ASS or SRT cue can be intentional, interior
+    /// indentation there can be deliberate, and a leading blank line is never a row ordinal.
+    ///
+    /// The passes run only on a page libzvbi did NOT flag as a subtitle page, which is exactly the
+    /// page that arrives without an `\an`. `gen_sub_ass` writes such a page out as the raw grid: one
+    /// full-width row per grid row, empty ones included, and the row ordinal as the only carrier of
+    /// the position. On a flagged page it instead curates the output, and both of the things these
+    /// passes remove become decisions there: the `empty_lines / 2` fillers are its vertical
+    /// fine-positioning inside the block, and the residual padding is the relative indentation that
+    /// carries the horizontal alignment it picked. Folding or trimming those deletes information
+    /// rather than noise, so a curated body is passed through whole, down to the one separator
+    /// space `gen_sub_ass` writes ahead of every `\N`.
+    ///
+    /// The two gates are the same gate. `gen_sub_ass` emits `{\anN}` on the first row of a flagged
+    /// page that holds any character, and a flagged page holding none produces no cue at all, so an
+    /// arriving `\an` and a curated body are equivalent.
     static func teletextBody(fromASSEventLine line: String,
                              playRes: CGSize = SubtitleRectText.defaultASSPlayRes)
         -> (body: SubtitleCue.Body, placement: SubtitleTextPlacement?)? {
         guard let parsed = styledRuns(fromASSEventLine: line, playRes: playRes) else { return nil }
+        let isCurated = parsed.placement?.alignment != nil
         let placement = parsed.placement ?? gridPlacement(firstTextRow: parsed.firstTextRow)
-        return body(for: collapseInteriorBlankLines(parsed.runs)).map { ($0, placement) }
+        let runs = isCurated
+            ? parsed.runs
+            : trimGridRows(collapseInteriorBlankLines(parsed.runs))
+        return body(for: runs).map { ($0, placement) }
     }
 
     /// Vertical anchor for a teletext page that carried no `\an` (#233).
@@ -360,10 +431,15 @@ enum SubtitleRectText {
     ///     an             = alignment + vertical_align * 3
     ///
     /// with `i` the grid row (emitted row + 1, since `txt_chop_top` defaults to 1) and the
-    /// horizontal alignment left at ffmpeg's own default of 2, centre: the column analysis it does
-    /// for subtitle pages needs the per-row trim that this path never ran. Coarse on purpose. Three
-    /// bands is what the source encodes; mapping each row to its own offset makes consecutive cues
-    /// of different heights sit at different heights, which reads as a blink.
+    /// horizontal alignment left at ffmpeg's own default of 2, centre. Deriving that one too is
+    /// measurable now that `trimGridRows` runs, since the leading and trailing pad of each row is
+    /// the column count `can_align_left` / `_right` / `_center` compare, but the analysis is not
+    /// self-contained: where it leaves more than one of the three viable it resolves the tie from
+    /// `last_ass_alignment`, the answer given to the PREVIOUS cue. A stateless parser has to fall
+    /// back to centre there, so an unambiguous left-aligned cue followed by an ambiguous one would
+    /// jump. Coarse on purpose, on both axes: three bands is what the source encodes, and mapping
+    /// each row to its own offset makes consecutive cues of different heights sit at different
+    /// heights, which reads as a blink.
     ///
     /// Never overrides an `\an` that arrived, including `{\an2}`: bottom is a real answer and it
     /// looks exactly like no answer.

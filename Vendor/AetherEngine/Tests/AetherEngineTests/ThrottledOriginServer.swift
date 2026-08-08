@@ -16,6 +16,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private let totalSize: Int64
     private let chunkBytes: Int
     private let throttleUs: useconds_t
+    private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
     private let lock = NSLock()
     private var _bytesWritten: Int64 = 0
     private var _connFDs: [Int32] = []
@@ -44,10 +45,16 @@ final class ThrottledOriginServer: @unchecked Sendable {
         return _stopped
     }
 
-    init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000) {
+    /// #281 retest: how long this origin sits on a request before its response header, per request
+    /// form. A loopback origin answers instantly, which is the one thing a real one never does, and
+    /// that difference is what let the speculative tail fetch pass every test while never once
+    /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
+    init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
+          firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 }) {
         self.totalSize = totalSize
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
+        self.firstByteDelayUs = firstByteDelayUs
 
         let fd = socket(AF_INET, SOCK_STREAM, 0)
         guard fd >= 0 else { return nil }
@@ -134,17 +141,35 @@ final class ThrottledOriginServer: @unchecked Sendable {
         guard let request = readRequestHeader(fd) else { return false }
         var offset: Int64 = 0
         var rangeEnd: Int64? = nil
+        var isSuffix = false
         if let rangeLine = request.components(separatedBy: "\r\n")
             .first(where: { $0.lowercased().hasPrefix("range:") }),
            let eq = rangeLine.range(of: "bytes="),
            let dash = rangeLine.range(of: "-", range: eq.upperBound..<rangeLine.endIndex) {
-            if let start = Int64(rangeLine[eq.upperBound..<dash.lowerBound]) { offset = start }
+            let head = rangeLine[eq.upperBound..<dash.lowerBound].trimmingCharacters(in: .whitespaces)
             let tail = rangeLine[dash.upperBound...].trimmingCharacters(in: .whitespaces)
-            if !tail.isEmpty, let end = Int64(tail) { rangeEnd = min(end, totalSize - 1) }
+            if head.isEmpty, let suffixLength = Int64(tail) {
+                // #281: the suffix form `bytes=-n`, the last n bytes, which is what the speculative
+                // tail fetch uses because it needs no size. Logged in its resolved form so a test
+                // asserts against real offsets.
+                offset = max(0, totalSize - suffixLength)
+                rangeEnd = totalSize - 1
+                isSuffix = true
+            } else {
+                if let start = Int64(head) { offset = start }
+                if !tail.isEmpty, let end = Int64(tail) { rangeEnd = min(end, totalSize - 1) }
+            }
         }
         lock.lock()
         _requestedRanges.append((offset, rangeEnd))
         lock.unlock()
+
+        var pendingDelay = firstByteDelayUs(isSuffix)
+        while pendingDelay > 0 && !stopped {
+            let slice = min(pendingDelay, 100_000)   // usleep is only defined below one second
+            usleep(slice)
+            pendingDelay -= slice
+        }
 
         let last = rangeEnd ?? (totalSize - 1)
         let remaining = last - offset + 1

@@ -200,8 +200,15 @@ public struct LoadOptions: Sendable, Equatable {
     /// readyToPlay but never builds a video track for a master that advertises one. That signature means
     /// the master delivers HEVC in MPEG-TS segments, which AVFoundation's HLS demuxer does not support
     /// (the HLS Authoring Spec sanctions HEVC only in fMP4); the ingest path remuxes TS to fMP4 and plays
-    /// the same stream. Live-only (VOD remote HLS is the AE#154 reroute target). `httpHeaders` ride along
-    /// onto the ingest fetches. Default `true` (AetherEngine#168).
+    /// the same stream. Live-only; finite HEVC-in-MPEG-TS VOD is classified before the native mount and
+    /// uses the seekable #268 ingest instead. `httpHeaders` ride along onto the ingest fetches. Default
+    /// `true` (AetherEngine#168).
+    ///
+    /// AE#293: the same verdict is also read off the source while the mount runs (the playlist plus the
+    /// head of one segment), so the reroute no longer waits out the watchdog grace and a media playlist
+    /// URL with no master to judge is covered as well. That read is gated on the master advertising a
+    /// codec sanctioned in fMP4 only, so an H.264 channel never spends the requests; this flag disables
+    /// it along with the watchdog.
     public var nativeRemoteHLSIngestFallback: Bool
 
     /// Emit raw ASS event lines (`ReadOrder,Layer,Style,...,Text` including override tags) instead of plain-text extraction. Opt-in for hosts that render ASS styling themselves; pair with `TrackInfo.assHeader`. Only affects ASS / SSA codecs. Default `false` (AetherEngine#30).
@@ -267,7 +274,7 @@ public struct LoadOptions: Sendable, Equatable {
     /// covers a whole feature film, so a host's "buffer without limit" option can pass `Int.max`).
     /// Beyond the historical 150 the real bound is bytes, not segments: the prefetch runs until it
     /// fills the session retention budget (a quarter of the tmp volume's free space, see
-    /// `HLSVideoEngine.vodRetentionBudgetBytes`) and then tracks the playhead, so a large window
+    /// `HLSVideoEngine.sessionRetentionBudgetBytes`) and then tracks the playhead, so a large window
     /// buffers as much of the source as safely fits rather than a fixed count (#207). nil keeps the
     /// historical default of 10 (~ 40 s). Ignored for `nativeRemoteHLS`, where AVPlayer talks to the
     /// remote server directly.
@@ -674,8 +681,11 @@ public struct SubtitleTextRun: Sendable, Equatable {
 public struct SubtitleTextPlacement: Sendable, Equatable {
     /// ASS numpad alignment from `\an`: 1 bottom-left through 9 top-right, 5 centred.
     public let alignment: Int?
-    /// Anchor from `\pos`, normalized to [0, 1] against the source video frame the same way
-    /// `SubtitleImage.position` is, with y measured from the top.
+    /// Anchor from `\pos`, normalized against the script's declared play resolution the same way
+    /// `SubtitleImage.position` is, with y measured from the top. Usually in [0, 1], but not
+    /// guaranteed: a script may anchor outside the frame on purpose, so a host that cannot draw
+    /// off-picture should decide for itself what to do with such a cue rather than assume the
+    /// range (#261).
     public let position: CGPoint?
 
     public init(alignment: Int?, position: CGPoint?) {

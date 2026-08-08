@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 6.0.1 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 6.7.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
 
 import PackageDescription
 
@@ -40,7 +40,11 @@ let package = Package(
         // libdovi (Dolby Vision RPU parser/converter). Resolved over Git like
         // FFmpegBuild so consumers (and Xcode Cloud) build without a sibling
         // LibDovi checkout; the prebuilt xcframework needs no Rust at build time.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", from: "2.0.0"),  // 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
+        // Pinned to the minor for the same reason as FFmpegBuild above, with a
+        // worked example: 1.1.0 shipped a tvOS floor raise as a minor, SwiftPM
+        // floated every `from: "1.0.x"` consumer onto it and then failed on the
+        // floor instead of backing off, so all of 5.x stopped resolving.
+        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.0.0")),  // 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
     ],
     targets: [
         .target(

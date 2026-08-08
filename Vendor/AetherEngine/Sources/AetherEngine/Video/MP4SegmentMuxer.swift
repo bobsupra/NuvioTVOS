@@ -91,7 +91,7 @@ final class MP4SegmentMuxer {
         case failed
     }
 
-    enum MuxerError: Error, CustomStringConvertible {
+    enum MuxerError: Error, CustomStringConvertible, LocalizedError {
         case allocFailed(code: Int32)
         case streamCreationFailed
         case copyParametersFailed(code: Int32)
@@ -109,6 +109,8 @@ final class MP4SegmentMuxer {
             case .openStagingFileFailed(let e): return "MP4SegmentMuxer: open() staging file failed errno=\(e)"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     // MARK: - State
@@ -442,10 +444,20 @@ final class MP4SegmentMuxer {
 
     // MARK: - Pump-side API
 
+    /// Timestamps exactly as handed to the muxer, in muxer time base (#260). Returned rather than read back
+    /// off the packet, because `av_interleaved_write_frame` takes ownership: "The returned packet will be
+    /// blank (as if returned from av_packet_alloc()), even on error", so afterwards `pts`/`dts` are NOPTS.
+    /// `pts` is what lands in the segment and therefore what `AVPlayerItem`'s timebase reads.
+    struct WrittenTimestamps {
+        let pts: Int64
+        let dts: Int64
+        static let none = WrittenTimestamps(pts: Int64.min, dts: Int64.min)
+    }
+
     /// Write one packet via av_interleaved_write_frame (caller must rescale pts/dts to muxerVideoTimeBase / muxerAudioTimeBase).
     @discardableResult
-    func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> Int32 {
-        guard let ctx = formatContext else { return -1 }
+    func writePacket(_ packet: UnsafeMutablePointer<AVPacket>) -> (rc: Int32, written: WrittenTimestamps) {
+        guard let ctx = formatContext else { return (-1, .none) }
         let clean = timestampSanitizer.sanitize(
             streamIndex: packet.pointee.stream_index,
             pts: packet.pointee.pts,
@@ -504,7 +516,7 @@ final class MP4SegmentMuxer {
             }
         }
 
-        return rc
+        return (rc, WrittenTimestamps(pts: clean.pts, dts: clean.dts))
     }
 
     /// Emit a moof+mdat for everything buffered into the CURRENT staging file, without rotating the fd or

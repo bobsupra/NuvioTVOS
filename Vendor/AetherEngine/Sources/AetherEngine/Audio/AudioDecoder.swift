@@ -406,11 +406,24 @@ final class AudioDecoder: @unchecked Sendable {
     }
 }
 
-enum AudioDecoderError: Error {
+enum AudioDecoderError: Error, CustomStringConvertible, LocalizedError {
     case noCodecParameters
     case unsupportedCodec
     case contextAllocationFailed
     case parameterCopyFailed
     case openFailed
     case formatDescriptionFailed
+
+    var description: String {
+        switch self {
+        case .noCodecParameters: "AudioDecoder: audio stream has no codec parameters"
+        case .unsupportedCodec: "AudioDecoder: no decoder for the audio codec"
+        case .contextAllocationFailed: "AudioDecoder: avcodec_alloc_context3 failed"
+        case .parameterCopyFailed: "AudioDecoder: avcodec_parameters_to_context failed"
+        case .openFailed: "AudioDecoder: decoder open failed"
+        case .formatDescriptionFailed: "AudioDecoder: could not build the output format description"
+        }
+    }
+
+    var errorDescription: String? { description }
 }

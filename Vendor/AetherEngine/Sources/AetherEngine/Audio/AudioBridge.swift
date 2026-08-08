@@ -36,7 +36,7 @@ final class AudioBridge: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum AudioBridgeError: Error, CustomStringConvertible {
+    enum AudioBridgeError: Error, CustomStringConvertible, LocalizedError {
         case decoderNotFound(codecID: UInt32)
         case decoderAllocFailed
         case decoderParametersFailed(code: Int32)
@@ -66,6 +66,8 @@ final class AudioBridge: @unchecked Sendable {
             case .sendFrameFailed(let c):        return "AudioBridge: avcodec_send_frame (encoder) returned \(c)"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     // MARK: - State

@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 6.0.1)
+## AetherEngine (pin 6.7.0)
 
-Local pin of [AetherEngine 6.0.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.0.1) with imports rewritten to the namespaced FFmpeg modules below.
+Local pin of [AetherEngine 6.7.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.7.0) with imports rewritten to the namespaced FFmpeg modules below.
 
 ## FFmpegBuild (based on 2.4.0, namespaced)
 

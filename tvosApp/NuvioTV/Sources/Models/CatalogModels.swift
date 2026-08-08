@@ -1867,6 +1867,11 @@ enum ContinueWatchingStore {
             } else if let year = item.meta.year {
                 subtitleParts.append(String(year))
             }
+            if let remaining = Self.remainingTimeText(
+                seconds: max(0, item.duration - item.position)
+            ) {
+                subtitleParts.append("\(remaining) left")
+            }
             return TopShelfEntry(
                 contentId: item.meta.id,
                 contentType: item.meta.type,
@@ -1877,6 +1882,15 @@ enum ContinueWatchingStore {
             )
         }
         TopShelfFeedStore.write(Array(entries))
+    }
+
+    private static func remainingTimeText(seconds: Double) -> String? {
+        guard seconds >= 60 else { return nil }
+        let totalMinutes = Int((seconds / 60).rounded())
+        let hours = totalMinutes / 60
+        let minutes = totalMinutes % 60
+        if hours > 0 { return "\(hours)h \(minutes)m" }
+        return "\(minutes)m"
     }
 
     /// Deletes one profile's resume state, leaving every other profile alone.

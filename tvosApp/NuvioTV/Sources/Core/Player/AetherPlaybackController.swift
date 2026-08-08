@@ -26,6 +26,21 @@ final class AetherSubtitleOverlayState: ObservableObject {
     }
 }
 
+/// Keeps enough translated dialogue ready to absorb provider latency without
+/// continuously translating far beyond the viewer's playback position.
+enum AISubtitleAdaptiveBuffer {
+    static let lowWatermark: TimeInterval = 20
+    static let highWatermark: TimeInterval = 60
+
+    static func shouldRefill(nextUntranslatedStart: Double, sourceTime: Double) -> Bool {
+        max(0, nextUntranslatedStart - sourceTime) <= lowWatermark
+    }
+
+    static func isInsideRefillWindow(cueStart: Double, sourceTime: Double) -> Bool {
+        cueStart <= sourceTime + highWatermark
+    }
+}
+
 /// Keeps translation separate from the renderer's timing state: new text is
 /// swapped in only after Gemini answers, so a slow/network-failed request
 /// continues to show the original cue rather than delaying or hiding it.
@@ -38,11 +53,16 @@ final class AISubtitleTranslationState: ObservableObject {
     /// Delivers the first successful translation and the first later failure
     /// separately, so quota errors are not hidden by an earlier success toast.
     var onFirstOutcome: ((Result<Void, Error>) -> Void)?
+    /// Lets Aether release its one-time cold-start playback hold when the
+    /// active cue finishes translating (or definitively fails).
+    var onCueTranslationResolved: ((Int) -> Void)?
 
     private struct PendingCue: Sendable {
         let id: Int
         let source: String
         let sourceIdentity: String
+        let startTime: Double
+        let endTime: Double
     }
 
     private var batchTask: Task<Void, Never>?
@@ -58,13 +78,16 @@ final class AISubtitleTranslationState: ObservableObject {
     private var lastSourceTime: Double = 0
     private var currentSettings: AISubtitleTranslationSettings?
     private var nextBatchStartAt = Date.distantPast
-    // Translate a short startup/seek window one cue at a time so text becomes
-    // visible as each response arrives. Then resume low-overhead bulk batches.
-    private let playbackPriorityBatchSize = 8
-    private let maximumConcurrentPriorityRequests = 4
+    // Translate the urgent cue alone while one nearby lookahead batch runs in
+    // parallel. This keeps first-text latency low without spending eight
+    // requests on the startup/seek window.
+    private let priorityLookaheadDuration: TimeInterval = 25
+    private let maximumPriorityLookaheadCueCount = 12
+    private let maximumConcurrentPriorityRequests = 1
     private var remainingPriorityCueIDs: [Int] = []
+    private var urgentPriorityCueID: Int?
     private var needsPriorityPrefetch = true
-    private let minimumBatchInterval: TimeInterval = 2
+    private let catchUpBatchInterval: TimeInterval = 0.35
 
     var isConfigured: Bool {
         let settings = AISubtitleTranslationSettings.current()
@@ -106,6 +129,7 @@ final class AISubtitleTranslationState: ObservableObject {
             sessionID = UUID()
             nextBatchStartAt = .distantPast
             remainingPriorityCueIDs = []
+            urgentPriorityCueID = nil
             needsPriorityPrefetch = true
         }
 
@@ -143,6 +167,7 @@ final class AISubtitleTranslationState: ObservableObject {
             currentSettings = settings
             nextBatchStartAt = .distantPast
             remainingPriorityCueIDs = []
+            urgentPriorityCueID = nil
             needsPriorityPrefetch = true
         }
 
@@ -165,6 +190,7 @@ final class AISubtitleTranslationState: ObservableObject {
         currentSettings = nil
         nextBatchStartAt = .distantPast
         remainingPriorityCueIDs = []
+        urgentPriorityCueID = nil
         needsPriorityPrefetch = true
     }
 
@@ -201,33 +227,86 @@ final class AISubtitleTranslationState: ObservableObject {
                 return PendingCue(
                     id: cue.id,
                     source: source,
-                    sourceIdentity: Self.normalizedSource(source)
+                    sourceIdentity: Self.normalizedSource(source),
+                    startTime: cue.startTime,
+                    endTime: cue.endTime
                 )
             }
         guard !candidateCues.isEmpty else { return }
 
         if needsPriorityPrefetch && remainingPriorityCueIDs.isEmpty {
-            remainingPriorityCueIDs = Array(candidateCues.prefix(playbackPriorityBatchSize).map(\.id))
+            var lookaheadCues = candidateCues
+                .filter { $0.startTime <= lastSourceTime + priorityLookaheadDuration }
+            if lookaheadCues.isEmpty, let first = candidateCues.first {
+                lookaheadCues = [first]
+            }
+            lookaheadCues = Array(lookaheadCues.prefix(maximumPriorityLookaheadCueCount))
+            remainingPriorityCueIDs = lookaheadCues.map(\.id)
+            urgentPriorityCueID = lookaheadCues.first(where: {
+                $0.startTime <= lastSourceTime && $0.endTime >= lastSourceTime
+            })?.id ?? lookaheadCues.first?.id
             needsPriorityPrefetch = false
         }
         let candidateCueIDs = Set(candidateCues.map(\.id))
         remainingPriorityCueIDs.removeAll { !candidateCueIDs.contains($0) }
+        if let urgentPriorityCueID,
+           !candidateCueIDs.contains(urgentPriorityCueID) {
+            self.urgentPriorityCueID = nil
+        }
         let availableCues = candidateCues.filter { !translatingCueIDs.contains($0.id) }
 
         if !remainingPriorityCueIDs.isEmpty {
-            startPriorityTranslations(from: availableCues, settings: settings)
+            if let urgentPriorityCueID,
+               let urgentCue = availableCues.first(where: { $0.id == urgentPriorityCueID }) {
+                startPriorityTranslations(from: [urgentCue], settings: settings)
+            }
+
+            let lookaheadCues = availableCues.filter {
+                remainingPriorityCueIDs.contains($0.id) && $0.id != urgentPriorityCueID
+            }
+            let lookaheadIDs = Set(
+                AISubtitleBatching.batches(
+                    lookaheadCues.map { .init(id: $0.id, text: $0.source) }
+                )
+                .first?
+                .map(\.id) ?? []
+            )
+            let pendingLookaheadCues = lookaheadCues.filter { lookaheadIDs.contains($0.id) }
+            if !pendingLookaheadCues.isEmpty {
+                startBatchTranslation(pendingLookaheadCues, settings: settings)
+            }
             return
+        }
+
+        guard let nextUntranslatedCue = availableCues.first,
+              AISubtitleAdaptiveBuffer.shouldRefill(
+                nextUntranslatedStart: nextUntranslatedCue.startTime,
+                sourceTime: lastSourceTime
+              ) else { return }
+        let refillCues = availableCues.filter {
+            AISubtitleAdaptiveBuffer.isInsideRefillWindow(
+                cueStart: $0.startTime,
+                sourceTime: lastSourceTime
+            )
         }
         let pendingIDs = Set(
             AISubtitleBatching.batches(
-                availableCues.map { .init(id: $0.id, text: $0.source) }
+                refillCues.map { .init(id: $0.id, text: $0.source) }
             )
             .first?
             .map(\.id) ?? []
         )
-        let pendingCues = availableCues.filter { pendingIDs.contains($0.id) }
+        let pendingCues = refillCues.filter { pendingIDs.contains($0.id) }
         guard !pendingCues.isEmpty else { return }
 
+        startBatchTranslation(pendingCues, settings: settings)
+    }
+
+    private func startBatchTranslation(
+        _ pendingCues: [PendingCue],
+        settings: AISubtitleTranslationSettings
+    ) {
+        guard batchTask == nil, !pendingCues.isEmpty else { return }
         translatingCueIDs.formUnion(pendingCues.map(\.id))
         let activeSession = sessionID
         let profileScope = ProfileSettings.activeProfileScope
@@ -255,6 +334,7 @@ final class AISubtitleTranslationState: ObservableObject {
                     ) { items in
                         try await AISubtitleTranslator.translateBatch(items, settings: settings)
                     }
+                    var cacheEntries: [AISubtitleTranslationCache.PendingTranslation] = []
                     for cue in uncachedCues {
                         guard let text = translated[cue.id] else {
                             throw AISubtitleTranslationError.invalidResponse
@@ -264,15 +344,17 @@ final class AISubtitleTranslationState: ObservableObject {
                             stripHearingImpaired: settings.stripHearingImpaired
                         )
                         translations[cue.id] = cleaned
-                        await AISubtitleTranslationCache.shared.store(
-                            cleaned,
-                            for: cue.source,
-                            targetLanguage: settings.targetLanguage,
-                            model: settings.cacheModelIdentifier,
-                            stripHearingImpaired: settings.stripHearingImpaired,
-                            profileScope: profileScope
+                        cacheEntries.append(
+                            .init(translatedText: cleaned, source: cue.source)
                         )
                     }
+                    await AISubtitleTranslationCache.shared.store(
+                        cacheEntries,
+                        targetLanguage: settings.targetLanguage,
+                        model: settings.cacheModelIdentifier,
+                        stripHearingImpaired: settings.stripHearingImpaired,
+                        profileScope: profileScope
+                    )
                 }
                 guard !Task.isCancelled,
                       let self,
@@ -367,6 +449,7 @@ final class AISubtitleTranslationState: ObservableObject {
     ) {
         priorityTasks[cue.id] = nil
         translatingCueIDs.remove(cue.id)
+        if urgentPriorityCueID == cue.id { urgentPriorityCueID = nil }
         switch outcome {
         case .success:
             if let translated {
@@ -387,6 +470,7 @@ final class AISubtitleTranslationState: ObservableObject {
                 startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
             }
         }
+        onCueTranslationResolved?(cue.id)
     }
 
     private func finishBatch(
@@ -396,6 +480,8 @@ final class AISubtitleTranslationState: ObservableObject {
     ) {
         batchTask = nil
         translatingCueIDs.subtract(cues.map(\.id))
+        let completedIDs = Set(cues.map(\.id))
+        remainingPriorityCueIDs.removeAll { completedIDs.contains($0) }
         switch outcome {
         case .success:
             translatedTextByCueID.merge(translations) { _, replacement in replacement }
@@ -404,7 +490,15 @@ final class AISubtitleTranslationState: ObservableObject {
                     translatedTextBySource[cue.sourceIdentity] = translated
                 }
             }
-            nextBatchStartAt = Date().addingTimeInterval(minimumBatchInterval)
+            if let nextStart = nextUntranslatedCueStart(settings: currentSettings),
+               AISubtitleAdaptiveBuffer.shouldRefill(
+                nextUntranslatedStart: nextStart,
+                sourceTime: lastSourceTime
+               ) {
+                nextBatchStartAt = Date().addingTimeInterval(catchUpBatchInterval)
+            } else {
+                nextBatchStartAt = .distantPast
+            }
             report(outcome)
             startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
         case .failure(let error):
@@ -417,6 +511,29 @@ final class AISubtitleTranslationState: ObservableObject {
                 startNextBatchIfNeeded(settings: currentSettings ?? AISubtitleTranslationSettings.current())
             }
         }
+        cues.forEach { onCueTranslationResolved?($0.id) }
+    }
+
+    private func nextUntranslatedCueStart(
+        settings: AISubtitleTranslationSettings?
+    ) -> Double? {
+        guard let settings else { return nil }
+        return lastCues.lazy
+            .filter { cue in
+                cue.endTime >= self.lastSourceTime &&
+                    !self.failedCueIDs.contains(cue.id) &&
+                    cue.text != nil &&
+                    self.translation(for: cue, settings: settings) == nil
+            }
+            .compactMap { cue -> Double? in
+                guard let text = cue.text else { return nil }
+                let source = Self.cleaned(
+                    text,
+                    stripHearingImpaired: settings.stripHearingImpaired
+                )
+                return source.isEmpty ? nil : cue.startTime
+            }
+            .min()
     }
 
     private func scheduleNextBatch(at date: Date, settings: AISubtitleTranslationSettings) {
@@ -454,6 +571,7 @@ final class AISubtitleTranslationState: ObservableObject {
         sessionID = UUID()
         nextBatchStartAt = .distantPast
         remainingPriorityCueIDs = []
+        urgentPriorityCueID = nil
         needsPriorityPrefetch = true
         if !translatedTextByCueID.isEmpty { translatedTextByCueID = [:] }
         if !translatedTextBySource.isEmpty { translatedTextBySource = [:] }
@@ -474,6 +592,7 @@ final class AISubtitleTranslationState: ObservableObject {
         cancelTranslationWork()
         translatingCueIDs = []
         remainingPriorityCueIDs = []
+        urgentPriorityCueID = nil
         nextBatchStartAt = .distantPast
     }
 
@@ -747,7 +866,11 @@ enum AISubtitleRetryPolicy {
     static let maximumAttempts = 5
 
     /// `completedAttempts` includes the failed request that just completed.
-    static func delay(for error: Error, completedAttempts: Int) -> TimeInterval? {
+    static func delay(
+        for error: Error,
+        completedAttempts: Int,
+        jitterMultiplier: Double? = nil
+    ) -> TimeInterval? {
         guard completedAttempts < maximumAttempts else { return nil }
         if let error = error as? AISubtitleTranslationError,
            error.isRetryable {
@@ -758,7 +881,9 @@ enum AISubtitleRetryPolicy {
         } else {
             return nil
         }
-        return min(60, pow(2, Double(completedAttempts - 1)) * 4)
+        let baseDelay = min(60, pow(2, Double(completedAttempts - 1)) * 4)
+        let jitter = jitterMultiplier ?? Double.random(in: 0.85...1.15)
+        return min(60, baseDelay * min(1.15, max(0.85, jitter)))
     }
 
     static func retryAfter(from headerValue: String, now: Date = Date()) -> TimeInterval? {
@@ -913,21 +1038,36 @@ enum GeminiSubtitleTranslator {
 
     private struct GenerationConfig: Encodable {
         let temperature: Double
+        let topP: Double?
+        let topK: Int?
         let maxOutputTokens: Int
         let responseMimeType: String?
+        let thinkingConfig: ThinkingConfig
 
         private enum CodingKeys: String, CodingKey {
             case temperature
+            case topP
+            case topK
             case maxOutputTokens
             case responseMimeType
+            case thinkingConfig
         }
 
         func encode(to encoder: Encoder) throws {
             var container = encoder.container(keyedBy: CodingKeys.self)
             try container.encode(temperature, forKey: .temperature)
+            try container.encodeIfPresent(topP, forKey: .topP)
+            try container.encodeIfPresent(topK, forKey: .topK)
             try container.encode(maxOutputTokens, forKey: .maxOutputTokens)
             try container.encodeIfPresent(responseMimeType, forKey: .responseMimeType)
+            try container.encode(thinkingConfig, forKey: .thinkingConfig)
         }
+    }
+
+    private struct ThinkingConfig: Encodable {
+        /// Gemini 3's minimum level is the closest supported equivalent to
+        /// disabling reasoning; its API does not permit turning it fully off.
+        let thinkingLevel: String
     }
 
     private struct ResponseBody: Decodable {
@@ -944,6 +1084,7 @@ enum GeminiSubtitleTranslator {
 
     private struct ResponsePart: Decodable {
         let text: String?
+        let thought: Bool?
     }
 
     private struct ErrorBody: Decodable {
@@ -980,8 +1121,8 @@ enum GeminiSubtitleTranslator {
         """
         let body = RequestBody(
             contents: [Content(parts: [Part(text: prompt)])],
-            generationConfig: GenerationConfig(
-                temperature: 0.1,
+            generationConfig: generationConfig(
+                model: model,
                 maxOutputTokens: 256,
                 responseMimeType: nil
             )
@@ -1019,10 +1160,12 @@ enum GeminiSubtitleTranslator {
         """
         let body = RequestBody(
             contents: [Content(parts: [Part(text: prompt)])],
-            generationConfig: GenerationConfig(
-                temperature: 0.1,
+            generationConfig: generationConfig(
+                model: model,
                 maxOutputTokens: AISubtitleBatching.outputTokenLimit(for: items),
-                responseMimeType: "application/json"
+                // Gemma 4 supports generateContent, but it is not listed for
+                // Gemini structured output. Its prompt still requests JSON.
+                responseMimeType: isGemma4(model) ? nil : "application/json"
             )
         )
         let response = try await generate(
@@ -1032,7 +1175,10 @@ enum GeminiSubtitleTranslator {
             timeout: 30,
             session: session
         )
-        guard let outputs = try? JSONDecoder().decode([BatchOutput].self, from: Data(response.utf8)) else {
+        guard let outputs = try? JSONDecoder().decode(
+            [BatchOutput].self,
+            from: Data(stripMarkdownCodeFence(from: response).utf8)
+        ) else {
             throw AISubtitleTranslationError.invalidResponse
         }
         let expectedIDs = Set(items.map(\.id))
@@ -1082,11 +1228,52 @@ enum GeminiSubtitleTranslator {
             )
         }
         let decoded = try JSONDecoder().decode(ResponseBody.self, from: data)
-        return decoded.candidates?
+        let text = decoded.candidates?
             .flatMap { $0.content?.parts ?? [] }
+            .filter { $0.thought != true }
             .compactMap(\.text)
             .joined()
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return stripGemmaThoughtChannel(from: text, model: model)
+    }
+
+    private static func generationConfig(
+        model: String,
+        maxOutputTokens: Int,
+        responseMimeType: String?
+    ) -> GenerationConfig {
+        let gemma4 = isGemma4(model)
+        return GenerationConfig(
+            temperature: gemma4 ? 1.0 : 0.1,
+            topP: gemma4 ? 0.95 : nil,
+            topK: gemma4 ? 64 : nil,
+            maxOutputTokens: maxOutputTokens,
+            responseMimeType: responseMimeType,
+            thinkingConfig: ThinkingConfig(thinkingLevel: "minimal")
+        )
+    }
+
+    private static func isGemma4(_ model: String) -> Bool {
+        model.lowercased().hasPrefix("gemma-4-")
+    }
+
+    private static func stripGemmaThoughtChannel(from text: String, model: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard isGemma4(model),
+              let marker = trimmed.range(of: "<channel|>", options: .backwards) else {
+            return trimmed
+        }
+        return String(trimmed[marker.upperBound...])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    private static func stripMarkdownCodeFence(from text: String) -> String {
+        let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.hasPrefix("```") else { return trimmed }
+        let withoutOpeningFence = trimmed.drop { $0 != "\n" }.dropFirst()
+        return String(withoutOpeningFence)
+            .replacingOccurrences(of: "```", with: "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func retryAfter(from response: HTTPURLResponse) -> TimeInterval? {
@@ -1242,7 +1429,7 @@ enum OpenRouterSubtitleTranslator {
             ],
             temperature: 0.1,
             maxTokens: maxTokens,
-            reasoning: disablesReasoning(for: model) ? Reasoning(enabled: false) : nil
+            reasoning: Reasoning(enabled: false)
         )
         var request = URLRequest(url: endpoint)
         request.httpMethod = "POST"
@@ -1270,16 +1457,11 @@ enum OpenRouterSubtitleTranslator {
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
     }
 
-    /// Translation does not benefit from hidden reasoning. Qwen's reasoning
-    /// tokens are billed as output, so those requests explicitly disable it.
-    /// The dynamic completion cap also prevents a short batch from consuming
-    /// the former blanket 4,096-token allowance.
+    /// Translation does not benefit from hidden reasoning. The dynamic
+    /// completion cap also prevents a short batch from consuming the former
+    /// blanket 4,096-token allowance.
     static func batchOutputTokenLimit(for items: [AISubtitleTranslationItem]) -> Int {
         AISubtitleBatching.outputTokenLimit(for: items)
-    }
-
-    static func disablesReasoning(for model: String) -> Bool {
-        model.lowercased().contains("qwen3.7-flash")
     }
 
     private static func stripMarkdownCodeFence(from text: String) -> String {
@@ -1359,6 +1541,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var didReportTerminalError = false
     private var sourceProbe: SourceProbe?
     private var subtitleDelaySeconds: Double = 0
+    private var aiSubtitleStartupHoldCueID: Int?
+    private var aiSubtitleStartupHoldTimeoutTask: Task<Void, Never>?
+    private var didAttemptAISubtitleStartupHold = false
+    private let aiSubtitleStartupHoldTimeout: TimeInterval = 6
 
     // MARK: PlaybackEngineControlling surface
 
@@ -1422,6 +1608,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
         }
         super.init(nibName: nil, bundle: nil)
+        subtitleTranslationState.onCueTranslationResolved = { [weak self] cueID in
+            self?.releaseAISubtitleStartupHold(for: cueID)
+        }
     }
 
     @available(*, unavailable)
@@ -1482,6 +1671,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                     cues: self.subtitleCues,
                     at: sourceTime - self.subtitleDelaySeconds
                 )
+                self.beginAISubtitleStartupHoldIfNeeded(
+                    cues: self.subtitleCues,
+                    sourceTime: sourceTime - self.subtitleDelaySeconds
+                )
             }
             .store(in: &cancellables)
 
@@ -1508,6 +1701,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 self.subtitleTranslationState.update(
                     cues: cues,
                     at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+                )
+                self.beginAISubtitleStartupHoldIfNeeded(
+                    cues: cues,
+                    sourceTime: self.engine.clock.sourceTime - self.subtitleDelaySeconds
                 )
             }
             .store(in: &cancellables)
@@ -1591,6 +1788,52 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
     }
 
+    private func beginAISubtitleStartupHoldIfNeeded(
+        cues: [SubtitleCue],
+        sourceTime: Double
+    ) {
+        guard !didAttemptAISubtitleStartupHold,
+              aiSubtitleStartupHoldCueID == nil,
+              isPlayerPlaying,
+              subtitleTranslationState.isActive,
+              let activeCue = cues.first(where: {
+                  $0.startTime <= sourceTime &&
+                      $0.endTime >= sourceTime &&
+                      !($0.text?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+              }),
+              subtitleTranslationState.translatedText(for: activeCue) == nil,
+              subtitleTranslationState.isTranslating(cueIDs: [activeCue.id]) else { return }
+
+        didAttemptAISubtitleStartupHold = true
+        aiSubtitleStartupHoldCueID = activeCue.id
+        engine.pause()
+
+        aiSubtitleStartupHoldTimeoutTask?.cancel()
+        aiSubtitleStartupHoldTimeoutTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(
+                nanoseconds: UInt64((self?.aiSubtitleStartupHoldTimeout ?? 0) * 1_000_000_000)
+            )
+            guard !Task.isCancelled else { return }
+            self?.releaseAISubtitleStartupHold()
+        }
+    }
+
+    private func releaseAISubtitleStartupHold(for cueID: Int? = nil, resume: Bool = true) {
+        guard let heldCueID = aiSubtitleStartupHoldCueID,
+              cueID == nil || cueID == heldCueID else { return }
+        aiSubtitleStartupHoldTimeoutTask?.cancel()
+        aiSubtitleStartupHoldTimeoutTask = nil
+        aiSubtitleStartupHoldCueID = nil
+        if resume { engine.play() }
+    }
+
+    private func resetAISubtitleStartupHold() {
+        aiSubtitleStartupHoldTimeoutTask?.cancel()
+        aiSubtitleStartupHoldTimeoutTask = nil
+        aiSubtitleStartupHoldCueID = nil
+        didAttemptAISubtitleStartupHold = false
+    }
+
     static func displayVideoSize(
         codedWidth: Int32,
         codedHeight: Int32,
@@ -1654,6 +1897,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     // MARK: Load
 
     func load(_ request: PlaybackLoadRequest, generation: UInt64) {
+        resetAISubtitleStartupHold()
         loadGeneration = generation
         subtitleDelaySeconds = request.subtitleDelaySeconds
         didReportTerminalError = false
@@ -1848,6 +2092,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func destroyPlayer() {
+        resetAISubtitleStartupHold()
         loadGeneration += 1
         engine.stop(resetDisplayCriteria: true)
         subtitleCues = []

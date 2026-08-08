@@ -15,7 +15,9 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
             item.title = entry.title
             item.imageShape = .poster
 
-            if let image = entry.imageURL, let url = URL(string: image) {
+            let imageURL = TopShelfFeedStore.artworkURL(for: entry)
+                ?? entry.imageURL.flatMap(URL.init(string:))
+            if let url = imageURL {
                 item.setImageURL(url, for: .screenScale1x)
                 item.setImageURL(url, for: .screenScale2x)
             }

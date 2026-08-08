@@ -155,16 +155,16 @@ struct RetentionBudgetSizingTests {
 
     @Test("Budget clamps to a quarter of the available capacity on tight disks")
     func clampsToQuarterOfFreeDisk() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: 4 << 30) == 1 << 30)
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: 4 << 30) == 1 << 30)
     }
 
     @Test("Budget caps at 2 GiB on roomy disks")
     func capsAtDefault() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: 100 << 30) == 2 << 30)
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: 100 << 30) == 2 << 30)
     }
 
     @Test("Unknown capacity falls back to the cap")
     func unknownCapacityFallsBack() {
-        #expect(HLSVideoEngine.vodRetentionBudgetBytes(volumeAvailableBytes: nil) == 2 << 30)
+        #expect(HLSVideoEngine.sessionRetentionBudgetBytes(volumeAvailableBytes: nil) == 2 << 30)
     }
 }

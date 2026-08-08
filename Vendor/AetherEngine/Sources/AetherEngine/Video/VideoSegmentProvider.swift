@@ -30,11 +30,21 @@ struct LiveWindowSizing {
 
     /// Number of segments the playlist keeps visible (and the cache keeps
     /// resident). Clamped up to `minSafeSegments`.
-    var windowSegmentCount: Int {
+    ///
+    /// `targetSegmentDurationSeconds` is the CUT TARGET, a lower bound on the real GOP-quantized
+    /// segment duration (fastZap: 0.5 s target vs ~2 s GOPs). Dividing the window seconds by it
+    /// alone inflated the window 4x (120 segments ≈ 240 s), pinning MEDIA-SEQUENCE at 0 for minutes
+    /// and deferring evictBelow (the "sliding" window never slid). Callers that know the observed
+    /// cadence (mean EXTINF of recent finalized segments) pass it so the window really holds
+    /// `effectiveWindowSeconds` of content.
+    func windowSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
         let effective = dvrWindowSeconds ?? Self.liveOnlyFloorSeconds
-        let raw = Int(ceil(effective / max(0.5, targetSegmentDurationSeconds)))
+        let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
+        let raw = Int(ceil(effective / divisor))
         return max(Self.minSafeSegments, raw)
     }
+
+    var windowSegmentCount: Int { windowSegmentCount(observedSegmentDurationSeconds: nil) }
 }
 
 // MARK: - Live-edge holdback policy
@@ -251,6 +261,13 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var _liveFirstVisible: Int = 0
     /// EXT-X-DISCONTINUITY-SEQUENCE: incremented for each discontinuous segment that slides out.
     private var _discontinuitySequence: Int = 0
+    /// Rolling EXTINF of the most recent finalized live segments; feeds the observed-cadence
+    /// divisor of `LiveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds:)`.
+    /// Guarded by stateLock.
+    private var _liveRecentDurations: [Double] = []
+    private static let liveRecentDurationSampleCount = 20
+    /// One-shot latch for `noteWindowSlideRelativeToConsumer`. Guarded by stateLock.
+    private var _liveConsumerOutsideWindowLatched = false
 
     init(
         cache: SegmentCache,
@@ -341,6 +358,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             durationSeconds: durationSeconds,
             discontinuous: discontinuous
         ))
+        _liveRecentDurations.append(durationSeconds)
+        if _liveRecentDurations.count > Self.liveRecentDurationSampleCount {
+            _liveRecentDurations.removeFirst(_liveRecentDurations.count - Self.liveRecentDurationSampleCount)
+        }
         stateLock.unlock()
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
@@ -357,7 +378,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         refreshCounter += 1
         if isLive {
             let total = segments.count
-            let window = liveWindowSizing.windowSegmentCount
+            let observedMean = _liveRecentDurations.isEmpty
+                ? nil : _liveRecentDurations.reduce(0, +) / Double(_liveRecentDurations.count)
+            let window = liveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds: observedMean)
             // highWater is the last produced index (total - 1). Keep the
             // last `window` segments visible: firstVisible = highWater -
             // window + 1 = total - window. Until at least `window`
@@ -374,13 +397,41 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 _liveFirstVisible = newFirst
                 let cutoff = newFirst
                 let cacheRef = cache
-                DispatchQueue.global(qos: .utility).async {
+                DispatchQueue.global(qos: .utility).async { [weak self] in
+                    // Read the consumer's fetch point BEFORE evicting, and off stateLock (the cache has
+                    // its own lock; nesting the two here would invert the ordering evictBelow's async
+                    // hop exists to avoid).
+                    let consumerTarget = cacheRef.targetIndex
                     cacheRef.evictBelow(cutoff)
+                    self?.noteWindowSlideRelativeToConsumer(cutoff: cutoff, consumerTarget: consumerTarget)
                 }
             }
             return (total, _liveFirstVisible, refreshCounter, false, _discontinuitySequence)
         }
         return (segments.count, 0, refreshCounter, false, 0)
+    }
+
+    /// The sliding window overtaking the consumer's fetch point is the failure mode the removed advance
+    /// park used to make impossible (it capped the producer 10 segments ahead of that point). Live is
+    /// source-paced, so a real-time origin cannot get there; an origin that hands over more than one
+    /// window of backlog faster than the consumer drains it can, and the consumer then asks for a
+    /// segment `evictBelow` has already deleted. That surfaces downstream as a cache miss, a jump, or a
+    /// silent rejoin, none of which name this cause, so name it here. Latched: once out, every
+    /// subsequent build would repeat it.
+    private func noteWindowSlideRelativeToConsumer(cutoff: Int, consumerTarget: Int) {
+        guard consumerTarget >= 0 else { return }
+        stateLock.lock()
+        let outside = consumerTarget < cutoff
+        let shouldLog = outside && !_liveConsumerOutsideWindowLatched
+        _liveConsumerOutsideWindowLatched = outside
+        stateLock.unlock()
+        guard shouldLog else { return }
+        EngineLog.emit(
+            "[HLSVideoEngine] live window slid past the consumer: firstVisible=\(cutoff) "
+            + "consumerTarget=\(consumerTarget) (producer is running more than one window ahead; "
+            + "expect a cache miss or a live-edge jump)",
+            category: .session
+        )
     }
 
     var firstVisibleSegmentIndex: Int {
@@ -817,6 +868,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         Self.resolveLiveBlockingReload(halted: liveProductionHalted,
                                        override: blockingReloadOverride,
                                        policy: liveCadencePolicy)
+    }
+
+    /// Blocking-reload hold bound: 3 x sealed TARGETDURATION (= the advertised HOLD-BACK depth).
+    /// The old hardcoded 18 s was 9 x TD under fastZap. A hold that outlives AVPlayer's ~4 s
+    /// forward buffer guarantees the stall it exists to prevent. The seal is always resolved before
+    /// the first playlist that can advertise CAN-BLOCK-RELOAD is served (every serve path runs
+    /// waitForFirstLiveSegment first), so the TD=6 fallback (3 x 6 = legacy 18 s) only covers tests.
+    var liveBlockingReloadHoldSeconds: TimeInterval {
+        stateLock.lock()
+        let sealed = liveTargetDurationSeal.value
+        stateLock.unlock()
+        return Double(3 * (sealed ?? 6))
     }
 
     var liveProductionHalted: Bool {

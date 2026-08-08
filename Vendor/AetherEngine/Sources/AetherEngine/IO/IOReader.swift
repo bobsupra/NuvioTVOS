@@ -15,11 +15,42 @@ public protocol IOReader: AnyObject, Sendable {
 
     /// Return an independent reader with its own cursor over the same source for concurrent access (side demuxer, scrub previews). Return nil for one-shot streams; the engine skips that feature. The returned reader is owned and closed by the engine.
     func makeIndependentReader() -> IOReader?
+
+    /// Whether the engine should inspect this custom byte source for an ISO/UDF disc image before
+    /// opening it as an ordinary media container. Keep the default for raw disc images. Remote
+    /// readers that already know they represent a regular media file can return `false` to avoid
+    /// the sparse signature reads performed by disc recognition. Independent readers should
+    /// preserve the same value.
+    var discImageProbeEnabled: Bool { get }
+}
+
+/// Internal seam for finite segmented sources whose natural seek axis is time,
+/// not a synthetic concatenated byte offset.
+protocol TimeSeekableIOReader: IOReader {
+    /// Total media duration in seconds, from the source's own manifest.
+    var mediaDuration: Double { get }
+
+    /// Reposition to `seconds` of ELAPSED MEDIA TIME (0 = first byte the reader would deliver from a
+    /// fresh open), never an absolute container PTS: the caller strips the source's PTS origin first
+    /// (`Demuxer.repositionTimeSeekable`). Landing at or before the requested time is the contract;
+    /// the demuxer's packet gate drops what precedes the exact target.
+    func seek(to seconds: Double) -> Bool
+
+    /// Elapsed media time in front of each of the source's own segments, ascending, starting at 0.
+    /// These are the source's declared random-access points: the segment plan is built on them so
+    /// every advertised boundary is one the producer's keyframe gate can actually open (AE#268).
+    /// Empty when the reader has no segment structure to report.
+    var segmentStartTimesSeconds: [Double] { get }
+}
+
+extension TimeSeekableIOReader {
+    var segmentStartTimesSeconds: [Double] { [] }
 }
 
 public extension IOReader {
     func cancel() {}
     func makeIndependentReader() -> IOReader? { nil }
+    var discImageProbeEnabled: Bool { true }
 }
 
 /// The source AetherEngine loads media from.

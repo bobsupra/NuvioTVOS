@@ -15,6 +15,7 @@ struct PlayerView: View {
     var episodes: [NuvioVideo] = []
     var currentEpisode: NuvioVideo? = nil
     var autoPlayNextEnabled: Bool = true
+    var autoPlayNextCountdownSeconds: Int = 10
     /// Resolves a next episode into a ready-to-play stream (add-on fetch + smart
     /// selection), supplied by the app layer. Nil disables auto-advance.
     var resolveNextStream: ((NuvioVideo) async -> PreparedNextStream?)? = nil
@@ -266,9 +267,9 @@ struct PlayerView: View {
                 .zIndex(3)
             }
 
-            // Next-episode prompt, shown near the end. It auto-hides like the skip
-            // card, returns with the transport controls, and advances only when
-            // the user selects it.
+            // Next-episode prompt, shown near the end. With Auto-Play enabled,
+            // its countdown advances to the following episode; otherwise the
+            // Play button remains available for a manual advance.
             if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
                 Button(action: { viewModel.playNextEpisode() }) {
                     NextEpisodeOverlay(
@@ -375,6 +376,7 @@ struct PlayerView: View {
                     episodes: episodes,
                     current: currentEpisode,
                     autoPlayEnabled: autoPlayNextEnabled,
+                    autoPlayCountdownSeconds: autoPlayNextCountdownSeconds,
                     resolver: resolveNextStream
                 )
             }

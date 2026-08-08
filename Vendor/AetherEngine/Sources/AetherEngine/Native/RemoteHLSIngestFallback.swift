@@ -19,6 +19,19 @@ enum RemoteHLSIngestFallback {
         case fire
     }
 
+    /// #293: what the concurrent playlist/PMT probe (`HLSCarriageProbe`) has established about the
+    /// source's carriage while the native mount runs. `transportStreamHEVC` is the verdict the grace
+    /// exists to infer, so it ends the wait; everything else leaves the timing loop as it was, because
+    /// only positive evidence may reroute.
+    enum CarriageEvidence: Equatable {
+        /// No probe result yet, or no probe ran for this session.
+        case pending
+        /// The first segment's PMT declares HEVC in MPEG-TS: AVPlayer will never build a video track.
+        case transportStreamHEVC
+        /// Carriage AVPlayer builds itself (fMP4, or a PMT without HEVC).
+        case nativeCapable
+    }
+
     /// Per-tick state machine, armed once the item reaches readyToPlay (a dead origin never gets there,
     /// so it can never misfire on a stream that served nothing at all). Fires only on positive evidence:
     /// the master advertised a video rendition and AVPlayer still built no video track after the grace.
@@ -35,9 +48,24 @@ enum RemoteHLSIngestFallback {
             self.graceTicks = graceTicks
         }
 
-        mutating func tick(videoTrackCount: Int, variantsAdvertiseVideo: Bool?) -> Verdict {
+        /// Grace still ahead of the watchdog, i.e. the wait a probe verdict removes when it ends the
+        /// window early (#274: a latency fix that does not name the interval it removed leaves the
+        /// reporter measuring the sum).
+        func remainingGraceSeconds(tickInterval: Double) -> Double {
+            Double(max(0, graceTicks - ticksObserved)) * tickInterval
+        }
+
+        mutating func tick(
+            videoTrackCount: Int,
+            variantsAdvertiseVideo: Bool?,
+            carriageEvidence: CarriageEvidence = .pending
+        ) -> Verdict {
             if videoTrackCount > 0 { return .disarm }
             if variantsAdvertiseVideo == false { return .disarm }
+            // #293: the probe read the same verdict off the source itself, so the remaining grace would
+            // only buy black. Master evidence is no longer required: a PMT that declares video outranks
+            // an absent variant parse, which is what leaves a direct media playlist unjudgeable today.
+            if carriageEvidence == .transportStreamHEVC { return .fire }
             ticksObserved += 1
             guard ticksObserved >= graceTicks else { return .keepWaiting }
             return variantsAdvertiseVideo == true ? .fire : .disarm
@@ -52,11 +80,45 @@ enum RemoteHLSIngestFallback {
         return variantHasVideoAttributes.contains(true)
     }
 
-    /// The watchdog runs only for live bypass sessions with the fallback enabled: VOD remote HLS is the
-    /// AE#154 reroute target (ingesting it back would ping-pong), and hosts can opt out via
-    /// `LoadOptions.nativeRemoteHLSIngestFallback`.
+    /// The watchdog runs only for live bypass sessions with the fallback enabled. Finite
+    /// HEVC-in-MPEG-TS VOD uses the content-gated, seekable #268 ingest before a native mount, and hosts
+    /// can opt out of this live recovery via `LoadOptions.nativeRemoteHLSIngestFallback`.
     static func shouldArm(isLive: Bool, fallbackEnabled: Bool) -> Bool {
         isLive && fallbackEnabled
+    }
+
+    /// Video sample types the HLS Authoring Spec sanctions in fMP4 carriage only. An origin that ships
+    /// one of them in MPEG-TS is the #168 case: readyToPlay with audio alone and no video track ever.
+    static let fragmentedMP4OnlyVideoCodecs: Set<FourCharCode> = [
+        0x68766331, // 'hvc1'
+        0x68657631, // 'hev1'
+        0x64766831, // 'dvh1'
+        0x64766865, // 'dvhe'
+        0x61763031, // 'av01'
+    ]
+
+    /// #293: whether the carriage probe may spend origin connects on this session. AVFoundation's own
+    /// master parse is free (it is already fetched), so a case it settles never reaches the network:
+    /// an all-audio master has nothing to present, and an H.264 master is carriage AVPlayer builds
+    /// itself. Probing is reserved for the two shapes AVFoundation cannot settle, an advertised codec
+    /// that is fMP4-only (or unstated), and a source with no master evidence at all (a direct media
+    /// playlist, which the watchdog can never judge). Per-token IPTV origins cap concurrent
+    /// connections, which is why this is a gate rather than an unconditional probe.
+    static func shouldProbeCarriage(
+        advertisesVideo: Bool?, advertisedVideoCodecs: [FourCharCode]
+    ) -> Bool {
+        if advertisesVideo == false { return false }
+        guard advertisesVideo == true else { return true }
+        guard !advertisedVideoCodecs.isEmpty else { return true }
+        return advertisesFragmentedMP4OnlyVideo(advertisedVideoCodecs)
+    }
+
+    /// #296: whether the master's own `CODECS` names a sample type the HLS Authoring Spec sanctions in
+    /// fMP4 alone. Combined with a media playlist that carries no `EXT-X-MAP` (an fMP4 media segment
+    /// requires one), this settles the carriage from the playlists, so the probe spends no segment fetch
+    /// on the shape that produced #293 in the first place.
+    static func advertisesFragmentedMP4OnlyVideo(_ advertisedVideoCodecs: [FourCharCode]) -> Bool {
+        advertisedVideoCodecs.contains { fragmentedMP4OnlyVideoCodecs.contains($0) }
     }
 
     /// #199: a load whose master already fired the carriage verdict (`RerouteVerdictMemory`) routes

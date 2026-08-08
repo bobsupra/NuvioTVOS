@@ -10,7 +10,7 @@ import AetherLibavutil
 /// `avformat_find_stream_info` pass degrades dts reconstruction on Matroska B-frame content.
 public enum PacketTimingProbe {
 
-    public enum ProbeError: Error, CustomStringConvertible {
+    public enum ProbeError: Error, CustomStringConvertible, LocalizedError {
         case unknownProfile(String)
         case noVideoStream
 
@@ -22,6 +22,8 @@ public enum PacketTimingProbe {
                 return "source has no video stream"
             }
         }
+
+        public var errorDescription: String? { description }
     }
 
     public static func run(

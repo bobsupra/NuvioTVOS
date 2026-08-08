@@ -1,3 +1,4 @@
+import CoreMedia
 import Foundation
 import AetherLibavformat
 import AetherLibavcodec
@@ -10,7 +11,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum ProducerError: Error, CustomStringConvertible {
+    enum ProducerError: Error, CustomStringConvertible, LocalizedError {
         case muxerAllocFailed(code: Int32)
         case streamCreationFailed
         case copyParametersFailed(code: Int32)
@@ -24,6 +25,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             case .writeHeaderFailed(let c):    return "HLSSegmentProducer: avformat_write_header failed (\(c))"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     /// Per-stream codec config carried from `HLSVideoEngine` into the muxer setup.
@@ -151,6 +154,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Start PTS (source video TB) for each segment at baseIndex+i; used to detect segment crossings.
     private let segmentBoundaries: [Int64]
+
+    /// Source PTS of plan time 0 (the plan's `firstKeyframePts`). The item axis every consumer sees is
+    /// `sourcePts - planAnchorVideoPts`, so this is what maps an item-axis timestamp back onto a plan
+    /// boundary. Deliberately NOT `videoShiftPts`: the shift additionally carries whatever this
+    /// producer's gate overshot its restart target by (AE#268).
+    private let planAnchorVideoPts: Int64
 
     /// Live mode: cuts at keyframes past targetSegmentDurationSeconds; ignores segmentBoundaries.
     private let isLive: Bool
@@ -457,10 +466,62 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
     private static let backpressureWedgeFastBreakThresholdSeconds = 5
 
-    private let pumpQueue = DispatchQueue(
-        label: "AetherEngine.HLSSegmentProducer.pump",
-        qos: .userInitiated
-    )
+    /// Live disk runaway cap for awaitLiveWindowHeadroom. In healthy play resident count tracks the
+    /// sliding window (~windowSegmentCount plus a few in flight) because every playlist build slides
+    /// evictBelow. It can only approach this cap when the consumer stopped polling entirely (dead
+    /// item), at which point the engine's stall watchdogs reload the item within ~12 s, so a park
+    /// here is diagnostic, never steady state. ~6 min of 2 s GOP segments.
+    private static let liveResidentSegmentCap = 180
+
+    static func qosName(_ c: qos_class_t) -> String {
+        switch c {
+        case QOS_CLASS_USER_INTERACTIVE: return "userInteractive"
+        case QOS_CLASS_USER_INITIATED: return "userInitiated"
+        case QOS_CLASS_DEFAULT: return "default"
+        case QOS_CLASS_UTILITY: return "utility"
+        case QOS_CLASS_BACKGROUND: return "background"
+        default: return "unspecified"
+        }
+    }
+
+    /// AE#286: how much produced-but-unfetched content has to sit ahead of the consumer before the
+    /// pump's work stops being latency-critical. `HLSLocalServer` answers segment requests from a
+    /// `.userInitiated` work queue, and a cache miss parks that thread in `cache.fetch` until this pump
+    /// produces the segment, so a permanently demoted pump is a priority inversion dispatch cannot see.
+    /// Held well below the `forwardWindow` the pump parks at, so the two states cannot flap.
+    private static let pumpRelaxedLeadSeconds = 16.0
+
+    /// `pumpRelaxedLeadSeconds` in this session's segments, floor 2.
+    private var pumpRelaxedLeadSegments: Int {
+        Self.relaxedLeadSegments(targetSegmentDurationSeconds: targetSegmentDurationSeconds)
+    }
+
+    static func relaxedLeadSegments(targetSegmentDurationSeconds: Double) -> Int {
+        max(2, Int((pumpRelaxedLeadSeconds / max(1.0, targetSegmentDurationSeconds)).rounded(.up)))
+    }
+
+    /// Whether the pump may run at the relaxed (efficiency) QoS. Pure so the guards are testable
+    /// without a session: `targetIndex < 0` is a consumer that has not fetched at all,
+    /// `hasStartedRendering == false` is one still filling its startup buffer, and a short lead is a
+    /// consumer sitting on the production head, which is a rebuffer in progress.
+    ///
+    /// `epochHighestStored` is what THIS pump has written since it started, not `cache.highestStoredIndex`.
+    /// The cache's high-water is monotonic across producer epochs, so a pump restarted for a seek reads
+    /// the previous epoch's head, computes a comfortable lead over content it has not produced, and
+    /// demotes itself in the one window where the consumer is provably blocked on it. Measured: a
+    /// restart at idx=127 with the old epoch at 135 demoted 5 ms into the seek landing.
+    static func pumpMayRelax(hasStartedRendering: Bool, targetIndex: Int,
+                             epochHighestStored: Int, relaxedLeadSegments: Int) -> Bool {
+        guard hasStartedRendering, targetIndex >= 0, epochHighestStored >= 0 else { return false }
+        return epochHighestStored - targetIndex >= relaxedLeadSegments
+    }
+
+    /// Pump-thread-only: the QoS class the pump last requested for itself, the segment index the last
+    /// decision was taken at, and the highest segment index THIS pump has written to the cache. No
+    /// lock; only `runPumpLoop` and its callees touch these.
+    private var pumpQoSCurrent: qos_class_t = QOS_CLASS_USER_INITIATED
+    private var pumpQoSLastSeg = Int.min
+    private var pumpEpochHighestStored = Int.min
 
     private let stateLock = NSLock()
     private var pumpStarted = false
@@ -545,8 +606,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Fires once per producer when HDR10+ T.35 SEI prefix (B5 00 3C 00 01 04) first appears in a video packet.
     var onFirstHDR10PlusDetected: (@Sendable () -> Void)?
 
+    /// #260: resolves the host's per-frame time observer at emission rather than holding it, so a host that
+    /// installs one mid-session reaches the running producer without a data race on a stored closure. Set
+    /// before `start()`; nil leaves the emission out entirely.
+    var nativeVideoFrameTimeObserverProvider: (@Sendable () -> NativeVideoFrameTimeObserver?)?
+
+    /// Monotonic producer generation, reported with every frame time so a consumer can drop entries from an
+    /// epoch whose segments a restart has since rewritten (#260).
+    let epoch: UInt64
+
     /// Fires at video gate-open with videoShiftPts (source video TB); re-fires on restart (matroska seek imprecision can shift).
-    var onVideoShiftKnown: (@Sendable (Int64) -> Void)?
+    /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
+    /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
+    /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
+    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
     /// Distinct from onVideoShiftKnown: the new shift is at the producer edge, AVPlayer renders it buffer+holdback later.
@@ -706,13 +779,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         desiredFirstVideoTfdtPts: Int64,
         desiredFirstAudioTfdtPts: Int64 = 0,
         segmentBoundaries: [Int64],
+        planAnchorVideoPts: Int64 = 0,
         isLive: Bool = false,
         packedSideAudioStartPts: Int64? = nil,
         packedSideAudioFallbackDurationPts: Int64 = 0,
         bufferAheadSegments: Int = 10,
         prefetchDiskBudgetBytes: Int = 0,
-        audioMoovPrimeFrame: [UInt8]? = nil
+        audioMoovPrimeFrame: [UInt8]? = nil,
+        epoch: UInt64 = 0
     ) throws {
+        self.epoch = epoch
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
@@ -750,7 +826,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.sourceVideoTimeBase = video.timeBase
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
-        self.vodCutter = VODSegmentCutter(boundaries: segmentBoundaries, baseIndex: baseIndex)
+        self.planAnchorVideoPts = planAnchorVideoPts
+        self.vodCutter = VODSegmentCutter(
+            sourceBoundaries: segmentBoundaries,
+            planAnchorPts: planAnchorVideoPts,
+            baseIndex: baseIndex
+        )
         self.isLive = isLive
         self.liveCurrentSegmentIndex = baseIndex
         self.videoFallbackDurationPts = videoFallbackDurationPts
@@ -851,10 +932,27 @@ final class HLSSegmentProducer: @unchecked Sendable {
         return Double(sourceVideoTimeBase.num) / Double(sourceVideoTimeBase.den)
     }
 
-    /// Map post-shift pts to absolute segment index. Folds shift back before comparing against source-axis boundaries.
+    /// Map post-shift (item-axis) pts to absolute segment index.
+    ///
+    /// AE#268: folds back the PLAN ANCHOR, not `videoShiftPts`. The two are equal whenever the gate
+    /// opened on the boundary the restart aimed at, but a restart that landed off a random-access
+    /// point carries the whole overshoot in the shift, and folding that back routed audio into a
+    /// segment index the video cutter never opened (a 10 s GOP under a 4 s plan skewed them by up to
+    /// two segments). The anchor is what the plan's item axis is defined against, so it is what maps
+    /// an item-axis timestamp onto a plan boundary.
     private func segmentIndex(forSourcePts pts: Int64) -> Int {
-        let absolute = videoShiftPts == Int64.min ? pts : pts &+ videoShiftPts
-        return baseIndex + Self.segmentOffset(forAbsolutePts: absolute, boundaries: segmentBoundaries)
+        return baseIndex + Self.segmentOffset(
+            forAbsolutePts: pts &+ planAnchorVideoPts,
+            boundaries: segmentBoundaries
+        )
+    }
+
+    /// Source-axis value of a timestamp the pump has already rebased onto the output axis
+    /// (`pts -= videoShiftPts`). Anything the producer hands to a consumer that works in source
+    /// PTS has to come back through here (#259). NOPTS and an unresolved shift pass through.
+    static func foldingShiftBack(_ value: Int64, shift: Int64) -> Int64 {
+        guard value != Int64.min, shift != Int64.min else { return value }
+        return value &+ shift
     }
 
     /// 0-based segment offset for `absolute` within the sorted-ascending `boundaries`: segment i spans
@@ -994,6 +1092,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         )
         while !checkShouldStop() {
             if cache.awaitFetchHighWater(reaching: target, timeout: 1.0) {
+                retunePumpQoS()
                 if parked >= Self.backpressureWedgeLogThresholdSeconds {
                     EngineLog.emit(
                         "[HLSSegmentProducer] #65 backpressure released (\(context)) head=\(head) "
@@ -1038,6 +1137,48 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 )
                 return false
             }
+        }
+        return false
+    }
+
+    /// Live replacement for the advance-path backpressure park (#65). Live production is source-paced,
+    /// so overproduction is bounded by the origin's real-time delivery; the only unbounded case is a
+    /// consumer that stopped polling entirely, which this cap catches. Logs from the first cycle (the
+    /// old live park was silent below 12 s, which is why consumer-facing 6-8 s freezes never showed a
+    /// producer-side line). Returns true on release, false when stop was requested.
+    ///
+    /// What makes this safe against a held blocking reload is the HEIGHT of the cap, not the release
+    /// path. A parked pump finalizes no segment, so `segments.count` stops growing, so the playlist
+    /// window stops sliding and `notePlaylistBuild -> evictBelow` evicts nothing: while the park holds,
+    /// the only thing that lowers `cache.count` is `pruneOutsideWindow` off a consumer segment GET
+    /// (`declareTarget`), structurally the same release the #65 park waited on. The deadlock is out of
+    /// reach only because reaching `liveResidentSegmentCap` takes a consumer that is already dead, and
+    /// the engine's 12 s stall watchdogs reload the item (and thus issue a fresh GET) long before then.
+    /// Lowering the cap toward the steady-state window would put that deadlock back within reach.
+    private func awaitLiveWindowHeadroom(head: Int) -> Bool {
+        if cache.count < Self.liveResidentSegmentCap { return true }
+        // #240: a parked pump is not using the link.
+        sideReaderLinkGate?.videoFetchEnded()
+        defer { sideReaderLinkGate?.videoFetchBegan() }
+        var parked = 0
+        while !checkShouldStop() {
+            if cache.count < Self.liveResidentSegmentCap {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
+                    + "resident=\(cache.count)",
+                    category: .session
+                )
+                return true
+            }
+            if parked % 10 == 0 {
+                EngineLog.emit(
+                    "[HLSSegmentProducer] live headroom PARK head=\(head) resident=\(cache.count) "
+                    + "cap=\(Self.liveResidentSegmentCap) parked=\(parked)s (playlist polls stopped?)",
+                    category: .session
+                )
+            }
+            Thread.sleep(forTimeInterval: 1.0)
+            parked += 1
         }
         return false
     }
@@ -1118,7 +1259,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // base segment is never overproduction: the consumer requested it (fetch-triggered restart)
         // or is about to (anchored start). seg0 sessions are unaffected (their target is negative
         // and releases immediately).
-        if initialSegmentIndex != baseIndex {
+        // Live never parks on the fetch high-water (see awaitLiveWindowHeadroom); an SSAI
+        // versioned-init re-alloc mid-live must not re-enter the park either.
+        if initialSegmentIndex != baseIndex, !isLive {
             let backpressureTarget = initialSegmentIndex - bufferAheadSegments
             if !awaitBackpressureRelease(target: backpressureTarget, head: initialSegmentIndex, context: "alloc") { return nil }
         }
@@ -1213,7 +1356,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
     }
 
-    /// Returns [start, end) on the AVPlayer axis for subtitle injection. VOD: from segmentBoundaries+videoShiftPts. Live: from liveSegmentStartByIndex.
+    /// Returns [start, end) on the AVPlayer axis for subtitle injection. VOD: from segmentBoundaries
+    /// minus the plan anchor (AE#268: the anchor defines the item axis; the shift carries a restart's
+    /// gate overshoot on top of it and would move the window under the cues). Live: from liveSegmentStartByIndex.
     private func segmentWindowAVPlayerSeconds(
         segIdx: Int,
         nextSegIdx: Int
@@ -1228,8 +1373,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             let i = segIdx - baseIndex
             let iNext = nextSegIdx - baseIndex
             guard i >= 0, iNext < segmentBoundaries.count else { return nil }
-            let t0 = Double(segmentBoundaries[i] - videoShiftPts) * sourceVideoTbSeconds
-            let t1 = Double(segmentBoundaries[iNext] - videoShiftPts) * sourceVideoTbSeconds
+            let t0 = Double(segmentBoundaries[i] - planAnchorVideoPts) * sourceVideoTbSeconds
+            let t1 = Double(segmentBoundaries[iNext] - planAnchorVideoPts) * sourceVideoTbSeconds
             return (t0, t1)
         }
     }
@@ -1309,6 +1454,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             cache.adopt(index: currentMuxerSegmentIndex,
                         stagingPath: path,
                         byteCount: bytesWritten)
+            // AE#286: per-epoch head. cache.highestStoredIndex is monotonic across restarts and would
+            // credit this pump with the previous epoch's production.
+            pumpEpochHighestStored = max(pumpEpochHighestStored, currentMuxerSegmentIndex)
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
@@ -1344,9 +1492,19 @@ final class HLSSegmentProducer: @unchecked Sendable {
             return nil
         }
         currentMuxerSegmentIndex = newIdx
-        let backpressureTarget = newIdx - bufferAheadSegments
-        if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
-        if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
+        if isLive {
+            // Live is source-paced: the pump only runs ahead of real time while draining the join
+            // backlog, and the sliding window (notePlaylistBuild -> evictBelow) bounds resident
+            // segments. Parking on the consumer's fetch high-water here deadlocked against a held
+            // LL-HLS blocking reload (the hold starves the segment GET that would release the park)
+            // and pushed TCP backpressure onto the single-connection origin whenever the join
+            // backlog exceeded bufferAheadSegments.
+            if !awaitLiveWindowHeadroom(head: newIdx) { return nil }
+        } else {
+            let backpressureTarget = newIdx - bufferAheadSegments
+            if !awaitBackpressureRelease(target: backpressureTarget, head: newIdx, context: "advance") { return nil }
+            if !awaitPrefetchDiskBudgetRelease(head: newIdx, context: "advance") { return nil }
+        }
         if checkShouldStop() { return nil }
 
         return muxer
@@ -1443,9 +1601,46 @@ final class HLSSegmentProducer: @unchecked Sendable {
         pumpStarted = true
         stateLock.unlock()
 
-        pumpQueue.async { [weak self] in
+        // AE#286: a thread we own rather than a dispatch queue, because the pump's urgency changes
+        // within one long-running block and a queue's QoS is fixed at creation.
+        let thread = Thread { [weak self] in
             self?.runPumpLoop()
         }
+        thread.name = "AetherEngine.HLSSegmentProducer.pump"
+        thread.stackSize = 1 << 20
+        thread.qualityOfService = .userInitiated
+        thread.start()
+    }
+
+    /// AE#286: match the pump's QoS to whether anything is waiting on it. Called at segment
+    /// boundaries and after a backpressure park, both cheap and both points where the answer can
+    /// have changed. VOD only: live production is source-paced and the LL-HLS blocking reload holds
+    /// an AVPlayer request open on the very next segment, so live is latency-critical throughout.
+    private func retunePumpQoS() {
+        guard !isLive else { return }
+        let target = cache.targetIndex
+        let lead = pumpEpochHighestStored >= 0 ? String(pumpEpochHighestStored - target) : "n/a"
+        // A consumer that has fetched has still not necessarily started rendering: AVPlayer keeps
+        // filling its startup buffer after the first segment, and demoting there cost 80 ms of
+        // time-to-first-frame under load with the forward buffer already 9 segments deep.
+        let relaxed = Self.pumpMayRelax(
+            hasStartedRendering: hasStartedRenderingProvider?() ?? true,
+            targetIndex: target,
+            epochHighestStored: pumpEpochHighestStored,
+            relaxedLeadSegments: pumpRelaxedLeadSegments
+        )
+        let desired: qos_class_t = relaxed ? QOS_CLASS_UTILITY : QOS_CLASS_USER_INITIATED
+        guard desired != pumpQoSCurrent else { return }
+        pumpQoSCurrent = desired
+        pthread_set_qos_class_self_np(desired, 0)
+        // Read the class back: a thread that was opted out of the QoS system silently keeps the old
+        // one, and then the whole mechanism is a no-op that still looks configured.
+        EngineLog.emit(
+            "[HLSSegmentProducer] pump qos -> \(Self.qosName(desired)) "
+            + "(now=\(Self.qosName(qos_class_self())) epochHead=\(pumpEpochHighestStored) "
+            + "target=\(target) lead=\(lead))",
+            category: .session
+        )
     }
 
     /// Async stop; also wakes backpressure waiter so restart doesn't wait a full poll timeout.
@@ -1585,6 +1780,17 @@ final class HLSSegmentProducer: @unchecked Sendable {
     // MARK: - Pump
 
     private func runPumpLoop() {
+        // AE#286: a (re)started pump always begins latency-critical. Nothing has been produced for
+        // this epoch yet, and both of its entry reasons, cold start and a seek landing, have the
+        // consumer waiting on the first segment it cuts.
+        pumpQoSCurrent = QOS_CLASS_USER_INITIATED
+        pumpQoSLastSeg = Int.min
+        pumpEpochHighestStored = Int.min
+        pthread_set_qos_class_self_np(pumpQoSCurrent, 0)
+        EngineLog.emit(
+            "[HLSSegmentProducer] pump thread qos=\(Self.qosName(qos_class_self()))",
+            category: .session
+        )
         if restartTargetVideoPts > Int64.min {
             bumpRestartCount()
         }
@@ -2273,7 +2479,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + "videoPID=\(videoStreamIndex) reconstructed=\(pendingJoinVideoConfig != nil)",
                             category: .session
                         )
-                        onVideoShiftKnown?(videoShiftPts)
+                        onVideoShiftKnown?(videoShiftPts, desiredFirstVideoTfdtPts)
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.
@@ -2537,6 +2743,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     let thisVideoSeg = isLive
                         ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
                         : vodCutter.index(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
+                    if thisVideoSeg != pumpQoSLastSeg {
+                        pumpQoSLastSeg = thisVideoSeg
+                        retunePumpQoS()
+                    }
                     if let prev = pendingVideoPkt {
                         let prevSeg = pendingVideoSegIndex
                         // #65 ledger: at each VOD segment open, map the segment's item-axis start (what AVPlayer and
@@ -2843,22 +3053,61 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         // #131: A53 caption extraction rides the same per-packet spot as the HDR10+ scan: decode
         // order, repaired DTS, timestamps still in the source time base (the rescale below).
+        // #259: the source time BASE, but no longer the source AXIS. The pump rebased this packet
+        // onto the output axis long before it got here, so the shift is folded back: the tap's cues
+        // are rendered against the source-PTS clock (as the c608 tap's and the SW path's are), and
+        // the shift is recomputed per producer session, so leaving it in would displace every
+        // caption by a different amount after each seek.
         if let kind = a53CodecKind, let observe = a53CaptionObserver,
            let data = packet.pointee.data, packet.pointee.pts != Int64.min {
             let size = Int(packet.pointee.size)
             if A53SEIParser.mayContainA53(data, size) {
                 let extracted = A53SEIParser.triplets(in: data, size: size, codec: kind, framing: a53NALFraming)
                 if !extracted.isEmpty {
-                    observe(extracted, packet.pointee.pts, packet.pointee.dts, sourceVideoTimeBase)
+                    observe(extracted,
+                            Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts),
+                            Self.foldingShiftBack(packet.pointee.dts, shift: videoShiftPts),
+                            sourceVideoTimeBase)
                 }
             }
         }
 
+        // #260: capture the source axis BEFORE the rescale (after it the packet carries muxer TB) and the
+        // keyframe flag while the packet is still ours. The item axis comes back out of writePacket: the write
+        // blanks the packet, so it cannot be read off it afterwards, and the sanitizer can move it.
+        let frameObserver = nativeVideoFrameTimeObserverProvider?()
+        let frameSourcePts = frameObserver == nil
+            ? Int64.min
+            : Self.foldingShiftBack(packet.pointee.pts, shift: videoShiftPts)
+        let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+        let frameSegmentIndex = currentMuxerSegmentIndex
+
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
-        _ = muxer.writePacket(packet)
+        let written = muxer.writePacket(packet).written
+
+        if let frameObserver,
+           let source = Self.cmTime(ticks: frameSourcePts, timeBase: sourceVideoTimeBase),
+           let item = Self.cmTime(ticks: written.pts, timeBase: muxer.muxerVideoTimeBase) {
+            frameObserver(
+                NativeVideoFrameTime(
+                    source: source,
+                    item: item,
+                    segmentIndex: frameSegmentIndex,
+                    isKeyframe: frameIsKeyframe,
+                    epoch: epoch
+                )
+            )
+        }
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         trackedPacketFree(&pkt)
+    }
+
+    /// Ticks in `timeBase` as a `CMTime`. nil for NOPTS or a degenerate time base, so a consumer never
+    /// receives a timestamp the engine could not actually resolve (#260).
+    static func cmTime(ticks: Int64, timeBase: AVRational) -> CMTime? {
+        guard ticks != Int64.min, timeBase.num > 0, timeBase.den > 0 else { return nil }
+        return CMTime(value: CMTimeValue(ticks &* Int64(timeBase.num)), timescale: CMTimeScale(timeBase.den))
     }
 
     /// Strip 7/9-byte ADTS header in-place (advances data pointer, shrinks size; buf untouched for unref safety).

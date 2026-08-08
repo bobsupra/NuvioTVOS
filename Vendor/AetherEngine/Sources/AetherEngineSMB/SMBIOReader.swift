@@ -13,6 +13,7 @@ private final class ReadOutcome: @unchecked Sendable {
 public final class SMBIOReader: IOReader, @unchecked Sendable {
     private let source: ByteRangeSource
     private let ownsSource: Bool
+    public let discImageProbeEnabled: Bool
     // `position` and `didClose` are only accessed on the demux/teardown thread
     // per the IOReader contract; no lock needed.
     private var position: Int64 = 0
@@ -37,9 +38,17 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     /// `AVSEEK_SIZE` from FFmpeg: return total size, do not move.
     private let avseekSize: Int32 = 65536
 
-    public init(source: ByteRangeSource, ownsSource: Bool = true) {
+    /// - Parameter discImageProbeEnabled: Keep enabled for an SMB path that is a raw ISO/UDF disc
+    ///   image. Set to `false` for an ordinary media file to avoid sparse signature reads before
+    ///   container probing.
+    public init(
+        source: ByteRangeSource,
+        ownsSource: Bool = true,
+        discImageProbeEnabled: Bool = true
+    ) {
         self.source = source
         self.ownsSource = ownsSource
+        self.discImageProbeEnabled = discImageProbeEnabled
     }
 
     public func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32 {
@@ -114,7 +123,11 @@ public final class SMBIOReader: IOReader, @unchecked Sendable {
     public func makeIndependentReader() -> IOReader? {
         // Range reads are serialised per connection by SMBClient, so the
         // independent reader shares the connection but never owns its teardown.
-        SMBIOReader(source: source, ownsSource: false)
+        SMBIOReader(
+            source: source,
+            ownsSource: false,
+            discImageProbeEnabled: discImageProbeEnabled
+        )
     }
 
     public func close() {

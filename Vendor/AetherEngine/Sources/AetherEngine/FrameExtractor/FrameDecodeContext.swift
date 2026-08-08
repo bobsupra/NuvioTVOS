@@ -171,9 +171,16 @@ final class FrameDecodeContext: @unchecked Sendable {
         }
         // Prefer container/stream SAR; the SW decoder does not reliably attach SAR
         // to output frames (see SoftwareVideoDecoder), so per-frame is fallback-only.
+        // Both fields: codecpar holds the bitstream-declared ratio, while a container-declared one
+        // (Matroska DisplayWidth, MP4 pasp) reaches AVStream alone.
         let parSAR = codecpar.pointee.sample_aspect_ratio
         if parSAR.num > 0, parSAR.den > 0 {
             streamSAR = parSAR
+        } else {
+            let containerSAR = stream.pointee.sample_aspect_ratio
+            if containerSAR.num > 0, containerSAR.den > 0 {
+                streamSAR = containerSAR
+            }
         }
         isHDR = Self.isHDRTransfer(codecpar.pointee.color_trc)
         isDolbyVisionNoBaseLayer = Self.isDVNoBaseLayer(codecpar: codecpar)
@@ -278,10 +285,7 @@ final class FrameDecodeContext: @unchecked Sendable {
                 ? targetWidth
                 : Self.clampedWidth(frame: f, maxSize: maxSize)
             if isDolbyVisionNoBaseLayer {
-                let frameSAR = f.pointee.sample_aspect_ratio
-                let sar = (streamSAR.num > 1 || streamSAR.den > 1)
-                    ? streamSAR
-                    : (frameSAR.num > 0 && frameSAR.den > 0 ? frameSAR : AVRational(num: 1, den: 1))
+                let sar = resolvedSAR(frame: f)
                 if let img = DolbyVisionStillConverter.makeImage(frame: f, targetWidth: width, sar: sar) {
                     return img
                 }
@@ -406,6 +410,24 @@ final class FrameDecodeContext: @unchecked Sendable {
                        provider: provider, decode: nil, shouldInterpolate: true, intent: .defaultIntent)
     }
 
+    /// Stream SAR (read at open) is authoritative, per-frame is fallback, square pixels are the
+    /// floor. #290: each candidate is judged against the frame it applies to, so a declared ratio
+    /// that would smear the picture into a band (a live channel claiming 3:1 on 1920x1080) drops
+    /// through instead of scaling a thumbnail to it. See `PixelAspectPolicy`.
+    private func resolvedSAR(frame: UnsafeMutablePointer<AVFrame>) -> AVRational {
+        let width = frame.pointee.width
+        let height = frame.pointee.height
+        if streamSAR.num > 1 || streamSAR.den > 1,
+           let sane = PixelAspectPolicy.saneSAR(streamSAR, width: width, height: height) {
+            return sane
+        }
+        if let sane = PixelAspectPolicy.saneSAR(
+            frame.pointee.sample_aspect_ratio, width: width, height: height) {
+            return sane
+        }
+        return AVRational(num: 1, den: 1)
+    }
+
     /// sws_scale the frame to RGBA at `targetWidth` (height from source aspect) into an
     /// owned-buffer CGImage. Mirrors the sws tuple-pointer dance in SoftwareVideoDecoder.
     private func convertToCGImage(frame: UnsafeMutablePointer<AVFrame>, targetWidth: Int) -> CGImage? {
@@ -413,11 +435,7 @@ final class FrameDecodeContext: @unchecked Sendable {
         let srcH = Int(frame.pointee.height)
         guard srcW > 0, srcH > 0, targetWidth > 0 else { return nil }
 
-        // Resolve SAR: stream value (read at open) is authoritative, per-frame is fallback.
-        let frameSAR = frame.pointee.sample_aspect_ratio
-        let sar = (streamSAR.num > 1 || streamSAR.den > 1)
-            ? streamSAR
-            : (frameSAR.num > 0 && frameSAR.den > 0 ? frameSAR : AVRational(num: 1, den: 1))
+        let sar = resolvedSAR(frame: frame)
 
         // Display height from coded aspect scaled by SAR so anamorphic draws true,
         // e.g. NTSC DVD 720x480 SAR 8:9 -> 4:3 not stretched 3:2.
@@ -483,10 +501,22 @@ final class FrameDecodeContext: @unchecked Sendable {
     }
 }
 
-enum FrameDecodeError: Error {
+enum FrameDecodeError: Error, CustomStringConvertible, LocalizedError {
     case noVideoStream
     case noCodecParameters
     case unsupportedCodec
     case allocationFailed
     case decoderOpenFailed
+
+    var description: String {
+        switch self {
+        case .noVideoStream: "FrameDecode: source has no video stream"
+        case .noCodecParameters: "FrameDecode: video stream has no codec parameters"
+        case .unsupportedCodec: "FrameDecode: no decoder for the video codec"
+        case .allocationFailed: "FrameDecode: avcodec_alloc_context3 failed"
+        case .decoderOpenFailed: "FrameDecode: decoder open failed"
+        }
+    }
+
+    var errorDescription: String? { description }
 }

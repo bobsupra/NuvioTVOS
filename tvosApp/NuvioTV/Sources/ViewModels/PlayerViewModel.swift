@@ -124,11 +124,12 @@ class PlayerViewModel: ObservableObject {
     private var isAdvanceInFlight: Bool = false
     private var autoHiddenNextEpisodeCard = false
     private var nextEpisodeAutoHideDeadline: Date?
+    private var autoPlayNextEnabled = false
+    private var autoPlayNextCountdownSeconds = 10
     /// Fallback when IntroDB has no ending marker: show the Next Episode card
     /// this many seconds before the end. When an ending skip exists, the card
     /// arms at the same moment as Skip Ending instead.
     private static let nextCardLeadSeconds: Double = 120
-    private static let nextEpisodeAutoHideSeconds = 5
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
 
@@ -651,13 +652,13 @@ class PlayerViewModel: ObservableObject {
         episodes: [NuvioVideo],
         current: NuvioVideo?,
         autoPlayEnabled: Bool,
+        autoPlayCountdownSeconds: Int,
         resolver: @escaping (NuvioVideo) async -> PreparedNextStream?
     ) {
         seriesEpisodes = episodes
         currentEpisodeVideo = current
-        // Auto-play is temporarily disabled. Keep accepting the setting so the
-        // player configuration API does not need to change.
-        _ = autoPlayEnabled
+        autoPlayNextEnabled = autoPlayEnabled
+        autoPlayNextCountdownSeconds = max(1, autoPlayCountdownSeconds)
         resolveNextStream = resolver
         autoHiddenNextEpisodeCard = false
         showNextEpisodeCard = false
@@ -715,18 +716,23 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
+        guard autoPlayNextEnabled else {
+            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
+            nextEpisodeAutoHideDeadline = nil
+            return
+        }
+
         if nextEpisodeAutoHideDeadline == nil {
-            nextEpisodeAutoHideDeadline = Date().addingTimeInterval(Double(Self.nextEpisodeAutoHideSeconds))
-            nextEpisodeCountdown = Self.nextEpisodeAutoHideSeconds
+            nextEpisodeAutoHideDeadline = Date().addingTimeInterval(Double(autoPlayNextCountdownSeconds))
+            nextEpisodeCountdown = autoPlayNextCountdownSeconds
         }
 
         guard let deadline = nextEpisodeAutoHideDeadline else { return }
         let secondsLeft = deadline.timeIntervalSinceNow
         if secondsLeft <= 0.05 {
-            autoHiddenNextEpisodeCard = true
-            showNextEpisodeCard = false
             nextEpisodeCountdown = nil
             nextEpisodeAutoHideDeadline = nil
+            advance()
         } else {
             let countdown = max(1, Int(secondsLeft.rounded(.up)))
             if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
@@ -1226,6 +1232,19 @@ class PlayerViewModel: ObservableObject {
         }
 
         if c.isPlayerEnded {
+            // Outro markers can begin only a few seconds before the end. If the
+            // selected countdown cannot finish in time, still honor Auto-Play
+            // instead of dismissing the player when the episode completes.
+            if autoPlayNextEnabled,
+               time.duration >= 60,
+               time.current / time.duration >= 0.85,
+               let next = nextEpisode,
+               EpisodeReleasePolicy.hasAired(next.released),
+               resolveNextStream != nil {
+                advance()
+                return
+            }
+
             // Only a genuine watch-through counts. A stream that dies early
             // (expired link, decode error) also reports "ended", and that must
             // neither mark the title watched nor wipe the resume point.

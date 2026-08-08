@@ -519,7 +519,7 @@ struct NextEpisodeOverlay: View {
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
                 } else if let countdown, !isAdvancing {
-                    Text("Hiding in \(countdown)s")
+                    Text("Playing in \(countdown)s")
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
                         .contentTransition(.numericText())

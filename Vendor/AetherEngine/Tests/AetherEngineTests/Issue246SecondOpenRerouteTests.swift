@@ -35,7 +35,12 @@ struct Issue246SecondOpenRerouteTests {
             Issue.record("expected openFailed, got \(mapped)")
             return
         }
-        #expect(reason.contains("openFailed"))
+        // AE#283 gave DemuxerError a description, so the reason now reads
+        // "Demuxer: open failed (Input/output error (-5))" instead of the reflected "openFailed(code: -5)".
+        // What this pins is that the wrapping preserves the underlying failure, code included; the
+        // exact case name was never the point.
+        #expect(reason.contains("open failed"))
+        #expect(reason.contains("-5"))
     }
 
     // MARK: - Reroute decision on the second-open error

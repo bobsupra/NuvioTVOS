@@ -43,7 +43,7 @@ final class LiveFixture: @unchecked Sendable {
 
     // MARK: - Errors
 
-    enum LiveFixtureError: Error, CustomStringConvertible {
+    enum LiveFixtureError: Error, CustomStringConvertible, LocalizedError {
         case seedMissing(path: String)
         case seedNotTS(path: String, size: Int)
         case socketCreate(errno: Int32)
@@ -63,6 +63,8 @@ final class LiveFixture: @unchecked Sendable {
             case .getsockname(let e):  return "LiveFixture: getsockname() failed (errno=\(e))"
             }
         }
+
+        var errorDescription: String? { description }
     }
 
     // MARK: - TS constants

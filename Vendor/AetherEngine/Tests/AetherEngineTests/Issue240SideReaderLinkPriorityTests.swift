@@ -239,10 +239,12 @@ struct Issue240SideReaderLinkPriorityTests {
     func latestRequestWins() {
         let box = SubtitleForwardPrefetcher.SideReaderReanchor(
             anchorStreamIndex: -1, fallbackDuration: 0, seekTimeout: 1)
-        box.request(600)
-        box.request(30)
-        box.request(302)
-        #expect(box.take() == 302)
+        box.request(600, seekGeneration: 4)
+        box.request(30, seekGeneration: 5)
+        box.request(302, seekGeneration: 6)
+        // #250: the surviving request carries its own seek generation, so the position the reader
+        // banks after the move is fenced to the seek that asked for it, not to the burst's first.
+        #expect(box.take() == .init(seconds: 302, seekGeneration: 6))
         #expect(box.take() == nil)
     }
 

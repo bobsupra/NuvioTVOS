@@ -109,6 +109,7 @@ enum SettingsKey {
     static let profileName = "nuvio.tv.settings.profile.name"
     static let profilePinEnabled = "nuvio.tv.settings.profile.pinEnabled"
     static let profileAutoSelectLast = "nuvio.tv.settings.profile.autoSelectLast"
+    static let profileRequireSelectionAfterBackground = "nuvio.tv.settings.profile.requireSelectionAfterBackground"
     static let accountSyncWatchState = "nuvio.tv.settings.account.syncWatchState"
 
     static let theme = "nuvio.tv.settings.appearance.theme"
@@ -218,6 +219,7 @@ enum SettingsKey {
     static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
     static let streamBadgePlacement = "nuvio.tv.settings.playback.streamBadgePlacement"
     static let autoPlayNext = "nuvio.tv.settings.playback.autoPlayNext"
+    static let autoPlayNextCountdown = "nuvio.tv.settings.playback.autoPlayNextCountdown"
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
     static let trailerPreviewSound = "nuvio.tv.settings.playback.trailerPreviewSound"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
@@ -248,7 +250,8 @@ enum SettingsKey {
     ])
 
     static let all = [
-        profileName, profilePinEnabled, profileAutoSelectLast, accountSyncWatchState,
+        profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
+        accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
         continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
@@ -273,7 +276,7 @@ enum SettingsKey {
         streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
         cachedOnlyStreams, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        autoPlayNext, trailersEnabled, trailerPreviewSound, trailerDelay,
+        autoPlayNext, autoPlayNextCountdown, trailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
@@ -1412,6 +1415,8 @@ private struct AccountSettingsView: View {
 
     @AppStorage(SettingsKey.profileName) private var profileName = "Nuvio User"
     @AppStorage(SettingsKey.profileAutoSelectLast) private var autoSelectLastProfile = true
+    @AppStorage(SettingsKey.profileRequireSelectionAfterBackground)
+    private var requireProfileSelectionAfterBackground = false
     @AppStorage(SettingsKey.accountSyncWatchState) private var syncWatchState = true
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
@@ -1525,6 +1530,21 @@ private struct AccountSettingsView: View {
                     isOn: $autoSelectLastProfile,
                     accentColor: accentColor
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "profile_select_on_return",
+                        fallback: "Choose Profile on Return"
+                    ),
+                    subtitle: L10n.string(
+                        "profile_select_on_return_subtitle",
+                        fallback: "Ask who's watching whenever Nuvio returns from the background"
+                    ),
+                    isOn: $requireProfileSelectionAfterBackground,
+                    accentColor: accentColor
+                )
+                .opacity(!autoSelectLastProfile ? 1 : 0.46)
+                .disabled(autoSelectLastProfile)
             }
 
             SettingsGroup(
@@ -4758,6 +4778,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
     @AppStorage(SettingsKey.autoPlayNext) private var autoPlayNext = true
+    @AppStorage(SettingsKey.autoPlayNextCountdown) private var autoPlayNextCountdown = 10
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
@@ -4784,6 +4805,7 @@ private struct PlaybackSettingsView: View {
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max"]
     private let assModes = ["Strip", "Scale", "Force"]
+    private let autoPlayNextCountdownOptions = [5, 10, 15, 20, 30]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -4825,10 +4847,20 @@ private struct PlaybackSettingsView: View {
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_auto_play_next_episode", fallback: "Auto-Play Next Episode"),
-                    subtitle: L10n.string("tvos_settings_play_the_next_episode_automatically_with_d5810d0b", fallback: "Play the next episode automatically with a 10-second countdown. Off keeps the Next Episode card with a manual Play."),
+                    subtitle: "Play the next episode automatically after the selected countdown. Off keeps the Next Episode card with a manual Play.",
                     isOn: $autoPlayNext,
                     accentColor: accentColor
                 )
+
+                SettingsOptionRow(
+                    title: "Next Episode Countdown",
+                    subtitle: "Choose how long to wait before the next episode starts automatically.",
+                    selection: autoPlayNextCountdownSelection,
+                    options: autoPlayNextCountdownOptions.map { "\($0) Seconds" },
+                    accentColor: accentColor
+                )
+                .opacity(autoPlayNext ? 1 : 0.46)
+                .disabled(!autoPlayNext)
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_frame_rate_matching", fallback: "Frame Rate Matching"),
@@ -4988,6 +5020,21 @@ private struct PlaybackSettingsView: View {
         SubtitleLanguagePreferences.settingsOptions.contains(audioLanguage)
             ? audioLanguage
             : "System"
+    }
+
+    private var autoPlayNextCountdownSelection: Binding<String> {
+        Binding(
+            get: {
+                let countdown = autoPlayNextCountdownOptions.contains(autoPlayNextCountdown)
+                    ? autoPlayNextCountdown
+                    : 10
+                return "\(countdown) Seconds"
+            },
+            set: { value in
+                guard let seconds = Int(value.split(separator: " ").first ?? "") else { return }
+                autoPlayNextCountdown = seconds
+            }
+        )
     }
 
     private var subtitleLanguageSummary: String {
@@ -6036,8 +6083,8 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 6.0.1",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.0.1 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 6.7.0",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.7.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(

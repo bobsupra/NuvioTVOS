@@ -19,6 +19,8 @@ struct SlowReadDiagnostics {
     private(set) var stallWaits = 0
     private(set) var stallWaitMs: Double = 0
     private(set) var stallWaitsSignaled = 0
+    private(set) var tailWaits = 0
+    private(set) var tailWaitMs: Double = 0
     private(set) var reconnects = 0
     private(set) var backoffMs: Double = 0
     private(set) var staleGenDroppedBytes: Int64 = 0
@@ -57,6 +59,15 @@ struct SlowReadDiagnostics {
         detourMs += ms
     }
 
+    /// #281 retest: time spent waiting for the speculative tail fetch to land instead of opening a
+    /// connection past it. Its own counter rather than a stall wait: a stall is the source failing to
+    /// deliver, this is the reader declining to duplicate a request that is already outstanding, and
+    /// a trace that cannot tell them apart reads the second as the first.
+    mutating func recordTailWait(ms: Double) {
+        tailWaits += 1
+        tailWaitMs += ms
+    }
+
     mutating func recordStallWait(ms: Double, signaled: Bool) {
         stallWaits += 1
         stallWaitMs += ms
@@ -89,10 +100,12 @@ struct SlowReadDiagnostics {
         // Time not attributable to any recorded branch: the read was blocked upstream of the loop
         // (fresh-connection first byte, a starved detour fetch not yet timed out, scheduling). This
         // is the #93/#96 residual's signature, so surfacing it turns "empty counters" into a number.
-        let unaccounted = max(0, elapsedMs - stallWaitMs - detourMs - backoffMs - lockWaitMs - connectMs)
+        let unaccounted = max(0, elapsedMs - stallWaitMs - detourMs - backoffMs - lockWaitMs
+                              - connectMs - tailWaitMs)
         return "[AVIOReader] slow read: \(Int(elapsedMs))ms at offset=\(offset) "
             + "detour=\(detourServes)(\(Int(detourMs))ms,\(detourFetches)fetch) "
             + "stallWaits=\(stallWaits)(\(Int(stallWaitMs))ms,\(stallWaitsSignaled)signaled) "
+            + "tailWaits=\(tailWaits)(\(Int(tailWaitMs))ms) "
             + "reconnects=\(reconnects) backoff=\(Int(backoffMs))ms "
             + "lockWait=\(Int(lockWaitMs))ms connect=\(Int(connectMs))ms "
             + "staleGenDropped=\(staleGenDroppedBytes)b "

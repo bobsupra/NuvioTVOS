@@ -1135,8 +1135,7 @@ enum SmartPlaybackSelector {
         var candidates = compatible.filter { !isPromotionalStream($0.stream) }
         if candidates.isEmpty { candidates = compatible }
         if cachedOnly {
-            let cached = candidates.filter { $0.stream.isLikelyCached }
-            if !cached.isEmpty { candidates = cached }
+            candidates = candidates.filter { $0.stream.isLikelyCached }
         }
 
         let ranked = candidates.map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
@@ -1171,8 +1170,7 @@ enum SmartPlaybackSelector {
         let nonPromotional = compatible.filter { !isPromotionalStream($0) }
         var result = nonPromotional.isEmpty ? compatible : nonPromotional
         if cachedOnly {
-            let cached = result.filter(\.isLikelyCached)
-            if !cached.isEmpty { result = cached }
+            result = result.filter(\.isLikelyCached)
         }
         return result
     }
