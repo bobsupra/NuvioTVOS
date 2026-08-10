@@ -8,6 +8,7 @@ import CoreMedia
 /// fold and reads 0 here by construction; `bufferedSessionTime` is fed only on live sessions, so a
 /// VOD software session published a `bufferedPosition` that just mirrored the playhead.
 @Suite("Software read-ahead telemetry (#303)")
+@MainActor
 struct Issue303SoftwareReadAheadTests {
 
     // MARK: - Frontier

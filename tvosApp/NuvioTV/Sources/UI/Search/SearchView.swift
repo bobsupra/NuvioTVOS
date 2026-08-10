@@ -106,7 +106,7 @@ struct SearchView: View {
                 DispatchQueue.main.async { searchBarFocused = true }
             }
         }
-        .onChange(of: focusedResultID) { newValue in
+        .onChange(of: focusedResultID) { _, newValue in
             if let newValue {
                 lastFocusedResultID = newValue
                 shouldRestoreResultFocus = false
@@ -120,7 +120,7 @@ struct SearchView: View {
         // `defaultFocus`. While `overlayRestoreResultID` is set every other
         // card is unfocusable, so the engine can only land back on the saved
         // card -- no scroll-to-top flash. See TVHomeView for the full story.
-        .onChange(of: isEnabled) { enabled in
+        .onChange(of: isEnabled) { _, enabled in
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreResultID = focusedResultID ?? lastFocusedResultID

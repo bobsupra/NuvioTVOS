@@ -132,6 +132,10 @@ enum SettingsKey {
     /// settings; the repository skips these rows. Not part of `all` — it syncs
     /// through its own RPC, not the tvOS settings blob.
     static let homeCatalogDisabled = "nuvio.tv.settings.layout.homeCatalogDisabled"
+    /// Local derived source state used to hide stale catalog snapshot rows when
+    /// an add-on is disabled before Home has rebuilt its snapshot.
+    static let homeCatalogDisabledAddonIDs = "nuvio.tv.settings.layout.homeCatalogDisabledAddonIDs"
+    static let homeCatalogDisabledAddonNames = "nuvio.tv.settings.layout.homeCatalogDisabledAddonNames"
     /// Collection ids hidden from Home via the account layout sync.
     static let homeCollectionDisabled = "nuvio.tv.settings.layout.homeCollectionDisabled"
     /// JSON `[String]` of account catalog keys (`<addonId>_<type>_<catalogId>`)
@@ -1002,13 +1006,13 @@ struct SettingsView: View {
                 categoryGrid
                     .focusSection()
                     .defaultFocusIfAvailable($focusedCategory, selectedCategory)
-                    .onChange(of: focusedCategory) { newValue in
+                    .onChange(of: focusedCategory) { _, newValue in
                         // focusedCategory goes nil exactly when focus leaves the
                         // sidebar for the detail pane — record that so re-entry is
                         // no longer locked to the first row.
                         if newValue == nil { detailVisited = true }
                     }
-                    .onChange(of: selectedCategory) { _ in
+                    .onChange(of: selectedCategory) { _, _ in
                         // A newly opened category should lock to its first row again.
                         detailVisited = false
                     }
@@ -1614,7 +1618,7 @@ private struct AccountSettingsView: View {
             }
         }
         .onAppear { refreshEditableName() }
-        .onChange(of: activeProfile) { _ in refreshEditableName() }
+        .onChange(of: activeProfile) { _, _ in refreshEditableName() }
         .sheet(isPresented: $showingAvatarPicker) {
             if let profile = activeProfile {
                 ProfileAvatarPickerSheet(
@@ -1992,10 +1996,10 @@ private struct AppearanceSettingsView: View {
             }
             localeManager.applyStoredTag(languageTag)
         }
-        .onChange(of: languageTag) { newValue in
+        .onChange(of: languageTag) { _, newValue in
             localeManager.applyStoredTag(newValue)
         }
-        .onChange(of: localeManager.revision) { _ in
+        .onChange(of: localeManager.revision) { _, _ in
             // Keep summary in sync when the picker writes via AppLocaleManager.
             let resolved = AppLocaleManager.shared.language
             if languageTag != resolved.tag {
@@ -2281,6 +2285,15 @@ private struct HeroCatalogSelectionRow: View {
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
             loadCatalogs()
         }
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.addonOrderChangedNotification)) { _ in
+            loadCatalogs()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
+            loadCatalogs()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.snapshotChangedNotification)) { _ in
+            loadCatalogs()
+        }
     }
 
     private func isSelected(_ id: String) -> Bool {
@@ -2302,12 +2315,65 @@ private struct HeroCatalogSelectionRow: View {
     private func loadCatalogs() {
         // A row hidden from Home stays in the snapshot so it can be restored, but
         // it has no items to draw a hero from — so it is not offered here.
-        catalogs = TVHomeCatalogOrder.snapshotRows().filter {
+        catalogs = layoutVisibleHomeCatalogRows().filter {
             $0.id != TVHomeSection.continueWatchingId
                 && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
                 && TVHomeCatalogOrder.isRowEnabled($0)
         }
     }
+}
+
+/// The Home snapshot intentionally keeps hidden rows so they can be restored.
+/// Add-on rows need one extra filter here: disabling an add-on removes its Home
+/// rows, but does not mark every row individually as disabled.
+private func layoutVisibleHomeCatalogRows() -> [TVHomeCatalogOrder.SnapshotRow] {
+    let rows = TVHomeCatalogOrder.snapshotRows()
+    let disabledAddonIDs = TVHomeCatalogOrder.disabledAddonIDs()
+    let disabledAddonNames = TVHomeCatalogOrder.disabledAddonNames()
+    let sourceRows = rows.filter { row in
+        if let addonId = row.addonId, disabledAddonIDs.contains(addonId) {
+            return false
+        }
+        if let addonName = row.addonName,
+           disabledAddonNames.contains(TVHomeCatalogOrder.normalizedAddonSourceName(addonName)) {
+            return false
+        }
+        return true
+    }
+    let cinemetaPrefix = "\(CinemetaCatalogRepository.cinemetaAddonId)_"
+    guard CinemetaCatalogRepository.isCinemetaEnabled else {
+        return sourceRows.filter { !($0.settingsKey?.hasPrefix(cinemetaPrefix) ?? false) }
+    }
+
+    // Home normally records these rows after its catalog request completes.
+    // Restore their metadata here too, so enabling Cinemeta updates Layout
+    // immediately instead of waiting for the user to visit Home first.
+    let builtIns: [(id: String, title: String, type: String, catalogId: String)] = [
+        ("movie_top", "Popular - Movies", "movie", "top"),
+        ("series_top", "Popular - Series", "series", "top"),
+        ("movie_rating", "Top Rated - Movies", "movie", "imdbRating"),
+        ("series_rating", "Top Rated - Series", "series", "imdbRating")
+    ]
+    var merged = sourceRows
+    let existingIDs = Set(sourceRows.map(\.id))
+    for builtIn in builtIns where !existingIDs.contains(builtIn.id) {
+        merged.append(
+            TVHomeCatalogOrder.SnapshotRow(
+                id: builtIn.id,
+                title: builtIn.title,
+                addonName: CinemetaCatalogRepository.cinemetaDisplayName,
+                addonId: nil,
+                contentType: builtIn.type,
+                catalogId: builtIn.catalogId,
+                settingsKey: TVHomeCatalogOrder.catalogSettingsKey(
+                    addonId: CinemetaCatalogRepository.cinemetaAddonId,
+                    contentType: builtIn.type,
+                    catalogId: builtIn.catalogId
+                )
+            )
+        )
+    }
+    return merged
 }
 
 private struct IntegrationSettingsView: View {
@@ -2523,12 +2589,12 @@ private struct IntegrationSettingsView: View {
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
         }
-        .onChange(of: tmdbApiKey) { _ in
+        .onChange(of: tmdbApiKey) { _, _ in
             if !tmdbHasApiKey {
                 tmdbEnabled = false
             }
         }
-        .onChange(of: mdbListApiKey) { _ in
+        .onChange(of: mdbListApiKey) { _, _ in
             if !mdbListHasApiKey {
                 mdbListEnabled = false
             }
@@ -2583,10 +2649,10 @@ private struct IntegrationSettingsView: View {
             AISubtitleOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
-        .onChange(of: traktViewModel.mode) { mode in
+        .onChange(of: traktViewModel.mode) { _, mode in
             if mode == .connected { showingTraktLogin = false }
         }
-        .onChange(of: simklViewModel.mode) { mode in
+        .onChange(of: simklViewModel.mode) { _, mode in
             if mode == .connected { showingSimklLogin = false }
         }
     }
@@ -2847,7 +2913,7 @@ private struct TmdbOptionsSheet: View {
             .focusSection()
         }
         .onAppear(perform: normalizeTmdbApiKey)
-        .onChange(of: tmdbApiKey) { _ in
+        .onChange(of: tmdbApiKey) { _, _ in
             if !tmdbHasApiKey {
                 tmdbEnabled = false
             }
@@ -3008,7 +3074,7 @@ private struct MdbListOptionsSheet: View {
             .focusSection()
         }
         .onAppear(perform: normalizeMdbListApiKey)
-        .onChange(of: mdbListApiKey) { _ in
+        .onChange(of: mdbListApiKey) { _, _ in
             if !mdbListHasApiKey {
                 mdbListEnabled = false
             }
@@ -3167,10 +3233,10 @@ private struct AISubtitleOptionsSheet: View {
             .focusSection()
         }
         .onAppear(perform: loadKey)
-        .onChange(of: apiKey) { _ in
+        .onChange(of: apiKey) { _, _ in
             persistKey()
         }
-        .onChange(of: provider) { _ in
+        .onChange(of: provider) { _, _ in
             keyStorageError = nil
             loadKey()
         }
@@ -3461,7 +3527,7 @@ private struct DebridDeviceAuthorizationSheet: View {
         .task(id: provider.id) {
             if !isConnected { viewModel.connect(provider) }
         }
-        .onChange(of: viewModel.state) { state in
+        .onChange(of: viewModel.state) { _, state in
             if state == .connected { dismiss() }
         }
         .onDisappear { viewModel.cancel() }
@@ -3750,7 +3816,7 @@ private struct TraktConnectedSettingsSheet: View {
                 now = Date()
             }
         }
-        .onChange(of: viewModel.mode) { mode in
+        .onChange(of: viewModel.mode) { _, mode in
             if mode != .connected { dismiss() }
         }
         .confirmationDialog(
@@ -4029,7 +4095,7 @@ private struct TraktDeviceLoginSheet: View {
                 viewModel.retryPolling()
             }
         }
-        .onChange(of: viewModel.mode) { mode in
+        .onChange(of: viewModel.mode) { _, mode in
             if mode == .connected {
                 // Brief success state then close.
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
@@ -4432,7 +4498,7 @@ private struct SimklConnectedSettingsSheet: View {
             viewModel.reload()
             viewModel.loadConnectedData()
         }
-        .onChange(of: viewModel.mode) { mode in
+        .onChange(of: viewModel.mode) { _, mode in
             if mode != .connected { dismiss() }
         }
         .confirmationDialog(
@@ -4715,7 +4781,7 @@ private struct SimklPINLoginSheet: View {
                 viewModel.retryPolling()
             }
         }
-        .onChange(of: viewModel.mode) { mode in
+        .onChange(of: viewModel.mode) { _, mode in
             if mode == .connected {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
                     dismiss()
@@ -5226,7 +5292,7 @@ struct SubtitleStyleEditor: View {
             .focusSection()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
-        .onChange(of: changeToken) { _ in onChange?() }
+        .onChange(of: changeToken) { _, _ in onChange?() }
     }
 
     private var controls: some View {
@@ -5706,7 +5772,7 @@ private struct LanguagePickerWindow: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .focusSection()
-        .onChange(of: focusedControl) { control in
+        .onChange(of: focusedControl) { _, control in
             if case .language(let language) = control {
                 lastFocusedLanguage = language
             } else if control == .leftGuard {
@@ -5962,6 +6028,8 @@ private struct AdvancedSettingsView: View {
         // Reset only the active profile's settings, not other profiles'.
         let defaults = ProfileSettings.current
         SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
+        defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
         AISubtitleKeyStore.remove()
         Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: ProfileSettings.activeProfileScope) }
     }
@@ -6303,6 +6371,14 @@ private struct AddonsSettingsSection: View {
             StreamAddonPreference(url: $0.url.absoluteString, enabled: $0.isEnabled)
         }
         CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences)
+        TVHomeCatalogOrder.setDisabledAddonSources(
+            ids: Set(syncedAddons.filter { !$0.isEnabled }.compactMap(\.manifestID)),
+            names: Set(
+                syncedAddons
+                    .filter { !$0.isEnabled }
+                    .map { TVHomeCatalogOrder.normalizedAddonSourceName($0.name) }
+            )
+        )
         streamAddonManifestURL = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURL) ?? ""
         streamAddonManifestURLs = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestURLs) ?? ""
         streamAddonManifestStates = ProfileSettings.current.string(forKey: SettingsKey.streamAddonManifestStates) ?? ""
@@ -6329,10 +6405,159 @@ private struct AddonsSettingsSection: View {
 
         for index in resolved.indices {
             guard !Task.isCancelled else { return }
-            if let manifest = await StremioManifest.fetch(from: resolved[index].url) {
-                resolved[index].apply(manifest)
-                syncedAddons = resolved
+            guard let manifest = await StremioManifest.fetch(from: resolved[index].url) else {
+                continue
             }
+            resolved[index].apply(manifest)
+            syncedAddons = resolved
+            if resolved[index].isEnabled,
+               let addonID = manifest.id,
+               addonID != CinemetaCatalogRepository.cinemetaAddonId,
+               let rows = await resolvedHomeRows(
+                   manifest: manifest,
+                   manifestURL: resolved[index].url,
+                   addonID: addonID,
+                   addonName: resolved[index].name
+               ) {
+                TVHomeCatalogOrder.replaceSnapshotRows(
+                    forAddonID: addonID,
+                    addonName: resolved[index].name,
+                    with: rows
+                )
+            }
+        }
+    }
+
+    /// Resolves the same subset Home can actually display. A manifest only
+    /// declares possible catalogs; personalized providers such as Watchly can
+    /// rotate that list and leave several candidates empty. Publishing all of
+    /// them made Layout disagree with Home until Home was opened.
+    private func resolvedHomeRows(
+        manifest: StremioManifest,
+        manifestURL: URL,
+        addonID: String,
+        addonName: String
+    ) async -> [TVHomeCatalogOrder.SnapshotRow]? {
+        let disabledKeys = TVHomeCatalogOrder.disabledCatalogKeys()
+        let catalogs = (manifest.catalogs ?? []).filter { catalog in
+            catalog.eligibleForHome
+                && (!catalog.requiresGenre || catalog.firstGenreOption != nil)
+        }
+        var rows: [TVHomeCatalogOrder.SnapshotRow] = []
+        var failed: [(StremioManifestCatalog, TVHomeCatalogOrder.SnapshotRow)] = []
+        var completedRequests = 0
+
+        for catalog in catalogs {
+            guard !Task.isCancelled,
+                  let row = snapshotRow(
+                      for: catalog,
+                      addonID: addonID,
+                      addonName: addonName
+                  ) else { continue }
+
+            // Hidden catalogs still belong in Layout so the user can restore
+            // them, but Home intentionally does not request their endpoints.
+            if let key = row.settingsKey, disabledKeys.contains(key) {
+                rows.append(row)
+                continue
+            }
+
+            switch await catalogAvailability(catalog, manifestURL: manifestURL) {
+            case .hasItems:
+                completedRequests += 1
+                rows.append(row)
+            case .empty:
+                completedRequests += 1
+            case .failed:
+                failed.append((catalog, row))
+            }
+        }
+
+        // Match Home's one serial retry without publishing every intermediate
+        // row. Settings receives a single snapshot update, avoiding the laggy
+        // list churn caused by repeated inserts.
+        if !failed.isEmpty, !Task.isCancelled {
+            try? await Task.sleep(nanoseconds: 600_000_000)
+            let retry = failed
+            failed.removeAll(keepingCapacity: true)
+            for (catalog, row) in retry {
+                guard !Task.isCancelled else { return nil }
+                switch await catalogAvailability(catalog, manifestURL: manifestURL) {
+                case .hasItems:
+                    completedRequests += 1
+                    rows.append(row)
+                case .empty:
+                    completedRequests += 1
+                case .failed:
+                    failed.append((catalog, row))
+                }
+            }
+        }
+
+        guard !Task.isCancelled else { return nil }
+        let requestableCount = catalogs.filter { catalog in
+            guard let key = catalog.settingsKey(addonID: addonID) else { return false }
+            return !disabledKeys.contains(key)
+        }.count
+        // A complete outage must not erase a previously useful snapshot.
+        guard requestableCount == 0 || completedRequests > 0 else { return nil }
+        return rows
+    }
+
+    private func snapshotRow(
+        for catalog: StremioManifestCatalog,
+        addonID: String,
+        addonName: String
+    ) -> TVHomeCatalogOrder.SnapshotRow? {
+        guard let type = catalog.type,
+              let catalogID = catalog.id else { return nil }
+        return TVHomeCatalogOrder.SnapshotRow(
+            id: "addon_\(addonID)_\(type)_\(catalogID)",
+            title: catalog.name ?? catalogID,
+            addonName: addonName,
+            addonId: addonID,
+            contentType: type,
+            catalogId: catalogID,
+            settingsKey: TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: addonID,
+                contentType: type,
+                catalogId: catalogID
+            )
+        )
+    }
+
+    private enum CatalogAvailability {
+        case hasItems
+        case empty
+        case failed
+    }
+
+    private func catalogAvailability(
+        _ catalog: StremioManifestCatalog,
+        manifestURL: URL
+    ) async -> CatalogAvailability {
+        guard let type = catalog.type,
+              let catalogID = catalog.id,
+              let url = try? StremioCatalogURLBuilder.url(
+                  baseURL: manifestURL.deletingLastPathComponent(),
+                  type: type,
+                  catalogId: catalogID,
+                  genre: catalog.requiresGenre ? catalog.firstGenreOption : nil
+              ) else { return .failed }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 15
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  200..<300 ~= http.statusCode else { return .failed }
+            let payload = try JSONDecoder().decode(
+                StremioCatalogPresenceResponse.self,
+                from: data
+            )
+            return payload.metas.isEmpty ? .empty : .hasItems
+        } catch {
+            return .failed
         }
     }
 
@@ -6366,6 +6591,7 @@ private struct AddonsSettingsSection: View {
 private struct SyncedAddon: Identifiable {
     let url: URL
     var name: String
+    var manifestID: String?
     var version: String?
     var description: String?
     /// The add-on's own artwork from its manifest, shown in place of the generic
@@ -6379,10 +6605,12 @@ private struct SyncedAddon: Identifiable {
     init(url: URL, isEnabled: Bool = true) {
         self.url = url
         self.name = CinemetaCatalogRepository.streamAddonName(for: url)
+        self.manifestID = nil
         self.isEnabled = isEnabled
     }
 
     mutating func apply(_ manifest: StremioManifest) {
+        manifestID = manifest.id
         if let manifestName = manifest.name?.trimmingCharacters(in: .whitespacesAndNewlines),
            !manifestName.isEmpty {
             name = manifestName
@@ -6399,9 +6627,11 @@ private struct SyncedAddon: Identifiable {
 }
 
 struct StremioManifest: Decodable {
+    let id: String?
     let name: String?
     let version: String?
     let description: String?
+    let catalogs: [StremioManifestCatalog]?
     /// Stremio manifests carry `logo` (wide/wordmark) and/or `icon` (square).
     let logo: String?
     let icon: String?
@@ -6422,12 +6652,62 @@ struct StremioManifest: Decodable {
     }
 
     static func fetch(from manifestURL: URL) async -> StremioManifest? {
-        guard let (data, response) = try? await URLSession.shared.data(from: manifestURL),
-              let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
+        guard let data = await StremioManifestDataCache.shared.data(for: manifestURL) else {
             return nil
         }
         return try? JSONDecoder().decode(StremioManifest.self, from: data)
     }
+}
+
+struct StremioManifestCatalog: Decodable {
+    let type: String?
+    let id: String?
+    let name: String?
+    let extra: [StremioManifestCatalogExtra]?
+    let extraRequired: [String]?
+
+    var eligibleForHome: Bool {
+        let required = requiredExtraNames
+        if required.contains("search") { return false }
+        return required.allSatisfy { $0 == "genre" }
+    }
+
+    var requiresGenre: Bool { requiredExtraNames.contains("genre") }
+
+    var firstGenreOption: String? {
+        extra?.first { $0.name.lowercased() == "genre" }?.options?.first
+    }
+
+    private var requiredExtraNames: [String] {
+        let structured = (extra ?? [])
+            .filter { $0.isRequired == true }
+            .map { $0.name.lowercased() }
+        let legacy = (extraRequired ?? []).map { $0.lowercased() }
+        return structured + legacy
+    }
+
+    func settingsKey(addonID: String) -> String? {
+        guard let type, let id else { return nil }
+        return TVHomeCatalogOrder.catalogSettingsKey(
+            addonId: addonID,
+            contentType: type,
+            catalogId: id
+        )
+    }
+}
+
+struct StremioManifestCatalogExtra: Decodable {
+    let name: String
+    let isRequired: Bool?
+    let options: [String]?
+}
+
+private struct StremioCatalogPresenceResponse: Decodable {
+    let metas: [StremioCatalogPresenceMeta]
+}
+
+private struct StremioCatalogPresenceMeta: Decodable {
+    let id: String?
 }
 
 private struct SyncedAddonSettingsRow: View {
@@ -6658,10 +6938,22 @@ private struct HomeCatalogOrderSection: View {
             }
         }
         .onAppear(perform: reload)
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.addonOrderChangedNotification)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
+            reload()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.snapshotChangedNotification)) { _ in
+            reload()
+        }
     }
 
     private func reload() {
-        rows = TVHomeCatalogOrder.snapshotRows()
+        rows = layoutVisibleHomeCatalogRows()
         enabledByRowId = Dictionary(
             uniqueKeysWithValues: rows.map { ($0.id, TVHomeCatalogOrder.isRowEnabled($0)) }
         )

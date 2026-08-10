@@ -48,7 +48,7 @@ struct PlayerControls: View {
                 bottomControls
             }
         }
-        .onChange(of: viewModel.showSettingsPanel) { isPresented in
+        .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
             if !isPresented, viewModel.showControls {
                 DispatchQueue.main.async { focusedControl = .settings }
             }
@@ -58,7 +58,7 @@ struct PlayerControls: View {
                 focusedControl = viewModel.isLiveStream ? .play : .timeline
             }
         }
-        .onChange(of: viewModel.showControls) { isVisible in
+        .onChange(of: viewModel.showControls) { _, isVisible in
             // Don't steal focus while the pause metadata sheet owns the remote.
             if isVisible,
                !viewModel.showPauseOverlay,
@@ -69,21 +69,21 @@ struct PlayerControls: View {
                 }
             }
         }
-        .onChange(of: viewModel.isLiveStream) { isLive in
+        .onChange(of: viewModel.isLiveStream) { _, isLive in
             if isLive, focusedControl == .timeline {
                 DispatchQueue.main.async { focusedControl = .play }
             }
         }
-        .onChange(of: viewModel.showPauseOverlay) { visible in
+        .onChange(of: viewModel.showPauseOverlay) { _, visible in
             if visible { focusedControl = nil }
         }
-        .onChange(of: isSkipSegmentFocused) { isFocused in
+        .onChange(of: isSkipSegmentFocused) { _, isFocused in
             if isFocused { focusedControl = nil }
         }
-        .onChange(of: isNextEpisodeFocused) { isFocused in
+        .onChange(of: isNextEpisodeFocused) { _, isFocused in
             if isFocused { focusedControl = nil }
         }
-        .onChange(of: focusedControl) { newControl in
+        .onChange(of: focusedControl) { _, newControl in
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
             viewModel.isTimelineFocused = (newControl == .timeline)
@@ -782,7 +782,7 @@ struct PlayerSettingsPanel: View {
         .onDisappear {
             viewModel.setControlsAutoHideSuspended(false)
         }
-        .onChange(of: focus) { newValue in
+        .onChange(of: focus) { _, newValue in
             // Focusing a language filters the middle column live.
             if case .language(let language) = newValue {
                 selectedLanguage = language

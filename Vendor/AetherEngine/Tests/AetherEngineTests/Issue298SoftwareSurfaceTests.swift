@@ -26,6 +26,7 @@ import QuartzCore
 /// direct path passed `CMTime.invalid` straight through to the display queue, and a NaN also
 /// silently breaks the reorder buffer's PTS ordering (every comparison against NaN is false).
 @Suite("Software-path surface visibility + unschedulable frame gate (#298)")
+@MainActor
 struct Issue298SoftwareSurfaceTests {
 
     // MARK: - Unschedulable frames

@@ -630,7 +630,7 @@ final class SoftwarePlaybackHost {
             }
         }
         if !demuxLoopStarted, let aOut = audioOutput {
-            aOut.attachVideoLayer(renderer.displayLayer)
+            aOut.attachVideoLayer(renderer.queueTarget)
         }
         if !demuxLoopStarted {
             demuxLoopStarted = true
@@ -902,7 +902,7 @@ final class SoftwarePlaybackHost {
 
         if let aOut = audioOutput {
             aOut.stop()
-            aOut.detachVideoLayer(renderer.displayLayer)
+            aOut.detachVideoLayer(renderer.queueTarget)
         }
         audioOutput = nil
         audioDecoder?.close()

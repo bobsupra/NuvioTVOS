@@ -20,16 +20,11 @@ final class AudioOutput: @unchecked Sendable {
         renderer.allowedAudioSpatializationFormats = .multichannel
     }
 
-    /// Add the video display layer to the synchronizer for automatic A/V sync + frame pacing. On iOS18/tvOS18/
-    /// macOS15+ Apple split the queue rendering surface onto displayLayer.sampleBufferRenderer; direct
-    /// addRenderer(layer) still type-checks but on tvOS 26+ fails with FigVideoQueueRemote err=-12080 after the
-    /// first enqueue, so attach the renderer instead.
-    func attachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            synchronizer.addRenderer(displayLayer.sampleBufferRenderer)
-        } else {
-            synchronizer.addRenderer(displayLayer)
-        }
+    /// Add the video queue target to the synchronizer for automatic A/V sync + frame pacing. The
+    /// caller resolves the display layer's modern sample-buffer renderer on the main actor once;
+    /// this output object never reaches through the actor-isolated layer from its worker contexts.
+    func attachVideoLayer(_ videoRenderer: any AVQueuedSampleBufferRendering) {
+        synchronizer.addRenderer(videoRenderer)
     }
 
     /// Remove the video display layer and block until removal completes. The synchronizer detaches asynchronously;
@@ -37,16 +32,10 @@ final class AudioOutput: @unchecked Sendable {
     /// owned by both (Apple-documented UB). Symptom: first PCM->Atmos switch after launch throws FigVideoQueueRemote
     /// err=-12080 and the display layer stops rendering (audio keeps going). The semaphore wait (sub-100ms) makes
     /// the handoff deterministic.
-    func detachVideoLayer(_ displayLayer: AVSampleBufferDisplayLayer) {
+    func detachVideoLayer(_ videoRenderer: any AVQueuedSampleBufferRendering) {
         let semaphore = DispatchSemaphore(value: 0)
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            synchronizer.removeRenderer(displayLayer.sampleBufferRenderer, at: synchronizer.currentTime()) { _ in
-                semaphore.signal()
-            }
-        } else {
-            synchronizer.removeRenderer(displayLayer, at: synchronizer.currentTime()) { _ in
-                semaphore.signal()
-            }
+        synchronizer.removeRenderer(videoRenderer, at: synchronizer.currentTime()) { _ in
+            semaphore.signal()
         }
         let result = semaphore.wait(timeout: .now() + .seconds(1))
         #if DEBUG

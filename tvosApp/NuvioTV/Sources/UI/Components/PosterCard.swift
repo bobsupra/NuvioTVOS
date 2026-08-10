@@ -89,7 +89,7 @@ struct PosterCard: View {
                     onLongPress?(meta)
                 }
             )
-            .onChange(of: isFocused) { focused in
+            .onChange(of: isFocused) { _, focused in
                 if focused {
                     onFocus?(meta)
                     didFinishTrailerPreview = false
@@ -595,7 +595,7 @@ private struct TrailerPreviewPlayer: View {
             .task(id: previewIdentity) {
                 await startPreview()
             }
-            .onChange(of: isActive) { active in
+            .onChange(of: isActive) { _, active in
                 if active {
                     player.play()
                     if hasResolvedPreview { onPlaybackReady() }
@@ -603,7 +603,7 @@ private struct TrailerPreviewPlayer: View {
                     player.pause()
                 }
             }
-            .onChange(of: trailerPreviewSound) { soundEnabled in
+            .onChange(of: trailerPreviewSound) { _, soundEnabled in
                 applySoundPreference(soundEnabled)
             }
             .onReceive(
@@ -770,7 +770,7 @@ struct PosterGridCard: View {
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
         )
-        .onChange(of: focused) { isFocused in
+        .onChange(of: focused) { _, isFocused in
             if isFocused { onFocus?(meta) }
         }
         .onAppear {
@@ -1492,7 +1492,7 @@ struct CardActionMenuOverlay: View {
         }
         // Re-grab focus if the engine drops it while the tab view fades out, so
         // the menu never ends up with nothing highlighted.
-        .onChange(of: focused) { newValue in
+        .onChange(of: focused) { _, newValue in
             if newValue == nil {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     if focused == nil { focused = .details }
@@ -1620,7 +1620,7 @@ struct ContinueWatchingActionMenuOverlay: View {
         }
         // Re-grab focus if the engine drops it while the tab view fades out, so
         // the menu never ends up with nothing highlighted.
-        .onChange(of: focused) { newValue in
+        .onChange(of: focused) { _, newValue in
             if newValue == nil {
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
                     if focused == nil { focused = .details }

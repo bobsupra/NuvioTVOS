@@ -94,6 +94,7 @@ public struct TopShelfFeed: Codable, Equatable {
 /// app never crashes or blocks on it.
 public enum TopShelfFeedStore {
     private static let feedKey = "nuvio.tv.topShelf.feed"
+    private static let artworkRenderVersion = 2
 
     private static var sharedDefaults: UserDefaults? {
         UserDefaults(suiteName: topShelfAppGroupID)
@@ -134,7 +135,12 @@ public enum TopShelfFeedStore {
     }
 
     private static func artworkFileName(for entry: TopShelfEntry) -> String {
-        let source = [entry.contentId, entry.imageURL ?? "", entry.subtitle ?? ""]
+        let source = [
+            String(artworkRenderVersion),
+            entry.contentId,
+            entry.imageURL ?? "",
+            entry.subtitle ?? ""
+        ]
             .joined(separator: "\u{1F}")
         var hash: UInt64 = 1_469_598_103_934_665_603 // FNV-1a offset basis
         for byte in source.utf8 {
@@ -196,18 +202,38 @@ public enum TopShelfFeedStore {
             )
             image.draw(in: imageRect)
 
-            let pillRect = CGRect(x: 44, y: 44, width: size.width - 88, height: 88)
-            UIColor.black.withAlphaComponent(0.76).setFill()
-            UIBezierPath(roundedRect: pillRect, cornerRadius: 24).fill()
+            let font = UIFont.systemFont(ofSize: 44, weight: .bold)
             let style = NSMutableParagraphStyle()
             style.alignment = .center
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: font,
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: style
+            ]
+            let textSize = (subtitle as NSString).size(withAttributes: attributes)
+            let horizontalPadding: CGFloat = 72
+            let maximumPillWidth = size.width - 88
+            let pillWidth = min(maximumPillWidth, ceil(textSize.width) + horizontalPadding)
+            let pillHeight = max(108, ceil(textSize.height) + 36)
+            let pillRect = CGRect(
+                x: (size.width - pillWidth) / 2,
+                y: 44,
+                width: pillWidth,
+                height: pillHeight
+            )
+
+            UIColor.black.withAlphaComponent(0.76).setFill()
+            UIBezierPath(roundedRect: pillRect, cornerRadius: pillHeight / 2).fill()
+
+            let textRect = CGRect(
+                x: pillRect.minX + horizontalPadding / 2,
+                y: pillRect.midY - ceil(textSize.height) / 2,
+                width: pillRect.width - horizontalPadding,
+                height: ceil(textSize.height)
+            )
             subtitle.draw(
-                in: pillRect.insetBy(dx: 20, dy: 19),
-                withAttributes: [
-                    .font: UIFont.systemFont(ofSize: 36, weight: .bold),
-                    .foregroundColor: UIColor.white,
-                    .paragraphStyle: style
-                ]
+                in: textRect,
+                withAttributes: attributes
             )
         }
         return rendered.jpegData(compressionQuality: 0.9)

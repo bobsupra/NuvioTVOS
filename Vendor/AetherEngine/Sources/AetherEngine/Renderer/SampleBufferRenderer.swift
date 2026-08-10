@@ -29,7 +29,11 @@ enum DisplayFlushOp: Equatable {
 
 final class SampleBufferRenderer: @unchecked Sendable {
 
-    private(set) var displayLayer: AVSampleBufferDisplayLayer
+    @MainActor private(set) var displayLayer: AVSampleBufferDisplayLayer
+    /// AVFoundation explicitly permits this queue interface to be used from a background thread.
+    /// Capture it once on the main actor instead of reaching through the actor-isolated layer for
+    /// every decoded frame.
+    private let renderingTarget: any AVQueuedSampleBufferRendering
 
     /// SW-PiP Phase C: composites active subtitle cues into frames while PiP is active (the system
     /// window renders only this layer, the host overlay cannot reach it).
@@ -59,7 +63,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
         var parV: Int?
     }
 
+    private let diagnosticsLock = NSLock()
+    private var diagnosticsRefreshPending = false
     private var loggedLayerFailed = false
+    private var cachedQueueStatusName = "unknown"
+    private var cachedQueueErrorDescription: String?
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
     private(set) var enqueueCount = 0
@@ -85,8 +93,15 @@ final class SampleBufferRenderer: @unchecked Sendable {
         return _newestEnqueuedPtsSeconds
     }
 
+    @MainActor
     init() {
-        displayLayer = Self.makeDisplayLayer(isHDR: false)
+        let layer = Self.makeDisplayLayer(isHDR: false)
+        displayLayer = layer
+        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
+            renderingTarget = layer.sampleBufferRenderer
+        } else {
+            renderingTarget = layer
+        }
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -123,10 +138,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering.
     var queueTarget: any AVQueuedSampleBufferRendering {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer
-        }
-        return displayLayer
+        renderingTarget
     }
 
     /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
@@ -134,20 +146,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         queueTarget.isReadyForMoreMediaData
     }
 
-    private var queueStatus: AVQueuedSampleBufferRenderingStatus {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.status
-        }
-        return displayLayer.status
-    }
-
-    private var queueError: Error? {
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            return displayLayer.sampleBufferRenderer.error
-        }
-        return displayLayer.error
-    }
-
+    @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
         let layer = AVSampleBufferDisplayLayer()
         layer.videoGravity = gravity
@@ -169,6 +168,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
     }
 
     /// Opt the display layer into HDR mode. Pass true only when the decoder delivers raw HDR10/DV pixel buffers; false for SDR or tone-mapped output.
+    @MainActor
     func setHDROutput(_ isHDR: Bool) {
         if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
@@ -247,6 +247,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
+    @MainActor
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
@@ -305,35 +306,89 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 EngineLog.emit("[Renderer] HDR10+ attachment count: \(hdr10PlusAttachedCount) (last payload \(hdr10PlusData.count) bytes)", category: .swPlayback)
             }
         }
-        // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
         let target = queueTarget
-        if queueStatus == .failed {
-            if !loggedLayerFailed {
-                loggedLayerFailed = true
-                EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(queueError?.localizedDescription ?? "nil"), attempting recovery via flush()", category: .swPlayback)
-            }
-            target.flush()
-        }
         if !target.isReadyForMoreMediaData, !loggedNotReady {
             loggedNotReady = true
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
+        }
+        if !target.isReadyForMoreMediaData {
+            scheduleQueueDiagnosticsRefresh()
         }
         target.enqueue(sampleBuffer)
 
         enqueueCount += 1
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
         if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
-            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
+            scheduleQueueDiagnosticsRefresh()
+            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueErrorDescription ?? "nil")", category: .swPlayback)
         }
     }
 
     private var statusName: String {
-        switch queueStatus {
-        case .unknown: "unknown"
-        case .rendering: "rendering"
-        case .failed: "failed"
-        @unknown default: "?"
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return cachedQueueStatusName
+    }
+
+    private var queueErrorDescription: String? {
+        diagnosticsLock.lock()
+        defer { diagnosticsLock.unlock() }
+        return cachedQueueErrorDescription
+    }
+
+    private func scheduleQueueDiagnosticsRefresh() {
+        diagnosticsLock.lock()
+        guard !diagnosticsRefreshPending else {
+            diagnosticsLock.unlock()
+            return
         }
+        diagnosticsRefreshPending = true
+        diagnosticsLock.unlock()
+
+        Task { @MainActor [weak self] in
+            self?.refreshQueueDiagnostics()
+        }
+    }
+
+    /// Status/error are UI-object diagnostics in Xcode 27 even though enqueueing is explicitly
+    /// background-safe. Sample them on the main actor and keep only Sendable values off-actor.
+    @MainActor
+    private func refreshQueueDiagnostics() {
+        let status: AVQueuedSampleBufferRenderingStatus
+        let errorDescription: String?
+        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
+            let renderer = displayLayer.sampleBufferRenderer
+            status = renderer.status
+            errorDescription = renderer.error?.localizedDescription
+        } else {
+            status = displayLayer.status
+            errorDescription = displayLayer.error?.localizedDescription
+        }
+
+        let statusText: String
+        switch status {
+        case .unknown: statusText = "unknown"
+        case .rendering: statusText = "rendering"
+        case .failed: statusText = "failed"
+        @unknown default: statusText = "?"
+        }
+
+        diagnosticsLock.lock()
+        cachedQueueStatusName = statusText
+        cachedQueueErrorDescription = errorDescription
+        diagnosticsRefreshPending = false
+        let shouldLogFailure = status == .failed && !loggedLayerFailed
+        if shouldLogFailure { loggedLayerFailed = true }
+        diagnosticsLock.unlock()
+
+        guard status == .failed else { return }
+        if shouldLogFailure {
+            EngineLog.emit(
+                "[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(errorDescription ?? "nil"), attempting recovery via flush()",
+                category: .swPlayback
+            )
+        }
+        renderingTarget.flush()
     }
 
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.

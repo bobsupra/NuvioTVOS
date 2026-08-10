@@ -468,7 +468,7 @@ private struct AppLocaleViewModifier: ViewModifier {
         case .arabic, .hebrew:
             return .rightToLeft
         case .system:
-            return Locale.characterDirection(forLanguage: Locale.preferredLanguages.first ?? "en") == .rightToLeft
+            return Locale.Language(identifier: Locale.preferredLanguages.first ?? "en").characterDirection == .rightToLeft
                 ? .rightToLeft
                 : .leftToRight
         default:

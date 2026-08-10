@@ -46,7 +46,7 @@ struct LoginView: View {
             if method == .qr { auth.startQrLogin() }
         }
         .onDisappear { auth.stopQrLogin() }
-        .onChange(of: method) { newMethod in
+        .onChange(of: method) { _, newMethod in
             auth.errorMessage = nil
             if newMethod == .qr {
                 auth.startQrLogin()
@@ -54,7 +54,7 @@ struct LoginView: View {
                 auth.stopQrLogin()
             }
         }
-        .onChange(of: auth.authState) { state in
+        .onChange(of: auth.authState) { _, state in
             if state.isAuthenticated { triggerContinue(delay: 0.9) }
         }
     }

@@ -38,12 +38,12 @@ struct AnimatedRemoteGIFView: View {
         .opacity(isActive && decoded != nil ? 1 : 0)
         .animation(.easeInOut(duration: 0.2), value: isActive && decoded != nil)
         .onAppear { ensureLoaded() }
-        .onChange(of: urlString) { _ in
+        .onChange(of: urlString) { _, _ in
             decoded = nil
             loadFailed = false
             ensureLoaded()
         }
-        .onChange(of: isActive) { active in
+        .onChange(of: isActive) { _, active in
             if active { ensureLoaded() }
         }
         .onDisappear {
@@ -229,22 +229,24 @@ private final class AnimatedGIFCache {
             return cached
         }
 
-        lock.lock()
-        if let existing = inFlight[key] {
-            lock.unlock()
-            return await existing.value
+        let (task, ownsTask) = lock.withLock {
+            if let existing = inFlight[key] {
+                return (existing, false)
+            }
+            let task = Task.detached(priority: .utility) { () -> DecodedAnimatedImage? in
+                await Self.fetchAndDecode(url: url)
+            }
+            inFlight[key] = task
+            return (task, true)
         }
-        let task = Task.detached(priority: .utility) { () -> DecodedAnimatedImage? in
-            await Self.fetchAndDecode(url: url)
-        }
-        inFlight[key] = task
-        lock.unlock()
 
         let image = await task.value
 
-        lock.lock()
-        inFlight[key] = nil
-        lock.unlock()
+        if ownsTask {
+            lock.withLock {
+                inFlight[key] = nil
+            }
+        }
 
         if let image {
             cache.setObject(image, forKey: key as NSString)

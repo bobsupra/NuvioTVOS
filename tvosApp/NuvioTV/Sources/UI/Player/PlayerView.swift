@@ -385,7 +385,7 @@ struct PlayerView: View {
             PlaybackWakeLock.release()
             viewModel.shutdown()
         }
-        .onChange(of: viewModel.status) { status in
+        .onChange(of: viewModel.status) { _, status in
             // Keep reasserting while the player is up — never re-enable sleep
             // based on transient status (pause/buffer/error) mid-session.
             PlaybackWakeLock.reassert()
@@ -401,12 +401,12 @@ struct PlayerView: View {
             didHandleFinished = true
             onFinished()
         }
-        .onChange(of: scenePhase) { phase in
+        .onChange(of: scenePhase) { _, phase in
             if phase == .active {
                 PlaybackWakeLock.reassert()
             }
         }
-        .onChange(of: viewModel.showControls) { isVisible in
+        .onChange(of: viewModel.showControls) { _, isVisible in
             if viewModel.sidePanel != nil {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
@@ -427,21 +427,21 @@ struct PlayerView: View {
                 focusRemoteInput()
             }
         }
-        .onChange(of: viewModel.sidePanel) { panel in
+        .onChange(of: viewModel.sidePanel) { _, panel in
             if panel != nil {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
                 skipSegmentFocused = false
             }
         }
-        .onChange(of: viewModel.showPauseOverlay) { visible in
+        .onChange(of: viewModel.showPauseOverlay) { _, visible in
             if visible {
                 nextEpisodeFocused = false
                 skipSegmentFocused = false
                 focusRemoteInput()
             }
         }
-        .onChange(of: viewModel.isScrubbing) { scrubbing in
+        .onChange(of: viewModel.isScrubbing) { _, scrubbing in
             if scrubbing {
                 nextEpisodeFocused = false
                 skipSegmentFocused = false
@@ -452,7 +452,7 @@ struct PlayerView: View {
                 focusRemoteInput()
             }
         }
-        .onChange(of: viewModel.showNextEpisodeCard) { visible in
+        .onChange(of: viewModel.showNextEpisodeCard) { _, visible in
             guard !viewModel.showControls else { return }
             if visible {
                 focusNextEpisode()
@@ -462,7 +462,7 @@ struct PlayerView: View {
                 focusRemoteInput()
             }
         }
-        .onChange(of: viewModel.showSkipSegmentCard) { visible in
+        .onChange(of: viewModel.showSkipSegmentCard) { _, visible in
             guard !viewModel.showControls, !viewModel.showNextEpisodeCard else { return }
             if visible {
                 focusSkipSegment()

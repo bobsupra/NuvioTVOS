@@ -185,6 +185,8 @@ final class MPVSubtitleTranslationState: ObservableObject {
     private func translate(source: String, settings: AISubtitleTranslationSettings) {
         let activeSession = sessionID
         let profileScope = ProfileSettings.activeProfileScope
+        let translationRequest = requestTranslation
+        let pacer = requestPacer
         isTranslating = currentSource == source
         tasks[source] = Task { [weak self] in
             do {
@@ -204,7 +206,7 @@ final class MPVSubtitleTranslationState: ObservableObject {
                     self.report(.success(()))
                     return
                 }
-                let translated = try await requestTranslation(source, settings, requestPacer)
+                let translated = try await translationRequest(source, settings, pacer)
                 let cleaned = AISubtitleTranslationState.cleaned(
                     translated,
                     stripHearingImpaired: settings.stripHearingImpaired
@@ -455,7 +457,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
         checkError(mpv_request_log_messages(mpv, "warn"))
 
-        checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &metalLayer))
+        var windowID = Int64(bitPattern: UInt64(UInt(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque())))
+        checkError(mpv_set_option(mpv, "wid", MPV_FORMAT_INT64, &windowID))
         checkError(mpv_set_option_string(mpv, "vo", "gpu-next"))
         checkError(mpv_set_option_string(mpv, "gpu-api", "vulkan"))
         checkError(mpv_set_option_string(mpv, "gpu-context", "moltenvk"))

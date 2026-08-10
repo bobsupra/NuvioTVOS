@@ -280,7 +280,7 @@ struct PlayerSourcesPanel: View {
             viewModel.loadSourcesIfNeeded()
             requestSourceFocus()
         }
-        .onChange(of: viewModel.availableSources.map(\.id)) { sourceIDs in
+        .onChange(of: viewModel.availableSources.map(\.id)) { _, sourceIDs in
             guard !sourceIDs.isEmpty,
                   focusedID == nil || !sourceIDs.contains(focusedID ?? "") else {
                 return

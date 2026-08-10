@@ -710,7 +710,8 @@ enum StreamBadgeMatcher {
                 isInsideCharacterClass = true
             case "]":
                 isInsideCharacterClass = false
-            case "^", "$" where !isInsideCharacterClass:
+            case "^" where !isInsideCharacterClass,
+                 "$" where !isInsideCharacterClass:
                 return true
             default:
                 break

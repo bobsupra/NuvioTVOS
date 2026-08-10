@@ -163,6 +163,39 @@ extension CatalogRepository {
     }
 }
 
+/// One process-wide manifest response per URL. Personalized add-ons can rotate
+/// their catalog declarations on every manifest request; Settings and Home
+/// must decode the same response or their row identities immediately diverge.
+actor StremioManifestDataCache {
+    static let shared = StremioManifestDataCache()
+
+    private var cachedData: [URL: Data] = [:]
+    private var inFlight: [URL: Task<Data?, Never>] = [:]
+
+    func data(for url: URL) async -> Data? {
+        if let data = cachedData[url] { return data }
+        if let task = inFlight[url] { return await task.value }
+
+        let task = Task<Data?, Never> {
+            do {
+                var request = URLRequest(url: url)
+                request.timeoutInterval = 15
+                let (data, response) = try await URLSession.shared.data(for: request)
+                guard let http = response as? HTTPURLResponse,
+                      200..<300 ~= http.statusCode else { return nil }
+                return data
+            } catch {
+                return nil
+            }
+        }
+        inFlight[url] = task
+        let data = await task.value
+        inFlight[url] = nil
+        if let data { cachedData[url] = data }
+        return data
+    }
+}
+
 /// One selectable add-on catalog, offered by the Collections editor when
 /// choosing what a folder shows.
 struct AddonCatalogOption: Identifiable {
@@ -1077,15 +1110,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return preference.enabled
     }
 
-    /// Manifest cache for the configured stream add-ons, shared by the home
-    /// catalog rows and the collection-folder resolver.
-    private var manifestByURL: [URL: AddonManifest] = [:]
-
     private func manifest(for url: URL) async -> AddonManifest? {
-        if let cached = manifestByURL[url] { return cached }
-        guard let manifest: AddonManifest = try? await fetch(url) else { return nil }
-        manifestByURL[url] = manifest
-        return manifest
+        guard let data = await StremioManifestDataCache.shared.data(for: url) else {
+            return nil
+        }
+        return try? JSONDecoder().decode(AddonManifest.self, from: data)
     }
 
     func getCollectionFolderItems(sources: [NuvioCollectionCatalogSource], limit: Int) async -> [NuvioMeta] {

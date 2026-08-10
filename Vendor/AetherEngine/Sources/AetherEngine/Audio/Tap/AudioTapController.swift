@@ -23,7 +23,7 @@ final class AudioTapController {
         continuation = cont
         filter = AudioTapMonotonicFilter(downstream: { buf in _ = cont.yield(buf) })
         startReader { [weak self] stop in self?.stopReader = stop }
-        cont.onTermination = { _ in
+        cont.onTermination = { [weak self] _ in
             // Consumer cancelled (broke the for-await loop): tear down from the MainActor.
             Task { @MainActor [weak self] in self?.teardown() }
         }

@@ -14,7 +14,7 @@ final class NuvioSyncManager: ObservableObject {
     /// Posted by the Settings add-on list after an order/enabled-state change.
     /// The object is `[StreamAddonPreference]`, with `[String]` accepted for the
     /// old reorder-only path.
-    static let addonOrderChangedNotification = Notification.Name("nuvio.tv.addons.orderChanged")
+    nonisolated static let addonOrderChangedNotification = Notification.Name("nuvio.tv.addons.orderChanged")
     /// Posted after an account pull has applied every profile-scoped Home input.
     /// Revision counters publish individual changes, while this completion
     /// signal guarantees one final catalog rebuild on slower physical devices.
@@ -707,7 +707,7 @@ final class NuvioSyncManager: ObservableObject {
         guard let target = await currentSyncTarget() else { return false }
         // Same ownership rule as the debounced push — this path skips
         // `pushLocalSnapshots` entirely, so it needs the gate of its own.
-        if let profileId = await profileViewModel?.activeProfile?.id,
+        if let profileId = profileViewModel?.activeProfile?.id,
            !Self.ownsWatchState(for: profileId) {
             return false
         }

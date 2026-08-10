@@ -14,6 +14,7 @@ import AetherLibavutil
 /// latches the first non-square SAR per stream, and the renderer keys its format-description
 /// cache on PAR as well.
 @Suite("Software-path SAR resolution, latch, and PAR-keyed format cache (#177)")
+@MainActor
 struct Issue177SARLatchTests {
 
     private func rational(_ num: Int32, _ den: Int32) -> AVRational {

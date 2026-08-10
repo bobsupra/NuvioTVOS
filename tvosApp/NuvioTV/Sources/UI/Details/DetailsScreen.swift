@@ -230,12 +230,12 @@ struct DetailsScreen: View {
             }
         }
         #endif
-        .onChange(of: viewModel.uiState.isLoadingStreams) { isLoading in
+        .onChange(of: viewModel.uiState.isLoadingStreams) { _, isLoading in
             if !isLoading {
                 finishSmartPlaybackIfPossible()
             }
         }
-        .onChange(of: viewModel.uiState.isLoading) { isLoading in
+        .onChange(of: viewModel.uiState.isLoading) { _, isLoading in
             if !isLoading {
                 presentInitialStreamPickerIfNeeded()
             }
@@ -1787,7 +1787,7 @@ struct TvDetailsContent: View {
             // episode on the way out, and while that capture stands every other
             // control here is unfocusable, so the engine can only put focus back
             // where it was.
-            .onChange(of: isEnabled) { enabled in
+            .onChange(of: isEnabled) { _, enabled in
                 if !enabled {
                     restoreGeneration &+= 1
                     restoreEpisodeKey = episodeFocus
@@ -1795,7 +1795,7 @@ struct TvDetailsContent: View {
                     restoreEpisodeFocus(to: target, generation: restoreGeneration)
                 }
             }
-            .onChange(of: episodeFocus) { newValue in
+            .onChange(of: episodeFocus) { _, newValue in
                 // Restoration landed — lift the restriction.
                 if let newValue, newValue == restoreEpisodeKey {
                     restoreEpisodeKey = nil
@@ -2233,7 +2233,7 @@ private struct TvDetailsActionButton: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
         }
         .simultaneousGesture(
@@ -2599,7 +2599,7 @@ private struct TvDetailsSectionButton: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.035 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused {
                 onFocus()
             }
@@ -2778,7 +2778,7 @@ private struct TvDetailsCompanyCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.05 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
         }
         .disabled(company.tmdbId == nil)
@@ -2891,7 +2891,7 @@ private struct TvDetailsCommentCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.03 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
         }
     }
@@ -3024,7 +3024,7 @@ private struct TvDetailsPersonCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.08 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused {
                 onFocus()
             }
@@ -3372,7 +3372,7 @@ private struct TvSeasonPill: View {
         .scaleEffect(isFocused ? 1.06 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .animation(.easeOut(duration: 0.14), value: isSelected)
-        .onChange(of: isFocused) { focused in
+        .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
         }
         .onMoveCommand { direction in
@@ -3499,7 +3499,7 @@ private struct TvEpisodeCard: View {
             .disabled(restrictFocusToKey != nil && restrictFocusToKey != cardKey)
             .scaleEffect(isFocused ? 1.05 : 1)
             .animation(.easeOut(duration: 0.14), value: isFocused)
-            .onChange(of: isFocused) { focused in
+            .onChange(of: isFocused) { _, focused in
                 if focused { onFocus() }
             }
             // tvOS delivers the Menu press that dismisses a context menu to the
@@ -3547,7 +3547,7 @@ private struct TvEpisodeCard: View {
             .animation(.easeOut(duration: 0.14), value: isWatchedControlFocused)
             .accessibilityLabel(isWatched ? "Mark episode as unwatched" : "Mark episode as watched")
             .padding(18)
-            .onChange(of: isWatchedControlFocused) { focused in
+            .onChange(of: isWatchedControlFocused) { _, focused in
                 if focused { onFocus() }
             }
         }
@@ -3880,7 +3880,7 @@ private struct TvStreamPickerOverlay: View {
             }
             // Progressive add-on results, filter chips, sort, and debrid toggle
             // all flow through this cache key. Focus is excluded.
-            .onChange(of: listCacheKey) { _ in
+            .onChange(of: listCacheKey) { _, _ in
                 refreshDisplayedStreamsIfNeeded()
                 seedStreamFocusIfNeeded()
             }
@@ -3894,7 +3894,7 @@ private struct TvStreamPickerOverlay: View {
             // cards before landing on the next one; re-seeding on that blip
             // snaps focus back to the first stream (the reported bug), so we
             // debounce and bail when focus has already landed somewhere.
-            .onChange(of: focusedItem) { newValue in
+            .onChange(of: focusedItem) { _, newValue in
                 guard newValue == nil else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     if focusedItem == nil {
@@ -4553,11 +4553,11 @@ private struct TvStreamImportedBadgeRow: View {
             .onAppear {
                 animationStart = Date()
             }
-            .onChange(of: geometry.size.width) { width in
+            .onChange(of: geometry.size.width) { _, width in
                 _ = width
                 animationStart = Date()
             }
-            .onChange(of: isScrolling) { _ in
+            .onChange(of: isScrolling) { _, _ in
                 animationStart = Date()
             }
         }

@@ -173,7 +173,7 @@ public struct LibraryView: View {
             .padding(.horizontal, LibraryGridMetrics.pageInset)
             .padding(.top, 56)
         }
-        .onChange(of: focusedItemID) { newValue in
+        .onChange(of: focusedItemID) { _, newValue in
             if let newValue {
                 lastFocusedItemID = newValue
                 shouldRestoreFocus = false
@@ -187,7 +187,7 @@ public struct LibraryView: View {
         // `defaultFocus`. While `overlayRestoreItemID` is set every other card
         // is unfocusable, so the engine can only land back on the saved card
         // -- no scroll-to-top flash. See TVHomeView for the full story.
-        .onChange(of: isEnabled) { enabled in
+        .onChange(of: isEnabled) { _, enabled in
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreItemID = focusedItemID ?? lastFocusedItemID
