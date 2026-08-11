@@ -150,6 +150,10 @@ enum SettingsKey {
     static let posterLabels = "nuvio.tv.settings.layout.posterLabels"
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
     static let discoverLocation = "nuvio.tv.settings.layout.discoverLocation"
+    /// Which Search screen the Search tab shows: `"Netflix"` (embedded
+    /// key-by-key keyboard with a title list beside the poster grid) or
+    /// `"Classic"` (system-keyboard search bar over a full-width poster grid).
+    static let searchStyle = "nuvio.tv.settings.layout.searchStyle"
     static let continueWatchingSort = "nuvio.tv.settings.layout.continueWatchingSort"
     static let upNextFromFurthestEpisode = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
     static let showUnairedNextUp = "nuvio.tv.settings.layout.showUnairedNextUp"
@@ -258,6 +262,7 @@ enum SettingsKey {
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
+        searchStyle,
         continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
         hideUnreleased, showFullDates,
         traktConnected, traktClientID, traktClientSecret,
@@ -2018,6 +2023,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
+    @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage(SettingsKey.continueWatchingSort) private var continueWatchingSort = "Default"
     @AppStorage(SettingsKey.upNextFromFurthestEpisode) private var upNextFromFurthestEpisode = true
     @AppStorage(SettingsKey.showUnairedNextUp) private var showUnairedNextUp = true
@@ -2031,6 +2037,7 @@ private struct LayoutDiscoverySettingsView: View {
     // Search is the only screen that currently hosts the full Discover surface.
     // Do not offer Home/Library as dead selections that merely hide Discover.
     private let discoverLocations = ["Search", "Off"]
+    private let searchStyles = ["Netflix", "Classic"]
     private let continueWatchingSorts = ["Default", "Recently watched", "Release order", "Next up"]
 
     var body: some View {
@@ -2149,6 +2156,22 @@ private struct LayoutDiscoverySettingsView: View {
                     fallback: "Visibility rules for discovery and continue watching"
                 )
             ) {
+                SettingsOptionRow(
+                    title: L10n.string("tvos_layout_search_style", fallback: "Search Style"),
+                    subtitle: L10n.string(
+                        "tvos_layout_search_style_subtitle",
+                        fallback: "Netflix keeps an on-screen keyboard up with a title list beside the posters; Classic uses the system keyboard over a full-width grid"
+                    ),
+                    selection: $searchStyle,
+                    options: searchStyles,
+                    accentColor: accentColor
+                )
+                .onAppear {
+                    if !searchStyles.contains(searchStyle) {
+                        searchStyle = "Netflix"
+                    }
+                }
+
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_discover_entry", fallback: "Discover Entry"),
                     subtitle: L10n.string(

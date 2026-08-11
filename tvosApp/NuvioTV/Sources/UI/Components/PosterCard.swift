@@ -743,6 +743,13 @@ struct PosterGridCard: View {
     var onInitialFocusRequested: (() -> Void)? = nil
     var onFocus: ((NuvioMeta) -> Void)? = nil
     var onLongPress: (() -> Void)? = nil
+    /// Forces the title/subtitle caption to render regardless of the user's
+    /// global poster-labels setting (used by Search's Netflix-style grid).
+    var forceShowLabels = false
+    /// Optional directional-command hook installed on the focusable Button
+    /// itself. Container-level handlers can miss commands consumed by tvOS's
+    /// focus engine before they bubble out of a poster.
+    var onMove: ((MoveCommandDirection) -> Void)? = nil
     let action: () -> Void
 
     @FocusState private var focused: Bool
@@ -791,7 +798,7 @@ struct PosterGridCard: View {
                     radius: showsFocusedAppearance ? 16 : 6
                 )
 
-                if posterLabels {
+                if posterLabels || forceShowLabels {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(meta.name)
                             .font(.system(size: 20, weight: .semibold))
@@ -811,6 +818,7 @@ struct PosterGridCard: View {
         .focused($focused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusValue ?? meta.id))
         .focusEffectDisabledIfAvailable()
+        .modifier(OptionalMoveCommandHandler(handler: onMove))
         .simultaneousGesture(
             LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
         )
@@ -846,6 +854,19 @@ struct PosterGridCard: View {
         if let year = meta.year { parts.append(String(year)) }
         if let rating = meta.rating, rating > 0 { parts.append(String(format: "★ %.1f", rating)) }
         return parts.joined(separator: "  ·  ")
+    }
+}
+
+private struct OptionalMoveCommandHandler: ViewModifier {
+    let handler: ((MoveCommandDirection) -> Void)?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let handler {
+            content.onMoveCommand(perform: handler)
+        } else {
+            content
+        }
     }
 }
 #endif
