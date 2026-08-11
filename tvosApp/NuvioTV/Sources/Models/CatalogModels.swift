@@ -401,6 +401,24 @@ enum EpisodeReleasePolicy {
     }
 }
 
+/// Catalog-level completion for series. Specials are excluded, and an episode
+/// dated today or later does not hold back the badge until it has aired under
+/// the app's existing date-only release policy.
+enum CatalogWatchedPolicy {
+    static func hasWatchedAllAiredEpisodes(
+        videos: [NuvioVideo]?,
+        watchedEpisodeKeys: Set<String>
+    ) -> Bool {
+        let airedEpisodes = (videos ?? []).filter {
+            $0.season > 0 && $0.episode > 0 && EpisodeReleasePolicy.hasAired($0.released)
+        }
+        guard !airedEpisodes.isEmpty else { return false }
+        return airedEpisodes.allSatisfy {
+            watchedEpisodeKeys.contains("\($0.season):\($0.episode)")
+        }
+    }
+}
+
 enum UpNextEpisodeSelectionPolicy {
     static let preferenceKey = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
 
@@ -3672,7 +3690,7 @@ enum WatchedStore {
     /// explicitly). Episode-level entries deliberately don't count here so one
     /// finished episode doesn't checkmark the whole series poster.
     static func contains(metaId: String, type: String) -> Bool {
-        items().contains {
+        visibleItems().contains {
             $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
                 && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
                 && $0.season == nil && $0.episode == nil
@@ -3685,6 +3703,20 @@ enum WatchedStore {
     static func visibleItems() -> [WatchedStoreItem] {
         let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
         return items().filter { $0.isVisible(under: source) }
+    }
+
+    /// Alias-aware keys for catalog badges. A Trakt IMDb row and a TMDB-backed
+    /// catalog preview for the same title must resolve to the same checkmark.
+    static func visibleWholeTitleIdentityKeys() -> Set<String> {
+        Set(visibleItems().flatMap { item -> [String] in
+            guard item.season == nil, item.episode == nil else { return [] }
+            return Array(catalogTitleIdentityKeys(for: item.meta))
+        })
+    }
+
+    static func catalogTitleIdentityKeys(for meta: NuvioMeta) -> Set<String> {
+        let type = normalizedType(meta.type)
+        return Set(contentIdentityKeys(for: meta).map { "\(type)\u{1f}\($0)" })
     }
 
     static func contains(meta: NuvioMeta) -> Bool {

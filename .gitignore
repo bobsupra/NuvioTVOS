@@ -9,6 +9,7 @@ xcuserdata
 local.properties
 .idea
 .vscode/
+.freebuff/
 .DS_Store
 captures
 .externalNativeBuild

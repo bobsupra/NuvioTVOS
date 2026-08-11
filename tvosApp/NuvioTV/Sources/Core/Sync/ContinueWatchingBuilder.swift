@@ -102,6 +102,10 @@ enum ContinueWatchingBuilder {
         generation &+= 1
         let currentGeneration = generation
         let profileId = WatchProgressLedger.activeProfileId
+        // Metadata resolution below suspends. Keep the exact ledger input so a
+        // playback save that lands while it is in flight cannot be overwritten
+        // by this older derived row.
+        let ledgerSnapshot = WatchProgressLedger.records()
 
         let candidates = WatchProgressLedger.continueWatchingCandidates()
         let seeds = WatchProgressLedger.upNextSeeds()
@@ -125,12 +129,28 @@ enum ContinueWatchingBuilder {
         )
         guard !Task.isCancelled, currentGeneration == generation else { return }
 
+        // Finishing an episode writes its completed ledger row and then saves a
+        // display-only Next Up card. A rebuild that began before those writes
+        // used to finish afterward, filter its stale resume row as watched, and
+        // replace the freshly saved card with an empty page. Leave the newer
+        // store untouched and derive it again from the completed ledger row.
+        guard rebuildInputIsCurrent(ledgerSnapshot) else {
+            diagnostic = "\(reason): ledger changed while building, retrying"
+            scheduleRebuild(reason: "\(reason) (ledger changed)")
+            return
+        }
+
         // Only the first page is persisted; it is what a cold start renders.
         ContinueWatchingStore.replaceAll(page.items)
         diagnostic = "\(reason): ledger \(WatchProgressLedger.records().count), "
             + "candidates \(candidates.count), seeds \(seeds.count), plan \(plan.count), "
             + "page 1 built \(page.items.count), showing \(ContinueWatchingStore.items().count), "
             + "lookups failed \(page.failedLookups)"
+    }
+
+    /// Visible for regression coverage of the stale-rebuild commit gate.
+    static func rebuildInputIsCurrent(_ snapshot: [WatchProgressRecord]) -> Bool {
+        WatchProgressLedger.records() == snapshot
     }
 
     /// Renders the next page of titles. Returns every item built so far so the

@@ -52,6 +52,9 @@ struct PosterCard: View {
     /// Keeps the last-selected card visually outlined while an overlay owns
     /// tvOS focus. The parent supplies this for exactly one saved card.
     var retainFocusAppearance: Bool = false
+    /// Lets Home retain off-window artwork without leaving every card in the
+    /// tvOS focus graph.
+    var allowsFocus: Bool = true
     var isWatched: Bool? = nil
     let onClick: () -> Void
 
@@ -76,7 +79,7 @@ struct PosterCard: View {
         #if os(tvOS)
         posterContent
             .contentShape(Rectangle())
-            .focusable(true)
+            .focusable(allowsFocus)
             .focused($isFocused)
             .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue ?? meta.id))
             .nuvioFocusEffectDisabledIfAvailable()
@@ -165,7 +168,6 @@ struct PosterCard: View {
                 placeholderView
             }
             .frame(width: cardWidth, height: cardHeight)
-            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
             #if os(tvOS)
             // Cross-fade the landscape artwork away only once the resolved
             // trailer is ready to draw, avoiding a black frame on slow links.
@@ -212,6 +214,10 @@ struct PosterCard: View {
                     }
                 }
             }
+            // Mask the complete card interior after composing both the trailer
+            // and landscape artwork overlays. The focus border remains outside
+            // this mask so its stroke stays crisp.
+            .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
             .overlay(
                 RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                     .stroke(focusedBorderColor, lineWidth: focusedBorderWidth)
@@ -566,6 +572,44 @@ struct PosterCard: View {
         false
     }
     #endif
+}
+
+// Home's vertical offset animates at the parent level. Without an equality
+// boundary, every parent focus update rebuilds the full poster subtree for
+// every mounted row, even though almost every card is unchanged. Keep dynamic
+// focus bindings inside the retained subtree while invalidating it only when a
+// value that affects the card's rendering or focus eligibility changes.
+extension PosterCard: Equatable {
+    static func == (lhs: PosterCard, rhs: PosterCard) -> Bool {
+        lhs.meta.id == rhs.meta.id
+            && lhs.meta.name == rhs.meta.name
+            && lhs.meta.posterUrl == rhs.meta.posterUrl
+            && lhs.meta.backgroundUrl == rhs.meta.backgroundUrl
+            && lhs.meta.logoUrl == rhs.meta.logoUrl
+            && lhs.meta.imdbId == rhs.meta.imdbId
+            && lhs.meta.tmdbId == rhs.meta.tmdbId
+            && lhs.meta.type == rhs.meta.type
+            && lhs.meta.trailerYtIds == rhs.meta.trailerYtIds
+            && lhs.isLandscape == rhs.isLandscape
+            && lhs.continueProgress == rhs.continueProgress
+            && lhs.continueRemainingText == rhs.continueRemainingText
+            && lhs.continueEpisodeText == rhs.continueEpisodeText
+            && lhs.continueEpisodeTitleText == rhs.continueEpisodeTitleText
+            && lhs.continueEpisodeArtworkURL == rhs.continueEpisodeArtworkURL
+            && lhs.continueIsUpNext == rhs.continueIsUpNext
+            && lhs.continueUpNextBadgeText == rhs.continueUpNextBadgeText
+            && lhs.showsWatchedBadge == rhs.showsWatchedBadge
+            && lhs.shouldRequestInitialFocus == rhs.shouldRequestInitialFocus
+            && lhs.externalFocusValue == rhs.externalFocusValue
+            && (lhs.onLongPress != nil) == (rhs.onLongPress != nil)
+            && lhs.layoutMode == rhs.layoutMode
+            && lhs.showPosterLabels == rhs.showPosterLabels
+            && lhs.smoothFocusAnimations == rhs.smoothFocusAnimations
+            && lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled
+            && lhs.retainFocusAppearance == rhs.retainFocusAppearance
+            && lhs.allowsFocus == rhs.allowsFocus
+            && lhs.isWatched == rhs.isWatched
+    }
 }
 
 #if os(tvOS)
@@ -1252,6 +1296,37 @@ private extension UIImage {
 }
 #endif
 
+/// Deduplicates full-series metadata requests made by catalog badges. Catalog
+/// previews usually omit `videos`, so completion cannot be decided until the
+/// episode guide is available. Only series with watched episode rows reach this
+/// cache, avoiding a request for every untouched poster on screen.
+@MainActor
+private final class CatalogWatchedMetadataCache {
+    static let shared = CatalogWatchedMetadataCache()
+
+    private let repository = CinemetaCatalogRepository()
+    private var metadataByKey: [String: NuvioMeta] = [:]
+    private var inFlightByKey: [String: Task<NuvioMeta?, Never>] = [:]
+
+    func fullMetadata(metaId: String, type: String, preview: NuvioMeta?) async -> NuvioMeta? {
+        if let preview, preview.videos?.isEmpty == false { return preview }
+
+        let profile = WatchedStore.activeProfileId ?? "default"
+        let key = "\(profile)\u{1f}\(type.lowercased())\u{1f}\(metaId.lowercased())"
+        if let cached = metadataByKey[key] { return cached }
+        if let inFlight = inFlightByKey[key] { return await inFlight.value }
+
+        let task: Task<NuvioMeta?, Never> = Task {
+            try? await repository.getMetadata(id: metaId, type: type)
+        }
+        inFlightByKey[key] = task
+        let resolved = await task.value
+        inFlightByKey[key] = nil
+        if let resolved { metadataByKey[key] = resolved }
+        return resolved
+    }
+}
+
 struct WatchedCheckmarkIcon: View {
     var size: CGFloat = 38
 
@@ -1301,18 +1376,53 @@ struct WatchedCheckmarkBadge: View {
                 WatchedCheckmarkIcon(size: size)
             }
         }
-        .onAppear(perform: refresh)
+        .task(id: refreshIdentity) {
+            await refresh()
+        }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
-            refresh()
+            Task { await refresh() }
         }
     }
 
-    private func refresh() {
-        // Series watched state lives on the episode cards inside Details; the
-        // poster badge is movies-only.
+    private var refreshIdentity: String {
+        "\(WatchedStore.activeProfileId ?? "default")\u{1f}\(type.lowercased())\u{1f}\(metaId)"
+    }
+
+    @MainActor
+    private func refresh() async {
         let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
-        isWatched = !isSeries && (meta.map { WatchedStore.contains(meta: $0) }
-            ?? WatchedStore.contains(metaId: metaId, type: type))
+        guard isSeries else {
+            isWatched = meta.map { WatchedStore.contains(meta: $0) }
+                ?? WatchedStore.contains(metaId: metaId, type: type)
+            return
+        }
+
+        if meta.map({ WatchedStore.contains(meta: $0) })
+            ?? WatchedStore.contains(metaId: metaId, type: type) {
+            isWatched = true
+            return
+        }
+
+        // No watched episodes means this cannot be a completed series, and it
+        // also lets untouched catalog cards avoid a metadata network request.
+        let previewWatchedKeys = meta.map { WatchedStore.watchedEpisodeKeys(meta: $0) }
+            ?? WatchedStore.watchedEpisodeKeys(metaId: metaId)
+        guard !previewWatchedKeys.isEmpty else {
+            isWatched = false
+            return
+        }
+
+        guard let fullMeta = await CatalogWatchedMetadataCache.shared.fullMetadata(
+            metaId: metaId,
+            type: type,
+            preview: meta
+        ), !Task.isCancelled else { return }
+
+        isWatched = WatchedStore.contains(meta: fullMeta)
+            || CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+                videos: fullMeta.videos,
+                watchedEpisodeKeys: WatchedStore.watchedEpisodeKeys(meta: fullMeta)
+            )
     }
 }
 

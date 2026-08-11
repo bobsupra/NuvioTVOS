@@ -946,6 +946,51 @@ private final class RequestCounter: @unchecked Sendable {
     }
 }
 
+final class CatalogWatchedPolicyTests: XCTestCase {
+    func testSeriesIsWatchedWhenEveryAiredRegularEpisodeIsWatched() {
+        let videos = [
+            episode(season: 0, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 2, released: "2000-01-02"),
+            episode(season: 1, episode: 3, released: "2999-01-01"),
+        ]
+
+        XCTAssertTrue(
+            CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+                videos: videos,
+                watchedEpisodeKeys: ["1:1", "1:2"]
+            )
+        )
+    }
+
+    func testSeriesIsNotWatchedWhenAnAiredEpisodeIsMissing() {
+        let videos = [
+            episode(season: 1, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 2, released: "2000-01-02"),
+        ]
+
+        XCTAssertFalse(
+            CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+                videos: videos,
+                watchedEpisodeKeys: ["1:1"]
+            )
+        )
+    }
+
+    private func episode(season: Int, episode: Int, released: String) -> NuvioVideo {
+        NuvioVideo(
+            id: "test:\(season):\(episode)",
+            title: "Episode \(episode)",
+            season: season,
+            episode: episode,
+            thumbnail: nil,
+            overview: nil,
+            released: released,
+            rating: nil
+        )
+    }
+}
+
 final class WatchedIdentityPolicyTests: XCTestCase {
     /// A mark belongs to the backend that was selected when it was made, and
     /// only that backend confirms it on a pull. Switching the selected source
@@ -1375,6 +1420,41 @@ final class EpisodeResumeIsolationTests: XCTestCase {
                 .contains { $0.progressKey == "tt-test_s1e2" },
             "a finished episode must not also be offered as resume progress"
         )
+    }
+
+    /// A metadata rebuild can overlap the final playback save. Its old input
+    /// must not be allowed to replace the newer display-only Next Up card.
+    @MainActor
+    func testRebuildRejectsLedgerSnapshotChangedByEpisodeCompletion() {
+        let meta = makeSeries()
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e02.mkv",
+            position: 2_400,
+            duration: 3_000,
+            season: 1,
+            episode: 2,
+            episodeId: "tt-test:1:2"
+        )
+        let rebuildSnapshot = WatchProgressLedger.records()
+        XCTAssertTrue(ContinueWatchingBuilder.rebuildInputIsCurrent(rebuildSnapshot))
+
+        ContinueWatchingStore.markPlaybackCompleted(
+            meta: meta,
+            duration: 3_000,
+            season: 1,
+            episode: 2
+        )
+        ContinueWatchingStore.saveUpNext(
+            meta: meta,
+            duration: 3_000,
+            season: 1,
+            episode: 3,
+            seedSeason: 1
+        )
+
+        XCTAssertFalse(ContinueWatchingBuilder.rebuildInputIsCurrent(rebuildSnapshot))
+        XCTAssertTrue(ContinueWatchingStore.item(for: meta.id)?.isUpNextEntry == true)
     }
 
     /// A just-finished episode must outrank months-old progress when the metadata
