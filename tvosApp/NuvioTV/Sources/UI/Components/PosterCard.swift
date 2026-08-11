@@ -699,6 +699,9 @@ struct PosterGridCard: View {
     var onInitialFocusRequested: (() -> Void)? = nil
     var onFocus: ((NuvioMeta) -> Void)? = nil
     var onLongPress: (() -> Void)? = nil
+    /// Forces the title/subtitle caption to render regardless of the user's
+    /// global poster-labels setting (used by Search's Netflix-style grid).
+    var forceShowLabels = false
     let action: () -> Void
 
     @FocusState private var focused: Bool
@@ -747,7 +750,7 @@ struct PosterGridCard: View {
                     radius: showsFocusedAppearance ? 16 : 6
                 )
 
-                if posterLabels {
+                if posterLabels || forceShowLabels {
                     VStack(alignment: .leading, spacing: 3) {
                         Text(meta.name)
                             .font(.system(size: 20, weight: .semibold))

@@ -149,7 +149,12 @@ struct ContentView: View {
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
+    // Both search screens are backed by their own view model. Only the one
+    // picked by `SettingsKey.searchStyle` is rendered, but both are held here
+    // so switching styles doesn't tear down and refetch the other's state.
+    // They share the same recent-search storage key.
     @StateObject private var searchViewModel = SearchViewModel()
+    @StateObject private var netflixSearchViewModel = NetflixSearchViewModel()
     @StateObject private var libraryViewModel = LibraryViewModel()
     // Owned here (not inside TVHomeView) so the Home catalog + focused card
     // survive the details/player push, which tears TVHomeView down. Returning
@@ -1196,6 +1201,7 @@ struct ContentView: View {
             selectedTab: $selectedTab,
             activeProfile: profileViewModel.activeProfile,
             searchViewModel: searchViewModel,
+            netflixSearchViewModel: netflixSearchViewModel,
             libraryViewModel: libraryViewModel,
             homeStore: homeStore,
             homeCatalogRevision: syncManager.homeCatalogRevision,
@@ -1256,6 +1262,8 @@ struct ContentView: View {
                 homeStore.reset()
                 searchViewModel.clear()
                 searchViewModel.clearRecent()
+                netflixSearchViewModel.clear()
+                netflixSearchViewModel.clearRecent()
                 withAnimation(.easeInOut(duration: 0.28)) {
                     selectedTab = .home
                     profileViewModel.activeProfile = nil
@@ -1924,6 +1932,7 @@ private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
     let activeProfile: Profile?
     @ObservedObject var searchViewModel: SearchViewModel
+    @ObservedObject var netflixSearchViewModel: NetflixSearchViewModel
     @ObservedObject var libraryViewModel: LibraryViewModel
     @ObservedObject var homeStore: TVHomeStore
     let homeCatalogRevision: UInt
@@ -1951,6 +1960,7 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
+    @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
     @StateObject private var profileTabAvatar = ProfileTabAvatarRenderer()
 
@@ -1972,6 +1982,26 @@ private struct TVMainTabView: View {
                 .tabViewStyle(.sidebarAdaptable)
         } else {
             tabs
+        }
+    }
+
+    /// Search screen chosen in Settings → Layout & Discovery → Search Style.
+    @ViewBuilder
+    private var searchTab: some View {
+        if searchStyle == "Classic" {
+            SearchView(
+                viewModel: searchViewModel,
+                showDiscover: discoverLocation == "Search",
+                onContentClick: onNavigateToDetails,
+                onLongPress: onLongPressCard
+            )
+        } else {
+            NetflixSearchView(
+                viewModel: netflixSearchViewModel,
+                showDiscover: discoverLocation == "Search",
+                onContentClick: onNavigateToDetails,
+                onLongPress: onLongPressCard
+            )
         }
     }
 
@@ -2021,12 +2051,7 @@ private struct TVMainTabView: View {
                 }
                 .tag(TVTab.home)
 
-            SearchView(
-                viewModel: searchViewModel,
-                showDiscover: discoverLocation == "Search",
-                onContentClick: onNavigateToDetails,
-                onLongPress: onLongPressCard
-            )
+            searchTab
                 .tabItem {
                     Label(TVTab.search.title, systemImage: TVTab.search.symbol)
                 }

@@ -57,8 +57,7 @@ struct SearchView: View {
 
             VStack(alignment: .leading, spacing: 24) {
                 header
-                    .frame(width: SearchGridMetrics.cardRowWidth, alignment: .leading)
-                    .padding(.horizontal, SearchGridMetrics.gridContentInset)
+                    .frame(maxWidth: .infinity, alignment: .leading)
                     .disabled(overlayRestoreResultID != nil || discoverOverlayTransitionActive)
                     .zIndex(1)
 
@@ -102,8 +101,14 @@ struct SearchView: View {
             .ignoresSafeArea(.container, edges: .bottom)
         }
         .onAppear {
-            if !viewModel.hasQuery {
-                DispatchQueue.main.async { searchBarFocused = true }
+            viewModel.reloadRecent()
+            DispatchQueue.main.async {
+                if !viewModel.hasQuery {
+                    searchBarFocused = true
+                }
+                // Netflix keeps the keyboard persistently up on the Search tab
+                // instead of popping it as a modal on first tap.
+                searchTextInputActive = true
             }
         }
         .onChange(of: focusedResultID) { newValue in
@@ -148,13 +153,7 @@ struct SearchView: View {
     // MARK: - Header + glass search bar
 
     private var header: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            Text(L10n.string("nav_search", fallback: "Search"))
-                .font(.system(size: 46, weight: .bold))
-                .foregroundColor(.white)
-
-            searchBar
-        }
+        searchBar
     }
 
     private var searchBar: some View {
@@ -172,7 +171,7 @@ struct SearchView: View {
                 searchTextInputActive = true
             } label: {
                 Color.clear
-                    .frame(maxWidth: .infinity, minHeight: 86)
+                    .frame(maxWidth: .infinity, minHeight: 72)
                     .contentShape(Rectangle())
             }
             .buttonStyle(PosterCardButtonStyle())
@@ -187,7 +186,7 @@ struct SearchView: View {
 
                 Text(
                     viewModel.searchText.isEmpty
-                        ? L10n.string("search_placeholder", fallback: "Search movies & series")
+                        ? L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
                         : viewModel.searchText
                 )
                     .font(.system(size: 30, weight: .regular))
@@ -213,9 +212,9 @@ struct SearchView: View {
             }
         }
         .padding(.horizontal, 34)
-        .frame(height: 86)
+        .frame(height: 72)
         .frame(maxWidth: .infinity, alignment: .leading)
-        .modifier(GlassCapsule(focused: searchBarFocused || searchTextInputActive))
+        .modifier(GlassSearchBar(focused: searchBarFocused || searchTextInputActive))
     }
 
     // MARK: - Type filter
@@ -292,7 +291,8 @@ struct SearchView: View {
                         height: SearchGridMetrics.posterHeight,
                         externalFocus: $focusedResultID,
                         retainFocusAppearance: overlayRestoreResultID == item.id,
-                        onLongPress: onLongPress.map { cb in { cb(item) } }
+                        onLongPress: onLongPress.map { cb in { cb(item) } },
+                        forceShowLabels: true
                     ) {
                         overlayRestoreResultID = item.id
                         lastFocusedResultID = item.id
@@ -403,7 +403,9 @@ struct SearchView: View {
 
 // MARK: - Hidden text input
 
-private struct HiddenSearchTextField: UIViewRepresentable {
+// Internal (not private) so `NetflixSearchView` can reuse the same hidden
+// text field to fall back to tvOS's system keyboard for Siri dictation.
+struct HiddenSearchTextField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
 
@@ -467,7 +469,7 @@ private struct HiddenSearchTextField: UIViewRepresentable {
     }
 }
 
-private final class HiddenSearchUITextField: UITextField {
+final class HiddenSearchUITextField: UITextField {
     override var canBecomeFocused: Bool { false }
 }
 
@@ -525,6 +527,34 @@ struct GlassCapsule: ViewModifier {
             content.glassEffect(.regular, in: Capsule())
         } else {
             content.background(.ultraThinMaterial, in: Capsule())
+        }
+    }
+}
+
+/// Full-width rounded-rectangle glass field for Search (Netflix-style), with a
+/// material fallback for tvOS < 26.
+struct GlassSearchBar: ViewModifier {
+    let focused: Bool
+
+    func body(content: Content) -> some View {
+        glassed(content)
+            .overlay(
+                RoundedRectangle(cornerRadius: 22, style: .continuous)
+                    .stroke(
+                        focused ? AppFocusOutline.color : Color.white.opacity(0.18),
+                        lineWidth: focused ? AppFocusOutline.width : 1
+                    )
+            )
+            .scaleEffect(focused ? 1.008 : 1.0)
+            .animation(.easeOut(duration: 0.18), value: focused)
+    }
+
+    @ViewBuilder
+    private func glassed(_ content: Content) -> some View {
+        if #available(tvOS 26.0, *) {
+            content.glassEffect(.regular, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
+        } else {
+            content.background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 22, style: .continuous))
         }
     }
 }
