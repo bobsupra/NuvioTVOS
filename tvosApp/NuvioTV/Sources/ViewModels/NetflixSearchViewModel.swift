@@ -1,35 +1,20 @@
 import Foundation
 import Combine
 
-/// Content-type filter for the search screen.
-enum SearchContentType: String, CaseIterable, Identifiable {
-    case all, movie, series
-    var id: String { rawValue }
-
-    var title: String {
-        switch self {
-        case .all:
-            return L10n.string("library_type_all", fallback: "All")
-        case .movie:
-            return L10n.string("type_movies", fallback: L10n.string("type_movie", fallback: "Movies"))
-        case .series:
-            return L10n.string("type_series_plural", fallback: L10n.string("type_series", fallback: "Series"))
-        }
-    }
-}
-
+/// Netflix-style alternative to `SearchViewModel`. Same catalog search use
+/// case (`CatalogRepository.search(query:)`) and the same debounce/cache/
+/// recent-search shape, but exposes a couple of small keyboard-input helpers
+/// instead of a raw `searchText` binding, since `NetflixSearchView` builds
+/// its query from an on-screen key-by-key keyboard rather than a hidden text
+/// field.
 @MainActor
-class SearchViewModel: ObservableObject {
+class NetflixSearchViewModel: ObservableObject {
     @Published var searchText = ""
     @Published var results: [NuvioMeta] = []
     @Published var isLoading = false
     @Published var error: String?
     @Published var selectedType: SearchContentType = .all
     @Published var recentSearches: [String] = []
-    /// Last focused result card, kept here (outside the view, like
-    /// `TVHomeStore.lastFocusedCardID`) so it survives the details push and
-    /// returning restores that card instead of snapping to the first result.
-    var lastFocusedResultID: String?
 
     private let repository: CatalogRepository
     private var allResults: [NuvioMeta] = []
@@ -39,6 +24,8 @@ class SearchViewModel: ObservableObject {
     /// instantaneous without keeping stale search data on disk.
     private var cachedResults: [String: [NuvioMeta]] = [:]
     private var cacheOrder: [String] = []
+    // Same UserDefaults key as `SearchViewModel` so a user's search history
+    // carries over regardless of which search UI is wired up to navigation.
     private let recentKey = "nuvio.search.recent"
 
     init(repository: CatalogRepository = CinemetaCatalogRepository()) {
@@ -122,15 +109,28 @@ class SearchViewModel: ObservableObject {
         saveRecent()
     }
 
-    /// Re-reads the shared recent-search list. `NetflixSearchViewModel` writes
-    /// the same key, so whichever search style isn't on screen goes stale until
-    /// its view reappears.
+    /// Re-reads the shared recent-search list. `SearchViewModel` writes the
+    /// same key, so whichever search style isn't on screen goes stale until its
+    /// view reappears.
     func reloadRecent() {
         recentSearches = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
     }
 
     func clear() {
         searchText = ""
+    }
+
+    // MARK: - On-screen keyboard input
+
+    /// Appends one key from the on-screen keyboard. The keyboard has no
+    /// shift state, so letters always arrive lowercase.
+    func typeCharacter(_ character: String) {
+        searchText += character
+    }
+
+    func deleteLastCharacter() {
+        guard !searchText.isEmpty else { return }
+        searchText.removeLast()
     }
 
     private func commitRecentSearch(_ term: String) {
