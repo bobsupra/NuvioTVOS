@@ -43,19 +43,19 @@ The Apple TV build is published as a `.ipa` on the [Releases page](https://githu
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.6 (build 57)** (`tvosApp/NuvioTV/Info.plist`).
+The tree currently targets **version 3.2.7 (build 58)** (`tvosApp/NuvioTV/Info.plist`).
 
-[Beta 3.2.6](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.6) is the latest tvOS release:
+[Beta 3.2.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.7) is the latest tvOS release:
 
-[NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa)
+[NuvioTV-3.2.7-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.7/NuvioTV-3.2.7-unsigned-release.ipa)
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.2.6
+### New in Beta 3.2.7
 
-- Makes AI subtitle translation substantially cheaper by keeping a small adaptive look-ahead buffer, batching cache writes, and disabling unnecessary model reasoning.
-- Updates the built-in AetherEngine playback stack to 6.7.0, with playback, subtitle, stream, Top Shelf, and diagnostics improvements.
-- Adds configurable next-episode countdown and return-to-profile behavior, while updating signing for the `com.pyksel.nuviotvos` app identity.
+- Greatly reduces catalog-induced UI lag by caching shared add-on manifests and keeping only the active Home rows and nearby neighbours mounted.
+- Makes the Netflix-style search keyboard the default. To return to the previous search, go to **Settings → Layout & Discovery → Search Style → Classic**.
+- Refines Home focus restoration, vertical-row navigation, and playback/renderer handling; further real-device catalog testing is still needed.
 
 ### The new player
 
