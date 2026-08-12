@@ -17,6 +17,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 jobs:
   update-readme:
@@ -112,9 +113,11 @@ jobs:
             fi
           done <<< "$release_tags"
 
-      - name: Commit updated beta links
+      - name: Commit README update and open pull request
         env:
+          GH_TOKEN: ${{ github.token }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          PR_BRANCH: automation/update-latest-beta-links
         run: |
           set -euo pipefail
           if git diff --quiet -- README.md; then
@@ -124,6 +127,18 @@ jobs:
 
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git checkout -B "$PR_BRANCH"
           git add README.md
           git commit -m "docs: update latest beta links"
-          git push origin "HEAD:${DEFAULT_BRANCH}"
+          git push --force origin "HEAD:${PR_BRANCH}"
+
+          existing_pr="$(gh pr list --head "$PR_BRANCH" --base "$DEFAULT_BRANCH" --state open --json url --jq '.[0].url // empty')"
+          if [ -n "$existing_pr" ]; then
+            echo "Updated existing pull request: $existing_pr"
+          else
+            gh pr create \
+              --base "$DEFAULT_BRANCH" \
+              --head "$PR_BRANCH" \
+              --title "docs: update latest beta links" \
+              --body "Updates the README beta hub with the latest download, release notes, notification, and feedback links."
+          fi
