@@ -46,12 +46,18 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.2.7** is the latest tvOS release.
+**Beta 3.2.8** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.7/NuvioTV-3.2.7-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.7) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.8/NuvioTV-3.2.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
+
+### New in Beta 3.2.8
+
+- Updates AetherEngine to 6.21.0 and FFmpegBuild to 2.4.2 with live-stream, subtitle delivery, timing, recovery, and display-path improvements.
+- Improves watched-series and Continue Watching behavior, including manual episode history, season rollover alerts, and safer Trakt/Simkl reconciliation.
+- Enriches catalog and search results with full metadata, artwork, logos, and identifiers while improving Home focus restoration.
 
 ### The new player
 

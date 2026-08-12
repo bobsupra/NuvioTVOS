@@ -204,6 +204,56 @@ final class HLSPlaylistTests: XCTestCase {
         XCTAssertThrowsError(try HLSPlaylistParser.parse("#EXTM3U\n#EXT-X-TARGETDURATION:6\n"))
     }
 
+    // AE#359: the master's SUBTITLES group was parsed away, so a live channel that offers WebVTT
+    // renditions (every public German broadcaster does) had no subtitle track to select. Fixture is
+    // MDR Sachsen's real master, trimmed to one variant and its rendition line.
+    func testParsesSubtitleRenditionsAndTheVariantGroup() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-VERSION:4
+        #EXT-X-MEDIA:TYPE=SUBTITLES,NAME="Untertitel",DEFAULT=YES,AUTOSELECT=YES,FORCED=NO,LANGUAGE="de",GROUP-ID="subs",URI="master-subs-1200.m3u8"
+        #EXT-X-STREAM-INF:BANDWIDTH=8500800,CODECS="avc1.64002a,mp4a.40.2",AUDIO="program_audio",SUBTITLES="subs"
+        master-1080p-5000.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertEqual(master.variants.first?.subtitleGroupID, "subs")
+        XCTAssertEqual(master.subtitleRenditions, [
+            HLSSubtitleRendition(groupID: "subs", uri: "master-subs-1200.m3u8",
+                                 name: "Untertitel", language: "de",
+                                 isDefault: true, isForced: false)
+        ])
+    }
+
+    func testMasterWithoutSubtitlesParsesUnchanged() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-STREAM-INF:BANDWIDTH=1000
+        v.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertTrue(master.subtitleRenditions.isEmpty)
+        XCTAssertNil(master.variants.first?.subtitleGroupID)
+    }
+
+    // An EXT-X-MEDIA line without a URI describes something muxed into the variant, not a fetchable
+    // rendition; taking it would publish a track whose playlist does not exist.
+    func testSubtitleRenditionWithoutURIIsIgnored() throws {
+        let text = """
+        #EXTM3U
+        #EXT-X-MEDIA:TYPE=SUBTITLES,NAME="CC",GROUP-ID="subs",LANGUAGE="en"
+        #EXT-X-STREAM-INF:BANDWIDTH=1000,SUBTITLES="subs"
+        v.m3u8
+        """
+        guard case .master(let master) = try HLSPlaylistParser.parse(text) else {
+            return XCTFail("expected master playlist")
+        }
+        XCTAssertTrue(master.subtitleRenditions.isEmpty)
+    }
+
     func testResolvesRelativeAndAbsoluteURIs() {
         let base = URL(string: "https://cdn.example.com/live/ch1/index.m3u8")!
         XCTAssertEqual(

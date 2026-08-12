@@ -2,29 +2,29 @@ import Testing
 import Foundation
 @testable import AetherEngine
 
-/// #174: the persistent reader applied backpressure by BLOCKING the URLSession delegate
-/// callback until the consumer drained below winHighWater. Blocking the delegate has no
-/// flow-control contract: whether the connection stops reading from the socket is a
-/// transport implementation detail. Plain HTTP/1.1 happens to park after a few MB of
-/// internal buffering, but the field crash (HTTPS origin, boringssl in the crashing
-/// stack, iPadOS) shows the TLS/H2 path keeps pulling at line rate and buffers the
-/// undelivered body in unbounded internal allocations (cold pages compress, then
-/// EXC_RESOURCE at the jetsam limit). Real, contractual flow control is task
-/// suspend/resume ("a task, while suspended, produces no network traffic"), the same
-/// mechanism the streaming path already uses (streamHighWater / streamLowWater).
+/// Backpressure history (#174 → #220 → #310) — each design fixed the previous one's failure
+/// mode, and these tests pin the current one:
+/// - #174: delegate-blocking had no flow-control contract (TLS/H2 transports keep reading at
+///   line rate into unbounded URLSession-internal allocations until jetsam) and was replaced
+///   with task suspend/resume.
+/// - #220: suspend() measured advisory — 911 MB arrived after a suspend — so requests became
+///   bounded ranges and a hard cap ended a connection the suspend failed to park.
+/// - #310: a task that DID park held a dormant established flow whose closed receive window
+///   starves every Network.framework flow in the process on user-space-networking OSes
+///   (tvOS/iOS). The suspend is gone: at winHighWater the connection is ENDED and the read
+///   loop re-requests at the frontier once the consumer drains below winLowWater. A stalled
+///   or paused consumer therefore holds NO connection at all — which is what these tests pin.
 ///
-/// These tests run a loopback HTTP/1.1 origin that counts every body byte it manages to
-/// write. The load-bearing assertion is the suspend state itself (the transport-agnostic
-/// mechanism); the origin byte bound is the regression guard that catches a backpressure
-/// removal without a replacement.
-@Suite("AVIOReader persistent backpressure (#174)")
+/// They run a loopback HTTP/1.1 origin that counts every body byte it manages to write and
+/// records every Range it is asked for.
+@Suite("AVIOReader persistent backpressure (#174/#220/#310)")
 struct Issue174PersistentReadBackpressureTests {
 
 
     // MARK: - Tests
 
-    @Test("stalled consumer parks the origin connection instead of buffering at line rate")
-    func stalledConsumerParksOrigin() async throws {
+    @Test("a stalled consumer is left with no live connection, not a parked one")
+    func stalledConsumerEndsOriginConnection() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
         defer { server.stop() }
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
@@ -35,25 +35,34 @@ struct Issue174PersistentReadBackpressureTests {
         // (muxer backpressured on SegmentCache high water, no read ever advances position).
         try await Task.sleep(for: .seconds(3))
 
-        // Origin line rate here is ~50 MB/s. Without real flow control the origin keeps
-        // serving (~150 MB in 3 s) into URLSession's internal buffering. With task-suspend
-        // backpressure it parks at winHighWater plus socket/transport buffer slack.
-        #expect(server.bytesWritten < 64 * 1024 * 1024,
+        // The #310 contract, in order of importance: the flow is GONE (a suspended task is a
+        // dormant flow), the end is recorded as backpressure so the refill path owns it, the
+        // window parked near winHighWater, the refill has not fired with nothing draining,
+        // and the origin was never asked to serve past the one bounded range.
+        #expect(!reader.hasLiveConnectionForTesting,
+                "a stalled consumer must hold no connection")
+        let diag = reader.windowDiagnostics
+        #expect(diag.parked,
+                "the end must be recorded as backpressure so the refill path owns it")
+        #expect(diag.aheadBytes < 32 * 1024 * 1024,
+                "window held \(diag.aheadBytes / (1024 * 1024)) MB against a 16 MB high water")
+        #expect(server.requestedRanges.filter { $0.start == 0 }.count == 1,
+                "the refill must not fire while nothing drains: \(server.requestedRanges)")
+        #expect(server.bytesWritten < 48 * 1024 * 1024,
                 "origin served \(server.bytesWritten / (1024 * 1024)) MB into a stalled consumer")
-        #expect(reader.persistentTaskIsSuspendedForTesting,
-                "the persistent task must be suspended once the window exceeds winHighWater")
     }
 
-    @Test("resuming consumption after a stall delivers fresh bytes (resume liveness)")
+    @Test("resuming consumption after a stall delivers fresh bytes at the frontier (refill liveness)")
     func drainAfterStallResumesDelivery() async throws {
-        let server = try #require(ThrottledOriginServer(totalSize: 256 * 1024 * 1024))
+        let totalSize: Int64 = 256 * 1024 * 1024
+        let server = try #require(ThrottledOriginServer(totalSize: totalSize))
         defer { server.stop() }
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
-        // Stall long enough for the suspend to engage, then consume far more than the
-        // window: delivery must keep flowing, which proves the task was resumed.
+        // Stall long enough for the high-water end to engage, then consume far more than the
+        // window: delivery must keep flowing, which proves the frontier refill runs.
         try await Task.sleep(for: .seconds(2))
 
         let sliceCap = 256 * 1024
@@ -68,10 +77,19 @@ struct Issue174PersistentReadBackpressureTests {
             got += Int(n)
         }
         #expect(got >= target, "only \(got / (1024 * 1024)) MB delivered after the stall")
+
+        // Every data-connection range must start at or past the previous one: a reconnect
+        // that reset below the frontier would be re-fetching resident bytes. The open-time
+        // speculative tail fetch is the one legitimate out-of-order range; it lives at the
+        // far end of the file and is excluded by position.
+        let dataStarts = server.requestedRanges.map(\.start)
+            .filter { $0 < totalSize - Int64(1024 * 1024) }
+        #expect(dataStarts == dataStarts.sorted(),
+                "a refill went backwards past the frontier: \(server.requestedRanges)")
     }
 
-    @Test("teardown while suspended releases the task and does not hang")
-    func teardownWhileSuspended() async throws {
+    @Test("teardown during the backpressure-ended state does not hang")
+    func teardownWhileParked() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
         defer { server.stop() }
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
@@ -79,11 +97,11 @@ struct Issue174PersistentReadBackpressureTests {
 
         try await Task.sleep(for: .seconds(2))
 
-        // Completing without a hang is the assertion; the suspended flag must be cleared
-        // so the balanced resume-before-cancel actually happened.
+        // Completing without a hang is the assertion: nothing may be left waiting on a
+        // connection that was deliberately ended and will never refill after close.
         reader.markClosed()
         reader.close()
-        #expect(!reader.persistentTaskIsSuspendedForTesting)
+        #expect(!reader.hasLiveConnectionForTesting)
     }
 
     /// #220: bounded ranges cannot be exercised against an origin that ignores the range end.

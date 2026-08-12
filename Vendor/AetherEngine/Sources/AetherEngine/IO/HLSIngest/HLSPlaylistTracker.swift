@@ -37,7 +37,8 @@ struct HLSPlaylistTracker {
                 let first = result[0]
                 result[0] = HLSMediaSegment(
                     uri: first.uri, duration: first.duration,
-                    discontinuityBefore: true, crypt: first.crypt
+                    discontinuityBefore: true, crypt: first.crypt,
+                    programDateTime: first.programDateTime
                 )
             }
             return result

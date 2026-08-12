@@ -51,17 +51,34 @@ struct Issue295RangeBoundaryRefetchTests {
         }
         try? await Task.sleep(nanoseconds: 200_000_000)
 
-        let ranges = dataRanges(server, fileSize: total)
-        var overlaps: [String] = []
-        var covered: [(Int64, Int64)] = []
-        for r in ranges {
-            let end = r.end ?? total - 1
-            for c in covered where r.start <= c.1 && end >= c.0 {
-                overlaps.append("[\(r.start)-\(end)] overlaps [\(c.0)-\(c.1)]")
-            }
-            covered.append((r.start, end))
+        // #310 changed what "no re-fetch" looks like on the wire. A connection can now be
+        // ENDED at winHighWater with the tail of its range undelivered, and the refill then
+        // legitimately re-requests that undelivered tail — so REQUESTED spans may overlap a
+        // cancelled predecessor's. What pins the #295 defect is direction: the refill and
+        // every request after it start at the delivered frontier, which only moves forward,
+        // while the defect's detour re-fetches fired at the READ position, below the refill
+        // it had just issued. Strictly increasing request starts therefore hold exactly
+        // when no delivered byte is asked for again.
+        let starts = dataRanges(server, fileSize: total).map(\.start)
+        #expect(starts.count >= 2, "the read never crossed a range boundary: \(starts)")
+        var regressions: [String] = []
+        for (a, b) in zip(starts, starts.dropFirst()) where b <= a {
+            regressions.append("\(b) after \(a)")
         }
-        #expect(overlaps.isEmpty,
-                "delivered bytes were fetched again: \(overlaps.joined(separator: ", ")); all ranges: \(ranges)")
+        #expect(regressions.isEmpty,
+                "a request started at or below its predecessor, i.e. re-requested delivered bytes: \(regressions.joined(separator: ", ")); all starts: \(starts)")
+
+        // Direction alone cannot price a re-fetch, and the defect was priced: 1506918 bytes
+        // delivered for a 764450 byte object, 1.97x what was read. Count it on the READER
+        // side, not the origin's: bytes the origin wrote into a socket we then cancelled were
+        // never delivered, so `bytesWritten` would make a healthy high-water end look like a
+        // re-fetch. What the reader accepted, minus what the consumer read, is exactly the
+        // resident window plus whatever is in flight. Measured margin on this fixture is the 64 KB
+        // tail probe; the 2 MB slack is set so one 4 MB detour block, the defect's unit of
+        // re-fetch, still fails it.
+        let overRead = reader.cumulativeBytesFetched - read
+        let resident = Int64(reader.windowDiagnostics.aheadBytes)
+        #expect(overRead <= resident + 2 * 1024 * 1024,
+                "the reader accepted \(overRead / (1024 * 1024)) MB beyond the \(read / (1024 * 1024)) MB consumed, with only \(resident / (1024 * 1024)) MB resident: bytes were fetched twice")
     }
 }

@@ -255,8 +255,8 @@ struct PosterCard: View {
 
             if continueEpisodeText != nil {
                 continueLandscapeSummary
-            } else if let logoUrl = meta.logoUrl {
-                AsyncImage(url: URL(string: logoUrl)) { phase in
+            } else if let logoURL = landscapeLogoURL {
+                AsyncImage(url: logoURL) { phase in
                     if case .success(let image) = phase {
                         image
                             .resizable()
@@ -309,6 +309,18 @@ struct PosterCard: View {
             .lineLimit(2)
     }
 
+    /// Source title logo trimmed of surrounding whitespace, or nil when blank
+    /// or not a valid URL — in which case `landscapeOverlay` shows the title
+    /// text fallback.
+    private var landscapeLogoURL: URL? {
+        guard let raw = meta.logoUrl?
+            .trimmingCharacters(in: .whitespacesAndNewlines),
+            !raw.isEmpty else {
+            return nil
+        }
+        return URL(string: raw)
+    }
+
     @ViewBuilder
     private var continueBadge: some View {
         if let continueBadgeDisplayText {
@@ -321,9 +333,21 @@ struct PosterCard: View {
                 .padding(.vertical, 8)
                 .background(
                 RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(Color.black.opacity(0.72))
+                    .fill(continueBadgeFill)
             )
             .padding(16)
+        }
+    }
+
+    private var continueBadgeFill: Color {
+        guard continueIsUpNext else { return Color.black.opacity(0.72) }
+        switch (continueUpNextBadgeText ?? "Next Up").uppercased() {
+        case "NEW SEASON":
+            return Color(red: 0xB4 / 255, green: 0x53 / 255, blue: 0x09 / 255)
+        case "NEW EPISODE":
+            return Color(red: 0x1D / 255, green: 0x4E / 255, blue: 0xD8 / 255)
+        default:
+            return Color.black.opacity(0.72)
         }
     }
 
@@ -1330,15 +1354,20 @@ private final class CatalogWatchedMetadataCache {
     private var inFlightByKey: [String: Task<NuvioMeta?, Never>] = [:]
 
     func fullMetadata(metaId: String, type: String, preview: NuvioMeta?) async -> NuvioMeta? {
-        if let preview, preview.videos?.isEmpty == false { return preview }
-
         let profile = WatchedStore.activeProfileId ?? "default"
         let key = "\(profile)\u{1f}\(type.lowercased())\u{1f}\(metaId.lowercased())"
         if let cached = metadataByKey[key] { return cached }
         if let inFlight = inFlightByKey[key] { return await inFlight.value }
 
         let task: Task<NuvioMeta?, Never> = Task {
-            try? await repository.getMetadata(id: metaId, type: type)
+            // Catalog rows may contain a partial episode list. Always resolve
+            // the full /meta payload so a recreated card cannot make a
+            // different completion decision from the same watched history.
+            if let refreshed = try? await repository.refreshMetadata(id: metaId, type: type) {
+                return refreshed
+            }
+            // Keep an already supplied guide as a useful offline fallback.
+            return preview
         }
         inFlightByKey[key] = task
         let resolved = await task.value
@@ -1376,6 +1405,8 @@ struct WatchedCheckmarkBadge: View {
     var size: CGFloat = 38
 
     @State private var isWatched = false
+    @State private var refreshVersion = 0
+    @Environment(\.isEnabled) private var isEnabled
 
     init(metaId: String, type: String, size: CGFloat = 38) {
         self.metaId = metaId
@@ -1392,21 +1423,37 @@ struct WatchedCheckmarkBadge: View {
     }
 
     var body: some View {
-        Group {
-            if isWatched {
-                WatchedCheckmarkIcon(size: size)
+        // Keep the badge mounted while unwatched. Search remains alive behind
+        // the Details overlay, and an EmptyView branch can miss the store
+        // notification that should reveal the checkmark when Details closes.
+        WatchedCheckmarkIcon(size: size)
+            .opacity(isWatched ? 1 : 0)
+            .accessibilityHidden(!isWatched)
+            .task(id: refreshTaskIdentity) {
+                await refresh()
             }
-        }
-        .task(id: refreshIdentity) {
-            await refresh()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
-            Task { await refresh() }
-        }
+            .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
+                // Re-key the SwiftUI task instead of starting an untracked Task.
+                // Store sync and view recreation can otherwise overlap refreshes,
+                // allowing an older result to overwrite a newer watched state.
+                refreshVersion &+= 1
+            }
     }
 
+    /// Re-runs the lookup whenever the card's identity changes. Search results
+    /// arrive IMDb-only and gain TMDB aliases when their background `/meta`
+    /// enrichment lands — without those aliases in the identity, the badge
+    /// would never recalculate and would miss a TMDB-first watched record.
     private var refreshIdentity: String {
-        "\(WatchedStore.activeProfileId ?? "default")\u{1f}\(type.lowercased())\u{1f}\(metaId)"
+        let imdb = meta?.imdbId?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() ?? ""
+        let tmdb = meta?.tmdbId.map(String.init) ?? ""
+        return "\(WatchedStore.activeProfileId ?? "default")\u{1f}\(type.lowercased())\u{1f}\(metaId)\u{1f}\(imdb)\u{1f}\(tmdb)"
+    }
+
+    private var refreshTaskIdentity: String {
+        "\(refreshIdentity)\u{1f}\(refreshVersion)\u{1f}\(isEnabled)"
     }
 
     @MainActor
@@ -1418,7 +1465,7 @@ struct WatchedCheckmarkBadge: View {
             return
         }
 
-        if meta.map({ WatchedStore.contains(meta: $0) })
+        if meta.map({ WatchedStore.containsCatalogTitle(meta: $0) })
             ?? WatchedStore.contains(metaId: metaId, type: type) {
             isWatched = true
             return
@@ -1426,10 +1473,22 @@ struct WatchedCheckmarkBadge: View {
 
         // No watched episodes means this cannot be a completed series, and it
         // also lets untouched catalog cards avoid a metadata network request.
-        let previewWatchedKeys = meta.map { WatchedStore.watchedEpisodeKeys(meta: $0) }
+        let previewWatchedKeys = meta.map { WatchedStore.catalogWatchedEpisodeKeys(meta: $0) }
             ?? WatchedStore.watchedEpisodeKeys(metaId: metaId)
         guard !previewWatchedKeys.isEmpty else {
             isWatched = false
+            return
+        }
+
+        // Search enrichment can carry the complete episode guide on the card.
+        // Resolve it synchronously from that already-loaded data instead of
+        // starting a second /meta request for every search result.
+        if let videos = meta?.videos,
+           CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+               videos: videos,
+               watchedEpisodeKeys: previewWatchedKeys
+           ) {
+            isWatched = true
             return
         }
 
@@ -1439,10 +1498,10 @@ struct WatchedCheckmarkBadge: View {
             preview: meta
         ), !Task.isCancelled else { return }
 
-        isWatched = WatchedStore.contains(meta: fullMeta)
+        isWatched = WatchedStore.containsCatalogTitle(meta: fullMeta)
             || CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
                 videos: fullMeta.videos,
-                watchedEpisodeKeys: WatchedStore.watchedEpisodeKeys(meta: fullMeta)
+                watchedEpisodeKeys: WatchedStore.catalogWatchedEpisodeKeys(meta: fullMeta)
             )
     }
 }
@@ -1557,6 +1616,7 @@ struct CardActionMenuOverlay: View {
 
     @State private var inLibrary = false
     @State private var isWatched = false
+    @State private var isSavingWatched = false
     @FocusState private var focused: Field?
 
     var body: some View {
@@ -1600,7 +1660,7 @@ struct CardActionMenuOverlay: View {
                         title: isWatched ? "Mark as unwatched" : "Mark as watched",
                         systemImage: isWatched ? "eye.slash" : "eye",
                         isFocused: focused == .watched,
-                        action: { isWatched = WatchedStore.toggle(meta: meta) }
+                        action: toggleWatched
                     )
                     .focused($focused, equals: .watched)
                 }
@@ -1654,6 +1714,34 @@ struct CardActionMenuOverlay: View {
             guard !Task.isCancelled else { return }
             if !succeeded {
                 inLibrary = !desiredMembership
+            }
+        }
+    }
+
+    private func toggleWatched() {
+        guard !isSavingWatched else { return }
+        let isSeries = ["series", "tv", "show", "tvshow"].contains(meta.type.lowercased())
+        guard isSeries else {
+            isWatched = WatchedStore.toggle(meta: meta)
+            return
+        }
+
+        // Catalog cards normally have no episode guide. Resolve it before the
+        // series action so this control writes only aired regular episodes,
+        // matching the Details action instead of falling back to a bare title
+        // mark with no episode boundaries.
+        isSavingWatched = true
+        Task {
+            let fullMeta = await CatalogWatchedMetadataCache.shared.fullMetadata(
+                metaId: meta.id,
+                type: meta.type,
+                preview: meta
+            ) ?? meta
+            guard !Task.isCancelled else { return }
+            let result = WatchedStore.toggle(meta: fullMeta)
+            await MainActor.run {
+                isWatched = result
+                isSavingWatched = false
             }
         }
     }

@@ -1190,7 +1190,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 }
 
-private struct CinemetaCatalogResponse: Decodable {
+/// Not `private`: the test target reaches the Stremio catalog/metas decoder
+/// through `@testable import` to verify field mapping (e.g. `logo` → logoUrl).
+struct CinemetaCatalogResponse: Decodable {
     let metas: [CinemetaMeta]
 }
 
@@ -1302,7 +1304,7 @@ private struct AddonManifestCatalogExtra: Decodable {
     let options: [String]?
 }
 
-private struct CinemetaMetaResponse: Decodable {
+struct CinemetaMetaResponse: Decodable {
     let meta: CinemetaMeta
 }
 
@@ -1381,7 +1383,7 @@ private extension String {
     }
 }
 
-private struct CinemetaMeta: Decodable {
+struct CinemetaMeta: Decodable {
     let id: String
     let name: String
     let type: String?
@@ -1502,7 +1504,8 @@ struct FlexibleStringArray: Decodable {
     }
 }
 
-private struct CinemetaTrailer: Decodable {
+// Internal so `CinemetaMeta` can stay Decodable for the test target.
+struct CinemetaTrailer: Decodable {
     let source: String?
     let ytId: String?
 
@@ -1511,11 +1514,11 @@ private struct CinemetaTrailer: Decodable {
     }
 }
 
-private struct CinemetaTrailerStream: Decodable {
+struct CinemetaTrailerStream: Decodable {
     let ytId: String?
 }
 
-private struct CinemetaVideo: Decodable {
+struct CinemetaVideo: Decodable {
     let id: String?
     let name: String?
     let title: String?
@@ -1556,7 +1559,8 @@ private struct CinemetaVideo: Decodable {
 }
 
 /// Decodes a JSON value that may arrive as either a string or a number.
-private struct FlexibleString: Decodable {
+/// Internal so `CinemetaVideo` can expose it to the test target.
+struct FlexibleString: Decodable {
     let value: String
 
     init(from decoder: Decoder) throws {
@@ -1643,6 +1647,12 @@ class MockCatalogRepository: CatalogRepository {
 
         let resolvedType = type.isEmpty ? (id.hasPrefix("movie") ? "movie" : "series") : type
         return generateMockMeta(id: id, type: resolvedType)
+    }
+
+    // Declared in the class body (rather than relying on the protocol-extension
+    // default) so test stubs can override it to answer specific /meta records.
+    func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        try await getMetadata(id: id, type: type)
     }
 
     func getStreams(id: String, type: String) async throws -> [NuvioStream] {

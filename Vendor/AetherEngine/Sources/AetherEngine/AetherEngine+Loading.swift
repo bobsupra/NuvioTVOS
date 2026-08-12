@@ -89,17 +89,111 @@ extension AetherEngine {
     /// `isReady` always feeds the public `isSessionReady` mirror and replays a deferred pre-ready host
     /// seek (#127); pass `settlePausedAtReadiness: false` for paths that skip the readiness -> .paused
     /// waypoint (autostarting loadRemoteHLS, where the terminal play() runs and readiness is a waypoint).
+    /// #315: fold a host's raw `isVideoReadyForDisplay` level into the load-scoped public latch.
+    ///
+    /// Two operators carry the whole contract. `dropFirst()` discards the value the publisher
+    /// replays on subscribe: every call site wires its sinks BEFORE it loads the host, so on a
+    /// reused native host that replay is still the outgoing item's picture, and taking it would
+    /// latch this load's flag on the previous load's frame. `prefix(1)` is the latch itself: after
+    /// the first rise nothing can lower it again, which is what keeps a host from re-covering the
+    /// few tens of milliseconds an item swap spends without a picture.
+    func latchFirstFrameReadyForDisplay(
+        from publisher: Published<Bool>.Publisher,
+        storeIn cancellables: inout Set<AnyCancellable>
+    ) {
+        publisher
+            .dropFirst()
+            .filter { $0 }
+            .prefix(1)
+            .sink { [weak self] _ in self?.hasFirstFrameReadyForDisplay = true }
+            .store(in: &cancellables)
+    }
+
+    /// #315, measured on a device (iPhone -> Apple TV, 2026-08-09): while external playback is active the
+    /// local `AVPlayerLayer` never reaches `isReadyForDisplay`. Not once in four external loads, two of them
+    /// titles started while the receiver already held the route, while the three loads either side of them
+    /// reached it in 0.16 to 0.22 s. Folding only the layer therefore leaves the latch false for the whole
+    /// AirPlay session, and a host lifting a cover on it covers the session instead of the load.
+    ///
+    /// There is no local first frame coming there and no way to see the receiver's screen, so the readiness
+    /// of the item is the honest edge: past it the picture is the receiver's business. Deliberately NOT the
+    /// clock advancing, which would hang the paused mount this signal exists for.
+    ///
+    /// Split into a pure decision so the matrix is testable without an AVPlayer and a receiver.
+    nonisolated static func shouldLatchFirstFrameForExternalPlayback(
+        alreadyLatched: Bool,
+        hasVideoDisplaySignal: Bool,
+        isSessionReady: Bool,
+        externalPlaybackHoldsThePicture: Bool
+    ) -> Bool {
+        guard !alreadyLatched else { return false }
+        // Audio-only has a picture nowhere, so nothing about a receiver makes a first frame exist.
+        guard hasVideoDisplaySignal else { return false }
+        return isSessionReady && externalPlaybackHoldsThePicture
+    }
+
+    func latchFirstFrameForExternalPlaybackIfNeeded() {
+        guard Self.shouldLatchFirstFrameForExternalPlayback(
+            alreadyLatched: hasFirstFrameReadyForDisplay,
+            hasVideoDisplaySignal: sessionPublishesVideoDisplaySignal,
+            isSessionReady: isSessionReady,
+            externalPlaybackHoldsThePicture: externalPlaybackHoldsThePicture) else { return }
+        EngineLog.emit(
+            "[AetherEngine] #315: an external screen holds the picture, so no local first frame is coming; "
+            + "latching hasFirstFrameReadyForDisplay at readiness",
+            category: .engine
+        )
+        hasFirstFrameReadyForDisplay = true
+    }
+
+    /// #353: mirror a software host's settled picture size onto the public `softwareDisplaySize`.
+    ///
+    /// A mirror rather than the latch `hasFirstFrameReadyForDisplay` gets, because the two answer
+    /// different questions. A picture that exists cannot stop existing for the rest of the load, but
+    /// the size it presents at can change under it: a live source that switches resolution
+    /// mid-stream re-shapes the rectangle a host already laid out against, and a latched first value
+    /// would keep the overlay on the old one.
+    ///
+    /// No `dropFirst()` here either, and that is a property of this path rather than a style choice:
+    /// the software path builds a new host per load (one construction site, and `stopInternal` nils
+    /// it), so what a fresh mirror replays is that host's own nil and not the outgoing item's size.
+    /// The native hosts, which are the ones reused across a load, have no size to mirror.
+    func mirrorSoftwareDisplaySize(
+        from publisher: Published<CGSize?>.Publisher,
+        storeIn cancellables: inout Set<AnyCancellable>
+    ) {
+        publisher
+            .sink { [weak self] size in self?.softwareDisplaySize = size }
+            .store(in: &cancellables)
+    }
+
+    /// `videoReadyForDisplay` is the host's raw layer level (#315); nil on the audio hosts, which
+    /// have nothing to display. It is folded, never mirrored: the engine's published flag is latched
+    /// for the load, so the seams that reuse a host and briefly lose the picture do not surface.
     private func wireCommonHostSinks(
         duration: Published<Double>.Publisher,
         isReady: Published<Bool>.Publisher,
         settlePausedAtReadiness: Bool = true,
         failureMessage: Published<String?>.Publisher,
         didReachEnd: Published<Bool>.Publisher,
+        videoReadyForDisplay: Published<Bool>.Publisher? = nil,
         storeIn cancellables: inout Set<AnyCancellable>
     ) {
+        if let videoReadyForDisplay {
+            sessionPublishesVideoDisplaySignal = true
+            latchFirstFrameReadyForDisplay(from: videoReadyForDisplay, storeIn: &cancellables)
+        }
         duration
             .sink { [weak self] value in
-                if value > 0 { self?.duration = value }
+                guard let self else { return }
+                // A caller-declared duration outranks the host's: a sequential session's append
+                // playlist grows while it plays, so the item duration is the produced span, not
+                // the window length the host UI should scale its scrubber to.
+                if let declared = self.loadedOptions.declaredDurationSeconds, declared > 0 {
+                    self.duration = declared
+                } else if value > 0 {
+                    self.duration = value
+                }
             }
             .store(in: &cancellables)
         isReady
@@ -109,6 +203,8 @@ extension AetherEngine {
                 if ready, settlePausedAtReadiness, self.state == .loading {
                     self.state = .paused
                 }
+                // #315: on an external screen this readiness IS the edge; the local layer never rises.
+                if ready { self.latchFirstFrameForExternalPlaybackIfNeeded() }
                 // #127: replay the latest host seek that arrived while the item was pre-ready.
                 // #178: not while still .loading (autostart paths hold .loading past readiness);
                 // replaying now would just re-stash. The state didSet resolves that case.
@@ -244,6 +340,7 @@ extension AetherEngine {
             settlePausedAtReadiness: !Self.loadPerformsAutostart(options),
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &nativeCancellables
         )
         // Track AVPlayer's REAL transport state. Eager .playing caused a ~10 s black screen during Jellyfin transcode spin-up.
@@ -271,11 +368,19 @@ extension AetherEngine {
             }
             .store(in: &nativeCancellables)
 
+        // #316: sidecars declared at load time can only reach media selection through the playlist, so
+        // when there are any, the engine writes a master of its own and AVPlayer opens that instead. The
+        // rewritten master's variants still point at the origin, so this changes nothing about where the
+        // media comes from. Any refusal (live, a playlist that will not rewrite, a slow origin) returns
+        // the origin URL and leaves the sidecars on the host overlay, which is the pre-#316 behaviour.
+        let playbackURL = await prepareRemoteHLSSubtitleProxy(
+            originURL: url, options: options, expectedGeneration: bypassGeneration) ?? url
+
         // Jellyfin HLS URLs carry auth (ApiKey / PlaySessionId / LiveStreamId) as query params, but
         // generic live HLS origins (IPTV / Stremio add-on channels) enforce per-stream Referer /
         // User-Agent / Authorization headers, so LoadOptions.httpHeaders rides into the AVURLAsset (#119).
         // forwardBufferDuration: 0 = system-adaptive; the 4 s VOD floor caused a 3-4 s black screen on live startup.
-        host.load(url: url,
+        host.load(url: playbackURL,
                   startPosition: startPosition,
                   perFrameHDR: true,
                   // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
@@ -289,6 +394,10 @@ extension AetherEngine {
                   // back would ping-pong), and hosts can opt out via LoadOptions.
                   armVideoCarriageWatchdog: RemoteHLSIngestFallback.shouldArm(
                       isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback),
+                  // #334: the ceiling on silence this path never had. AVPlayer's "gave up" covers an
+                  // origin that stops answering; it does not cover one that answers everything while
+                  // AVFoundation builds no track, where nothing terminal is ever published.
+                  readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
                   isLive: options.isLive)
 
         // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
@@ -296,7 +405,7 @@ extension AetherEngine {
         // Selection routes back through `selectSubtitleTrack(index:)` / `clearSubtitle()`.
         publishRemoteHLSSubtitleTracks(host: host)
 
-        // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content. Wait for its display-mode handshake before transport starts; otherwise direct HLS can advance behind the television's black HDMI transition.
+        // VOD path triggers play() at the tail of load(); this lean path early-returns, so self-start here. AVKit drives match-content; automaticallyWaitsToMinimizeStalling handles play-before-ready. Without this call the item reaches readyToPlay but timeControlStatus stays .paused.
         // State stays .loading; flips to .playing only when timeControlStatus sink sees AVPlayer rendering.
         // #124: a paused mount skips the self-start; the wired isReady waypoint settles .loading -> .paused.
         if Self.loadPerformsAutostart(options) {
@@ -307,6 +416,44 @@ extension AetherEngine {
         }
         startMemoryProbe()
         // No startLiveTelemetrySampler: all sampler counters read the loopback pipeline (demuxer / producer / cache / server), none of which exists on this bypass.
+    }
+
+    /// #316: stand a subtitle-injecting loopback origin in front of the remote master, and return the URL
+    /// AVPlayer should open. Nil means "play the origin directly", which is the answer for every live
+    /// source, every session without text sidecars, and every refusal inside the proxy.
+    ///
+    /// Bitmap sidecars (`.sup`) are excluded: WebVTT is a text rendition, and promising one for a PGS file
+    /// would serve an empty `.vtt` that AVPlayer never re-fetches. Those keep the overlay (and Phase D OCR).
+    @MainActor
+    private func prepareRemoteHLSSubtitleProxy(originURL: URL,
+                                               options: LoadOptions,
+                                               expectedGeneration: UInt64) async -> URL? {
+        guard !options.isLive else { return nil }
+        let tracks = externalSubtitleRegistry
+            .filter { $0.value.isTextFormat }
+            .sorted { $0.key < $1.key }
+            .map { RemoteHLSSubtitleProvider.Track(externalID: $0.key, source: $0.value) }
+        guard !tracks.isEmpty else { return nil }
+
+        guard let prepared = await RemoteHLSSubtitleProxy.prepare(
+            originURL: originURL, tracks: tracks, httpHeaders: options.httpHeaders) else { return nil }
+        // The playlist fetches suspend; a load()/stop() can have superseded this session meanwhile, and a
+        // proxy nobody owns would keep its socket and decode task for the rest of the process.
+        guard loadGeneration == expectedGeneration else {
+            prepared.tearDown()
+            return nil
+        }
+        remoteHLSSubtitleProxy = prepared
+        injectedSubtitleRenditionNames = Dictionary(
+            uniqueKeysWithValues: zip(tracks.map(\.externalID),
+                                      RemoteHLSSubtitleProvider.renditions(for: tracks).map(\.name)))
+        #if os(iOS)
+        // #86 / #227: a receiver cannot reach 127.0.0.1. Mounting while already AirPlaying has to hand out
+        // the LAN address straight away; the route-change reload re-enters this path and re-resolves it.
+        return airPlayActive ? airPlayHostSwapped(prepared.masterURL) : prepared.masterURL
+        #else
+        return prepared.masterURL
+        #endif
     }
 
     /// #168: program `preferredDisplayCriteria` for an HDR range detected on the probe-free nativeRemoteHLS
@@ -378,6 +525,9 @@ extension AetherEngine {
         // final by the time loadNative runs; nil means muxed audio.
         let liveIngest = customReader as? LiveIngestSourceInfo
         let companionAudioReader = liveIngest?.companionAudioReader
+        // AE#359: same guarantee as the companion reader, the resolver has published these before any
+        // main-stream byte flows, so the list is final here.
+        if let liveIngest { surfaceLiveSubtitleRenditions(liveIngest.subtitleRenditions) }
         // Observed-cadence closure for live-ingest LL-HLS shaping (AetherEngine#167): read per manifest
         // render, so the engine reacts to how the origin ACTUALLY delivers segments rather than trusting its
         // self-reported TARGETDURATION. weak so it never retains the host-owned reader past teardown. The
@@ -427,6 +577,8 @@ extension AetherEngine {
             // Caller-bounded probe budget (#68) for the fallback open / live reopen; the happy path reuses preopenedDemuxer.
             probesize: loadedOptions.probesize,
             maxAnalyzeDuration: loadedOptions.maxAnalyzeDuration,
+            sequentialOrigin: loadedOptions.sequentialOrigin,
+            declaredDurationSeconds: loadedOptions.declaredDurationSeconds,
             forwardBufferSegments: loadedOptions.forwardBufferSegments
         )
         // #240: the pump claims the source link through this gate while it is fetching, so the
@@ -581,8 +733,9 @@ extension AetherEngine {
                 self.liveSourceReset.send()
             }
         }
-        // #126: zero-progress VOD pump death (readError before any packet/segment). Without this
-        // the host sees isPlayable=true, tracks=0, waitingToPlay until its own first-frame timeout.
+        // #126: zero-progress VOD pump death (readError before any packet/segment), and #169:
+        // mid-session readError after the revive cap. Without this the host sees
+        // isPlayable=true / a stalled item and waits until its own timeout.
         session.onVODSourceFailed = { [weak self, weak session] code in
             Task { @MainActor in
                 guard let self, let session, self.nativeVideoSession === session else {
@@ -592,7 +745,7 @@ extension AetherEngine {
                     )
                     return
                 }
-                self.state = .error("Source read failed before any media was produced (code \(code))")
+                self.state = .error("Source read failed (code \(code))")
             }
         }
         // prepareNativeSubtitles + non-bitmap text tracks: builds the native subtitle table; must be set before start().
@@ -899,6 +1052,7 @@ extension AetherEngine {
             isReady: host.$isReady,
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &nativeCancellables
         )
         host.$timeControlStatus
@@ -961,17 +1115,43 @@ extension AetherEngine {
                 let fetchesAtStall = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
                 self.stallReengageTask?.cancel()
                 self.stallReengageTask = Task { @MainActor [weak self, weak host] in
+                    // Level re-watch (#65): fetch activity inside the grace window used to disarm
+                    // this watchdog permanently, but a player that drains its remaining TAIL
+                    // segments and then parks on a frozen playlist (fwd buffer non-empty, so
+                    // playbackStalled never re-fires) was exactly that case, and nothing ever
+                    // re-armed. Re-baseline and keep watching instead, bounded so trickling
+                    // fetches on a merely slow session hand back to the producer-side arms.
+                    var baseline = fetchesAtStall
+                    var passes = 0
+                    watch: while true {
+                        try? await Task.sleep(
+                            nanoseconds: UInt64(Self.stallReengageGraceSeconds * 1_000_000_000))
+                        guard !Task.isCancelled, let self, let host,
+                              host.stallCount == count,
+                              let player = self.currentAVPlayer else { return }
+                        let fetchesNow = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
+                        switch Self.stallWatchVerdict(
+                            fetchesNow: fetchesNow,
+                            baseline: baseline,
+                            isWaitingToPlay:
+                                player.timeControlStatus == .waitingToPlayAtSpecifiedRate,
+                            itemFailed: player.currentItem?.status == .failed,
+                            passesSoFar: passes,
+                            cap: Self.maxStallWatchPasses
+                        ) {
+                        case .disarm:
+                            return
+                        case .escalate:
+                            break watch
+                        case .rewatch:
+                            passes += 1
+                            baseline = fetchesNow
+                        }
+                    }
+                    guard let self, let host,
+                          let player = self.currentAVPlayer else { return }
                     // Stage 1: nudge seek. Device-proven to reach AVPlayer (rate re-asserts)
                     // but NOT always to revive its loader; stage 2 covers that.
-                    try? await Task.sleep(
-                        nanoseconds: UInt64(Self.stallReengageGraceSeconds * 1_000_000_000))
-                    guard !Task.isCancelled, let self, let host,
-                          host.stallCount == count else { return }
-                    let fetchesNow = self.nativeVideoSession?.mediaFetchCountSnapshot ?? 0
-                    guard fetchesNow == fetchesAtStall,
-                          let player = self.currentAVPlayer,
-                          player.timeControlStatus == .waitingToPlayAtSpecifiedRate,
-                          player.currentItem?.status != .failed else { return }
                     self.reengageStalledConsumer(
                         position: player.currentTime().seconds,
                         trigger: "stall + \(Int(Self.stallReengageGraceSeconds))s without fetches")
@@ -986,7 +1166,42 @@ extension AetherEngine {
                           let player2 = self.currentAVPlayer,
                           player2.timeControlStatus == .waitingToPlayAtSpecifiedRate,
                           player2.currentItem?.status != .failed else { return }
-                    self.reloadStalledConsumerItem(position: player2.currentTime().seconds)
+                    // Storm shape of the final rung: on a frozen live playlist each reload replays
+                    // the tail and re-stalls within seconds, and the fresh stall supersedes this
+                    // task BEFORE the post-reload rung below can run. The persistent gate spans
+                    // stall events: reloads at the same frozen position exhaust it, then the only
+                    // remaining move is the host's (fresh session against the server route).
+                    let reloadPosition = player2.currentTime().seconds
+                    if self.isLive, !self.stallReloadReviveGate.admit(position: reloadPosition) {
+                        EngineLog.emit(
+                            "[AetherEngine] #65 stage-2 reload budget exhausted at frozen "
+                            + "\(String(format: "%.2f", reloadPosition))s; "
+                            + "publishing liveSourceReset to host",
+                            category: .engine)
+                        self.liveSourceReset.send()
+                        return
+                    }
+                    self.reloadStalledConsumerItem(position: reloadPosition)
+                    // Final rung (#65, live only): a reload against a FROZEN playlist refills the
+                    // same tail and parks again, with no notification left to re-fire. A rendered
+                    // clock that has not moved a whole post-reload window later means the local
+                    // session is unrecoverable consumer-side; only the host can retune.
+                    let clockAtReload = host.renderedTime
+                    try? await Task.sleep(
+                        nanoseconds: UInt64(2 * Self.stallReengageGraceSeconds * 1_000_000_000))
+                    guard !Task.isCancelled, host.stallCount == count,
+                          Self.shouldPublishLiveSourceReset(
+                              isLive: self.isLive,
+                              clockAtReload: clockAtReload,
+                              clockNow: host.renderedTime,
+                              isWaitingToPlay: self.currentAVPlayer?.timeControlStatus
+                                  == .waitingToPlayAtSpecifiedRate
+                          ) else { return }
+                    EngineLog.emit(
+                        "[AetherEngine] #65 stage-2 reload did not move a frozen live clock; "
+                        + "publishing liveSourceReset to host",
+                        category: .engine)
+                    self.liveSourceReset.send()
                 }
             }
             .store(in: &nativeCancellables)
@@ -1046,6 +1261,17 @@ extension AetherEngine {
         // forwardBufferDuration default (4 s): deep buffer lets AVPlayer race to the live edge and hit the transcode warm-up gap head-on (-12888); 4 s PACES consumption. Verified: 8 s worsened startup pause (8-10 s vs ~1 s).
         // Live REJOIN: skip initial seek so AVPlayer picks edge-minus-holdback instead; seek-to-0 against the re-served backlog wedged the reloaded item in waitingToPlay (device repro: tvOS 26, Jellyfin stream.ts). See LiveReloadPolicy.
         lastNativeVideoStartPosition = startPosition ?? 0
+        // Sequential append playlist: AVPlayer treats the growing playlist as an EVENT and
+        // defaults to edge-minus-holdback (~6 s in on a fresh session, more once the producer
+        // has raced ahead). The load-time seek to 0 fires before readyToPlay and the item
+        // re-anchors to the edge default afterwards, so queue a post-readiness seek through
+        // the #127 replay instead - every segment stays retained, so 0 is always reachable.
+        // A declared start position does not exempt it: the session produces from byte 0 either
+        // way (HLSVideoEngine drops the resume anchor for a sequential origin), so leaving the
+        // item on the EVENT edge default would start it mid-archive with no way back.
+        if !isLive, loadedOptions.sequentialOrigin {
+            pendingPreReadySeekSeconds = 0.0
+        }
         // AE#158: consume-and-reset so only the load() that armed the handover swaps in place; audio-switch
         // and recovery reloads keep their own contracts.
         let inPlaceHandover = pendingInPlaceItemHandover
@@ -1118,6 +1344,11 @@ extension AetherEngine {
         }
 
         activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
+        // Drop the previous session's sinks BEFORE anything wires this one's. Standing further down,
+        // between two groups of `.store(in:)` calls, this cancelled everything wired above it: the
+        // SW-PiP cue mirror never delivered a cue after the frame compositor was armed. Both halves
+        // of such a wiring work in isolation, which is why a dead sink here reads as a working one.
+        softwareCancellables.removeAll()
         let host = SoftwarePlaybackHost()
         host.deinterlaceConfig = DeinterlaceConfig(
             mode: loadedOptions.deinterlaceMode,
@@ -1131,6 +1362,12 @@ extension AetherEngine {
             self?.publishLiveWindow(edgeSessionTime: edge)
         }
         self.softwareHost = host
+        // #311: a load builds a new host and a new renderer, so an observer installed once by the
+        // host app has to be carried across the seam, exactly as the native session does at load.
+        host.setVideoFrameTimeObserver(softwareVideoFrameTimeObserver)
+        // #353: the settled picture size, wired next to the frame times because a host laying out an
+        // overlay needs the rectangle as well as the clock, and both come off this renderer.
+        mirrorSoftwareDisplaySize(from: host.$videoDisplaySize, storeIn: &softwareCancellables)
         // SW-PiP: publish the bridge once the session owns its layer (the layer object is stable for
         // the session; the host attaches it to the view and, on PiP start, to the system window).
         softwarePiPSource = SoftwarePiPSource(layer: host.displayLayer, isLive: isLive, engine: self)
@@ -1176,7 +1413,6 @@ extension AetherEngine {
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
 
-        softwareCancellables.removeAll()
         host.$currentTime
             .sink { [weak self] value in
                 guard let self = self else { return }
@@ -1204,6 +1440,7 @@ extension AetherEngine {
             isReady: host.$isReady,
             failureMessage: host.$failureMessage,
             didReachEnd: host.$didReachEnd,
+            videoReadyForDisplay: host.$isVideoReadyForDisplay,
             storeIn: &softwareCancellables
         )
 
@@ -1211,18 +1448,20 @@ extension AetherEngine {
         // Capture the caller's probe budget (#68) before the detach: loadedOptions is @MainActor-isolated and unreachable inside the closure. Only used on the fallback open (probe absent).
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let sequentialOrigin = loadedOptions.sequentialOrigin
+        let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, isLive, dvrWindowSeconds, probesize, maxAnalyzeDuration, sequentialOrigin, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration), isLive: isLive)
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration), isLive: isLive)
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -1278,18 +1517,20 @@ extension AetherEngine {
         // Caller's probe budget (#68) captured before the detach; only used on the fallback open (probe absent).
         let probesize = loadedOptions.probesize
         let maxAnalyzeDuration = loadedOptions.maxAnalyzeDuration
+        let sequentialOrigin = loadedOptions.sequentialOrigin
+        let declaredDuration = loadedOptions.declaredDurationSeconds
         // Built on the main actor, captured into the detach: surfaces source stall/reconnect to playbackPhase (#85).
         let networkPhaseSink: @Sendable (ReaderNetworkPhase) -> Void = { [weak self] phase in
             Task { @MainActor in self?.setReaderNetworkPhase(phase) }
         }
         try await Task.detached(priority: .userInitiated) {
-            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, networkPhaseSink] in
+            [host, preopenedDemuxer, url, sourceHTTPHeaders, probesize, maxAnalyzeDuration, sequentialOrigin, declaredDuration, networkPhaseSink] in
             let dem: Demuxer
             if let pre = preopenedDemuxer {
                 dem = pre
             } else {
                 dem = Demuxer()
-                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration))
+                try dem.open(url: url, extraHeaders: sourceHTTPHeaders, profile: .playback.withProbeBudget(probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration).withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDuration))
             }
             dem.onNetworkPhaseChanged = networkPhaseSink
             try await host.load(
@@ -1557,6 +1798,10 @@ extension AetherEngine {
                 softwareHost?.play()
             } else {
                 EngineLog.emit("[AetherEngine] reload: loadNative enter audio=\(audioStreamIndex.map(String.init) ?? "nil") resumeAt=\(String(format: "%.2f", resumeAt))s", category: .engine)
+                // #339: the only write this reload can still produce is a sole-writer host's re-write on the
+                // swapped item, which happens inside loadNative. Arm before it, or the gate below is again
+                // reading a flag for a switch whose notifications it was not registered for.
+                if loadedOptions.suppressDisplayCriteria { displayCriteria.armSwitchObservation() }
                 try await loadNative(
                     url: url,
                     sourceHTTPHeaders: loadedOptions.httpHeaders,
@@ -1589,12 +1834,14 @@ extension AetherEngine {
                 // #274: this reload preserved the criteria (resetDisplayCriteria: false) and re-applies none,
                 // so only a sole-writer host's re-write on the swapped item can still switch anything; the
                 // published (panel-clamped) format decides whether that can be a dynamic-range switch.
-                await displayCriteria.waitForSwitch(startGrace: Self.playGateGrace(
-                    criteriaUnchanged: false,
-                    engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
-                    formatKnown: true,
-                    effectiveFormat: videoFormat
-                ))
+                await displayCriteria.waitForSwitch(
+                    startGrace: Self.playGateGrace(
+                        criteriaUnchanged: false,
+                        engineIsCriteriaWriter: !loadedOptions.suppressDisplayCriteria,
+                        formatKnown: true,
+                        effectiveFormat: videoFormat
+                    ),
+                    settleCap: loadedOptions.isLive ? .standard : .awaitObservedEnd)
                 try checkLoadCurrent(gen)
                 nativeHost?.play()
             }

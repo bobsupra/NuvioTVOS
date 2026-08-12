@@ -13,6 +13,9 @@ enum FFmpegErr {
     /// DTS-HD MA XLL frame that residual-codes channels without a usable core) reject a single packet
     /// with this while staying usable for the next one (#64).
     static let einval: Int32 = -22
+    /// `AVERROR(EIO)`; EIO is POSIX 5. "The source is lost", as distinct from `eof`, which every
+    /// consumer reads as played-to-the-end and deliberately never retries.
+    static let eio: Int32 = -5
 
     /// FFmpeg's own text for an AVERROR code, with the raw number appended so a report never loses it
     /// ("Invalid data found when processing input (-1094995529)"). Falls back to the bare number when

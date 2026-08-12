@@ -14,8 +14,15 @@ import Foundation
 /// stream. The cut point is the only thing that changes; EXTINF still comes from the plan boundaries.
 struct VODSegmentCutter {
 
-    /// Plan boundaries on the ITEM axis: `boundaries[i]` is the start of segment `baseIndex + i` as
-    /// AVPlayer sees it, i.e. the plan's source PTS minus the plan anchor (plan time 0 in source PTS).
+    /// Plan boundaries on the ITEM axis, in the timestamps the PLAN is expressed in: `boundaries[i]`
+    /// is the start of segment `baseIndex + i`, i.e. the plan's source timestamp minus the plan anchor.
+    ///
+    /// #358: for a keyframe-aligned plan those timestamps come from the container index, and mov/mp4
+    /// index entries are DECODE timestamps. The gate is therefore fed decode timestamps too. Feeding
+    /// it presentation timestamps let a keyframe reach boundaries beyond its own by its composition
+    /// offset, which is a couple of frames on an ordinary encode and was 3 s on a remux carrying an
+    /// edit list; every boundary inside that offset was consumed and never opened a segment, while
+    /// the playlist kept offering it.
     /// `boundaries.count` is the segment count + 1 (the last entry is the end of the final segment).
     ///
     /// AE#268: packets reach the cutter with the producer's shift already subtracted, so they are on

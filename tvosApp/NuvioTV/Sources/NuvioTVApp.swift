@@ -2828,6 +2828,12 @@ struct TVHomeView: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
             refreshWatchedTitles()
+            // A watched mark can be the only history left for a completed
+            // series. Rebuild the local row so a newly aired episode can seed a
+            // fresh "Airs Today" card even after the old row was retired.
+            if !usesRemoteProgress {
+                ContinueWatchingBuilder.scheduleRebuild(reason: "watched state changed")
+            }
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
@@ -3914,29 +3920,55 @@ struct TVHomeView: View {
             }
 
             // Third-party catalog responses are often intentionally compact
-            // and omit runtime/status. Once focus settles, ask for the full
-            // metadata record and fill just those missing hero fields.
+            // and omit runtime/status and shelf artwork. Once focus settles,
+            // ask for the full metadata record and fill the missing fields.
             guard settledMeta.needsHeroMetadataEnrichment else { return }
-            let enrichmentKey = "\(settledMeta.type.lowercased())\u{1f}\(settledMeta.id)"
-            if let fullMeta = focusWork.enrichedHeroMetadata[enrichmentKey] {
-                focusedMeta = settledMeta.fillingMissingHeroMetadata(from: fullMeta)
-                return
-            }
-
-            guard let fullMeta = try? await repository.refreshMetadata(
-                      id: settledMeta.id,
-                      type: settledMeta.type
-                  ) else {
-                return
-            }
-            focusWork.enrichedHeroMetadata[enrichmentKey] = fullMeta
-            guard !Task.isCancelled,
-                  focusWork.pendingFocusedMeta?.id == targetMetaId,
-                  focusWork.pendingFocusedFolder == nil else {
-                return
-            }
-            focusedMeta = settledMeta.fillingMissingHeroMetadata(from: fullMeta)
+            await enrichSettledCatalogMeta(settledMeta, in: targetSectionId)
         }
+    }
+
+    /// Fetches (or reuses the cached) full `/meta` record for a catalog card
+    /// focus has rested on and merges the missing fields into it. Debounced by
+    /// `scheduleHeroSettle`, so rapid navigation never generates a request per
+    /// card passed over. The merged record replaces `focusedMeta` (hero), the
+    /// pending focus target, and the exact item inside
+    /// `store.sections[sectionId].items` — the latter being what `PosterCard`
+    /// renders, so the landscape overlay gains the title logo/backdrop.
+    @MainActor
+    private func enrichSettledCatalogMeta(_ settledMeta: NuvioMeta, in sectionId: String) async {
+        let enrichmentKey = "\(settledMeta.type.lowercased())\u{1f}\(settledMeta.id)"
+        let fullMeta: NuvioMeta
+        if let cached = focusWork.enrichedHeroMetadata[enrichmentKey] {
+            fullMeta = cached
+        } else {
+            guard let refreshed = try? await repository.refreshMetadata(
+                id: settledMeta.id,
+                type: settledMeta.type
+            ) else {
+                return
+            }
+            // Cache even when focus has already moved on, so the next visit to
+            // this card reuses the fetch instead of repeating it.
+            focusWork.enrichedHeroMetadata[enrichmentKey] = refreshed
+            fullMeta = refreshed
+        }
+
+        let merged = settledMeta.fillingMissingHeroMetadata(from: fullMeta)
+        // Publish only while this card is still the settled focus target: a
+        // stale record must never overwrite the hero mid-navigation.
+        guard !Task.isCancelled,
+              focusWork.pendingFocusedMeta?.id == settledMeta.id,
+              focusWork.pendingSectionId == sectionId,
+              focusWork.pendingFocusedFolder == nil else {
+            return
+        }
+        focusedMeta = merged
+        focusWork.pendingFocusedMeta = merged
+        guard let sectionIndex = store.sections.firstIndex(where: { $0.id == sectionId }),
+              let itemIndex = store.sections[sectionIndex].items.firstIndex(where: { $0.id == settledMeta.id }) else {
+            return
+        }
+        store.sections[sectionIndex].items[itemIndex] = merged
     }
 
     @MainActor
@@ -3962,15 +3994,29 @@ struct TVHomeView: View {
 
         // Some add-ons return hundreds of items in their first response. Home
         // mounts them in small batches to keep the horizontal row responsive;
-        // reveal those before making another network request.
+        // reveal those before making another network request. These records
+        // skipped the TMDB enrichment the first 18 items went through, so pass
+        // the batch through the same preparation so post-18 cards show the
+        // same shelf artwork (logo/backdrop) as the head of the row.
         if !section.pendingItems.isEmpty {
             let batchCount = min(18, section.pendingItems.count)
             let batch = Array(section.pendingItems.prefix(batchCount))
-            let existingIds = Set(section.items.map(\.id))
-            store.sections[sectionIndex].items.append(contentsOf: batch.filter { !existingIds.contains($0.id) })
-            store.sections[sectionIndex].pendingItems.removeFirst(batchCount)
-            store.sections[sectionIndex].hasMore = !store.sections[sectionIndex].pendingItems.isEmpty
-                || (section.contentType != nil && section.catalogId != nil)
+            store.sections[sectionIndex].isLoadingMore = true
+            Task { @MainActor in
+                let enrichedBatch = await TmdbDetailsService.localizedMetadata(for: batch)
+                guard let latestIndex = store.sections.firstIndex(where: { $0.id == sectionId }) else {
+                    return
+                }
+                let currentIds = Set(store.sections[latestIndex].items.map(\.id))
+                store.sections[latestIndex].items.append(
+                    contentsOf: enrichedBatch.filter { !currentIds.contains($0.id) }
+                )
+                store.sections[latestIndex].pendingItems.removeFirst(batchCount)
+                store.sections[latestIndex].hasMore =
+                    !store.sections[latestIndex].pendingItems.isEmpty
+                    || (section.contentType != nil && section.catalogId != nil)
+                store.sections[latestIndex].isLoadingMore = false
+            }
             return
         }
 
@@ -5315,13 +5361,16 @@ private struct TVCatalogRow: View {
 
     private func isWatched(_ item: NuvioMeta) -> Bool? {
         let normalizedType = item.type.lowercased()
-        guard !["series", "tv", "show", "tvshow"].contains(normalizedType) else {
-            // Let the badge resolve episode-level series completion.
-            return nil
-        }
-        return !watchedTitleKeys.isDisjoint(
+        let titleWatched = !watchedTitleKeys.isDisjoint(
             with: WatchedStore.catalogTitleIdentityKeys(for: item)
         )
+        guard ["series", "tv", "show", "tvshow"].contains(normalizedType) else {
+            return titleWatched
+        }
+        // A whole-series action writes a local aggregate marker plus episode
+        // rows. Return the marker immediately, just like movie cards; when it
+        // is absent, nil lets WatchedCheckmarkBadge resolve episode completion.
+        return titleWatched ? true : nil
     }
 
     var body: some View {
@@ -5472,10 +5521,13 @@ private enum TVHomeGridLayout {
 
     static func isWatched(_ item: NuvioMeta, watchedTitleKeys: Set<String>) -> Bool? {
         let type = item.type.lowercased()
-        guard !["series", "tv", "show", "tvshow"].contains(type) else { return nil }
-        return !watchedTitleKeys.isDisjoint(
+        let titleWatched = !watchedTitleKeys.isDisjoint(
             with: WatchedStore.catalogTitleIdentityKeys(for: item)
         )
+        guard ["series", "tv", "show", "tvshow"].contains(type) else {
+            return titleWatched
+        }
+        return titleWatched ? true : nil
     }
 }
 
@@ -5730,10 +5782,17 @@ private struct TVHomeCatalogBrowseView: View {
         if !pendingItems.isEmpty {
             let batchCount = min(18, pendingItems.count)
             let batch = Array(pendingItems.prefix(batchCount))
-            let existingIDs = Set(items.map(\.id))
-            items.append(contentsOf: batch.filter { !existingIDs.contains($0.id) })
-            pendingItems.removeFirst(batchCount)
-            hasMore = !pendingItems.isEmpty || (section.contentType != nil && section.catalogId != nil)
+            // Same TMDB preparation the initial 18 Home items received, so
+            // post-18 cards match their shelf artwork (logo/backdrop).
+            isLoadingMore = true
+            Task { @MainActor in
+                defer { isLoadingMore = false }
+                let enrichedBatch = await TmdbDetailsService.localizedMetadata(for: batch)
+                let currentIDs = Set(items.map(\.id))
+                items.append(contentsOf: enrichedBatch.filter { !currentIDs.contains($0.id) })
+                pendingItems.removeFirst(batchCount)
+                hasMore = !pendingItems.isEmpty || (section.contentType != nil && section.catalogId != nil)
+            }
             return
         }
 
@@ -6306,6 +6365,8 @@ struct CollectionFolderBrowseView: View {
     @State private var lastFocusedItemID: String?
     @State private var focusRestoreGeneration = 0
     @State private var watchedTitleKeys: Set<String> = []
+    @State private var cachedCollectionMetadata: [String: NuvioMeta] = [:]
+    @State private var collectionEnrichmentTask: Task<Void, Never>?
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
@@ -6383,6 +6444,10 @@ struct CollectionFolderBrowseView: View {
         .onExitCommand(perform: onBack)
         .onAppear {
             requestLoadingFocusIfNeeded()
+        }
+        .onDisappear {
+            collectionEnrichmentTask?.cancel()
+            collectionEnrichmentTask = nil
         }
         .task {
             refreshWatchedTitles()
@@ -6499,6 +6564,7 @@ struct CollectionFolderBrowseView: View {
                                 showPosterLabels: posterLabels,
                                 externalFocus: $focusedItemID,
                                 watchedTitleKeys: watchedTitleKeys,
+                                onFocus: enrichCollectionItemIfNeeded,
                                 onApproachEnd: { item in
                                     loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
                                 },
@@ -6708,6 +6774,7 @@ struct CollectionFolderBrowseView: View {
                                 showPosterLabels: posterLabels,
                                 externalFocus: $focusedItemID,
                                 watchedTitleKeys: watchedTitleKeys,
+                                onFocus: enrichCollectionItemIfNeeded,
                                 onApproachEnd: { item in
                                     loadMoreRowIfNeeded(rowId: row.id, currentItem: item)
                                 },
@@ -6775,12 +6842,13 @@ struct CollectionFolderBrowseView: View {
     }
 
     private func isTitleWatched(_ meta: NuvioMeta) -> Bool? {
-        guard !["series", "tv", "show", "tvshow"].contains(meta.type.lowercased()) else {
-            return nil
-        }
-        return !watchedTitleKeys.isDisjoint(
+        let titleWatched = !watchedTitleKeys.isDisjoint(
             with: WatchedStore.catalogTitleIdentityKeys(for: meta)
         )
+        guard !["series", "tv", "show", "tvshow"].contains(meta.type.lowercased()) else {
+            return titleWatched ? true : nil
+        }
+        return titleWatched
     }
 
     @MainActor
@@ -6953,6 +7021,49 @@ struct CollectionFolderBrowseView: View {
         }
     }
 
+    /// Collections use the same focus-driven catalog enrichment as Home. This
+    /// intentionally goes through the repository rather than TMDB, so a
+    /// source-provided `/meta` logo still appears when TMDB is disabled.
+    private func enrichCollectionItemIfNeeded(_ item: NuvioMeta) {
+        guard item.needsHeroMetadataEnrichment else { return }
+        let key = "\(item.type.lowercased())\u{1f}\(item.id)"
+
+        if let fullMeta = cachedCollectionMetadata[key] {
+            applyCollectionMetadata(fullMeta, to: item.id)
+            return
+        }
+
+        // Focus moves quickly while the user browses with the remote. Do not
+        // start one metadata request per card passed over; wait for focus to
+        // settle and cancel the previous pending request.
+        collectionEnrichmentTask?.cancel()
+        collectionEnrichmentTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 250_000_000)
+            guard !Task.isCancelled,
+                  let fullMeta = try? await repository.refreshMetadata(
+                id: item.id,
+                type: item.type
+            ), !Task.isCancelled else {
+                return
+            }
+            cachedCollectionMetadata[key] = fullMeta
+            applyCollectionMetadata(fullMeta, to: item.id)
+        }
+    }
+
+    private func applyCollectionMetadata(_ fullMeta: NuvioMeta, to itemID: String) {
+        for rowIndex in catalogRows.indices {
+            guard let itemIndex = catalogRows[rowIndex].items.firstIndex(where: { $0.id == itemID }) else {
+                continue
+            }
+            let compact = catalogRows[rowIndex].items[itemIndex]
+            catalogRows[rowIndex].items[itemIndex] = compact.fillingMissingHeroMetadata(from: fullMeta)
+        }
+        if let itemIndex = items.firstIndex(where: { $0.id == itemID }) {
+            items[itemIndex] = items[itemIndex].fillingMissingHeroMetadata(from: fullMeta)
+        }
+    }
+
     private func pageItems(
         _ page: CatalogPage,
         source: NuvioCollectionSource
@@ -6995,6 +7106,7 @@ private struct CollectionFolderHomeStyleRow: View {
     var showPosterLabels: Bool = false
     var externalFocus: FocusState<String?>.Binding? = nil
     let watchedTitleKeys: Set<String>
+    let onFocus: (NuvioMeta) -> Void
     let onApproachEnd: (NuvioMeta) -> Void
     let onLongPress: (NuvioMeta) -> Void
     let onSelect: (NuvioMeta) -> Void
@@ -7078,6 +7190,7 @@ private struct CollectionFolderHomeStyleRow: View {
                                     scrollIndex = index
                                 }
                             }
+                            onFocus(focused)
                             scheduleLandscapeFocus(cardKey: cardKey)
                             onApproachEnd(focused)
                         },
@@ -7123,12 +7236,13 @@ private struct CollectionFolderHomeStyleRow: View {
     }
 
     private func isTitleWatched(_ meta: NuvioMeta) -> Bool? {
-        guard !["series", "tv", "show", "tvshow"].contains(meta.type.lowercased()) else {
-            return nil
-        }
-        return !watchedTitleKeys.isDisjoint(
+        let titleWatched = !watchedTitleKeys.isDisjoint(
             with: WatchedStore.catalogTitleIdentityKeys(for: meta)
         )
+        guard !["series", "tv", "show", "tvshow"].contains(meta.type.lowercased()) else {
+            return titleWatched ? true : nil
+        }
+        return titleWatched
     }
 
     /// Wait for the configured backdrop delay before expanding the settled

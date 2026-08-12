@@ -323,9 +323,17 @@ struct Issue255BodyReserveTests {
         defer { server.stop() }
 
         AVIOReader.peakBodyReserveForTesting = 0
+        // The budget matters here, because it bounds the wait for the staggered probe ladder:
+        // `sizeProbeStaggerSeconds + min(25, chunkRequestTimeout) + 2`. At 5 that is 7.75 s, and a
+        // loaded CI runner took longer than that to get the HEAD fallback's closure onto a thread:
+        // `open()` broke out of the wait, the reader fell back to streaming mode, and this test read
+        // "the HEAD fallback never ran" from a request log that only held the primary probe (one
+        // observed failure, green on the next run of the same commit). The wait exits as soon as a
+        // size resolves, so a wider ceiling costs nothing in the healthy case and only buys the
+        // fallback the room to actually be measured.
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/big.mkv")!,
                                 chunkSize: 1024 * 1024, prefetchEnabled: false,
-                                chunkRequestTimeout: 5)
+                                chunkRequestTimeout: 15)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 

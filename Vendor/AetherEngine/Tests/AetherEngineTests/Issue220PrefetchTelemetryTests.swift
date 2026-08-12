@@ -101,44 +101,30 @@ struct Issue220PrefetchTelemetryTests {
         #expect(AetherEngine.readerWindowFragment(pump: nil, prefetch: nil).isEmpty)
     }
 
-    /// The discriminator the kill needs: `ahead` far above winHighWater with `Susp=0` is
-    /// backpressure that never engaged, not a transport overshoot past a suspend that did.
-    @Test("both readers report window, ahead and suspend state")
+    /// The discriminator the kill needs: `ahead` far above winHighWater with `Parked=0` is
+    /// backpressure that never engaged, not an in-flight overshoot past an end that fired (#310).
+    @Test("both readers report window, ahead and parked state")
     func bothReadersReported() {
         let fragment = AetherEngine.readerWindowFragment(
-            pump: (windowBytes: 12 * 1024 * 1024, aheadBytes: 8 * 1024 * 1024,
-                   suspended: false, postSuspendBytes: 0),
+            pump: (windowBytes: 12 * 1024 * 1024, aheadBytes: 8 * 1024 * 1024, parked: false),
             prefetch: (windowBytes: 1024 * 1024 * 1024, aheadBytes: 1020 * 1024 * 1024,
-                       suspended: false, postSuspendBytes: 0))
+                       parked: false))
         #expect(fragment.contains("pumpWinMB=12 "))
         #expect(fragment.contains("pumpAheadMB=8 "))
-        #expect(fragment.contains("pumpSusp=0 "))
+        #expect(fragment.contains("pumpParked=0 "))
         #expect(fragment.contains("prefWinMB=1024 "))
         #expect(fragment.contains("prefAheadMB=1020 "))
-        #expect(fragment.contains("prefSusp=0 "))
+        #expect(fragment.contains("prefParked=0 "))
     }
 
-    @Test("a suspended reader is flagged")
-    func suspendedReaderFlagged() {
+    /// #310: parked now means the connection was deliberately ENDED at high water and the
+    /// low-water refill has not fired yet — a reader in this state holds no flow at all.
+    @Test("a parked reader is flagged")
+    func parkedReaderFlagged() {
         let fragment = AetherEngine.readerWindowFragment(
             pump: nil,
-            prefetch: (windowBytes: 17 * 1024 * 1024, aheadBytes: 17 * 1024 * 1024,
-                       suspended: true, postSuspendBytes: 1024 * 1024))
+            prefetch: (windowBytes: 17 * 1024 * 1024, aheadBytes: 17 * 1024 * 1024, parked: true))
         #expect(!fragment.contains("pump"))
-        #expect(fragment.contains("prefSusp=1 "))
-    }
-
-    /// #220: the quantity that decided the issue. A suspend that works leaves `PostMB` at the
-    /// transport's in-flight amount; one that does not leaves it tracking the whole window, and
-    /// the two are only distinguishable because this is reported separately from `AheadMB`.
-    @Test("post-suspend delivery is reported per reader")
-    func postSuspendDeliveryReported() {
-        let fragment = AetherEngine.readerWindowFragment(
-            pump: (windowBytes: 16 * 1024 * 1024, aheadBytes: 16 * 1024 * 1024,
-                   suspended: true, postSuspendBytes: 2 * 1024 * 1024),
-            prefetch: (windowBytes: 612 * 1024 * 1024, aheadBytes: 609 * 1024 * 1024,
-                       suspended: true, postSuspendBytes: 911 * 1024 * 1024))
-        #expect(fragment.contains("pumpPostMB=2 "))
-        #expect(fragment.contains("prefPostMB=911 "))
+        #expect(fragment.contains("prefParked=1 "))
     }
 }

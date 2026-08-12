@@ -43,6 +43,13 @@ extension AetherEngine {
         // Phase D: every selection change disarms the OCR worker first; the embedded bitmap
         // branch below re-arms it (cursors persist, so a reselect resumes coverage).
         cancelSubtitleOCRWorker()
+        // #316: an external track the remote-HLS proxy declared as a rendition is rendered by AVPlayer
+        // itself, so it must NOT also start a sidecar decode; the overlay would draw the same cues a
+        // second time, and only the rendition survives PiP / AirPlay / an external display.
+        if let renditionName = injectedSubtitleRenditionNames[index] {
+            selectInjectedSubtitleRendition(id: index, name: renditionName)
+            return
+        }
         // #88: external ids route onto the sidecar decode path; no side demuxer, no loadedURL needed.
         if let external = externalSubtitleRegistry[index] {
             selectExternalSubtitleTrack(id: index, track: external)
@@ -51,6 +58,12 @@ extension AetherEngine {
         // AE#154: remote-HLS bypass ids drive AVMediaSelection; AVPlayer renders the cues itself.
         if RemoteHLSMediaSelection.ordinal(forTrackID: index) != nil {
             selectRemoteHLSSubtitleTrack(id: index)
+            return
+        }
+        // AE#359: a live SUBTITLES rendition carries no packets in this demuxer; its cues come from the
+        // rendition's own WebVTT playlist, fetched only now that the host has actually asked for it.
+        if Self.isLiveSubtitleRenditionTrackID(index) {
+            selectLiveSubtitleRendition(id: index)
             return
         }
         guard index < Self.externalSubtitleTrackIDBase else { return }  // unknown external id: no-op
@@ -226,6 +239,8 @@ extension AetherEngine {
         subtitleDrainCursors.removeAll()
         subtitleDrainLastTickUptime = nil   // #271
         subtitleResolutionLastFrontier.removeAll()   // #250
+        subtitleResolutionCoverageStated.removeAll()   // #318
+        subtitleDeliveryLastOutcome.removeAll()   // #357
         cancelSubtitleForwardPrefetcher()   // #151
     }
 
@@ -235,6 +250,8 @@ extension AetherEngine {
         subtitleDrainDecoders[channel] = nil
         subtitleDrainCursors[channel] = nil
         subtitleResolutionLastFrontier[channel] = nil   // #250
+        subtitleResolutionCoverageStated.remove(channel)   // #318
+        subtitleDeliveryLastOutcome[channel] = nil   // #357
         refreshSubtitleStoreProtection()   // #166
         if subtitleDrainTargets.isEmpty { stopSubtitleDrainer() }
     }
@@ -281,8 +298,9 @@ extension AetherEngine {
                 // #276: an idle tick decoded nothing, so it banks nothing into the retained run.
                 // The frontier may well have moved under it; folding that in would claim
                 // determination the drainer never performed.
-                emitSubtitleResolutionStatementIfFrontierChanged(channel: channel,
-                                                                 streamIndex: streamIndex)
+                emitSubtitleResolutionStatementIfTransitioned(channel: channel,
+                                                              streamIndex: streamIndex,
+                                                              playhead: playhead)
                 continue
             case .decode(let from, let through):
                 isReset = false
@@ -304,7 +322,16 @@ extension AetherEngine {
             if subtitleDrainDecoders[channel] == nil {
                 subtitleDrainDecoders[channel] = makeSubtitleDrainDecoder(streamIndex: streamIndex)
             }
-            guard let decoder = subtitleDrainDecoders[channel] else { continue }
+            guard let decoder = subtitleDrainDecoders[channel] else {
+                // #357: a channel holding a drain target whose decoder cannot be built delivers
+                // nothing for the rest of the session, and the tick used to skip it in silence.
+                var tally = SubtitleDeliveryStatement.Tally()
+                tally.decoderMissing = true
+                emitSubtitleDeliveryStatementIfTransitioned(
+                    channel: channel, streamIndex: streamIndex, playhead: playhead,
+                    tally: tally, isReset: isReset)
+                continue
+            }
             let entries = store.entries(streamIndex: streamIndex,
                                         from: window.from, through: window.through)
             // #271: bound the batch, on a PTS boundary. The window is bounded in seconds of
@@ -321,16 +348,27 @@ extension AetherEngine {
             // handful of cues. One bind, one publish, and only when the batch changed something.
             var cues = retainedSubtitleCues(for: channel)
             var didMutate = false
+            // #357: what this tick did, counted as it happens. The cursor below advances over every
+            // packet whether or not the decoder built anything from it, so without these counts a
+            // window of undecodable packets is indistinguishable in the log from a window that
+            // delivered normally.
+            var tally = SubtitleDeliveryStatement.Tally()
+            tally.packets = batchEnd
             // The cursor only advances to an actually-decoded packet's PTS: a window that is
             // empty because the producer has not reached it yet must be rescanned next tick.
             var lastDecoded = subtitleDrainCursors[channel]?.lastDecodedPts
             for entry in entries[..<batchEnd] {
-                // A cue-less event still matters: a PGS clear composition carries only
-                // pgsTrimAt and is what removes the line during silence.
-                if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder),
-                   !event.cues.isEmpty || event.pgsTrimAt != nil,
-                   applySubtitleEvent(event, to: &cues, channel: channel) {
-                    didMutate = true
+                if let event = Self.decodeStoredSubtitlePacket(entry, with: decoder) {
+                    tally.events += 1
+                    tally.cues += event.cues.count
+                    // A cue-less event still matters: a PGS clear composition carries only
+                    // pgsTrimAt and is what removes the line during silence.
+                    if !event.cues.isEmpty || event.pgsTrimAt != nil {
+                        let applied = applySubtitleEvent(event, to: &cues, channel: channel)
+                        tally.admitted += applied.admitted
+                        tally.published += applied.published
+                        if applied.changed { didMutate = true }
+                    }
                 }
                 lastDecoded = entry.ptsSeconds
             }
@@ -363,9 +401,17 @@ extension AetherEngine {
                 // than the epsilon behind the playhead and re-dark the overlay this fix exists to light.
                 for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
                     .finalizeReconstruction(playhead: playhead) {
-                    if insertSorted(cue, into: &cues) { didMutate = true }
+                    // #357: a finalized candidate is a delivery like any other, and counting it as
+                    // one is what keeps a landing that published only through this path from
+                    // reading as `held`.
+                    tally.admitted += 1
+                    if insertSorted(cue, into: &cues) {
+                        didMutate = true
+                        tally.published += 1
+                    }
                 }
             }
+            tally.reconstructing = pgsStaleArrivalGates[channel]?.reconstructing ?? false
             // Retention prune, once per batch instead of once per event: it depends only on the
             // playhead, which the batch does not move.
             if isSubtitleActive(for: channel),
@@ -373,19 +419,34 @@ extension AetherEngine {
                 didMutate = true
             }
             if didMutate { publishRetainedSubtitleCues(cues, for: channel) }
+            // #357: state what the tick did before the resolution line states how far it reached.
+            // The two answer different questions and a report needs both: determination can keep
+            // pace with every landing while delivery is empty, and that pairing is the whole
+            // ambiguity this line removes.
+            emitSubtitleDeliveryStatementIfTransitioned(
+                channel: channel, streamIndex: streamIndex, playhead: playhead,
+                tally: tally, isReset: isReset)
             // #250: the post-seek window has decoded, so state how far determination reaches.
             // #276: one statement value per decoding tick, built whether or not it is printed. Its
             // `resolvedThrough` is this run's determined end under the fence that is live RIGHT
             // NOW, and banking it here is the only place it can be had: by the next reset tick the
             // seek generation has moved on and the outgoing run's frontier no longer passes its
             // own fence.
-            let statement = subtitleResolutionStatement(
+            var statement = subtitleResolutionStatement(
                 channel: channel, streamIndex: streamIndex,
-                reason: isReset ? .reconstruction : .frontier)
+                reason: isReset ? .reconstruction : .frontier, playhead: playhead)
             subtitleDrainCursors[channel]?.retained = SubtitleResolutionStatement.extend(
                 runRetained, with: statement.resolvedThrough)
-            if isReset || subtitleResolutionLastFrontier[channel] != statement.via {
-                emitSubtitleResolutionStatement(statement, channel: channel)
+            // #318: a reset starts a fresh run, and whether THAT run reaches the playhead is a
+            // fresh question. Cleared before the decision below so a reconstruction line that
+            // already states coverage can latch it again on the way out.
+            if isReset { subtitleResolutionCoverageStated.remove(channel) }
+            if let reason = SubtitleResolutionStatement.transitionReason(
+                statement, playhead: playhead, isReset: isReset,
+                coverageStated: subtitleResolutionCoverageStated.contains(channel),
+                lastFrontier: subtitleResolutionLastFrontier[channel]) {
+                statement.reason = reason
+                emitSubtitleResolutionStatement(statement, channel: channel, playhead: playhead)
             }
         }
         // #151: a jump (seek / producer re-anchor) moves the drain window out from under the
@@ -729,24 +790,29 @@ extension AetherEngine {
         }
     }
 
-    /// Returns whether the event changed anything. An event that decodes but resolves to nothing new
-    /// (a re-decoded cue the store already holds, a trim matching no open window) must not cost a
+    /// Returns what the event did to the array (#357). An event that decodes but resolves to nothing
+    /// new (a re-decoded cue the store already holds, a trim matching no open window) must not cost a
     /// publication: on a dense track that is the common case, and each publication makes every
     /// consumer walk the whole cumulative snapshot (#271).
     @discardableResult
     private func applySubtitleEvent(_ event: EmbeddedSubtitleDecoder.SubtitleEvent,
                                     to cues: inout [SubtitleCue],
-                                    channel: SubtitleChannel) -> Bool {
-        guard isSubtitleActive(for: channel) else { return false }
+                                    channel: SubtitleChannel) -> SubtitleDeliveryStatement.Application {
+        guard isSubtitleActive(for: channel) else { return .init() }
 
-        // Per-session diagnostics: primary-only, capped at 20 to keep the in-app log readable.
-        if channel == .primary, subtitleCueDiagnosticCount < 20, let firstCue = event.cues.first {
-            subtitleCueDiagnosticCount += 1
+        // #357: primary-only, and budgeted per seek generation rather than per load, so a seek
+        // sequence stays observable to its end. The playhead is `sourceTime`, the axis cue
+        // timestamps are on; `currentTime` rides beside it because their difference is the playlist
+        // shift, and reading the two as one clock has cost a round of diagnosis before.
+        if channel == .primary, let firstCue = event.cues.first,
+           subtitleCueDiagnosticBudget.claim(generation: currentSeekGeneration) {
             EngineLog.emit(
-                "[applySubtitleEvent #\(subtitleCueDiagnosticCount)] " +
+                "[applySubtitleEvent] " +
                 "cueStart=\(String(format: "%.3f", firstCue.startTime))s " +
                 "cueEnd=\(String(format: "%.3f", firstCue.endTime))s " +
-                "engine.currentTime=\(String(format: "%.3f", currentTime))s",
+                "sourceTime=\(String(format: "%.3f", sourceTime))s " +
+                "engine.currentTime=\(String(format: "%.3f", currentTime))s " +
+                "seekGen=\(currentSeekGeneration)",
                 category: .engine
             )
         }
@@ -759,15 +825,15 @@ extension AetherEngine {
     /// return value reports whether `cues` actually changed.
     @MainActor
     @discardableResult
-    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) -> Bool {
-        var changed = false
+    private func applyEventMutations(_ event: EmbeddedSubtitleDecoder.SubtitleEvent, to cues: inout [SubtitleCue], channel: SubtitleChannel = .primary) -> SubtitleDeliveryStatement.Application {
+        var applied = SubtitleDeliveryStatement.Application()
         if let trimAt = event.pgsTrimAt {
             for i in 0..<cues.count {
                 guard case .image = cues[i].body else { continue }
                 let cue = cues[i]
                 if cue.startTime < trimAt && cue.endTime > trimAt {
                     cues[i] = cue.with(endTime: trimAt)
-                    changed = true
+                    applied.changed = true
                 }
             }
             // #100: this event is the held stale arrival's successor; its start closes the held
@@ -775,13 +841,17 @@ extension AetherEngine {
             // genuinely active cue), drop replayed history silently.
             for cue in pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
                 .resolveHeld(trimAt: trimAt, playhead: sourceTime) {
-                if insertSorted(cue, into: &cues) { changed = true }
+                applied.admitted += 1
+                if insertSorted(cue, into: &cues) {
+                    applied.changed = true
+                    applied.published += 1
+                }
             }
         }
         // #107: teletext page-state semantics; every event (content or erase) closes earlier
         // open text cues at its start, since libzvbi emits pages open-ended ("until replaced").
         if let trimAt = event.textTrimAt, Self.trimTextCues(&cues, at: trimAt) {
-            changed = true
+            applied.changed = true
         }
         // #100: a PGS event whose cues start well behind the playhead is a catch-up replay; its
         // open-ended placeholder window would cover the playhead the instant it inserts and flash
@@ -792,10 +862,14 @@ extension AetherEngine {
         let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
             .admit(cues: event.cues, isPGS: event.isPGS,
                    isSelfContained: event.isSelfContainedPGS, playhead: sourceTime)
+        applied.admitted += admitted.count
         for cue in admitted {
-            if insertSorted(cue, into: &cues) { changed = true }
+            if insertSorted(cue, into: &cues) {
+                applied.changed = true
+                applied.published += 1
+            }
         }
-        return changed
+        return applied
     }
 
 
@@ -928,6 +1002,25 @@ extension AetherEngine {
         applyPreferredSubtitleSelection(startAnchor: sourceTime,
                                         sourceDuration: duration > 0 ? duration : nil)
         return info
+    }
+
+    /// #88: seat the load-declared external tracks in `subtitleTracks`. On the probe path this runs
+    /// BEFORE preferred-language selection and the native rendition table are built from the list.
+    ///
+    /// #170: a session-preserving reload seeds the previous session's registry verbatim instead:
+    /// mid-session adds survive with their ids (and, registered pre-table, become rendition-eligible on
+    /// the reloaded item); mid-session removals stay removed; the host's subtitle authority carries over
+    /// so the load-end auto-selection cannot override it.
+    ///
+    /// #316: the nativeRemoteHLS bypass and the AE#154 reroute return long before the probe path reaches
+    /// this point, so both call it themselves. Without that a host declaring sidecars on a remote-HLS
+    /// source got nothing back and no diagnostic: the option was read, then dropped at the branch.
+    func registerDeclaredExternalSubtitles(_ options: LoadOptions) {
+        if let carryover = options.subtitleSessionCarryover {
+            applySubtitleSessionCarryoverRegistrations(carryover)
+        } else {
+            for track in options.externalSubtitles { registerExternalSubtitleTrack(track) }
+        }
     }
 
     /// Registration without the preference re-run; the load path runs its own selection at load end.
@@ -1151,11 +1244,17 @@ extension AetherEngine {
     /// Disable primary subtitles, clear cues, cancel sidecar task + side demuxer, cancel multi-decode reader, clear native mov_text stores (#55, all-tracks). `nativeSubtitleTracks` is NOT cleared: the host needs the list to re-select after an audio/subtitle switch; only `stop()` / `load()` reset it.
     public func clearSubtitle() {
         hostExplicitSubtitleAction = true
+        // AE#359: subtitles off ends the rendition poll. The renditions themselves stay listed, only
+        // the fetching stops, so re-selecting the track starts fresh from the current window.
+        liveSubtitleFetchTask?.cancel()
+        liveSubtitleFetchTask = nil
         // AE#154: a remote-HLS legible selection lives in AVMediaSelection, not the overlay
         // pipeline; deselect it on the item (criteria pinned manual so system caption prefs
         // don't immediately re-select).
+        // #316: an injected external rendition is the same kind of selection, under an external id.
         if let active = activeSubtitleTrackIndex,
-           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil,
+           RemoteHLSMediaSelection.ordinal(forTrackID: active) != nil
+            || injectedSubtitleRenditionNames[active] != nil,
            let item = currentAVPlayer?.currentItem {
             Task { @MainActor in
                 self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
@@ -1971,18 +2070,26 @@ extension AetherEngine {
             guard let group, !group.options.isEmpty else { return }
             guard let self, !Task.isCancelled,
                   self.currentAVPlayer?.currentItem === item else { return }
-            let snapshots = group.options.map { option in
-                RemoteHLSMediaSelection.LegibleOption(
+            var snapshots: [RemoteHLSMediaSelection.LegibleOption] = []
+            for option in group.options {
+                snapshots.append(RemoteHLSMediaSelection.LegibleOption(
                     displayName: option.displayName,
                     extendedLanguageTag: option.extendedLanguageTag,
                     isDefault: group.defaultOption == option,
                     isForced: option.hasMediaCharacteristic(.containsOnlyForcedSubtitles),
                     isSDH: option.hasMediaCharacteristic(.transcribesSpokenDialogForAccessibility)
-                        && option.hasMediaCharacteristic(.describesMusicAndSoundForAccessibility))
+                        && option.hasMediaCharacteristic(.describesMusicAndSoundForAccessibility),
+                    playlistName: await RemoteHLSMediaSelection.playlistName(of: option)))
             }
-            self.subtitleTracks = RemoteHLSMediaSelection.subtitleTrackInfos(from: snapshots)
+            // #316: merge, don't assign; the host's load-declared external tracks must survive. The
+            // renditions the proxy injected for those same tracks are dropped here: they are already
+            // listed under their external ids, and a second entry would offer one file as two tracks.
+            let injected = Set(self.injectedSubtitleRenditionNames.values)
+            self.subtitleTracks = RemoteHLSMediaSelection.mergedSubtitleTracks(
+                existing: self.subtitleTracks, legible: snapshots, injectedNames: injected)
             EngineLog.emit(
-                "[AetherEngine] AE#154: remote-HLS legible group surfaced \(group.options.count) subtitle rendition(s)",
+                "[AetherEngine] AE#154: remote-HLS legible group surfaced \(group.options.count) subtitle "
+                + "rendition(s)\(injected.isEmpty ? "" : ", \(injected.count) of them engine-injected (#316)")",
                 category: .engine)
             // Selection mirror after readiness: AVKit / caption-pref auto-select runs at readyToPlay,
             // later than the group load above.
@@ -1991,12 +2098,59 @@ extension AetherEngine {
                   !self.hostExplicitSubtitleAction else { return }
             if let selected = item.currentMediaSelection.selectedMediaOption(in: group),
                let ordinal = group.options.firstIndex(of: selected) {
-                self.activeSubtitleTrackIndex = RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
+                // #316: an auto-selected injected rendition mirrors back as the EXTERNAL id it was
+                // declared under, not as a second identity in the legible id range.
+                let selectedName = await RemoteHLSMediaSelection.playlistName(of: selected)
+                    ?? selected.displayName
+                self.activeSubtitleTrackIndex = self.injectedSubtitleRenditionNames
+                    .first { $0.value == selectedName }?.key
+                    ?? RemoteHLSMediaSelection.subtitleTrackIDBase + ordinal
                 self.isSubtitleActive = true
                 EngineLog.emit(
                     "[AetherEngine] AE#154: mirrored auto-selected legible option ordinal=\(ordinal)",
                     category: .engine)
             }
+        }
+    }
+
+    /// #316: activate a sidecar the proxy declared in the served master. The track keeps the external id
+    /// the host registered it under, but the selection is an `AVMediaSelection` one, so AVPlayer renders
+    /// it and it survives leaving the view hierarchy.
+    ///
+    /// Matched by NAME: the rewriter guarantees uniqueness within the group (it disambiguates against the
+    /// origin's own names), and `AVMediaSelectionOption.displayName` is the rendition's NAME attribute.
+    /// A miss leaves the previous selection alone and says so rather than silently reporting success.
+    func selectInjectedSubtitleRendition(id: Int, name: String) {
+        guard let item = currentAVPlayer?.currentItem else { return }
+        cancelSidecarTask()
+        clearSubtitleDrainTarget(channel: .primary)
+        activeEmbeddedSubtitleStreamIndex = -1
+        // AVPlayer owns the drawing here; leaving overlay cues behind would double up.
+        subtitleCues = []
+        loadedSidecarURL = nil
+        isSubtitleActive = true
+        activeSubtitleTrackIndex = id
+        isLoadingSubtitles = false
+        Task { @MainActor in
+            self.currentAVPlayer?.appliesMediaSelectionCriteriaAutomatically = false
+            guard let group = try? await item.asset.loadMediaSelectionGroup(for: .legible) else { return }
+            var match: AVMediaSelectionOption?
+            var seen: [String] = []
+            for option in group.options {
+                let playlistName = await RemoteHLSMediaSelection.playlistName(of: option)
+                seen.append(playlistName ?? option.displayName)
+                if match == nil, playlistName == name || option.displayName == name { match = option }
+            }
+            guard let option = match else {
+                EngineLog.emit(
+                    "[AetherEngine] #316: injected rendition \"\(name)\" is not in the item's legible "
+                    + "group (\(seen.joined(separator: ", ")))",
+                    category: .engine)
+                return
+            }
+            item.select(option, in: group)
+            EngineLog.emit("[AetherEngine] #316: selected injected rendition \"\(name)\" for external id=\(id)",
+                           category: .engine)
         }
     }
 

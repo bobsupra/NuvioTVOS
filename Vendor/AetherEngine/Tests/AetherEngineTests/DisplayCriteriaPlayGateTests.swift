@@ -59,10 +59,7 @@ struct DisplayCriteriaPlayGateTests {
     }
 
     @Test("Budgets are the documented millisecond values")
-    func graceTicks() {
-        #expect(DisplayCriteriaController.StartGrace.skip.ticks == 0)
-        #expect(DisplayCriteriaController.StartGrace.brief.ticks == 20)   // 20 x 10ms = 200ms
-        #expect(DisplayCriteriaController.StartGrace.full.ticks == 100)   // 100 x 10ms = 1000ms
+    func graceBudgets() {
         #expect(DisplayCriteriaController.StartGrace.skip.budgetMs == 0)
         #expect(DisplayCriteriaController.StartGrace.brief.budgetMs == 200)
         #expect(DisplayCriteriaController.StartGrace.full.budgetMs == 1000)
@@ -128,8 +125,8 @@ struct DisplayCriteriaPlayGateTests {
     @Test("Reported timings are the measured ones, not the Stage 1 budget added back in")
     func timingSuffixReportsMeasuredValues() {
         let suffix = DisplayCriteriaController.timingSuffix(
-            startSignal: .preGate, stage1Ms: 5, totalMs: 55)
-        #expect(suffix == "start pre-gate after 5ms, total 55ms")
+            startSignal: .inGate, stage1Ms: 5, totalMs: 55)
+        #expect(suffix == "start in-gate after 5ms, total 55ms")
         // The line this replaces read "~1050ms" for exactly this switch: Stage 1's full 1000 ms budget,
         // which it never spent, plus one 50 ms Stage 2 tick.
         #expect(!suffix.contains("1050"))
@@ -138,12 +135,90 @@ struct DisplayCriteriaPlayGateTests {
 
     @Test("Start signal distinguishes a switch already running from one that began inside the gate")
     func startSignalNamesTheOrdering() {
-        // The whole point of #49: a pre-gate start means the panel was switching while the item was built.
-        #expect(DisplayCriteriaController.StartSignal.preGate.rawValue == "pre-gate")
+        // The whole point of #49. Since #339 the observation is armed at the criteria write, so a switch
+        // that was running while the item was built announces itself and the flag-only reading says exactly
+        // what it is: a switch this session's write never announced.
+        #expect(DisplayCriteriaController.StartSignal.preGateObserved.rawValue
+            == "pre-gate (start notification, before gate entry)")
+        #expect(DisplayCriteriaController.StartSignal.preGate.rawValue
+            == "pre-gate (flag only, no start notification since the criteria write)")
         #expect(DisplayCriteriaController.StartSignal.inGate.rawValue == "in-gate")
         #expect(DisplayCriteriaController.timingSuffix(
             startSignal: .inGate, stage1Ms: 120, totalMs: 300)
             == "start in-gate after 120ms, total 300ms")
+    }
+
+    // MARK: - Start classification (Sodalite#49, second measurement round)
+    //
+    // The first round's fix made the reported numbers real. The numbers then showed that the signal they
+    // were attached to was not: all three reporter runs came back "pre-gate", including one whose flag was
+    // demonstrably false for the first 376 ms. Stage 1 tested the in-progress flag on every poll but drew
+    // the pre-gate conclusion the enum only licenses for the first one.
+
+    @Test("A start notification names an in-gate start, whatever the in-progress flag reads")
+    func notificationWinsOverFlag() {
+        #expect(DisplayCriteriaController.classifyStart(
+            isFirstPoll: true, startNotificationFired: true, switchInProgress: true) == .inGate)
+        #expect(DisplayCriteriaController.classifyStart(
+            isFirstPoll: false, startNotificationFired: true, switchInProgress: false) == .inGate)
+    }
+
+    @Test("The in-progress flag on the very first poll is the only evidence of a pre-gate start")
+    func flagOnFirstPollIsPreGate() {
+        #expect(DisplayCriteriaController.classifyStart(
+            isFirstPoll: true, startNotificationFired: false, switchInProgress: true) == .preGate)
+    }
+
+    @Test("A flag that only rises after the first poll started inside the gate, notification or not")
+    func flagRisingLaterIsNotPreGate() {
+        // The reporter's flipped run logged "start pre-gate after 376ms". The flag was false at entry and
+        // for ~37 polls after it, and the classifier still called the switch older than the gate, which is
+        // the single question #49 was filed on. A flag observed false at entry cannot describe a switch
+        // that predates entry.
+        let signal = DisplayCriteriaController.classifyStart(
+            isFirstPoll: false, startNotificationFired: false, switchInProgress: true)
+        #expect(signal == .inGateFlagOnly)
+        #expect(signal != .preGate)
+    }
+
+    @Test("Nothing observed keeps Stage 1 polling")
+    func nothingObservedKeepsPolling() {
+        #expect(DisplayCriteriaController.classifyStart(
+            isFirstPoll: true, startNotificationFired: false, switchInProgress: false) == nil)
+        #expect(DisplayCriteriaController.classifyStart(
+            isFirstPoll: false, startNotificationFired: false, switchInProgress: false) == nil)
+    }
+
+    @Test("The flag-only start reads as its own signal, not as either certainty")
+    func flagOnlyStartHasItsOwnSuffix() {
+        // Naming the missed notification matters: it is the difference between "the panel started late" and
+        // "we were not listening yet", and only the second one indicts the observer registration point.
+        #expect(DisplayCriteriaController.timingSuffix(
+            startSignal: .inGateFlagOnly, stage1Ms: 376, totalMs: 3238)
+            == "start in-gate (flag only, start notification missed) after 376ms, total 3238ms")
+    }
+
+    // MARK: - Budgets are deadlines, not tick counts (Sodalite#49)
+
+    @Test("A budget is spent by elapsed time, so scheduler overhead cannot stretch it")
+    func budgetExhaustsOnElapsedTime() {
+        #expect(DisplayCriteriaController.isBudgetSpent(elapsedMs: 1999, budgetMs: 2000) == false)
+        #expect(DisplayCriteriaController.isBudgetSpent(elapsedMs: 2000, budgetMs: 2000))
+        // Both figures are measured, from two runs of the same "2 s cap" on the reporter's Apple TV: a
+        // tick-counting Stage 2 ran its 40 x 50 ms to 2082 ms in one and to 2862 ms in another, a 40 %
+        // spread on a thermally throttled device. A deadline does not have that spread.
+        #expect(DisplayCriteriaController.isBudgetSpent(elapsedMs: 2082, budgetMs: 2000))
+        #expect(DisplayCriteriaController.isBudgetSpent(elapsedMs: 2862, budgetMs: 2000))
+    }
+
+    @Test("A zero budget is spent before the first poll")
+    func zeroBudgetIsSpentImmediately() {
+        #expect(DisplayCriteriaController.isBudgetSpent(elapsedMs: 0, budgetMs: 0))
+    }
+
+    @Test("The Stage 2 cap is the documented two seconds")
+    func stage2CapIsTwoSeconds() {
+        #expect(DisplayCriteriaController.stage2CapMs == 2000)
     }
 
     @Test("Elapsed conversion is nanoseconds to whole milliseconds, truncating")

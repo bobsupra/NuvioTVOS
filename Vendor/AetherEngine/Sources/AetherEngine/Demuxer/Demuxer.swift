@@ -41,6 +41,17 @@ struct DemuxerOpenProfile: Sendable {
     /// ~300 ms). nil keeps the open-ended behaviour for every other path (playback streams from 0).
     var boundedInitialFetch: Int64? = nil
 
+    /// `LoadOptions.sequentialOrigin`: the origin fabricates range answers, so the AVIO reader must
+    /// run its forward-only streaming mode (one unranged GET from byte 0) and never issue a ranged
+    /// request. Lives in the profile so the probe demuxer, the session demuxer, and every fresh
+    /// reopen (wedge restart, revive) inherit it together.
+    var avioSequentialOnly: Bool = false
+
+    /// `LoadOptions.declaredDurationSeconds`: caller-trusted duration override consumed by
+    /// `Demuxer.duration`. Rides in the profile next to `avioSequentialOnly` because the two are a
+    /// pair: without the ranged tail read the container resolves no duration of its own.
+    var declaredDurationSeconds: Double? = nil
+
     /// #240: what to call this demuxer's network reader in the log. Several readers run against the
     /// same origin at once (the pump, the subtitle forward prefetcher, the native subtitle readers),
     /// and a connection line without a name cannot say which one opened it: the reporter of #240 read
@@ -86,6 +97,16 @@ struct DemuxerOpenProfile: Sendable {
         var copy = self
         if let probesize { copy.probesize = probesize }
         if let maxAnalyzeDuration { copy.maxAnalyzeDuration = maxAnalyzeDuration }
+        return copy
+    }
+
+    /// A copy of `self` carrying the sequential-origin declaration and its paired trusted
+    /// duration (no-op when `sequential` is false and `declaredDuration` is nil), in the style
+    /// of `withProbeBudget` so call sites can chain it onto their existing profile.
+    func withSequentialOrigin(_ sequential: Bool, declaredDuration: Double?) -> DemuxerOpenProfile {
+        var copy = self
+        copy.avioSequentialOnly = sequential
+        if let declaredDuration { copy.declaredDurationSeconds = declaredDuration }
         return copy
     }
 
@@ -191,7 +212,7 @@ public final class Demuxer: @unchecked Sendable {
     /// #220: sliding-window snapshot of this demuxer's network reader, nil for disc / custom /
     /// file providers that have no window. Surfaced per demuxer (pump and subtitle side reader
     /// are separate readers against the same origin) in the periodic memprobe.
-    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)? {
+    var ioWindowDiagnostics: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
         (avioProvider as? AVIOReader)?.windowDiagnostics
     }
 
@@ -298,6 +319,19 @@ public final class Demuxer: @unchecked Sendable {
         return container
     }
 
+    /// Full duration-precedence chain: a caller-declared duration
+    /// (`DemuxerOpenProfile.declaredDurationSeconds`, the sequential-origin pair) outranks
+    /// everything - the non-seekable pb ran no tail estimate, so the container value is 0 or
+    /// garbage from fabricated range data - then a custom time-seekable reader's own duration,
+    /// then the disc/container resolution above.
+    static func effectiveDurationSeconds(
+        declared: Double?, readerDuration: Double?, discTitle: Double?, container: Double
+    ) -> Double {
+        if let declared, declared > 0 { return declared }
+        if let readerDuration, readerDuration > 0 { return readerDuration }
+        return effectiveDurationSeconds(discTitle: discTitle, container: container)
+    }
+
     /// Open a media URL and probe its streams.
     /// - Parameters:
     ///   - extraHeaders: Attached to every HTTP request (ignored for file:// URLs).
@@ -396,7 +430,8 @@ public final class Demuxer: @unchecked Sendable {
             isLive: isLive,
             chunkRequestTimeout: openProfile.avioRequestTimeout,
             chunkMaxRetries: openProfile.avioMaxRetries,
-            boundedInitialFetch: openProfile.boundedInitialFetch
+            boundedInitialFetch: openProfile.boundedInitialFetch,
+            sequentialOnly: openProfile.avioSequentialOnly
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
         try openWithProvider(reader, isLive: isLive)
@@ -425,7 +460,8 @@ public final class Demuxer: @unchecked Sendable {
         // URL is nil because pb is already set.
         var ctxPtr: UnsafeMutablePointer<AVFormatContext>? = ctx
         var opts: OpaquePointer? = nil
-        Self.applyDemuxerOptions(&opts, isLive: isLive)
+        Self.applyDemuxerOptions(&opts, isLive: isLive,
+                                 skipDurationEstimate: openProfile.avioSequentialOnly)
         let ret = avformat_open_input(&ctxPtr, nil, inputFormat, &opts)
         av_dict_free(&opts)
         guard ret == 0 else {
@@ -456,12 +492,15 @@ public final class Demuxer: @unchecked Sendable {
     /// (3.24 MB/s -> ~1.7 MB/s). Tried+reverted: +sortdts (worse RSS), +discardcorrupt
     /// (worse RSS), +igndts (AetherEngine#5: matroska still emits dts=0 on HEVC open-GOP
     /// CRA B-frames, NOPTS repair stack stayed load-bearing).
-    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false) {
+    private static func applyDemuxerOptions(_ opts: inout OpaquePointer?, isLive: Bool = false, skipDurationEstimate: Bool = false) {
         av_dict_set(&opts, "fflags", "+genpts", 0)
-        if isLive {
+        if isLive || skipDurationEstimate {
             // Live sources have no Content-Length; stream-info pass seeks SEEK_END,
             // which latches pb->eof_reached and collapses av_read_frame ~10s in.
             // skip_estimate_duration_from_pts avoids that SEEK_END entirely.
+            // A sequential-origin VOD skips it for the same reason from the other
+            // side: its pb is non-seekable by declaration, and the caller supplies
+            // the duration (`declaredDurationSeconds`) the estimate would have fed.
             av_dict_set(&opts, "skip_estimate_duration_from_pts", "1", 0)
         }
     }
@@ -555,18 +594,17 @@ public final class Demuxer: @unchecked Sendable {
     }
 
     var duration: Double {
-        if let duration = (avioProvider as? CustomIOReaderBridge)?
-            .timeSeekableReader?.mediaDuration,
-           duration > 0 {
-            return duration
-        }
         let container: Double = {
             guard let ctx = formatContext else { return 0 }
             let dur = ctx.pointee.duration
             return dur > 0 ? Double(dur) / Double(AV_TIME_BASE) : 0
         }()
-        // A disc title's MPLS/IFO duration overrides FFmpeg's unreliable mpegts estimate (AE#105).
-        return Self.effectiveDurationSeconds(discTitle: selectedDiscTitleDurationSeconds, container: container)
+        // Declared (sequential-origin caller trust) > custom reader > disc MPLS/IFO (AE#105) > container.
+        return Self.effectiveDurationSeconds(
+            declared: openProfile.declaredDurationSeconds,
+            readerDuration: (avioProvider as? CustomIOReaderBridge)?.timeSeekableReader?.mediaDuration,
+            discTitle: selectedDiscTitleDurationSeconds,
+            container: container)
     }
 
     /// AVFormatContext.bit_rate in bps, or 0 if unknown. Used by

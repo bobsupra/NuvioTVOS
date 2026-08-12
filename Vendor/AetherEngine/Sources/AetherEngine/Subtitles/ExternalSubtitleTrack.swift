@@ -56,6 +56,14 @@ public struct ExternalSubtitleTrack: Sendable, Equatable {
         }
     }
 
+    /// Text formats the engine can turn into a WebVTT rendition (#316). `codecName` deliberately falls
+    /// back to subrip for anything it does not recognise, which is a fine host label but would promise a
+    /// rendition for a `.sup` bitmap sidecar; those stay on the overlay (and Phase D's OCR).
+    var isTextFormat: Bool {
+        ["srt", "subrip", "ass", "ssa", "vtt", "webvtt"]
+            .contains((formatHint ?? url.pathExtension).lowercased())
+    }
+
     func makeTrackInfo(id: Int, fallbackNumber: Int) -> TrackInfo {
         let resolvedName: String
         if let name, !name.isEmpty {

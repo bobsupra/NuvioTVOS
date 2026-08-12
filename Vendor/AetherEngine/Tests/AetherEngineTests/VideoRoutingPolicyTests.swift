@@ -34,6 +34,27 @@ struct VideoRoutingPolicyTests {
             codecID: AV_CODEC_ID_VC1, fieldOrder: AV_FIELD_UNKNOWN, av1Available: true))
     }
 
+    @Test("qtrle and the rest of the long tail route software, not native (FFmpegBuild#1)")
+    func unenumeratedVideoCodecsAreSoftware() {
+        // HLSVideoEngine accepts HEVC / H.264 / HW AV1 and throws unsupportedCodec on everything else,
+        // so a codec the switch never named used to fail the load rather than fall back to libavcodec.
+        for codec in [AV_CODEC_ID_QTRLE, AV_CODEC_ID_PRORES, AV_CODEC_ID_MJPEG,
+                      AV_CODEC_ID_THEORA, AV_CODEC_ID_RAWVIDEO, AV_CODEC_ID_CINEPAK] {
+            #expect(VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: codec, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true))
+            #expect(VideoRoutingPolicy.requiresSoftwarePath(
+                codecID: codec, fieldOrder: AV_FIELD_UNKNOWN, av1Available: false))
+        }
+    }
+
+    @Test("no video stream stays native (audio-only probes as NONE)")
+    func audioOnlyStaysNative() {
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_NONE, fieldOrder: AV_FIELD_UNKNOWN, av1Available: true))
+        #expect(!VideoRoutingPolicy.requiresSoftwarePath(
+            codecID: AV_CODEC_ID_NONE, fieldOrder: AV_FIELD_UNKNOWN, av1Available: false))
+    }
+
     @Test("AV1 follows hardware availability")
     func av1FollowsHardware() {
         #expect(VideoRoutingPolicy.requiresSoftwarePath(

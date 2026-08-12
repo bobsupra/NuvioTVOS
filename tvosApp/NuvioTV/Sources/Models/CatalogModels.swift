@@ -141,32 +141,50 @@ struct NuvioMeta: Identifiable, Codable {
 
     /// Add-on catalog cards commonly omit fields that are available from their
     /// full `/meta` response. Keep the catalog's artwork/copy intact while
-    /// filling the two fields Home's hero cannot otherwise display.
+    /// filling what the hero and the landscape shelf artwork cannot otherwise
+    /// display: runtime/status, and any missing/blank poster, backdrop, or
+    /// title logo.
     var needsHeroMetadataEnrichment: Bool {
         let hasRuntime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
         let hasStatus = status?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-        return !hasRuntime || (isSeries && !hasStatus)
+        let hasLogo = logoUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        let hasBackdrop = backgroundUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+        return !hasRuntime || (isSeries && !hasStatus) || !hasLogo || !hasBackdrop
     }
 
+    /// Search records also need both external identifiers so watched-state
+    /// matching can resolve the same title as Discovery.
+    var needsSearchMetadataEnrichment: Bool {
+        needsHeroMetadataEnrichment
+            || trimmedNonEmpty(imdbId) == nil
+            || tmdbId == nil
+    }
+
+    /// Merges a refreshed `/meta` record into this catalog card. Catalog values
+    /// win wherever they are present — so a source-provided logo is never
+    /// replaced by a TMDB one — while missing or blank artwork (poster,
+    /// backdrop, title logo), IMDb/TMDB ids, missing year, runtime, and status
+    /// are filled from the full record. The refreshed record itself only
+    /// carries TMDB artwork when that integration/artwork option is enabled, so
+    /// a disabled TMDB can never inject or suppress logos here.
     func fillingMissingHeroMetadata(from fullMeta: NuvioMeta) -> NuvioMeta {
-        let resolvedRuntime = runtime?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? runtime
-            : fullMeta.runtime
-        let resolvedStatus = status?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
-            ? status
-            : fullMeta.status
+        let resolvedPoster = trimmedNonEmpty(posterUrl) ?? fullMeta.posterUrl
+        let resolvedBackground = trimmedNonEmpty(backgroundUrl) ?? fullMeta.backgroundUrl
+        let resolvedLogo = trimmedNonEmpty(logoUrl) ?? fullMeta.logoUrl
+        let resolvedRuntime = trimmedNonEmpty(runtime) ?? fullMeta.runtime
+        let resolvedStatus = trimmedNonEmpty(status) ?? fullMeta.status
 
         return NuvioMeta(
             id: id,
             name: name,
             description: description,
-            posterUrl: posterUrl,
-            backgroundUrl: backgroundUrl,
-            logoUrl: logoUrl,
+            posterUrl: resolvedPoster,
+            backgroundUrl: resolvedBackground,
+            logoUrl: resolvedLogo,
             imdbId: imdbId ?? fullMeta.imdbId,
             tmdbId: tmdbId ?? fullMeta.tmdbId,
             type: type,
-            year: year,
+            year: year ?? fullMeta.year,
             genres: genres,
             rating: rating,
             releaseInfo: releaseInfo,
@@ -180,6 +198,49 @@ struct NuvioMeta: Identifiable, Codable {
             status: resolvedStatus,
             videos: videos,
             trailerYtIds: trailerYtIds,
+            externalRatings: externalRatings
+        )
+    }
+
+    /// Search-specific merge for a compact result and its refreshed `/meta`
+    /// record. Search artwork can be stale even when it is present, so the
+    /// refreshed poster, backdrop, and logo win; compact artwork is used only
+    /// when the refreshed record has no non-blank value. The original id and
+    /// all other compact-result identity/order fields remain unchanged.
+    func mergingSearchMetadata(from fullMeta: NuvioMeta) -> NuvioMeta {
+        let resolvedPoster = trimmedNonEmpty(fullMeta.posterUrl) ?? trimmedNonEmpty(posterUrl)
+        let resolvedBackground = trimmedNonEmpty(fullMeta.backgroundUrl) ?? trimmedNonEmpty(backgroundUrl)
+        let resolvedLogo = trimmedNonEmpty(fullMeta.logoUrl) ?? trimmedNonEmpty(logoUrl)
+        let heroMerged = fillingMissingHeroMetadata(from: fullMeta)
+
+        return NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: resolvedPoster,
+            backgroundUrl: resolvedBackground,
+            logoUrl: resolvedLogo,
+            imdbId: trimmedNonEmpty(imdbId) ?? trimmedNonEmpty(fullMeta.imdbId),
+            tmdbId: tmdbId ?? fullMeta.tmdbId,
+            type: type,
+            year: year ?? fullMeta.year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: heroMerged.runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            released: released,
+            status: heroMerged.status,
+            // Search cards start with compact catalog records, which often
+            // have no guide at all. Keep the refreshed guide so a watched
+            // checkmark can resolve series completion directly on the card
+            // after background enrichment, without another metadata fetch.
+            videos: videos ?? fullMeta.videos,
+            trailerYtIds: trailerYtIds ?? fullMeta.trailerYtIds,
             externalRatings: externalRatings
         )
     }
@@ -292,12 +353,13 @@ enum EpisodeReleasePolicy {
     }
 
     static func hasAired(_ released: String?) -> Bool {
-        guard let releaseDay = isoDay(released) else { return true }
-        return releaseDay < todayIsoDay()
+        guard let releaseDate = releaseDate(for: released) else { return true }
+        return Date() >= releaseDate
     }
 
-    /// Episodes dated today are still unaired by this date-only policy, but
-    /// deserve to remain visible even when future Up Next suggestions are off.
+    /// Episodes scheduled for the current calendar day remain visible even
+    /// before their exact release time, including when future Up Next
+    /// suggestions are off.
     static func isAiringToday(_ released: String?) -> Bool {
         isoDay(released) == todayIsoDay()
     }
@@ -311,14 +373,14 @@ enum EpisodeReleasePolicy {
         if !isSeasonRollover {
             return showUnairedNextUp || isAiringToday(released) || hasAired(released)
         }
-        if hasAired(released), isoDate(released) != nil {
+        if hasAired(released), releaseDate(for: released) != nil {
             return true
         }
         if isAiringToday(released) {
             return true
         }
         guard showUnairedNextUp,
-              let releaseDate = isoDate(released) else {
+              let releaseDate = calendarDayDate(for: released) else {
             return false
         }
         let days = Calendar.current.dateComponents([.day], from: today(), to: releaseDate).day
@@ -333,15 +395,14 @@ enum EpisodeReleasePolicy {
         return NuvioDateDisplay.formattedDate(released) ?? released.prefix(10).description
     }
 
-    /// True when `released` is a real date within the last `days` days. A missing
-    /// or unparseable date returns false, so uncertain entries read as "Next Up"
-    /// rather than over-claiming "New Episode".
+    /// True when `released` is a real timestamp within the last `days` days.
+    /// This mirrors Android's release-alert window, which uses elapsed time
+    /// rather than only comparing calendar dates.
     static func isRecentlyReleased(_ released: String?, within days: Int) -> Bool {
-        guard let releaseDate = isoDate(released),
-              let elapsed = Calendar.current.dateComponents([.day], from: releaseDate, to: today()).day else {
-            return false
-        }
-        return (0...days).contains(elapsed)
+        guard let releaseDate = releaseDate(for: released) else { return false }
+        let elapsed = Date().timeIntervalSince(releaseDate)
+        let window = Double(max(days, 0)) * 24 * 60 * 60
+        return elapsed >= 0 && elapsed < window
     }
 
     /// True when an aired up-next episode is a genuine new drop rather than a
@@ -358,11 +419,37 @@ enum EpisodeReleasePolicy {
         return isRecentlyReleased(released, within: newEpisodeWindowDays)
     }
 
-    /// The calendar day `released` names, as a local-midnight date. Nil for a
-    /// missing or unparseable value.
-    static func releaseDate(for released: String?) -> Date? { isoDate(released) }
+    /// Parses the exact release timestamp when one is supplied. Date-only
+    /// values fall back to midnight UTC, matching Android's
+    /// `parseReleaseDateToEpochMs` behavior.
+    static func releaseDate(for released: String?) -> Date? {
+        guard let raw = released?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !raw.isEmpty else { return nil }
 
-    private static func isoDate(_ value: String?) -> Date? {
+        let fractional = ISO8601DateFormatter()
+        fractional.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = fractional.date(from: raw) { return date }
+
+        let standard = ISO8601DateFormatter()
+        standard.formatOptions = [.withInternetDateTime]
+        if let date = standard.date(from: raw) { return date }
+
+        guard let day = isoDay(raw) else { return nil }
+        let parts = day.split(separator: "-").compactMap { Int($0) }
+        guard parts.count == 3 else { return nil }
+
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+        var components = DateComponents()
+        components.year = parts[0]
+        components.month = parts[1]
+        components.day = parts[2]
+        return calendar.date(from: components)
+    }
+
+    /// Parses the calendar day portion at local midnight. This is used only for
+    /// the upcoming-season visibility window, which is date-based on Android.
+    private static func calendarDayDate(for value: String?) -> Date? {
         guard let day = isoDay(value) else { return nil }
         let parts = day.split(separator: "-").compactMap { Int($0) }
         guard parts.count == 3 else { return nil }
@@ -3510,9 +3597,8 @@ struct WatchedStoreItem: Identifiable, Codable {
 /// a `SIGABRT` with nothing to catch. Anything holding a `NuvioMeta` per row
 /// reaches megabytes on a real account and must live in a file instead.
 ///
-/// Mirrors ``WatchedStore``'s durable storage: Application Support first, then
-/// Caches, because physical tvOS sideloads can reject Application Support
-/// writes while Simulator succeeds. There is deliberately no `UserDefaults`
+/// Uses verified Application Support storage with a Caches fallback. There is
+/// deliberately no `UserDefaults`
 /// tier — falling back to preferences is the crash this exists to prevent, and
 /// every caller is a cache or a store that can survive a failed write.
 enum LargePayloadStore {
@@ -3613,13 +3699,13 @@ enum WatchedStore {
     static private(set) var persistenceDiagnostic = "not attempted"
 
     private enum PersistenceError: LocalizedError {
-        case applicationSupportUnavailable
+        case storageUnavailable(String)
         case verificationFailed
 
         var errorDescription: String? {
             switch self {
-            case .applicationSupportUnavailable:
-                return "Application Support is unavailable"
+            case .storageUnavailable(let label):
+                return "\(label) is unavailable"
             case .verificationFailed:
                 return "the saved watched list could not be verified"
             }
@@ -3725,6 +3811,16 @@ enum WatchedStore {
         }
     }
 
+    /// Catalog cards can use a provider-local id while the watched marker was
+    /// saved from the canonical Details response. Fall back to the normalized
+    /// series title/year in that case so the portrait checkmark still appears.
+    static func containsCatalogTitle(meta: NuvioMeta) -> Bool {
+        visibleItems().contains {
+            guard $0.season == nil, $0.episode == nil else { return false }
+            return sameContent($0.meta, meta) || sameCatalogSeriesTitle($0.meta, meta)
+        }
+    }
+
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {
         visibleItems().contains {
             $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
@@ -3762,17 +3858,200 @@ enum WatchedStore {
         })
     }
 
+    /// Episode keys for a catalog badge. Some add-ons return a provider-local
+    /// id without IMDb/TMDB aliases, while synced history still names the same
+    /// show by its canonical id. Prefer normal id matching, then allow an exact
+    /// normalized title match when the years do not conflict.
+    static func catalogWatchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
+        Set(visibleItems().compactMap { item in
+            guard let season = item.season,
+                  let episode = item.episode,
+                  sameContent(item.meta, meta) || sameCatalogSeriesTitle(item.meta, meta) else {
+                return nil
+            }
+            return "\(season):\(episode)"
+        })
+    }
+
     /// Toggles whole-title watched state and returns the **actual** persisted
-    /// result. Callers must not assume the opposite of the previous value —
-    /// a failed device write keeps the prior state.
+    /// result. For a series, marking the title also marks every aired regular
+    /// episode in its guide; specials and unaired episodes are left alone.
+    /// Callers must not assume the opposite of the previous value — a failed
+    /// device write keeps the prior state.
     @discardableResult
     static func toggle(meta: NuvioMeta) -> Bool {
-        if contains(meta: meta) {
+        if meta.isSeries {
+            if contains(meta: meta) || hasSeriesWatchedState(meta) {
+                removeSeriesWatched(meta)
+            } else {
+                markSeriesWatched(meta)
+            }
+        } else if contains(meta: meta) {
             remove(meta: meta)
         } else {
             markWatched(meta)
         }
         return contains(meta: meta)
+    }
+
+    /// Episode completion is also a watched state when a remote snapshot has
+    /// no whole-title marker. This keeps the series toggle reversible after a
+    /// sync or after episode rows were created by playback.
+    private static func hasSeriesWatchedState(_ meta: NuvioMeta) -> Bool {
+        guard let videos = meta.videos, !videos.isEmpty else { return false }
+        return CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+            videos: videos,
+            watchedEpisodeKeys: catalogWatchedEpisodeKeys(meta: meta)
+        )
+    }
+
+    /// Creates the local title marker and the episode rows needed for a
+    /// completed-series mark in one durable write. Existing special and
+    /// upcoming rows are intentionally retained, but eligible episode rows
+    /// are replaced with the current source attribution and timestamp.
+    @discardableResult
+    private static func markSeriesWatched(_ meta: NuvioMeta) -> Bool {
+        let episodesBySeason = airedRegularEpisodeNumbers(bySeason: meta)
+        // A complete guide with no aired regular episodes has nothing that a
+        // whole-series action is allowed to mark. A missing guide is retained
+        // as a title-only fallback for compact catalog cards.
+        if meta.videos != nil, episodesBySeason.isEmpty { return false }
+        let snapshot = meta.persistenceSnapshot
+        let watchedAt = Date()
+        let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+        let episodeItems = episodesBySeason
+            .keys
+            .sorted()
+            .flatMap { season in
+                (episodesBySeason[season] ?? []).sorted().map { episode in
+                    WatchedStoreItem(
+                        meta: snapshot,
+                        watchedAt: watchedAt,
+                        season: season,
+                        episode: episode,
+                        sources: [source.rawValue]
+                    )
+                }
+            }
+        let episodeKeys = Set(episodeItems.compactMap { item -> String? in
+            guard let season = item.season, let episode = item.episode else { return nil }
+            return String(season) + ":" + String(episode)
+        })
+        let titleItem = WatchedStoreItem(
+            meta: snapshot,
+            watchedAt: watchedAt,
+            sources: [source.rawValue]
+        )
+        let updated = [titleItem] + episodeItems + items().filter { item in
+            guard sameContent(item.meta, meta) else { return true }
+            guard let season = item.season, let episode = item.episode else {
+                return false
+            }
+            return !episodeKeys.contains(String(season) + ":" + String(episode))
+        }
+        guard persist(updated) else { return false }
+
+        clearTombstone(meta: meta, season: nil, episode: nil)
+        for item in episodeItems {
+            guard let season = item.season, let episode = item.episode else { continue }
+            clearTombstone(meta: meta, season: season, episode: episode)
+            ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
+        }
+        ContinueWatchingStore.removeWatched(episodeItems)
+        syncSeriesWatchedEpisodes(meta, episodesBySeason: episodesBySeason, isWatched: true)
+        return true
+    }
+
+    /// Removes the aggregate title marker and all aired regular episode rows
+    /// for a series. Specials and unaired rows are deliberately retained so a
+    /// future release or a separately watched special is not changed by the
+    /// whole-series control.
+    @discardableResult
+    private static func removeSeriesWatched(_ meta: NuvioMeta) -> Bool {
+        let episodesBySeason = airedRegularEpisodeNumbers(bySeason: meta)
+        let episodeKeys = Set(episodesBySeason.flatMap { season, episodes in
+            episodes.map { String(season) + ":" + String($0) }
+        })
+        let currentItems = items()
+        let removedTitle = currentItems.first {
+            sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil
+        }
+        let updated = currentItems.filter { item in
+            guard sameContent(item.meta, meta) else { return true }
+            guard let season = item.season, let episode = item.episode else {
+                return false
+            }
+            return !episodeKeys.contains(String(season) + ":" + String(episode))
+        }
+        guard persist(updated) else { return false }
+
+        let titleMeta = removedTitle?.meta ?? meta.persistenceSnapshot
+        addTombstone(meta: titleMeta, season: nil, episode: nil)
+        enqueueTraktRemovalIfConnected(meta: titleMeta, season: nil, episode: nil)
+        for season in episodesBySeason.keys.sorted() {
+            for episode in (episodesBySeason[season] ?? []).sorted() {
+                addTombstone(meta: meta, season: season, episode: episode)
+            }
+        }
+        syncSeriesWatchedEpisodes(meta, episodesBySeason: episodesBySeason, isWatched: false)
+        return true
+    }
+
+    /// Uses the same completion policy as catalog badges: season zero and
+    /// episode zero are specials, while a missing release date is treated as
+    /// aired by ``EpisodeReleasePolicy`` for compatibility with existing
+    /// metadata providers.
+    private static func airedRegularEpisodeNumbers(bySeason meta: NuvioMeta) -> [Int: Set<Int>] {
+        Dictionary(grouping: (meta.videos ?? []).filter {
+            $0.season > 0 && $0.episode > 0 && EpisodeReleasePolicy.hasAired($0.released)
+        }, by: \.season).mapValues { Set($0.map(\.episode)) }
+    }
+
+    /// Sends only the concrete aired episode rows to remote history services.
+    /// A bare series mutation can be interpreted as the entire show, including
+    /// specials and future episodes, so it is deliberately never sent here.
+    private static func syncSeriesWatchedEpisodes(
+        _ meta: NuvioMeta,
+        episodesBySeason: [Int: Set<Int>],
+        isWatched: Bool
+    ) {
+        let store = ProfileSettings.current
+        let profileId = activeProfileId
+        for season in episodesBySeason.keys.sorted() {
+            let episodes = (episodesBySeason[season] ?? []).sorted()
+            guard !episodes.isEmpty else { continue }
+            if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: store) {
+                for episode in episodes {
+                    _ = enqueuePendingTraktMutation(
+                        meta: meta,
+                        season: season,
+                        episode: episode,
+                        isWatched: isWatched,
+                        profileId: profileId
+                    )
+                }
+                Task {
+                    _ = await TraktHistoryService.setWatched(
+                        meta,
+                        season: season,
+                        episodes: episodes,
+                        isWatched: isWatched,
+                        store: store
+                    )
+                }
+            }
+            if RemoteTrackingState.shouldSyncWatchedHistory(to: .simkl, in: store) {
+                Task {
+                    _ = await SimklHistoryService.setWatched(
+                        meta,
+                        season: season,
+                        episodes: episodes,
+                        isWatched: isWatched,
+                        store: store
+                    )
+                }
+            }
+        }
     }
 
     /// Episode equivalent of the working movie/title toggle. It uses the same
@@ -3872,7 +4151,49 @@ enum WatchedStore {
                 )
             }
         }
+        // Season actions write episode rows (the same rows playback uses), so
+        // reconcile the local aggregate marker as well. This makes the
+        // portrait card checkmark appear as soon as manually marking seasons
+        // completes every aired regular episode in the series, and removes it
+        // again when any season is marked unwatched.
+        reconcileWholeSeriesMarker(for: meta)
         return true
+    }
+
+    /// Keeps the local title marker in sync with episode-level season actions.
+    /// The marker is only a local UI/indexing aid; remote history remains
+    /// episode-based so specials and unaired episodes are never implied.
+    private static func reconcileWholeSeriesMarker(for meta: NuvioMeta) {
+        guard normalizedType(meta.type) == "series",
+              let videos = meta.videos,
+              !videos.isEmpty else { return }
+
+        let allAiredEpisodesWatched = CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+            videos: videos,
+            watchedEpisodeKeys: catalogWatchedEpisodeKeys(meta: meta)
+        )
+        let matchesSeries: (WatchedStoreItem) -> Bool = { item in
+            item.season == nil && item.episode == nil
+                && (sameContent(item.meta, meta) || sameCatalogSeriesTitle(item.meta, meta))
+        }
+        let current = items()
+        let hasTitleMarker = current.contains(where: matchesSeries)
+        guard allAiredEpisodesWatched != hasTitleMarker else { return }
+
+        let updated: [WatchedStoreItem]
+        if allAiredEpisodesWatched {
+            let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+            let marker = WatchedStoreItem(
+                meta: meta.persistenceSnapshot,
+                watchedAt: Date(),
+                sources: [source.rawValue]
+            )
+            updated = [marker] + current.filter { !matchesSeries($0) }
+            clearTombstone(meta: meta, season: nil, episode: nil)
+        } else {
+            updated = current.filter { !matchesSeries($0) }
+        }
+        _ = persist(updated)
     }
 
     @discardableResult
@@ -4075,10 +4396,10 @@ enum WatchedStore {
         return true
     }
 
-    /// Applies Trakt as the authoritative watched snapshot. Local marks created
-    /// after this request began are preserved; older Trakt-addressable marks
-    /// absent from the snapshot become tombstones so a later Nuvio pull cannot
-    /// resurrect them.
+    /// Applies Trakt as the authoritative snapshot for Trakt's attribution.
+    /// Local marks created after this request began are preserved; absence
+    /// removes only Trakt ownership and never blocks an independent Nuvio or
+    /// Simkl mark for the same episode.
     @discardableResult
     static func reconcileTraktSnapshot(
         _ remoteItems: [WatchedStoreItem],
@@ -4092,6 +4413,7 @@ enum WatchedStore {
         let current = items()
         let obsolete = current.filter { item in
             guard item.watchedAt <= syncStartedAt,
+                  item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.trakt.rawValue),
                   isRepresentedByTraktSnapshot(item) else { return false }
             let keys = traktIdentityKeys(item)
             guard keys.isDisjoint(with: remoteKeys) else { return false }
@@ -4099,10 +4421,19 @@ enum WatchedStore {
         }
         if !obsolete.isEmpty {
             let obsoleteIDs = Set(obsolete.map(\.id))
-            guard persist(current.filter { !obsoleteIDs.contains($0.id) }) else { return false }
-            obsolete.forEach {
-                addTombstone(meta: $0.meta, season: $0.season, episode: $0.episode)
+            let updated = current.compactMap { item -> WatchedStoreItem? in
+                guard obsoleteIDs.contains(item.id) else { return item }
+                // A merged row can be confirmed by several independent
+                // backends. Trakt absence removes only Trakt's ownership; the
+                // Nuvio/Simkl mark must remain visible under those sources.
+                guard !item.sources.isEmpty else {
+                    return nil
+                }
+                var retained = item
+                retained.sources.remove(TraktWatchProgressSource.trakt.rawValue)
+                return retained.sources.isEmpty ? nil : retained
             }
+            guard persist(updated) else { return false }
         }
         confirmPendingTraktMutations(against: remoteItems)
         return true
@@ -4126,16 +4457,44 @@ enum WatchedStore {
         guard !removedRemoteKeys.isEmpty else { return true }
 
         let current = items()
-        let updated = current.filter { item in
-            guard item.watchedAt <= syncStartedAt else { return true }
-            return watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys)
+        let updated = current.compactMap { item -> WatchedStoreItem? in
+            guard item.watchedAt <= syncStartedAt,
+                  !watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys),
+                  item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.simkl.rawValue) else {
+                return item
+            }
+            guard !item.sources.isEmpty else { return nil }
+            var retained = item
+            retained.sources.remove(TraktWatchProgressSource.simkl.rawValue)
+            return retained.sources.isEmpty ? nil : retained
         }
-        return updated.count == current.count || persist(updated)
+        let changed = updated.count != current.count || zip(updated, current).contains {
+            $0.id != $1.id || $0.sources != $1.sources
+        }
+        return !changed || persist(updated)
     }
 
     static func sameContent(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
         guard normalizedType(lhs.type) == normalizedType(rhs.type) else { return false }
         return !contentIdentityKeys(for: lhs).isDisjoint(with: contentIdentityKeys(for: rhs))
+    }
+
+    static func sameCatalogSeriesTitle(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
+        guard normalizedType(lhs.type) == "series",
+              normalizedType(rhs.type) == "series",
+              normalizedCatalogTitle(lhs.name) == normalizedCatalogTitle(rhs.name),
+              !normalizedCatalogTitle(lhs.name).isEmpty else {
+            return false
+        }
+        if let lhsYear = lhs.year, let rhsYear = rhs.year {
+            return lhsYear == rhsYear
+        }
+        return true
+    }
+
+    private static func normalizedCatalogTitle(_ title: String) -> String {
+        title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+            .filter { $0.isLetter || $0.isNumber }
     }
 
     static func isRepresentedByTraktSnapshot(_ item: WatchedStoreItem) -> Bool {
@@ -4538,23 +4897,23 @@ enum WatchedStore {
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
-    // MARK: - Durable file storage (Application Support + Caches fallback)
+    // MARK: - Durable file storage (Application Support + Caches)
 
     private static func readData(forKey key: String) -> Data? {
-        // A failed primary write can leave an older Application Support file
-        // beside a newer Caches fallback. Always choose the newest verified
-        // byte stream instead of blindly preferring the stale primary copy.
+        // A failed preferred-tier write can leave an older file beside a newer
+        // fallback. Always choose the newest verified byte stream instead of
+        // blindly preferring the stale primary copy.
         if let stored = newestStoredFile(forKey: key) {
             if stored.isFallback, let primaryURL = storageURL(forKey: key) {
                 // Promote directly to the primary path. Calling writeData here
-                // could succeed by writing Caches again and then delete the only
-                // good fallback while incorrectly reporting a recovery.
+                // could succeed on the same tier and then delete the only good
+                // fallback while incorrectly reporting a recovery.
                 do {
                     try writeAndVerify(stored.data, to: primaryURL, verify: nil)
                     try? FileManager.default.removeItem(at: stored.url)
-                    persistenceDiagnostic = "recovered Application Support storage"
+                    persistenceDiagnostic = "recovered \(primaryStorageLabel) storage"
                 } catch {
-                    persistenceDiagnostic = "using Caches fallback: \(diagnosticText(for: error))"
+                    persistenceDiagnostic = "using \(fallbackStorageLabel): \(diagnosticText(for: error))"
                 }
             } else if !stored.isFallback,
                       let fallbackURL = fallbackStorageURL(forKey: key),
@@ -4609,7 +4968,9 @@ enum WatchedStore {
         }
     }
 
-    /// Writes `data` with a verify-read. Tries Application Support, then Caches.
+    /// Writes `data` with a verify-read. Physical tvOS tries Caches first because
+    /// some sideloaded containers reject Application Support; Simulator builds
+    /// retain Application Support as the preferred tier.
     /// Optional `verify` round-trips the payload through JSON decode so a write
     /// that `items()` cannot load never reports success.
     @discardableResult
@@ -4629,19 +4990,18 @@ enum WatchedStore {
                     try? FileManager.default.removeItem(at: fallbackURL)
                 }
                 if updateDiagnostic {
-                    persistenceDiagnostic = "Application Support: \(data.count) bytes"
+                    persistenceDiagnostic = "\(primaryStorageLabel): \(data.count) bytes"
                 }
                 return true
             } catch {
                 primaryError = error
             }
         } else {
-            primaryError = PersistenceError.applicationSupportUnavailable
+            primaryError = PersistenceError.storageUnavailable(primaryStorageLabel)
         }
 
-        // Physical tvOS sideloads / some install paths can reject Application
-        // Support writes while Simulator succeeds. Keep a verified Caches copy
-        // so the mark still survives the session (and often longer).
+        // Keep a verified copy on the secondary tier if the preferred location
+        // is unavailable for this installation.
         if let fallbackURL = fallbackStorageURL(forKey: key) {
             do {
                 try writeAndVerify(data, to: fallbackURL, verify: verify)
@@ -4651,20 +5011,19 @@ enum WatchedStore {
                 }
                 let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
                 if updateDiagnostic {
-                    persistenceDiagnostic = "Caches fallback: \(data.count) bytes; \(reason)"
-                    print("Nuvio watched storage using Caches fallback: \(reason)")
+                    persistenceDiagnostic = "\(fallbackStorageLabel): \(data.count) bytes; \(reason)"
                 }
                 return true
             } catch {
                 let primaryReason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-                persistenceDiagnostic = "save failed: \(primaryReason); Caches fallback: \(diagnosticText(for: error))"
+                persistenceDiagnostic = "save failed: \(primaryReason); \(fallbackStorageLabel): \(diagnosticText(for: error))"
                 print("Nuvio watched storage write failed: \(persistenceDiagnostic)")
                 return false
             }
         }
 
         let reason = primaryError.map(diagnosticText(for:)) ?? "unknown error"
-        persistenceDiagnostic = "save failed: \(reason); Caches unavailable"
+        persistenceDiagnostic = "save failed: \(reason); \(fallbackStorageLabel) unavailable"
         print("Nuvio watched storage write failed: \(persistenceDiagnostic)")
         return false
     }
@@ -4695,14 +5054,41 @@ enum WatchedStore {
     }
 
     private static var storageDirectoryURL: URL? {
+        #if os(tvOS) && !targetEnvironment(simulator)
+        return FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("Nuvio", isDirectory: true)
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+        #else
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
             .appendingPathComponent(storageDirectoryName, isDirectory: true)
+        #endif
     }
 
     private static var fallbackStorageDirectoryURL: URL? {
+        #if os(tvOS) && !targetEnvironment(simulator)
+        return FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask).first?
+            .appendingPathComponent(storageDirectoryName, isDirectory: true)
+        #else
         FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
             .appendingPathComponent("Nuvio", isDirectory: true)
             .appendingPathComponent(storageDirectoryName, isDirectory: true)
+        #endif
+    }
+
+    private static var primaryStorageLabel: String {
+        #if os(tvOS) && !targetEnvironment(simulator)
+        return "Caches"
+        #else
+        return "Application Support"
+        #endif
+    }
+
+    private static var fallbackStorageLabel: String {
+        #if os(tvOS) && !targetEnvironment(simulator)
+        return "Application Support fallback"
+        #else
+        return "Caches fallback"
+        #endif
     }
 
     private static func storageURL(forKey key: String) -> URL? {
@@ -4938,4 +5324,13 @@ struct DetailsUiState {
     /// Top liked Trakt comments (max 5).
     var comments: [TraktCommentReview] = []
     var isLoadingEnrichment: Bool = false
+}
+
+/// Nil for missing or whitespace-only values, so blank artwork/status fields
+/// from a compact catalog card count as "missing" when merging a full `/meta`
+/// record into it.
+fileprivate func trimmedNonEmpty(_ value: String?) -> String? {
+    guard let value else { return nil }
+    let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+    return trimmed.isEmpty ? nil : trimmed
 }

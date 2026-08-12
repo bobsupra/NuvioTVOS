@@ -29,6 +29,14 @@ struct RollingWindow<T: AdditiveArithmetic> {
     /// Populated slot count; sampler keeps instant-bitrate nil until count >= 2 (one sample = zero-second delta).
     var count: Int { filled ? capacity : index }
 
+    /// Populated slots carrying a non-zero sample. The playback reader fetches a large range and then
+    /// parks on backpressure until low water, so on a fast link most slots in the window are empty and
+    /// a mean over `count` measures the park rather than the link (#306 follow-up).
+    var activeCount: Int {
+        let active = filled ? buffer : Array(buffer.prefix(index))
+        return active.filter { $0 != .zero }.count
+    }
+
     mutating func reset() {
         for i in 0..<buffer.count { buffer[i] = .zero }
         index = 0
@@ -60,15 +68,31 @@ struct NativeAVFReadings: Sendable {
     var isPlaybackBufferEmpty: Bool = false
 }
 
+/// #306: everything the software branch of a tick reads off the software host, as one value. Mirrors
+/// `NativeAVFReadings` in intent: the sampler reaches the host through a single injectable read, so
+/// that branch is exercisable without a decoding session, and the tick keeps no host state of its own.
+struct SoftwareReadings: Sendable {
+    /// Decoded video queued ahead of the clock (#303). Nil before the first enqueued frame.
+    var displayCushionSeconds: Double? = nil
+    /// Undrained forward extent of the pump reader's window. Nil for sources with no `AVIOReader`.
+    var readerWindowAheadBytes: Int? = nil
+    /// Frames the render synchronizer dropped, nil where the metrics cannot be asked for (pre-18 OS).
+    var droppedFrameCount: Int? = nil
+    /// Cumulative late-frame delay from the same metrics read.
+    var accumulatedFrameDelaySeconds: Double? = nil
+}
+
 /// Drives engine.diagnostics.liveTelemetry at 1 Hz. Reads existing engine counters; owns no playback state.
 /// Started with the memprobe task; stopped in stopInternal.
 @MainActor
 final class LiveTelemetrySampler {
     typealias NativeRead = @Sendable (AVPlayer, AVPlayerItem) -> NativeAVFReadings
+    typealias SoftwareRead = @MainActor (AetherEngine) async -> SoftwareReadings
 
     private weak var engine: AetherEngine?
     private var task: Task<Void, Never>?
     private let nativeRead: NativeRead
+    private let softwareRead: SoftwareRead
 
     /// Dedicated + serial: the sync XPC reads may block for seconds, which must not tie up the
     /// shared cooperative pool, and serial means a stalled tick back-pressures the next one
@@ -100,9 +124,12 @@ final class LiveTelemetrySampler {
     /// 23.976 fps frame of ~42 ms of legitimate forward progress).
     private static let eomParkFrozenEpsilonSeconds: Double = 0.05
 
-    init(engine: AetherEngine, nativeRead: @escaping NativeRead = LiveTelemetrySampler.batchReadNativeAVF) {
+    init(engine: AetherEngine,
+         nativeRead: @escaping NativeRead = LiveTelemetrySampler.batchReadNativeAVF,
+         softwareRead: @escaping SoftwareRead = LiveTelemetrySampler.readSoftwareHost) {
         self.engine = engine
         self.nativeRead = nativeRead
+        self.softwareRead = softwareRead
     }
 
     func start() {
@@ -134,6 +161,25 @@ final class LiveTelemetrySampler {
         task = nil
     }
 
+    /// #306 follow-up: the rate the link delivers at, measured over the seconds bytes actually arrived
+    /// in rather than over wall-clock seconds.
+    ///
+    /// The playback reader fetches a large range and then parks on backpressure until low water, so on
+    /// a fast link most ticks of a window carry nothing at all: measured over a local origin, a healthy
+    /// 2.8 Mbps VP9 session pulled 16.4 MB in one tick and then sat at exactly zero for the next 23,
+    /// while the reader's runway drained from 16.0 to 8.3 MB. A wall-clock mean reports 0.00 Mbps
+    /// through all of that, which is the false-with-confidence zero #306 was filed about, one field
+    /// over. Dividing by the active seconds instead reports the link, and under-reports it at worst,
+    /// since a burst that finishes inside a tick is still charged the whole second.
+    ///
+    /// nil when the window holds fewer than two samples (a single sample spans no time) or when nothing
+    /// arrived in it at all. That mirrors the native path, where `observedBitrate` is published only
+    /// when it is finite and positive: "not measurable right now" is a gap, never a zero.
+    static func observedTransferMbps(windowBytes: Int64, activeSeconds: Int, samples: Int) -> Double? {
+        guard samples >= 2, activeSeconds > 0, windowBytes > 0 else { return nil }
+        return Double(windowBytes) * 8.0 / Double(activeSeconds) / 1_000_000.0
+    }
+
     private func tick() async {
         guard let engine = engine else { return }
 
@@ -152,6 +198,11 @@ final class LiveTelemetrySampler {
         } else {
             instantBitrateMbps = nil
         }
+
+        let observedTransferMbps = Self.observedTransferMbps(
+            windowBytes: byteWindow.sum,
+            activeSeconds: byteWindow.activeCount,
+            samples: byteWindow.count)
 
         let averageBitrateMbps: Double?
         if let start = sessionStartTime {
@@ -182,11 +233,18 @@ final class LiveTelemetrySampler {
         let networkTransferredBytes: Int64?
         let avSyncGapMs: Double?
         let forwardBufferSeconds: Double?
+        // #306: software-path fields. Nil on every other backend, so a host reading them knows it is
+        // looking at the software pipeline and not at a zero that means "healthy".
+        let displayCushionSeconds: Double?
+        let accumulatedFrameDelaySeconds: Double?
+        var readerWindowAheadBytes: Int? = engine.pumpIOWindow?.aheadBytes
         var nativeReadings: NativeAVFReadings?
 
         switch engine.playbackBackend {
         case .native:
             observedFps = nil
+            displayCushionSeconds = nil
+            accumulatedFrameDelaySeconds = nil
             avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
             if let player = engine.currentAVPlayer, let item = player.currentItem {
                 let readings = await readNativeOffMain(player: player, item: item)
@@ -220,11 +278,27 @@ final class LiveTelemetrySampler {
             } else {
                 observedFps = nil
             }
-            droppedFrameCount = nil
-            networkThroughputMbps = instantBitrateMbps  // SW: demuxer pulls the same bytes
+            // #306: the render-metrics read is async, so the session can end or be replaced under it
+            // exactly like the native batch above; publishing then would carry a dead session's
+            // numbers into the next one.
+            let hostBeforeRead = engine.softwareHost
+            let software = await softwareRead(engine)
+            guard !Task.isCancelled,
+                  engine.playbackBackend == .software,
+                  engine.softwareHost === hostBeforeRead else { return }
+            droppedFrameCount = software.droppedFrameCount
+            displayCushionSeconds = software.displayCushionSeconds
+            accumulatedFrameDelaySeconds = software.accumulatedFrameDelaySeconds
+            readerWindowAheadBytes = software.readerWindowAheadBytes
+            // SW: the demuxer pulls the bytes itself, so the rate comes from its counter rather than
+            // from an access log. Over active seconds, not wall-clock ones: see observedTransferMbps.
+            networkThroughputMbps = observedTransferMbps
             networkTransferredBytes = demuxerBytes
             avSyncGapMs = nil          // HLSSegmentProducer doesn't run on SW path
-            forwardBufferSeconds = nil // SW host has no loadedTimeRanges equivalent
+            // Deliberately nil, see LiveTelemetry: the software pump is renderer-back-pressured, so
+            // there is no arrived-but-unplayed reservoir in seconds. displayCushionSeconds and
+            // readerWindowAheadBytes carry what this path actually holds.
+            forwardBufferSeconds = nil
 
         case .aether, .none, .audio:
             observedFps = nil
@@ -233,6 +307,8 @@ final class LiveTelemetrySampler {
             networkTransferredBytes = nil
             avSyncGapMs = nil
             forwardBufferSeconds = nil
+            displayCushionSeconds = nil
+            accumulatedFrameDelaySeconds = nil
         }
 
         // Feed the extractor yield gate (#93 startup): nil on non-native paths keeps the
@@ -251,6 +327,9 @@ final class LiveTelemetrySampler {
             observedFps: observedFps,
             droppedFrameCount: droppedFrameCount,
             forwardBufferSeconds: forwardBufferSeconds,
+            displayCushionSeconds: displayCushionSeconds,
+            readerWindowAheadBytes: readerWindowAheadBytes,
+            accumulatedFrameDelaySeconds: accumulatedFrameDelaySeconds,
             cachedBytes: engine.cachedBytes,
             networkThroughputMbps: networkThroughputMbps,
             networkTransferredBytes: networkTransferredBytes,
@@ -338,6 +417,21 @@ final class LiveTelemetrySampler {
             didSynthesizeEomPark = true
             engine.synthesizeEndOfMediaFromTailPark(playhead: playhead, loadedEnd: loadedEnd)
         }
+    }
+
+    /// #306: the real software read. `videoPerformanceMetrics` is an ASYNC AVFoundation accessor, so
+    /// the main actor suspends on it rather than blocking, which is the distinction #134 turns on: the
+    /// sync accessors are the ones that must never be touched here. Cushion and reader window are
+    /// lock-guarded in-process snapshots and cost nothing.
+    @MainActor
+    private static func readSoftwareHost(_ engine: AetherEngine) async -> SoftwareReadings {
+        guard let host = engine.softwareHost else { return SoftwareReadings() }
+        let metrics = await host.loadRenderMetrics()
+        return SoftwareReadings(
+            displayCushionSeconds: host.displayCushionSeconds,
+            readerWindowAheadBytes: engine.pumpIOWindow?.aheadBytes,
+            droppedFrameCount: metrics?.dropped,
+            accumulatedFrameDelaySeconds: metrics?.accumulatedDelay)
     }
 
     /// Hops the AVFoundation batch onto the dedicated read queue and back. The main actor only

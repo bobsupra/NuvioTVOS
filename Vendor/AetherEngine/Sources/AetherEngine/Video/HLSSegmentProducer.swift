@@ -174,6 +174,44 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Fires synchronously on the pump thread per finalized live segment (index, duration, startSeconds, discontinuous).
     var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
 
+    /// Sequential-VOD twin of `onLiveSegmentFinalized` (index, real duration in seconds): feeds
+    /// the append playlist whose EXTINF must match the media actually muxed. Set only for
+    /// sequential-origin sessions; nil keeps the historical VOD behavior byte-identical.
+    var onSequentialSegmentFinalized: (@Sendable (Int, Double) -> Void)?
+    /// Fired once when the pump reaches true source EOF (not a stop/teardown): the append
+    /// playlist completes with ENDLIST.
+    var onSequentialSourceEnded: (@Sendable () -> Void)?
+    /// Item-axis start (seconds) per VOD segment, recorded at the #65 ledger site as each
+    /// segment opens. Pump-thread only.
+    private var vodSegmentStartByIndex: [Int: Double] = [:]
+    /// Capture and duration arrive in either order: the muxer rotation can fire off an AUDIO
+    /// packet crossing the boundary before the first video packet of the new segment has
+    /// recorded its start (the duration source). The report fires once BOTH are in. Pump-thread only.
+    private var seqCapturedAwaitingDuration: Set<Int> = []
+    private var seqDurationAwaitingCapture: [Int: Double] = [:]
+    /// The most recent segment index the ledger recorded a start for: a long GOP can SKIP plan
+    /// indices entirely (a 5.76 s cut spans two 4 s boundaries), so duration pairing runs against
+    /// the last RECORDED index, and the skipped holes report duration 0 (the playlist renderer
+    /// omits zero-duration entries). Pump-thread only.
+    private var lastSeqLedgerSeg = Int.min
+    /// The provider's append API is strictly contiguous; captures, holes and the EOF tail can
+    /// resolve out of order, so reports funnel through this small reorder buffer. Pump-thread only.
+    private var seqNextReportIndex: Int? = nil
+    private var seqReadyReports: [Int: Double] = [:]
+
+    /// Order-preserving funnel for sequential finalize reports.
+    private func emitSequentialReport(index: Int, duration: Double) {
+        let base = seqNextReportIndex ?? index
+        seqNextReportIndex = base
+        seqReadyReports[index] = duration
+        var next = base
+        while let d = seqReadyReports.removeValue(forKey: next) {
+            onSequentialSegmentFinalized?(next, d)
+            next += 1
+        }
+        seqNextReportIndex = next
+    }
+
     /// Forward discontinuity threshold. Distinct from NOPTS-dts repair (+1 tick scale); only fires on genuine multi-second leaps.
     static let discontinuityThresholdSeconds: Double = 10.0
 
@@ -246,9 +284,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var loggedFirstDiscontinuity: Bool = false
 
     private let targetSegmentDurationSeconds: Double
-    /// AE#222: real audio frame handed to every muxer this producer builds, so moov (with its packet-derived
-    /// dec3/dac3/dmlp) is written at init instead of at the first cut. nil on a normal session.
-    private let audioMoovPrimeFrame: [UInt8]?
+    /// Real audio frame handed to every muxer this producer builds, so moov (with its packet-derived
+    /// dec3/dac3/dmlp) is written at init instead of at the first cut. Two origins, one field:
+    /// - AE#222 seeds it from the host, and only on a session that already proved its first segment
+    ///   carries no audio (nil on a normal session).
+    /// - Every audio frame a muxer accepts then replaces it, so a LATER allocation (same-PID
+    ///   parameter-set rotation, SSAI program switch) starts primed too. Video leads audio across a seam,
+    ///   so a rotated muxer's first cut can arrive before any post-seam audio packet exists; unprimed,
+    ///   that cut defers for a sample entry the bridge's encoder latency will never deliver in time and
+    ///   the pump dies with `muxerFailed`.
+    ///
+    /// Pump-thread confined: written only from the two audio write sites, read only from `allocateMuxer`,
+    /// and every muxer allocation goes through `ensureMuxer` on the pump thread.
+    private var audioMoovPrimeFrame: [UInt8]?
+    /// True when the session's audio codec derives its mp4 sample entry from a parsed packet
+    /// (AC-3/E-AC-3/TrueHD); only then is a per-frame prime copy worth the memcpy. AAC never copies.
+    private let capturesAudioPrimeFrames: Bool
     /// Latched when a cut deferred for want of an audio sample entry; the pump then scans forward for one
     /// real audio frame and exits with `.needsAudioSampleEntryPrime` so the host can rebuild primed.
     private var cutDeferredAwaitingAudioSampleEntry: Bool = false
@@ -790,6 +841,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
     ) throws {
         self.epoch = epoch
         self.audioMoovPrimeFrame = audioMoovPrimeFrame
+        self.capturesAudioPrimeFrames =
+            audio.map { MP4SegmentMuxer.audioNeedsParsedPacketForMoov($0.codecpar.pointee.codec_id) } ?? false
         self.bufferAheadSegments = bufferAheadSegments
         self.prefetchDiskBudgetBytes = prefetchDiskBudgetBytes
         self.demuxer = demuxer
@@ -1320,7 +1373,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 // Floored at 8s (the historical 2 x 4s value): a sub-second fastZap cut target (AE#195)
                 // must not shrink the cap below typical TS A/V interleave skew.
                 maxBufferedFragmentSeconds: max(8.0, 2 * targetSegmentDurationSeconds),
-                // AE#222: only set on a session that already proved its first segment carries no audio.
+                // AE#222 + mid-session rotation: the last frame a muxer accepted, or the host's
+                // construction-time prime while no muxer has accepted one yet.
                 audioMoovPrimeFrame: audioMoovPrimeFrame,
                 onInitCaptured: { [weak self] initBytes in
                     guard let self = self else { return }
@@ -1460,6 +1514,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if isLive {
                 reportLiveSegmentFinalized(index: currentMuxerSegmentIndex,
                                            nextIndex: newIdx)
+            } else if onSequentialSegmentFinalized != nil {
+                reportSequentialSegmentFinalized(index: currentMuxerSegmentIndex, isFinal: false)
             }
             // Cut succeeded but muxer failed to open the next staging fd: silently discards every subsequent byte.
             if muxer.isWedged {
@@ -1491,6 +1547,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
             return nil
         }
+        // #358: the cut jumped over plan indices, so no keyframe reached their boundaries and no
+        // segment will ever open there. The VOD playlist still offers them, which is what turns the
+        // gap into a consumer that waits forever, so record them for the wedge handler.
+        if !isLive, newIdx > currentMuxerSegmentIndex + 1 {
+            let folded = (currentMuxerSegmentIndex + 1)..<newIdx
+            cache.noteFolded(folded)
+            EngineLog.emit(
+                "[HLSSegmentProducer] #358 plan indices \(folded.lowerBound)...\(folded.upperBound - 1) "
+                + "folded into seg-\(newIdx) (no IRAP reached their boundary)",
+                category: .session
+            )
+        }
         currentMuxerSegmentIndex = newIdx
         if isLive {
             // Live is source-paced: the pump only runs ahead of real time while draining the join
@@ -1509,6 +1577,40 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         return muxer
     }
+
+    /// Sequential-VOD duration became known (next segment's start recorded at the ledger).
+    /// Reports immediately when the segment is already captured; otherwise parks until the
+    /// capture side arrives.
+    private func noteSequentialDurationKnown(index: Int, duration: Double) {
+        if seqCapturedAwaitingDuration.remove(index) != nil {
+            emitSequentialReport(index: index, duration: duration)
+        } else {
+            seqDurationAwaitingCapture[index] = duration
+        }
+    }
+
+    /// Sequential-VOD capture side of the pairing. `isFinal` (EOF finalize) reports with the cut
+    /// target when no next ledger entry will ever supply the real duration - one estimated tail
+    /// EXTINF beats a playlist that never completes.
+    private func reportSequentialSegmentFinalized(index: Int, isFinal: Bool) {
+        if let dur = seqDurationAwaitingCapture.removeValue(forKey: index) {
+            emitSequentialReport(index: index, duration: dur)
+        } else if isFinal {
+            let dur: Double
+            if let start = vodSegmentStartByIndex[index], lastMuxedItemAxisSeconds > start {
+                dur = lastMuxedItemAxisSeconds - start
+            } else {
+                dur = targetSegmentDurationSeconds
+            }
+            emitSequentialReport(index: index, duration: dur)
+        } else {
+            seqCapturedAwaitingDuration.insert(index)
+        }
+    }
+
+    /// Newest item-axis video segment start muxed (seconds); floors the final segment's EXTINF
+    /// estimate at EOF. Pump-thread only.
+    private var lastMuxedItemAxisSeconds: Double = 0
 
     private func reportLiveSegmentFinalized(index: Int, nextIndex: Int?) {
         guard let startSeconds = liveSegmentStartByIndex[index] else {
@@ -1550,6 +1652,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         byteCount: result.bytesWritten)
             if isLive {
                 reportLiveSegmentFinalized(index: idx, nextIndex: nil)
+            } else if onSequentialSegmentFinalized != nil {
+                reportSequentialSegmentFinalized(index: idx, isFinal: true)
             }
         } else {
             EngineLog.emit(
@@ -2740,15 +2844,33 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     // at the IRAP that reaches its plan boundary, so the IRAP is the segment's first sample
                     // and its open-GOP RASL leading pictures stay with it (#92). Routing by DTS against PTS
                     // boundaries used to drop the IRAP (dts < pts) into the previous segment.
+                    // #358: the VOD plan's boundaries are the mov/mp4 index's sync-sample timestamps,
+                    // which are DECODE times, so the gate compares decode times too. Comparing the
+                    // presentation time against them let a keyframe reach boundaries beyond its own
+                    // by its composition offset (3 s on the field report's remux), consuming plan
+                    // indices that then never opened a segment. Keyframe gating is unchanged, so
+                    // #92 holds: the IRAP is still the segment's first sample and its RASL pictures
+                    // still follow it in decode order.
                     let thisVideoSeg = isLive
                         ? liveVideoSegmentIndex(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
-                        : vodCutter.index(pts: packet.pointee.pts, isKeyframe: isVideoKeyframe)
+                        : vodCutter.index(pts: packet.pointee.dts != Int64.min
+                                               ? packet.pointee.dts : packet.pointee.pts,
+                                          isKeyframe: isVideoKeyframe)
                     if thisVideoSeg != pumpQoSLastSeg {
                         pumpQoSLastSeg = thisVideoSeg
                         retunePumpQoS()
                     }
                     if let prev = pendingVideoPkt {
                         let prevSeg = pendingVideoSegIndex
+                        // Newest muxed frame time, recorded per PACKET. Recording it at the ledger
+                        // site below (which only fires when a segment opens) left it equal to the
+                        // last segment's start, so the EOF tail EXTINF's "real span" branch could
+                        // never be true and every archive's final segment was advertised at the
+                        // full cut target no matter how little media it held.
+                        if onSequentialSegmentFinalized != nil, prev.pointee.dts != Int64.min,
+                           sourceVideoTbSeconds > 0 {
+                            lastMuxedItemAxisSeconds = Double(prev.pointee.dts) * sourceVideoTbSeconds
+                        }
                         // #65 ledger: at each VOD segment open, map the segment's item-axis start (what AVPlayer and
                         // currentTime see) to the TRUE source content muxed there. drift = actual source - planned
                         // source for this index; non-zero means the presented frame leads the clock (Root B positively
@@ -2759,6 +2881,24 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             vodLedgerLastRoutedSeg = prevSeg
                             let shiftTicks = videoShiftPts == Int64.min ? 0 : videoShiftPts
                             let outDts = prev.pointee.dts
+                            if onSequentialSegmentFinalized != nil {
+                                let startSec = Double(outDts) * sourceVideoTbSeconds
+                                vodSegmentStartByIndex[prevSeg] = startSec
+                                // The previous segment's REAL duration is final the moment this
+                                // one's start is known; the report pairs with its capture. Plan
+                                // indices a long GOP skipped report as zero-duration holes.
+                                if lastSeqLedgerSeg != Int.min, lastSeqLedgerSeg < prevSeg,
+                                   let priorStart = vodSegmentStartByIndex[lastSeqLedgerSeg],
+                                   startSec > priorStart {
+                                    vodSegmentStartByIndex.removeValue(forKey: lastSeqLedgerSeg)
+                                    noteSequentialDurationKnown(index: lastSeqLedgerSeg,
+                                                                duration: startSec - priorStart)
+                                    for hole in (lastSeqLedgerSeg + 1)..<prevSeg {
+                                        emitSequentialReport(index: hole, duration: 0)
+                                    }
+                                }
+                                lastSeqLedgerSeg = prevSeg
+                            }
                             let srcDts = outDts &+ shiftTicks
                             let localI = prevSeg - baseIndex
                             let planSrc: Int64? = (localI >= 0 && localI < segmentBoundaries.count)
@@ -2831,7 +2971,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             }
                             fp.pointee.stream_index = muxer.audioOutputStreamIndex
                             av_packet_rescale_ts(fp, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-                            _ = muxer.writePacket(fp)
+                            let prime = copyAudioPrimeCandidate(fp)
+                            if muxer.writePacket(fp).rc >= 0, let prime {
+                                audioMoovPrimeFrame = prime
+                            }
                             trackedPacketFree(&fpVar)
                         }
                         if bridgedMuxerGone {
@@ -3120,6 +3263,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         packet.pointee.size -= headerLen
     }
 
+    /// Copies the payload of an audio packet about to be muxed, BEFORE the write: movenc consumes the
+    /// packet's data reference, so afterwards there is nothing left to copy. The caller commits the copy
+    /// into `audioMoovPrimeFrame` only when the write succeeded.
+    private func copyAudioPrimeCandidate(_ packet: UnsafeMutablePointer<AVPacket>) -> [UInt8]? {
+        guard capturesAudioPrimeFrames, let data = packet.pointee.data, packet.pointee.size > 0 else {
+            return nil
+        }
+        return [UInt8](UnsafeBufferPointer(start: data, count: Int(packet.pointee.size)))
+    }
+
     /// Stream-copy audio only; bridge audio bypasses this (FLAC encoder sets durations correctly).
     private func finalizeAndWriteAudio(
         _ packet: UnsafeMutablePointer<AVPacket>,
@@ -3138,7 +3291,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         packet.pointee.stream_index = muxer.audioOutputStreamIndex
         av_packet_rescale_ts(packet, audio.inputTimeBase, muxer.muxerAudioTimeBase)
-        _ = muxer.writePacket(packet)
+        let prime = copyAudioPrimeCandidate(packet)
+        if muxer.writePacket(packet).rc >= 0, let prime {
+            audioMoovPrimeFrame = prime
+        }
 
         var pkt: UnsafeMutablePointer<AVPacket>? = packet
         trackedPacketFree(&pkt)

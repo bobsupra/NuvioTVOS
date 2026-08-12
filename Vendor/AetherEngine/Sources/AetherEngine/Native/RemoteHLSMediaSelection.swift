@@ -1,4 +1,5 @@
 import Foundation
+import AVFoundation
 
 /// AE#154: remote HLS on the loopback path. FFmpeg is built with --disable-network, so its hls
 /// demuxer can neither probe a playlist behind a custom AVIO context (no extension / MIME hint)
@@ -14,6 +15,11 @@ enum RemoteHLSMediaSelection {
     /// (embedded ids are AVStream indices, external ids start at 100_000).
     static let subtitleTrackIDBase = 200_000
 
+    /// Width of that space. The membership test used to be `id >= base`, which silently claimed every
+    /// id range added ABOVE it: the live subtitle renditions at 300_000 (AE#359) were routed here and
+    /// their selection never reached their own path. An id space needs both ends.
+    static let subtitleTrackIDRangeCount = 100_000
+
     /// Value snapshot of an `AVMediaSelectionOption` (not constructible in tests).
     struct LegibleOption: Sendable, Equatable {
         let displayName: String
@@ -21,6 +27,39 @@ enum RemoteHLSMediaSelection {
         let isDefault: Bool
         let isForced: Bool
         let isSDH: Bool
+        /// The rendition's verbatim playlist NAME, when AVFoundation exposes it (#316).
+        var playlistName: String?
+
+        init(displayName: String, extendedLanguageTag: String?, isDefault: Bool, isForced: Bool,
+             isSDH: Bool, playlistName: String? = nil) {
+            self.displayName = displayName
+            self.extendedLanguageTag = extendedLanguageTag
+            self.isDefault = isDefault
+            self.isForced = isForced
+            self.isSDH = isSDH
+            self.playlistName = playlistName
+        }
+    }
+
+    /// `AVMediaSelectionOption.displayName` is NOT the rendition's NAME: AVFoundation derives a
+    /// LOCALIZED language name from LANGUAGE and ignores NAME entirely. Measured against Apple's own
+    /// CMAF master, `NAME="简体中文"` reads back as "Chinese" and an injected `NAME="DE"` as "German".
+    /// The verbatim attribute does survive, in `commonMetadata` under the `m3u8/NAME` identifier, and
+    /// that is the only stable handle on a rendition the engine declared itself (#316).
+    static let playlistNameIdentifier = AVMetadataIdentifier(rawValue: "m3u8/NAME")
+
+    static func playlistName(of option: AVMediaSelectionOption) async -> String? {
+        for item in option.commonMetadata where item.identifier == playlistNameIdentifier {
+            if let value = try? await item.load(.stringValue) { return value }
+        }
+        return nil
+    }
+
+    /// Identity of an injected rendition: the playlist NAME when it survived, else the display name
+    /// (an OS that exposes no `m3u8/NAME` at least still matches renditions whose NAME is a plain
+    /// language label). Used for both the dedupe and the selection lookup so they cannot disagree.
+    static func injectionKey(_ option: LegibleOption) -> String {
+        option.playlistName ?? option.displayName
     }
 
     /// Reroute only the typed VOD-path misroute, and only for URL sources: custom readers have no
@@ -41,9 +80,16 @@ enum RemoteHLSMediaSelection {
 
     /// Map the legible group's options (in group order) onto the public track model. HLS subtitle
     /// renditions are WebVTT by spec on Apple origins; the codec is informational for host UIs.
-    static func subtitleTrackInfos(from options: [LegibleOption]) -> [TrackInfo] {
-        options.enumerated().map { i, option in
-            TrackInfo(
+    ///
+    /// #316: `skippingNames` drops the renditions the engine itself injected for host-declared sidecars;
+    /// those are already published under their external ids, and listing them twice would offer the same
+    /// file as two tracks. The id stays the option's index in the FULL group, because that is what
+    /// `selectRemoteHLSSubtitleTrack` indexes back into.
+    static func subtitleTrackInfos(from options: [LegibleOption],
+                                   skippingNames: Set<String> = []) -> [TrackInfo] {
+        options.enumerated().compactMap { i, option in
+            guard !skippingNames.contains(injectionKey(option)) else { return nil }
+            return TrackInfo(
                 id: subtitleTrackIDBase + i,
                 name: option.displayName.isEmpty ? "Subtitle \(i + 1)" : option.displayName,
                 codec: "webvtt",
@@ -56,8 +102,23 @@ enum RemoteHLSMediaSelection {
         }
     }
 
+    /// #316: fold a freshly surfaced legible group into the published list. The renditions are
+    /// authoritative for their own id range and are replaced wholesale on every surfacing, but the
+    /// host's load-declared external tracks (registered before the item existed) have to survive it.
+    /// Assigning the legible list straight to `subtitleTracks` delisted them a beat after they were
+    /// registered, which is why a bypass sidecar looked like it had never been declared.
+    static func mergedSubtitleTracks(existing: [TrackInfo],
+                                     legible: [LegibleOption],
+                                     injectedNames: Set<String> = []) -> [TrackInfo] {
+        existing.filter(\.isExternal)
+            + subtitleTrackInfos(from: legible, skippingNames: injectedNames)
+    }
+
     /// Group-order ordinal backing a synthetic track id; nil for ids outside the remote-HLS range.
     static func ordinal(forTrackID id: Int) -> Int? {
-        id >= subtitleTrackIDBase ? id - subtitleTrackIDBase : nil
+        guard id >= subtitleTrackIDBase, id < subtitleTrackIDBase + subtitleTrackIDRangeCount else {
+            return nil
+        }
+        return id - subtitleTrackIDBase
     }
 }

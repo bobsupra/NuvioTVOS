@@ -1,7 +1,7 @@
 // FFmpegBuild: Minimal FFmpeg for Apple platforms.
 //
 // This is a thin wrapper target that links the prebuilt xcframeworks
-// (Libavcodec, Libavformat, Libavutil, Libswresample) together with
+// (AetherLibavcodec, AetherLibavformat, AetherLibavutil, AetherLibswresample) together with
 // the required system frameworks (VideoToolbox, AudioToolbox, etc).
 //
 // The xcframeworks are built by build.sh from FFmpeg source with a

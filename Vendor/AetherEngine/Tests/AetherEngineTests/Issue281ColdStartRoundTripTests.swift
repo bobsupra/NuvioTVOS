@@ -80,6 +80,11 @@ struct Issue281ColdStartRoundTripTests {
     ///
     /// Both requests are delayed here because both cross the same origin; the suffix one is slower
     /// only by the body it carries, which is the whole margin by which it loses.
+    ///
+    /// The budget is pinned rather than derived. Deriving it put the test's own two latencies on
+    /// either side of a bound computed from one of them (2 x 400 ms against a 550 ms fetch), and a
+    /// loaded CI runner spent that 250 ms margin and reconnected, failing a test whose subject is
+    /// whether the reader waits at all. The bound's calibration is checked separately, below.
     @Test("a tail read waits for a fetch already on the wire instead of connecting past it")
     func tailReadWaitsForTheInFlightPrefetch() async throws {
         let delayed = ThrottledOriginServer(
@@ -88,19 +93,21 @@ struct Issue281ColdStartRoundTripTests {
         let server = try #require(delayed)
         defer { server.stop() }
         let reader = makeReader(server)
+        reader.tailPrefetchWaitBudgetForTesting = 5.0
         defer { reader.markClosed(); reader.close() }
         try reader.open()
         _ = read(reader, 64 * 1024)   // the box chain at the head
 
         let tailStart = fileSize - Int64(AVIOReader.tailPrefetchBytes)
         await waitForTailSpan(server, tailStart: tailStart)   // the REQUEST is out; its body is not
-        let requestsBefore = server.rangeRequestCount
 
         #expect(reader.seek(offset: tailStart + 1024, whence: SEEK_SET) == tailStart + 1024)
         let got = read(reader, 4096)
 
         #expect(got == 4096, "tail read returned \(got)")
-        #expect(server.rangeRequestCount == requestsBefore,
+        // On the range, not on the count: the reconnect this forbids is identifiable by where it
+        // starts (the read position), and a bare count cannot tell it from any other arrival.
+        #expect(!server.requestedRanges.contains(where: { $0.start == tailStart + 1024 }),
                 "the tail read connected past a fetch already in flight: \(server.requestedRanges)")
     }
 
@@ -388,5 +395,16 @@ struct Issue281ColdStartRoundTripTests {
         #expect(AVIOReader.suffixRangeStart(response(nil, length: 100), expectedLength: 100) == nil)
         #expect(AVIOReader.suffixRangeStart(response("bytes */1000", length: 100),
                                             expectedLength: 100) == nil)
+    }
+
+    /// The calibration the in-flight test above no longer carries, checked where it costs no socket
+    /// and no wall clock: two measured round trips, floored so a cache-warm first connection still
+    /// buys a wait, capped so a hung fetch cannot own the open.
+    @Test("the wait budget is two measured round trips, floored and capped")
+    func waitBudgetIsTwoRoundTrips() {
+        #expect(AVIOReader.tailPrefetchWaitBudget(firstDataMs: 400) == 0.8)
+        #expect(AVIOReader.tailPrefetchWaitBudget(firstDataMs: 0) == 0.25)
+        #expect(AVIOReader.tailPrefetchWaitBudget(firstDataMs: 50) == 0.25)
+        #expect(AVIOReader.tailPrefetchWaitBudget(firstDataMs: 10_000) == 5.0)
     }
 }

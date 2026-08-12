@@ -3,12 +3,13 @@ import XCTest
 
 final class AudioTapHLSVariantResolverTests: XCTestCase {
     private func master(_ variants: [HLSVariant], _ renditions: [HLSAudioRendition], _ demuxed: Set<String>) -> HLSPlaylist {
-        .master(HLSMasterPlaylist(variants: variants, demuxedAudioGroupIDs: demuxed, audioRenditions: renditions))
+        .master(HLSMasterPlaylist(variants: variants, demuxedAudioGroupIDs: demuxed,
+                          audioRenditions: renditions, subtitleRenditions: []))
     }
 
     func testPrefersDefaultAudioRendition() {
         let pl = master(
-            [HLSVariant(bandwidth: 5_000_000, uri: "v-hi.m3u8", audioGroupID: "aud")],
+            [HLSVariant(bandwidth: 5_000_000, uri: "v-hi.m3u8", audioGroupID: "aud", subtitleGroupID: nil)],
             [HLSAudioRendition(groupID: "aud", uri: "a-eng.m3u8", isDefault: true),
              HLSAudioRendition(groupID: "aud", uri: "a-ger.m3u8", isDefault: false)],
             ["aud"])
@@ -17,8 +18,8 @@ final class AudioTapHLSVariantResolverTests: XCTestCase {
 
     func testFallsBackToLowestVariantWhenMuxed() {
         let pl = master(
-            [HLSVariant(bandwidth: 5_000_000, uri: "v-hi.m3u8", audioGroupID: nil),
-             HLSVariant(bandwidth: 800_000, uri: "v-lo.m3u8", audioGroupID: nil)],
+            [HLSVariant(bandwidth: 5_000_000, uri: "v-hi.m3u8", audioGroupID: nil, subtitleGroupID: nil),
+             HLSVariant(bandwidth: 800_000, uri: "v-lo.m3u8", audioGroupID: nil, subtitleGroupID: nil)],
             [], [])
         XCTAssertEqual(AudioTapHLSVariantResolver.pickAudioURI(from: pl), "v-lo.m3u8")
     }

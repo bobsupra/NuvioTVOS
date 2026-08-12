@@ -14,6 +14,32 @@ struct Issue220BoundedRangeTests {
         AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!)
     }
 
+    /// Wait until the origin has taken every request the reader has already issued.
+    ///
+    /// A request is issued on the read thread and counted when it ARRIVES, so an assertion that
+    /// runs the instant a read returns is timing the scheduler, not the reader. Both directions
+    /// were measured on this suite: the frontier refill landed before the assertion on a loaded CI
+    /// runner and after it on a quiet machine, and with the #295 fix reverted the re-fetch it
+    /// exists to catch also landed too late to be seen. Quiescence is the state the assertions
+    /// actually want, and it is reachable without a fixed sleep.
+    private func waitForOriginToSettle(_ server: ThrottledOriginServer,
+                                       quietFor: TimeInterval = 0.2,
+                                       cap: TimeInterval = 5) async {
+        let deadline = Date().addingTimeInterval(cap)
+        var last = server.rangeRequestCount
+        var quietSince = Date()
+        while Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+            let now = server.rangeRequestCount
+            if now != last {
+                last = now
+                quietSince = Date()
+                continue
+            }
+            if Date().timeIntervalSince(quietSince) >= quietFor { return }
+        }
+    }
+
     @Test("a VOD read asks for a bounded range, not the rest of the file")
     func vodRequestsBoundedRange() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
@@ -42,14 +68,22 @@ struct Issue220BoundedRangeTests {
     /// therefore re-fetched what it had just been handed. Measured with aetherctl against a
     /// Range-logging origin: a 764450 B trailing `moov` cost three connections and 1.97x its own
     /// size in delivered bytes, one 256 KB AVIO buffer at a time.
+    ///
+    /// The claim is about WHICH bytes are asked for a second time, not about how many requests
+    /// exist, and the distinction is not cosmetic. A range that ended on purpose with the window
+    /// below low water also arms the #220 frontier refill, so the very read that is served out of
+    /// the window legitimately opens the next range AT the frontier. A count cannot tell that
+    /// apart from a re-fetch: this asserted two requests and saw three on a loaded CI runner,
+    /// where the third was `bytes=524288-34078719`, the refill doing its job.
     @Test("a completed range is read out of the window, not fetched again")
     func completedRangeIsNotRefetched() async throws {
         let server = try #require(ThrottledOriginServer(totalSize: 512 * 1024 * 1024))
         defer { server.stop() }
         // A small first range so it completes long before the reader has consumed it, which is the
         // parse-pass shape: the transfer wins the race against the consumer.
+        let firstRange: Int64 = 512 * 1024
         let reader = AVIOReader(url: URL(string: "http://127.0.0.1:\(server.port)/movie.bin")!,
-                                boundedInitialFetch: 512 * 1024)
+                                boundedInitialFetch: firstRange)
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
@@ -60,13 +94,19 @@ struct Issue220BoundedRangeTests {
         for _ in 0..<100 where reader.hasLiveConnectionForTesting {
             try? await Task.sleep(nanoseconds: 10_000_000)
         }
-        let requestsBefore = server.rangeRequestCount
 
-        // Still inside the delivered range, so nothing here needs the network.
+        // Still inside the delivered range, so the bytes come out of the window.
         #expect(reader.read(into: buf, size: 64 * 1024) == 64 * 1024)
 
-        #expect(server.rangeRequestCount == requestsBefore,
+        // The defect reconnected at the READ position, so it asked again for a byte inside the
+        // range already in hand. Nothing may do that: the opening request is the only one allowed
+        // to touch [0, firstRange), and the refill starts at firstRange exactly.
+        await waitForOriginToSettle(server)
+        let refetches = server.requestedRanges.filter { $0.start > 0 && $0.start < firstRange }
+        #expect(refetches.isEmpty,
                 "a completed range was re-fetched instead of read: \(server.requestedRanges)")
+        #expect(server.requestedRanges.filter { $0.start == 0 }.count == 1,
+                "the delivered range was requested again from its start: \(server.requestedRanges)")
     }
 
     /// A position at or past the last byte has nothing to connect for. The EOF decision used to sit
@@ -84,10 +124,15 @@ struct Issue220BoundedRangeTests {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: 4096)
         defer { buf.deallocate() }
         _ = reader.read(into: buf, size: 4096)
+        // Baseline only counts as a baseline once the open's own requests have all landed; the
+        // speculative tail fetch is issued concurrently and would otherwise arrive afterwards and
+        // read as a connection this EOF read opened.
+        await waitForOriginToSettle(server)
         let requestsBefore = server.rangeRequestCount
 
         #expect(reader.seek(offset: size, whence: SEEK_SET) == size)
         #expect(reader.read(into: buf, size: 4096) == FFmpegErr.eof)
+        await waitForOriginToSettle(server)
         #expect(server.rangeRequestCount == requestsBefore,
                 "a read at EOF opened a connection: \(server.requestedRanges)")
     }

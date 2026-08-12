@@ -138,4 +138,64 @@ struct Issue290DisplayAspectGateTests {
         #expect(resolved?.num == 16)
         #expect(resolved?.den == 11)
     }
+
+    // MARK: - The rejection line
+
+    /// A rejected SAR never latches, so the latch line that names frame / ctx / stream cannot fire
+    /// for it: the rejection line is the only line a bad ratio produces, and until it carried the
+    /// axes the question "which axis lied" was unanswerable in exactly the case that asks it.
+    @Test("the rejection line names the axis the ratio arrived on")
+    func rejectionLineNamesAxes() {
+        // The reported shape, reproduced as a container-declared ratio: nothing on the frame,
+        // nothing on the codec context, 3:1 on the stream axis alone.
+        let message = SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(0, 1), ctx: rational(0, 1), stream: rational(3, 1),
+            width: 1920, height: 1080)
+        #expect(message?.contains("SAR 3:1 rejected on 1920x1080") == true)
+        #expect(message?.contains("display aspect 5.33 outside 0.33...3.00") == true)
+        #expect(message?.contains("(frame=0:1 ctx=0:1 stream=3:1)") == true)
+    }
+
+    @Test("disagreeing axes are both readable, which is the mid-stream-join fingerprint")
+    func rejectionLineShowsDisagreement() {
+        // MPEG-TS has no container ratio, so stream= is the parser's SPS reading at open and
+        // frame= is the SPS in force for this frame. Different values mean the declaration moved.
+        let message = SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(3, 1), ctx: rational(0, 1), stream: rational(2, 1),
+            width: 1920, height: 1080)
+        // The headline names what would have been used, the axes name where each value sat.
+        #expect(message?.contains("SAR 3:1 rejected") == true)
+        #expect(message?.contains("(frame=3:1 ctx=0:1 stream=2:1)") == true)
+    }
+
+    @Test("a ratio too broken for the component gate still reports the one that was used")
+    func rejectionLineSkipsComponentGarbage() {
+        // #177's 1088:1 fails the component gate, so the ctx value is what the resolution would
+        // have attached, but the frame axis still has to be visible to explain the drop.
+        let message = SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(1088, 1), ctx: rational(3, 1), stream: rational(0, 1),
+            width: 1920, height: 1080)
+        #expect(message?.contains("SAR 3:1 rejected") == true)
+        #expect(message?.contains("(frame=1088:1 ctx=3:1 stream=0:1)") == true)
+    }
+
+    @Test("no declared SAR anywhere stays silent")
+    func noSARIsSilent() {
+        let message = SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(0, 1), ctx: rational(0, 1), stream: rational(0, 1),
+            width: 1920, height: 1080)
+        #expect(message == nil)
+    }
+
+    @Test("a SAR that was believed is never described as rejected")
+    func believedSARIsSilent() {
+        // Only an axis that lost on the display aspect is reported: square pixels and a legal
+        // broadcast ratio both pass, and a line about either would be a false accusation.
+        #expect(SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(1, 1), ctx: rational(0, 1), stream: rational(0, 1),
+            width: 1920, height: 1080) == nil)
+        #expect(SoftwareVideoDecoder.rejectedSARMessage(
+            frame: rational(0, 1), ctx: rational(0, 1), stream: rational(32, 11),
+            width: 352, height: 576) == nil)
+    }
 }

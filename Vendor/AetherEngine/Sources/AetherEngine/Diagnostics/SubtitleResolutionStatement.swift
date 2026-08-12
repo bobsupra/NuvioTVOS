@@ -49,6 +49,8 @@ enum SubtitleResolutionStatement {
         case eof
         /// The frontier's source changed, e.g. the prefetcher died and the pump is all that is left.
         case frontier
+        /// #318: determination first reached the playhead under this fence.
+        case coverage
     }
 
     /// The engine's fence for a subtitle-resolution claim. A side-reader frontier is only usable
@@ -194,6 +196,41 @@ enum SubtitleResolutionStatement {
         return Statement(fence: fence, streamIndex: streamIndex, coveredFrom: coveredFrom,
                          resolvedThrough: resolved, via: via, decodedThrough: decodedThrough,
                          retainedFrom: retainedFrom, reason: reason)
+    }
+
+    /// #318: does this statement claim determination at the playhead itself?
+    ///
+    /// Three conditions, and each one is a way the claim could be hollow. `via=pump` is excluded
+    /// outright: the pump case's bound is the drain cursor, a lower bound on what was decoded and
+    /// not a contiguity claim, so it can never answer "determined here". `resolvedThrough` has to
+    /// reach the playhead, and `coveredFrom` has to lie at or below it, because the statement claims
+    /// a SPAN and a span that ends above the playhead but starts above it too does not contain it.
+    static func statesCoverage(_ s: Statement, playhead: Double) -> Bool {
+        guard playhead.isFinite, s.via != .pump else { return false }
+        guard let resolved = s.resolvedThrough, resolved.isFinite else { return false }
+        return resolved >= playhead && s.coveredFrom <= playhead
+    }
+
+    /// #318: which transition this statement marks, or nil when it is cadence rather than news.
+    ///
+    /// The whole emission decision for a drain tick, in one place, because the two callers (a tick
+    /// that decoded, a tick that idled) must not drift apart on it. Order is precedence:
+    ///
+    /// - A reset anchors the post-seek sequence, so it always prints and keeps its own reason. If
+    ///   that line already states coverage the caller records it as stated, and no second line
+    ///   repeats it.
+    /// - A first crossing outranks a frontier change, and the two coincide often: the tick where the
+    ///   side reader's position first becomes usable is frequently the tick where it is already
+    ///   past the playhead. `via=` carries the frontier change either way, whereas nothing else in
+    ///   the log marks the crossing, which is the point of #318.
+    /// - A frontier change with no crossing is the #231 case: determination just collapsed to the
+    ///   pump's lookahead and the harness has to hear about it before the next cadence tick.
+    static func transitionReason(_ s: Statement, playhead: Double, isReset: Bool,
+                                 coverageStated: Bool, lastFrontier: Frontier?) -> Reason? {
+        if isReset { return .reconstruction }
+        if !coverageStated, statesCoverage(s, playhead: playhead) { return .coverage }
+        if lastFrontier != s.via { return .frontier }
+        return nil
     }
 
     static func format(_ s: Statement) -> String {

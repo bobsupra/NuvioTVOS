@@ -127,8 +127,10 @@ extension AetherEngine {
                 }
 
                 // #220: the two readers of a subtitled VOD session, separately attributable.
-                // `ahead` above winHighWater (16 MB) with `susp=0` is backpressure that never
-                // engaged; the pump's own window is the control.
+                // `ahead` far above winHighWater (16 MB VOD / 64 MB live) with `parked=0` is
+                // backpressure that never engaged; the pump's own window is the control. A live
+                // reader plateauing between the two marks is healthy: that is the join burst,
+                // absorbed once and held.
                 //
                 // Both paths, not just software. On a direct-play source the native path runs
                 // the HLS loopback, so `HLSVideoEngine` demuxes from the origin through an
@@ -137,8 +139,7 @@ extension AetherEngine {
                 // shape that lets a connection ignoring the suspend keep filling the window,
                 // and the #174 field crash it was built against (HTTPS origin, boringssl in
                 // the stack) was on this path. Reporting software-only hid that.
-                let pumpWin = self.softwareHost?.ioWindowDiagnostics
-                    ?? self.nativeVideoSession?.demuxer?.ioWindowDiagnostics
+                let pumpWin = self.pumpIOWindow
                 let prefetchWin = self.subtitleForwardPrefetchDemuxer?.ioWindowDiagnostics
                 let readerStr = Self.readerWindowFragment(
                     pump: pumpWin, prefetch: prefetchWin,
@@ -268,33 +269,31 @@ extension AetherEngine {
     }
 
     /// #220: one memprobe fragment per live `AVIOReader` window. `win` is the whole buffer,
-    /// `ahead` the undrained forward extent that `appendPersistentData` gates the suspend on.
-    /// `ahead` far above winHighWater (16 MB) while `susp=0` means the backpressure never
-    /// engaged, which is a different defect from a transport overshoot past a suspend that did.
-    /// `postMB` is what the transport delivered after the suspend was issued. #174 priced that
-    /// as a bounded in-flight overshoot; a value tracking the whole window says `suspend()` is
-    /// not stopping delivery, so the high water bounds nothing at all.
+    /// `ahead` the undrained forward extent that `appendPersistentData` gates the backpressure
+    /// end on. `ahead` far above winHighWater (16 MB VOD / 64 MB live) while `parked=0` means the backpressure
+    /// never engaged, which is a different defect from a transport overshoot past an end that
+    /// fired (#310: the end replaced the suspend, so the overshoot is bounded by one
+    /// delivery's in-flight amount rather than by whatever a suspended task lets through).
     ///
     /// #240: `FetchedMB` per reader is the link attribution. The aggregate `avioFetchedMB` cannot
     /// answer "who took the bandwidth", and the reporter of #240 had to infer a second reader from
     /// connection-start lines that carried no identity. Two counters side by side answer it directly:
     /// a session whose `prefFetchedMB` tracks `pumpFetchedMB` is reading the stream twice.
     nonisolated static func readerWindowFragment(
-        pump: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
-        prefetch: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
+        pump: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
+        prefetch: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
         pumpFetchedBytes: Int64? = nil,
         prefetchFetchedBytes: Int64? = nil
     ) -> String {
         func fragment(
             _ prefix: String,
-            _ w: (windowBytes: Int, aheadBytes: Int, suspended: Bool, postSuspendBytes: Int64)?,
+            _ w: (windowBytes: Int, aheadBytes: Int, parked: Bool)?,
             _ fetched: Int64?
         ) -> String {
             guard let w else { return "" }
             return "\(prefix)WinMB=\(w.windowBytes / 1024 / 1024) "
                 + "\(prefix)AheadMB=\(w.aheadBytes / 1024 / 1024) "
-                + "\(prefix)Susp=\(w.suspended ? 1 : 0) "
-                + "\(prefix)PostMB=\(w.postSuspendBytes / 1024 / 1024) "
+                + "\(prefix)Parked=\(w.parked ? 1 : 0) "
                 + (fetched.map { "\(prefix)FetchedMB=\($0 / 1024 / 1024) " } ?? "")
         }
         return fragment("pump", pump, pumpFetchedBytes)
@@ -329,9 +328,30 @@ extension AetherEngine {
     }
 
 
-    /// `Demuxer.avioBytesFetched` via HLSVideoEngine. Used by `LiveTelemetrySampler` for instant + average bitrate. 0 on SW path or pre-start.
+    /// Lifetime bytes the session's playback reader pulled from the source. Feeds the sampler's
+    /// instant + average bitrate and `LiveTelemetry.demuxerBytesFetched`. 0 before a reader exists.
+    ///
+    /// #306: software first, native second, the same precedence the memprobe has always read the pump
+    /// with. A software session owns no `HLSVideoEngine`, so the native-only form returned 0 for the
+    /// whole session and every byte-derived figure a host can show (bitrate, throughput, transferred)
+    /// read zero on the one path that carries the exotic content.
     var demuxerBytesFetched: Int64 {
-        nativeVideoSession?.demuxerBytesFetched ?? 0
+        Self.pumpBytesFetched(software: softwareHost?.demuxerBytesFetched,
+                              native: nativeVideoSession?.demuxerBytesFetched)
+    }
+
+    /// #306: the precedence itself, as a function, so the ordering is assertable without a live
+    /// session on either path. Software first: only one of the two exists per session, and a
+    /// software session's counter is the one that used to be dropped.
+    nonisolated static func pumpBytesFetched(software: Int64?, native: Int64?) -> Int64 {
+        software ?? native ?? 0
+    }
+
+    /// The playback pump reader's sliding-window snapshot, from whichever path owns the reader.
+    /// nil for sources with no `AVIOReader` (disc, custom provider) and before the reader exists.
+    /// Named for the pump to keep it apart from the subtitle side reader, which has a window of its own.
+    var pumpIOWindow: (windowBytes: Int, aheadBytes: Int, parked: Bool)? {
+        softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
     /// Resident bytes in the loopback HLS segment cache. nil when no native session is active.

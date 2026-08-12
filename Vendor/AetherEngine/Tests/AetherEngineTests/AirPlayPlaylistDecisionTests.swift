@@ -62,4 +62,22 @@ struct AirPlayPlaylistDecisionTests {
             base: base, lanIP: "192.168.8.166", playlist: .media))
         #expect(url.absoluteString == "http://192.168.8.166:52341/media.m3u8")
     }
+
+    @Test("#86: the loopback session reloads on both edges of a route change")
+    func loopbackSessionReloadsOnBothEdges() {
+        #expect(AirPlayPlaylistDecision.routeChangeNeedsReload(
+            isRemoteHLSBypass: false, bypassServesLoopbackOrigin: false))
+    }
+
+    @Test("#316: a bypass standing on its own loopback origin reloads, or the receiver is handed 127.0.0.1")
+    func bypassOnLoopbackOriginReloads() {
+        #expect(AirPlayPlaylistDecision.routeChangeNeedsReload(
+            isRemoteHLSBypass: true, bypassServesLoopbackOrigin: true))
+    }
+
+    @Test("A bypass playing the origin directly is receiver-reachable and must not reload")
+    func bypassOnOriginDoesNotReload() {
+        #expect(!AirPlayPlaylistDecision.routeChangeNeedsReload(
+            isRemoteHLSBypass: true, bypassServesLoopbackOrigin: false))
+    }
 }

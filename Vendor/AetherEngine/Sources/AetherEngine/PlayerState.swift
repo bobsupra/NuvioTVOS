@@ -31,6 +31,45 @@ public enum PlaybackBackend: String, Sendable, Equatable {
     case audio
 }
 
+/// Which pipeline is actually serving the session (#321). `LoadOptions.nativeRemoteHLS` records what the
+/// host asked for; the engine can change the effective route after that, and until now only a log line
+/// said so. Observe `$videoRoute` for decisions that differ per pipeline, above all who owns subtitle
+/// drawing: on `.remoteBypass` AVPlayer renders the origin's own legible renditions, on `.loopback` and
+/// `.software` the host's renderer does.
+///
+/// Derived from `playbackBackend` + the session's effective options, never assigned on its own, so it
+/// cannot drift from the running session (the `playbackPhase` arrangement, #85).
+///
+/// Route changes the host does not request:
+/// - `.remoteBypass` -> `.loopback` when the #168 carriage watchdog finds no video track on a master
+///   that advertises one, when the #199 memory routes a known such master straight onto the ingest, and
+///   when the AE#268 probe classifies a VOD playlist as HEVC-in-MPEG-TS;
+/// - `.loopback` -> `.remoteBypass` when AE#154 / AE#246 find an HLS playlist on the loopback path.
+public enum VideoRoute: String, Sendable, Equatable {
+    /// Nothing loaded, or the session was torn down.
+    case none
+    /// AVPlayer plays the origin URL directly (`LoadOptions.nativeRemoteHLS`). No demuxer, no local
+    /// server: media selection, subtitle drawing and buffering all belong to AVFoundation.
+    case remoteBypass
+    /// Demuxer plus local HLS-fMP4 server feeding AVPlayer. The engine owns the source connection and
+    /// the subtitle pipeline; this is the default video route.
+    case loopback
+    /// FFmpeg / dav1d into AVSampleBufferDisplayLayer.
+    case software
+    /// An audio-only session. There is no video pipeline to route.
+    case audio
+
+    /// Single point where a backend and the session's effective remote-HLS bit become a route.
+    static func derive(backend: PlaybackBackend, nativeRemoteHLS: Bool) -> VideoRoute {
+        switch backend {
+        case .none, .aether: return .none
+        case .native: return nativeRemoteHLS ? .remoteBypass : .loopback
+        case .software: return .software
+        case .audio: return .audio
+        }
+    }
+}
+
 /// What playback is doing right now, as one observable (#85). Derived from `state`, `isBuffering`,
 /// `isSeeking`, and the reader network phase, so it can never desync from them. Observe `$playbackPhase`
 /// instead of stitching `state == .loading` + `$isBuffering` + `$isSeeking` together, and instead of
@@ -232,6 +271,27 @@ public struct LoadOptions: Sendable, Equatable {
     /// Preferred subtitle languages (ISO 639-1/2) used ONLY to choose which native WebVTT rendition is marked DEFAULT=YES in the master, so a host-selected legible track renders (AVKit hides a non-default legible selection as mute-only). Read back as `nativeSubtitleDefaultOrdinal`. Unlike `preferredSubtitleLanguages` this does NOT auto-activate the host-overlay subtitle path, so it won't double up with the native render. Default empty (Sodalite#32).
     public var nativeSubtitlePreferredLanguages: [String] = []
 
+    /// The origin fabricates range answers: any `Range: bytes=X-` gets a plausible-looking
+    /// `206 Content-Range: bytes X-.../total`, but the body is positioned on a coarse internal
+    /// chunk boundary rather than byte X (IPTV timeshift/catch-up archives are the motivating
+    /// case; a device trace showed ~1.9 s of content lost at every 32 MB range rotation, heard
+    /// as a once-a-minute audio desync). Headers cannot expose the lie, so this is a caller
+    /// declaration, not a probe. Only byte 0 is addressable: the reader runs its forward-only
+    /// streaming mode on one long-lived unranged GET - no bounded-range windowing, no
+    /// suffix/tail probes, no detour fills, no byte-offset reconnects - and the demuxer's pb is
+    /// non-seekable, so byte seeking is unavailable and a dropped connection surfaces as a read
+    /// error (EOF would read as end-of-media) for the host to re-request. FFmpeg's tail-read
+    /// duration estimate is skipped with the rest of the ranged reads; pair with
+    /// `declaredDurationSeconds` on VOD or the load fails with `zeroDuration`. Default `false`.
+    public var sequentialOrigin: Bool = false
+
+    /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
+    /// trust family as the disc MPLS/IFO override, AE#105). Required alongside
+    /// `sequentialOrigin` for VOD sources: with the tail read gone the demuxer resolves no
+    /// duration, and the caller usually knows the real one (an IPTV catch-up request names its
+    /// window length outright). nil keeps the demuxer's own value. Default nil.
+    public var declaredDurationSeconds: Double? = nil
+
     /// Caller-bounded demux probe budget in bytes, mapped to `AVFormatContext.probesize` for the main playback open. nil keeps the engine default (50 MB). A smaller value speeds `find_stream_info` on slow remote sources whose sparse streams (PGS, mjpeg cover art) would otherwise read to the full budget. An over-tight budget fails OPEN, not closed: `find_stream_info` still returns success with a logged warning, so the session loads with late-resolving tracks silently missing rather than throwing a load error. The value is written to the context verbatim (FFmpeg's AVOption floor of 32 is bypassed), so validate track presence after load if you set this aggressively. The routing `probe(url:)` API and still extraction keep the full budget; the embedded subtitle side-demuxer caps its own probe (it only needs codec ids, not resolved sparse tracks) and tightens to this value when it is smaller (#76). Default nil (#68).
     public var probesize: Int64?
 
@@ -335,6 +395,8 @@ public struct LoadOptions: Sendable, Equatable {
         eagerNativeSubtitleReaders: Bool = false,
         confirmAtmos: Bool = false,
         nativeSubtitlePreferredLanguages: [String] = [],
+        sequentialOrigin: Bool = false,
+        declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
         preferredAudioLanguages: [String] = [],
@@ -365,6 +427,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.eagerNativeSubtitleReaders = eagerNativeSubtitleReaders
         self.confirmAtmos = confirmAtmos
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
+        self.sequentialOrigin = sequentialOrigin
+        self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
         self.preferredAudioLanguages = preferredAudioLanguages
@@ -526,9 +590,8 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// True for host-registered external subtitle tracks (AetherEngine#88); their `id` is synthetic
     /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
     public let isExternal: Bool
-
-    /// True when the playback backend, rather than `subtitleCues`, renders this
-    /// track. Hosts can avoid presenting overlay controls that cannot affect it.
+    /// True when the playback backend, rather than `subtitleCues`, renders this track.
+    /// Hosts can avoid presenting overlay controls that cannot affect it.
     public let isNativelyRenderedSubtitle: Bool
 
     public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false) {

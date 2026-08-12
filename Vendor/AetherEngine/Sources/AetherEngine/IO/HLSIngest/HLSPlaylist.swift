@@ -5,6 +5,8 @@ struct HLSVariant: Equatable {
     let uri: String
     /// nil when the variant declares no alternate-audio group.
     let audioGroupID: String?
+    /// nil when the variant declares no subtitle group (AE#359).
+    let subtitleGroupID: String?
 }
 
 /// EXT-X-MEDIA:TYPE=AUDIO with a URI. Companion reader ingests chosen rendition for demuxed-audio variants (ARD-style).
@@ -14,11 +16,24 @@ struct HLSAudioRendition: Equatable {
     let isDefault: Bool
 }
 
+/// EXT-X-MEDIA:TYPE=SUBTITLES with a URI (AE#359). Unlike audio these are never companion-demuxed:
+/// the rendition is a WebVTT playlist of its own, fetched only once the host selects the track.
+/// A line without a URI describes something muxed into the variant and is not a fetchable rendition.
+struct HLSSubtitleRendition: Equatable {
+    let groupID: String
+    let uri: String
+    let name: String
+    let language: String?
+    let isDefault: Bool
+    let isForced: Bool
+}
+
 /// `demuxedAudioGroupIDs` is kept as a stable Set for O(1) membership checks even though it is derivable from `audioRenditions`. EXT-X-MEDIA without a URI means audio is muxed into the variant stream.
 struct HLSMasterPlaylist: Equatable {
     let variants: [HLSVariant]
     let demuxedAudioGroupIDs: Set<String>
     let audioRenditions: [HLSAudioRendition]
+    let subtitleRenditions: [HLSSubtitleRendition]
 }
 
 /// AES-128 clear-key context (Pluto/Samsung-TV+ style). `iv`: explicit EXT-X-KEY IV attribute or big-endian media-sequence number per RFC 8216 §5.2.
@@ -32,12 +47,18 @@ struct HLSMediaSegment: Equatable {
     let duration: Double
     let discontinuityBefore: Bool
     let crypt: HLSSegmentCrypt?
+    /// Wall time this segment starts at, from EXT-X-PROGRAM-DATE-TIME plus the durations since the last
+    /// tag. Nil when the playlist carries none. This is the only reference two renditions of a program
+    /// reliably share (AE#359): their PTS bases can differ, their PDT and media sequence do not.
+    let programDateTime: Date?
 
-    init(uri: String, duration: Double, discontinuityBefore: Bool, crypt: HLSSegmentCrypt? = nil) {
+    init(uri: String, duration: Double, discontinuityBefore: Bool, crypt: HLSSegmentCrypt? = nil,
+         programDateTime: Date? = nil) {
         self.uri = uri
         self.duration = duration
         self.discontinuityBefore = discontinuityBefore
         self.crypt = crypt
+        self.programDateTime = programDateTime
     }
 }
 
@@ -84,12 +105,15 @@ enum HLSPlaylistParser {
         var variants: [HLSVariant] = []
         var demuxedAudioGroups: Set<String> = []
         var audioRenditions: [HLSAudioRendition] = []
+        var subtitleRenditions: [HLSSubtitleRendition] = []
         var pendingBandwidth: Int?
         var pendingAudioGroup: String?
+        var pendingSubtitleGroup: String?
         for line in lines {
             if line.hasPrefix("#EXT-X-STREAM-INF:") {
                 pendingBandwidth = attribute("BANDWIDTH", in: line).flatMap(Int.init) ?? 0
                 pendingAudioGroup = attribute("AUDIO", in: line)
+                pendingSubtitleGroup = attribute("SUBTITLES", in: line)
             } else if line.hasPrefix("#EXT-X-MEDIA:") {
                 if attribute("TYPE", in: line) == "AUDIO",
                    let uri = attribute("URI", in: line),
@@ -100,11 +124,25 @@ enum HLSPlaylistParser {
                         uri: uri,
                         isDefault: attribute("DEFAULT", in: line) == "YES"
                     ))
+                } else if attribute("TYPE", in: line) == "SUBTITLES",
+                          let uri = attribute("URI", in: line),
+                          let group = attribute("GROUP-ID", in: line) {
+                    subtitleRenditions.append(HLSSubtitleRendition(
+                        groupID: group,
+                        uri: uri,
+                        name: attribute("NAME", in: line) ?? "",
+                        language: attribute("LANGUAGE", in: line),
+                        isDefault: attribute("DEFAULT", in: line) == "YES",
+                        isForced: attribute("FORCED", in: line) == "YES"
+                    ))
                 }
             } else if !line.hasPrefix("#"), let bw = pendingBandwidth {
-                variants.append(HLSVariant(bandwidth: bw, uri: line, audioGroupID: pendingAudioGroup))
+                variants.append(HLSVariant(bandwidth: bw, uri: line,
+                                           audioGroupID: pendingAudioGroup,
+                                           subtitleGroupID: pendingSubtitleGroup))
                 pendingBandwidth = nil
                 pendingAudioGroup = nil
+                pendingSubtitleGroup = nil
             }
         }
         guard !variants.isEmpty else {
@@ -113,7 +151,8 @@ enum HLSPlaylistParser {
         return HLSMasterPlaylist(
             variants: variants,
             demuxedAudioGroupIDs: demuxedAudioGroups,
-            audioRenditions: audioRenditions
+            audioRenditions: audioRenditions,
+            subtitleRenditions: subtitleRenditions
         )
     }
 
@@ -130,6 +169,9 @@ enum HLSPlaylistParser {
         // AES-128 keys are "sticky": one EXT-X-KEY tag governs all following segments until the next tag. Pluto/Samsung-TV+ emit one tag per segment with the same URI and an incrementing explicit IV.
         var currentKeyURI: String?
         var currentExplicitIV: Data?
+        // EXT-X-PROGRAM-DATE-TIME is emitted periodically, not per segment; the segments after one
+        // inherit it plus the durations in between.
+        var pendingDateTime: Date?
 
         for line in lines {
             if line.hasPrefix("#EXT-X-TARGETDURATION:") {
@@ -160,6 +202,8 @@ enum HLSPlaylistParser {
                     currentKeyURI = nil
                     currentExplicitIV = nil
                 }
+            } else if line.hasPrefix("#EXT-X-PROGRAM-DATE-TIME:") {
+                pendingDateTime = parseProgramDateTime(String(line.dropFirst("#EXT-X-PROGRAM-DATE-TIME:".count)))
             } else if line.hasPrefix("#EXT-X-MAP:") {
                 hasMap = true
             } else if line.hasPrefix("#EXT-X-ENDLIST") {
@@ -175,11 +219,15 @@ enum HLSPlaylistParser {
                 } else {
                     crypt = nil
                 }
+                let segmentDuration = pendingDuration ?? targetDuration ?? 0
+                let segmentDate = pendingDateTime
+                if let segmentDate { pendingDateTime = segmentDate.addingTimeInterval(segmentDuration) }
                 segments.append(HLSMediaSegment(
                     uri: line,
-                    duration: pendingDuration ?? targetDuration ?? 0,
+                    duration: segmentDuration,
                     discontinuityBefore: pendingDiscontinuity,
-                    crypt: crypt
+                    crypt: crypt,
+                    programDateTime: segmentDate
                 ))
                 pendingDuration = nil
                 pendingDiscontinuity = false
@@ -203,6 +251,18 @@ enum HLSPlaylistParser {
     }
 
     /// Parse a `0x`-prefixed hex EXT-X-KEY IV into 16-byte big-endian Data. Returns nil on malformed length (caller falls back to sequence-number IV).
+    /// ISO 8601 with fractional seconds is what every broadcaster emits; the plain form is accepted
+    /// because the spec allows it.
+    private static func parseProgramDateTime(_ raw: String) -> Date? {
+        let text = raw.trimmingCharacters(in: .whitespaces)
+        let withFraction = ISO8601DateFormatter()
+        withFraction.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = withFraction.date(from: text) { return date }
+        let plain = ISO8601DateFormatter()
+        plain.formatOptions = [.withInternetDateTime]
+        return plain.date(from: text)
+    }
+
     private static func parseHexIV(_ raw: String) -> Data? {
         var hex = raw.trimmingCharacters(in: .whitespaces)
         if hex.hasPrefix("0x") || hex.hasPrefix("0X") { hex = String(hex.dropFirst(2)) }
@@ -230,7 +290,9 @@ enum HLSPlaylistParser {
     }
 
     /// Extract a KEY=VALUE attribute from a tag line, tolerating quoted values. Match is anchored to `:` or `,` before the key: bare substring search matched `BANDWIDTH=` inside `AVERAGE-BANDWIDTH=` and caused wrong variant selection.
-    private static func attribute(_ key: String, in line: String) -> String? {
+    /// Internal rather than private since #316: the master rewriter reads the same attributes off the
+    /// same tag lines, and a second parser would be a second place for the anchoring trap to reappear.
+    static func attribute(_ key: String, in line: String) -> String? {
         let needle = "\(key)="
         var searchStart = line.startIndex
         while let range = line.range(of: needle, range: searchStart..<line.endIndex) {

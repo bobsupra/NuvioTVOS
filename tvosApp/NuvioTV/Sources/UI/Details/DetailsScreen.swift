@@ -3512,8 +3512,7 @@ private struct TvEpisodeCard: View {
             )
             .contextMenu {
                 Button {
-                    onMenuClosed()
-                    onToggleWatched()
+                    performAfterMenuDismissal(onToggleWatched)
                 } label: {
                     Label(
                         isWatched ? "Mark as unwatched" : "Mark as watched",
@@ -3522,8 +3521,7 @@ private struct TvEpisodeCard: View {
                 }
 
                 Button {
-                    onMenuClosed()
-                    onToggleSeasonWatched()
+                    performAfterMenuDismissal(onToggleSeasonWatched)
                 } label: {
                     Label(
                         isSeasonWatched ? "Mark season as unwatched" : "Mark season as watched",
@@ -3553,6 +3551,18 @@ private struct TvEpisodeCard: View {
         }
         .onMoveCommand { direction in
             if direction == .down { onMoveDown() }
+        }
+    }
+
+    /// A native tvOS context-menu action runs before the menu's presentation
+    /// transaction has finished. Rebuilding the episode rail from a watched
+    /// notification in that transaction produces SwiftUI's
+    /// `setPresentationValue`/menu-lock warnings, so commit on the next settled
+    /// main-loop turn instead.
+    private func performAfterMenuDismissal(_ action: @escaping () -> Void) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            onMenuClosed()
+            action()
         }
     }
 

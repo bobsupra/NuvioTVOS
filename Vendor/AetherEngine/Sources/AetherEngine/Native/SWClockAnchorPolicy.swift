@@ -32,4 +32,25 @@ enum SWClockAnchorPolicy {
         return Resolution(anchorSeconds: firstSampleSeconds,
                           sessionZeroSeconds: max(0, firstSampleSeconds - initialSeconds))
     }
+
+    /// Whether a video packet parked on renderer back-pressure has to anchor the clock itself
+    /// (#337).
+    ///
+    /// Both feed loops gate video on `renderer.isReadyForMoreMediaData`, and the renderer only
+    /// drains while the synchronizer clock runs, so a park entered with an unarmed clock cannot
+    /// end on its own: the combined demux loop is the single reader, and every packet that could
+    /// arm the clock is behind the park; the live feeder has a second reader, but once its
+    /// look-ahead pump has spent its pre-arm budget nothing else will deliver a first buffer
+    /// either. The cycle closes whenever the selected audio stream's first packet lies past the
+    /// renderer's fill point (a track grouped late in the mux, or one the host switched to at
+    /// start-from-zero), and the session then publishes `.playing` at a frozen clock until a seek
+    /// arms it by hand. Anchoring on the video the renderer is already holding is the only exit
+    /// that needs nothing from the host.
+    static func shouldArmFromParkedVideo(clockArmed: Bool,
+                                         isPlaying: Bool,
+                                         rendererReadyForMoreData: Bool,
+                                         audioArmingStillPossible: Bool) -> Bool {
+        guard !clockArmed, isPlaying, !rendererReadyForMoreData else { return false }
+        return !audioArmingStillPossible
+    }
 }

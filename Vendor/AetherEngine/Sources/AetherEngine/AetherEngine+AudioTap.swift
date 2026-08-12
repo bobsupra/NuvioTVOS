@@ -10,6 +10,19 @@ extension AetherEngine {
     /// previous stream. `load()` and `stop()` finish it too (opt-in is per load). With no
     /// active playback session (or a video-only source) the returned stream finishes
     /// immediately.
+    ///
+    /// A **session-preserving reload finishes the stream as well** (#356): an audio-track
+    /// switch, a subtitle-track switch, a disc-title switch and `reloadAtCurrentPosition` all
+    /// rebuild the playback session, and the tap is bound to that session's delivery pipeline
+    /// (the loopback reader reads its segment cache, the remote-HLS reader follows its playhead,
+    /// the software sink hangs off its host). Re-install on stream end to follow the new session.
+    ///
+    /// Deliberate rather than a gap to close: each install gets a fresh
+    /// `AudioTapMonotonicFilter`, so the new session's timeline starts clean. Carrying one
+    /// across the seam would meet a reload that resumes slightly behind the previous position
+    /// with the old `lastEnd` still latched, which is the backward-overlap shape SpeechAnalyzer
+    /// rejects outright (`SFSpeechErrorDomain Code=17`, the reason the filter exists). A stream
+    /// that ends is a boundary a host can act on; a stitched one is not.
     @MainActor
     public func installAudioTap() -> AsyncStream<AudioTapBuffer> {
         removeAudioTap()

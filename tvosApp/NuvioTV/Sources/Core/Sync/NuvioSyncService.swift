@@ -2115,7 +2115,14 @@ fileprivate final class NuvioAPIClient {
         // from Trakt or Simkl in an earlier session, and those are not this
         // account's to upload.
         let payload = WatchedStore.items()
-            .filter { $0.isVisible(under: .nuvioSync) }
+            .filter {
+                $0.isVisible(under: .nuvioSync)
+                    // A series title marker is only a local aggregate used by
+                    // tvOS to render the watched state. Upload its concrete
+                    // episode rows instead, so specials and unaired episodes
+                    // are never implied by a whole-show row.
+                    && !($0.meta.isSeries && $0.season == nil && $0.episode == nil)
+            }
             .map { item -> [String: Any] in
             [
                 "content_id": item.meta.id,

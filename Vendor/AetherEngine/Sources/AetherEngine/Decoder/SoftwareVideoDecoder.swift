@@ -646,16 +646,40 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// SAR that cleared the component gate and failed on the display aspect reaches this; an unset
     /// or square SAR is the ordinary case and stays silent.
     private func logRejectedSAR(frame: AVRational, ctx: AVRational, width: Int32, height: Int32) {
-        let candidates = [frame, ctx, streamSAR]
-        guard let rejected = candidates.first(where: { PixelAspectPolicy.saneSAR($0) != nil }) else { return }
+        guard let message = Self.rejectedSARMessage(
+            frame: frame, ctx: ctx, stream: streamSAR, width: width, height: height
+        ) else { return }
         loggedSARReject = true
+        EngineLog.emit(message, category: .swPlayback)
+    }
+
+    /// The rejection line, including the three axes the ratio could have arrived on.
+    ///
+    /// #290 (axes): a rejected SAR never latches, so the latch line that names frame / ctx / stream
+    /// cannot fire for it, and this line was the only one a bad ratio produced. That made the axis
+    /// unreadable in exactly the case where it is asked for. The axes separate the two hypotheses a
+    /// smeared live channel leaves open: on MPEG-TS, where no container ratio exists, `stream=` is
+    /// the parser's reading of the SPS VUI at open time and `frame=` is the SPS in force for this
+    /// frame, so agreement means the VUI genuinely declares the ratio and disagreement is the
+    /// fingerprint of a declaration that changed between the join and the frame.
+    ///
+    /// Nil unless some axis actually lost on the display aspect: an unset or square SAR everywhere
+    /// is the ordinary case and has nothing to report.
+    static func rejectedSARMessage(
+        frame: AVRational, ctx: AVRational, stream: AVRational, width: Int32, height: Int32
+    ) -> String? {
+        let candidates = [frame, ctx, stream]
+        let rejectedByAspect = { (sar: AVRational) in
+            PixelAspectPolicy.saneSAR(sar) != nil
+                && PixelAspectPolicy.saneSAR(sar, width: width, height: height) == nil
+        }
+        guard let rejected = candidates.first(where: rejectedByAspect) else { return nil }
         let aspect = PixelAspectPolicy.displayAspect(sar: rejected, width: width, height: height)
-        EngineLog.emit(
-            "[SWDecoder] SAR \(rejected.num):\(rejected.den) rejected on \(width)x\(height): "
+        return "[SWDecoder] SAR \(rejected.num):\(rejected.den) rejected on \(width)x\(height): "
             + String(format: "display aspect %.2f outside %.2f...%.2f",
                      aspect, PixelAspectPolicy.minDisplayAspect, PixelAspectPolicy.maxDisplayAspect)
-            + ", using square pixels",
-            category: .swPlayback
-        )
+            + ", using square pixels "
+            + "(frame=\(frame.num):\(frame.den) ctx=\(ctx.num):\(ctx.den) "
+            + "stream=\(stream.num):\(stream.den))"
     }
 }

@@ -28,9 +28,15 @@ public struct NativeVideoFrameTime: Sendable, Equatable {
     /// `AV_PKT_FLAG_KEY` on the source packet.
     public let isKeyframe: Bool
 
-    /// Producer epoch. Increments on every producer (re)start; a restart re-muxes segments from its
+    /// Producer epoch. Moves on at every producer (re)start; a restart re-muxes segments from its
     /// start index forward under a fresh shift, so entries from an older epoch describe bytes AVPlayer
     /// may no longer be able to reach. Drop a table's older epochs when this changes.
+    ///
+    /// Strictly increasing process-wide, across `load()` calls as well as within one session (#314):
+    /// the next item continues the sequence rather than restarting it, so a report that arrives from
+    /// the superseded producer while the next session is coming up always ranks below that session's
+    /// first, and the same "higher retires, lower is stale" rule sorts both cases. Successive epochs
+    /// are not consecutive and the values carry no meaning beyond their order.
     public let epoch: UInt64
 
     public init(source: CMTime, item: CMTime, segmentIndex: Int, isKeyframe: Bool, epoch: UInt64) {

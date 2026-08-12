@@ -109,4 +109,20 @@ struct RemoteHLSMediaSelectionTests {
         #expect(RemoteHLSMediaSelection.ordinal(forTrackID: 0) == nil)
         #expect(RemoteHLSMediaSelection.ordinal(forTrackID: AetherEngine.externalSubtitleTrackIDBase) == nil)
     }
+
+    /// AE#359: the test used to be `id >= base`, which claimed every id space added above it. The live
+    /// subtitle renditions sit at 300_000 and were routed here, so selecting one silently drove the
+    /// AVMediaSelection path instead of their own and produced no cues at all.
+    @Test("An id above this space belongs to somebody else")
+    @MainActor
+    func idsAboveTheRangeAreNotClaimed() {
+        #expect(RemoteHLSMediaSelection.ordinal(forTrackID: AetherEngine.liveSubtitleRenditionTrackIDBase) == nil)
+        #expect(RemoteHLSMediaSelection.ordinal(
+            forTrackID: RemoteHLSMediaSelection.subtitleTrackIDBase
+                + RemoteHLSMediaSelection.subtitleTrackIDRangeCount) == nil)
+        // The last id inside the space still resolves.
+        #expect(RemoteHLSMediaSelection.ordinal(
+            forTrackID: RemoteHLSMediaSelection.subtitleTrackIDBase
+                + RemoteHLSMediaSelection.subtitleTrackIDRangeCount - 1) != nil)
+    }
 }

@@ -20,8 +20,13 @@ class NetflixSearchViewModel: ObservableObject {
     private var allResults: [NuvioMeta] = []
     private var cancellables = Set<AnyCancellable>()
     private var searchTask: Task<Void, Never>?
+    /// Runs after the raw search grid is visible: refreshes the top results'
+    /// full `/meta` records so artwork and watched state match Discovery.
+    /// Cancelled on every new query so stale enrichment can never be applied.
+    private var enrichmentTask: Task<Void, Never>?
     /// Small in-memory cache makes repeated queries (including backspacing)
-    /// instantaneous without keeping stale search data on disk.
+    /// instantaneous without keeping stale search data on disk. Stores the
+    /// enriched results once the background enrichment finishes.
     private var cachedResults: [String: [NuvioMeta]] = [:]
     private var cacheOrder: [String] = []
     // Same UserDefaults key as `SearchViewModel` so a user's search history
@@ -49,6 +54,7 @@ class NetflixSearchViewModel: ObservableObject {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         searchTask?.cancel()
+        enrichmentTask?.cancel()
 
         guard !trimmed.isEmpty else {
             allResults = []
@@ -63,6 +69,9 @@ class NetflixSearchViewModel: ObservableObject {
             applyFilter()
             error = nil
             isLoading = false
+            if SearchResultEnrichment.hasIncompleteLeadingResults(cached) {
+                enrich(cached, cacheKey: cacheKey)
+            }
             return
         }
 
@@ -79,12 +88,40 @@ class NetflixSearchViewModel: ObservableObject {
                 self.applyFilter()
                 if !found.isEmpty { self.commitRecentSearch(trimmed) }
                 self.isLoading = false
+                self.enrich(found, cacheKey: cacheKey)
             } catch {
                 if Task.isCancelled { return }
                 self.error = "Couldn’t complete search. Check your connection and try again."
                 self.isLoading = false
             }
         }
+    }
+
+    /// Refreshes the top raw results with their full `/meta` records without
+    /// blocking the grid already on screen, then swaps them into `allResults`
+    /// (and the filter) and the query cache. Cancelled whenever the query
+    /// changes; the query-key guard is a second line of defense against a
+    /// stale enrichment landing on a newer result list.
+    @MainActor
+    private func enrich(_ found: [NuvioMeta], cacheKey: String) {
+        enrichmentTask?.cancel()
+        enrichmentTask = Task { [weak self] in
+            guard let self else { return }
+            let enriched = await SearchResultEnrichment.enrich(
+                found,
+                repository: self.repository
+            )
+            guard !Task.isCancelled,
+                  self.normalizedQuery() == cacheKey else { return }
+            self.allResults = enriched
+            self.cache(enriched, for: cacheKey)
+            self.applyFilter()
+        }
+    }
+
+    private func normalizedQuery() -> String {
+        searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            .folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
     }
 
     func setType(_ type: SearchContentType) {

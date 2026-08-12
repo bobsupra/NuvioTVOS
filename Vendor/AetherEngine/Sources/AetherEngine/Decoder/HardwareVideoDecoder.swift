@@ -60,6 +60,17 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     private var colorTransfer: CFString?
     private var colorMatrix: CFString?
 
+    /// #354: the stream's pixel aspect ratio, re-applied to every CVPixelBuffer for the same reason
+    /// the colorimetry is: nothing else puts it there. The renderer builds its format description
+    /// from the delivered buffer, so a ratio that is not an attachment on that buffer never reaches
+    /// the layer, and anamorphic content is displayed at its coded dimensions. nil for square pixels
+    /// and for a ratio the policy rejects, which is the case where coded dimensions ARE correct.
+    ///
+    /// Resolved once at `open()`, not per frame: VT delivers pixel buffers rather than `AVFrame`s, so
+    /// the per-frame source `SoftwareVideoDecoder` prefers does not exist here. That also makes the
+    /// #177 latch unnecessary, since one resolution cannot oscillate.
+    private var pixelAspectRatio: AVRational?
+
     /// Protects `session` across the demux thread (decode), main thread (close/flush), and VT callback (delivery).
     private let lock = NSLock()
 
@@ -85,6 +96,26 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         timeBase = stream.pointee.time_base
         width = codecpar.pointee.width
         height = codecpar.pointee.height
+
+        // #354: both declared sources, because only one of them is the container's. The bitstream
+        // ratio reaches codecpar, while a container-declared one reaches AVStream alone (Matroska's
+        // DisplayWidth quotient, MP4's `pasp`), which is where every DVD remuxed to MKV carries it.
+        pixelAspectRatio = Self.resolvePixelAspectRatio(
+            bitstream: codecpar.pointee.sample_aspect_ratio,
+            container: stream.pointee.sample_aspect_ratio,
+            width: width,
+            height: height
+        )
+        if let sar = pixelAspectRatio {
+            EngineLog.emit(
+                "[HWDecoder] SAR \(sar.num):\(sar.den) on \(width)x\(height) "
+                + "(bitstream=\(codecpar.pointee.sample_aspect_ratio.num):"
+                + "\(codecpar.pointee.sample_aspect_ratio.den) "
+                + "container=\(stream.pointee.sample_aspect_ratio.num):"
+                + "\(stream.pointee.sample_aspect_ratio.den))",
+                category: .swPlayback
+            )
+        }
 
         guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else {
             throw VideoDecoderError.unsupportedCodec(id: codecpar.pointee.codec_id.rawValue)
@@ -319,6 +350,22 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         close()
     }
 
+    // MARK: - Pixel aspect ratio (#354)
+
+    /// The ratio to attach, or nil when there is nothing to correct. Bitstream first, container
+    /// second (`declaredStreamSAR`), then the same two gates the libavcodec path runs: the #177
+    /// component bound and the #290 display aspect the ratio produces on this frame. Square pixels
+    /// return nil rather than 1:1, because attaching a correction of one is a correction a consumer
+    /// cannot tell from a real one.
+    static func resolvePixelAspectRatio(
+        bitstream: AVRational, container: AVRational, width: Int32, height: Int32
+    ) -> AVRational? {
+        let declared = SoftwareVideoDecoder.declaredStreamSAR(bitstream: bitstream, container: container)
+        guard let sane = PixelAspectPolicy.saneSAR(declared, width: width, height: height),
+              sane.num != sane.den else { return nil }
+        return sane
+    }
+
     // MARK: - Callback handling (called from VT's queue)
 
     /// Invoked by `hwDecoderOutputCallback`; delivers CVPixelBuffer+PTS, honouring `skipUntilPTS` for seek-pre-roll.
@@ -343,6 +390,19 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         if let matrix = colorMatrix {
             CVBufferSetAttachment(imageBuffer, kCVImageBufferYCbCrMatrixKey, matrix, .shouldPropagate)
+        }
+
+        // #354: without this the renderer's format description carries no pixel aspect ratio and
+        // anamorphic content is displayed at its coded dimensions.
+        if let sar = pixelAspectRatio {
+            let aspect: NSDictionary = [
+                kCVImageBufferPixelAspectRatioHorizontalSpacingKey: Int(sar.num),
+                kCVImageBufferPixelAspectRatioVerticalSpacingKey: Int(sar.den),
+            ]
+            CVBufferSetAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey, aspect, .shouldPropagate)
+        } else {
+            // A recycled pool buffer can carry a stale attachment from an earlier stream.
+            CVBufferRemoveAttachment(imageBuffer, kCVImageBufferPixelAspectRatioKey)
         }
 
         onFrame?(imageBuffer, pts, nil)

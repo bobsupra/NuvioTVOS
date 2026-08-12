@@ -23,9 +23,15 @@ final class AudioTapController {
         continuation = cont
         filter = AudioTapMonotonicFilter(downstream: { buf in _ = cont.yield(buf) })
         startReader { [weak self] stop in self?.stopReader = stop }
+        // The weak capture belongs on the outer closure. Written on the inner Task it was
+        // decorative: `self` was still strongly captured here, so the continuation this
+        // controller owns retained the controller back. Every path releases the controller
+        // through `teardown()` (removeAudioTap, load, stop), so the strong reference bought
+        // nothing, and a future path that drops it without tearing down would have kept the
+        // reader running instead of stopping it.
         cont.onTermination = { [weak self] _ in
             // Consumer cancelled (broke the for-await loop): tear down from the MainActor.
-            Task { @MainActor [weak self] in self?.teardown() }
+            Task { @MainActor in self?.teardown() }
         }
         return stream
     }

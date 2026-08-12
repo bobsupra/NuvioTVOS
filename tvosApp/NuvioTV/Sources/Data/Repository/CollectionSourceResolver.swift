@@ -202,6 +202,8 @@ struct CollectionSourceResolver {
     ) -> [URLQueryItem] {
         let filters = source.filters
         let sort = normalizedTmdbSort(source.sortBy, mediaType: mediaType)
+        let releaseDateLte = nonEmpty(filters?.releaseDateLte)
+            ?? (isRecentReleaseSource(source, sort: sort) ? currentLocalDateString() : nil)
         let voteCountGte = filters?.voteCountGte.map { String($0) }
         let voteAverageGte = filters?.voteAverageGte.map { String($0) }
         let voteAverageLte = filters?.voteAverageLte.map { String($0) }
@@ -233,11 +235,29 @@ struct CollectionSourceResolver {
         ))
         values.append((
             mediaType == "tv" ? "first_air_date.lte" : "primary_release_date.lte",
-            filters?.releaseDateLte
+            releaseDateLte
         ))
         return values.compactMap { name, value in
             nonEmpty(value).map { URLQueryItem(name: name, value: $0) }
         }
+    }
+
+    /// The built-in Recent rows sort by release date, but TMDB includes announced
+    /// future titles unless the discover request also supplies an upper bound.
+    private func isRecentReleaseSource(_ source: NuvioCollectionSource, sort: String) -> Bool {
+        guard let title = nonEmpty(source.title)?.lowercased(), title.hasPrefix("recent ") else {
+            return false
+        }
+        return sort == "primary_release_date.desc" || sort == "first_air_date.desc"
+    }
+
+    private func currentLocalDateString() -> String {
+        let formatter = DateFormatter()
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = .autoupdatingCurrent
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
     }
 
     private func normalizedTmdbSort(_ value: String?, mediaType: String) -> String {

@@ -991,6 +991,135 @@ final class CatalogWatchedPolicyTests: XCTestCase {
     }
 }
 
+final class WholeSeriesWatchedTests: XCTestCase {
+    private let profileId = "whole-series-watched-tests"
+
+    override func setUp() {
+        super.setUp()
+        WatchedStore.setActiveProfile(profileId)
+        WatchedStore.eraseProfile(profileId)
+    }
+
+    override func tearDown() {
+        WatchedStore.eraseProfile(profileId)
+        super.tearDown()
+    }
+
+    func testMarkingSeriesMarksOnlyAiredRegularEpisodes() {
+        let meta = NuvioMeta(
+            id: "tt-whole-series",
+            name: "Whole Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt-whole-series",
+            tmdbId: nil,
+            type: "series",
+            year: 2020,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: [
+                episode(season: 0, episode: 1, released: "2000-01-01"),
+                episode(season: 1, episode: 1, released: "2000-01-01"),
+                episode(season: 1, episode: 2, released: "2999-01-01"),
+                episode(season: 2, episode: 1, released: "2000-01-01")
+            ]
+        )
+
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 0, episode: 1))
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 1, episode: 2))
+        XCTAssertTrue(WatchedStore.toggle(meta: meta))
+
+        let rows = WatchedStore.items().filter { WatchedStore.sameContent($0.meta, meta) }
+        let keys = Set(rows.map { row in
+            guard let season = row.season, let episode = row.episode else { return "title" }
+            return "\(season):\(episode)"
+        })
+        XCTAssertEqual(keys, ["title", "0:1", "1:1", "1:2", "2:1"])
+
+        XCTAssertFalse(WatchedStore.toggle(meta: meta))
+        let remainingRows = WatchedStore.items().filter { WatchedStore.sameContent($0.meta, meta) }
+        let remainingKeys = Set(remainingRows.map { row in
+            guard let season = row.season, let episode = row.episode else { return "title" }
+            return "\(season):\(episode)"
+        })
+        XCTAssertEqual(remainingKeys, ["0:1", "1:2"])
+    }
+
+    func testMarkingFinalSeasonCreatesPortraitSeriesMarker() {
+        let meta = NuvioMeta(
+            id: "tt-season-marker",
+            name: "Season Marker Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt-season-marker",
+            tmdbId: nil,
+            type: "series",
+            year: 2020,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: [
+                episode(season: 0, episode: 1, released: "2000-01-01"),
+                episode(season: 1, episode: 1, released: "2000-01-01"),
+                episode(season: 1, episode: 2, released: "2000-01-02"),
+                episode(season: 1, episode: 3, released: "2999-01-01")
+            ]
+        )
+
+        XCTAssertTrue(
+            WatchedStore.setSeasonWatched(
+                meta: meta,
+                season: 1,
+                episodes: [1, 2],
+                isWatched: true
+            )
+        )
+        XCTAssertTrue(WatchedStore.containsCatalogTitle(meta: meta))
+
+        XCTAssertTrue(
+            WatchedStore.setSeasonWatched(
+                meta: meta,
+                season: 1,
+                episodes: [1],
+                isWatched: false
+            )
+        )
+        XCTAssertFalse(WatchedStore.containsCatalogTitle(meta: meta))
+    }
+
+    private func episode(season: Int, episode: Int, released: String) -> NuvioVideo {
+        NuvioVideo(
+            id: "test:\(season):\(episode)",
+            title: "Episode \(episode)",
+            season: season,
+            episode: episode,
+            thumbnail: nil,
+            overview: nil,
+            released: released,
+            rating: nil
+        )
+    }
+}
+
 final class WatchedIdentityPolicyTests: XCTestCase {
     /// A mark belongs to the backend that was selected when it was made, and
     /// only that backend confirms it on a pull. Switching the selected source
@@ -1057,6 +1186,28 @@ final class WatchedIdentityPolicyTests: XCTestCase {
         XCTAssertTrue(WatchedStore.sameContent(catalog, trakt))
     }
 
+    func testCatalogSeriesTitleFallbackMatchesProviderLocalAndCanonicalIDs() {
+        let catalog = makeMeta(
+            id: "provider:reacher", imdbId: nil, tmdbId: nil, name: "Reacher", year: 2022
+        )
+        let history = makeMeta(
+            id: "tt9288030", imdbId: "tt9288030", tmdbId: 108978, name: "Reacher", year: 2022
+        )
+
+        XCTAssertTrue(WatchedStore.sameCatalogSeriesTitle(catalog, history))
+    }
+
+    func testCatalogSeriesTitleFallbackRejectsDifferentReleaseYears() {
+        let original = makeMeta(
+            id: "provider:show", imdbId: nil, tmdbId: nil, name: "The Show", year: 1999
+        )
+        let remake = makeMeta(
+            id: "tt-remake", imdbId: "tt-remake", tmdbId: nil, name: "The Show", year: 2024
+        )
+
+        XCTAssertFalse(WatchedStore.sameCatalogSeriesTitle(original, remake))
+    }
+
     func testDoesNotMatchDifferentTitlesThatShareAType() {
         let first = makeMeta(id: "tmdb:1", imdbId: nil, tmdbId: 1)
         let second = makeMeta(id: "tmdb:2", imdbId: nil, tmdbId: 2)
@@ -1107,11 +1258,13 @@ final class WatchedIdentityPolicyTests: XCTestCase {
         id: String,
         imdbId: String?,
         tmdbId: Int?,
-        type: String = "series"
+        type: String = "series",
+        name: String = "Test",
+        year: Int? = nil
     ) -> NuvioMeta {
         NuvioMeta(
             id: id,
-            name: "Test",
+            name: name,
             description: nil,
             posterUrl: nil,
             backgroundUrl: nil,
@@ -1119,7 +1272,7 @@ final class WatchedIdentityPolicyTests: XCTestCase {
             imdbId: imdbId,
             tmdbId: tmdbId,
             type: type,
-            year: nil,
+            year: year,
             genres: nil,
             rating: nil,
             releaseInfo: nil,
@@ -1130,6 +1283,99 @@ final class WatchedIdentityPolicyTests: XCTestCase {
             certification: nil,
             country: nil,
             released: nil
+        )
+    }
+}
+
+final class WatchedSourceReconciliationTests: XCTestCase {
+    private let profileId = "watched-source-reconciliation-tests"
+
+    override func setUp() {
+        super.setUp()
+        WatchedStore.setActiveProfile(profileId)
+        WatchedStore.eraseProfile(profileId)
+    }
+
+    override func tearDown() {
+        WatchedStore.eraseProfile(profileId)
+        super.tearDown()
+    }
+
+    func testTraktAbsencePreservesTheSameEpisodeOwnedByNuvioSync() {
+        let item = watchedEpisode(sources: [.nuvioSync, .trakt])
+        XCTAssertTrue(WatchedStore.mergeRemote([item], confirmsTombstoneDeletions: false))
+
+        XCTAssertTrue(
+            WatchedStore.reconcileTraktSnapshot([], syncStartedAt: Date().addingTimeInterval(1))
+        )
+
+        XCTAssertEqual(
+            WatchedStore.items().first?.sources,
+            Set([TraktWatchProgressSource.nuvioSync.rawValue])
+        )
+    }
+
+    func testTraktAbsenceRemovesAnEpisodeOwnedOnlyByTrakt() {
+        let item = watchedEpisode(sources: [.trakt])
+        XCTAssertTrue(WatchedStore.mergeRemote([item], confirmsTombstoneDeletions: false))
+
+        XCTAssertTrue(
+            WatchedStore.reconcileTraktSnapshot([], syncStartedAt: Date().addingTimeInterval(1))
+        )
+
+        XCTAssertTrue(WatchedStore.items().isEmpty)
+        XCTAssertTrue(WatchedStore.tombstones().isEmpty)
+    }
+
+    func testSimklAbsencePreservesTheSameEpisodeOwnedByNuvioSync() {
+        let merged = watchedEpisode(sources: [.nuvioSync, .simkl])
+        let previousSimkl = watchedEpisode(sources: [.simkl])
+        XCTAssertTrue(WatchedStore.mergeRemote([merged], confirmsTombstoneDeletions: false))
+
+        XCTAssertTrue(
+            WatchedStore.reconcileSimklSnapshot(
+                [],
+                previousRemoteItems: [previousSimkl],
+                syncStartedAt: Date().addingTimeInterval(1)
+            )
+        )
+
+        XCTAssertEqual(
+            WatchedStore.items().first?.sources,
+            Set([TraktWatchProgressSource.nuvioSync.rawValue])
+        )
+    }
+
+    private func watchedEpisode(
+        sources: Set<TraktWatchProgressSource>
+    ) -> WatchedStoreItem {
+        WatchedStoreItem(
+            meta: NuvioMeta(
+                id: "tt9288030",
+                name: "Reacher",
+                description: nil,
+                posterUrl: nil,
+                backgroundUrl: nil,
+                logoUrl: nil,
+                imdbId: "tt9288030",
+                tmdbId: 108978,
+                type: "series",
+                year: 2022,
+                genres: nil,
+                rating: nil,
+                releaseInfo: "2022",
+                runtime: nil,
+                cast: nil,
+                director: nil,
+                writer: nil,
+                certification: nil,
+                country: nil,
+                released: nil
+            ),
+            watchedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            season: 1,
+            episode: 1,
+            sources: Set(sources.map(\.rawValue))
         )
     }
 }
@@ -1151,6 +1397,74 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         ContinueWatchingStore.eraseProfile(profileId)
         WatchedStore.eraseProfile(profileId)
         super.tearDown()
+    }
+
+    @MainActor
+    func testManuallyWatchedEpisodeSeedsASeasonRolloverAlert() {
+        let meta = makeSeries()
+        XCTAssertTrue(WatchedStore.markWatched(meta, season: 1, episode: 2))
+
+        let seed = ContinueWatchingBuilder.watchedHistorySeeds().first
+        XCTAssertEqual(seed?.season, 1)
+        XCTAssertEqual(seed?.episode, 2)
+
+        let day = Calendar.current.dateComponents(
+            in: TimeZone.current,
+            from: Date()
+        )
+        let today = String(
+            format: "%04d-%02d-%02d",
+            day.year ?? 2026,
+            day.month ?? 1,
+            day.day ?? 1
+        )
+        let returning = NuvioMeta(
+            id: meta.id,
+            name: meta.name,
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: meta.imdbId,
+            tmdbId: meta.tmdbId,
+            type: "series",
+            year: meta.year,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: [
+                NuvioVideo(
+                    id: "tt-test:2:1",
+                    title: "Return",
+                    season: 2,
+                    episode: 1,
+                    thumbnail: nil,
+                    overview: nil,
+                    released: today,
+                    rating: nil
+                )
+            ]
+        )
+        let item = ContinueWatchingItem(
+            meta: returning,
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: seed?.lastWatchedAt ?? Date(),
+            season: 2,
+            episode: 1,
+            released: today,
+            isUpNext: true,
+            upNextSeedSeason: seed?.season
+        )
+        XCTAssertEqual(item.upNextBadgeText, "AIRS TODAY")
     }
 
     func testEachEpisodeKeepsItsOwnResumePoint() {

@@ -175,6 +175,50 @@ struct SegmentPlanSparseIndexTests {
         #expect((plan.last?.startSeconds ?? 0) < 6599)
     }
 
+    @Test("The uniform stride is never finer than the measured IRAP spacing (#358)")
+    func uniformStrideRespectsMeasuredSpacing() {
+        // A 4 s grid over a 10 s GOP is the reported case: the keyframe-gated cutter opens a segment
+        // only at the IRAP that reaches a boundary, so two boundaries in three get no segment while
+        // the playlist keeps offering them, and AVPlayer stalls on the first of those forever.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(10)) == 10)
+        // A GOP at or under the target keeps the target: those boundaries all have an IRAP.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(2)) == 4)
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(4)) == 4)
+        // Budget spent holding one IRAP: the spacing is at least the budget, so the stride is too.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .exceedsBudget(30)) == 30)
+        // Scanned to the end of the source holding one IRAP: same stride, different statement.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .singleKeyframeInSource(30)) == 30)
+        // No witness at all leaves the previous behaviour rather than inventing a coarse grid.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .unknown) == 4)
+        // Degenerate measurements are not strides.
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(0)) == 4)
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(-3)) == 4)
+        #expect(HLSVideoEngine.uniformStrideSeconds(spacing: .measured(.infinity)) == 4)
+    }
+
+    @Test("A stride at the measured spacing puts an IRAP in every segment window (#358)")
+    func uniformPlanAtMeasuredStrideHasNoUnopenableBoundary() {
+        // The witness that matters is not the segment count but that every boundary is reachable by a
+        // keyframe: with IRAPs every 10 s and boundaries every 10 s, each window holds exactly one.
+        let gop = 10.0
+        let firstKf: Int64 = Int64(1.4 * 90_000)
+        let plan = HLSVideoEngine.buildUniformSegmentPlan(
+            videoTimeBase: ts90k, sourceDurationSeconds: 120, startPts0: firstKf,
+            strideSeconds: HLSVideoEngine.uniformStrideSeconds(spacing: .measured(gop)))
+        var irap = firstKf
+        let step = Int64(gop * 90_000)
+        for segment in plan {
+            // The IRAP that opens this segment sits at or after its boundary and before the next one.
+            #expect(irap >= segment.startPts)
+            #expect(Double(irap - segment.startPts) * (1.0 / 90_000) < gop)
+            irap += step
+        }
+        // The old 4 s grid over the same source is the defect: boundary 1 has no IRAP at all.
+        let fineGrid = HLSVideoEngine.buildUniformSegmentPlan(
+            videoTimeBase: ts90k, sourceDurationSeconds: 120, startPts0: firstKf)
+        #expect(fineGrid[1].startPts < firstKf + step)   // boundary before the next IRAP: unopenable
+    }
+
     @Test("The uniform fallback anchors segment 0 at the content start, not source PTS 0")
     func uniformPlanAnchoredAtFirstKeyframe() {
         // A Blu-ray title whose first keyframe is at 11.609s must not advertise empty leading

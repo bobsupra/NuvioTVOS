@@ -3,16 +3,23 @@ import Testing
 import AetherLibavcodec
 @testable import AetherEngine
 
-/// #142: a bare Epoch-Continue display set (PCS+WDS+END, palette and objects referenced from retained
-/// decoder state, no PDS/ODS retransmit) must render from that retained state. Stock FFmpeg pgssubdec
-/// flushes palettes and objects for ANY composition_state != Normal, including 0xC0 Epoch Continue,
-/// so the bare set fails find_palette ("Invalid palette id 0") and is dropped whole; because PGS end
-/// times are closed by the successor cue, the predecessor cue then overstays. FFmpegBuild carries a
-/// pgssubdec patch that skips the flush for Epoch Continue only; Epoch Start and Acquisition Point
-/// keep flushing (both are self-contained restatements by spec, the flush is safe there).
+/// #142: PGS carries no end time, a cue is closed by the start of its successor. When a display set
+/// references a palette the decoder does not have, stock pgssubdec drops the whole set, so the
+/// successor that would have closed the previous cue disappears with it and the predecessor
+/// overstays its authored end. FFmpegBuild carries a pgssubdec patch that returns the empty subtitle
+/// at that branch instead (outside AV_EF_EXPLODE), which closes the predecessor at the authored time
+/// without inventing a rendering the damaged set never conveyed.
+///
+/// FFmpegBuild 2.1.1 through 2.4.1 repaired the same symptom by keeping the palette and object caches
+/// across composition state 3 (Epoch Continue) so a bare PCS+WDS+END set rendered from retained
+/// state. That was withdrawn in 2.4.2: the caches are fixed arrays bounded by a COUNT
+/// (MAX_EPOCH_OBJECTS 64), so retained pre-connection objects occupy the slots a self-contained
+/// connection set needs and a conformant set conveying a new object id was rejected outright. See
+/// FFmpeg PR 23851.
 ///
 /// These tests drive the shipped AetherLibavcodec pgssub decoder directly with synthetic display sets, the
-/// same call path EmbeddedSubtitleDecoder uses.
+/// same call path EmbeddedSubtitleDecoder uses. They exist here to guard the FFmpegBuild pin: an
+/// engine built against a package without the patch fails them.
 struct Issue142PGSEpochContinueTests {
 
     // MARK: - Segment builders (layouts per pgssubdec.c parsers)
@@ -76,12 +83,17 @@ struct Issue142PGSEpochContinueTests {
 
     // MARK: - Decoder harness
 
-    private func withPGSDecoder(_ body: (UnsafeMutablePointer<AVCodecContext>) -> Void) {
+    private func withPGSDecoder(errorRecognition: Int32 = 0,
+                                _ body: (UnsafeMutablePointer<AVCodecContext>) -> Void) {
         guard let codec = avcodec_find_decoder(AV_CODEC_ID_HDMV_PGS_SUBTITLE),
               let ctx = avcodec_alloc_context3(codec) else {
             Issue.record("pgssub decoder unavailable")
             return
         }
+        ctx.pointee.err_recognition = errorRecognition
+        // Without a packet time base avcodec_decode_subtitle2 leaves sub->pts unset, and the
+        // clearing cue's timestamp is what closes the predecessor.
+        ctx.pointee.pkt_timebase = AVRational(num: 1, den: 90_000)
         guard avcodec_open2(ctx, codec, nil) >= 0 else {
             Issue.record("avcodec_open2 failed for pgssub")
             return
@@ -108,8 +120,8 @@ struct Issue142PGSEpochContinueTests {
 
     // MARK: - Tests
 
-    @Test("a bare Epoch-Continue set renders from retained palette and objects")
-    func bareEpochContinueRendersFromRetainedState() {
+    @Test("a bare Epoch-Continue set emits a clearing cue at its own pts")
+    func bareEpochContinueEmitsClearingCue() {
         withPGSDecoder { ctx in
             var sub = AVSubtitle()
             #expect(decode(ctx, epochStartSet, pts: 0, into: &sub) == 1)
@@ -118,17 +130,40 @@ struct Issue142PGSEpochContinueTests {
 
             var continued = AVSubtitle()
             let got = decode(ctx, bareSet(compositionState: 0xC0), pts: 90_000, into: &continued)
-            #expect(got == 1, "bare Epoch-Continue set was dropped (pgssubdec flushed retained state)")
-            if got == 1 {
-                #expect(continued.num_rects == 1)
-                if continued.num_rects == 1, let rect = continued.rects?[0]?.pointee {
-                    #expect(rect.w == 8)
-                    #expect(rect.h == 8)
-                    #expect(rect.x == 100)
-                    #expect(rect.y == 100)
-                }
-                avsubtitle_free(&continued)
-            }
+            #expect(got == 1, "the damaged set was dropped, so the predecessor cue overstays")
+            #expect(continued.num_rects == 0, "a set that conveys nothing must not render")
+            // 90000 ticks of 1/90000 rescaled to AV_TIME_BASE_Q (microseconds).
+            #expect(continued.pts == 1_000_000, "the clearing cue must carry the successor's pts")
+            avsubtitle_free(&continued)
+        }
+    }
+
+    @Test("the recovery is not scoped to Epoch Continue")
+    func recoveryAppliesToEveryDamagedSet() {
+        withPGSDecoder { ctx in
+            var sub = AVSubtitle()
+            #expect(decode(ctx, epochStartSet, pts: 0, into: &sub) == 1)
+            avsubtitle_free(&sub)
+
+            var continued = AVSubtitle()
+            let got = decode(ctx, bareSet(compositionState: 0x80), pts: 90_000, into: &continued)
+            #expect(got == 1)
+            #expect(continued.num_rects == 0)
+            avsubtitle_free(&continued)
+        }
+    }
+
+    @Test("AV_EF_EXPLODE still rejects the damaged set")
+    func explodeStillRejects() {
+        withPGSDecoder(errorRecognition: AV_EF_EXPLODE) { ctx in
+            var sub = AVSubtitle()
+            #expect(decode(ctx, epochStartSet, pts: 0, into: &sub) == 1)
+            avsubtitle_free(&sub)
+
+            var continued = AVSubtitle()
+            let got = decode(ctx, bareSet(compositionState: 0xC0), pts: 90_000, into: &continued)
+            #expect(got == 0, "strict error recognition must keep rejecting the set")
+            if got == 1 { avsubtitle_free(&continued) }
         }
     }
 
@@ -142,20 +177,7 @@ struct Issue142PGSEpochContinueTests {
             var continued = AVSubtitle()
             let got = decode(ctx, bareSet(compositionState: 0x00), pts: 90_000, into: &continued)
             #expect(got == 1, "bare Normal set failed; the synthetic fixture itself is broken")
-            if got == 1 { avsubtitle_free(&continued) }
-        }
-    }
-
-    @Test("a bare Epoch-Start set still flushes and drops (patch stays scoped to Epoch Continue)")
-    func bareEpochStartStillFlushes() {
-        withPGSDecoder { ctx in
-            var sub = AVSubtitle()
-            #expect(decode(ctx, epochStartSet, pts: 0, into: &sub) == 1)
-            avsubtitle_free(&sub)
-
-            var continued = AVSubtitle()
-            let got = decode(ctx, bareSet(compositionState: 0x80), pts: 90_000, into: &continued)
-            #expect(got == 0, "a bare Epoch-Start set must not survive the epoch flush")
+            #expect(continued.num_rects == 1)
             if got == 1 { avsubtitle_free(&continued) }
         }
     }

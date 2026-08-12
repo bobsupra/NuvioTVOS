@@ -69,6 +69,29 @@ enum AirPlayPlaylistDecision {
         playlist == .master
     }
 
+    /// Whether a wireless-AirPlay route change has to reload the session so the playback URL is re-resolved
+    /// for the new route (#86, and #316 for the second case).
+    ///
+    /// The `nativeRemoteHLS` bypass was excluded wholesale on the premise that remote HLS is already
+    /// receiver-reachable, which held as long as the bypass could only ever play the origin URL. #316 gave
+    /// it a second shape: with text sidecars declared at load, the bypass plays a master the engine serves
+    /// from its own loopback origin, and that address means nothing on the receiver. So the discriminator
+    /// is not the backend, it is where the session's playback URL points.
+    ///
+    /// Both edges reload, matching the loopback path: engaging swaps the loopback host for the LAN IP,
+    /// ending puts the session back on 127.0.0.1 rather than leaving it depending on a LAN address that
+    /// outlives the receiver.
+    ///
+    /// - Parameters:
+    ///   - isRemoteHLSBypass: `LoadOptions.nativeRemoteHLS` for the loaded session.
+    ///   - bypassServesLoopbackOrigin: a #316 subtitle proxy is mounted, so the bypass is playing the
+    ///     engine's rewritten master off the loopback instead of the origin URL. Meaningless off the bypass.
+    static func routeChangeNeedsReload(isRemoteHLSBypass: Bool,
+                                       bypassServesLoopbackOrigin: Bool) -> Bool {
+        guard isRemoteHLSBypass else { return true }
+        return bypassServesLoopbackOrigin
+    }
+
     /// The loopback URL rewritten for the receiver: same port and query, the device's LAN IP for the host
     /// (the receiver cannot reach 127.0.0.1), and the path of the chosen playlist. `.master` keeps whatever
     /// the session resolved. The playlists' `EXT-X-MEDIA` and segment URIs are relative, so everything

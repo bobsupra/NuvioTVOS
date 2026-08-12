@@ -28,6 +28,18 @@ final class NativeAVPlayerHost {
     private var hasEverPlayed = false
     @Published private(set) var didReachEnd: Bool = false
 
+    /// #315: `AVPlayerLayer.isReadyForDisplay` for the item this host holds, which is the only
+    /// signal on this path for "there is a picture". `isReady` is the item's `readyToPlay`, which
+    /// AVFoundation reaches before the layer has presented anything and which stays true across a
+    /// seek, so a host lifting a black cover on it lifts it onto black.
+    ///
+    /// A LEVEL, not a latch: it falls whenever the layer loses its picture, which every item swap
+    /// does, including the in-place handover (measured: ~40 ms of false around a
+    /// `replaceCurrentItem`, even when the swap is meant to be invisible). The engine folds it into
+    /// the load-scoped `AetherEngine.hasFirstFrameReadyForDisplay`, which is what a host should
+    /// consume; nothing here is worth reacting to on its own.
+    @Published private(set) var isVideoReadyForDisplay: Bool = false
+
     /// Set per load; gates the AE#287 premature-end recovery, which only makes sense for a fixed-length
     /// presentation. A live session has no advertised end to fall short of.
     private var isLiveSession: Bool = false
@@ -91,6 +103,11 @@ final class NativeAVPlayerHost {
     /// readyToPlay. 20 s is well past the point where a mount that has not become ready is going to.
     static let carriageProbeReadinessTickSeconds = 0.05
     static let carriageProbeReadinessTicks = 400
+
+    /// #334: budget for the bypass's readiness deadline, nil on every path that has its own terminal
+    /// state (the loopback's live-reload watchdog, VOD). Set per load from `load(readinessDeadline:)`.
+    private var readinessDeadlineSeconds: Double?
+    private var readinessDeadlineTask: Task<Void, Never>?
 
     /// #35 (Sodalite) cold-DV-master startup-readiness gate. While the engine drives the bounded
     /// retry loop this is true, so a startup failure (`.failed` with any code, including a
@@ -251,11 +268,12 @@ final class NativeAVPlayerHost {
     /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false, isLive: Bool = false) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false, readinessDeadline: Double? = nil, isLive: Bool = false) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.surfaceEndFailures = surfaceEndFailures
         self.carriageWatchdogArmed = armVideoCarriageWatchdog
+        self.readinessDeadlineSeconds = readinessDeadline
         self.isLiveSession = isLive
         Self.nextSessionID += 1
         sessionID = Self.nextSessionID
@@ -265,15 +283,28 @@ final class NativeAVPlayerHost {
 
         EngineLog.emit("[NativeAVPlayerHost] #\(sid) load url=\(url.absoluteString) startPos=\(startPosition.map { String(format: "%.2fs", $0) } ?? "nil") headers=\(httpHeaders.isEmpty ? "none" : "\(httpHeaders.count)")", category: .engine)
 
-        // First-frame-visible diagnostic (see `layerReadyObservation`).
+        // First frame on screen, published as `isVideoReadyForDisplay` and stamped for the
+        // audio-leads-black-video gap (see `layerReadyObservation`).
+        //
+        // The install-time value is logged separately rather than taken through `.initial`, and it
+        // is deliberately not published: on a reused host the layer still reads true here, for the
+        // item this load is replacing. AVFoundation clears it ~40 ms later and raises it again for
+        // the new item, so only CHANGES observed from here on describe this session's picture
+        // (`unloadCurrentItem` has already published false).
+        EngineLog.emit(
+            "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(playerLayer.isReadyForDisplay) t+0.00s (carried in from the previous item when true)",
+            category: .engine
+        )
         layerReadyObservation = playerLayer.observe(
-            \.isReadyForDisplay, options: [.new, .initial]
-        ) { layer, change in
+            \.isReadyForDisplay, options: [.new]
+        ) { [weak self] layer, change in
+            let ready = change.newValue ?? layer.isReadyForDisplay
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - loadStart.uptimeNanoseconds) / 1_000_000_000
             EngineLog.emit(
-                "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(change.newValue ?? layer.isReadyForDisplay) t+\(String(format: "%.2f", elapsed))s",
+                "[NativeAVPlayerHost] #\(sid) layer.isReadyForDisplay=\(ready) t+\(String(format: "%.2f", elapsed))s",
                 category: .engine
             )
+            Task { @MainActor in self?.isVideoReadyForDisplay = ready }
         }
 
         let asset = AVURLAsset(url: url, options: Self.assetCreationOptions(httpHeaders: httpHeaders))
@@ -312,6 +343,11 @@ final class NativeAVPlayerHost {
         lastSuppressedStartupFailure = nil
         isReady = false
         seekableEnd = 0
+        // #334: the bypass's ceiling on silence. Started with the mount rather than at readyToPlay,
+        // because the session it exists for is exactly the one that never gets there.
+        if let budget = readinessDeadline {
+            startReadinessDeadline(item: item, budgetSeconds: budget)
+        }
 
         // #134: mirror seekableTimeRanges instead of reading it per call. The callback runs on
         // the item's queue where the re-read is a harmless off-main XPC; live playlist refreshes
@@ -1138,6 +1174,10 @@ final class NativeAVPlayerHost {
         // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failureMessage/didReachEnd corrupt the new session (issue #15).
         failureMessage = nil
         didReachEnd = false
+        // #315: same reason. The layer itself still reads true for a few tens of ms past this point
+        // (AVFoundation clears it after the swap), so the published value leads the layer here on
+        // purpose: the outgoing item's picture is not this session's.
+        isVideoReadyForDisplay = false
         // AE#287: the recovery budget is per item, not per host.
         prematureEndRecoveryAttempts = 0
         lastPrematureEndRecoveryPlayhead = nil
@@ -1154,6 +1194,10 @@ final class NativeAVPlayerHost {
         carriageProbeTask?.cancel()
         carriageProbeTask = nil
         carriageProbeEvidence = .pending
+        // #334: the deadline belongs to the outgoing item too.
+        readinessDeadlineTask?.cancel()
+        readinessDeadlineTask = nil
+        readinessDeadlineSeconds = nil
         // Re-arm #50 hasEverPlayed: reused host must not inherit prior session's established state.
         hasEverPlayed = false
         // #93 recovery reload: same content, same position, playback must continue. Skip the
@@ -1283,7 +1327,21 @@ final class NativeAVPlayerHost {
                     + "so the segment head waits for readyToPlay rather than compete with the mount (#296)",
                     category: .engine
                 )
-                guard await self.awaitReadyForDeferredProbe(sid: sid) else { return }
+                switch await self.awaitReadyForDeferredProbe(sid: sid) {
+                case .abandoned:
+                    return
+                case .ceilingExpired:
+                    // #334: readiness is not coming. Deferring existed so the read would not compete
+                    // with the mount, and a mount that has not settled in 20 s is not competing for
+                    // anything; giving up here is what left the source unjudged and the session silent.
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) carriage probe: readyToPlay never arrived, "
+                        + "reading the segment head anyway rather than leaving the source unjudged (#334)",
+                        category: .engine
+                    )
+                case .ready:
+                    break
+                }
                 let verdict = await HLSCarriageProbe.classifyDeferredSegmentHead(
                     url: segmentURL, httpHeaders: httpHeaders)
                 guard !Task.isCancelled, self.sessionID == sid else { return }
@@ -1297,30 +1355,97 @@ final class NativeAVPlayerHost {
         _ verdict: MPEGTransportStreamCodecProbe.Verdict, sid: Int, from source: String
     ) {
         carriageProbeEvidence = verdict == .hevcInMPEGTS ? .transportStreamHEVC : .nativeCapable
+        // #334: a settled verdict is conclusive without the grace, so it must not wait for the timing
+        // loop that arms at readyToPlay. A source with no audio track either never reaches readiness at
+        // all, and that is precisely the session this verdict is the only fix for.
+        if RemoteHLSIngestFallback.shouldRerouteOnSettledEvidence(
+            carriageEvidence: carriageProbeEvidence,
+            videoTrackCount: currentVideoTrackCount(),
+            armed: carriageWatchdogArmed,
+            alreadyRejected: remoteHLSVideoCarriageRejected
+        ) {
+            EngineLog.emit(
+                "[NativeAVPlayerHost] #\(sid) carriage probe: \(verdict) from \(source) evidence; "
+                + "rerouting without waiting for readyToPlay (#334)",
+                category: .engine
+            )
+            carriageWatchdogTask?.cancel()
+            carriageWatchdogTask = nil
+            remoteHLSVideoCarriageRejected = true
+            return
+        }
         EngineLog.emit(
             "[NativeAVPlayerHost] #\(sid) carriage probe: \(verdict) from \(source) evidence (#293)",
             category: .engine
         )
     }
 
-    /// AE#296: hold the deferred segment-head read until the item is ready. The verdict cannot be acted on
-    /// before then anyway (the watchdog arms at readyToPlay), so waiting costs nothing and removes the one
-    /// window where the read is expensive: a connection lost while the mount is establishing its own can
-    /// cost the mount, one lost here can only cost the verdict, on a session that is already black. A
-    /// session that never reaches readyToPlay, or whose watchdog disarms first, spends no media byte at
-    /// all. Returns false when the wait was overtaken by cancellation, a new session or the ceiling.
+    /// #334: the wait has three outcomes, because "readiness never came" and "this session is gone" no
+    /// longer lead to the same place. Only the second abandons the probe.
+    private enum DeferredProbeWait { case ready, ceilingExpired, abandoned }
+
+    /// AE#296: hold the deferred segment-head read until the item is ready. It removes the one window
+    /// where the read is expensive: a connection lost while the mount is establishing its own can cost
+    /// the mount, one lost afterwards can only cost the verdict, on a session that is already black. A
+    /// session whose watchdog disarms first spends no media byte at all.
+    ///
+    /// #334 corrected the other half of that rationale. Waiting was said to cost nothing because the
+    /// verdict could not be acted on before readyToPlay anyway; it can now, and a source AVFoundation
+    /// builds no track at all for never reaches readiness, so the ceiling reports itself rather than
+    /// silently ending the probe.
     @MainActor
-    private func awaitReadyForDeferredProbe(sid: Int) async -> Bool {
+    private func awaitReadyForDeferredProbe(sid: Int) async -> DeferredProbeWait {
         var ticksWaited = 0
         while !isReady {
-            guard !Task.isCancelled,
-                  sessionID == sid,
-                  ticksWaited < Self.carriageProbeReadinessTicks else { return false }
+            guard !Task.isCancelled, sessionID == sid else { return .abandoned }
+            guard ticksWaited < Self.carriageProbeReadinessTicks else { return .ceilingExpired }
             ticksWaited += 1
             try? await Task.sleep(
                 nanoseconds: UInt64(Self.carriageProbeReadinessTickSeconds * 1_000_000_000))
         }
-        return !Task.isCancelled && sessionID == sid
+        return (!Task.isCancelled && sessionID == sid) ? .ready : .abandoned
+    }
+
+    /// Video tracks AVPlayer has actually built for the current item. Shared by the watchdog tick and
+    /// the #334 pre-readiness reroute so both judge the same thing.
+    @MainActor
+    private func currentVideoTrackCount() -> Int {
+        playerItem?.tracks.filter { $0.assetTrack?.mediaType == .video }.count ?? 0
+    }
+
+    /// #334: fail a bypass session that neither becomes ready nor fails. Runs from the mount rather than
+    /// from readyToPlay for the obvious reason. Everything that resolves the session disarms it, so the
+    /// budget is only ever spent by a session that was going to sit in `.loading` indefinitely.
+    @MainActor
+    private func startReadinessDeadline(item: AVPlayerItem, budgetSeconds: Double) {
+        let sid = sessionID
+        readinessDeadlineTask = Task { @MainActor [weak self] in
+            var deadline = RemoteHLSReadinessDeadline(
+                budgetSeconds: budgetSeconds, tickSeconds: Self.carriageWatchdogTickSeconds)
+            while !Task.isCancelled {
+                try? await Task.sleep(
+                    nanoseconds: UInt64(Self.carriageWatchdogTickSeconds * 1_000_000_000))
+                guard let self, !Task.isCancelled, self.sessionID == sid,
+                      self.playerItem === item else { return }
+                switch deadline.tick(isReady: self.isReady,
+                                     carriageRerouted: self.remoteHLSVideoCarriageRejected,
+                                     hasFailed: self.failureMessage != nil) {
+                case .keepWaiting:
+                    continue
+                case .disarm:
+                    return
+                case .fail:
+                    let message = RemoteHLSReadinessDeadline.failureMessage(budgetSeconds: budgetSeconds)
+                    EngineLog.emit(
+                        "[NativeAVPlayerHost] #\(sid) readiness deadline: no track, no readiness and no "
+                        + "failure in \(Int(budgetSeconds.rounded()))s; surfacing a terminal state (#334)",
+                        category: .engine
+                    )
+                    self.failureMessage = message
+                    return
+                }
+            }
+        }
     }
 
     /// AetherEngine#168 follow-up: after readyToPlay, poll `item.tracks` at the tick cadence against the
@@ -1344,7 +1469,7 @@ final class NativeAVPlayerHost {
                 variantHasVideoAttributes: variants.map { $0.videoAttributes != nil })
             while !Task.isCancelled {
                 guard let self, self.playerItem === item else { return }
-                let videoTrackCount = item.tracks.filter { $0.assetTrack?.mediaType == .video }.count
+                let videoTrackCount = self.currentVideoTrackCount()
                 let evidence = self.carriageProbeEvidence
                 switch watchdog.tick(
                     videoTrackCount: videoTrackCount,

@@ -49,12 +49,53 @@ final class LiveProductionHaltTests: XCTestCase {
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .stopRequested, sourceReopenable: false))
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
-            reason: .muxerFailed, sourceReopenable: false))
+            reason: .muxerFailed, sourceReopenable: false),
+            "handleLiveMuxerFailure rebuilds the producer into the same provider; an eager halt would 503 the provider the rebuild serves, and the arm halts itself on budget exhaustion")
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .backpressureWedge, sourceReopenable: false))
         XCTAssertFalse(HLSVideoEngine.shouldHaltLiveProduction(
             reason: .needsAudioSampleEntryPrime, sourceReopenable: false),
-            "AE#222 rebuilds into the same provider with a primed muxer, so production continues")
+            "the AE#222 arm rebuilds into the same provider with a primed muxer (in place for live), so production continues")
+    }
+
+    // MARK: - Live recovery budget (shared by the in-place muxer rebuild and the reopen ladder)
+
+    /// Both arms carry their own counter pair but the same decision, and both ship the same cap. Pinned
+    /// because the reopen arm ran an untested inline copy of this until the muxer arm needed it too.
+    func testBothLiveRecoveryArmsShipTheSameCap() {
+        XCTAssertEqual(HLSVideoEngine.maxBarrenReopenCycles, 3)
+        XCTAssertEqual(HLSVideoEngine.maxLiveMuxerRebuildCycles, 3)
+    }
+
+    func testFirstLiveMuxerDeathAlwaysRebuilds() {
+        let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+            progressIndex: 414, lastProgressIndex: -1, barrenCycles: 0, cap: 3)
+        XCTAssertTrue(d.proceed, "a fresh death at a new continuation point starts a fresh budget")
+        XCTAssertEqual(d.newBarrenCycles, 0)
+    }
+
+    func testProgressSinceLastDeathResetsTheBudget() {
+        let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+            progressIndex: 431, lastProgressIndex: 414, barrenCycles: 2, cap: 3)
+        XCTAssertTrue(d.proceed,
+            "segments were cut since the last death: an hours-long channel crossing several encoder restarts must not exhaust a session-lifetime budget")
+        XCTAssertEqual(d.newBarrenCycles, 0)
+    }
+
+    func testConsecutiveBarrenDeathsExhaustTheBudget() {
+        var cycles = 0
+        var last = -1
+        var rebuilds = 0
+        // Death after death at the same continuation point: nothing was ever produced in between.
+        for _ in 0..<10 {
+            let d = HLSVideoEngine.liveRecoveryBudgetDecision(
+                progressIndex: 414, lastProgressIndex: last, barrenCycles: cycles, cap: 3)
+            cycles = d.newBarrenCycles
+            last = 414
+            if d.proceed { rebuilds += 1 } else { break }
+        }
+        XCTAssertEqual(rebuilds, 3,
+            "exactly the cap's worth of barren rebuilds, then halt + host retune, never an endless rebuild storm against an unmuxable source")
     }
 
     // MARK: - Provider halt latch

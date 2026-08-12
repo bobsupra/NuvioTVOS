@@ -108,7 +108,10 @@ enum ContinueWatchingBuilder {
         let ledgerSnapshot = WatchProgressLedger.records()
 
         let candidates = WatchProgressLedger.continueWatchingCandidates()
-        let seeds = WatchProgressLedger.upNextSeeds()
+        let seeds = mergedSeedRecords(
+            WatchProgressLedger.upNextSeeds(),
+            watchedHistorySeeds()
+        )
         guard !candidates.isEmpty || !seeds.isEmpty else {
             diagnostic = "\(reason): ledger empty"
             plan = []
@@ -226,10 +229,18 @@ enum ContinueWatchingBuilder {
             let existing = existingById[record.contentId]
 
             if entry.isSeed {
-                guard meta.isSeries,
-                      let season = record.season,
-                      let episodeNumber = record.episode else { continue }
-                guard let next = nextEpisode(after: (season, episodeNumber), in: meta) else {
+                guard meta.isSeries else { continue }
+                let current: (season: Int, episode: Int)
+                if let season = record.season, let episode = record.episode {
+                    current = (season, episode)
+                } else {
+                    guard let latest = latestEpisodeForTitleSeed(
+                        in: meta,
+                        watchedAt: record.lastWatchedAt
+                    ) else { continue }
+                    current = latest
+                }
+                guard let next = nextEpisode(after: current, in: meta) else {
                     // Caught up, or the guide could not be loaded this pass. A
                     // card already on screen must not disappear for the latter.
                     if let existing, existing.isUpNextEntry { page.append(existing) }
@@ -255,7 +266,7 @@ enum ContinueWatchingBuilder {
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
                         isUpNext: true,
-                        upNextSeedSeason: season
+                        upNextSeedSeason: current.season
                     )
                 )
                 continue
@@ -375,6 +386,140 @@ enum ContinueWatchingBuilder {
                     released: candidate.released
                 )
             }
+    }
+
+    /// A manually watched episode has no playback row to seed Next Up. Keep the
+    /// watched history as a lightweight seed so a show that left Continue
+    /// Watching can return when a later episode (especially a new-season
+    /// premiere) appears in the refreshed guide.
+    static func watchedHistorySeeds() -> [WatchProgressRecord] {
+        let watched = WatchedStore.visibleItems()
+        var selectedByContentId: [String: WatchProgressRecord] = [:]
+        var hasEpisodeSeed: Set<String> = []
+
+        for item in watched where item.meta.isSeries {
+            guard let season = item.season,
+                  let episode = item.episode,
+                  season > 0,
+                  episode > 0 else {
+                continue
+            }
+            let record = WatchProgressRecord(
+                progressKey: WatchProgressLedger.progressKey(
+                    contentId: item.meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                contentId: item.meta.id,
+                contentType: "series",
+                videoId: WatchProgressLedger.videoId(
+                    contentId: item.meta.id,
+                    season: season,
+                    episode: episode
+                ),
+                season: season,
+                episode: episode,
+                // This record is only a display seed; it is never uploaded as
+                // playback progress and its runtime is intentionally unknown.
+                position: 1,
+                duration: 1,
+                lastWatchedAt: item.watchedAt
+            )
+            hasEpisodeSeed.insert(item.meta.id)
+            if let current = selectedByContentId[item.meta.id],
+               !UpNextEpisodeSelectionPolicy.prefers(
+                   candidateSeason: season,
+                   candidateEpisode: episode,
+                   candidateWatchedAt: item.watchedAt,
+                   over: current.season ?? 0,
+                   currentEpisode: current.episode ?? 0,
+                   currentWatchedAt: current.lastWatchedAt,
+                   preferFurthestEpisode: UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
+               ) {
+                continue
+            }
+            selectedByContentId[item.meta.id] = record
+        }
+
+        // Older title-only marks do not carry episode rows. They can still seed
+        // a later season once metadata is refreshed; materialization resolves
+        // their last episode from the guide using the marker's watch date.
+        for item in watched where item.meta.isSeries && item.season == nil && item.episode == nil {
+            guard !hasEpisodeSeed.contains(item.meta.id), selectedByContentId[item.meta.id] == nil else {
+                continue
+            }
+            selectedByContentId[item.meta.id] = WatchProgressRecord(
+                progressKey: WatchProgressLedger.progressKey(
+                    contentId: item.meta.id,
+                    season: nil,
+                    episode: nil
+                ),
+                contentId: item.meta.id,
+                contentType: "series",
+                videoId: item.meta.id,
+                season: nil,
+                episode: nil,
+                position: 1,
+                duration: 1,
+                lastWatchedAt: item.watchedAt
+            )
+        }
+
+        return selectedByContentId.values.sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+    }
+
+    /// Merge playback-completion and watched-history seeds without producing a
+    /// duplicate title. Furthest-episode preference matches the existing ledger
+    /// and remote-provider Continue Watching policies.
+    private static func mergedSeedRecords(
+        _ first: [WatchProgressRecord],
+        _ second: [WatchProgressRecord]
+    ) -> [WatchProgressRecord] {
+        var selectedByContentId: [String: WatchProgressRecord] = [:]
+        for candidate in first + second {
+            guard let current = selectedByContentId[candidate.contentId] else {
+                selectedByContentId[candidate.contentId] = candidate
+                continue
+            }
+            let candidateHasEpisode = candidate.season != nil && candidate.episode != nil
+            let currentHasEpisode = current.season != nil && current.episode != nil
+            if candidateHasEpisode != currentHasEpisode {
+                if candidateHasEpisode { selectedByContentId[candidate.contentId] = candidate }
+                continue
+            }
+            guard UpNextEpisodeSelectionPolicy.prefers(
+                candidateSeason: candidate.season ?? 0,
+                candidateEpisode: candidate.episode ?? 0,
+                candidateWatchedAt: candidate.lastWatchedAt,
+                over: current.season ?? 0,
+                currentEpisode: current.episode ?? 0,
+                currentWatchedAt: current.lastWatchedAt,
+                preferFurthestEpisode: UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
+            ) else { continue }
+            selectedByContentId[candidate.contentId] = candidate
+        }
+        return selectedByContentId.values.sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+    }
+
+    private static func latestEpisodeForTitleSeed(
+        in meta: NuvioMeta,
+        watchedAt: Date
+    ) -> (season: Int, episode: Int)? {
+        let watchedDay = Calendar.current.startOfDay(for: watchedAt)
+        return (meta.videos ?? [])
+            .filter { video in
+                guard video.season > 0, video.episode > 0 else { return false }
+                // A title mark only proves what was available before that day.
+                // Treating the marker's own day as watched would hide a new
+                // episode dated today, which is exactly the alert this row is
+                // meant to surface.
+                guard let releaseDate = EpisodeReleasePolicy.releaseDate(for: video.released) else {
+                    return true
+                }
+                return releaseDate < watchedDay
+            }
+            .max { ($0.season, $0.episode) < ($1.season, $1.episode) }
+            .map { ($0.season, $0.episode) }
     }
 
     private static func episode(in meta: NuvioMeta, season: Int?, episode: Int?) -> NuvioVideo? {

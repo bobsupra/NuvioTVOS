@@ -158,15 +158,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
         return _nativeVideoFrameTimeObserver
     }
 
-    /// Monotonic producer generation handed to each producer (#260). Own lock: `makeProducer` runs both
-    /// under `restartLock` (live reopen) and outside it (initial bring-up).
-    private let producerEpochLock = NSLock()
-    private var producerEpochCounter: UInt64 = 0
+    /// Monotonic producer generation handed to each producer (#260). Process-wide rather than per
+    /// session (#314): a `load()` builds a new HLSVideoEngine, and a per-instance counter would restart
+    /// under a host that is still holding the outgoing session's reports. Its own allocator, with its
+    /// own lock, because `makeProducer` runs both under `restartLock` (live reopen) and outside it
+    /// (initial bring-up), and because two sessions overlap while the outgoing one unwinds.
+    private static let producerEpochs = FrameTimeSequence()
 
     private func nextProducerEpoch() -> UInt64 {
-        producerEpochLock.lock(); defer { producerEpochLock.unlock() }
-        producerEpochCounter &+= 1
-        return producerEpochCounter
+        HLSVideoEngine.producerEpochs.next()
     }
 
     /// Sodalite#32: ordinal-aligned source stream indices for the native subtitle cue stores (nil entry =
@@ -480,6 +480,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var consecutiveWedgeReanchors = 0
     var lastWedgeReanchorPosition = -Double.greatestFiniteMagnitude
     static let maxConsecutiveWedgeReanchors = 5
+    /// How many pumps must have folded the index the consumer waits on before the wedge handler
+    /// treats the gap as unrecoverable rather than re-anchoring into it again (#358). One fold can
+    /// still be filled by a rebase; two is the recovery reproducing its own trigger.
+    static let foldsProvingUnrecoverableGap = 2
 
     /// #99: bounded revive for a VOD pump that died with muxerFailed (under `restartLock`).
     /// performRestart rebuilds muxer AND re-arms the audio bridge, so transient causes heal;
@@ -638,14 +642,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
         companionAudioReader: IOReader? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
+        sequentialOrigin: Bool = false,
+        declaredDurationSeconds: Double? = nil,
         forwardBufferSegments: Int? = nil
     ) {
         self.sourceURL = url
         self.sourceHTTPHeaders = sourceHTTPHeaders
+        self.sequentialOrigin = sequentialOrigin
+        self.declaredDurationSeconds = declaredDurationSeconds
         // Caller-bounded find_stream_info budget (#68); nil keeps the .playback default. Applied only to the
         // fallback open / live reopen here; the happy path reuses the already-budgeted preopenedDemuxer.
         self.openProfile = DemuxerOpenProfile.playback.withProbeBudget(
             probesize: probesize, maxAnalyzeDuration: maxAnalyzeDuration)
+            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds)
         self.dvModeAvailable = dvModeAvailable
         self.displaySupportsHDR = displaySupportsHDR
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
@@ -756,6 +765,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// `.playback` unless the caller set `LoadOptions.probesize` / `maxAnalyzeDuration`. Read in the
     /// `+LiveReopen` extension, so it cannot be file-private.
     let openProfile: DemuxerOpenProfile
+
+    /// `LoadOptions.sequentialOrigin` for this session. Gates the VOD readError revive
+    /// (`+LiveReopen`): a revive's fresh demuxer can only reopen from byte 0 and then fails its
+    /// anchor seek on the non-seekable pb, burning a connection slot on origins that are typically
+    /// connection-capped, so the session surfaces `onVODSourceFailed` directly instead.
+    let sequentialOrigin: Bool
+
+    /// `LoadOptions.declaredDurationSeconds`, threaded into every fresh-demuxer profile this
+    /// session builds (wedge restart) so a reopened demuxer reports the same trusted duration.
+    let declaredDurationSeconds: Double?
+
+    /// Every site that would set the producer down somewhere other than byte 0 asks this first:
+    /// the readError revive (`+LiveReopen`), the restart coalescer (`requestRestart`), and the
+    /// resume anchor for the first producer. A sequential origin answers only from byte 0, and
+    /// the demuxer seek that would move the cursor fails silently on a non-seekable pb, so a
+    /// reposition does not fail loudly, it mislabels content. Live sessions are untouched: their
+    /// reopen path re-requests the feed by URL and never seeks.
+    var sequentialOriginPinsProducerToZero: Bool { sequentialOrigin && !isLiveSession }
 
 
     // MARK: - Public API
@@ -943,10 +970,22 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let sorted = keyframes.sorted()
                 let streamStart = videoStream.pointee.start_time
                 let anchorPts = sorted.first ?? (streamStart != Int64.min ? max(0, streamStart) : 0)
+                // #358: a grid finer than the GOP advertises boundaries no keyframe sits on, and the
+                // keyframe-gated cutter leaves every one of them without a segment while the playlist
+                // still offers it. Measure the spacing instead of assuming the target fits it.
+                let anchorSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
+                let spacing = measureKeyframeSpacing(
+                    demuxer: dem,
+                    videoStreamIndex: videoIndex,
+                    videoTimeBase: videoTimeBase,
+                    fromSeconds: anchorSeconds
+                )
+                let stride = Self.uniformStrideSeconds(spacing: spacing)
                 plan = Self.buildUniformSegmentPlan(
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds,
-                    startPts0: anchorPts
+                    startPts0: anchorPts,
+                    strideSeconds: stride
                 )
                 self.firstKeyframePts = anchorPts
                 self.firstKeyframeSeconds = Double(anchorPts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
@@ -969,8 +1008,16 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let reason = keyframes.count < 2
                     ? "\(keyframes.count) IRAPs in index, need >=2"
                     : "index unusable (\(keyframes.count) IRAPs, coverage=\(String(format: "%.1f", coverageSeconds))s, largestGap=\(String(format: "%.1f", largestGapSeconds))s)"
+                let spacingText: String
+                switch spacing {
+                case .measured(let s): spacingText = "measured IRAP spacing \(String(format: "%.3f", s))s"
+                case .exceedsBudget(let s): spacingText = "IRAP spacing exceeds the \(String(format: "%.0f", s))s scan budget"
+                case .singleKeyframeInSource: spacingText = "source holds one IRAP, no second to space against"
+                case .unknown: spacingText = "IRAP spacing unknown (no keyframe scanned)"
+                }
                 EngineLog.emit(
-                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts))",
+                    "[HLSVideoEngine] segment plan: uniform stride fallback (\(reason), anchorPts=\(anchorPts), "
+                    + "\(spacingText) → stride=\(String(format: "%.3f", stride))s, \(plan.count) segments)",
                     category: .session
                 )
             }
@@ -1113,12 +1160,26 @@ public final class HLSVideoEngine: @unchecked Sendable {
         // can 404 the item into a host reload (device: double spinner). The baseIndex > 0 anchor is
         // the battle-tested restart path (gate at plan[base].startPts, tfdt continuity per 4.9.1).
         if !isLiveSession, let startSeconds = initialStartSeconds, startSeconds > 0 {
-            initialProducerBaseIndex = segmentIndexForPlaylistTime(startSeconds)
-            EngineLog.emit(
-                "[HLSVideoEngine] initial producer anchored at idx=\(initialProducerBaseIndex) "
-                + "(startPosition=\(String(format: "%.2f", startSeconds))s)",
-                category: .session
-            )
+            // A sequential origin cannot honour a resume anchor: the first producer would read
+            // from byte 0 (the only addressable offset) while labelling those bytes segment
+            // idx > 0, and the append playlist - which requires reports contiguous from 0 -
+            // would drop every one of them and serve an empty asset. Produce from 0 and say so;
+            // seeking into an archive means re-requesting it with a shifted start timestamp.
+            if sequentialOriginPinsProducerToZero {
+                EngineLog.emit(
+                    "[HLSVideoEngine] sequential origin ignores startPosition="
+                    + "\(String(format: "%.2f", startSeconds))s: only byte 0 is addressable, "
+                    + "producing from the beginning",
+                    category: .session
+                )
+            } else {
+                initialProducerBaseIndex = segmentIndexForPlaylistTime(startSeconds)
+                EngineLog.emit(
+                    "[HLSVideoEngine] initial producer anchored at idx=\(initialProducerBaseIndex) "
+                    + "(startPosition=\(String(format: "%.2f", startSeconds))s)",
+                    category: .session
+                )
+            }
         }
 
         // Fallback duration from avg_frame_rate for MKVs that drop TrackEntry DefaultDuration
@@ -1399,6 +1460,11 @@ public final class HLSVideoEngine: @unchecked Sendable {
             hdcpLevel: hdcpLevel,
             sourceBitrate: sourceBitrate,
             isLive: isLiveSession,
+            // Sequential archives: playlist grows with the producer's REAL cut durations. The
+            // static plan's uniform EXTINF lies whenever the archive's GOP cadence does not
+            // divide the cut target (1.92 s GOPs vs a 4.0 s plan put every segment's media up
+            // to 1.9 s outside its advertised window; AVPlayer visibly jumped at each resync).
+            sequentialAppendPlaylist: sequentialOrigin && !isLiveSession,
             liveWindowSizing: LiveWindowSizing(
                 targetSegmentDurationSeconds: liveCutTargetSeconds,
                 dvrWindowSeconds: dvrWindowSeconds
@@ -1408,6 +1474,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
             liveCadencePolicy: liveCadencePolicy,
             restartHandler: isLiveSession ? nil : { [weak self] idx in
                 self?.requestRestart(at: idx)
+            },
+            // #358: a plan index no keyframe can open, asked for twice. Nothing downstream recovers
+            // from it, so the session ends with an error the host can act on instead of a picture
+            // that never moves again while the engine still reports playing.
+            unrecoverableGapHandler: isLiveSession ? nil : { [weak self] _ in
+                self?.onVODSourceFailed?(FFmpegErr.eio)
             },
             restartActivity: isLiveSession ? nil : { [weak self] in
                 self?.restartInFlight ?? false
@@ -1438,6 +1510,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
                                         startSeconds: startPtsSeconds,
                                         durationSeconds: durationSeconds,
                                         discontinuous: discontinuous)
+            }
+        } else if sequentialOrigin {
+            prod.onSequentialSegmentFinalized = { [weak prov] index, durationSeconds in
+                prov?.appendSequentialSegmentDuration(index: index, durationSeconds: durationSeconds)
             }
         }
 
@@ -1977,6 +2053,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
     var barrenReopenCycles = 0
     var lastReopenSegmentCount = -1
     static let maxBarrenReopenCycles = 3
+    /// Live muxerFailed in-place rebuilds, bounded by progress like the reopen cycles above: new segments
+    /// since the last death reset the budget (an hours-long channel legitimately crosses several encoder
+    /// restarts, so a session-lifetime gate like the VOD #99 one would be wrong here); consecutive barren
+    /// deaths exhaust it and the session halts + delegates to host retune.
+    var liveMuxerRebuildCycles = 0
+    var lastMuxerRebuildSegmentCount = -1
+    static let maxLiveMuxerRebuildCycles = 3
 
     private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
@@ -2062,6 +2145,21 @@ public final class HLSVideoEngine: @unchecked Sendable {
     }
 
     func requestRestart(at idx: Int, authoritative: Bool = false) {
+        // A sequential origin has no restart. performRestart's demuxer seek has nowhere to land
+        // on a non-seekable pb, and it ignores that failure: the new producer would keep reading
+        // wherever the stream stands (or from byte 0 after a fresh reopen) and label those bytes
+        // segment `idx`. That is the same fabricated-position content the declaration exists to
+        // keep out, only silent instead of audible. Surface the loss; the host's re-request with
+        // a shifted start timestamp is the recovery path.
+        if sequentialOriginPinsProducerToZero {
+            EngineLog.emit(
+                "[HLSVideoEngine] restart at idx=\(idx) refused: a sequential origin can only be "
+                + "read from byte 0, so the reposition would mislabel content; surfacing source failure",
+                category: .session
+            )
+            onVODSourceFailed?(FFmpegErr.eio)
+            return
+        }
         restartLock.lock()
         let shouldRun = restartCoalescer.begin(idx, authoritative: authoritative)
         let seekTime = segmentStartSecondsLocked(idx) // under lock; segmentPlan guarded by restartLock (#38)
@@ -2199,7 +2297,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     // .restartReopen: bounded find_stream_info budget; the FULL playback budget was
                     // the bulk of a 44 s wedge-reopen over WAN (#93 residual). The pass itself must
                     // run so video_delay resolves, else B-frame dts arrive broken (#93 judder).
-                    try fresh.open(url: sourceURL, extraHeaders: sourceHTTPHeaders, profile: .restartReopen, isLive: false)
+                    // A sequential origin keeps its declaration on the fresh open too: a ranged
+                    // reopen would splice fabricated-position bytes into the new pump.
+                    try fresh.open(
+                        url: sourceURL, extraHeaders: sourceHTTPHeaders,
+                        profile: DemuxerOpenProfile.restartReopen
+                            .withSequentialOrigin(sequentialOrigin, declaredDuration: declaredDurationSeconds),
+                        isLive: false)
                     dem.markClosed() // abort any wedged read now that the replacement is ready
                     freshDemuxer = fresh
                     activeDem = fresh

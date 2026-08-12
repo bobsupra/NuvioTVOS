@@ -64,6 +64,102 @@ extension HLSVideoEngine {
         return largestGapSeconds <= maxTrustedGapSeconds
     }
 
+    /// What a bitstream scan learned about the source's random-access spacing (#358).
+    enum KeyframeSpacing: Equatable {
+        /// Two consecutive IRAPs were seen this far apart.
+        case measured(Double)
+        /// The budget was spent holding one IRAP, so the spacing is at least this.
+        case exceedsBudget(Double)
+        /// The scan reached the end of the source holding one IRAP: it has no second random-access
+        /// point at all, so no grid can be finer than the source itself.
+        case singleKeyframeInSource(Double)
+        /// No IRAP at all, or the scan could not read.
+        case unknown
+    }
+
+    /// How far the #358 spacing scan reads before giving up, in seconds of content.
+    static let keyframeSpacingScanBudgetSeconds: Double = 30
+
+    /// Stride for the uniform fallback plan: never finer than the source's measured IRAP spacing (#358).
+    ///
+    /// A grid finer than the GOP advertises boundaries no keyframe sits on, and the keyframe-gated
+    /// cutter (#92) opens a segment only at the IRAP that reaches a boundary. Every boundary the IRAP
+    /// stepped over is then an index that gets no segment while the playlist still offers it, so
+    /// AVPlayer fetches it, waits out the slow threshold and stalls for good. A stride at or above the
+    /// spacing puts at least one IRAP in every window, so every index is opened.
+    ///
+    /// The index cannot answer this. It is untrustworthy by the time this path runs, and its entries
+    /// are whatever `find_stream_info` plus the cue prewarm happened to scan: a 10 s-GOP TS measured
+    /// here indexed 1.400, 59.960, 60.000, 60.280, 121.360, whose smallest gap (0.04 s) and largest
+    /// (58.6 s) both miss the real 10 s by an order of magnitude in opposite directions.
+    static func uniformStrideSeconds(spacing: KeyframeSpacing) -> Double {
+        switch spacing {
+        case .measured(let seconds) where seconds.isFinite && seconds > 0:
+            return Swift.max(targetSegmentDuration, seconds)
+        case .exceedsBudget(let seconds) where seconds.isFinite && seconds > 0,
+             .singleKeyframeInSource(let seconds) where seconds.isFinite && seconds > 0:
+            // Coarser than anything the scan could confirm. A source whose GOP outruns the budget
+            // keeps holes, which is why the budget is logged with the plan rather than hidden.
+            return Swift.max(targetSegmentDuration, seconds)
+        default:
+            return targetSegmentDuration
+        }
+    }
+
+    /// Distance between the first two IRAPs at-or-after `fromSeconds`, read from the bitstream (#358).
+    ///
+    /// Only the untrusted-index path needs this, so the cost is paid exactly where the alternative is
+    /// a plan that starves the session. Consumes packets and leaves the demuxer wherever it stopped,
+    /// which matches `rebuildHEVCExtradataWithInBandParameterSets` above and the cue prewarm before it:
+    /// nothing downstream of planning depends on the read cursor.
+    func measureKeyframeSpacing(
+        demuxer: Demuxer,
+        videoStreamIndex: Int32,
+        videoTimeBase: AVRational,
+        fromSeconds: Double
+    ) -> KeyframeSpacing {
+        let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
+        guard tb > 0 else { return .unknown }
+        let budget = Self.keyframeSpacingScanBudgetSeconds
+        demuxer.seek(to: Swift.max(0, fromSeconds))
+
+        var firstKeyframe: Int64?
+        // Backstop against a stream that yields no video packet at all; the budget below is the
+        // real bound for anything that does.
+        var packetsRead = 0
+        let readBudget = 20_000
+
+        while packetsRead < readBudget {
+            let readResult: UnsafeMutablePointer<AVPacket>?
+            do {
+                readResult = try demuxer.readPacket()
+            } catch {
+                break
+            }
+            guard let pkt = readResult else { break }
+            defer {
+                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&maybePkt)
+            }
+            packetsRead += 1
+            guard pkt.pointee.stream_index == videoStreamIndex else { continue }
+            let stamp = pkt.pointee.pts != Int64.min ? pkt.pointee.pts : pkt.pointee.dts
+            guard stamp != Int64.min else { continue }
+            guard let first = firstKeyframe else {
+                if pkt.pointee.flags & AV_PKT_FLAG_KEY != 0 { firstKeyframe = stamp }
+                continue
+            }
+            let elapsed = Double(stamp &- first) * tb
+            if pkt.pointee.flags & AV_PKT_FLAG_KEY != 0, elapsed > 0 {
+                return .measured(elapsed)
+            }
+            if elapsed > budget { return .exceedsBudget(budget) }
+        }
+        // Loop left on EOF or on the read backstop, not on the content budget: with one IRAP in hand
+        // the source has no second one, which is a different statement from "the GOP is long".
+        return firstKeyframe != nil ? .singleKeyframeInSource(budget) : .unknown
+    }
+
     /// Uniform-duration fallback plan when the keyframe index is too sparse. Source-axis boundaries are
     /// anchored at `startPts0` (the first keyframe PTS), exactly like the keyframe-aligned plan, so segment 0
     /// begins at the content start rather than at source PTS 0. A title whose content starts late (e.g. a
@@ -75,10 +171,11 @@ extension HLSVideoEngine {
     static func buildUniformSegmentPlan(
         videoTimeBase: AVRational,
         sourceDurationSeconds: Double,
-        startPts0: Int64 = 0
+        startPts0: Int64 = 0,
+        strideSeconds: Double = HLSVideoEngine.targetSegmentDuration
     ) -> [Segment] {
         guard sourceDurationSeconds > 0 else { return [] }
-        let stride = Self.targetSegmentDuration
+        let stride = strideSeconds.isFinite && strideSeconds > 0 ? strideSeconds : Self.targetSegmentDuration
         let count = max(1, Int(ceil(sourceDurationSeconds / stride)))
         let tb = Double(videoTimeBase.num) / Double(videoTimeBase.den)
         guard tb > 0 else { return [] }

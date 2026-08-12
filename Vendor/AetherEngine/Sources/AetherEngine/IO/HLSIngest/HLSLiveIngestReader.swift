@@ -34,6 +34,11 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     private var _cadenceMeter = LiveArrivalCadenceMeter()
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
+    /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
+    private var _subtitleRenditions: [LiveSubtitleRenditionInfo] = []
+    /// AE#359: EXT-X-PROGRAM-DATE-TIME of the first segment this reader joined at, i.e. the wall time
+    /// the engine's own timeline starts at. The anchor a sibling rendition is placed against.
+    private var _joinWallClock: Date?
     /// "mpegts" or "aac", classified from the first segment's leading bytes, written before that segment's first FIFO byte.
     private var _segmentFormatHint: String?
     private var _packedAudioTimestampOffset90k: Int64?
@@ -74,6 +79,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
 
     public var companionAudioReader: IOReader? {
         startLock.withLock { _companionAudioReader }
+    }
+
+    var subtitleRenditions: [LiveSubtitleRenditionInfo] {
+        startLock.withLock { _subtitleRenditions }
+    }
+
+    var joinWallClock: Date? {
+        startLock.withLock { _joinWallClock }
     }
 
     public var packedAudioTimestampOffset90k: Int64? {
@@ -235,9 +248,15 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     startLock.withLock { _cadenceMeter.recordArrival(at: now) }
                 }
                 if isJoin, !fresh.isEmpty {
+                    // AE#359: the wall time the engine's timeline begins at. Sibling renditions carry the
+                    // same PDT for the same content, which is what makes their cues placeable.
+                    if let joinDate = fresh.first?.programDateTime {
+                        startLock.withLock { _joinWallClock = joinDate }
+                    }
                     let backlog = fresh.reduce(0.0) { $0 + $1.duration }
                     EngineLog.emit(
-                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge",
+                        "[HLSIngest] joined \(fresh.count) segment(s), ~\(Int(backlog))s behind the live edge"
+                        + " pdt=\(fresh.first?.programDateTime.map { "\($0)" } ?? "nil")",
                         category: .engine
                     )
                 }
@@ -434,6 +453,28 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     category: .engine
                 )
                 installCompanion(HLSLiveIngestReader(playlistURL: audioURL, httpHeaders: httpHeaders, role: .companionAudio))
+            }
+            // AE#359: the variant's SUBTITLES group, resolved to absolute playlist URLs and published as
+            // metadata. Nothing is fetched here; the host decides whether a subtitle track is ever wanted.
+            if let group = best.subtitleGroupID {
+                let resolved = master.subtitleRenditions
+                    .filter { $0.groupID == group }
+                    .compactMap { rendition -> LiveSubtitleRenditionInfo? in
+                        guard let url = HLSPlaylistParser.resolve(uri: rendition.uri, against: finalURL) else {
+                            return nil
+                        }
+                        return LiveSubtitleRenditionInfo(name: rendition.name, language: rendition.language,
+                                                         isDefault: rendition.isDefault,
+                                                         isForced: rendition.isForced, playlistURL: url)
+                    }
+                startLock.withLock { _subtitleRenditions = resolved }
+                // Logged including the empty case: a group that resolves to nothing is a routing answer,
+                // and a silent diagnostic there is indistinguishable from a resolver that never ran.
+                EngineLog.emit(
+                    "[HLSIngest] subtitle renditions in group \"\(group)\": \(resolved.count)"
+                    + (resolved.isEmpty ? "" : " (" + resolved.map { $0.language ?? "und" }.joined(separator: ", ") + ")"),
+                    category: .engine
+                )
             }
             EngineLog.emit("[HLSIngest] master playlist: picked variant bandwidth=\(best.bandwidth)", category: .engine)
             return (url, nil)

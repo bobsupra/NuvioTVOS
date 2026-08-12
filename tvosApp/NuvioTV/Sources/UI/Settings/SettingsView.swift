@@ -6174,14 +6174,14 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 6.7.0",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.7.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 6.21.0",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.21.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(
             id: "aether-ffmpeg",
-            title: "FFmpegBuild 2.4.0 (AetherLib*)",
-            body: "Dynamically linked FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.4.0 and Vendor/FFmpegBuild.",
+            title: "FFmpegBuild 2.4.2 (AetherLib*)",
+            body: "Dynamically linked, namespaced FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.4.2 and Vendor/FFmpegBuild.",
             license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
         ),
         LicenseEntry(

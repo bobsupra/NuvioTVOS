@@ -52,6 +52,11 @@ final class SegmentCache: @unchecked Sendable {
     /// Monotonic across prunes; NOT decremented by pruneOutsideWindow. Lets VideoSegmentProvider
     /// detect gaps below the producer's write head after eviction erases them from indexRange().
     private var _highestStoredIndex: Int = -1
+    /// Plan index -> how many pumps passed it without opening a segment (#358). Survives producer
+    /// restarts on purpose: the repeat across a restart is the signal.
+    private var foldCounts: [Int: Int] = [:]
+    /// Above this, a jump is a reposition rather than a fold.
+    private static let maxFoldRunLength = 64
 
     /// (10, 20)=30 entries, ~300 MB at 4K HDR HEVC ~10 MB/seg.
     init(forwardWindow: Int = 10, backwardWindow: Int = 20, retentionBudgetBytes: Int = 0) {
@@ -193,6 +198,9 @@ final class SegmentCache: @unchecked Sendable {
             entryBytes[index] = byteCount
             _totalBytes += byteCount
             if index > _highestStoredIndex { _highestStoredIndex = index }
+            // A later epoch produced what an earlier one passed over: a re-anchor moved the
+            // boundaries and this index is no longer a hole (#358).
+            foldCounts.removeValue(forKey: index)
         }
         let doomed = pruneOutsideWindow()
         condition.broadcast()
@@ -346,6 +354,34 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return currentTargetIndex
+    }
+
+    /// How often a pump has passed a plan index without opening a segment for it (#358).
+    ///
+    /// The keyframe-gated cutter opens a segment at the IRAP that reaches a boundary, so a boundary
+    /// no IRAP reaches is stepped over while the playlist keeps offering it. One fold is not proof of
+    /// a dead index: a re-anchor rebases the producer, which moves the boundaries, and the index can
+    /// come out producible (measured: a re-anchor at a different base filled exactly such a gap).
+    /// A SECOND fold of the same index is the proof, because it is the recovery reproducing its own
+    /// trigger. Cleared by `adopt` when the index does arrive.
+    func foldCount(_ index: Int) -> Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return foldCounts[index] ?? 0
+    }
+
+    /// Record plan indices a cut jumped over. VOD only: a live playlist is built from what was
+    /// finalized, so it never offers an index the pump skipped.
+    func noteFolded(_ indices: Range<Int>) {
+        guard !indices.isEmpty else { return }
+        condition.lock()
+        defer { condition.unlock() }
+        // A jump this wide is a restart or a seek, not a fold; counting it would grow the table
+        // without describing anything.
+        guard indices.count <= Self.maxFoldRunLength else { return }
+        for index in indices where entries[index] == nil {
+            foldCounts[index, default: 0] += 1
+        }
     }
 
     func indexRange() -> (Int, Int)? {

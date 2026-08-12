@@ -46,6 +46,12 @@ protocol HLSSegmentProvider: AnyObject {
     /// value so later cadence or visible-segment growth cannot mutate RFC 8216 playlist timing.
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int
 
+    /// #316: a master to serve VERBATIM instead of building one from the metadata below. The remote-HLS
+    /// subtitle proxy fills this with the origin's own master, rewritten to absolute URIs plus the
+    /// injected SUBTITLES renditions: its variants live at the origin, so there is nothing here to
+    /// describe them with. Nil on every producer-backed provider, which builds its master as before.
+    var staticMasterPlaylistBody: String? { get }
+
     /// Master-playlist metadata. When masterCodecs is non-nil the server publishes master.m3u8; nil means media-playlist-only.
     var masterCodecs: String? { get }
     var masterResolution: (width: Int, height: Int)? { get }
@@ -87,6 +93,10 @@ protocol HLSSegmentProvider: AnyObject {
     /// LL-HLS blocking reload: block until segment at absolute index exists. Holds AVPlayer's ?_HLS_msn= reload open so it receives the new segment the instant it is cut, not a poll-interval late.
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool
 
+    /// Sequential append playlist: block until the startup segments are finalized (or timeout).
+    /// Same rationale as the live gate - AVPlayer treats an empty first playlist as a broken asset.
+    func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool
+
     /// Upper bound on how long a blocking reload may hold before the 503. Production providers derive
     /// it from the sealed TARGETDURATION (3 x TD, the HOLD-BACK depth) so a fastZap session (TD=2)
     /// times out in 6 s instead of 18 s — a hold that outlives AVPlayer's forward buffer guarantees
@@ -97,6 +107,7 @@ protocol HLSSegmentProvider: AnyObject {
 extension HLSSegmentProvider {
     func mediaSegment(at index: Int, onSlow: (@Sendable () -> Void)?) -> Data? { mediaSegment(at: index) }
     func mediaSegmentURL(at index: Int) -> URL? { nil }
+    var staticMasterPlaylistBody: String? { nil }
     var firstVisibleSegmentIndex: Int { 0 }
     func segmentIsDiscontinuous(at index: Int) -> Bool { false }
     func initVersionID(forSegment index: Int) -> Int { 0 }
@@ -126,6 +137,7 @@ extension HLSSegmentProvider {
     }
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool { true }
     func waitForLiveSegment(index: Int, timeout: TimeInterval) -> Bool { true }
+    func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool { true }
     var liveBlockingReloadHoldSeconds: TimeInterval { 18.0 }
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
         return (visibleCount: segmentCount, firstVisible: 0, refreshCounter: 0, endlistAdded: false, discontinuitySequence: 0)
@@ -177,7 +189,10 @@ final class HLSLocalServer: @unchecked Sendable {
         stateLock.lock()
         defer { stateLock.unlock() }
         guard port > 0 else { return nil }
-        let path = (provider?.masterCodecs != nil) ? "master.m3u8" : "media.m3u8"
+        // #316: a static master has no masterCodecs of its own (its variants live at the origin), but it
+        // is still the playlist AVPlayer must open, or the injected renditions never reach media selection.
+        let hasMaster = provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil
+        let path = hasMaster ? "master.m3u8" : "media.m3u8"
         return URL(string: "http://127.0.0.1:\(port)/\(path)")
     }
 
@@ -637,7 +652,7 @@ final class HLSLocalServer: @unchecked Sendable {
 
         switch normalizedPath {
         case "/master.m3u8":
-            if provider?.masterCodecs != nil {
+            if provider?.masterCodecs != nil || provider?.staticMasterPlaylistBody != nil {
                 let body = buildMasterPlaylist()
                 stateLock.lock()
                 let firstTime = !loggedMasterPlaylist
@@ -690,6 +705,12 @@ final class HLSLocalServer: @unchecked Sendable {
                 } else {
                     _ = p.waitForFirstLiveSegment(timeout: 30.0)
                 }
+            } else if let p = provider, p.playlistType == .event {
+                // Sequential append playlist: hold until the startup segments exist. A fast
+                // archive origin cuts them within ~a second; the timeout only covers a source
+                // that dies before its first cut (the playlist then renders empty and AVPlayer
+                // surfaces the failure instead of hanging).
+                _ = p.waitForSequentialStartupSegments(timeout: 30.0)
             }
             let body = buildMediaPlaylist()
             stateLock.lock()
@@ -1058,6 +1079,8 @@ final class HLSLocalServer: @unchecked Sendable {
 
     private func buildMasterPlaylist() -> String {
         guard let provider = provider else { return "#EXTM3U\n" }
+        // #316: the remote-HLS proxy hands over a finished master; there is nothing to build.
+        if let staticBody = provider.staticMasterPlaylistBody { return staticBody }
         return Self.buildMasterPlaylistText(provider: provider,
                                              subResourceBaseURL: subResourceBaseURL)
     }
@@ -1331,6 +1354,13 @@ final class HLSLocalServer: @unchecked Sendable {
                 lastInitVersion = v
             }
             let dur = provider.segmentDuration(at: i)
+            // A zero-duration entry is a plan index the producer skipped outright (sequential
+            // sessions: a long GOP spanning two boundaries); no media file exists for it. Scoped
+            // to the append playlist on purpose: dropping a URI shifts every later segment's
+            // implicit media sequence number by one, which is exactly what a live blocking
+            // reload (?_HLS_msn=) resolves against, and a zero on live or plain VOD is a
+            // different bug that should stay visible rather than be rendered away.
+            if provider.playlistType == .event, dur <= 0 { continue }
             lines.append("#EXTINF:\(String(format: "%.3f", dur)),")
             lines.append(segURI(i))
         }

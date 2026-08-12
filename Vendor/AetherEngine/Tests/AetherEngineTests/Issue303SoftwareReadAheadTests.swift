@@ -24,8 +24,7 @@ struct Issue303SoftwareReadAheadTests {
             renderer.enqueue(pixelBuffer: Self.makePixelBuffer(),
                              pts: CMTime(seconds: seconds, preferredTimescale: 600))
         }
-        let frontier = try? #require(renderer.newestEnqueuedPtsSeconds)
-        #expect(frontier == 0.12)
+        #expect(renderer.newestEnqueuedPtsSeconds == 0.12)
     }
 
     @Test("a frame refused at the unschedulable-PTS gate does not advance the frontier")

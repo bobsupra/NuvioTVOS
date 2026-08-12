@@ -39,6 +39,17 @@ final class DisplayCriteriaController {
     /// `apply()`, so an SDR route writes SDR criteria and never consults the proof.
     private var panelProvenToEngageHDR: Bool = false
 
+    #if os(tvOS)
+    /// #339: armed at the criteria write, not when the play gate opens, so an engine-written switch is
+    /// observable end to end instead of having to be guessed at from the in-progress flag.
+    private let observation = SwitchObservation()
+    #endif
+
+    /// The arm generation whose record has been spent. Only a gate that ends the load's wait spends it, so
+    /// both gates of one load see the same evidence while a later, unarmed gate sees none
+    /// (`recordIsFreshEvidence`).
+    private var spentArmGeneration: Int = 0
+
     /// The identifying inputs of an apply(): equal signatures mean the panel is already in the target mode.
     struct AppliedCriteria: Equatable {
         let isHDR: Bool
@@ -70,27 +81,87 @@ final class DisplayCriteriaController {
         /// Nothing can be pending; return before touching the display manager.
         case skip
         /// 200 ms: only a rate-only switch could still start (the pre-#274 budget, sized for a synchronous
-        /// engine write). The engine already declines to pre-flight its own rate-only writes on the premise
-        /// that they are sub-second, which is an assumption from d87b54d that no log has ever measured: the
-        /// settle times it would have been read off were inflated by the whole Stage 1 budget (Sodalite#49).
-        /// `timingSuffix` now reports the real number, so this budget can be confirmed or corrected.
+        /// engine write). The engine declines to pre-flight its own rate-only writes on the d87b54d premise
+        /// that they are sub-second.
+        ///
+        /// That premise is now contradicted, though not yet by a run that also juddered: on the Sodalite#49
+        /// reporter's Apple TV a rate-only SDR switch was measured at ~2.9 s end to end, and two further
+        /// runs never reported an end at all inside Stage 2's cap. Reading that as "shorten nothing, widen
+        /// nothing" is deliberate: one panel is not grounds for making every session's cold start wait
+        /// longer, and the runs that produced these numbers played cleanly.
         case brief
         /// 1000 ms: a dynamic-range switch may still be inbound from a writer whose timing we don't control
         /// (AVKit's auto-criteria path fires from the AVPlayerItem formatDescription). DV P5 cold start
         /// depends on this budget.
         case full
 
-        var ticks: Int {
+        /// The budget both as the log lines report it and as Stage 1 spends it. Latency fixes are verified
+        /// off the number they moved, so both the spent-time line and the #289 skip line name it (#274).
+        var budgetMs: Int {
             switch self {
             case .skip:  0
-            case .brief: 20
-            case .full:  100
+            case .brief: 200
+            case .full:  1000
             }
         }
+    }
 
-        /// The budget as the log lines report it: one tick is a 10 ms poll. Latency fixes are verified off
-        /// the number they moved, so both the spent-time line and the #289 skip line name it (#274).
-        var budgetMs: Int { ticks * 10 }
+    /// Stage 2's ceiling: long enough that an unobservable DV switch does not gate the first frame the way
+    /// the old fixed 5 s poll did, short enough to stay a startup cost.
+    ///
+    /// **Do not raise this to "fit" the measured switch duration.** Twelve device measurements (Apple TV 4K
+    /// 3rd gen, tvOS 26.5, 2026-08-09, dynamic-range and range-plus-rate alike) put a real switch at 2779 to
+    /// 2898 ms, so the pre-flight gate reliably breaks out here at ~2.0 s with the panel still switching.
+    /// That looks like a defect and is currently load-bearing: breaking out is what lets `loadNative` start
+    /// while the switch finishes, and the play gate then waits out whatever is left. Timed end to end:
+    ///
+    ///     cap 2000: pre-flight breaks +2020, load ~850 ms, play() at ~+2918
+    ///     cap 4000: pre-flight ends +2892 on the notification, load ~850 ms, play() at ~+3740
+    ///
+    /// The "corrected" cap costs a full load's worth of startup, ~820 ms here, because the load is serialised
+    /// behind the wait. The way to spend that time properly is to load *during* the switch rather than to
+    /// pick a cap that overlaps them by accident (AE#348); until then this number is doing two jobs and only
+    /// one of them is written on it.
+    nonisolated static let stage2CapMs = 2000
+
+    /// What the settle wait is allowed to cost, decided by what else is waiting on it.
+    enum SettleCap: Equatable {
+        /// `stage2CapMs`. For a gate that runs *before* the item is built, where breaking out early is what
+        /// releases the load, and for live, where a zap must not sit behind a panel handshake.
+        case standard
+        /// Wait for the end that was observed to be coming, up to `observedEndCapMs`. For a gate that runs
+        /// after the item is ready: nothing else is pending, so the wait costs only itself.
+        case awaitObservedEnd
+    }
+
+    /// Ceiling for `awaitObservedEnd`. Only reachable when a start notification was recorded and its end
+    /// never arrives, which did not happen once across sixteen device switches; the real numbers are 2.8 s
+    /// for a dynamic-range switch and 3.55 s for a rate switch.
+    nonisolated static let observedEndCapMs = 6000
+
+    /// A gate that ran after the load, on a switch it saw start, waits for that switch to end.
+    ///
+    /// The measurement that decides this (Apple TV 4K 3rd gen, tvOS 26.5, 2026-08-09, SDR 25p on a 60 Hz
+    /// system, so a rate-only write with no pre-flight): the item was ready at +443 ms, the cap released
+    /// `play()` at +2130 ms, and the panel finished switching at +3555 ms. **The panel blanks throughout**,
+    /// which is the part no log shows: the first visible frame lands at +3555 ms either way, so releasing
+    /// early buys no picture at all and costs 1.4 s of content played into a dark screen.
+    ///
+    /// This is the answer to "a rate-only switch does not need to be waited out" (Sodalite#49, DrHurt). It
+    /// does not need to be waited out for *correctness*, since only a range change can fail AVPlayer, but
+    /// waiting is free where the panel is dark anyway, and not waiting is not.
+    nonisolated static func settleCapMs(cap: SettleCap, startRecorded: Bool) -> Int {
+        guard cap == .awaitObservedEnd, startRecorded else { return stage2CapMs }
+        return observedEndCapMs
+    }
+
+    /// Both stages spend a deadline, not a poll count. `n` sleeps of `m` ms is only `n * m` on an idle
+    /// scheduler: the same 40 x 50 ms Stage 2 ran 2082 ms in one of the reporter's runs and 2862 ms in
+    /// another, on a device reporting `thermal=serious` throughout. A budget that stretches 40 % under the
+    /// load it exists to survive is not a budget, and it was the second measurement defect in a row to make
+    /// #49's logs unreadable (Sodalite#49).
+    nonisolated static func isBudgetSpent(elapsedMs: Int, budgetMs: Int) -> Bool {
+        elapsedMs >= budgetMs
     }
 
     /// #289: with Match Content off, nothing can start a switch, so waiting for one is pure startup latency
@@ -139,6 +210,19 @@ final class DisplayCriteriaController {
     /// combined toggle) never sets the proof and keeps the conservative answer, so it is still never offered a
     /// PQ master it would reject with -11848.
     ///
+    /// `UIScreen.potentialEDRHeadroom` looks like the way out of all of this and is not. It reads **1.00 on
+    /// tvOS regardless of the display's mode**, measured 2026-08-09 on an Apple TV 4K (3rd gen), tvOS 26.5,
+    /// HDR10 panel, same title played once with the box set to 4K HDR and once to 4K SDR:
+    ///
+    ///     4K HDR, t+2.5s:  current 1.20, potential 1.00
+    ///     4K HDR, t+20s:   current 1.00, potential 1.00
+    ///     4K SDR, t+2.5s:  current 1.00, potential 1.00
+    ///
+    /// The first row is the one that closes it: the panel was demonstrably in an HDR mode, and the value
+    /// documented as the maximum the screen can display read *lower* than the live one at the same instant,
+    /// from the same `UIScreen`. That is not a sampling-time problem, it is a property tvOS does not
+    /// maintain. There is no mode read-back; do not go looking for one here again (Sodalite#49).
+    ///
     /// The residual risk is the reverse: Match Dynamic Range switched off in Settings after a proven session,
     /// without the app being killed. That offers one master to an SDR panel, which the reactive master-to-media
     /// fallback (#98) and the startup-readiness gate (#35) already recover from. Trading a rare, self-healing
@@ -157,27 +241,137 @@ final class DisplayCriteriaController {
         return lastCriteriaWasHDR ? .engineHDR : .engineRateOnly
     }
 
-    /// How Stage 1 learned a switch was running. This is the one bit that separates "the panel was already
+    /// How the gate learned a switch was running. This is the one bit that separates "the panel was already
     /// switching while the AVPlayerItem was built" from "the switch started after the gate opened", the
-    /// ordering question Sodalite#49 was filed on and which no log line could answer. The observers are
-    /// registered on entry, so a switch that began earlier is only visible through the in-progress flag;
-    /// a start notification means it began inside the gate.
+    /// ordering question Sodalite#49 was filed on and which no log line could answer.
+    ///
+    /// Since #339 the notifications are recorded from the criteria write onward rather than from gate entry,
+    /// so `preGateObserved` answers that question with two timestamps. The flag-derived cases remain for what
+    /// the notifications miss, and each one now indicts something specific: `preGate` says a switch was
+    /// running that this session's write never announced, `inGateFlagOnly` says the start notification for a
+    /// switch inside the gate went missing. Both are measurements of the observation itself, which is what
+    /// makes the #339 change checkable on a device rather than only in review.
     enum StartSignal: String, Equatable {
-        /// In-progress flag already set when polling began: the switch started before the gate, i.e. during
-        /// the load that built the item.
-        case preGate = "pre-gate"
+        /// Start notification recorded between the criteria write and the gate opening.
+        case preGateObserved = "pre-gate (start notification, before gate entry)"
+        /// In-progress flag set on the first poll with no start recorded since the write: the switch began
+        /// before the observation was armed, or its notification never arrived.
+        case preGate = "pre-gate (flag only, no start notification since the criteria write)"
         /// Mode-switch-start notification arrived while the gate was polling.
         case inGate = "in-gate"
+        /// The flag rose after the first poll and no start notification ever arrived. The switch began
+        /// inside the gate either way; what is missing is the notification, not the ordering.
+        case inGateFlagOnly = "in-gate (flag only, start notification missed)"
         /// Nothing observed within the budget.
         case none = "none"
     }
 
-    /// The two numbers a settle log needs to be usable: when Stage 1 saw the switch start, and how long the
-    /// whole gate took. Both used to be reported as `startGrace.ticks * 10 + stage2Ticks * 50`, which counts
-    /// the Stage 1 *budget* rather than the time actually spent in it, so every settle in every log read up
-    /// to a full second slower than it was and no measurement of real switch latency was possible (#49).
-    nonisolated static func timingSuffix(startSignal: StartSignal, stage1Ms: Int, totalMs: Int) -> String {
-        "start \(startSignal.rawValue) after \(stage1Ms)ms, total \(totalMs)ms"
+    /// Stage 1's per-poll verdict, `nil` while nothing has been observed yet. Pure so the distinction the
+    /// whole of #49 rests on is covered by tests rather than by reading a device log.
+    nonisolated static func classifyStart(isFirstPoll: Bool,
+                                          startNotificationFired: Bool,
+                                          switchInProgress: Bool) -> StartSignal? {
+        if startNotificationFired { return .inGate }
+        guard switchInProgress else { return nil }
+        return isFirstPoll ? .preGate : .inGateFlagOnly
+    }
+
+    /// What the observation already knows when the gate opens (#339). The observers are armed at the
+    /// criteria write, so a switch that started, or started and finished, while the item was being built is
+    /// knowable here instead of having to be inferred from a flag inside Stage 1.
+    enum ObservedSwitch: Equatable {
+        /// Start and end both recorded before the gate opened, and the panel is not switching now: there is
+        /// nothing left to wait for.
+        case settled(startBeforeGateMs: Int, switchMs: Int)
+        /// A start was recorded and no end followed it. Stage 1 has nothing left to discover, so the gate
+        /// goes straight to waiting the end out.
+        case running(startBeforeGateMs: Int)
+        /// Nothing usable recorded since the write.
+        case none
+    }
+
+    /// May a raised EDR headroom end the wait?
+    ///
+    /// The headroom rises *with* the dynamic-range transition, so during a switch it reports "HDR is coming
+    /// up", not "the panel is done". Device measurement (Apple TV 4K 3rd gen, tvOS 26.5, 2026-08-09): a run
+    /// whose headroom reached 1.20 at +374 ms belonged to a switch that ended at +2853 ms, and the gate
+    /// released `play()` 2.5 s into a running HDMI handshake. That is the "first frame hits a mid-transition
+    /// panel" case the whole wait exists to prevent, and the shape Sodalite#49 was filed on.
+    ///
+    /// The deciding input is whether **this load recorded a start notification at all**, not whether one
+    /// arrived since this gate opened. A load runs two gates (pre-flight, then play), the second finds the
+    /// record already consumed, and reading that as "no observable switch" let the headroom end the wait
+    /// 759 ms early on the very next device run. If a start was recorded, its end will be too, and the
+    /// notification or the in-progress flag is the authority: on that device the flag cleared within 1 ms of
+    /// the notification.
+    ///
+    /// Without a recorded start the headroom is the only end signal there is, which is the unobservable-DV
+    /// panel the Stage 2 cap exists for, so it keeps its say there.
+    nonisolated static func startPhaseHeadroomSettles(startRecorded: Bool, switchInProgress: Bool) -> Bool {
+        !startRecorded && !switchInProgress
+    }
+
+    /// Stage 2 has already classified a start, so the flag is expected to be set and cannot disqualify the
+    /// headroom the way it does in Stage 1; an unobservable-DV panel sticks it `true` for the whole switch.
+    /// A recorded start still rules the headroom out.
+    nonisolated static func settlePhaseHeadroomSettles(startRecorded: Bool) -> Bool {
+        !startRecorded
+    }
+
+    /// May the entry fast-exit take a raised headroom as "nothing to wait for"?
+    ///
+    /// Its purpose is the panel a previous session already drove into HDR: no transition is pending and the
+    /// wait would be dead time. A panel that is mid-switch produces the same raised headroom for the
+    /// opposite reason, so the in-progress flag has to agree. Same device run: the play gate read headroom
+    /// 1.20 at entry and returned in 0 ms while the switch had another 2.4 s to run.
+    nonisolated static func entryHeadroomIsSettled(headroomAboveOne: Bool, switchInProgress: Bool) -> Bool {
+        headroomAboveOne && !switchInProgress
+    }
+
+    /// Whether a recorded switch belongs to the load whose gate is asking (#339).
+    ///
+    /// The record survives between loads, so a gate that runs without a preceding arm must not read it: an
+    /// engine-writer reload re-applies no criteria and arms nothing, and inheriting the previous load's start
+    /// would make it wait out an end that can no longer arrive.
+    ///
+    /// Marking the record spent is a separate decision (`consumesRecord`), because a load runs up to two
+    /// gates and both are entitled to the same evidence. The pre-flight deliberately does not spend it: on
+    /// the device, a play gate that opened after its switch had ended found the record already spent, fell
+    /// back to Stage 1 and paid its 200 ms grace for a switch it could have known was over.
+    nonisolated static func recordIsFreshEvidence(recordGeneration: Int, lastSpentGeneration: Int) -> Bool {
+        recordGeneration != 0 && recordGeneration != lastSpentGeneration
+    }
+
+    /// Pure verdict on the recorded timestamps.
+    ///
+    /// Two asymmetries are deliberate. A `settled` conclusion needs *both* a start and an end, because an end
+    /// alone can belong to an older switch (the criteria reset a sole-writer load performs makes one), and
+    /// mistaking that for this session's settle would hand a DV P5 cold start to a panel still in SDR. And
+    /// `switchInProgress` may only veto, never confirm: the flag is documented as unreliable right after a
+    /// write, so it can move the gate towards waiting and never towards proceeding.
+    nonisolated static func observedSwitch(startedAtNanos: UInt64?,
+                                           endedAtNanos: UInt64?,
+                                           gateEntryNanos: UInt64,
+                                           switchInProgress: Bool) -> ObservedSwitch {
+        guard let started = startedAtNanos else { return .none }
+        let startBeforeGateMs = elapsedMs(fromNanos: started, toNanos: gateEntryNanos)
+        if let ended = endedAtNanos, ended >= started, !switchInProgress {
+            return .settled(startBeforeGateMs: startBeforeGateMs,
+                            switchMs: elapsedMs(fromNanos: started, toNanos: ended))
+        }
+        return .running(startBeforeGateMs: startBeforeGateMs)
+    }
+
+    /// The numbers a settle log needs to be usable: when the switch started relative to the gate, how long
+    /// the whole gate took, and, when both notifications were seen, how long the panel's switch actually
+    /// took. All three used to be unavailable: the stage budgets were reported instead of measurements
+    /// (#49), and a switch that completed before the gate opened produced no numbers at all (#339).
+    nonisolated static func timingSuffix(startSignal: StartSignal, stage1Ms: Int, totalMs: Int,
+                                         startBeforeGateMs: Int? = nil, switchMs: Int? = nil) -> String {
+        let start = startBeforeGateMs.map { "start \(startSignal.rawValue) \($0)ms before gate entry" }
+            ?? "start \(startSignal.rawValue) after \(stage1Ms)ms"
+        let measured = switchMs.map { ", switch \($0)ms end to end" } ?? ""
+        return "\(start), total \(totalMs)ms\(measured)"
     }
 
     /// Guarded against reversed arguments: unsigned uptime subtraction traps, and a diagnostic helper is a
@@ -283,6 +477,10 @@ final class DisplayCriteriaController {
 
         // Always pass the real rate; tvOS uses it when Match Frame Rate is on, ignores it otherwise (dynamic-range switch still fires).
         let criteria = AVDisplayCriteria(refreshRate: effectiveRate, formatDescription: desc)
+        // #339: arm before the write. The switch this triggers can start and finish while the AVPlayerItem
+        // is being built, and observers registered at gate entry miss both notifications; that is why two of
+        // three device runs in Sodalite#49 never saw an end for a switch that was already over.
+        observation.arm()
         displayManager.preferredDisplayCriteria = criteria
         didApply = true
         lastCriteriaWasHDR = isHDR
@@ -298,6 +496,19 @@ final class DisplayCriteriaController {
         return isHDR ? .willSwitch : .applied
         #else
         return .applied
+        #endif
+    }
+
+    /// Arm the mode-switch observation for a write this controller does not make.
+    ///
+    /// A sole-writer host (`LoadOptions.suppressDisplayCriteria`) leaves the criteria to AVKit, which writes
+    /// them from the AVPlayerItem's formatDescription somewhere inside the load. The engine has to be
+    /// listening before that load starts, not when the gate opens, or the same switch goes unobserved as in
+    /// the engine-writer case (#339). Idempotent: re-arming only clears the record and keeps the observers.
+    func armSwitchObservation() {
+        #if os(tvOS)
+        guard resolveWindow() != nil else { return }
+        observation.arm()
         #endif
     }
 
@@ -320,7 +531,12 @@ final class DisplayCriteriaController {
     /// timeout. Presenting slightly early on that fallback is at worst cosmetic:
     /// the panel is mid re-sync (black) during the handshake and shows the correct
     /// frame once it locks. The decode/color-correctness guard is Stage 1 below.
-    func waitForSwitch(startGrace: StartGrace = .full) async {
+    /// `consumesRecord: false` leaves the observation readable for the load's second gate. The pre-flight
+    /// passes it: it waits an HDR switch out before the item is built, and the play gate that follows is
+    /// entitled to the same start/end timestamps (#339).
+    func waitForSwitch(startGrace: StartGrace = .full,
+                       consumesRecord: Bool = true,
+                       settleCap: SettleCap = .standard) async {
         #if os(tvOS)
         guard startGrace != .skip else { return }
         guard let window = resolveWindow() else { return }
@@ -337,28 +553,47 @@ final class DisplayCriteriaController {
             return
         }
 
-        // HDR headroom only describes dynamic range. A panel that is already in
-        // HDR may still be changing from the UI's 60 Hz mode to the video's
-        // 23.976/24 Hz mode, so it must not release playback by itself.
-        let enteredWithHDR = observeHeadroom(screen)
+        // Fast exit: panel already in HDR (headroom already raised, e.g. a prior
+        // HDR/DV session left it there) and not currently switching.
+        if Self.entryHeadroomIsSettled(headroomAboveOne: observeHeadroom(screen),
+                                       switchInProgress: displayManager.isDisplayModeSwitchInProgress) {
+            EngineLog.emit("[DisplayCriteria] no switch needed (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) at entry, panel not switching)", category: .engine)
+            return
+        }
 
-        // Observe the OS mode-switch notifications. Start marks the HDMI handshake
-        // beginning, more reliable than polling `isDisplayModeSwitchInProgress`,
-        // which can read false for a beat right after the criteria write. End is
-        // the authoritative "settled" signal.
-        let switchStarted = SwitchFlag()
-        let switchEnded = SwitchFlag()
-        let startToken = NotificationCenter.default.addObserver(
-            forName: .AVDisplayManagerModeSwitchStart,
-            object: displayManager, queue: nil
-        ) { _ in switchStarted.fire() }
-        let endToken = NotificationCenter.default.addObserver(
-            forName: .AVDisplayManagerModeSwitchEnd,
-            object: displayManager, queue: nil
-        ) { _ in switchEnded.fire() }
-        defer {
-            NotificationCenter.default.removeObserver(startToken)
-            NotificationCenter.default.removeObserver(endToken)
+        // What the observation armed at the criteria write already knows (#339). Everything the stages read
+        // from here on is measured against this snapshot, so an end belonging to an older switch (the reset
+        // a sole-writer load performs can produce one) cannot settle a gate waiting on a newer one.
+        let gateSnapshot = observation.snapshot()
+        var startSignal = StartSignal.none
+        var stage1Ms = 0
+        var preGateStartMs: Int?
+
+        let observed: ObservedSwitch
+        if Self.recordIsFreshEvidence(recordGeneration: gateSnapshot.generation,
+                                      lastSpentGeneration: spentArmGeneration) {
+            observed = Self.observedSwitch(
+                startedAtNanos: gateSnapshot.startedAt,
+                endedAtNanos: gateSnapshot.endedAt,
+                gateEntryNanos: entry.uptimeNanoseconds,
+                switchInProgress: displayManager.isDisplayModeSwitchInProgress)
+        } else {
+            observed = .none
+        }
+        if consumesRecord { spentArmGeneration = gateSnapshot.generation }
+
+        switch observed {
+        case .settled(let before, let measured):
+            // The whole switch happened while the item was being built. Before #339 this run was
+            // indistinguishable from an unobservable panel and paid the full Stage 2 cap for it.
+            EngineLog.emit("[DisplayCriteria] switch settled before the gate opened (\(Self.timingSuffix(startSignal: .preGateObserved, stage1Ms: 0, totalMs: Self.elapsedMs(since: entry), startBeforeGateMs: before, switchMs: measured))); nothing left to wait for", category: .engine)
+            return
+        case .running(let before):
+            // Start already recorded: Stage 1 has nothing to discover, only the end is still open.
+            startSignal = .preGateObserved
+            preGateStartMs = before
+        case .none:
+            break
         }
 
         // Stage 1: `startGrace` for the switch to actually start. The handshake
@@ -367,29 +602,43 @@ final class DisplayCriteriaController {
         // before the DV asset loads; starting the decode mid-write races an
         // AVPlayer error on DV Profile 8.1.
         //
-        // Which of the two signals ends this stage is recorded, not just that one did: the in-progress flag
-        // being set on the first poll means the panel was already switching while the item was built, which
-        // is the ordering Sodalite#49 suspected and which nothing in the log used to distinguish from a
-        // switch that started inside the gate.
-        var startSignal = StartSignal.none
-        for _ in 0..<startGrace.ticks {
-            if switchEnded.fired || (!enteredWithHDR && observeHeadroom(screen)) {
-                EngineLog.emit("[DisplayCriteria] settled during start phase (after \(Self.elapsedMs(since: entry))ms, EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+        // Which signal ends this stage is recorded, not just that one did: the in-progress flag being set on
+        // the *first* poll means the panel was already switching while the item was built, which is the
+        // ordering Sodalite#49 suspected. Reading that same flag on a later poll says the opposite (the
+        // switch began after entry) and used to be logged as if it said the same, which is why the second
+        // round of reporter logs still could not answer the question. `classifyStart` holds that line, and
+        // with the observation armed at the write both of its flag-only verdicts now report a missing
+        // notification rather than standing in for one.
+        if startSignal == .none {
+            var isFirstPoll = true
+            while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: entry), budgetMs: startGrace.budgetMs) {
+                let headroomSettles = observeHeadroom(screen)
+                    && Self.startPhaseHeadroomSettles(
+                        startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot),
+                        switchInProgress: displayManager.isDisplayModeSwitchInProgress)
+                if observation.hasNewEnd(since: gateSnapshot) || headroomSettles {
+                    EngineLog.emit("[DisplayCriteria] settled during start phase (after \(Self.elapsedMs(since: entry))ms, EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
+                    return
+                }
+                if let signal = Self.classifyStart(
+                    isFirstPoll: isFirstPoll,
+                    startNotificationFired: observation.hasNewStart(since: gateSnapshot),
+                    switchInProgress: displayManager.isDisplayModeSwitchInProgress) {
+                    startSignal = signal
+                    break
+                }
+                isFirstPoll = false
+                try? await Task.sleep(for: .milliseconds(10))
+            }
+            // Time spent, not the budget: the polls carry scheduler overhead, and everything downstream is
+            // reported relative to this (#49).
+            stage1Ms = Self.elapsedMs(since: entry)
+            if startSignal == .none {
+                // No switch started within the grace: panel already satisfies the criteria
+                // or the setter was a no-op. Don't block; AVPlayer tonemaps or errors for real.
+                EngineLog.emit("[DisplayCriteria] no switch started (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) after \(stage1Ms)ms, budget \(startGrace.budgetMs)ms); proceeding", category: .engine)
                 return
             }
-            if switchStarted.fired { startSignal = .inGate; break }
-            if displayManager.isDisplayModeSwitchInProgress { startSignal = .preGate; break }
-            try? await Task.sleep(for: .milliseconds(10))
-        }
-        // Time spent, not the budget: the polls carry scheduler overhead, and everything downstream is
-        // reported relative to this (#49).
-        let stage1Ms = Self.elapsedMs(since: entry)
-        let startBudgetMs = startGrace.budgetMs
-        if startSignal == .none {
-            // No switch started within the grace: panel already satisfies the criteria
-            // or the setter was a no-op. Don't block; AVPlayer tonemaps or errors for real.
-            EngineLog.emit("[DisplayCriteria] no switch started (EDR headroom \(String(format: "%.2f", screen.currentEDRHeadroom)) after \(stage1Ms)ms, budget \(startBudgetMs)ms); proceeding", category: .engine)
-            return
         }
 
         // Stage 2: proceed as soon as ANY reliable signal says settled (the
@@ -397,18 +646,34 @@ final class DisplayCriteriaController {
         // in-progress flag clearing), else a bounded ~2s cap so a panel whose DV
         // switch is unobservable to the app can't gate the first frame the way the
         // old fixed 5s poll did.
-        let capTicks = 40  // 40 x 50ms = 2000ms
+        // What this gate may spend waiting for the end, given who is waiting on it (`settleCapMs`).
+        let capMs = Self.settleCapMs(
+            cap: settleCap,
+            startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot))
+        let stage2Entry = DispatchTime.now()
         func timing() -> String {
-            Self.timingSuffix(startSignal: startSignal, stage1Ms: stage1Ms,
-                              totalMs: Self.elapsedMs(since: entry))
+            // The panel's own switch duration whenever both notifications were seen. This is the number the
+            // `.brief` premise ("engine rate-only writes settle sub-second") has never been checked against
+            // on hardware, and before #339 an engine-written switch could not produce it at all.
+            let now = observation.snapshot()
+            let switchMs: Int? = {
+                guard let started = now.startedAt, let ended = now.endedAt, ended >= started else { return nil }
+                return Self.elapsedMs(fromNanos: started, toNanos: ended)
+            }()
+            return Self.timingSuffix(startSignal: startSignal, stage1Ms: stage1Ms,
+                                     totalMs: Self.elapsedMs(since: entry),
+                                     startBeforeGateMs: preGateStartMs, switchMs: switchMs)
         }
-        for _ in 0..<capTicks {
+        while !Self.isBudgetSpent(elapsedMs: Self.elapsedMs(since: stage2Entry), budgetMs: capMs) {
             try? await Task.sleep(for: .milliseconds(50))
-            if switchEnded.fired {
+            if observation.hasNewEnd(since: gateSnapshot) {
                 EngineLog.emit("[DisplayCriteria] switch settled via modeSwitchEnd (\(timing()))", category: .engine)
                 return
             }
-            if !enteredWithHDR && observeHeadroom(screen) {
+            // Only meaningful when this load recorded no start: the headroom rises with the transition, so
+            // during an observable switch it is the panel warming up, not the panel being done.
+            if observeHeadroom(screen), Self.settlePhaseHeadroomSettles(
+                startRecorded: gateSnapshot.startedAt != nil || observation.hasNewStart(since: gateSnapshot)) {
                 EngineLog.emit("[DisplayCriteria] switch settled via EDR (\(timing()), headroom \(String(format: "%.2f", screen.currentEDRHeadroom)))", category: .engine)
                 return
             }
@@ -439,7 +704,8 @@ final class DisplayCriteriaController {
         // Cap reached: the in-progress flag never cleared. "Unobservable DV panel" was the blanket
         // explanation, but it only fits an HDR write; an engine rate-only write sitting here for two
         // seconds contradicts the sub-second premise the .brief budget rests on and is worth reading as
-        // its own event (Sodalite#49).
+        // its own event (Sodalite#49). Two of the reporter's three second-round runs landed here, both
+        // rate-only SDR, so this is the common outcome on that panel rather than an edge case.
         let headroom = String(format: "%.2f", screen.currentEDRHeadroom)
         switch Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR) {
         case .engineRateOnly:
@@ -541,13 +807,110 @@ final class DisplayCriteriaController {
 }
 
 #if os(tvOS)
-/// Minimal thread-safe one-shot flag set from an `AVDisplayManager` mode-switch
-/// notification (delivered on an arbitrary queue) and polled from the settle loop.
-private final class SwitchFlag: @unchecked Sendable {
+/// Records `AVDisplayManager` mode-switch notifications from the moment a criteria write is imminent.
+///
+/// `waitForSwitch` used to register these observers when it opened, which is after the engine's own write and
+/// sometimes after the switch that write triggers has already finished. Both notifications then landed
+/// outside the window and the gate fell back on `isDisplayModeSwitchInProgress`, a flag its own call site
+/// documents as unreliable right after a write. Sodalite#49's device logs are that defect twice over: two
+/// runs spent the entire Stage 2 cap waiting for an end that had happened, and a third labelled a switch it
+/// had watched begin as one that predated it (#339).
+///
+/// Notifications arrive on an arbitrary queue, so every field is lock-guarded. The counters exist to keep
+/// "recorded before I looked" apart from "arrived while I waited": an end belonging to an older switch must
+/// never settle a gate that is waiting on a newer one.
+private final class SwitchObservation: @unchecked Sendable {
+    struct Snapshot {
+        let startedAt: UInt64?
+        let endedAt: UInt64?
+        let startCount: Int
+        let endCount: Int
+        /// Bumped by every arm, 0 until the first one. Lets a gate tell a record written for this load from
+        /// one left by the previous load, which must not settle anything.
+        let generation: Int
+    }
+
     private let lock = NSLock()
-    private var value = false
-    var fired: Bool { lock.lock(); defer { lock.unlock() }; return value }
-    func fire() { lock.lock(); value = true; lock.unlock() }
+    private var startedAt: UInt64?
+    private var endedAt: UInt64?
+    private var startCount = 0
+    private var endCount = 0
+    private var generation = 0
+    private var tokens: [NSObjectProtocol] = []
+
+    /// Clear the record and, on first use, register. Called immediately before a criteria write so
+    /// everything the following gate reads belongs to that write.
+    ///
+    /// `object: nil` is the load-bearing part. tvOS posts both notifications from an
+    /// **`AVSharedDisplayManager`**, not from the `AVDisplayManager` that `window.avDisplayManager` returns
+    /// and that `preferredDisplayCriteria` is written to. Filtering on that manager, which is what this code
+    /// did from the start, dropped every notification the settle gate exists to read. Device probe, Apple TV
+    /// 4K (3rd gen), tvOS 26.5, 2026-08-09, listening on all objects:
+    ///
+    ///     FIRED AVDisplayManagerModeSwitchStartNotification object=AVSharedDisplayManager@0x10b581a10
+    ///     our manager=AVDisplayManager@0x1036fdfa0
+    ///
+    /// Six start/end pairs arrived that way in three playbacks while the engine's filtered observers saw
+    /// none. That, not the registration point, is why no run in Sodalite#49 ever reported an end.
+    func arm() {
+        lock.lock()
+        startedAt = nil
+        endedAt = nil
+        startCount = 0
+        endCount = 0
+        generation += 1
+        let needsRegistration = tokens.isEmpty
+        lock.unlock()
+
+        guard needsRegistration else { return }
+        // Weak, or the token retains the block retains this object for the process lifetime.
+        let start = NotificationCenter.default.addObserver(
+            forName: .AVDisplayManagerModeSwitchStart, object: nil, queue: nil
+        ) { [weak self] _ in self?.record(isStart: true) }
+        let end = NotificationCenter.default.addObserver(
+            forName: .AVDisplayManagerModeSwitchEnd, object: nil, queue: nil
+        ) { [weak self] _ in self?.record(isStart: false) }
+        lock.lock()
+        tokens = [start, end]
+        lock.unlock()
+    }
+
+    /// First start since arming (so a switch is measured from its beginning), latest end.
+    private func record(isStart: Bool) {
+        let now = DispatchTime.now().uptimeNanoseconds
+        lock.lock()
+        if isStart {
+            startedAt = startedAt ?? now
+            startCount += 1
+        } else {
+            endedAt = now
+            endCount += 1
+        }
+        lock.unlock()
+    }
+
+    func snapshot() -> Snapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        return Snapshot(startedAt: startedAt, endedAt: endedAt,
+                        startCount: startCount, endCount: endCount, generation: generation)
+    }
+
+    func hasNewStart(since snapshot: Snapshot) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return startCount > snapshot.startCount
+    }
+
+    func hasNewEnd(since snapshot: Snapshot) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return endCount > snapshot.endCount
+    }
+
+    deinit {
+        tokens.forEach { NotificationCenter.default.removeObserver($0) }
+    }
 }
 
 /// Times display-link ticks so the caller can read the active HDMI mode's refresh rate. Enough ticks

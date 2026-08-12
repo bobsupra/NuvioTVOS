@@ -1,9 +1,9 @@
 import AetherLibavcodec
 
 /// Pure codec-and-field-order routing decision extracted from AetherEngine.load's dispatch so it is
-/// unit-testable. Mirrors the historical switch (AV1 gated on HW, VP9/VP8/MPEG4/MPEG2/VC1 always
-/// software) and adds the #107 rule: interlaced H.264 goes software so DeinterlaceFilter (bwdif) can
-/// deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
+/// unit-testable. Native carries HEVC, H.264 and HW-decodable AV1; every other video codec is
+/// software. The #107 rule sits on top: interlaced H.264 goes software too, so DeinterlaceFilter
+/// (bwdif) can deinterlace it. tvOS AVPlayer does not deinterlace, so 1080i broadcast otherwise combs.
 enum VideoRoutingPolicy {
 
     /// Field orders that indicate interlaced content warranting software deinterlacing.
@@ -19,6 +19,13 @@ enum VideoRoutingPolicy {
     /// through untouched), never a wrong deinterlace. #232 narrows that class: on a seekable VOD
     /// source the declaration is checked against decoded frames before it routes (see
     /// `InterlaceProbe` and `routesSoftwareForDeclaredInterlace`).
+    ///
+    /// FFmpegBuild#1: the native side is an allowlist, not a denylist. `HLSVideoEngine` refuses
+    /// anything that is not HEVC / H.264 / HW-decodable AV1 (`unsupportedCodec`), so a codec that is
+    /// merely absent from the software list did not fall back, it failed the load. That took every
+    /// codec nobody had enumerated (qtrle, ProRes, MJPEG, Theora, the QuickTime long tail) to the one
+    /// path that cannot play it, while the software path decodes them. Only `AV_CODEC_ID_NONE` stays
+    /// native by default: an audio-only source probes as NONE and has no video route to get wrong.
     static func requiresSoftwarePath(
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
@@ -26,17 +33,16 @@ enum VideoRoutingPolicy {
         spsIndicatesInterlaced: Bool = false
     ) -> Bool {
         switch codecID {
+        case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
+            return false
         case AV_CODEC_ID_AV1:
             return !av1Available
-        case AV_CODEC_ID_VP9, AV_CODEC_ID_VP8, AV_CODEC_ID_MPEG4,
-             AV_CODEC_ID_MPEG2VIDEO, AV_CODEC_ID_VC1:
-            return true
         case AV_CODEC_ID_H264:
             return routesSoftwareForDeclaredInterlace(
                 codecID: codecID, fieldOrder: fieldOrder,
                 spsIndicatesInterlaced: spsIndicatesInterlaced)
         default:
-            return false
+            return true
         }
     }
 
