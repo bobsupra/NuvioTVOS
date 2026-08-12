@@ -9,6 +9,11 @@ on:
         description: Release tag to use for the README beta hub
         required: false
         type: string
+      all:
+        description: Add notification and feedback links to every published release
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -77,23 +82,35 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+          UPDATE_ALL: ${{ inputs.all || false }}
         run: |
           set -euo pipefail
 
-          tag="$RELEASE_TAG"
-          if [ -z "$tag" ]; then
-            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.draft == false)] | first | .tag_name')"
+          if [ "$UPDATE_ALL" = "true" ]; then
+            release_tags="$(gh api --paginate "repos/${GITHUB_REPOSITORY}/releases" --jq '.[].tag_name')"
+          else
+            tag="$RELEASE_TAG"
+            if [ -z "$tag" ]; then
+              tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.draft == false)] | first | .tag_name')"
+            fi
+            release_tags="$tag"
           fi
 
-          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
-          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
-          body="$(printf '%s' "$release_json" | jq -r '.body // ""')"
-          links="**New beta alerts:** [Manage notifications](https://github.com/${GITHUB_REPOSITORY}/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/${GITHUB_REPOSITORY}/issues/new/choose)"
+          while IFS= read -r tag; do
+            [ -n "$tag" ] || continue
+            release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+            release_id="$(printf '%s' "$release_json" | jq -r '.id')"
+            body="$(printf '%s' "$release_json" | jq -r '.body // ""')"
+            links="**New beta alerts:** [Manage notifications](https://github.com/${GITHUB_REPOSITORY}/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/${GITHUB_REPOSITORY}/issues/new/choose)"
 
-          if [[ "$body" != *"${GITHUB_REPOSITORY}/subscription"* ]]; then
-            body="${body}"$'\n\n'"$links"
-            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f body="$body" >/dev/null
-          fi
+            if [[ "$body" != *"${GITHUB_REPOSITORY}/subscription"* ]]; then
+              body="${body}"$'\n\n'"$links"
+              gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f body="$body" >/dev/null
+              echo "Updated release $tag"
+            else
+              echo "Release $tag already contains the beta links"
+            fi
+          done <<< "$release_tags"
 
       - name: Commit updated beta links
         env:
