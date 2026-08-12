@@ -105,6 +105,14 @@
 		A9DBFCF8302D0CA1007F842B /* CloudLibraryView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC71302D0CA1007F842B /* CloudLibraryView.swift */; };
 		A9DBFCF9302D0D05007F842B /* TopShelfFeed.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC5A302D0CA1007F842B /* TopShelfFeed.swift */; };
 		A9DBFCFA302D0D05007F842B /* TopShelfFeed.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC5A302D0CA1007F842B /* TopShelfFeed.swift */; };
+		A9DBFD04302D151B007F842B /* SMBServerConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFD00302D151B007F842B /* SMBServerConfig.swift */; };
+		A9DBFD05302D151B007F842B /* SMBLibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFCFD302D151B007F842B /* SMBLibraryIndex.swift */; };
+		A9DBFD06302D151B007F842B /* SMBServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFD01302D151B007F842B /* SMBServerStore.swift */; };
+		A9DBFD07302D151B007F842B /* SMBSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFD02302D151B007F842B /* SMBSessionManager.swift */; };
+		A9DBFD08302D151B007F842B /* SMBLibraryResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFCFE302D151B007F842B /* SMBLibraryResolver.swift */; };
+		A9DBFD09302D151B007F842B /* SMBCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFCFC302D151B007F842B /* SMBCredentialStore.swift */; };
+		A9DBFD0A302D151B007F842B /* MediaFilenameParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFCFB302D151B007F842B /* MediaFilenameParser.swift */; };
+		A9DBFD0B302D151B007F842B /* SMBLibraryScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFCFF302D151B007F842B /* SMBLibraryScanner.swift */; };
 		AE00BF010000000000000001 /* AetherEngine in Frameworks */ = {isa = PBXBuildFile; productRef = AE00PD010000000000000001 /* AetherEngine */; };
 		AE01SMBPB /* AetherEngineSMB in Frameworks */ = {isa = PBXBuildFile; productRef = AE01SMBPD /* AetherEngineSMB */; };
 		AE01SMBT01 /* MediaFilenameParserTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE01SMBTF01 /* MediaFilenameParserTests.swift */; };
@@ -262,6 +270,14 @@
 		A9DBFC9B302D0CA1007F842B /* SearchViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SearchViewModel.swift; sourceTree = "<group>"; };
 		A9DBFC9D302D0CA1007F842B /* DomainModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DomainModels.swift; sourceTree = "<group>"; };
 		A9DBFC9E302D0CA1007F842B /* NuvioTVApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTVApp.swift; sourceTree = "<group>"; };
+		A9DBFCFB302D151B007F842B /* MediaFilenameParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaFilenameParser.swift; sourceTree = "<group>"; };
+		A9DBFCFC302D151B007F842B /* SMBCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBCredentialStore.swift; sourceTree = "<group>"; };
+		A9DBFCFD302D151B007F842B /* SMBLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBLibraryIndex.swift; sourceTree = "<group>"; };
+		A9DBFCFE302D151B007F842B /* SMBLibraryResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBLibraryResolver.swift; sourceTree = "<group>"; };
+		A9DBFCFF302D151B007F842B /* SMBLibraryScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBLibraryScanner.swift; sourceTree = "<group>"; };
+		A9DBFD00302D151B007F842B /* SMBServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBServerConfig.swift; sourceTree = "<group>"; };
+		A9DBFD01302D151B007F842B /* SMBServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBServerStore.swift; sourceTree = "<group>"; };
+		A9DBFD02302D151B007F842B /* SMBSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBSessionManager.swift; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = NuvioTV/SplashScreen.storyboard; sourceTree = "<group>"; };
 		AE01SMBTF01 /* MediaFilenameParserTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = MediaFilenameParserTests.swift; sourceTree = "<group>"; };
 		AE01SMBTF02 /* SMBLibraryResolverTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SMBLibraryResolverTests.swift; sourceTree = "<group>"; };
@@ -518,6 +534,7 @@
 		A9DBFC60302D0CA1007F842B /* Core */ = {
 			isa = PBXGroup;
 			children = (
+				A9DBFD03302D151B007F842B /* SMB */,
 				A9DBFC28302D0CA1007F842B /* Addons */,
 				A9DBFC2E302D0CA1007F842B /* Auth */,
 				A9DBFC33302D0CA1007F842B /* Cloud */,
@@ -723,6 +740,21 @@
 				A9DBFC9E302D0CA1007F842B /* NuvioTVApp.swift */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		A9DBFD03302D151B007F842B /* SMB */ = {
+			isa = PBXGroup;
+			children = (
+				A9DBFCFB302D151B007F842B /* MediaFilenameParser.swift */,
+				A9DBFCFC302D151B007F842B /* SMBCredentialStore.swift */,
+				A9DBFCFD302D151B007F842B /* SMBLibraryIndex.swift */,
+				A9DBFCFE302D151B007F842B /* SMBLibraryResolver.swift */,
+				A9DBFCFF302D151B007F842B /* SMBLibraryScanner.swift */,
+				A9DBFD00302D151B007F842B /* SMBServerConfig.swift */,
+				A9DBFD01302D151B007F842B /* SMBServerStore.swift */,
+				A9DBFD02302D151B007F842B /* SMBSessionManager.swift */,
+			);
+			path = SMB;
 			sourceTree = "<group>";
 		};
 		F0A100000000000000000001 /* Fonts */ = {
@@ -959,6 +991,14 @@
 				A9DBFCA1302D0CA1007F842B /* CatalogBrowseViewModel.swift in Sources */,
 				A9DBFCA2302D0CA1007F842B /* PlayerView.swift in Sources */,
 				A9DBFCA3302D0CA1007F842B /* CloudLibraryModels.swift in Sources */,
+				A9DBFD04302D151B007F842B /* SMBServerConfig.swift in Sources */,
+				A9DBFD05302D151B007F842B /* SMBLibraryIndex.swift in Sources */,
+				A9DBFD06302D151B007F842B /* SMBServerStore.swift in Sources */,
+				A9DBFD07302D151B007F842B /* SMBSessionManager.swift in Sources */,
+				A9DBFD08302D151B007F842B /* SMBLibraryResolver.swift in Sources */,
+				A9DBFD09302D151B007F842B /* SMBCredentialStore.swift in Sources */,
+				A9DBFD0A302D151B007F842B /* MediaFilenameParser.swift in Sources */,
+				A9DBFD0B302D151B007F842B /* SMBLibraryScanner.swift in Sources */,
 				A9DBFCA4302D0CA1007F842B /* DebridDeviceAuthorization.swift in Sources */,
 				A9DBFCA5302D0CA1007F842B /* AuthModels.swift in Sources */,
 				A9DBFCA6302D0CA1007F842B /* ScrubberViews.swift in Sources */,

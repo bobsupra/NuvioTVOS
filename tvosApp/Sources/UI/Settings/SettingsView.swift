@@ -1,6 +1,7 @@
 import SwiftUI
 import UIKit
 import Security
+import AetherEngineSMB
 
 enum AppFocusOutline {
     static var color: Color {
@@ -215,6 +216,14 @@ enum SettingsKey {
     static let streamAddonManifestURL = "nuvio.tv.settings.integrations.streamAddonManifestURL"
     static let streamAddonManifestURLs = "nuvio.tv.settings.integrations.streamAddonManifestURLs"
     static let streamAddonManifestStates = "nuvio.tv.settings.integrations.streamAddonManifestStates"
+    /// JSON `[SMBServerConfig]` of configured SMB servers. Passwords are never
+    /// in this blob — see `SMBCredentialStore`.
+    static let smbServers = "nuvio.tv.settings.integrations.smbServers"
+    /// JSON `[String: [SMBIndexedTitle]]` scan index, keyed by server id.
+    static let smbLibraryIndex = "nuvio.tv.settings.integrations.smbLibraryIndex"
+    /// Whether Home shows the "Local titles" row. Defaults on; a user with no
+    /// indexed titles sees nothing either way since the row hides when empty.
+    static let smbLocalRowEnabled = "nuvio.tv.settings.integrations.smbLocalRowEnabled"
 
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
@@ -283,6 +292,7 @@ enum SettingsKey {
         aiSubtitlesTargetLanguage, aiSubtitlesAutoSelect, aiSubtitlesStripHearingImpaired,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
+        smbServers, smbLibraryIndex, smbLocalRowEnabled,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
         cachedOnlyStreams, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, trailersEnabled, trailerPreviewSound, trailerDelay,
@@ -2605,6 +2615,8 @@ private struct IntegrationSettingsView: View {
                     debridAccountToConnect = .premiumize
                 }
             }
+
+            SMBSettingsSection(accentColor: accentColor)
         }
         .onAppear {
             traktViewModel.reload()
@@ -6285,6 +6297,571 @@ private struct LicensesAttributionsSheet: View {
             }
         }
     }
+}
+
+// MARK: - SMB (local network servers)
+
+private struct SMBSettingsSection: View {
+    let accentColor: Color
+
+    @ObservedObject private var serverStore = SMBServerStore.shared
+    @ObservedObject private var sessionManager = SMBSessionManager.shared
+    @State private var editingServer: SMBServerConfig?
+    @State private var isAddingServer = false
+    @State private var scanningServer: SMBServerConfig?
+
+    var body: some View {
+        SettingsGroup(
+            title: "SMB",
+            subtitle: "Play files from a NAS or PC on your local network"
+        ) {
+            SettingsActionRow(
+                title: L10n.string("smb_add_server", fallback: "Add Server"),
+                subtitle: L10n.string("smb_add_server_subtitle", fallback: "Connect a share by host or IP address"),
+                value: "",
+                accentColor: accentColor
+            ) {
+                isAddingServer = true
+            }
+
+            ForEach(serverStore.servers) { server in
+                SMBServerRow(
+                    server: server,
+                    accentColor: accentColor,
+                    connectionState: sessionManager.connectionState(for: server.id),
+                    testState: sessionManager.testState(for: server.id),
+                    scanState: sessionManager.scanState(for: server.id),
+                    onEdit: { editingServer = server },
+                    onConnect: { Task { await sessionManager.connect(server) } },
+                    onDisconnect: { Task { await sessionManager.disconnect(server) } },
+                    onTest: { Task { await sessionManager.test(server) } },
+                    onScan: { scanningServer = server },
+                    onDelete: {
+                        Task {
+                            await sessionManager.disconnect(server)
+                            serverStore.remove(server.id)
+                        }
+                    }
+                )
+            }
+        }
+        .sheet(isPresented: $isAddingServer) {
+            SMBServerEditSheet(server: nil, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(item: $editingServer) { server in
+            SMBServerEditSheet(server: server, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(item: $scanningServer) { server in
+            SMBShareSelectionSheet(server: server, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+}
+
+/// One configured server: connection status plus Connect/Disconnect, Scan,
+/// and Test — Scan and Test stay disabled until the connection succeeds, so a
+/// server row never lets you scan a share list you don't have yet.
+private struct SMBServerRow: View {
+    let server: SMBServerConfig
+    let accentColor: Color
+    let connectionState: SMBConnectionState
+    let testState: SMBTestState
+    let scanState: SMBScanState
+    let onEdit: () -> Void
+    let onConnect: () -> Void
+    let onDisconnect: () -> Void
+    let onTest: () -> Void
+    let onScan: () -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button(action: onEdit) {
+                SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                    SettingsRowText(title: server.displayName, subtitle: subtitleText)
+
+                    Spacer(minLength: 24)
+
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(connectionState.isConnected ? Color.green : Color.white.opacity(0.3))
+                            .frame(width: 10, height: 10)
+                        Text(statusText)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+            .entryLockable()
+
+            HStack(spacing: 12) {
+                if connectionState.isConnected {
+                    SMBRowButton(title: L10n.string("smb_disconnect", fallback: "Disconnect"), accentColor: accentColor, action: onDisconnect)
+                } else {
+                    SMBRowButton(
+                        title: connectionState == .connecting
+                            ? L10n.string("smb_connecting", fallback: "Connecting…")
+                            : L10n.string("smb_connect", fallback: "Connect"),
+                        accentColor: accentColor,
+                        isLoading: connectionState == .connecting,
+                        action: onConnect
+                    )
+                }
+                SMBRowButton(
+                    title: scanTitle,
+                    accentColor: accentColor,
+                    enabled: connectionState.isConnected,
+                    isLoading: isScanning,
+                    action: onScan
+                )
+                SMBRowButton(
+                    title: L10n.string("smb_test", fallback: "Test"),
+                    accentColor: accentColor,
+                    enabled: connectionState.isConnected,
+                    isLoading: testState == .testing,
+                    action: onTest
+                )
+                Spacer()
+                Button(role: .destructive, action: onDelete) {
+                    Image(systemName: "trash")
+                        .foregroundColor(.white.opacity(0.6))
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focusEffectDisabledIfAvailable()
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var subtitleText: String {
+        var parts = ["\(server.authSummary) · \(server.hostAndPort)/\(server.selectedShares.joined(separator: ","))"]
+        if let count = server.lastScanTitleCount {
+            parts.append(L10n.format("smb_title_count", fallback: "%d titles", count))
+        }
+        if case .failed(let message) = connectionState {
+            parts.append(message)
+        } else if case .failed(let message) = testState {
+            parts.append(message)
+        } else if case .reachable(let latencyMs) = testState {
+            parts.append(L10n.format("smb_reachable_latency", fallback: "Reachable · %d ms", latencyMs))
+        }
+        return parts.joined(separator: " — ")
+    }
+
+    private var statusText: String {
+        switch connectionState {
+        case .disconnected: return L10n.string("debrid_not_set", fallback: "Not set")
+        case .connecting: return L10n.string("smb_connecting", fallback: "Connecting…")
+        case .connected: return L10n.string("debrid_connected", fallback: "Connected")
+        case .failed: return L10n.string("smb_failed", fallback: "Failed")
+        }
+    }
+
+    private var isScanning: Bool {
+        if case .scanning = scanState { return true }
+        return false
+    }
+
+    private var scanTitle: String {
+        if case .scanning(let found, _) = scanState {
+            return L10n.format("smb_scanning_count", fallback: "Scanning (%d)…", found)
+        }
+        return L10n.string("smb_scan", fallback: "Scan")
+    }
+}
+
+private struct SMBRowButton: View {
+    let title: String
+    let accentColor: Color
+    var enabled: Bool = true
+    var isLoading: Bool = false
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 8) {
+                if isLoading {
+                    ProgressView().tint(.white).scaleEffect(0.7)
+                }
+                Text(title)
+                    .font(.system(size: 17, weight: .bold))
+                    .foregroundColor(enabled ? .white : .white.opacity(0.4))
+            }
+            .padding(.horizontal, 18)
+            .padding(.vertical, 10)
+            .background(
+                Capsule().fill(isFocused && enabled ? accentColor : Color.white.opacity(0.08))
+            )
+            .overlay(
+                Capsule().strokeBorder(isFocused ? AppFocusOutline.color : Color.clear, lineWidth: 2)
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .focused($isFocused)
+        .disabled(!enabled)
+        .opacity(enabled ? 1 : 0.5)
+    }
+}
+
+/// Shared Cancel/primary button pair for the SMB sheets. The confirm
+/// (`isPrimary`) button reads slightly translucent at rest and brightens
+/// on focus, rather than jumping straight to solid white — the same "settle
+/// in" cue `SettingsMiniButton`/`SMBRowButton` give their focus ring.
+private struct SMBDialogButton: View {
+    let title: String
+    let isPrimary: Bool
+    var enabled: Bool = true
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 21, weight: .bold))
+                .foregroundColor(isPrimary ? .black : .white)
+                .padding(.horizontal, 28)
+                .padding(.vertical, 14)
+                .background(Capsule().fill(backgroundColor))
+                .overlay(
+                    Capsule().strokeBorder(isFocused ? AppFocusOutline.color : Color.clear, lineWidth: 2)
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .disabled(isPrimary && !enabled)
+    }
+
+    private var backgroundColor: Color {
+        guard isPrimary else { return Color.white.opacity(0.12) }
+        guard enabled else { return Color.white.opacity(0.3) }
+        return Color.white.opacity(isFocused ? 0.9 : 0.75)
+    }
+}
+
+/// Add or edit a server's connection settings. The password (when Sign In is
+/// chosen) is written to Keychain on save, never to the persisted config.
+private struct SMBServerEditSheet: View {
+    let server: SMBServerConfig?
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+
+    @State private var displayName: String
+    @State private var host: String
+    @State private var portText: String
+    @State private var authKind: SMBAuthKind
+    @State private var username: String
+    @State private var password: String
+    @State private var domain: String
+    @State private var maxDepth: Int
+
+    init(server: SMBServerConfig?, accentColor: Color) {
+        self.server = server
+        self.accentColor = accentColor
+        _displayName = State(initialValue: server?.displayName ?? "")
+        _host = State(initialValue: server?.host ?? "")
+        _portText = State(initialValue: server?.port.map(String.init) ?? "")
+        _authKind = State(initialValue: server?.authKind ?? .anonymous)
+        _username = State(initialValue: server?.username ?? "")
+        _password = State(initialValue: server.map { SMBCredentialStore.password(forServerID: $0.id) } ?? "")
+        _domain = State(initialValue: server?.domain ?? "")
+        _maxDepth = State(initialValue: server?.maxDepth ?? 6)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(server == nil ? L10n.string("smb_add_server", fallback: "Add Server") : L10n.string("smb_edit_server", fallback: "Edit Server"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("smb_connection", fallback: "Connection"),
+                        subtitle: L10n.string("smb_connection_subtitle", fallback: "Host or IP address of the server")
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_display_name", fallback: "Name"),
+                            subtitle: L10n.string("smb_display_name_subtitle", fallback: "Shown in Settings and on Home"),
+                            placeholder: "Living Room NAS",
+                            text: $displayName
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_host", fallback: "Host"),
+                            subtitle: L10n.string("smb_host_subtitle", fallback: "e.g. 192.168.1.10 or nas.local"),
+                            placeholder: "192.168.1.10",
+                            text: $host
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_port", fallback: "Port"),
+                            subtitle: L10n.string("smb_port_subtitle", fallback: "Leave blank for the default (445)"),
+                            placeholder: "445",
+                            text: $portText
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("smb_authentication", fallback: "Authentication"),
+                        subtitle: L10n.string("smb_authentication_subtitle", fallback: "How to sign in to this server")
+                    ) {
+                        SettingsChoiceRow(
+                            title: L10n.string("smb_auth_mode", fallback: "Sign-in Method"),
+                            subtitle: "",
+                            selection: authKindSelection,
+                            options: SMBAuthKind.allCases.map(\.title),
+                            accentColor: accentColor
+                        )
+                        if authKind == .credentials {
+                            SettingsNativeTextFieldRow(
+                                title: L10n.string("smb_username", fallback: "Username"),
+                                subtitle: "",
+                                placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                                text: $username
+                            )
+                            SettingsNativeTextFieldRow(
+                                title: L10n.string("smb_password", fallback: "Password"),
+                                subtitle: L10n.string(
+                                    "tvos_settings_stored_locally_on_this_apple_tv",
+                                    fallback: "Stored locally on this Apple TV"
+                                ),
+                                placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                                text: $password,
+                                isSecure: true
+                            )
+                            SettingsNativeTextFieldRow(
+                                title: L10n.string("smb_domain", fallback: "Domain (optional)"),
+                                subtitle: "",
+                                placeholder: "WORKGROUP",
+                                text: $domain
+                            )
+                        }
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("smb_scan_settings", fallback: "Scan"),
+                        subtitle: L10n.string("smb_scan_settings_subtitle", fallback: "How deep to recurse into folders")
+                    ) {
+                        SettingsStepperRow(
+                            title: L10n.string("smb_max_depth", fallback: "Max Folder Depth"),
+                            subtitle: "",
+                            value: $maxDepth,
+                            range: 1...12,
+                            step: 1,
+                            suffix: "",
+                            accentColor: accentColor
+                        )
+                    }
+
+                    // Spread edge-to-edge (not packed under `.leading`) so a
+                    // downward press from a right-aligned control higher up
+                    // the sheet (the depth stepper's + button, the auth
+                    // picker) always has a horizontally reachable target —
+                    // tvOS's directional focus engine won't bridge a large
+                    // gap between a right-edge control and a left-packed
+                    // button pair. `.focusSection()` gives this row its own
+                    // navigable region.
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) { dismiss() }
+                        Spacer()
+                        SMBDialogButton(title: L10n.string("action_save", fallback: "Save"), isPrimary: true, enabled: canSave) {
+                            save()
+                            dismiss()
+                        }
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+    }
+
+    private var canSave: Bool {
+        !displayName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            && !host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private var authKindSelection: Binding<String> {
+        Binding(
+            get: { authKind.title },
+            set: { title in
+                authKind = SMBAuthKind.allCases.first { $0.title == title } ?? .anonymous
+            }
+        )
+    }
+
+    private func save() {
+        let id = server?.id ?? UUID().uuidString
+        let config = SMBServerConfig(
+            id: id,
+            displayName: displayName.trimmingCharacters(in: .whitespacesAndNewlines),
+            host: host.trimmingCharacters(in: .whitespacesAndNewlines),
+            port: Int(portText.trimmingCharacters(in: .whitespacesAndNewlines)),
+            authKind: authKind,
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+            domain: domain.trimmingCharacters(in: .whitespacesAndNewlines),
+            selectedShares: server?.selectedShares ?? [],
+            maxDepth: maxDepth,
+            lastScanDate: server?.lastScanDate,
+            lastScanTitleCount: server?.lastScanTitleCount
+        )
+        SMBCredentialStore.save(password, forServerID: id)
+        SMBServerStore.shared.upsert(config)
+    }
+}
+
+/// Presented after "Scan" on a connected server: pick which shares to walk,
+/// then watch live progress and the resulting match report.
+private struct SMBShareSelectionSheet: View {
+    let server: SMBServerConfig
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @ObservedObject private var sessionManager = SMBSessionManager.shared
+    @State private var selectedShares: Set<String>
+
+    init(server: SMBServerConfig, accentColor: Color) {
+        self.server = server
+        self.accentColor = accentColor
+        _selectedShares = State(initialValue: Set(server.selectedShares))
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(L10n.format("smb_shares_on_server", fallback: "Shares on %@", server.displayName))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    if let shares = availableShares {
+                        SettingsGroup(
+                            title: L10n.string("smb_shares", fallback: "Shares"),
+                            subtitle: L10n.string("smb_shares_subtitle", fallback: "Choose which shares to scan for video files")
+                        ) {
+                            ForEach(shares, id: \.name) { share in
+                                SettingsToggleRow(
+                                    title: share.name + (share.isAdmin ? "  ⚠︎" : ""),
+                                    subtitle: share.comment,
+                                    isOn: shareBinding(share.name),
+                                    accentColor: accentColor
+                                )
+                            }
+                        }
+                    }
+
+                    scanStatusView
+
+                    // Spread edge-to-edge for the same reason as
+                    // `SMBServerEditSheet`'s Cancel/Save row: the share
+                    // toggles above are right-aligned switches, and a
+                    // left-packed button pair is too far away for tvOS's
+                    // directional focus to reach reliably from there.
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_cancel", fallback: "Close"), isPrimary: false) { dismiss() }
+                        Spacer()
+                        SMBDialogButton(
+                            title: L10n.string("smb_start_scan", fallback: "Start Scan"),
+                            isPrimary: true,
+                            enabled: !selectedShares.isEmpty && !isScanning
+                        ) {
+                            startScan()
+                        }
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+    }
+
+    private var availableShares: [SMBShareInfo]? {
+        if case .connected(let shares) = sessionManager.connectionState(for: server.id) {
+            return shares
+        }
+        return nil
+    }
+
+    private var isScanning: Bool {
+        if case .scanning = sessionManager.scanState(for: server.id) { return true }
+        return false
+    }
+
+    private func shareBinding(_ name: String) -> Binding<Bool> {
+        Binding(
+            get: { selectedShares.contains(name) },
+            set: { isOn in
+                if isOn { selectedShares.insert(name) } else { selectedShares.remove(name) }
+            }
+        )
+    }
+
+    private func startScan() {
+        var updated = server
+        updated.selectedShares = Array(selectedShares)
+        SMBServerStore.shared.upsert(updated)
+        sessionManager.scan(updated)
+    }
+
+    @ViewBuilder
+    private var scanStatusView: some View {
+        switch sessionManager.scanState(for: server.id) {
+        case .idle:
+            EmptyView()
+        case .scanning(let found, let path):
+            SettingsGroup(
+                title: L10n.string("smb_scanning", fallback: "Scanning…"),
+                subtitle: path
+            ) {
+                SettingsInfoRow(title: L10n.string("smb_found_so_far", fallback: "Found so far"), value: "\(found)")
+            }
+        case .done(let report):
+            SettingsGroup(
+                title: L10n.string("smb_scan_complete", fallback: "Scan Complete"),
+                subtitle: L10n.string("smb_scan_complete_subtitle", fallback: "Matched titles appear on Home as Local titles")
+            ) {
+                SettingsInfoRow(title: L10n.string("smb_matched_titles", fallback: "Matched Titles"), value: "\(report.matchedTitles)")
+                SettingsInfoRow(title: L10n.string("smb_matched_episodes", fallback: "Matched Episodes"), value: "\(report.matchedEpisodes)")
+                SettingsInfoRow(title: L10n.string("smb_unmatched", fallback: "Unmatched"), value: "\(report.unmatched.count)")
+                SettingsInfoRow(title: L10n.string("smb_skipped", fallback: "Skipped"), value: "\(report.skipped)")
+                if !report.unmatched.isEmpty {
+                    VStack(alignment: .leading, spacing: 6) {
+                        ForEach(report.unmatched.prefix(20), id: \.self) { name in
+                            Text(name)
+                                .font(.system(size: 15, weight: .regular))
+                                .foregroundColor(.white.opacity(0.5))
+                                .lineLimit(1)
+                        }
+                    }
+                }
+            }
+        case .failed(let message):
+            SettingsGroup(
+                title: L10n.string("smb_scan_failed", fallback: "Scan Failed"),
+                subtitle: message
+            ) { EmptyView() }
+        }
+    }
+
 }
 
 // MARK: - Addons (moved here from the former Addons tab)

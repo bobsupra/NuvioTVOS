@@ -72,6 +72,27 @@ final class SMBSessionManager: ObservableObject {
 
     // MARK: - Connect / Disconnect
 
+    /// Best-effort connect to every configured server, run once at cold
+    /// launch (and again on profile switch) so browsing and playback don't
+    /// require a manual "Connect" tap in Settings first. Servers are
+    /// independent hosts, so they race concurrently; skips a server already
+    /// `.connecting`/`.connected`, and one that's offline just ends up
+    /// `.failed` — same outcome as a manual Connect that fails.
+    func connectAll() async {
+        await withTaskGroup(of: Void.self) { group in
+            for server in SMBServerStore.shared.servers {
+                switch connectionState(for: server.id) {
+                case .connecting, .connected:
+                    continue
+                case .disconnected, .failed:
+                    group.addTask { [weak self] in
+                        await self?.connect(server)
+                    }
+                }
+            }
+        }
+    }
+
     func connect(_ server: SMBServerConfig) async {
         connectionStates[server.id] = .connecting
         let browser = SMBBrowser(host: server.host, port: server.port, auth: authMode(for: server))

@@ -349,6 +349,8 @@ struct ContentView: View {
         }
         .onReceive(profileViewModel.$activeProfile) { profile in
             syncManager.activeProfileChanged(profile)
+            SMBServerStore.shared.reload()
+            Task { await SMBSessionManager.shared.connectAll() }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
