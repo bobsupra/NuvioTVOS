@@ -790,6 +790,43 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(result.backend, .mpv)
     }
 
+    func testSMBSourceForcesAetherWithNoAutomaticFallback() {
+        let result = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "smb://192.168.1.10/Media/movie.mkv",
+                separateAudioURL: nil,
+                streamName: nil,
+                streamDescription: nil,
+                filename: nil,
+                engineSetting: .auto,
+                requiresMPVAudioControls: false,
+                assMode: .strip
+            )
+        )
+        XCTAssertEqual(result.backend, .aether)
+        XCTAssertFalse(result.allowAutomaticFallback)
+    }
+
+    /// MPVKit has no SMB transport, so a user-forced `Player Engine = MPVKit`
+    /// must not win for an `smb://` source — this exception is checked before
+    /// the `engineSetting` switch.
+    func testSMBSourceOverridesForcedMPVEngineSetting() {
+        let result = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "smb://nas.local/Media/show/S01E02.mkv",
+                separateAudioURL: nil,
+                streamName: nil,
+                streamDescription: nil,
+                filename: nil,
+                engineSetting: .mpv,
+                requiresMPVAudioControls: false,
+                assMode: .strip
+            )
+        )
+        XCTAssertEqual(result.backend, .aether)
+        XCTAssertFalse(result.allowAutomaticFallback)
+    }
+
     func testSettingsMigration() {
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "Auto"), .auto)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "AVPlayer"), .auto)
