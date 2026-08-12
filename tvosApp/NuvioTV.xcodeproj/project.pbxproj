@@ -306,7 +306,6 @@
 				A1L100030000000000000003 /* NuvioTV/Resources/AppLanguageCatalog.json */,
 				C0D320000000000000000000 /* Sources */,
 				F11748442D0722820044C1D9 /* NuvioTV-Bridging-Header.h */,
-				BB2F792B24A3F905000567C9 /* Supporting */,
 				F0A100000000000000000001 /* Fonts */,
 				13B07FB51A68108700A75B9A /* Images.xcassets */,
 				13B07FB61A68108700A75B9A /* Info.plist */,
@@ -375,108 +374,143 @@
 			name = Products;
 			sourceTree = "<group>";
 		};
-		BB2F792B24A3F905000567C9 /* Supporting */ = {
-			isa = PBXGroup;
-			children = (
-			);
-			name = Supporting;
-			path = NuvioTV/Supporting;
-			sourceTree = "<group>";
-		};
 		C0D320000000000000000000 /* Sources */ = {
 			isa = PBXGroup;
 			children = (
+				C0D3E1000000000000000001 /* Core */,
+				C0D3E1000000000000000002 /* Data */,
+				C0D3E1000000000000000003 /* Models */,
+				C0D3E1000000000000000004 /* UI */,
+				C0D3E1000000000000000005 /* ViewModels */,
+				C0D300220000000000000022 /* NuvioTV/Sources/DomainModels.swift */,
 				C0D300010000000000000001 /* NuvioTV/Sources/NuvioTVApp.swift */,
-				A1L100010000000000000001 /* NuvioTV/Sources/Core/AppLanguage.swift */,
-				C0D300020000000000000002 /* NuvioTV/Sources/Models/CatalogModels.swift */,
+			);
+			name = Sources;
+			sourceTree = "<group>";
+		};
+		C0D3E1000000000000000001 /* Core */ = {
+			isa = PBXGroup;
+			children = (
+				C0D30062 /* NuvioTV/Sources/Core/Addons/CommunityAddonCatalog.swift */,
+				C0D300230000000000000023 /* NuvioTV/Sources/Core/Auth/AuthConfig.swift */,
+				C0D300270000000000000027 /* NuvioTV/Sources/Core/Auth/AuthManager.swift */,
+				C0D300240000000000000024 /* NuvioTV/Sources/Core/Auth/AuthModels.swift */,
+				C0D300250000000000000025 /* NuvioTV/Sources/Core/Auth/AuthService.swift */,
+				C0D300260000000000000026 /* NuvioTV/Sources/Core/Auth/QRCode.swift */,
+				C0D300330000000000000033 /* NuvioTV/Sources/Core/Cloud/CloudLibraryModels.swift */,
+				C0D300360000000000000036 /* NuvioTV/Sources/Core/Cloud/CloudLibraryService.swift */,
+				C0D300340000000000000034 /* NuvioTV/Sources/Core/Cloud/PremiumizeCloudLibrary.swift */,
+				C0D300350000000000000035 /* NuvioTV/Sources/Core/Cloud/TorboxCloudLibrary.swift */,
+				C0D3003A000000000000003A /* NuvioTV/Sources/Core/Debrid/DebridDeviceAuthorization.swift */,
+				C0D3002E000000000000002E /* NuvioTV/Sources/Core/Debrid/DebridProvider.swift */,
+				C0D300300000000000000030 /* NuvioTV/Sources/Core/Debrid/DebridResolver.swift */,
+				C0D300310000000000000031 /* NuvioTV/Sources/Core/Debrid/PremiumizeResolver.swift */,
+				C0D3002F000000000000002F /* NuvioTV/Sources/Core/Debrid/RealDebridResolver.swift */,
+				C0D300320000000000000032 /* NuvioTV/Sources/Core/Debrid/TorboxResolver.swift */,
+				AE10F00C /* NuvioTV/Sources/Core/Player/AISubtitleTranslationCache.swift */,
+				AE10F007 /* NuvioTV/Sources/Core/Player/AetherPlaybackController.swift */,
+				AE10F00E /* NuvioTV/Sources/Core/Player/AppleTVCapability.swift */,
+				AE10F009 /* NuvioTV/Sources/Core/Player/MPVPlaybackController.swift */,
+				AE10F006 /* NuvioTV/Sources/Core/Player/PlaybackBackendPolicy.swift */,
+				AE10F002 /* NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift */,
+				AE10F005 /* NuvioTV/Sources/Core/Player/PlaybackEngineCapabilities.swift */,
+				C0D30051 /* NuvioTV/Sources/Core/Player/PlaybackEngineControlling.swift */,
+				AE10F004 /* NuvioTV/Sources/Core/Player/PlaybackEngineState.swift */,
+				AE10F003 /* NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift */,
+				AE10F008 /* NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift */,
+				AE10F001 /* NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift */,
+				C0D30054 /* NuvioTV/Sources/Core/Player/PlaybackWakeLock.swift */,
+				A17000000000000000000003 /* NuvioTV/Sources/Core/Search/SearchResultEnrichment.swift */,
+				51A100010000000000000001 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift */,
+				51A100030000000000000003 /* NuvioTV/Sources/Core/Simkl/SimklAuthService.swift */,
+				51A1000A000000000000000A /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift */,
+				51A100070000000000000007 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift */,
+				C0D3002D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift */,
+				C0D30060 /* NuvioTV/Sources/Core/Streams/StreamQualityTags.swift */,
+				C0D300FB00000000000000FB /* NuvioTV/Sources/Core/Sync/ContinueWatchingBuilder.swift */,
+				C0D300FC00000000000000FC /* NuvioTV/Sources/Core/Sync/ContinueWatchingTestData.swift */,
+				C0D3002B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift */,
+				C0D30070 /* NuvioTV/Sources/Core/TMDB/TmdbDetailsService.swift */,
+				C0D300390000000000000039 /* NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift */,
+				C0D3002C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift */,
+				C0D30071 /* NuvioTV/Sources/Core/Trakt/TraktDetailsService.swift */,
+			);
+			name = Core;
+			sourceTree = "<group>";
+		};
+
+		C0D3E1000000000000000002 /* Data */ = {
+			isa = PBXGroup;
+			children = (
 				C0D300030000000000000003 /* NuvioTV/Sources/Data/Repository/CatalogRepository.swift */,
-				C0D300E100000000000000E1 /* NuvioTV/Sources/Data/Repository/StreamsRepository.swift */,
 				C0D300E500000000000000E5 /* NuvioTV/Sources/Data/Repository/CollectionSourceResolver.swift */,
-				C0D300040000000000000004 /* NuvioTV/Sources/ViewModels/CatalogBrowseViewModel.swift */,
+				C0D300E100000000000000E1 /* NuvioTV/Sources/Data/Repository/StreamsRepository.swift */,
+			);
+			name = Data;
+			sourceTree = "<group>";
+		};
+
+		C0D3E1000000000000000003 /* Models */ = {
+			isa = PBXGroup;
+			children = (
+				C0D300020000000000000002 /* NuvioTV/Sources/Models/CatalogModels.swift */,
+				C0D3000A000000000000000A /* NuvioTV/Sources/Models/PlayerModels.swift */,
+				C0D300FA00000000000000FA /* NuvioTV/Sources/Models/WatchProgressLedger.swift */,
+			);
+			name = Models;
+			sourceTree = "<group>";
+		};
+
+		C0D3E1000000000000000004 /* UI */ = {
+			isa = PBXGroup;
+			children = (
+				C0D300190000000000000019 /* NuvioTV/Sources/UI/Addons/AddonsView.swift */,
+				C0D300280000000000000028 /* NuvioTV/Sources/UI/Auth/LoginView.swift */,
 				C0D300050000000000000005 /* NuvioTV/Sources/UI/Catalog/CatalogBrowseView.swift */,
 				C0D300060000000000000006 /* NuvioTV/Sources/UI/Catalog/FilterSection.swift */,
-				C0D300070000000000000007 /* NuvioTV/Sources/UI/Components/PosterCard.swift */,
-				C0D300080000000000000008 /* NuvioTV/Sources/UI/Components/FilterChip.swift */,
-				C0D300F900000000000000F9 /* NuvioTV/Sources/UI/Components/AnimatedRemoteGIFView.swift */,
-				C0D3000A000000000000000A /* NuvioTV/Sources/Models/PlayerModels.swift */,
+				C0D300380000000000000038 /* NuvioTV/Sources/UI/Cloud/CloudLibraryView.swift */,
 				C0D3000B000000000000000B /* NuvioTV/Sources/UI/Components/ActionButtons.swift */,
+				C0D300F900000000000000F9 /* NuvioTV/Sources/UI/Components/AnimatedRemoteGIFView.swift */,
 				C0D3000C000000000000000C /* NuvioTV/Sources/UI/Components/CastCrewSection.swift */,
-				C0D3000D000000000000000D /* NuvioTV/Sources/UI/Components/RatingBadge.swift */,
+				C0D300080000000000000008 /* NuvioTV/Sources/UI/Components/FilterChip.swift */,
 				C0D3000E000000000000000E /* NuvioTV/Sources/UI/Components/MetadataInfo.swift */,
+				C0D300070000000000000007 /* NuvioTV/Sources/UI/Components/PosterCard.swift */,
+				C0D3000D000000000000000D /* NuvioTV/Sources/UI/Components/RatingBadge.swift */,
+				C0D3001A000000000000001A /* NuvioTV/Sources/UI/Details/DetailsScreen.swift */,
+				C0D30072 /* NuvioTV/Sources/UI/Details/ProductionBrowseView.swift */,
+				C0D3002A000000000000002A /* NuvioTV/Sources/UI/Discover/DiscoverView.swift */,
 				C0D300120000000000000012 /* NuvioTV/Sources/UI/Library/LibraryView.swift */,
+				C0D3003D000000000000003D /* NuvioTV/Sources/UI/Player/PauseOverlayView.swift */,
 				C0D300130000000000000013 /* NuvioTV/Sources/UI/Player/PlayerControls.swift */,
 				AE10F00A /* NuvioTV/Sources/UI/Player/PlayerSubtitleOverlay.swift */,
 				C0D300140000000000000014 /* NuvioTV/Sources/UI/Player/PlayerView.swift */,
 				C0D3003B000000000000003B /* NuvioTV/Sources/UI/Player/RemoteInput.swift */,
 				C0D3003C000000000000003C /* NuvioTV/Sources/UI/Player/ScrubberViews.swift */,
-				C0D3003D000000000000003D /* NuvioTV/Sources/UI/Player/PauseOverlayView.swift */,
 				C0D3003E000000000000003E /* NuvioTV/Sources/UI/Player/SidePanels.swift */,
 				C0D300150000000000000015 /* NuvioTV/Sources/UI/Profile/ProfilePinView.swift */,
 				C0D300160000000000000016 /* NuvioTV/Sources/UI/Profile/UserProfileView.swift */,
-				C0D300170000000000000017 /* NuvioTV/Sources/UI/Search/SearchView.swift */,
 				A17000000000000000000001 /* NuvioTV/Sources/UI/Search/NetflixSearchView.swift */,
+				C0D300170000000000000017 /* NuvioTV/Sources/UI/Search/SearchView.swift */,
 				C0D300180000000000000018 /* NuvioTV/Sources/UI/Settings/SettingsView.swift */,
-				C0D300190000000000000019 /* NuvioTV/Sources/UI/Addons/AddonsView.swift */,
-				C0D3001A000000000000001A /* NuvioTV/Sources/UI/Details/DetailsScreen.swift */,
+			);
+			name = UI;
+			sourceTree = "<group>";
+		};
+
+		C0D3E1000000000000000005 /* ViewModels */ = {
+			isa = PBXGroup;
+			children = (
+				C0D300040000000000000004 /* NuvioTV/Sources/ViewModels/CatalogBrowseViewModel.swift */,
+				C0D300370000000000000037 /* NuvioTV/Sources/ViewModels/CloudLibraryViewModel.swift */,
 				C0D3001B000000000000001B /* NuvioTV/Sources/ViewModels/DetailsViewModel.swift */,
+				C0D300290000000000000029 /* NuvioTV/Sources/ViewModels/DiscoverViewModel.swift */,
 				C0D3001D000000000000001D /* NuvioTV/Sources/ViewModels/LibraryViewModel.swift */,
+				A17000000000000000000002 /* NuvioTV/Sources/ViewModels/NetflixSearchViewModel.swift */,
 				C0D3001E000000000000001E /* NuvioTV/Sources/ViewModels/PlayerViewModel.swift */,
-				AE10F001 /* NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift */,
-				AE10F002 /* NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift */,
-				AE10F003 /* NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift */,
-				AE10F004 /* NuvioTV/Sources/Core/Player/PlaybackEngineState.swift */,
-				AE10F005 /* NuvioTV/Sources/Core/Player/PlaybackEngineCapabilities.swift */,
-				AE10F006 /* NuvioTV/Sources/Core/Player/PlaybackBackendPolicy.swift */,
-				AE10F00E /* NuvioTV/Sources/Core/Player/AppleTVCapability.swift */,
-				AE10F007 /* NuvioTV/Sources/Core/Player/AetherPlaybackController.swift */,
-				AE10F008 /* NuvioTV/Sources/Core/Player/PlaybackSessionCoordinator.swift */,
-				AE10F009 /* NuvioTV/Sources/Core/Player/MPVPlaybackController.swift */,
-				AE10F00C /* NuvioTV/Sources/Core/Player/AISubtitleTranslationCache.swift */,
-				C0D30051 /* NuvioTV/Sources/Core/Player/PlaybackEngineControlling.swift */,
-				C0D30054 /* NuvioTV/Sources/Core/Player/PlaybackWakeLock.swift */,
 				C0D3001F000000000000001F /* NuvioTV/Sources/ViewModels/ProfileViewModel.swift */,
 				C0D300200000000000000020 /* NuvioTV/Sources/ViewModels/SearchViewModel.swift */,
-				A17000000000000000000002 /* NuvioTV/Sources/ViewModels/NetflixSearchViewModel.swift */,
-				A17000000000000000000003 /* NuvioTV/Sources/Core/Search/SearchResultEnrichment.swift */,
-				C0D300220000000000000022 /* NuvioTV/Sources/DomainModels.swift */,
-				C0D300230000000000000023 /* NuvioTV/Sources/Core/Auth/AuthConfig.swift */,
-				C0D300240000000000000024 /* NuvioTV/Sources/Core/Auth/AuthModels.swift */,
-				C0D300250000000000000025 /* NuvioTV/Sources/Core/Auth/AuthService.swift */,
-				C0D300260000000000000026 /* NuvioTV/Sources/Core/Auth/QRCode.swift */,
-				C0D300270000000000000027 /* NuvioTV/Sources/Core/Auth/AuthManager.swift */,
-				C0D3002B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift */,
-				C0D300FA00000000000000FA /* NuvioTV/Sources/Models/WatchProgressLedger.swift */,
-				C0D300FB00000000000000FB /* NuvioTV/Sources/Core/Sync/ContinueWatchingBuilder.swift */,
-				C0D300FC00000000000000FC /* NuvioTV/Sources/Core/Sync/ContinueWatchingTestData.swift */,
-				C0D3002C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift */,
-				51A100010000000000000001 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift */,
-				51A100030000000000000003 /* NuvioTV/Sources/Core/Simkl/SimklAuthService.swift */,
-				51A100070000000000000007 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift */,
-				51A1000A000000000000000A /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift */,
-				C0D3002D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift */,
-				C0D30072 /* NuvioTV/Sources/UI/Details/ProductionBrowseView.swift */,
-				C0D30071 /* NuvioTV/Sources/Core/Trakt/TraktDetailsService.swift */,
-				C0D30070 /* NuvioTV/Sources/Core/TMDB/TmdbDetailsService.swift */,
-				C0D30062 /* NuvioTV/Sources/Core/Addons/CommunityAddonCatalog.swift */,
-				C0D30060 /* NuvioTV/Sources/Core/Streams/StreamQualityTags.swift */,
-				C0D3002E000000000000002E /* NuvioTV/Sources/Core/Debrid/DebridProvider.swift */,
-				C0D3003A000000000000003A /* NuvioTV/Sources/Core/Debrid/DebridDeviceAuthorization.swift */,
-				C0D3002F000000000000002F /* NuvioTV/Sources/Core/Debrid/RealDebridResolver.swift */,
-				C0D300300000000000000030 /* NuvioTV/Sources/Core/Debrid/DebridResolver.swift */,
-				C0D300310000000000000031 /* NuvioTV/Sources/Core/Debrid/PremiumizeResolver.swift */,
-				C0D300320000000000000032 /* NuvioTV/Sources/Core/Debrid/TorboxResolver.swift */,
-				C0D300330000000000000033 /* NuvioTV/Sources/Core/Cloud/CloudLibraryModels.swift */,
-				C0D300340000000000000034 /* NuvioTV/Sources/Core/Cloud/PremiumizeCloudLibrary.swift */,
-				C0D300350000000000000035 /* NuvioTV/Sources/Core/Cloud/TorboxCloudLibrary.swift */,
-				C0D300360000000000000036 /* NuvioTV/Sources/Core/Cloud/CloudLibraryService.swift */,
-				C0D300370000000000000037 /* NuvioTV/Sources/ViewModels/CloudLibraryViewModel.swift */,
-				C0D300380000000000000038 /* NuvioTV/Sources/UI/Cloud/CloudLibraryView.swift */,
-				C0D300390000000000000039 /* NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift */,
-				C0D300280000000000000028 /* NuvioTV/Sources/UI/Auth/LoginView.swift */,
-				C0D300290000000000000029 /* NuvioTV/Sources/ViewModels/DiscoverViewModel.swift */,
-				C0D3002A000000000000002A /* NuvioTV/Sources/UI/Discover/DiscoverView.swift */,
 			);
-			name = Sources;
+			name = ViewModels;
 			sourceTree = "<group>";
 		};
 		F0A100000000000000000001 /* Fonts */ = {
