@@ -1,0 +1,88 @@
+name: Update latest beta links
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to use for the README beta hub
+        required: false
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  update-readme:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the default branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+
+      - name: Update latest beta block
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.draft == false)] | first | .tag_name')"
+          fi
+
+          gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}" > /tmp/release.json
+
+          python3 - /tmp/release.json README.md <<'PY'
+          import json
+          import os
+          import sys
+          from pathlib import Path
+
+          release = json.loads(Path(sys.argv[1]).read_text())
+          readme_path = Path(sys.argv[2])
+          readme = readme_path.read_text()
+
+          tag = release["tag_name"]
+          title = release.get("name") or tag
+          ipa = next(
+              (asset for asset in release.get("assets", [])
+               if asset.get("name", "").lower().endswith(".ipa")),
+              None,
+          )
+          if ipa is None:
+              raise SystemExit(f"No .ipa asset found in release {tag}")
+
+          start_marker = "<!-- BEGIN LATEST_BETA -->"
+          end_marker = "<!-- END LATEST_BETA -->"
+          start = readme.index(start_marker) + len(start_marker)
+          end = readme.index(end_marker, start)
+
+          block = (
+              f"\n**{title}** is the latest tvOS release.\n\n"
+              f"[Quick download (.ipa)]({ipa['browser_download_url']}) · "
+              f"[Read the release notes]({release['html_url']}) · "
+              f"[Report a bug or suggest an idea](https://github.com/"
+              f"{os.environ['GITHUB_REPOSITORY']}/issues/new/choose)\n"
+          )
+          readme_path.write_text(readme[:start] + block + readme[end:])
+          PY
+
+      - name: Commit updated beta links
+        env:
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- README.md; then
+            echo "README already points to the latest beta."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add README.md
+          git commit -m "docs: update latest beta links"
+          git push origin "HEAD:${DEFAULT_BRANCH}"

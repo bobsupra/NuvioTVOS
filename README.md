@@ -39,23 +39,19 @@
 </div>
 
 
-The Apple TV build is published as a `.ipa` on the [Releases page](https://github.com/bobsupra/NuvioTVOS/releases). Sideload it onto an Apple TV with your preferred tool (for example a Mac with Xcode, Apple Configurator, or a sideloading utility). This is a beta build - see the release notes for what works and what still needs testing.
+Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/NuvioTVOS/releases), then sideload it with Xcode, Apple Configurator, or your preferred tool. See the release notes for known issues.
+
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases**.
 
 ## Latest tvOS Beta
 
-The tree currently targets **version 3.2.7 (build 58)** (`tvosApp/NuvioTV/Info.plist`).
+<!-- BEGIN LATEST_BETA -->
+**Beta 3.2.7** is the latest tvOS release.
 
-[Beta 3.2.7](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.7) is the latest tvOS release:
-
-[NuvioTV-3.2.7-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.7/NuvioTV-3.2.7-unsigned-release.ipa)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.7/NuvioTV-3.2.7-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.7) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+<!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
-
-### New in Beta 3.2.7
-
-- Greatly reduces catalog-induced UI lag by caching shared add-on manifests and keeping only the active Home rows and nearby neighbours mounted.
-- Makes the Netflix-style search keyboard the default. To return to the previous search, go to **Settings → Layout & Discovery → Search Style → Classic**.
-- Refines Home focus restoration, vertical-row navigation, and playback/renderer handling; further real-device catalog testing is still needed.
 
 ### The new player
 
