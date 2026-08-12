@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 ### Fixed and improved
 
 - Backing out after a stream has started returns to Details. If a selected stream never starts, Back returns to the stream picker at the same movie or episode so another source can be chosen immediately.

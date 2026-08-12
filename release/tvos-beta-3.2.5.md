@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 Beta 3.2.5 refines immersive Home previews, makes Siri Remote focus transitions more deliberate, and fixes catalog access for tokenized Stremio add-ons.
 
 ### Focused posters and trailer previews

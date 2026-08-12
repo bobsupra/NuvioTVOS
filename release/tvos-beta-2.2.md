@@ -2,6 +2,8 @@ tvOS Beta 2.2
 
 Important: if you installed Beta 2 or Beta 2.1 and still run into sign-in/profile issues, delete the old app before installing this build. This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 - Player now prevents the Apple TV screensaver from starting while video is playing or buffering, so waking the device should no longer kick you back out of playback.
 - Play/Pause focus is steadier inside the player; toggling pause/resume no longer swaps the button structure and drops focus down to the timeline.
 - Audio language and subtitle choices made inside the player are remembered per movie/episode, including subtitle Off and external subtitle URLs, and restored when you reopen playback.

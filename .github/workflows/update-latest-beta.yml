@@ -65,11 +65,35 @@ jobs:
               f"\n**{title}** is the latest tvOS release.\n\n"
               f"[Quick download (.ipa)]({ipa['browser_download_url']}) · "
               f"[Read the release notes]({release['html_url']}) · "
+              f"[Manage notifications](https://github.com/"
+              f"{os.environ['GITHUB_REPOSITORY']}/subscription) → choose **Custom → Releases** · "
               f"[Report a bug or suggest an idea](https://github.com/"
               f"{os.environ['GITHUB_REPOSITORY']}/issues/new/choose)\n"
           )
           readme_path.write_text(readme[:start] + block + readme[end:])
           PY
+
+      - name: Add notification and feedback links to release notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag || github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          if [ -z "$tag" ]; then
+            tag="$(gh api "repos/${GITHUB_REPOSITORY}/releases" --jq '[.[] | select(.draft == false)] | first | .tag_name')"
+          fi
+
+          release_json="$(gh api "repos/${GITHUB_REPOSITORY}/releases/tags/${tag}")"
+          release_id="$(printf '%s' "$release_json" | jq -r '.id')"
+          body="$(printf '%s' "$release_json" | jq -r '.body // ""')"
+          links="**New beta alerts:** [Manage notifications](https://github.com/${GITHUB_REPOSITORY}/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/${GITHUB_REPOSITORY}/issues/new/choose)"
+
+          if [[ "$body" != *"${GITHUB_REPOSITORY}/subscription"* ]]; then
+            body="${body}"$'\n\n'"$links"
+            gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${release_id}" -f body="$body" >/dev/null
+          fi
 
       - name: Commit updated beta links
         env:

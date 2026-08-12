@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 ### Fixed and improved
 
 - Fixed the account-sync crash caused by large Continue Watching payloads falling back to UserDefaults. Synced progress now remains file-backed and storage failure is reported without terminating the app.

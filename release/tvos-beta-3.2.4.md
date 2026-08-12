@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 Beta 3.2.4 strengthens AI subtitle translation, introduces customizable Home collection templates, and improves catalog browsing and Apple TV presentation.
 
 ### AI subtitles and subtitle style

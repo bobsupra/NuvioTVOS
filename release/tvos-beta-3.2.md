@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 Beta 3.2 is a broad reliability and polish release spanning Home, metadata, Continue Watching, synchronization, details, and playback. Please test it with your own add-ons and providers—especially on physical Apple TV hardware—and report the stream, provider, and steps needed to reproduce any problem.
 
 ### Home, catalogs, and profiles

@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 This beta includes a large synchronization and Continue Watching overhaul. Please test it with your own Nuvio Sync, Trakt, and Simkl setup. If something does not work, message the maintainer with what you expected, what happened, and which provider you selected so it can be reproduced and fixed faster.
 
 ### Simkl synchronization reliability

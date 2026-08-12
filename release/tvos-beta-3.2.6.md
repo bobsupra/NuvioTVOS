@@ -2,6 +2,8 @@
 
 > **Install:** [NuvioTV-3.2.6-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.6/NuvioTV-3.2.6-unsigned-release.ipa) requires a compatible tvOS development or sideloading signing workflow before installation.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 ### Cheaper AI subtitle translation
 
 - Reworks subtitle translation around a small adaptive look-ahead buffer: it translates the active cue plus a limited nearby window instead of continuously translating far ahead.

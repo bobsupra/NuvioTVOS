@@ -2,6 +2,8 @@
 
 **Important:** This IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 Beta 3.2.3 focuses on live-TV playback, subtitle-provider flexibility, stream-picker performance, and Home navigation. Test it with your own add-ons, streams, API credentials, displays, and Apple TV hardware.
 
 ### Live playback and player controls

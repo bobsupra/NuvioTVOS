@@ -7,9 +7,9 @@
   <h1>Nuvio TV for tvOS</h1>
 
   <p>
-    A modern Apple TV media player powered by the Stremio addon ecosystem.
+    A modern Apple TV media player for browsing catalogs and playing user-configured sources.
     <br />
-    SwiftUI tvOS shell - Stremio-compatible catalogs - AetherEngine / MPVKit playback
+    SwiftUI tvOS shell - catalog browsing - AetherEngine / MPVKit playback
   </p>
 
   <p>
@@ -55,7 +55,7 @@ The IPA requires a compatible tvOS development or sideloading signing workflow b
 
 ### The new player
 
-Nuvio now uses **AetherEngine** as its primary built-in player instead of the legacy AVPlayer implementation. It supports tvOS-native playback controls, precise seeking and resume, embedded and add-on subtitles, styled text and PGS bitmap subtitles, saved audio/subtitle selections, and automatic frame-rate matching. **MPVKit** remains available as a one-way compatibility fallback for streams or controls that AetherEngine cannot currently handle, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
+Nuvio now uses **AetherEngine** as its primary built-in player instead of the legacy AVPlayer implementation. It supports tvOS-native playback controls, precise seeking and resume, embedded and configured subtitles, styled text and PGS bitmap subtitles, saved audio/subtitle selections, and automatic frame-rate matching. **MPVKit** remains available as a one-way compatibility fallback for sources or controls that AetherEngine cannot currently handle, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
 
 ### Trakt sign-in with your own API app
 
@@ -81,7 +81,7 @@ Simkl's PIN flow does not need a Client Secret. The Client ID stays on that Appl
 
 ### Notes
 
-- Stream availability depends on your configured add-ons and their upstream servers. Premiumize uses manual API-key entry unless a private OAuth client ID is configured.
+- Content availability depends on your configured sources and their upstream services.
 - The Apple TV Simulator cannot play AV1. ASS/SSA positioning and typesetting use the app subtitle style.
 
 ## About
@@ -94,11 +94,10 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 
 - Native SwiftUI entry point in [NuvioTVApp.swift](./tvosApp/NuvioTV/Sources/NuvioTVApp.swift).
 - Apple TV tab navigation for Profile, Home, Search, Library, and Settings.
-- Home rows for synced Nuvio collections and add-on catalog lists.
-- Cinemeta-backed catalog and metadata repository with Stremio-compatible stream/subtitle addon hooks.
-- User-configurable Stremio stream add-ons in Settings → Integrations → Add-ons.
-- Debrid account linking for Real-Debrid, TorBox, and Premiumize (Settings → Integrations → Debrid). AllDebrid and Debrid-Link are not wired.
-- Premiumize and TorBox Cloud Library playback through the built-in player.
+- Home rows for synced Nuvio collections and configured catalog lists.
+- Catalog and metadata repository with configurable catalog, playback, and subtitle integrations.
+- User-configurable source integrations in Settings → Integrations → Add-ons.
+- Cloud library playback through supported connected services.
 - Apple TV Top Shelf extension backed by the active Continue Watching row.
 - Long-press quick actions for poster cards, including details, library toggle, and watched toggle.
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
@@ -109,22 +108,16 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - Pure Swift app core (no Nuvio Rust / FFI dependency).
 - tvOS app assets, splash screen, top shelf images, and Apple TV app icon stack in [Images.xcassets](./tvosApp/NuvioTV/Images.xcassets).
 
-## Contributor Notes
+## Contributing
 
-Most of the early tvOS gaps are now fixed. Contributions are welcome—please test on a real Apple TV or simulator and open an issue for anything that still feels rough.
-
-- The main remaining known issue is occasional stutter while scrolling horizontally, especially in artwork-heavy rows.
-- Add-on, debrid, Cloud Library, and Top Shelf integrations benefit from real-account/device testing. AllDebrid and Debrid-Link are not supported yet; Cloud Library supports Premiumize and TorBox.
-- For large UI or experience changes, open a discussion first so the app stays consistent with Apple TV conventions.
-
-If login returns to the Apple TV Home screen, please include a device console or crash log in the report. The optional `NuvioTVandroid/` reference checkout is not required to build or contribute.
+Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution rules, testing notes, and issue-reporting guidance.
 
 ## Requirements
 
 - macOS with Xcode installed.
 - Apple TV simulator runtime installed in Xcode.
 - CocoaPods if `tvosApp/Pods` needs to be regenerated.
-- Network access for catalog metadata, stream addon lookups, and Swift Package resolution.
+- Network access for catalog metadata, source lookups, and Swift Package resolution.
 
 The Xcode project targets Apple TV (`SDKROOT = appletvos`) with bundle id `com.nuvio.app.tv`. The tvOS deployment target is configured in [project.pbxproj](./tvosApp/NuvioTV.xcodeproj/project.pbxproj).
 
@@ -182,11 +175,7 @@ To enable QR login and email auth, fill in the Supabase values in:
 tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift
 ```
 
-Catalogs and metadata use Cinemeta plus Stremio-compatible stream and subtitle add-on endpoints from [CatalogRepository.swift](./tvosApp/NuvioTV/Sources/Data/Repository/CatalogRepository.swift).
-
-For Real-Debrid and TorBox, open Settings → Integrations → Debrid and link with the TV QR code. Premiumize has no public open-source device OAuth — paste the API key from [premiumize.me/account](https://www.premiumize.me/account) (QR only if you set a private `PREMIUMIZE_CLIENT_ID` in `Info.plist`). TorBox/Premiumize credentials also power Cloud Library in Library.
-
-Debrid API keys sync with the Nuvio account on the shared **tv** settings blob (`features.debrid_settings`), matching Android TV, so linking on one TV fills the other after account sync.
+Catalogs and metadata use configurable catalog, playback, and subtitle endpoints from [CatalogRepository.swift](./tvosApp/NuvioTV/Sources/Data/Repository/CatalogRepository.swift).
 
 ## Tests
 
@@ -211,7 +200,7 @@ Some older verification scripts in `tvosApp/` still carry inherited iOS wording.
 - `tvosApp/NuvioTV/` contains the native SwiftUI tvOS app.
 - `tvosApp/NuvioTV/Sources/UI/` contains the Apple TV screens and reusable components.
 - `tvosApp/NuvioTV/Sources/ViewModels/` contains the Swift view models for tvOS flows.
-- `tvosApp/NuvioTV/Sources/Data/Repository/` contains catalog, metadata, stream, and subtitle fetching.
+- `tvosApp/NuvioTV/Sources/Data/Repository/` contains catalog, metadata, source, and subtitle fetching.
 - `tvosApp/NuvioTV/Sources/Core/Auth/` contains Supabase email and TV QR-login support.
 - `MPVKit/` is the local Swift Package used for playback.
 - `composeApp/` and `iosApp/` are inherited from the mobile fork and remain useful references while tvOS functionality is ported.
@@ -219,13 +208,13 @@ Some older verification scripts in `tvosApp/` still carry inherited iOS wording.
 ## Built With
 
 - SwiftUI and UIKit focus/input bridging for tvOS
-- MPVKit / libmpv for playback
-- Stremio-compatible catalog, stream, and subtitle APIs
+- AetherEngine and MPVKit playback engines
+- Configurable catalog, source, and subtitle APIs
 - Kotlin Multiplatform / Compose Multiplatform code inherited from the mobile fork
 
 ## Legal & DMCA
 
-Nuvio functions solely as a client-side interface for browsing metadata and playing media provided by user-installed extensions and/or user-provided sources. It is intended for content the user owns or is otherwise authorized to access.
+Nuvio functions solely as a client-side interface for browsing metadata and playing media provided by user-configured sources. It is intended for content the user owns or is otherwise authorized to access.
 
 Nuvio is not affiliated with any third-party extensions, catalogs, sources, or content providers. It does not host, store, or distribute any media content.
 

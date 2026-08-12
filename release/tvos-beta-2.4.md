@@ -2,6 +2,8 @@ tvOS Beta 2.4
 
 Important: this IPA is unsigned because no tvOS signing identity is configured on this machine.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 - IntroDB skip intro and skip ending are now available in the player, with a 5-second countdown before the button hides with the controls.
 - Skip cards now sit on the left side, return with the player controls after hiding, and can be focused from the progress bar alongside the Next Episode card.
 - Next Episode focus is fixed during end credits, including the case where the controls are open.

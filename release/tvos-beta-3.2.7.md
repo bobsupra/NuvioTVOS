@@ -2,6 +2,8 @@
 
 > **Install:** [NuvioTV-3.2.7-unsigned-release.ipa](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.7/NuvioTV-3.2.7-unsigned-release.ipa) requires a compatible tvOS development or sideloading signing workflow before installation.
 
+> **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+
 ### Faster catalog browsing
 
 - Reduces catalog-driven UI lag by sharing add-on manifest responses and virtualizing Home rows: the focused row and its nearby neighbours stay mounted while off-screen rows use lightweight placeholders.
