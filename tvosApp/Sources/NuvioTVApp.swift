@@ -149,6 +149,7 @@ struct ContentView: View {
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
+    @StateObject private var cloudSyncManager = CloudSyncManager()
     // Both search screens are backed by their own view model. Only the one
     // picked by `SettingsKey.searchStyle` is rendered, but both are held here
     // so switching styles doesn't tear down and refetch the other's state.
@@ -281,6 +282,7 @@ struct ContentView: View {
         .onOpenURL(perform: handleDeepLink)
         .onAppear {
             syncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
+            cloudSyncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
             // Skip the login gate if a session was restored or the user has
@@ -360,6 +362,8 @@ struct ContentView: View {
                 backgroundedAt = Date()
             case .active:
                 syncManager.refreshAccountIfIdle()
+                // iCloud sync is deliberately not triggered here. It runs only
+                // from Settings → Sync Now.
                 presentProfileSelectionAfterBackgroundIfNeeded()
             default:
                 break

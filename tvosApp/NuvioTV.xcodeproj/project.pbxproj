@@ -91,6 +91,18 @@
 		A9DBFCEA302D0CA1007F842B /* RatingBadge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC79302D0CA1007F842B /* RatingBadge.swift */; };
 		A9DBFCEB302D0CA1007F842B /* IntroDBSkipService.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC50302D0CA1007F842B /* IntroDBSkipService.swift */; };
 		A9DBFCEC302D0CA1007F842B /* LibraryViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC97302D0CA1007F842B /* LibraryViewModel.swift */; };
+		A9CD01103100AA01007F842B /* CloudSyncPolicy.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01113100AA01007F842B /* CloudSyncPolicy.swift */; };
+		A9CD01123100AA01007F842B /* CloudSyncSnapshot.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01133100AA01007F842B /* CloudSyncSnapshot.swift */; };
+		A9CD01143100AA01007F842B /* CloudSyncOrigin.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01153100AA01007F842B /* CloudSyncOrigin.swift */; };
+		A9CD01163100AA01007F842B /* SettingsChangeJournal.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01173100AA01007F842B /* SettingsChangeJournal.swift */; };
+		A9CD01183100AA01007F842B /* CloudSyncSnapshotTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01193100AA01007F842B /* CloudSyncSnapshotTests.swift */; };
+		A9CD01203100AA01007F842B /* CloudSyncSchema.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01213100AA01007F842B /* CloudSyncSchema.swift */; };
+		A9CD01223100AA01007F842B /* CloudSyncStateStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01233100AA01007F842B /* CloudSyncStateStore.swift */; };
+		A9CD01243100AA01007F842B /* CloudSyncEngine.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01253100AA01007F842B /* CloudSyncEngine.swift */; };
+		A9CD01263100AA01007F842B /* CloudSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01273100AA01007F842B /* CloudSyncManager.swift */; };
+		A9CD01303100AA01007F842B /* CloudSyncSchemaTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01313100AA01007F842B /* CloudSyncSchemaTests.swift */; };
+		A9CD01323100AA01007F842B /* KeychainSecretBridge.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01333100AA01007F842B /* KeychainSecretBridge.swift */; };
+		A9CD01023100AA01007F842B /* CloudSyncAvailability.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9CD01013100AA01007F842B /* CloudSyncAvailability.swift */; };
 		A9DBFCED302D0CA1007F842B /* ContinueWatchingBuilder.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC54302D0CA1007F842B /* ContinueWatchingBuilder.swift */; };
 		A9DBFCEE302D0CA1007F842B /* ProfilePinView.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC8A302D0CA1007F842B /* ProfilePinView.swift */; };
 		A9DBFCEF302D0CA1007F842B /* AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFC5F302D0CA1007F842B /* AppLanguage.swift */; };
@@ -226,6 +238,18 @@
 		A9DBFC52302D0CA1007F842B /* StreamQualityTags.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamQualityTags.swift; sourceTree = "<group>"; };
 		A9DBFC54302D0CA1007F842B /* ContinueWatchingBuilder.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContinueWatchingBuilder.swift; sourceTree = "<group>"; };
 		A9DBFC55302D0CA1007F842B /* ContinueWatchingTestData.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContinueWatchingTestData.swift; sourceTree = "<group>"; };
+		A9CD01113100AA01007F842B /* CloudSyncPolicy.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncPolicy.swift; sourceTree = "<group>"; };
+		A9CD01133100AA01007F842B /* CloudSyncSnapshot.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSnapshot.swift; sourceTree = "<group>"; };
+		A9CD01153100AA01007F842B /* CloudSyncOrigin.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncOrigin.swift; sourceTree = "<group>"; };
+		A9CD01173100AA01007F842B /* SettingsChangeJournal.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SettingsChangeJournal.swift; sourceTree = "<group>"; };
+		A9CD01193100AA01007F842B /* CloudSyncSnapshotTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSnapshotTests.swift; sourceTree = "<group>"; };
+		A9CD01213100AA01007F842B /* CloudSyncSchema.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSchema.swift; sourceTree = "<group>"; };
+		A9CD01233100AA01007F842B /* CloudSyncStateStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncStateStore.swift; sourceTree = "<group>"; };
+		A9CD01253100AA01007F842B /* CloudSyncEngine.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncEngine.swift; sourceTree = "<group>"; };
+		A9CD01273100AA01007F842B /* CloudSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncManager.swift; sourceTree = "<group>"; };
+		A9CD01313100AA01007F842B /* CloudSyncSchemaTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncSchemaTests.swift; sourceTree = "<group>"; };
+		A9CD01333100AA01007F842B /* KeychainSecretBridge.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = KeychainSecretBridge.swift; sourceTree = "<group>"; };
+		A9CD01013100AA01007F842B /* CloudSyncAvailability.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CloudSyncAvailability.swift; sourceTree = "<group>"; };
 		A9DBFC56302D0CA1007F842B /* NuvioSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioSyncService.swift; sourceTree = "<group>"; };
 		A9DBFC58302D0CA1007F842B /* TmdbDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TmdbDetailsService.swift; sourceTree = "<group>"; };
 		A9DBFC5A302D0CA1007F842B /* TopShelfFeed.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelfFeed.swift; sourceTree = "<group>"; };
@@ -516,8 +540,26 @@
 				A9DBFC54302D0CA1007F842B /* ContinueWatchingBuilder.swift */,
 				A9DBFC55302D0CA1007F842B /* ContinueWatchingTestData.swift */,
 				A9DBFC56302D0CA1007F842B /* NuvioSyncService.swift */,
+				A9CD01003100AA01007F842B /* iCloud */,
 			);
 			path = Sync;
+			sourceTree = "<group>";
+		};
+		A9CD01003100AA01007F842B /* iCloud */ = {
+			isa = PBXGroup;
+			children = (
+				A9CD01013100AA01007F842B /* CloudSyncAvailability.swift */,
+				A9CD01333100AA01007F842B /* KeychainSecretBridge.swift */,
+				A9CD01273100AA01007F842B /* CloudSyncManager.swift */,
+				A9CD01213100AA01007F842B /* CloudSyncSchema.swift */,
+				A9CD01233100AA01007F842B /* CloudSyncStateStore.swift */,
+				A9CD01253100AA01007F842B /* CloudSyncEngine.swift */,
+				A9CD01113100AA01007F842B /* CloudSyncPolicy.swift */,
+				A9CD01133100AA01007F842B /* CloudSyncSnapshot.swift */,
+				A9CD01153100AA01007F842B /* CloudSyncOrigin.swift */,
+				A9CD01173100AA01007F842B /* SettingsChangeJournal.swift */,
+			);
+			path = iCloud;
 			sourceTree = "<group>";
 		};
 		A9DBFC59302D0CA1007F842B /* TMDB */ = {
@@ -807,6 +849,8 @@
 				AE01SMBTF01 /* MediaFilenameParserTests.swift */,
 				AE01SMBTF02 /* SMBLibraryResolverTests.swift */,
 				AE01SMBTF03 /* SMBLibraryIndexTests.swift */,
+				A9CD01313100AA01007F842B /* CloudSyncSchemaTests.swift */,
+				A9CD01193100AA01007F842B /* CloudSyncSnapshotTests.swift */,
 			);
 			path = NuvioTVTests;
 			sourceTree = "<group>";
@@ -1009,6 +1053,8 @@
 				AE01SMBT01 /* MediaFilenameParserTests.swift in Sources */,
 				AE01SMBT02 /* SMBLibraryResolverTests.swift in Sources */,
 				AE01SMBT03 /* SMBLibraryIndexTests.swift in Sources */,
+				A9CD01303100AA01007F842B /* CloudSyncSchemaTests.swift in Sources */,
+				A9CD01183100AA01007F842B /* CloudSyncSnapshotTests.swift in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -1108,6 +1154,16 @@
 				A9DBFCEA302D0CA1007F842B /* RatingBadge.swift in Sources */,
 				A9DBFCEB302D0CA1007F842B /* IntroDBSkipService.swift in Sources */,
 				A9DBFCEC302D0CA1007F842B /* LibraryViewModel.swift in Sources */,
+				A9CD01023100AA01007F842B /* CloudSyncAvailability.swift in Sources */,
+				A9CD01323100AA01007F842B /* KeychainSecretBridge.swift in Sources */,
+				A9CD01263100AA01007F842B /* CloudSyncManager.swift in Sources */,
+				A9CD01203100AA01007F842B /* CloudSyncSchema.swift in Sources */,
+				A9CD01223100AA01007F842B /* CloudSyncStateStore.swift in Sources */,
+				A9CD01243100AA01007F842B /* CloudSyncEngine.swift in Sources */,
+				A9CD01103100AA01007F842B /* CloudSyncPolicy.swift in Sources */,
+				A9CD01123100AA01007F842B /* CloudSyncSnapshot.swift in Sources */,
+				A9CD01143100AA01007F842B /* CloudSyncOrigin.swift in Sources */,
+				A9CD01163100AA01007F842B /* SettingsChangeJournal.swift in Sources */,
 				A9DBFCED302D0CA1007F842B /* ContinueWatchingBuilder.swift in Sources */,
 				A9DBFCEE302D0CA1007F842B /* ProfilePinView.swift in Sources */,
 				A9DBFCEF302D0CA1007F842B /* AppLanguage.swift in Sources */,
@@ -1211,7 +1267,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
 				CURRENT_PROJECT_VERSION = 59;
-				DEVELOPMENT_TEAM = RNNQM69L4M;
+				DEVELOPMENT_TEAM = 852397N5X9;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
@@ -1226,7 +1282,7 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos;
+				PRODUCT_BUNDLE_IDENTIFIER = com.rb.nuviotvos;
 				PRODUCT_NAME = NuvioTV;
 				SDKROOT = appletvos;
 				SWIFT_OBJC_BRIDGING_HEADER = "NuvioTV/NuvioTV-Bridging-Header.h";
@@ -1246,7 +1302,7 @@
 				CLANG_ENABLE_MODULES = YES;
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
 				CURRENT_PROJECT_VERSION = 59;
-				DEVELOPMENT_TEAM = RNNQM69L4M;
+				DEVELOPMENT_TEAM = 852397N5X9;
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1259,7 +1315,7 @@
 					"-ObjC",
 					"-lc++",
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos;
+				PRODUCT_BUNDLE_IDENTIFIER = com.rb.nuviotvos;
 				PRODUCT_NAME = NuvioTV;
 				SDKROOT = appletvos;
 				SWIFT_OBJC_BRIDGING_HEADER = "NuvioTV/NuvioTV-Bridging-Header.h";
@@ -1276,7 +1332,7 @@
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 59;
-				DEVELOPMENT_TEAM = RNNQM69L4M;
+				DEVELOPMENT_TEAM = 852397N5X9;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1285,7 +1341,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 3.2.8;
-				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos.TopShelf;
+				PRODUCT_BUNDLE_IDENTIFIER = com.rb.nuviotvos.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;
@@ -1302,7 +1358,7 @@
 				CODE_SIGN_ENTITLEMENTS = TopShelf/TopShelf.entitlements;
 				CODE_SIGN_STYLE = Automatic;
 				CURRENT_PROJECT_VERSION = 59;
-				DEVELOPMENT_TEAM = RNNQM69L4M;
+				DEVELOPMENT_TEAM = 852397N5X9;
 				GENERATE_INFOPLIST_FILE = NO;
 				INFOPLIST_FILE = TopShelf/Info.plist;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1311,7 +1367,7 @@
 					"@executable_path/../../Frameworks",
 				);
 				MARKETING_VERSION = 3.2.8;
-				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos.TopShelf;
+				PRODUCT_BUNDLE_IDENTIFIER = com.rb.nuviotvos.TopShelf;
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SDKROOT = appletvos;
 				SKIP_INSTALL = YES;

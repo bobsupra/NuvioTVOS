@@ -112,6 +112,12 @@ enum SettingsKey {
     static let profileAutoSelectLast = "nuvio.tv.settings.profile.autoSelectLast"
     static let profileRequireSelectionAfterBackground = "nuvio.tv.settings.profile.requireSelectionAfterBackground"
     static let accountSyncWatchState = "nuvio.tv.settings.account.syncWatchState"
+    /// Whether this Apple TV participates in iCloud settings sync at all.
+    static let iCloudSyncEnabled = "nuvio.tv.settings.account.iCloudSyncEnabled"
+    /// Whether credentials (server passwords, API keys, tracker tokens) travel
+    /// with the settings. Off means this device neither publishes nor consumes
+    /// them — it abstains rather than clearing what other devices hold.
+    static let iCloudSyncSecrets = "nuvio.tv.settings.account.iCloudSyncSecrets"
 
     static let theme = "nuvio.tv.settings.appearance.theme"
     static let bodyColor = "nuvio.tv.settings.appearance.bodyColor"
@@ -268,15 +274,17 @@ enum SettingsKey {
     static let playbackDiagnostics = "nuvio.tv.settings.advanced.playbackDiagnostics"
     static let focusHighlighter = "nuvio.tv.settings.advanced.focusHighlighter"
 
-    /// API app credentials must remain on the Apple TV and never enter the
-    /// account settings payload.
+    /// Never leaves this Apple TV in the *account* settings payload: API app
+    /// credentials, plus the per-device sync switches themselves — syncing
+    /// those would let one TV turn sync off everywhere.
     static let deviceLocal = Set([
-        traktClientID, traktClientSecret, simklClientID, aiSubtitlesGeminiAPIKey
+        traktClientID, traktClientSecret, simklClientID, aiSubtitlesGeminiAPIKey,
+        iCloudSyncEnabled, iCloudSyncSecrets
     ])
 
     static let all = [
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
-        accountSyncWatchState,
+        accountSyncWatchState, iCloudSyncEnabled, iCloudSyncSecrets,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
         searchStyle,
@@ -701,11 +709,14 @@ enum AISubtitleKeyStore {
         addQuery[kSecValueData as String] = data
         let status = SecItemAdd(addQuery as CFDictionary, nil)
         if status == errSecDuplicateItem {
-            return SecItemUpdate(
+            let updated = SecItemUpdate(
                 keychainQuery(for: provider, profileScope: profileScope) as CFDictionary,
                 [kSecValueData as String: data] as CFDictionary
             ) == errSecSuccess
+            if updated { KeychainSecretBridge.postChanged() }
+            return updated
         }
+        if status == errSecSuccess { KeychainSecretBridge.postChanged() }
         return status == errSecSuccess
     }
 
@@ -715,6 +726,7 @@ enum AISubtitleKeyStore {
         profileScope: String = ProfileSettings.activeProfileScope
     ) -> Bool {
         let status = SecItemDelete(keychainQuery(for: provider, profileScope: profileScope) as CFDictionary)
+        if status == errSecSuccess { KeychainSecretBridge.postChanged() }
         return status == errSecSuccess || status == errSecItemNotFound
     }
 
@@ -1448,6 +1460,12 @@ private struct AccountSettingsView: View {
     @AppStorage(SettingsKey.accountSyncWatchState) private var syncWatchState = true
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
+    @AppStorage(SettingsKey.iCloudSyncEnabled) private var iCloudSyncEnabled = true
+    @AppStorage(SettingsKey.iCloudSyncSecrets) private var iCloudSyncSecrets = true
+    @State private var cloudSyncState = "—"
+    @State private var isCloudSyncing = false
+    @State private var isResettingCloud = false
+    @State private var showingCloudResetConfirmation = false
 
     private var accountStatusText: String {
         guard isAuthenticated else {
@@ -1640,7 +1658,109 @@ private struct AccountSettingsView: View {
                     .disabled(onSignIn == nil)
                 }
             }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_icloud_sync", fallback: "iCloud Sync"),
+                subtitle: L10n.string(
+                    "tvos_settings_icloud_sync_subtitle",
+                    fallback: "Keep settings, integrations, and servers on every Apple TV signed in to your Apple Account"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_icloud_sync_enabled", fallback: "Sync With iCloud"),
+                    subtitle: L10n.string(
+                        "tvos_settings_icloud_sync_enabled_subtitle",
+                        fallback: "Applies to this Apple TV only"
+                    ),
+                    isOn: $iCloudSyncEnabled,
+                    accentColor: accentColor
+                )
+                .onChange(of: iCloudSyncEnabled) { _, enabled in
+                    Task { @MainActor in
+                        await CloudSyncManager.current?.setEnabled(enabled)
+                        await refreshCloudDiagnostics()
+                    }
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_settings_icloud_sync_secrets",
+                        fallback: "Include Passwords and API Keys"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_settings_icloud_sync_secrets_subtitle",
+                        fallback: "Server passwords and keys travel end-to-end encrypted. Off means this Apple TV neither sends nor receives them."
+                    ),
+                    isOn: $iCloudSyncSecrets,
+                    accentColor: accentColor
+                )
+                .opacity(iCloudSyncEnabled ? 1 : 0.46)
+                .disabled(!iCloudSyncEnabled)
+
+                SettingsInfoRow(
+                    title: L10n.string("tvos_account_status", fallback: "Status"),
+                    value: cloudSyncState,
+                    isDiagnostic: true
+                )
+
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_icloud_sync_now", fallback: "Sync Now"),
+                    subtitle: L10n.string(
+                        "tvos_settings_icloud_sync_now_subtitle",
+                        fallback: "Fetch changes from your other Apple TVs, then send this one's"
+                    ),
+                    value: isCloudSyncing
+                        ? L10n.string("tvos_settings_working", fallback: "Working…")
+                        : L10n.string("tvos_settings_icloud_sync_action", fallback: "Sync"),
+                    accentColor: accentColor
+                ) {
+                    guard !isCloudSyncing, iCloudSyncEnabled else { return }
+                    isCloudSyncing = true
+                    Task { @MainActor in
+                        await CloudSyncManager.current?.syncNow()
+                        isCloudSyncing = false
+                        await refreshCloudDiagnostics()
+                    }
+                }
+                .opacity(iCloudSyncEnabled ? 1 : 0.46)
+                .disabled(!iCloudSyncEnabled)
+
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_icloud_reset", fallback: "Reset iCloud Data"),
+                    subtitle: L10n.string(
+                        "tvos_settings_icloud_reset_subtitle",
+                        fallback: "Erases the synced copy for every Apple TV on this Apple Account. Local settings stay."
+                    ),
+                    value: isResettingCloud
+                        ? L10n.string("tvos_settings_working", fallback: "Working…")
+                        : L10n.string("tvos_settings_icloud_reset_action", fallback: "Erase"),
+                    accentColor: Color(red: 1.0, green: 0.43, blue: 0.43)
+                ) {
+                    guard !isResettingCloud else { return }
+                    showingCloudResetConfirmation = true
+                }
+            }
         }
+        .alert(
+            L10n.string("tvos_settings_icloud_reset", fallback: "Reset iCloud Data"),
+            isPresented: $showingCloudResetConfirmation
+        ) {
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+            Button(L10n.string("tvos_settings_icloud_reset_action", fallback: "Erase"), role: .destructive) {
+                isResettingCloud = true
+                Task { @MainActor in
+                    await CloudSyncManager.current?.resetCloudData()
+                    isResettingCloud = false
+                    await refreshCloudDiagnostics()
+                }
+            }
+        } message: {
+            Text(L10n.string(
+                "tvos_settings_icloud_reset_confirm",
+                fallback: "This erases the synced copy shared by every Apple TV on this Apple Account. Each one keeps its own settings and will upload them again."
+            ))
+        }
+        .task { await refreshCloudDiagnostics() }
         .onAppear { refreshEditableName() }
         .onChange(of: activeProfile) { _, _ in refreshEditableName() }
         .sheet(isPresented: $showingAvatarPicker) {
@@ -1661,6 +1781,26 @@ private struct AccountSettingsView: View {
     private var displayProfileName: String {
         if !isAuthenticated, activeProfile == nil { return L10n.string("tvos_settings_nuvio_guest", fallback: "Nuvio Guest") }
         return ProfileDisplayName.resolve(profile: activeProfile, settingsName: profileName)
+    }
+
+    /// Read-only on purpose: this runs on every appearance of the pane.
+    @MainActor
+    private func refreshCloudDiagnostics() async {
+        guard iCloudSyncEnabled else {
+            cloudSyncState = L10n.string("tvos_settings_icloud_off", fallback: "Off for this Apple TV")
+            return
+        }
+
+        guard let manager = CloudSyncManager.current else {
+            cloudSyncState = await CloudSyncAvailability.current().displayText
+            return
+        }
+        guard let synced = manager.lastSyncDate else {
+            cloudSyncState = manager.statusText
+            return
+        }
+        let stamp = synced.formatted(date: .omitted, time: .shortened)
+        cloudSyncState = "\(manager.statusText) — \(L10n.string("tvos_settings_icloud_last_sync", fallback: "last sync")) \(stamp)"
     }
 
     private var isPinProtected: Bool {
@@ -5929,6 +6069,9 @@ private struct AdvancedSettingsView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
+    @State private var cloudAccountStatus = "—"
+    @State private var cloudBookkeeping = "—"
+    @State private var keychainRoundTrip = "—"
     @State private var isSeedingTestHistory = false
     @State private var testHistoryStatus = ContinueWatchingTestData.status
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
@@ -5965,6 +6108,50 @@ private struct AdvancedSettingsView: View {
                     fallback: "Local tools for debugging playback and focus"
                 )
             ) {
+                SettingsInfoRow(
+                    title: "iCloud Container",
+                    value: CloudSync.containerID,
+                    isDiagnostic: true
+                )
+                SettingsInfoRow(
+                    title: "iCloud Account",
+                    value: cloudAccountStatus,
+                    isDiagnostic: true
+                )
+                // Whether CloudKit change tags persist. When this reads "no
+                // writable directory" every record save is rejected as
+                // serverRecordChanged and sync silently never converges.
+                SettingsInfoRow(
+                    title: "iCloud Bookkeeping",
+                    value: cloudBookkeeping,
+                    isDiagnostic: true
+                )
+                SettingsInfoRow(
+                    title: "Keychain Round-Trip",
+                    value: keychainRoundTrip,
+                    isDiagnostic: true
+                )
+
+                SettingsActionRow(
+                    title: "Write Keychain Probe",
+                    subtitle: "Stamps this Apple TV into a synchronizable Keychain item, to test whether tvOS syncs it",
+                    value: "Write",
+                    accentColor: accentColor
+                ) {
+                    let marker = "\(UIDevice.current.name) @ "
+                        + Date().formatted(date: .omitted, time: .standard)
+                    keychainRoundTrip = CloudKeychainProbe.write(marker: marker)
+                }
+
+                SettingsActionRow(
+                    title: "Refresh iCloud Diagnostics",
+                    subtitle: "Re-read the container status, bookkeeping, and probe item",
+                    value: "Run",
+                    accentColor: accentColor
+                ) {
+                    Task { await refreshCloudTechnicalDiagnostics() }
+                }
+
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_playback_issue_reports", fallback: "Playback Issue Reports"),
                     subtitle: L10n.string("tvos_settings_keep_diagnostic_snapshots_after_failed_p_cd841397", fallback: "Keep diagnostic snapshots after failed playback attempts"),
@@ -6068,12 +6255,31 @@ private struct AdvancedSettingsView: View {
                 )
             }
         }
+        .task { await refreshCloudTechnicalDiagnostics() }
+    }
+
+    /// Read-only. Never writes to the Keychain — the probe write is its own row.
+    @MainActor
+    private func refreshCloudTechnicalDiagnostics() async {
+        cloudBookkeeping = CloudSyncStateStore.healthDiagnostic()
+        keychainRoundTrip = CloudKeychainProbe.read()
+        cloudAccountStatus = await CloudSyncAvailability.current().displayText
     }
 
     private func resetSettings() {
         // Reset only the active profile's settings, not other profiles'.
         let defaults = ProfileSettings.current
-        SettingsKey.all.forEach { defaults.removeObject(forKey: $0) }
+        // Configured servers are not "settings defaults" — clearing them
+        // discards hosts, shares, and Keychain credentials the user set up by
+        // hand, and would leave the scan indexes orphaned. Removing a server is
+        // its own explicit action in Integrations.
+        let preserved: Set<String> = [
+            SettingsKey.smbServers, SettingsKey.smbLibraryIndex,
+            SettingsKey.jellyfinServers, SettingsKey.jellyfinLibraryIndex
+        ]
+        SettingsKey.all
+            .filter { !preserved.contains($0) }
+            .forEach { defaults.removeObject(forKey: $0) }
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonIDs)
         defaults.removeObject(forKey: SettingsKey.homeCatalogDisabledAddonNames)
         AISubtitleKeyStore.remove()

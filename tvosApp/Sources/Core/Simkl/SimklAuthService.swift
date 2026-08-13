@@ -79,6 +79,9 @@ final class SimklKeychainTokenStorage: SimklTokenStorage {
 
     func setAccessToken(_ token: String?, for profileScope: String) {
         SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
+        // Lets the iCloud change journal stamp this; a Keychain write posts no
+        // `UserDefaults.didChangeNotification`.
+        defer { KeychainSecretBridge.postChanged() }
         guard let token, !token.isEmpty, let data = token.data(using: .utf8) else { return }
 
         var addQuery = keychainQuery(for: profileScope)

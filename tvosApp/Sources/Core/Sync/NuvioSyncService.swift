@@ -747,6 +747,12 @@ final class NuvioSyncManager: ObservableObject {
 
     private func schedulePush() {
         guard !isApplyingRemote else { return }
+        // The iCloud sync writes the same profile suites. Without this, every
+        // record it applies looks like a user edit and bounces straight back
+        // out to the account — and the two managers keep re-notifying each
+        // other. Guarded here rather than per observer so every push path is
+        // covered by one check.
+        guard !CloudSyncOrigin.isApplyingRemote else { return }
         guard AuthConfig.isConfigured else { return }
         guard authManager?.isAuthenticated == true else { return }
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
@@ -1930,6 +1936,19 @@ fileprivate final class NuvioAPIClient {
             ?? (features[Self.streamBadgeSettingsFeature] as? [String: Any])
         guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil else {
             return false
+        }
+
+        // iCloud is the settings authority wherever it is available
+        // (ICLOUD_SYNC_PLAN.md §3). Importing here as well would give the same
+        // values two writers racing over one suite, so this device reads
+        // settings from iCloud only.
+        //
+        // Returning false lets the caller push, keeping the account row a fresh
+        // mirror for the Android TV and mobile apps — but only once iCloud has
+        // actually merged. Before that this device holds nothing authoritative,
+        // and pushing would overwrite the mirror with defaults.
+        if await CloudSyncManager.isSettingsAuthority {
+            return !(await CloudSyncManager.hasCompletedInitialSync)
         }
 
         if let tvosFeature {
