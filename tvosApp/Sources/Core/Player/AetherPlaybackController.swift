@@ -3,6 +3,7 @@ import UIKit
 import AVFoundation
 import Combine
 import AetherEngine
+import AetherEngineSMB
 
 /// High-frequency state observed only by the subtitle overlay. Keeping it
 /// separate prevents Aether's 10 Hz presentation clock from rebuilding the
@@ -1960,7 +1961,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             guard let self else { return }
             do {
                 let probe: SourceProbe?
-                if let start, start > 0 {
+                if request.videoURL.scheme == "smb" {
+                    let reader = try await Self.makeSMBReader(for: request.videoURL)
+                    probe = try await self.engine.load(
+                        source: .custom(reader, formatHint: nil),
+                        startPosition: (start ?? 0) > 0 ? start : nil,
+                        options: options
+                    )
+                } else if let start, start > 0 {
                     probe = try await self.engine.load(
                         url: request.videoURL,
                         startPosition: start,
@@ -1984,6 +1992,29 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 }
             }
         }
+    }
+
+    /// Re-derives share/path from the `smb://` URL `StreamsRepository` built
+    /// (`host[:port]/share/path`), then matches it back to its configured
+    /// server by host+port to authenticate exactly as "Connect" verified in
+    /// Settings — the URL itself never carries a password. The resulting
+    /// reader is handed to the engine via `MediaSource.custom`, which takes
+    /// ownership of its lifecycle (same pattern as `HLSLiveIngestReader`
+    /// above); nothing here needs to retain or close it afterward.
+    private static func makeSMBReader(for url: URL) async throws -> SMBIOReader {
+        let parsed = try SMBURL.parse(url.absoluteString)
+        guard let server = SMBServerStore.shared.servers.first(where: {
+            $0.host.caseInsensitiveCompare(url.host ?? "") == .orderedSame && $0.port == url.port
+        }) else {
+            throw SMBConnection.SMBError(message: "No configured SMB server for \(url.host ?? "?")")
+        }
+        let connection = try await SMBConnection.connect(
+            server: parsed.server,
+            share: parsed.share,
+            path: parsed.path,
+            auth: SMBSessionManager.shared.authMode(for: server)
+        )
+        return SMBIOReader(source: connection, discImageProbeEnabled: parsed.path.lowercased().hasSuffix(".iso"))
     }
 
     func loadFile(_ urlString: String) {

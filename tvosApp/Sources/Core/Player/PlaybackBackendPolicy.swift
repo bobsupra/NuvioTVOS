@@ -63,6 +63,18 @@ enum PlaybackBackendPolicy {
     }
 
     static func resolve(_ input: Input) -> Result {
+        // MPVKit has no SMB transport, so the usual Aether→MPV fallback would
+        // fail identically and just cost the user a reload — hence
+        // allowAutomaticFallback: false. This also overrides a user-forced
+        // Player Engine = MPVKit, which is why it's checked before that switch.
+        if input.urlString.hasPrefix("smb://") {
+            return Result(
+                backend: .aether,
+                allowAutomaticFallback: false,
+                reason: "SMB source requires AetherEngine's custom IO reader",
+                statusMessage: nil
+            )
+        }
         // Hard capability exceptions always take MPV.
         if let audio = input.separateAudioURL, !audio.isEmpty {
             return Result(

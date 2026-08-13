@@ -577,6 +577,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        // Jellyfin titles carry their own metadata (synced straight from the
+        // server, see `JellyfinLibraryIndex`) and must never fall through to
+        // Cinemeta/TMDB/MDBList below — every caller of `getMetadata`
+        // (Details, Trakt/Simkl sync, ContinueWatchingBuilder, this row)
+        // goes through here, so this is the one place that needs to know.
+        if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
+            return jellyfinMeta
+        }
+
         if let cached = cachedMetadata(for: id) {
             return await TmdbDetailsService.localizedMetadata(for: cached)
         }
@@ -585,6 +594,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
+            return jellyfinMeta
+        }
+
         removeCachedMetadata(for: id)
         return try await loadMetadata(id: id, type: type)
     }

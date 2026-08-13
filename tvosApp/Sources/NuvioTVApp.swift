@@ -351,6 +351,8 @@ struct ContentView: View {
             syncManager.activeProfileChanged(profile)
             SMBServerStore.shared.reload()
             Task { await SMBSessionManager.shared.connectAll() }
+            JellyfinServerStore.shared.reload()
+            Task { await JellyfinSessionManager.shared.connectAll() }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -933,7 +935,11 @@ struct ContentView: View {
         // Hand off to the external app only when it is actually installed
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
+        // `smb://` never qualifies: it isn't a URL an external app like
+        // Infuse/VLC/nPlayer can open, only Nuvio's own SMBConnection/
+        // SMBIOReader pipeline can.
         if !isTrailer,
+           url.scheme != "smb",
            let launchURL = player.launchURL(for: url, subtitleURLs: subtitleURLs),
            UIApplication.shared.canOpenURL(launchURL) {
             UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
@@ -2352,7 +2358,17 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
     @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
     @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
+    @AppStorage(SettingsKey.smbLocalRowEnabled) private var smbLocalRowEnabled = true
+    @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = true
 
+    /// Hydrated via `repository.getMetadata`, the same path remote catalog
+    /// rows use, so TMDB/MDBList enrichment and artwork are identical. `nil`
+    /// when there is nothing indexed (or the row is off in Settings) rather
+    /// than an empty section, so `visibleSections` never inserts a blank row.
+    @State private var localTitlesSection: TVHomeSection?
+    /// Same hydration/`nil`-when-empty rationale as `localTitlesSection`, for
+    /// titles synced from a Jellyfin server.
+    @State private var jellyfinSection: TVHomeSection?
     @State private var isLoading = true
     @State private var focusedMeta: NuvioMeta?
     /// Collection folder currently focused on Home. When set, the hero shows
@@ -2718,6 +2734,18 @@ struct TVHomeView: View {
         }
         .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
             await refreshCollectionSections(for: contentIdentity)
+        }
+        .task(id: "\(contentIdentity.profileId):smbLocalTitles:\(smbLocalRowEnabled)") {
+            await loadLocalTitlesSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SMBLibraryIndex.changedNotification)) { _ in
+            Task { await loadLocalTitlesSection() }
+        }
+        .task(id: "\(contentIdentity.profileId):jellyfinTitles:\(jellyfinLocalRowEnabled)") {
+            await loadJellyfinSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: JellyfinLibraryIndex.changedNotification)) { _ in
+            Task { await loadJellyfinSection() }
         }
         .onAppear {
             #if DEBUG
@@ -3266,7 +3294,16 @@ struct TVHomeView: View {
             title: "Continue Watching",
             items: continueWatching.map(\.meta)
         )
-        let allSections = continueWatching.isEmpty ? store.sections : [resumeSection] + store.sections
+        // Continue Watching always leads Home — resuming something already
+        // in progress outranks everything else, including owned local
+        // media. Local titles, then Jellyfin, follow directly under it;
+        // both are still "owned media" outranking ordinary catalog rows,
+        // just not resume state. All three are excluded from
+        // `TVHomeCatalogOrder` (see `publishHomeSections`) so none can be
+        // reordered/hidden like a catalog row.
+        let pinnedSections = (continueWatching.isEmpty ? [] : [resumeSection])
+            + [localTitlesSection, jellyfinSection].compactMap { $0 }
+        let allSections = pinnedSections + store.sections
 
         // The common path does not need to copy and filter every add-on row on
         // each focus update. Keep the original copy-on-write item arrays intact.
@@ -3275,7 +3312,13 @@ struct TVHomeView: View {
         let today = ContentReleasePolicy.todayIsoDay()
         return allSections.map { section in
             // Collection folder rows don't carry title posters; leave them intact.
-            if !section.collectionFolders.isEmpty { return section }
+            // Local titles/Jellyfin are files/libraries the user already owns —
+            // a release-date heuristic has no business hiding them.
+            if !section.collectionFolders.isEmpty
+                || section.id == TVHomeSection.localTitlesId
+                || section.id == TVHomeSection.jellyfinId {
+                return section
+            }
             var copy = section
             copy.items = section.items.filter {
                 !ContentReleasePolicy.isUnreleased($0, today: today)
@@ -4307,10 +4350,87 @@ struct TVHomeView: View {
     private func refreshWatchedTitles() {
         watchedTitleKeys = WatchedStore.visibleWholeTitleIdentityKeys()
     }
+
+    /// Hydrates the "Local titles" row from `SMBLibraryIndex` through the same
+    /// `getMetadata` path remote catalog rows use — TMDB/MDBList enrichment,
+    /// artwork, and ratings all come along for free. Bounded concurrency keeps
+    /// a large library from firing dozens of requests at once; order matches
+    /// `SMBLibraryIndex.titles()` (most-recently-configured server first).
+    @MainActor
+    private func loadLocalTitlesSection() async {
+        guard smbLocalRowEnabled else {
+            localTitlesSection = nil
+            return
+        }
+        let indexed = SMBLibraryIndex.shared.titles()
+        guard !indexed.isEmpty else {
+            localTitlesSection = nil
+            return
+        }
+
+        let maxConcurrent = 6
+        var metasByContentId: [String: NuvioMeta] = [:]
+        var iterator = indexed.makeIterator()
+        await withTaskGroup(of: (String, NuvioMeta?).self) { group in
+            func startNext() {
+                guard let title = iterator.next() else { return }
+                group.addTask { [repository] in
+                    let meta = try? await repository.getMetadata(id: title.contentId, type: title.type)
+                    return (title.contentId, meta)
+                }
+            }
+            for _ in 0..<maxConcurrent { startNext() }
+            while let (contentId, meta) = await group.next() {
+                if let meta { metasByContentId[contentId] = meta }
+                startNext()
+            }
+        }
+
+        let metas = indexed.compactMap { metasByContentId[$0.contentId] }
+        guard !metas.isEmpty else {
+            localTitlesSection = nil
+            return
+        }
+        localTitlesSection = TVHomeSection(
+            id: TVHomeSection.localTitlesId,
+            title: L10n.string("home_local_titles", fallback: "Local titles"),
+            items: metas
+        )
+    }
+
+    /// Hydrates the "Jellyfin" row straight from `JellyfinLibraryIndex` —
+    /// unlike `loadLocalTitlesSection()`, there's no `getMetadata` round trip
+    /// at all: every synced title already carries its own Jellyfin-sourced
+    /// metadata, and that's the only metadata a Jellyfin title ever shows.
+    @MainActor
+    private func loadJellyfinSection() async {
+        guard jellyfinLocalRowEnabled else {
+            jellyfinSection = nil
+            return
+        }
+        let indexed = JellyfinLibraryIndex.shared.titles()
+        let metas = indexed.compactMap { JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId) }
+        guard !metas.isEmpty else {
+            jellyfinSection = nil
+            return
+        }
+        jellyfinSection = TVHomeSection(
+            id: TVHomeSection.jellyfinId,
+            title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
+            items: metas
+        )
+    }
 }
 
 struct TVHomeSection: Identifiable {
     static let continueWatchingId = "continue_watching"
+    /// Local SMB titles, pinned above Continue Watching. Not a catalog row —
+    /// excluded from `TVHomeCatalogOrder` reordering/hiding and from hero
+    /// selection, same treatment as Continue Watching.
+    static let localTitlesId = "local_titles"
+    /// Titles synced from a Jellyfin server, pinned directly under Local
+    /// titles. Same exclusions as `localTitlesId`.
+    static let jellyfinId = "jellyfin_titles"
     /// Id prefix for rows built from account-synced collections.
     static let collectionIdPrefix = "collection_"
 

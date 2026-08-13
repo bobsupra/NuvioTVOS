@@ -125,6 +125,13 @@
 		T0D310E200000000000000E2 /* StreamsDiscoveryTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */; };
 		T0D310E3 /* StreamQualityTagsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E3 /* StreamQualityTagsTests.swift */; };
 		T0D310E4 /* CatalogDecodingTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = T0D300E4 /* CatalogDecodingTests.swift */; };
+		A9DBFE20302D151B007F842B /* JellyfinServerConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE10302D151B007F842B /* JellyfinServerConfig.swift */; };
+		A9DBFE21302D151B007F842B /* JellyfinCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE11302D151B007F842B /* JellyfinCredentialStore.swift */; };
+		A9DBFE22302D151B007F842B /* JellyfinServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE12302D151B007F842B /* JellyfinServerStore.swift */; };
+		A9DBFE23302D151B007F842B /* JellyfinClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE13302D151B007F842B /* JellyfinClient.swift */; };
+		A9DBFE24302D151B007F842B /* JellyfinLibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE14302D151B007F842B /* JellyfinLibraryIndex.swift */; };
+		A9DBFE25302D151B007F842B /* JellyfinLibraryResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE15302D151B007F842B /* JellyfinLibraryResolver.swift */; };
+		A9DBFE26302D151B007F842B /* JellyfinSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A9DBFE16302D151B007F842B /* JellyfinSessionManager.swift */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -292,6 +299,13 @@
 		T0D300E200000000000000E2 /* StreamsDiscoveryTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamsDiscoveryTests.swift; sourceTree = "<group>"; };
 		T0D300E3 /* StreamQualityTagsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = StreamQualityTagsTests.swift; sourceTree = "<group>"; };
 		T0D300E4 /* CatalogDecodingTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CatalogDecodingTests.swift; sourceTree = "<group>"; };
+		A9DBFE10302D151B007F842B /* JellyfinServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinServerConfig.swift; sourceTree = "<group>"; };
+		A9DBFE11302D151B007F842B /* JellyfinCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinCredentialStore.swift; sourceTree = "<group>"; };
+		A9DBFE12302D151B007F842B /* JellyfinServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinServerStore.swift; sourceTree = "<group>"; };
+		A9DBFE13302D151B007F842B /* JellyfinClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinClient.swift; sourceTree = "<group>"; };
+		A9DBFE14302D151B007F842B /* JellyfinLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinLibraryIndex.swift; sourceTree = "<group>"; };
+		A9DBFE15302D151B007F842B /* JellyfinLibraryResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinLibraryResolver.swift; sourceTree = "<group>"; };
+		A9DBFE16302D151B007F842B /* JellyfinSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JellyfinSessionManager.swift; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -535,6 +549,7 @@
 			isa = PBXGroup;
 			children = (
 				A9DBFD03302D151B007F842B /* SMB */,
+				A9DBFE30302D151B007F842B /* Jellyfin */,
 				A9DBFC28302D0CA1007F842B /* Addons */,
 				A9DBFC2E302D0CA1007F842B /* Auth */,
 				A9DBFC33302D0CA1007F842B /* Cloud */,
@@ -740,6 +755,20 @@
 				A9DBFC9E302D0CA1007F842B /* NuvioTVApp.swift */,
 			);
 			path = Sources;
+			sourceTree = "<group>";
+		};
+		A9DBFE30302D151B007F842B /* Jellyfin */ = {
+			isa = PBXGroup;
+			children = (
+				A9DBFE10302D151B007F842B /* JellyfinServerConfig.swift */,
+				A9DBFE11302D151B007F842B /* JellyfinCredentialStore.swift */,
+				A9DBFE12302D151B007F842B /* JellyfinServerStore.swift */,
+				A9DBFE13302D151B007F842B /* JellyfinClient.swift */,
+				A9DBFE14302D151B007F842B /* JellyfinLibraryIndex.swift */,
+				A9DBFE15302D151B007F842B /* JellyfinLibraryResolver.swift */,
+				A9DBFE16302D151B007F842B /* JellyfinSessionManager.swift */,
+			);
+			path = Jellyfin;
 			sourceTree = "<group>";
 		};
 		A9DBFD03302D151B007F842B /* SMB */ = {
@@ -998,6 +1027,13 @@
 				A9DBFD08302D151B007F842B /* SMBLibraryResolver.swift in Sources */,
 				A9DBFD09302D151B007F842B /* SMBCredentialStore.swift in Sources */,
 				A9DBFD0A302D151B007F842B /* MediaFilenameParser.swift in Sources */,
+				A9DBFE20302D151B007F842B /* JellyfinServerConfig.swift in Sources */,
+				A9DBFE21302D151B007F842B /* JellyfinCredentialStore.swift in Sources */,
+				A9DBFE22302D151B007F842B /* JellyfinServerStore.swift in Sources */,
+				A9DBFE23302D151B007F842B /* JellyfinClient.swift in Sources */,
+				A9DBFE24302D151B007F842B /* JellyfinLibraryIndex.swift in Sources */,
+				A9DBFE25302D151B007F842B /* JellyfinLibraryResolver.swift in Sources */,
+				A9DBFE26302D151B007F842B /* JellyfinSessionManager.swift in Sources */,
 				A9DBFD0B302D151B007F842B /* SMBLibraryScanner.swift in Sources */,
 				A9DBFCA4302D0CA1007F842B /* DebridDeviceAuthorization.swift in Sources */,
 				A9DBFCA5302D0CA1007F842B /* AuthModels.swift in Sources */,

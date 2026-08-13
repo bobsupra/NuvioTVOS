@@ -52,6 +52,64 @@ final class StreamsRepository: ObservableObject {
         return (season, episode)
     }
 
+    /// Stremio stream requests carry season/episode embedded in `videoId`
+    /// ("tt1234567:1:5"); `SMBIndexedTitle.contentId` is the bare Cinemeta id.
+    nonisolated private static func baseContentId(from videoId: String) -> String {
+        String(videoId.split(separator: ":").first ?? Substring(videoId))
+    }
+
+    /// Local files already indexed for this title/episode, as a synthetic
+    /// "Local (SMB)" group — resolved synchronously (no network round trip),
+    /// so it can lead the stream list the instant discovery starts.
+    private func localStreamGroup(type: String, videoId: String) -> AddonStreamGroup? {
+        let contentId = Self.baseContentId(from: videoId)
+        let se = Self.seasonEpisode(fromVideoId: videoId)
+        let files = SMBLibraryIndex.shared.files(forContentId: contentId, season: se.season, episode: se.episode)
+        guard !files.isEmpty else { return nil }
+
+        let serversByID = Dictionary(uniqueKeysWithValues: SMBServerStore.shared.servers.map { ($0.id, $0) })
+        let streams: [NuvioStream] = files.compactMap { file -> NuvioStream? in
+            guard let server = serversByID[file.serverID] else { return nil }
+            return NuvioStream(
+                url: file.streamPath(hostAndPort: server.hostAndPort),
+                name: server.displayName,
+                description: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
+                addonName: "Local (SMB)",
+                filename: file.filename,
+                videoSize: file.size
+            )
+        }
+        guard !streams.isEmpty else { return nil }
+        return AddonStreamGroup(addonId: "local.smb", displayName: "Local (SMB)", streams: streams, isLoading: false)
+    }
+
+    /// Titles already synced from a Jellyfin server, as a synthetic
+    /// "Jellyfin" group — same synchronous, no-round-trip shape as
+    /// `localStreamGroup`, since the sync step already resolved the item ids.
+    private func jellyfinStreamGroup(type: String, videoId: String) -> AddonStreamGroup? {
+        let contentId = Self.baseContentId(from: videoId)
+        let se = Self.seasonEpisode(fromVideoId: videoId)
+        guard let title = JellyfinLibraryIndex.shared.titles().first(where: { $0.contentId == contentId }),
+              let server = JellyfinServerStore.shared.server(id: title.serverID),
+              let baseURL = server.baseURL else { return nil }
+        let items = title.items.filter { $0.season == se.season && $0.episode == se.episode }
+        guard !items.isEmpty else { return nil }
+
+        let token = JellyfinCredentialStore.token(forServerID: server.id)
+        let streams: [NuvioStream] = items.compactMap { item -> NuvioStream? in
+            guard let url = item.streamURL(baseURL: baseURL, accessToken: token) else { return nil }
+            return NuvioStream(
+                url: url.absoluteString,
+                name: server.displayName,
+                description: item.size.map { ByteCountFormatter.string(fromByteCount: $0, countStyle: .file) },
+                addonName: "Jellyfin",
+                videoSize: item.size
+            )
+        }
+        guard !streams.isEmpty else { return nil }
+        return AddonStreamGroup(addonId: "local.jellyfin", displayName: "Jellyfin", streams: streams, isLoading: false)
+    }
+
     // MARK: - Public API
 
     func load(
@@ -135,6 +193,10 @@ final class StreamsRepository: ObservableObject {
             isAnyLoading: true
         )
 
+        let localGroup = localStreamGroup(type: type, videoId: videoId)
+        let jellyfinGroup = jellyfinStreamGroup(type: type, videoId: videoId)
+        let ownedGroups = [localGroup, jellyfinGroup].compactMap { $0 }
+
         let preferences = CinemetaCatalogRepository.configuredStreamAddonPreferences
         let enabledURLs = preferences.compactMap { pref -> URL? in
             guard pref.enabled else { return nil }
@@ -144,15 +206,18 @@ final class StreamsRepository: ObservableObject {
         print("[StreamsRepo] configured=\(preferences.count) enabled=\(enabledURLs.count) type=\(type) id=\(videoId)")
 
         guard !enabledURLs.isEmpty else {
+            // A NAS-only/Jellyfin-only user with no add-ons configured still
+            // has their owned media — that must not read as "no add-ons
+            // configured".
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: [],
+                groups: ownedGroups,
                 isAnyLoading: false,
-                emptyStateReason: .noAddonsConfigured,
+                emptyStateReason: ownedGroups.isEmpty ? .noAddonsConfigured : nil,
                 hasResolvedTargets: true
             )
-            print("[StreamsRepo] no enabled add-ons")
+            print("[StreamsRepo] no enabled add-ons, owned=\(ownedGroups.reduce(0) { $0 + $1.streams.count })")
             return
         }
 
@@ -192,7 +257,9 @@ final class StreamsRepository: ObservableObject {
         }
 
         // Create every group as loading *before* any request so chips appear immediately.
-        let initialGroups = targets.map {
+        // The owned groups (if any) are already resolved — no network round
+        // trip — so they lead the list and never carry a loading state.
+        let initialGroups = ownedGroups + targets.map {
             AddonStreamGroup(
                 addonId: $0.addonId,
                 displayName: $0.displayName,

@@ -94,6 +94,16 @@ final class PlaybackSessionCoordinator: ObservableObject {
             print("[PlaybackCoordinator] fallback already used for \(currentURLString ?? "?")")
             return
         }
+        // MPVKit has no SMB transport. The automatic-fallback path is already
+        // blocked for SMB via `allowAutomaticFallback` (see
+        // `PlaybackBackendPolicy`), but `requestMPVForAudioControls` hands off
+        // unconditionally on a user action (audio delay/gain), so this needs
+        // its own guard rather than silently attempting a load MPV can't do.
+        guard request.videoURL.scheme != "smb" else {
+            print("[PlaybackCoordinator] refusing MPV handoff for SMB source (\(reason))")
+            onHandoffToast?("Compatibility player isn't available for local network files")
+            return
+        }
 
         isHandoffInProgress = true
         isProgressSaveSuspended = true
