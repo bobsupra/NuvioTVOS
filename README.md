@@ -43,15 +43,13 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 
 > **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases**.
 
-## Latest tvOS Beta
+## Upcoming tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.2.8** is the latest tvOS release.
+**Beta 3.2.8** is coming soon.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.8/NuvioTV-3.2.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
-
-The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
 ### New in Beta 3.2.8
 
