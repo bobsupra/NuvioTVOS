@@ -17,7 +17,7 @@ Two complementary samples covering different audiences:
    ```
    https://github.com/superuser404notfound/AetherEngine
    ```
-   Dependency Rule: Up to Next Major Version, starting from `6.7.0`. Add the `AetherEngine` library product to your app target.
+   Dependency Rule: Up to Next Major Version, starting from `6.21.0`. Add the `AetherEngine` library product to your app target.
 
 3. **Drop the file in.** Replace the Xcode template's default `App.swift` (or whatever the generated `@main` file is called) with the contents of [`MinimalPlayerApp.swift`](MinimalPlayer/MinimalPlayerApp.swift). The file is self-contained: it defines both the `@main App` struct and the `ContentView`.
 

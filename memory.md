@@ -485,3 +485,56 @@ Verified reference artifact:
 - `build/NuvioTV-3.2.2-53-exact-id-signed.ipa`
 - SHA-256:
   `bac3d45ad2694b04645bef533cf00a7725da837b08bcbd218707d4d62a888f0e`
+
+## Home vertical catalog scrolling lag fix
+
+Last verified: 2026-08-15 on tvOS Simulator & Apple TV.
+
+### Symptom
+
+Navigating vertically between catalog rows on Home (e.g. between "Popular - Series" and "Top Rated - Movies") produced a noticeable frame drop / stuttering lag during the vertical scroll animation, even after debouncing hero metadata updates.
+
+### Root Causes
+
+1. **Obsolete `HomeTabBarScrollState`**:
+   - A legacy non-interactive `ScrollView` with two 1080pt children was listening to `focusedRowIndex` to scroll between `0` and `1`.
+   - On tvOS 18+ with `.tabViewStyle(.sidebarAdaptable)`, tvOS monitors active scroll views to collapse/expand the floating sidebar pill.
+   - Crossing between row 0 and row 1 triggered a full 1080pt scroll in that hidden view, forcing tvOS to synchronously animate the system tab bar and recalculate window safe areas mid-animation.
+   - For all rows > 1, `rowIndex == 0 ? 0 : 1` stayed `1` (a no-op), which is why the issue manifested selectively between the top catalogs.
+
+2. **`LazyVStack` synchronous 44ms layout spikes**:
+   - `TVHeroView` occupies ~500pt of the 1080pt screen, leaving only ~580pt for the catalog `ScrollView`.
+   - Because catalog rows were placed in a `LazyVStack`, rows that were only 1 position away from the current focus were unmounted.
+   - When scrolling down, the newly entering catalog row (e.g. `series_rating`) was constructed synchronously on the main thread mid-scroll, causing a **44ms main-thread stall** (dropping 3–5 consecutive frames).
+   - Scrolling back up forced the previously scrolled-out row to remount again.
+
+3. **Cascading view tree re-renders**:
+   - Every focus change (`focusedRowIndex`, `focusedCardID`) re-evaluated `TVHomeView.body`.
+   - Because `TVCatalogRow`, `TVCollectionFolderRow`, `TVHeroView`, and `CrossfadingBackdrop` were not `Equatable`, SwiftUI was evaluating their body blocks on every focus step (e.g. `TVHeroView` was rendering 6 times per step).
+
+### Fix and Required Invariants
+
+1. **Removed `HomeTabBarScrollState`**:
+   - The native `ScrollView(.vertical)` around catalog rows now handles scrolling naturally without artificial duplicate scroll view jumps.
+2. **Replaced `LazyVStack` with `VStack` inside `ScrollView(.vertical)`**:
+   - Each `TVCatalogRow` already virtualizes its horizontal cards (`materializedCardIndices` maintains only ~11 visible cards).
+   - Keeping the catalog rows pre-mounted inside `VStack` eliminates runtime row construction stalls (`0ms` mount time during scrolling).
+3. **`Equatable` conformances and `.equatable()` modifiers**:
+   - Added `Equatable, Hashable` to `NuvioMeta`.
+   - Added `Equatable` conformances and `.equatable()` to:
+     - `TVCatalogRow`
+     - `TVCollectionFolderRow`
+     - `TVHeroView`
+     - `CrossfadingBackdrop`
+   - Unaffected rows and the Hero skip body re-evaluations during navigation.
+
+### Key Code
+
+- `tvosApp/NuvioTV/Sources/NuvioTVApp.swift`
+  - `TVHomeView.body` (removed `HomeTabBarScrollState`, added `VStack`, `.equatable()` on rows/Hero/Backdrop).
+  - `CrossfadingBackdrop` (`Equatable` conformance).
+  - `TVHeroView` (`Equatable` conformance).
+  - `TVCatalogRow` (`Equatable` conformance).
+  - `TVCollectionFolderRow` (`Equatable` conformance).
+- `tvosApp/NuvioTV/Sources/Models/CatalogModels.swift`
+  - `NuvioMeta` (`Equatable`, `Hashable` conformances).

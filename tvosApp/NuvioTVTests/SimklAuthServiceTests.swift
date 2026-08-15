@@ -1287,6 +1287,50 @@ final class SimklAuthServiceTests: XCTestCase {
         )!
         return (response, Data(json.utf8))
     }
+
+    func testSimklKeychainTokenStorageMirrorsAndRecoversFromProfileSettings() {
+        let storage = SimklKeychainTokenStorage()
+        let testScope = "test-profile-\(UUID().uuidString)"
+        let profileStore = ProfileSettings.store(for: testScope)
+
+        // Clean slate
+        storage.setAccessToken(nil, for: testScope)
+        XCTAssertNil(storage.accessToken(for: testScope))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
+
+        // Saving token mirrors to ProfileSettings
+        storage.setAccessToken("test-token-12345", for: testScope)
+        XCTAssertEqual(profileStore.string(forKey: SettingsKey.simklAccessToken), "test-token-12345")
+        XCTAssertEqual(storage.accessToken(for: testScope), "test-token-12345")
+
+        // Clearing token deletes from ProfileSettings
+        storage.setAccessToken(nil, for: testScope)
+        XCTAssertNil(storage.accessToken(for: testScope))
+        XCTAssertNil(profileStore.string(forKey: SettingsKey.simklAccessToken))
+
+        // If another device synced the token via iCloud into ProfileSettings, storage recovers it
+        profileStore.set("cloud-synced-token", forKey: SettingsKey.simklAccessToken)
+        XCTAssertEqual(storage.accessToken(for: testScope), "cloud-synced-token")
+
+        // Clean up
+        storage.setAccessToken(nil, for: testScope)
+    }
+
+    @MainActor
+    func testICloudSettingsSyncManagerToggleAndKeys() {
+        let manager = ICloudSettingsSyncManager.shared
+        let original = manager.isEnabled
+
+        manager.isEnabled = true
+        XCTAssertTrue(UserDefaults.standard.bool(forKey: SettingsKey.iCloudSyncEnabled))
+        XCTAssertTrue(manager.isEnabled)
+
+        manager.isEnabled = false
+        XCTAssertFalse(UserDefaults.standard.bool(forKey: SettingsKey.iCloudSyncEnabled))
+        XCTAssertFalse(manager.isEnabled)
+
+        manager.isEnabled = original
+    }
 }
 
 private actor SimklIntegerRecorder {

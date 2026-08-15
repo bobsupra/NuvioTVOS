@@ -91,6 +91,8 @@ enum ContinueWatchingBuilder {
     }
 
     static func rebuild(reason: String) async {
+        let rebuildStarted = TVHomeDebugTrace.now()
+        TVHomeDebugTrace.log("cw.builder.rebuild.begin reason=\(reason)")
         // With Trakt or Simkl driving the row, Home renders that provider's list
         // and this derived one is never shown. Keep syncing rows into the ledger,
         // but do not spend metadata requests rendering something invisible.
@@ -108,10 +110,12 @@ enum ContinueWatchingBuilder {
         let ledgerSnapshot = WatchProgressLedger.records()
 
         let candidates = WatchProgressLedger.continueWatchingCandidates()
-        let seeds = mergedSeedRecords(
-            WatchProgressLedger.upNextSeeds(),
-            watchedHistorySeeds()
-        )
+        let seeds = ContinueWatchingFeatureFlags.nextUpCardsEnabled
+            ? mergedSeedRecords(
+                WatchProgressLedger.upNextSeeds(),
+                watchedHistorySeeds()
+            )
+            : []
         guard !candidates.isEmpty || !seeds.isEmpty else {
             diagnostic = "\(reason): ledger empty"
             plan = []
@@ -149,6 +153,11 @@ enum ContinueWatchingBuilder {
             + "candidates \(candidates.count), seeds \(seeds.count), plan \(plan.count), "
             + "page 1 built \(page.items.count), showing \(ContinueWatchingStore.items().count), "
             + "lookups failed \(page.failedLookups)"
+        TVHomeDebugTrace.log(
+            "cw.builder.rebuild.end page=\(page.items.count) plan=\(plan.count) "
+                + "failed=\(page.failedLookups) "
+                + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: rebuildStarted))"
+        )
     }
 
     /// Visible for regression coverage of the stale-rebuild commit gate.
@@ -183,6 +192,7 @@ enum ContinueWatchingBuilder {
         generation currentGeneration: UInt,
         profileId: String?
     ) async -> PageResult {
+        let pageStarted = TVHomeDebugTrace.now()
         let slice = Array(plan.dropFirst(consumedEntries).prefix(pageSize))
         guard !slice.isEmpty else { return PageResult(items: materialized, failedLookups: 0) }
 
@@ -211,6 +221,11 @@ enum ContinueWatchingBuilder {
         }
 
         let fetched = await fetchMetadata(needsFetch)
+        TVHomeDebugTrace.log(
+            "cw.builder.page slice=\(slice.count) metadataRequests=\(needsFetch.count) "
+                + "resolved=\(fetched.count) "
+                + "fetchMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: pageStarted))"
+        )
         guard !Task.isCancelled, currentGeneration == generation,
               profileId == WatchProgressLedger.activeProfileId else {
             return PageResult(items: materialized, failedLookups: 0)
@@ -296,6 +311,10 @@ enum ContinueWatchingBuilder {
 
         consumedEntries += slice.count
         materialized = retainingUnwatched(materialized + page)
+        TVHomeDebugTrace.log(
+            "cw.builder.page.end rendered=\(page.count) total=\(materialized.count) "
+                + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: pageStarted))"
+        )
         return PageResult(items: materialized, failedLookups: failedLookups)
     }
 

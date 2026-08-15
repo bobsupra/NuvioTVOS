@@ -1590,7 +1590,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             dynamicRange: range,
             resolution: width > 0 && height > 0 ? "\(width)×\(height)" : "Unknown",
             frameRate: fps.map { String(format: "%.3f fps", $0) } ?? "Unknown fps",
-            audio: audio
+            audio: audio,
+            diagnostics: engine.displayDebugLines
         )
     }
 

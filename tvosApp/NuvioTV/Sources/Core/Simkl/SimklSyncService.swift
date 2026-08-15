@@ -1683,6 +1683,11 @@ struct SimklProgressService {
     /// so without this a rejected scrobble is indistinguishable from a sent one.
     static private(set) var scrobbleDiagnostic = "not attempted"
 
+    /// Bounded metadata fetch concurrency. Matches the Continue Watching
+    /// builder's limit so a large paused list fans out without flooding the
+    /// upstream metadata hosts with one request per title at once.
+    private static let metadataConcurrency = 4
+
     static func fetchContinueWatching(
         repository: CatalogRepository,
         store: UserDefaults = ProfileSettings.current
@@ -1742,10 +1747,28 @@ struct SimklProgressService {
             return meta
         }
 
-        var results: [ContinueWatchingItem] = []
-        for playback in playbacks.sorted(by: {
+        let sortedPlaybacks = playbacks.sorted(by: {
             (parseDate($0.pausedAt) ?? .distantPast) > (parseDate($1.pausedAt) ?? .distantPast)
-        }) {
+        })
+
+        // Resolve metadata in parallel: a large paused list used to fetch one
+        // title at a time, which turned many paused rows into the same number
+        // of sequential network round-trips before the row could appear. The
+        // index keeps the pausedAt ordering stable no matter which request
+        // finishes first.
+        struct PlaybackPlan {
+            let index: Int
+            let progress: Double
+            let seed: (item: SimklSyncItem, type: String)
+            let placeholder: NuvioMeta
+            let pausedAt: Date?
+            let season: Int?
+            let episode: Int?
+            let episodeTitle: String?
+        }
+        var plan: [PlaybackPlan] = []
+        plan.reserveCapacity(sortedPlaybacks.count)
+        for (index, playback) in sortedPlaybacks.enumerated() where !Task.isCancelled {
             // Cut at the same percentage the rest of the app calls "finished".
             // Simkl's own resumable window is wider (it only auto-completes at
             // 80% on `/scrobble/stop`), but admitting 90-100% here surfaces rows
@@ -1762,41 +1785,82 @@ struct SimklProgressService {
                 type: seed.type,
                 watchedDates: watchedDates
             ) else { continue }
-            let meta = (try? await repository.getMetadata(id: placeholder.id, type: seed.type))
-                ?? placeholder
-            let duration = runtimeSeconds(meta.runtime) ?? 100
-            results.append(
-                ContinueWatchingItem(
-                    meta: meta,
-                    streamUrl: "",
-                    position: duration * progress / 100,
-                    duration: duration,
-                    lastWatchedAt: parseDate(playback.pausedAt) ?? Date(),
+            plan.append(
+                PlaybackPlan(
+                    index: index,
+                    progress: progress,
+                    seed: seed,
+                    placeholder: placeholder,
+                    pausedAt: parseDate(playback.pausedAt),
                     season: playback.episode?.season,
                     episode: playback.episode?.resolvedNumber,
-                    released: nil,
-                    episodeTitleOverride: playback.episode?.title,
-                    episodeOverviewOverride: nil,
-                    episodeThumbnailOverride: nil,
-                    isUpNext: false
+                    episodeTitle: playback.episode?.title
                 )
             )
         }
 
+        let rows = await withTaskGroup(of: (Int, ContinueWatchingItem?).self) { group in
+            var results: [Int: ContinueWatchingItem] = [:]
+            results.reserveCapacity(plan.count)
+            var iterator = plan.makeIterator()
+            var inFlight = 0
+
+            func addNext() {
+                guard let entry = iterator.next() else { return }
+                inFlight += 1
+                group.addTask {
+                    let meta = (try? await repository.getMetadata(
+                        id: entry.placeholder.id,
+                        type: entry.seed.type
+                    )) ?? entry.placeholder
+                    let duration = runtimeSeconds(meta.runtime) ?? 100
+                    let item = ContinueWatchingItem(
+                        meta: meta,
+                        streamUrl: "",
+                        position: duration * entry.progress / 100,
+                        duration: duration,
+                        lastWatchedAt: entry.pausedAt ?? Date(),
+                        season: entry.season,
+                        episode: entry.episode,
+                        released: nil,
+                        episodeTitleOverride: entry.episodeTitle,
+                        episodeOverviewOverride: nil,
+                        episodeThumbnailOverride: nil,
+                        isUpNext: false
+                    )
+                    return (entry.index, item)
+                }
+            }
+
+            for _ in 0..<min(metadataConcurrency, plan.count) { addNext() }
+            while inFlight > 0 {
+                guard let (index, item) = await group.next() else { break }
+                inFlight -= 1
+                if let item { results[index] = item }
+                addNext()
+            }
+            return results.sorted { $0.key < $1.key }.map(\.value)
+        }
+
+        var results = rows
+        if results.count > 20 { results = Array(results.prefix(20)) }
+
         // A real paused row wins over a generated suggestion for the same
         // title. This also keeps the one-card-per-title rule in Home from
         // hiding a resume row behind its Up Next counterpart.
-        for seed in upNextSeeds where !playbackMetas.contains(where: {
-            WatchedStore.sameContent($0, seed.meta)
-        }) {
-            guard results.count < 20,
-                  !Task.isCancelled,
-                  let item = await makeUpNextItem(from: seed, repository: repository) else {
-                continue
+        if results.count < 20 {
+            for seed in upNextSeeds where !playbackMetas.contains(where: {
+                WatchedStore.sameContent($0, seed.meta)
+            }) {
+                guard results.count < 20,
+                      !Task.isCancelled,
+                      let item = await makeUpNextItem(from: seed, repository: repository) else {
+                    continue
+                }
+                results.append(item)
             }
-            results.append(item)
         }
-        return Array(results.prefix(20))
+        return results
     }
 
     private struct UpNextSeed {

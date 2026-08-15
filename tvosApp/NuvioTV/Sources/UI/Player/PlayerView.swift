@@ -267,9 +267,8 @@ struct PlayerView: View {
                 .zIndex(3)
             }
 
-            // Next-episode prompt, shown near the end. With Auto-Play enabled,
-            // its countdown advances to the following episode; otherwise the
-            // Play button remains available for a manual advance.
+            // Next-episode prompt, shown near the end. It auto-hides after five
+            // seconds like the skip card; Auto-Play can still advance afterward.
             if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
                 Button(action: { viewModel.playNextEpisode() }) {
                     NextEpisodeOverlay(
@@ -328,7 +327,6 @@ struct PlayerView: View {
                     .zIndex(7)
             }
 
-            #if DEBUG
             if viewModel.isPlaybackDebugHUDVisible,
                let info = viewModel.playbackDebugInfo {
                 PlaybackDebugHUD(
@@ -338,7 +336,6 @@ struct PlayerView: View {
                 .transition(.opacity.combined(with: .move(edge: .top)))
                 .zIndex(100)
             }
-            #endif
         }
         .animation(.playerControls, value: viewModel.showSettingsPanel)
         .animation(.playerControls, value: viewModel.showNextEpisodeCard)
@@ -572,7 +569,6 @@ struct PlayerView: View {
     }
 }
 
-#if DEBUG
 private struct PlaybackDebugHUD: View {
     let info: PlaybackDebugInfo
     let reason: String
@@ -592,6 +588,13 @@ private struct PlaybackDebugHUD: View {
                 Text(line)
                     .font(.system(size: 19, weight: .semibold, design: .monospaced))
                     .foregroundStyle(.white)
+            }
+
+            ForEach(info.diagnostics, id: \.self) { line in
+                Text(line)
+                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .foregroundStyle(.cyan)
+                    .fixedSize(horizontal: false, vertical: true)
             }
 
             if !reason.isEmpty {
@@ -617,7 +620,6 @@ private struct PlaybackDebugHUD: View {
         .accessibilityLabel("Playback debug information")
     }
 }
-#endif
 
 // Hosts the libmpv UIViewController (owns the CAMetalLayer surface).
 struct MPVVideoSurface: UIViewControllerRepresentable {

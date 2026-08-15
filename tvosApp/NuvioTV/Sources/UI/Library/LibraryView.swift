@@ -25,6 +25,10 @@ public struct LibraryView: View {
     /// snapping back to the top of the grid.
     @State private var lastFocusedItemID: String?
     @State private var shouldRestoreFocus = false
+    /// Debounced arming of the restore flag: a rapid vertical move blips
+    /// `focusedItemID` to nil while the next lazy cell materializes, and
+    /// arming instantly on that blip bounces focus back to the previous card.
+    @State private var restoreArmTask: Task<Void, Never>?
     /// Card to actively re-focus once the Details overlay dismisses; captured
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreItemID: String?
@@ -175,12 +179,13 @@ public struct LibraryView: View {
         }
         .onChange(of: focusedItemID) { _, newValue in
             if let newValue {
+                restoreArmTask?.cancel()
                 lastFocusedItemID = newValue
                 shouldRestoreFocus = false
                 // Restoration complete -- lift the focus restriction.
                 if isEnabled, newValue == overlayRestoreItemID { overlayRestoreItemID = nil }
             } else if lastFocusedItemID != nil {
-                shouldRestoreFocus = true
+                scheduleRestoreArm()
             }
         }
         // Overlay dismissal re-places focus geometrically without consulting
@@ -197,6 +202,19 @@ public struct LibraryView: View {
         }
         .task {
             await viewModel.refreshSelectedLibrary()
+        }
+    }
+
+    /// Arms the restore flag only after focus has stayed off the cards long
+    /// enough that the nil is a real departure (menu/tab) instead of the
+    /// one-frame blip of a rapid vertical move between lazy cells.
+    private func scheduleRestoreArm() {
+        guard lastFocusedItemID != nil, focusedItemID == nil else { return }
+        restoreArmTask?.cancel()
+        restoreArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, focusedItemID == nil else { return }
+            shouldRestoreFocus = true
         }
     }
 

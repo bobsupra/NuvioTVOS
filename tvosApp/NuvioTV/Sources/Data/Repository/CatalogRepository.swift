@@ -963,13 +963,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         guard !query.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return [] }
         async let movies = fetchCatalog(type: "movie", catalogId: "top", skip: nil, search: query, genre: nil)
         async let series = fetchCatalog(type: "series", catalogId: "top", skip: nil, search: query, genre: nil)
-        // Search must become useful as soon as Cinemeta responds. Enriching
-        // every result with a separate TMDB details request delayed the grid by
-        // one slow request per card; Details still performs full enrichment for
-        // the title the user actually opens.
         let results = try await movies + series
-        cacheMetadata(results)
-        return results
+        let localized = await TmdbDetailsService.localizedMetadata(for: results)
+        cacheMetadata(localized)
+        return localized
     }
 
     func browseCatalog(

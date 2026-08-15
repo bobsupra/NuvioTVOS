@@ -94,6 +94,11 @@ struct PosterCard: View {
             )
             .onChange(of: isFocused) { _, focused in
                 if focused {
+                    TVHomeDebugTrace.log(
+                        "card.focus meta=\(meta.id) landscape=\(effectiveLandscape) "
+                            + "episode=\(continueEpisodeText ?? "nil") "
+                            + "episodeArt=\(continueEpisodeArtworkURL != nil)"
+                    )
                     onFocus?(meta)
                     didFinishTrailerPreview = false
                 } else {
@@ -118,6 +123,10 @@ struct PosterCard: View {
                 }
                 guard !Task.isCancelled, isFocused else { return }
                 landscapePreloadArmed = true
+                TVHomeDebugTrace.log(
+                    "card.preload.arm meta=\(meta.id) landscapeURL=\(landscapeArtworkURL != nil) "
+                        + "episodeArt=\(continueEpisodeArtworkURL != nil)"
+                )
             }
             .onAppear {
                 guard shouldRequestInitialFocus, !didRequestInitialFocus else {
@@ -173,10 +182,14 @@ struct PosterCard: View {
             // trailer is ready to draw, avoiding a black frame on slow links.
             .opacity(isTrailerPreviewVisible ? 0 : 1)
             .overlay {
-                if isFocused && trailersEnabled && !didFinishTrailerPreview {
+                // Do not even create AVPlayerViewController while the user is
+                // moving focus. `isActive` is intentionally delayed; mounting
+                // VideoPlayer before that delay still constructs AVKit's view
+                // hierarchy for every card passed during rapid scrolling.
+                if isFocused && isTrailerPreviewActive && trailersEnabled && !didFinishTrailerPreview {
                     TrailerPreviewPlayer(
                         meta: meta,
-                        isActive: effectiveLandscape && isTrailerPreviewActive,
+                        isActive: true,
                         onPlaybackReady: {
                             guard isTrailerPreviewActive else { return }
                             isTrailerPreviewReady = true
@@ -1057,6 +1070,11 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
         }
 
         let key = cacheKey
+        let traceLoad = preloadURLString != nil
+        let started = TVHomeDebugTrace.now()
+        if traceLoad {
+            TVHomeDebugTrace.log("art.load.begin host=\(url.host ?? "unknown") key=\(key)")
+        }
         let loadStartedAt = Date()
         if loadedKey == key { return }
 
@@ -1065,6 +1083,11 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
             previousLoadedKey = loadedKey
             image = preloadedImage
             loadedKey = key
+            if traceLoad {
+                TVHomeDebugTrace.log(
+                    "art.load.end source=preloaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
+            }
             return
         }
 
@@ -1076,6 +1099,11 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
             loadedKey = key
             self.previousImage = nil
             previousLoadedKey = nil
+            if traceLoad {
+                TVHomeDebugTrace.log(
+                    "art.load.end source=previous ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
+            }
             return
         }
 
@@ -1090,6 +1118,11 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
             image = cached
             loadedKey = key
         }
+        if traceLoad {
+            TVHomeDebugTrace.log(
+                "art.load.end source=cache ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
+        }
     }
 
     @MainActor
@@ -1100,26 +1133,41 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
         }
 
         let key = preloadCacheKey
+        let started = TVHomeDebugTrace.now()
+        TVHomeDebugTrace.log(
+            "art.preload.begin host=\(url.host ?? "unknown") key=\(key)"
+        )
         if loadedKey == key, let image {
             preloadedImage = image
             preloadedKey = key
             onPreloadFinished()
+            TVHomeDebugTrace.log(
+                "art.preload.end source=loaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
             return
         }
         if preloadedKey == key {
             onPreloadFinished()
+            TVHomeDebugTrace.log(
+                "art.preload.end source=preloaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
             return
         }
 
-        if let cached = await PosterArtworkCache.shared.image(
+        let cached = await PosterArtworkCache.shared.image(
             for: url,
             maxPixelSize: maxPixelSize
-        ) {
+        )
+        if let cached {
             guard !Task.isCancelled, key == preloadCacheKey else { return }
             preloadedImage = cached
             preloadedKey = key
         }
         onPreloadFinished()
+        TVHomeDebugTrace.log(
+            "art.preload.end source=cache hit=\(cached != nil) "
+                + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+        )
     }
 }
 
@@ -1546,6 +1594,24 @@ struct ExternalFocusBinding: ViewModifier {
     }
 }
 
+struct DefaultFocusBindingModifier<V: Hashable>: ViewModifier {
+    let binding: FocusState<V?>.Binding?
+    let value: V?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let binding, let value {
+            if #available(tvOS 17.0, *) {
+                content.defaultFocus(binding, value)
+            } else {
+                content
+            }
+        } else {
+            content
+        }
+    }
+}
+
 extension View {
     /// `.defaultFocus` guarded for tvOS 17+ (no-op below). Lets a focus scope
     /// restore to a specific value when it regains focus (e.g. from the menu,
@@ -1557,6 +1623,11 @@ extension View {
         } else {
             self
         }
+    }
+
+    @ViewBuilder
+    func defaultFocusIfAvailable<V: Hashable>(_ binding: FocusState<V?>.Binding?, _ value: V?) -> some View {
+        self.modifier(DefaultFocusBindingModifier(binding: binding, value: value))
     }
 }
 #endif

@@ -279,8 +279,7 @@ struct NetflixSearchView: View {
                     ? L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
                     : viewModel.searchText
             )
-                .textCase(.uppercase)
-                .font(.system(size: 26, weight: .medium))
+                                .font(.system(size: 26, weight: .medium))
                 .foregroundColor(viewModel.searchText.isEmpty ? .white.opacity(0.45) : .white)
                 .lineLimit(1)
         }

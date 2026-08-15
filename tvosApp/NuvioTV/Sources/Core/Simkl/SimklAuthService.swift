@@ -60,7 +60,8 @@ protocol SimklTokenStorage: AnyObject {
     func setAccessToken(_ token: String?, for profileScope: String)
 }
 
-/// Long-lived Simkl access tokens live in the Keychain, namespaced by profile.
+/// Long-lived Simkl access tokens live in the Keychain, namespaced by profile,
+/// with ProfileSettings mirroring for iCloud sync across Apple TVs.
 final class SimklKeychainTokenStorage: SimklTokenStorage {
     private let service = "com.nuvio.tv.simkl.auth"
 
@@ -70,21 +71,36 @@ final class SimklKeychainTokenStorage: SimklTokenStorage {
         query[kSecMatchLimit as String] = kSecMatchLimitOne
 
         var item: CFTypeRef?
-        guard SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
-              let data = item as? Data else {
-            return nil
+        if SecItemCopyMatching(query as CFDictionary, &item) == errSecSuccess,
+           let data = item as? Data,
+           let token = String(data: data, encoding: .utf8), !token.isEmpty {
+            return token
         }
-        return String(data: data, encoding: .utf8)
+
+        // Fallback to ProfileSettings (mirrored by iCloud sync across Apple TVs)
+        let store = ProfileSettings.store(for: profileScope)
+        if let mirrored = store.string(forKey: SettingsKey.simklAccessToken), !mirrored.isEmpty {
+            // Restore into Keychain for fast local lookup
+            setAccessToken(mirrored, for: profileScope)
+            return mirrored
+        }
+        return nil
     }
 
     func setAccessToken(_ token: String?, for profileScope: String) {
         SecItemDelete(keychainQuery(for: profileScope) as CFDictionary)
-        guard let token, !token.isEmpty, let data = token.data(using: .utf8) else { return }
-
-        var addQuery = keychainQuery(for: profileScope)
-        addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
-        addQuery[kSecValueData as String] = data
-        SecItemAdd(addQuery as CFDictionary, nil)
+        let store = ProfileSettings.store(for: profileScope)
+        if let token, !token.isEmpty {
+            store.set(token, forKey: SettingsKey.simklAccessToken)
+            if let data = token.data(using: .utf8) {
+                var addQuery = keychainQuery(for: profileScope)
+                addQuery[kSecAttrAccessible as String] = kSecAttrAccessibleAfterFirstUnlockThisDeviceOnly
+                addQuery[kSecValueData as String] = data
+                SecItemAdd(addQuery as CFDictionary, nil)
+            }
+        } else {
+            store.removeObject(forKey: SettingsKey.simklAccessToken)
+        }
     }
 
     private func keychainQuery(for profileScope: String) -> [String: Any] {

@@ -748,16 +748,66 @@ final class DisplayCriteriaController {
     /// Whether the panel presents this session in HDR, read after apply() + waitForSwitch() settle. A live
     /// headroom above 1.0 answers it; a decayed one is answered by `panelPresentsHDR` from what this display
     /// has already proven, because the headroom is a transition artifact and its absence proves nothing.
-    func currentPanelIsHDR() -> Bool {
+    ///
+    /// On tvOS, an HDR-eligible display with Match Content enabled can complete an HDR10 criteria write
+    /// without ever raising EDR headroom or emitting a usable mode-switch signal. In that case the
+    /// criteria/eligibility combination is the only remaining positive evidence, so accept it as a fallback.
+    func currentPanelIsHDR(eligibleForHDRPlayback: Bool = false) -> Bool {
         #if os(tvOS)
         guard let window = resolveWindow() else { return false }
-        return Self.panelPresentsHDR(
+        let panelPresentsHDR = Self.panelPresentsHDR(
             headroomAboveOne: observeHeadroom(window.screen),
             attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
             panelProvenToEngageHDR: panelProvenToEngageHDR
         )
+        if panelPresentsHDR { return true }
+
+        let displayManager = window.avDisplayManager
+        guard eligibleForHDRPlayback,
+              lastCriteriaWasHDR,
+              displayManager.isDisplayCriteriaMatchingEnabled,
+              !displayManager.isDisplayModeSwitchInProgress else {
+            return false
+        }
+        EngineLog.emit(
+            "[DisplayCriteria] HDR fallback accepted: HDR-eligible display + HDR criteria + Match Content "
+            + "enabled, but EDR/mode-switch proof stayed unavailable",
+            category: .engine
+        )
+        return true
         #else
         return false
+        #endif
+    }
+
+    /// Compact live state for the host's playback debug overlay. tvOS has no public read-back of the
+    /// negotiated HDMI mode, so show every signal we do have: requested criterion, Match Content gate,
+    /// EDR transition headroom, remembered HDR proof, and the mode-switch flag.
+    func debugSummary() -> String {
+        #if os(tvOS)
+        guard let window = resolveWindow() else { return "window=none" }
+        let displayManager = window.avDisplayManager
+        let headroom = window.screen.currentEDRHeadroom
+        let measuredPanelHDR = Self.panelPresentsHDR(
+            headroomAboveOne: headroom > 1.001,
+            attribution: Self.criteriaAttribution(didApply: didApply, lastCriteriaWasHDR: lastCriteriaWasHDR),
+            panelProvenToEngageHDR: panelProvenToEngageHDR
+        )
+        let criteriaFallback = !measuredPanelHDR
+            && AVPlayer.eligibleForHDRPlayback
+            && lastCriteriaWasHDR
+            && displayManager.isDisplayCriteriaMatchingEnabled
+            && !displayManager.isDisplayModeSwitchInProgress
+        let panelState = measuredPanelHDR ? "HDR" : criteriaFallback ? "HDR(fallback)" : "SDR"
+        let target: String
+        if let lastApplied {
+            target = "\(lastCriteriaWasHDR ? "HDR" : "SDR")/\(fourccString(lastApplied.codecType))"
+        } else {
+            target = "none"
+        }
+        return "target=\(target) match=\(displayManager.isDisplayCriteriaMatchingEnabled ? "on" : "off") panel=\(panelState) EDR=\(String(format: "%.2f", headroom)) proven=\(panelProvenToEngageHDR ? "Y" : "N") switching=\(displayManager.isDisplayModeSwitchInProgress ? "Y" : "N")"
+        #else
+        return "criteria=not-available"
         #endif
     }
 

@@ -87,24 +87,30 @@ s#    ff_objc_release\(&encoder\);\n    ff_objc_release\(&buffer\);\n\}#    } //
 }
 
 patch_ffmpeg_pgssub() {
-    # AetherEngine #142 (rationale aligned with FFmpeg PR 23851 review): an
-    # Epoch Continue set marks a seamless connection between two clips. A
-    # conformant set re-conveys the palettes/objects it references (overwriting
-    # the cached entries before END resolves anything), so skipping the flush
-    # is output-neutral for conformant streams. A non-conformant bare
-    # PCS+WDS+END continue set relying on retained state, however, fails
-    # find_palette ("Invalid palette id 0") under the upstream flush, the whole
-    # set is dropped, and since PGS end times are closed by the successor cue
-    # the predecessor cue overstays. Keep the cache on Epoch Continue as error
-    # resilience; Acquisition Point (1) and Epoch Start (2) still flush.
+    # AetherEngine #142, second shape (FFmpeg PR 23851). PGS carries no end time,
+    # a cue is closed by the start of its successor, so dropping a damaged display
+    # set also removes the successor that would have closed the previous cue: the
+    # predecessor overstays its authored end until the next intact set arrives.
+    # Outside AV_EF_EXPLODE, emit the empty subtitle instead. The pts is already
+    # set and no rect has been allocated yet, so this is the same clearing form
+    # the object_count == 0 path a few lines above returns.
+    #
+    # The first version of this patch instead kept the palette/object cache across
+    # composition state 3 (Epoch Continue). That was withdrawn: the caches are
+    # fixed arrays bounded by a COUNT (MAX_EPOCH_OBJECTS 64), and retained
+    # pre-connection objects occupy the slots a self-contained connection set needs,
+    # so a conformant set conveying a new object id is rejected with "Too many
+    # objects in epoch" although stock FFmpeg renders it. What we actually needed
+    # was the recovery below, and it covers every damaged set, not only Epoch
+    # Continue.
     local F="${FFMPEG_SRC}/libavcodec/pgssubdec.c"
-    grep -q "epoch-continue" "${F}" && return
-    echo "→ Patching FFmpeg: retain pgssubdec state across Epoch Continue (AetherEngine #142)"
+    grep -q "pgs-missing-palette" "${F}" && return
+    echo "→ Patching FFmpeg: close the predecessor cue on a missing pgssub palette (AetherEngine #142)"
     perl -0777 -pi -e '
-s#    state = bytestream_get_byte\(&buf\) >> 6;\n    if \(state != 0\) \{\n        flush_cache\(avctx\);\n    \}#    state = bytestream_get_byte(&buf) >> 6;\n    if (state != 0 \&\& state != 3) {\n        /* epoch-continue (3): seamless connection between two clips; a\n         * conformant set re-conveys the data it references (overwriting the\n         * cached entries), while non-conformant bare PCS+WDS+END sets rely on\n         * the retained state, so keep the cache; only acquisition point (1)\n         * and epoch start (2) release it.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142). */\n        flush_cache(avctx);\n    }#;
+s#               ctx->presentation\.palette_id\);\n        avsubtitle_free\(sub\);\n        return AVERROR_INVALIDDATA;\n    \}#               ctx->presentation.palette_id);\n        /* pgs-missing-palette: dropping the set here would also drop the successor\n         * that closes the previous cue, so the predecessor overstays its authored\n         * end. Outside AV_EF_EXPLODE emit the empty subtitle instead: the pts is\n         * set, no rect is allocated yet, and this is the clearing form the\n         * object_count == 0 path above returns.\n         * See FFmpegBuild build.sh patch_ffmpeg_pgssub (AetherEngine issue 142,\n         * FFmpeg PR 23851). */\n        if (avctx->err_recognition \& AV_EF_EXPLODE) {\n            avsubtitle_free(sub);\n            return AVERROR_INVALIDDATA;\n        }\n        av_freep(\&sub->rects);\n        return 1;\n    }#;
 ' "${F}"
-    if ! grep -q "epoch-continue" "${F}"; then
-        echo "ERROR: pgssubdec epoch-continue patch did not apply (upstream source changed?)"
+    if ! grep -q "pgs-missing-palette" "${F}"; then
+        echo "ERROR: pgssubdec missing-palette patch did not apply (upstream source changed?)"
         exit 1
     fi
 }
@@ -478,6 +484,7 @@ COMMON_FLAGS=(
     --enable-decoder=h264 --enable-decoder=hevc --enable-decoder=vp8
     --enable-decoder=vp9 --enable-decoder=av1 --enable-decoder=libdav1d
     --enable-decoder=mpeg2video --enable-decoder=mpeg4 --enable-decoder=vc1
+    --enable-decoder=qtrle
     --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=ac3
     --enable-decoder=eac3 --enable-decoder=flac --enable-decoder=mp3
     --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis

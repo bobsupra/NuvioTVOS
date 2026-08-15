@@ -29,6 +29,10 @@ struct DiscoverSection: View {
     /// snapping back to the top of the grid.
     @State private var lastFocusedCardID: String?
     @State private var shouldRestoreFocus = false
+    /// Debounced arming of the restore flag: a rapid vertical move blips
+    /// `focusedCardID` to nil while the next lazy cell materializes, and
+    /// arming instantly on that blip bounces focus back to the previous card.
+    @State private var restoreArmTask: Task<Void, Never>?
     /// Card to actively re-focus once the Details overlay dismisses; captured
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreCardID: String?
@@ -65,6 +69,7 @@ struct DiscoverSection: View {
         }
         .onChange(of: focusedCardID) { _, newValue in
             if let newValue {
+                restoreArmTask?.cancel()
                 lastFocusedCardID = newValue
                 shouldRestoreFocus = false
                 // Restoration complete -- lift the focus restriction.
@@ -73,7 +78,7 @@ struct DiscoverSection: View {
                     parentTransitionActive = false
                 }
             } else if lastFocusedCardID != nil {
-                shouldRestoreFocus = true
+                scheduleRestoreArm()
             }
         }
         .onChange(of: focusedElementID) { oldValue, newValue in
@@ -100,6 +105,19 @@ struct DiscoverSection: View {
             } else if let target = overlayRestoreCardID {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
+        }
+    }
+
+    /// Arms the restore flag only after focus has stayed off the cards long
+    /// enough that the nil is a real departure (menu/tab) instead of the
+    /// one-frame blip of a rapid vertical move between lazy cells.
+    private func scheduleRestoreArm() {
+        guard lastFocusedCardID != nil, focusedCardID == nil else { return }
+        restoreArmTask?.cancel()
+        restoreArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, focusedCardID == nil else { return }
+            shouldRestoreFocus = true
         }
     }
 

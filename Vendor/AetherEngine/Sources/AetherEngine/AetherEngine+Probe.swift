@@ -579,7 +579,11 @@ extension AetherEngine {
             return caps.supportsHLG ? .hlg : .sdr
         }
         // SMPTE2084 base (P5/P7/P8.1) or unspecified trc (P5 with empty VUI): AVPlayer tonemaps via dvh1 on non-DV panel.
-        return caps.supportsHDR10 ? .hdr10 : .sdr
+        // tvOS 26 can report eligibleForHDRPlayback while availableHDRModes omits HDR10. For a non-DV
+        // display, an HDR-eligible PQ DV base has only one valid downgrade target: HDR10/PQ. Treat the
+        // generic HDR eligibility as the HDR10 fallback so the criteria handshake is not downgraded to SDR.
+        let canPresentHDR10Base = caps.supportsHDR10 || (caps.supportsHDR && !caps.supportsDolbyVision)
+        return canPresentHDR10Base ? .hdr10 : .sdr
     }
 
     private nonisolated static func streamHasDV(stream: UnsafeMutablePointer<AVStream>) -> Bool {

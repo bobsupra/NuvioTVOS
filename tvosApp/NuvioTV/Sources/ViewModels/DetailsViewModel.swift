@@ -18,6 +18,7 @@ class DetailsViewModel: ObservableObject {
     private let usesSharedStreamDiscovery: Bool
     private var streamObserveTask: Task<Void, Never>?
     private var enrichmentTask: Task<Void, Never>?
+    private var deferredLoadTask: Task<Void, Never>?
     private var observedRequestKey: String?
     private var lastAppliedStreamsRequestKey: String?
     private var lastAppliedStreamsRevision: UInt64?
@@ -28,6 +29,9 @@ class DetailsViewModel: ObservableObject {
     }
 
     func loadDetails(id: String, type: String) {
+        let started = TVHomeDebugTrace.now()
+        TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
+        deferredLoadTask?.cancel()
         streamObserveTask?.cancel()
         enrichmentTask?.cancel()
         Task {
@@ -35,22 +39,46 @@ class DetailsViewModel: ObservableObject {
 
             do {
                 let meta = try await repository.getMetadata(id: id, type: type)
+                TVHomeDebugTrace.log(
+                    "details.load.meta.success id=\(id) name=\(meta.name) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
                 uiState.meta = meta
                 uiState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
                 uiState.isWatched = WatchedStore.contains(meta: meta)
                 uiState.isLoading = false
 
-                // Movies stream off the title id; series stream per episode, loaded
-                // on demand when the user picks one (see prepareStreams).
-                if !meta.isSeries {
-                    prepareStreams(forId: id, type: meta.type)
+                // Present primary metadata immediately for instant smooth transition.
+                // Defer streams & heavy secondary enrichment until the screen transition
+                // has completed (350ms). If the user quickly backs out, zero heavy work
+                // or image decompression is performed!
+                deferredLoadTask?.cancel()
+                deferredLoadTask = Task { @MainActor in
+                    try? await Task.sleep(nanoseconds: 350_000_000)
+                    guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
+
+                    if !meta.isSeries {
+                        prepareStreams(forId: meta.streamId, type: meta.type)
+                    }
+                    loadEnrichment(for: meta)
                 }
-                loadEnrichment(for: meta)
             } catch {
+                TVHomeDebugTrace.log(
+                    "details.load.meta.error id=\(id) error=\(error.localizedDescription) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
                 uiState.isLoading = false
                 uiState.error = error.localizedDescription
             }
         }
+    }
+
+    func cancelAllTasks() {
+        TVHomeDebugTrace.log("details.cancelAllTasks")
+        deferredLoadTask?.cancel()
+        deferredLoadTask = nil
+        streamObserveTask?.cancel()
+        streamObserveTask = nil
+        enrichmentTask?.cancel()
+        enrichmentTask = nil
     }
 
     /// Loads More Like This, Production companies, and top Trakt comments
@@ -58,11 +86,16 @@ class DetailsViewModel: ObservableObject {
     private func loadEnrichment(for meta: NuvioMeta) {
         enrichmentTask?.cancel()
         enrichmentTask = Task {
+            let started = TVHomeDebugTrace.now()
+            TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
             uiState.isLoadingEnrichment = true
             defer {
                 if !Task.isCancelled {
                     uiState.isLoadingEnrichment = false
                 }
+                TVHomeDebugTrace.log(
+                    "details.enrich.finish id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
             }
 
             async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
@@ -107,6 +140,10 @@ class DetailsViewModel: ObservableObject {
             uiState.comments = comments
             uiState.simklRatings = simkl?.ratings
 
+            TVHomeDebugTrace.log(
+                "details.enrich.data.set id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
+
             // Trakt's related endpoint commonly omits usable artwork even with
             // `extended=images`. Resolve those IMDb ids through Cinemeta so the
             // row gets the same poster data as Home. Keep the initial titles on
@@ -114,6 +151,9 @@ class DetailsViewModel: ObservableObject {
             let hydrated = await hydrateRelatedArtwork(in: moreLikeThis)
             guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
             uiState.moreLikeThis = hydrated
+            TVHomeDebugTrace.log(
+                "details.enrich.hydrated.set id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
         }
     }
 

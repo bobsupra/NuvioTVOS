@@ -1287,14 +1287,8 @@ extension AetherEngine {
     }
 
     /// Activate AVAudioSession for renderer paths (SoftwarePlaybackHost, audio hosts) that have no AVPlayerViewController. Native path deliberately skips this: AVKit activates per playback so tvOS can auto-negotiate the HDMI route (issue #24).
-    private func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) {
+    private func activateRendererAudioSession(audioSourceStreamIndex: Int32? = nil) async {
         #if os(iOS) || os(tvOS)
-        let session = AVAudioSession.sharedInstance()
-        do { try session.setActive(true) }
-        catch {
-            EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(error)", category: .engine)
-        }
-        
         // Resolve the active audio track's channel count from the already-published track list.
         // so the HDMI / AirPlay link negotiates at the correct channel count.
         // Accept an explicit stream index parameter because during a reload (track change)
@@ -1307,10 +1301,30 @@ extension AetherEngine {
             nil
         }
         
-        let maxCh = session.maximumOutputNumberOfChannels
-        let prefCh = min(sourceChannels ?? maxCh, maxCh)
-        try? session.setPreferredOutputNumberOfChannels(prefCh) 
-        EngineLog.emit("[AetherEngine] renderer audio session active: sourceCh=\(sourceChannels?.formatted() ?? "unknown") maxChannels=\(maxCh) preferred=\(session.preferredOutputNumberOfChannels) output=\(session.outputNumberOfChannels)", category: .engine)
+        let result = await Task.detached(priority: .userInitiated) {
+            let session = AVAudioSession.sharedInstance()
+            var activationError: String?
+            do {
+                try session.setActive(true)
+            } catch {
+                activationError = String(describing: error)
+            }
+
+            let maxChannels = session.maximumOutputNumberOfChannels
+            let preferredChannels = min(sourceChannels ?? maxChannels, maxChannels)
+            try? session.setPreferredOutputNumberOfChannels(preferredChannels)
+            return (
+                activationError: activationError,
+                maxChannels: maxChannels,
+                preferredChannels: session.preferredOutputNumberOfChannels,
+                outputChannels: session.outputNumberOfChannels
+            )
+        }.value
+
+        if let activationError = result.activationError {
+            EngineLog.emit("[AetherEngine] activateRendererAudioSession error: \(activationError)", category: .engine)
+        }
+        EngineLog.emit("[AetherEngine] renderer audio session active: sourceCh=\(sourceChannels?.formatted() ?? "unknown") maxChannels=\(result.maxChannels) preferred=\(result.preferredChannels) output=\(result.outputChannels)", category: .engine)
         #endif
     }
 
@@ -1343,7 +1357,7 @@ extension AetherEngine {
             }
         }
 
-        activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
+        await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         // Drop the previous session's sinks BEFORE anything wires this one's. Standing further down,
         // between two groups of `.store(in:)` calls, this cancelled everything wired above it: the
         // SW-PiP cue mirror never delivered a cue after the frame compositor was armed. Both halves
@@ -1488,7 +1502,7 @@ extension AetherEngine {
         preopenedDemuxer: Demuxer?,
         generation: UInt64
     ) async throws {
-        activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
+        await activateRendererAudioSession(audioSourceStreamIndex: audioSourceStreamIndex)
         let host = AudioPlaybackHost()
         self.audioHost = host
         applyDesiredVolume(to: host)
@@ -1554,7 +1568,7 @@ extension AetherEngine {
         generation: UInt64
     ) async throws {
         // Reuse the persistent host (MPNowPlayingSession survives across tracks). host.load() swaps the item via replaceCurrentItem.
-        activateRendererAudioSession()
+        await activateRendererAudioSession()
         let host = audioAVPlayerHost ?? AudioAVPlayerHost()
         self.audioAVPlayerHost = host
         applyDesiredVolume(to: host)

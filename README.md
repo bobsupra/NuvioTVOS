@@ -43,19 +43,23 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 
 > **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases**.
 
-## Upcoming tvOS Beta
+## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.2.8** is coming soon.
+**Beta 3.2.8** is the latest tvOS release.
 
-[Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.8/NuvioTV-3.2.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
+
+The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
 ### New in Beta 3.2.8
 
-- Updates AetherEngine to 6.21.0 and FFmpegBuild to 2.4.2 with live-stream, subtitle delivery, timing, recovery, and display-path improvements.
-- Improves watched-series and Continue Watching behavior, including manual episode history, season rollover alerts, and safer Trakt/Simkl reconciliation.
-- Enriches catalog and search results with full metadata, artwork, logos, and identifiers while improving Home focus restoration.
+- Eliminates Home vertical scrolling lag and optimizes view rendering with `Equatable` conformances and deferred secondary Details screen enrichment.
+- Adds iCloud Settings Sync to synchronize themes, player preferences, and integration keys across Apple TVs on the same iCloud account.
+- Enhances Simkl integration with Keychain token mirroring for iCloud multi-device sync and concurrent Continue Watching metadata resolution.
+- Updates AetherEngine to 6.21.0 and FFmpegBuild to 2.4.2 with live HLS rotation, subtitle delivery & proxying, PGS palette recovery, and backend-selected subtitle preference preservation.
+- Enriches catalog and search results with full metadata, Stremio logos, and debounced instant loading state.
 
 ### The new player
 
@@ -105,7 +109,7 @@ The original shared mobile code is still present in [composeApp](./composeApp), 
 - Apple TV Top Shelf extension backed by the active Continue Watching row.
 - Long-press quick actions for poster cards, including details, library toggle, and watched toggle.
 - QR-code and email login flow backed by Supabase configuration in [AuthConfig.swift](./tvosApp/NuvioTV/Sources/Core/Auth/AuthConfig.swift).
-- tvOS profile/account sync for profiles, add-ons, library, watched state, and progress.
+- tvOS profile/account sync for profiles, add-ons, settings, library, watched state, and progress. Settings follow the selected profile across Apple TVs; device-only app credentials stay local.
 - Trakt device-code login using a user-provided Client ID and Client Secret, stored locally on the Apple TV.
 - Simkl PIN login, watched-history sync, Plan to Watch library sync, playback progress, and scrobbling.
 - New AetherEngine-first player with Siri Remote controls, precise seeking and resume, embedded/add-on subtitle support, saved track selections, frame-rate matching, and a one-way MPVKit compatibility fallback.

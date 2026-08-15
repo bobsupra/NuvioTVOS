@@ -62,7 +62,7 @@ struct NuvioExternalRating: Codable, Hashable, Identifiable {
 }
 
 /// Content metadata
-struct NuvioMeta: Identifiable, Codable {
+struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     let id: String
     let name: String
     let description: String?
@@ -95,6 +95,12 @@ struct NuvioMeta: Identifiable, Codable {
     let externalRatings: [NuvioExternalRating]?
 
     var isSeries: Bool { type == "series" }
+
+    /// Canonical stream lookup id: the additive-imdb id when known (what stream
+    /// add-ons declare in their `idPrefixes`), otherwise the meta id. Items can
+    /// carry non-canonical ids ("tmdb:123", "simkl:42") which stream add-ons do
+    /// not claim, causing "No compatible add-ons".
+    var streamId: String { imdbId ?? id }
 
     /// Compact copy for watched / library-style persistence.
     /// Drops the full episode guide (can be huge) and non-finite ratings so a
@@ -353,6 +359,15 @@ enum EpisodeReleasePolicy {
     }
 
     static func hasAired(_ released: String?) -> Bool {
+        // A date-only release (e.g. "2026-08-13") is a calendar-day statement.
+        // Comparing it as absolute UTC time makes "today" flip to "already
+        // aired" once local time passes UTC midnight — 02:00 in UTC+2. Keep it
+        // day-based so an episode airing today stays "today" all day, exactly
+        // as `isAiringToday` compares calendar days.
+        let trimmed = released?.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let day = isoDay(released), day == trimmed {
+            return day < todayIsoDay()
+        }
         guard let releaseDate = releaseDate(for: released) else { return true }
         return Date() >= releaseDate
     }
@@ -822,6 +837,12 @@ struct TrailerPlaybackSource {
     let audioUrl: String?
 }
 
+enum ContinueWatchingFeatureFlags {
+    /// Next Up remains enabled in normal builds. Set this false only when
+    /// isolating the cost of the Next Up metadata path.
+    static let nextUpCardsEnabled = true
+}
+
 struct ContinueWatchingItem: Identifiable, Codable {
     var id: String { meta.id }
     let meta: NuvioMeta
@@ -1241,10 +1262,15 @@ enum ContinueWatchingStore {
     /// this, because a stale row is worse than a slow one.
     private static var cachedItems: [ContinueWatchingItem]?
     private static var cachedKey: String?
+    /// Raw bytes last written for `cachedKey`, so a no-op persist can be
+    /// detected exactly (same Encoding size, no `Equatable` conformance needed)
+    /// without re-decoding or re-encoding the multi-megabyte payload.
+    private static var cachedData: Data?
 
     private static func invalidateCache() {
         cachedItems = nil
         cachedKey = nil
+        cachedData = nil
     }
 
     private enum PersistenceError: LocalizedError {
@@ -1320,6 +1346,7 @@ enum ContinueWatchingStore {
         guard let data = data(for: key) else {
             cachedItems = []
             cachedKey = key
+            cachedData = nil
             return []
         }
         let decoded: [ContinueWatchingItem]
@@ -1339,6 +1366,7 @@ enum ContinueWatchingStore {
             .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
         cachedItems = kept
         cachedKey = key
+        cachedData = data
         return kept
     }
 
@@ -1631,49 +1659,96 @@ enum ContinueWatchingStore {
     /// incomplete episode guides here so the Home hero does not stay stuck on a
     /// series synopsis when Cinemeta later supplies the episode overview/still.
     static func refreshMissingEpisodeDetails() async {
+        let refreshStarted = TVHomeDebugTrace.now()
         let current = items()
         guard current.contains(where: needsEpisodeGuideRefresh) else { return }
 
         let repository = CinemetaCatalogRepository()
-        var refreshedItems = current
-        var didRefresh = false
+        let indices = current.indices.filter { needsEpisodeGuideRefresh(current[$0]) }
+        guard !indices.isEmpty else { return }
 
-        for index in refreshedItems.indices where needsEpisodeGuideRefresh(refreshedItems[index]) {
-            let item = refreshedItems[index]
-            guard let latest = try? await repository.refreshMetadata(id: item.meta.id, type: item.meta.type),
-                  let numbers = item.episodeNumbers,
-                  let latestEpisode = latest.videos?.first(where: {
-                      $0.season == numbers.season && $0.episode == numbers.episode
-                  }),
-                  !episodeText(latestEpisode.overview).isEmpty else {
-                continue
+        // Resolve missing episode guides concurrently. A row with a big series
+        // guide used to refresh one title at a time, so a handful of missing
+        // overviews translated into just as many sequential network round-trips
+        // before the row finished rebuilding. The index keeps the original
+        // order no matter which request finishes first.
+        struct RefreshPlan {
+            let index: Int
+            let item: ContinueWatchingItem
+        }
+        let plan = indices.map { RefreshPlan(index: $0, item: current[$0]) }
+        TVHomeDebugTrace.log(
+            "cw.episodeRefresh.begin items=\(current.count) missing=\(plan.count)"
+        )
+
+        let refreshedByIndex: [Int: ContinueWatchingItem] = await withTaskGroup(
+            of: (Int, ContinueWatchingItem?).self
+        ) { group in
+            var results: [Int: ContinueWatchingItem] = [:]
+            var iterator = plan.makeIterator()
+            var inFlight = 0
+
+            func addNext() {
+                guard let entry = iterator.next() else { return }
+                inFlight += 1
+                group.addTask {
+                    guard let latest = try? await repository.refreshMetadata(
+                        id: entry.item.meta.id,
+                        type: entry.item.meta.type
+                    ),
+                    let numbers = entry.item.episodeNumbers,
+                    let latestEpisode = latest.videos?.first(where: {
+                        $0.season == numbers.season && $0.episode == numbers.episode
+                    }),
+                    !episodeText(latestEpisode.overview).isEmpty else {
+                        return (entry.index, nil)
+                    }
+
+                    let refreshed = ContinueWatchingItem(
+                        meta: latest,
+                        streamUrl: entry.item.streamUrl,
+                        position: entry.item.position,
+                        duration: entry.item.duration,
+                        lastWatchedAt: entry.item.lastWatchedAt,
+                        season: entry.item.season,
+                        episode: entry.item.episode,
+                        released: latestEpisode.released ?? entry.item.released,
+                        episodeTitleOverride: entry.item.episodeTitleOverride,
+                        episodeOverviewOverride: entry.item.episodeOverviewOverride,
+                        episodeThumbnailOverride: entry.item.episodeThumbnailOverride,
+                        isUpNext: entry.item.isUpNext,
+                        upNextSeedSeason: entry.item.upNextSeedSeason
+                    )
+                    return (entry.index, refreshed)
+                }
             }
 
-            refreshedItems[index] = ContinueWatchingItem(
-                meta: latest,
-                streamUrl: item.streamUrl,
-                position: item.position,
-                duration: item.duration,
-                lastWatchedAt: item.lastWatchedAt,
-                season: item.season,
-                episode: item.episode,
-                released: latestEpisode.released ?? item.released,
-                episodeTitleOverride: item.episodeTitleOverride,
-                episodeOverviewOverride: item.episodeOverviewOverride,
-                episodeThumbnailOverride: item.episodeThumbnailOverride,
-                isUpNext: item.isUpNext,
-                upNextSeedSeason: item.upNextSeedSeason
-            )
-            didRefresh = true
+            for _ in 0..<min(4, plan.count) { addNext() }
+            while inFlight > 0 {
+                guard let (index, item) = await group.next() else { break }
+                inFlight -= 1
+                if let item { results[index] = item }
+                addNext()
+            }
+            return results
         }
 
-        if didRefresh {
-            persist(refreshedItems)
+        guard !refreshedByIndex.isEmpty else { return }
+        var refreshedItems = current
+        for (index, item) in refreshedByIndex {
+            refreshedItems[index] = item
         }
+        persist(refreshedItems)
+        TVHomeDebugTrace.log(
+            "cw.episodeRefresh.end refreshed=\(refreshedByIndex.count) "
+                + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: refreshStarted))"
+        )
     }
 
     private static func needsEpisodeGuideRefresh(_ item: ContinueWatchingItem) -> Bool {
-        guard item.meta.isSeries, item.episodeNumbers != nil else { return false }
+        guard ContinueWatchingFeatureFlags.nextUpCardsEnabled,
+              item.meta.isSeries,
+              item.episodeNumbers != nil else { return false }
         return episodeText(item.episodeOverview).isEmpty
     }
 
@@ -1808,12 +1883,32 @@ enum ContinueWatchingStore {
         return (position / duration) < WatchProgressLedger.completionFraction
     }
 
+    private static let episodeResumeDirectoryName = "EpisodeResumePoints"
+
     private static func episodeResumePoints() -> [EpisodeResumePoint] {
-        guard let data = UserDefaults.standard.data(forKey: episodeResumeStorageKey),
+        guard let data = readEpisodeResumeData(forKey: episodeResumeStorageKey),
               let decoded = try? makeDecoder().decode([EpisodeResumePoint].self, from: data) else {
             return []
         }
         return decoded.sorted { $0.updatedAt > $1.updatedAt }
+    }
+
+    private static func readEpisodeResumeData(forKey key: String) -> Data? {
+        if let data = LargePayloadStore.read(key: key, directory: episodeResumeDirectoryName) {
+            return data
+        }
+        guard let legacy = UserDefaults.standard.data(forKey: key) else { return nil }
+        if LargePayloadStore.write(legacy, key: key, directory: episodeResumeDirectoryName) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return legacy
+    }
+
+    private static func persistEpisodeResumePoints(_ points: [EpisodeResumePoint]) {
+        guard let data = try? makeEncoder().encode(points) else { return }
+        if LargePayloadStore.write(data, key: episodeResumeStorageKey, directory: episodeResumeDirectoryName) {
+            UserDefaults.standard.removeObject(forKey: episodeResumeStorageKey)
+        }
     }
 
     private static func saveEpisodeResumePoint(
@@ -1850,8 +1945,7 @@ enum ContinueWatchingStore {
         let updated = ([point] + current.filter {
             !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: episodeId)
         }).prefix(maxEpisodeResumePoints)
-        guard let data = try? makeEncoder().encode(Array(updated)) else { return }
-        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+        persistEpisodeResumePoints(Array(updated))
     }
 
     private static func removeEpisodeResumePoint(meta: NuvioMeta, season: Int, episode: Int) {
@@ -1859,9 +1953,8 @@ enum ContinueWatchingStore {
         let remaining = current.filter {
             !resumePoint($0, matches: meta, season: season, episode: episode, episodeId: nil)
         }
-        guard remaining.count != current.count,
-              let data = try? makeEncoder().encode(remaining) else { return }
-        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+        guard remaining.count != current.count else { return }
+        persistEpisodeResumePoints(remaining)
     }
 
     private static func removeEpisodeResumePoints(watchedItems: [WatchedStoreItem]) {
@@ -1880,9 +1973,8 @@ enum ContinueWatchingStore {
                 newestWatchedByIdentity[$0].map { $0 >= point.updatedAt } ?? false
             }
         }
-        guard remaining.count != current.count,
-              let data = try? makeEncoder().encode(remaining) else { return }
-        UserDefaults.standard.set(data, forKey: episodeResumeStorageKey)
+        guard remaining.count != current.count else { return }
+        persistEpisodeResumePoints(remaining)
     }
 
     private static func resumePoint(
@@ -1923,6 +2015,14 @@ enum ContinueWatchingStore {
         }
 
         let key = storageKey
+        // A rebuild with no real change (an account pull that did not move the
+        // row) must not shear the multi-megabyte payload back to disk every
+        // time. The encoded bytes are authoritative — if they match the last
+        // written bytes exactly, nothing changed, so skip the disk write and
+        // the notification.
+        if cachedKey == key, let cachedData, cachedData == data {
+            return true
+        }
         guard let url = storageURL(for: key) else {
             persistenceDiagnostic = "save failed: Caches unavailable"
             return false
@@ -1945,6 +2045,7 @@ enum ContinueWatchingStore {
                 .filter { shouldKeep(position: $0.position, duration: $0.duration) }
                 .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
             cachedKey = key
+            cachedData = data
             persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
             NotificationCenter.default.post(name: changedNotification, object: nil)
             writeTopShelfFeed()
@@ -2005,6 +2106,7 @@ enum ContinueWatchingStore {
         invalidateCache()
         WatchProgressLedger.eraseProfile(profileId)
         ContinueWatchingDismissStore.eraseProfile(profileId)
+        LargePayloadStore.remove(key: episodeResumeStorageKey(for: profileId), directory: episodeResumeDirectoryName)
         for key in [storageKey(for: profileId), episodeResumeStorageKey(for: profileId)] {
             UserDefaults.standard.removeObject(forKey: key)
             if let url = storageURL(for: key) {
@@ -2020,6 +2122,7 @@ enum ContinueWatchingStore {
         invalidateCache()
         WatchProgressLedger.eraseAllProfiles()
         ContinueWatchingDismissStore.eraseAllProfiles()
+        LargePayloadStore.removeDirectory(episodeResumeDirectoryName)
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }
@@ -2332,6 +2435,7 @@ enum LibraryStore {
     static let changedNotification = Notification.Name("nuvio.tv.library.changed")
 
     private static let baseKey = "nuvio.tv.library.items"
+    private static let storageDirectoryName = "LibraryStore"
     private(set) static var activeProfileId: String?
 
     static func setActiveProfile(_ profileId: String?) {
@@ -2340,12 +2444,36 @@ enum LibraryStore {
     }
 
     private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+        storageKey(for: activeProfileId)
+    }
+
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
     }
 
+    private static func readData(forKey key: String) -> Data? {
+        if let data = LargePayloadStore.read(key: key, directory: storageDirectoryName) {
+            return data
+        }
+        guard let legacy = UserDefaults.standard.data(forKey: key) else { return nil }
+        if LargePayloadStore.write(legacy, key: key, directory: storageDirectoryName) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return legacy
+    }
+
+    @discardableResult
+    private static func writeData(_ data: Data, forKey key: String) -> Bool {
+        let written = LargePayloadStore.write(data, key: key, directory: storageDirectoryName)
+        if written {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return written
+    }
+
     static func items() -> [LibraryStoreItem] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey),
+        guard let data = readData(forKey: storageKey),
               let decoded = try? JSONDecoder().decode([LibraryStoreItem].self, from: data) else {
             return []
         }
@@ -2401,7 +2529,15 @@ enum LibraryStore {
 
     private static func persist(_ items: [LibraryStoreItem]) {
         guard let data = try? JSONEncoder().encode(items) else { return }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        _ = writeData(data, forKey: storageKey)
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    /// Deletes one profile's library, leaving every other profile alone.
+    static func eraseProfile(_ profileId: String) {
+        let key = storageKey(for: profileId)
+        UserDefaults.standard.removeObject(forKey: key)
+        LargePayloadStore.remove(key: key, directory: storageDirectoryName)
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
@@ -2411,6 +2547,7 @@ enum LibraryStore {
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }
             .forEach { defaults.removeObject(forKey: $0) }
+        LargePayloadStore.removeDirectory(storageDirectoryName)
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 }
@@ -2893,6 +3030,7 @@ enum CollectionsStore {
 
     private static let baseKey = "nuvio.tv.collections.json"
     private static let lastPulledIdsKey = "nuvio.tv.collections.lastPulledIds"
+    private static let storageDirectoryName = "CollectionsStore"
     private(set) static var activeProfileId: String?
 
     static func setActiveProfile(_ profileId: String?) {
@@ -2901,13 +3039,41 @@ enum CollectionsStore {
     }
 
     private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+        storageKey(for: activeProfileId)
+    }
+
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
     }
 
     private static var lastPulledIdsStorageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return lastPulledIdsKey }
+        lastPulledIdsStorageKey(for: activeProfileId)
+    }
+
+    private static func lastPulledIdsStorageKey(for profileId: String?) -> String {
+        guard let id = profileId, !id.isEmpty else { return lastPulledIdsKey }
         return "\(lastPulledIdsKey).\(id)"
+    }
+
+    private static func readData(forKey key: String) -> Data? {
+        if let data = LargePayloadStore.read(key: key, directory: storageDirectoryName) {
+            return data
+        }
+        guard let legacy = UserDefaults.standard.data(forKey: key) else { return nil }
+        if LargePayloadStore.write(legacy, key: key, directory: storageDirectoryName) {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return legacy
+    }
+
+    @discardableResult
+    private static func writeData(_ data: Data, forKey key: String) -> Bool {
+        let written = LargePayloadStore.write(data, key: key, directory: storageDirectoryName)
+        if written {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
+        return written
     }
 
     /// Collection ids present in the last successful account pull. Used when
@@ -2915,7 +3081,7 @@ enum CollectionsStore {
     /// after this device last synced) are not wiped, while intentional deletes
     /// of previously-pulled ids still go through.
     static func lastPulledCollectionIds() -> Set<String> {
-        guard let data = UserDefaults.standard.data(forKey: lastPulledIdsStorageKey),
+        guard let data = readData(forKey: lastPulledIdsStorageKey),
               let ids = try? JSONDecoder().decode([String].self, from: data) else {
             return []
         }
@@ -2924,7 +3090,7 @@ enum CollectionsStore {
 
     private static func rememberPulledIds(_ ids: [String]) {
         guard let data = try? JSONEncoder().encode(ids) else { return }
-        UserDefaults.standard.set(data, forKey: lastPulledIdsStorageKey)
+        _ = writeData(data, forKey: lastPulledIdsStorageKey)
     }
 
     /// Decode one collection at a time so a single bad row cannot drop the rest.
@@ -2968,7 +3134,7 @@ enum CollectionsStore {
 
         // Prefer re-encoded raw rows so a double-encoded string input is stored cleanly.
         let storeData = (try? JSONSerialization.data(withJSONObject: rows)) ?? json
-        UserDefaults.standard.set(storeData, forKey: storageKey)
+        _ = writeData(storeData, forKey: storageKey)
         rememberPulledIds(decoded.map(\.id))
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -2982,14 +3148,14 @@ enum CollectionsStore {
     /// dicts instead of the typed models so fields only the Android app knows
     /// (view modes, tile shapes, TMDB sources, …) survive the round-trip.
     static func rawCollections() -> [[String: Any]] {
-        guard let data = UserDefaults.standard.data(forKey: storageKey) else { return [] }
+        guard let data = readData(forKey: storageKey) else { return [] }
         let rows = parseCollectionsArray(from: data) ?? []
         let streamingMigration = migrateStreamingServicesTemplate(in: rows)
         let studiosMigration = migrateStudiosFranchisesTemplate(in: streamingMigration.rows)
         let genresMigration = migrateDiscoverGenresTemplate(in: studiosMigration.rows)
         if (streamingMigration.changed || studiosMigration.changed || genresMigration.changed),
            let migratedData = try? JSONSerialization.data(withJSONObject: genresMigration.rows) {
-            UserDefaults.standard.set(migratedData, forKey: storageKey)
+            _ = writeData(migratedData, forKey: storageKey)
         }
         return genresMigration.rows
     }
@@ -3466,7 +3632,7 @@ enum CollectionsStore {
             print("CollectionsStore.saveLocalEdit: refused — no decodable collections")
             return
         }
-        UserDefaults.standard.set(data, forKey: storageKey)
+        _ = writeData(data, forKey: storageKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         NotificationCenter.default.post(name: locallyEditedNotification, object: raw)
     }
@@ -3509,12 +3675,24 @@ enum CollectionsStore {
         return merged
     }
 
+    /// Deletes one profile's collections, leaving every other profile alone.
+    static func eraseProfile(_ profileId: String) {
+        let key = storageKey(for: profileId)
+        let lastPulledKey = lastPulledIdsStorageKey(for: profileId)
+        UserDefaults.standard.removeObject(forKey: key)
+        UserDefaults.standard.removeObject(forKey: lastPulledKey)
+        LargePayloadStore.remove(key: key, directory: storageDirectoryName)
+        LargePayloadStore.remove(key: lastPulledKey, directory: storageDirectoryName)
+        NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
     /// Deletes every profile's collections on sign-out.
     static func eraseAllProfiles() {
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) || $0.hasPrefix(lastPulledIdsKey) }
             .forEach { defaults.removeObject(forKey: $0) }
+        LargePayloadStore.removeDirectory(storageDirectoryName)
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 }

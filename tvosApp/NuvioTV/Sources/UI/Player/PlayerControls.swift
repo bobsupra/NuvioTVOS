@@ -481,11 +481,11 @@ extension View {
 // MARK: - Next episode card
 //
 // Next-episode prompt shown near the end of an episode. Liquid Glass card with
-// the upcoming episode's thumbnail, a short auto-hide countdown, and a manual
-// Play button.
+// the upcoming episode's thumbnail, an optional Auto-Play countdown, and a
+// manual Play button.
 struct NextEpisodeOverlay: View {
     let episode: NuvioVideo
-    /// Seconds left before the card hides; nil while controls are visible.
+    /// Seconds left before Auto-Play advances; nil while controls are visible.
     let countdown: Int?
     let isAdvancing: Bool
     var isFocused: Bool

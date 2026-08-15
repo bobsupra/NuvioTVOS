@@ -628,9 +628,9 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         }
 
         state.update(sourceText: "First", settings: aiSettings(model: "outcome-test"))
-        try await Task.sleep(nanoseconds: 40_000_000)
+        await waitForWhile { outcomes.count >= 1 }
         state.update(sourceText: "Second", settings: aiSettings(model: "outcome-test"))
-        try await Task.sleep(nanoseconds: 40_000_000)
+        await waitForWhile { outcomes.count >= 2 }
 
         XCTAssertEqual(outcomes, ["success", "failure"])
     }
@@ -856,6 +856,29 @@ final class PlaybackBackendPolicyTests: XCTestCase {
     }
 
     @MainActor
+    func testAutomaticSubtitlePreferenceKeepsBackendSelectedPreferredTrack() {
+        let full = SubtitleTrack(
+            id: "2",
+            name: "ENG (Full)",
+            language: "eng",
+            isSelected: true
+        )
+
+        XCTAssertTrue(
+            PlayerViewModel.shouldPreserveBackendSubtitleSelection(
+                full,
+                preferredLanguages: ["English"]
+            )
+        )
+        XCTAssertFalse(
+            PlayerViewModel.shouldPreserveBackendSubtitleSelection(
+                SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
+                preferredLanguages: ["English"]
+            )
+        )
+    }
+
+    @MainActor
     func testAetherOverlayStatePublishesClockIndependently() {
         let state = AetherSubtitleOverlayState()
         state.updateSourceTime(12.5)
@@ -943,6 +966,18 @@ private final class RequestCounter: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         return count
+    }
+}
+
+/// Waits up to 5 seconds for `condition`, yielding to the main actor so the
+/// async work under test can complete. The outcome tests used fixed sleeps,
+/// which flaked under full-suite load; polling until a condition is
+/// deterministic instead.
+@MainActor
+private func waitForWhile(_ condition: () -> Bool) async {
+    let deadline = Date().addingTimeInterval(5)
+    while !condition() && Date() < deadline {
+        await Task.yield()
     }
 }
 
@@ -2552,4 +2587,5 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
             videos: videos
         )
     }
+
 }

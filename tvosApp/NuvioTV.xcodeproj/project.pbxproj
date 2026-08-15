@@ -77,6 +77,7 @@
 		C0D310290000000000000029 /* NuvioTV/Sources/ViewModels/DiscoverViewModel.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300290000000000000029 /* NuvioTV/Sources/ViewModels/DiscoverViewModel.swift */; };
 		C0D3102A000000000000002A /* NuvioTV/Sources/UI/Discover/DiscoverView.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002A000000000000002A /* NuvioTV/Sources/UI/Discover/DiscoverView.swift */; };
 		C0D3102B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift */; };
+		C0D310FD00000000000000FD /* NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D300FD00000000000000FD /* NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift */; };
 		C0D3102C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift */; };
 		C0D3102D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift */; };
 		C0D3102E000000000000002E /* NuvioTV/Sources/Core/Debrid/DebridProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = C0D3002E000000000000002E /* NuvioTV/Sources/Core/Debrid/DebridProvider.swift */; };
@@ -231,6 +232,7 @@
 		C0D300290000000000000029 /* NuvioTV/Sources/ViewModels/DiscoverViewModel.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/ViewModels/DiscoverViewModel.swift; sourceTree = "<group>"; };
 		C0D3002A000000000000002A /* NuvioTV/Sources/UI/Discover/DiscoverView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/UI/Discover/DiscoverView.swift; sourceTree = "<group>"; };
 		C0D3002B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Sync/NuvioSyncService.swift; sourceTree = "<group>"; };
+		C0D300FD00000000000000FD /* NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift; sourceTree = "<group>"; };
 		C0D3002C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Trakt/TraktAuthService.swift; sourceTree = "<group>"; };
 		C0D3002D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift; sourceTree = "<group>"; };
 		C0D3002E000000000000002E /* NuvioTV/Sources/Core/Debrid/DebridProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Debrid/DebridProvider.swift; sourceTree = "<group>"; };
@@ -430,6 +432,7 @@
 				C0D300FB00000000000000FB /* NuvioTV/Sources/Core/Sync/ContinueWatchingBuilder.swift */,
 				C0D300FC00000000000000FC /* NuvioTV/Sources/Core/Sync/ContinueWatchingTestData.swift */,
 				C0D3002B000000000000002B /* NuvioTV/Sources/Core/Sync/NuvioSyncService.swift */,
+				C0D300FD00000000000000FD /* NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift */,
 				C0D30070 /* NuvioTV/Sources/Core/TMDB/TmdbDetailsService.swift */,
 				C0D300390000000000000039 /* NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift */,
 				C0D3002C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift */,
@@ -797,6 +800,7 @@
 				C0D310FA00000000000000FA /* NuvioTV/Sources/Models/WatchProgressLedger.swift in Sources */,
 				C0D310FB00000000000000FB /* NuvioTV/Sources/Core/Sync/ContinueWatchingBuilder.swift in Sources */,
 				C0D310FC00000000000000FC /* NuvioTV/Sources/Core/Sync/ContinueWatchingTestData.swift in Sources */,
+				C0D310FD00000000000000FD /* NuvioTV/Sources/Core/Sync/ICloudSettingsSyncManager.swift in Sources */,
 				C0D3102C000000000000002C /* NuvioTV/Sources/Core/Trakt/TraktAuthService.swift in Sources */,
 				51A100020000000000000002 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift in Sources */,
 				51A100040000000000000004 /* NuvioTV/Sources/Core/Simkl/SimklAuthService.swift in Sources */,

@@ -249,7 +249,11 @@ enum SettingsKey {
     static let fastNavigation = "nuvio.tv.settings.advanced.fastNavigation"
     static let smoothFocus = "nuvio.tv.settings.advanced.smoothFocus"
     static let playbackDiagnostics = "nuvio.tv.settings.advanced.playbackDiagnostics"
+    static let playbackDebug = "nuvio.tv.settings.advanced.playbackDebug"
     static let focusHighlighter = "nuvio.tv.settings.advanced.focusHighlighter"
+    static let iCloudSyncEnabled = "nuvio.tv.settings.advanced.iCloudSyncEnabled"
+    static let iCloudLastSyncDate = "nuvio.tv.settings.advanced.iCloudLastSyncDate"
+    static let simklAccessToken = "nuvio.tv.settings.integrations.simklAccessToken"
 
     /// API app credentials must remain on the Apple TV and never enter the
     /// account settings payload.
@@ -269,7 +273,7 @@ enum SettingsKey {
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
         traktLibrarySourceMode, traktMoreLikeThisSource,
-        simklClientID,
+        simklClientID, simklAccessToken,
         tmdbEnabled, tmdbApiKey, tmdbLanguage,
         tmdbUseTrailers, tmdbUseArtwork, tmdbUseBasicInfo, tmdbUseDetails, tmdbUseCredits,
         tmdbUseProductions, tmdbUseNetworks, tmdbUseEpisodes, tmdbUseSeasonPosters,
@@ -290,7 +294,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
         externalPlayerForwardSubtitles, assOverrideMode,
-        fastNavigation, smoothFocus, playbackDiagnostics, focusHighlighter
+        fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter
     ] + SubtitleStyleKey.all
 }
 
@@ -1427,6 +1431,7 @@ private struct AccountSettingsView: View {
     @AppStorage(SettingsKey.profileRequireSelectionAfterBackground)
     private var requireProfileSelectionAfterBackground = false
     @AppStorage(SettingsKey.accountSyncWatchState) private var syncWatchState = true
+    @AppStorage(SettingsKey.iCloudSyncEnabled) private var iCloudSyncEnabled = false
     @State private var editableProfileName = ""
     @State private var showingAvatarPicker = false
 
@@ -1588,6 +1593,19 @@ private struct AccountSettingsView: View {
                         fallback: "Keep watched history, resume points, and library state eligible for sync"
                     ),
                     isOn: $syncWatchState,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "tvos_account_icloud_sync",
+                        fallback: "iCloud Settings Sync"
+                    ),
+                    subtitle: L10n.string(
+                        "tvos_account_icloud_sync_subtitle",
+                        fallback: "Sync themes, layout, player preferences, and integration keys across Apple TVs on this iCloud account"
+                    ),
+                    isOn: $iCloudSyncEnabled,
                     accentColor: accentColor
                 )
 
@@ -5906,9 +5924,12 @@ private struct AdvancedSettingsView: View {
     @AppStorage(SettingsKey.fastNavigation) private var fastNavigation = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.playbackDiagnostics) private var playbackDiagnostics = false
+    @AppStorage(SettingsKey.playbackDebug) private var playbackDebug = false
     @State private var isSeedingTestHistory = false
     @State private var testHistoryStatus = ContinueWatchingTestData.status
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @AppStorage(SettingsKey.iCloudSyncEnabled) private var iCloudSyncEnabled = false
+    @ObservedObject private var iCloudSyncManager = ICloudSettingsSyncManager.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -5946,6 +5967,13 @@ private struct AdvancedSettingsView: View {
                     title: L10n.string("tvos_settings_playback_issue_reports", fallback: "Playback Issue Reports"),
                     subtitle: L10n.string("tvos_settings_keep_diagnostic_snapshots_after_failed_p_cd841397", fallback: "Keep diagnostic snapshots after failed playback attempts"),
                     isOn: $playbackDiagnostics,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_playback_debug_overlay", fallback: "Playback Debug Overlay"),
+                    subtitle: L10n.string("tvos_settings_show_live_playback_engine_details", fallback: "Show live engine, pipeline, codec, HDR, resolution, frame-rate, audio and policy details while playing"),
+                    isOn: $playbackDebug,
                     accentColor: accentColor
                 )
 
@@ -6033,6 +6061,46 @@ private struct AdvancedSettingsView: View {
                     value: testHistoryStatus,
                     isDiagnostic: true
                 )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_icloud_sync_title", fallback: "iCloud Sync"),
+                subtitle: L10n.string(
+                    "tvos_settings_icloud_sync_subtitle",
+                    fallback: "Sync configurations across all Apple TVs on the same iCloud account"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_account_icloud_sync", fallback: "iCloud Settings Sync"),
+                    subtitle: L10n.string(
+                        "tvos_account_icloud_sync_subtitle",
+                        fallback: "Sync themes, layout, player preferences, and integration keys across Apple TVs on this iCloud account"
+                    ),
+                    isOn: $iCloudSyncEnabled,
+                    accentColor: accentColor
+                )
+
+                if iCloudSyncEnabled {
+                    SettingsActionRow(
+                        title: L10n.string("tvos_settings_icloud_sync_now", fallback: "Sync Now"),
+                        subtitle: L10n.string(
+                            "tvos_settings_icloud_sync_now_subtitle",
+                            fallback: "Push and pull the latest settings to and from iCloud"
+                        ),
+                        value: L10n.string("action_sync", fallback: "Sync"),
+                        accentColor: accentColor,
+                        action: {
+                            ICloudSettingsSyncManager.shared.syncNow()
+                        }
+                    )
+
+                    if let lastSync = iCloudSyncManager.lastSyncDate {
+                        SettingsInfoRow(
+                            title: L10n.string("tvos_settings_icloud_last_sync", fallback: "Last iCloud Sync"),
+                            value: DateFormatter.localizedString(from: lastSync, dateStyle: .short, timeStyle: .medium)
+                        )
+                    }
+                }
             }
 
             SettingsGroup(title: L10n.string("subtitle_style_reset", fallback: "Reset"), subtitle: L10n.string("tvos_settings_clear_local_tvos_settings_saved_by_this_screen", fallback: "Clear local tvOS settings saved by this screen")) {

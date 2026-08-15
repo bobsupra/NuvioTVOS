@@ -398,7 +398,21 @@ final class AvatarCatalogStore: ObservableObject {
         return byId[id]
     }
 
-    func imageURL(for id: String?) -> URL? { item(for: id)?.imageURL }
+    /// Resolves both catalog ids and custom avatar URLs configured in the web
+    /// panel. Custom URLs are stored directly in `avatarId`, so they are not
+    /// present in `byId` and need to bypass the catalog lookup.
+    func imageURL(for id: String?) -> URL? {
+        guard let id = id?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !id.isEmpty else { return nil }
+        if let catalogURL = item(for: id)?.imageURL {
+            return catalogURL
+        }
+        guard let url = URL(string: id),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else { return nil }
+        return url
+    }
 
     /// Categories shown as picker tabs: "All" first, then the marquee ones the
     /// Android app pins, then any remaining categories alphabetically.
@@ -430,7 +444,7 @@ enum ProfileAvatarCatalog {
 }
 
 /// Renders a profile's avatar: the synced catalog image over its accent color,
-/// or the brand gradient when no avatar is set / the catalog hasn't loaded.
+/// a custom web image, or the brand gradient when no avatar is set.
 struct ProfileAvatarView: View {
     let avatarId: String
     var size: CGFloat
@@ -439,16 +453,12 @@ struct ProfileAvatarView: View {
     @ObservedObject private var catalog = AvatarCatalogStore.shared
 
     var body: some View {
+        let catalogItem = catalog.item(for: avatarId)
+        let imageURL = catalog.imageURL(for: avatarId)
+
         ZStack {
-            if let item = catalog.item(for: avatarId) {
-                Circle().fill(item.backgroundColor)
-                AsyncImage(url: item.imageURL) { phase in
-                    if let image = phase.image {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } else {
-                        Color.clear
-                    }
-                }
+            if let catalogItem {
+                Circle().fill(catalogItem.backgroundColor)
             } else {
                 Circle().fill(
                     LinearGradient(
@@ -458,6 +468,17 @@ struct ProfileAvatarView: View {
                         endPoint: .bottomTrailing
                     )
                 )
+            }
+
+            if let imageURL {
+                AsyncImage(url: imageURL) { phase in
+                    if let image = phase.image {
+                        image.resizable().aspectRatio(contentMode: .fill)
+                    } else {
+                        Color.clear
+                    }
+                }
+            } else if catalogItem == nil {
                 Image(systemName: "sparkles")
                     .font(.system(size: size * 0.42, weight: .bold))
                     .foregroundColor(.white)
@@ -799,12 +820,16 @@ struct ProfileAvatarPickerSheet: View {
     @Binding var isPresented: Bool
     let title: String
     @State private var selectedAvatarId: String
+    @State private var customAvatarURL: String
+    @State private var isEditingCustomAvatarURL = false
+    @FocusState private var isCustomAvatarFieldFocused: Bool
     let onSave: (String) -> Void
 
     init(isPresented: Binding<Bool>, title: String, selectedAvatarId: String, onSave: @escaping (String) -> Void) {
         _isPresented = isPresented
         self.title = title
         _selectedAvatarId = State(initialValue: selectedAvatarId)
+        _customAvatarURL = State(initialValue: Self.validCustomAvatarURL(selectedAvatarId) ?? "")
         self.onSave = onSave
     }
 
@@ -830,7 +855,37 @@ struct ProfileAvatarPickerSheet: View {
                     ProfileAvatarView(avatarId: selectedAvatarId, size: 112)
                 }
 
-                AvatarPickerGrid(selectedAvatarId: $selectedAvatarId, scrollsGrid: true)
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Custom Avatar URL")
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.72))
+
+                    Button {
+                        isEditingCustomAvatarURL = true
+                    } label: {
+                        SettingsGlassTextField(
+                            text: $customAvatarURL,
+                            placeholder: "https://example.com/avatar.jpg",
+                            focused: isCustomAvatarFieldFocused,
+                            isEditing: $isEditingCustomAvatarURL,
+                            fieldWidth: 760,
+                            onCommit: applyCustomAvatarURL
+                        )
+                    }
+                    .buttonStyle(ProfilePlainButtonStyle())
+                    .focused($isCustomAvatarFieldFocused)
+                    .focusEffectDisabledIfAvailable()
+
+                    Text("Paste a direct image link, or choose an avatar below.")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.white.opacity(0.48))
+                }
+
+                AvatarPickerGrid(
+                    selectedAvatarId: $selectedAvatarId,
+                    onSelectAvatar: { _ in customAvatarURL = "" },
+                    scrollsGrid: true
+                )
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 HStack(spacing: 16) {
@@ -842,9 +897,10 @@ struct ProfileAvatarPickerSheet: View {
                         title: "Save",
                         systemImage: "checkmark",
                         prominent: true,
-                        disabled: selectedAvatarId.isEmpty
+                        disabled: avatarToSave == nil
                     ) {
-                        onSave(selectedAvatarId)
+                        guard let avatarToSave else { return }
+                        onSave(avatarToSave)
                         isPresented = false
                     }
                 }
@@ -853,6 +909,30 @@ struct ProfileAvatarPickerSheet: View {
             .padding(.vertical, 62)
             .frame(maxWidth: 1180, maxHeight: .infinity)
         }
+    }
+
+    private var avatarToSave: String? {
+        let customURL = customAvatarURL.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !customURL.isEmpty {
+            return Self.validCustomAvatarURL(customURL)
+        }
+        return selectedAvatarId.isEmpty ? nil : selectedAvatarId
+    }
+
+    private func applyCustomAvatarURL() {
+        guard let customURL = Self.validCustomAvatarURL(customAvatarURL) else { return }
+        customAvatarURL = customURL
+        selectedAvatarId = customURL
+        isEditingCustomAvatarURL = false
+    }
+
+    private static func validCustomAvatarURL(_ value: String) -> String? {
+        let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard let url = URL(string: trimmed),
+              let scheme = url.scheme?.lowercased(),
+              scheme == "http" || scheme == "https",
+              url.host != nil else { return nil }
+        return trimmed
     }
 }
 

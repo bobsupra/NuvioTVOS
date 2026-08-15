@@ -51,6 +51,14 @@ class SearchViewModel: ObservableObject {
         recentSearches = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
 
         $searchText
+            .dropFirst()
+            .removeDuplicates()
+            .sink { [weak self] text in
+                self?.handleQueryChange(text)
+            }
+            .store(in: &cancellables)
+
+        $searchText
             .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
             .removeDuplicates()
             .sink { [weak self] text in
@@ -61,6 +69,35 @@ class SearchViewModel: ObservableObject {
 
     var hasQuery: Bool {
         !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+
+    private func handleQueryChange(_ query: String) {
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            searchTask?.cancel()
+            enrichmentTask?.cancel()
+            allResults = []
+            results = []
+            error = nil
+            isLoading = false
+            return
+        }
+
+        let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        if let cached = cachedResults[cacheKey] {
+            allResults = cached
+            applyFilter()
+            error = nil
+            isLoading = false
+            return
+        }
+
+        // Cancel pending tasks and immediately enter loading state while debouncing
+        // so the UI does not flash "No Results" before the search runs.
+        searchTask?.cancel()
+        enrichmentTask?.cancel()
+        isLoading = true
+        error = nil
     }
 
     func performSearch(query: String) {
@@ -101,7 +138,9 @@ class SearchViewModel: ObservableObject {
                 self.applyFilter()
                 if !found.isEmpty { self.commitRecentSearch(trimmed) }
                 self.isLoading = false
-                self.enrich(found, cacheKey: cacheKey)
+                if SearchResultEnrichment.hasIncompleteLeadingResults(found) {
+                    self.enrich(found, cacheKey: cacheKey)
+                }
             } catch {
                 if Task.isCancelled { return }
                 self.error = "Couldn’t complete search. Check your connection and try again."

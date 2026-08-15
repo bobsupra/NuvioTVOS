@@ -79,10 +79,65 @@ mkdir -p "$APP_DIR/Contents/Resources"
 cp "$BINARY" "$APP_DIR/Contents/MacOS/DemoPlayerMac"
 chmod +x "$APP_DIR/Contents/MacOS/DemoPlayerMac"
 
-# FFmpeg / dav1d / etc. are statically linked into the binary (verified
-# via `otool -L`, no LC_LOAD_DYLIB entries for the custom frameworks),
-# so the .app's Frameworks/ directory stays empty. If FFmpegBuild ever
-# switches to dynamic frameworks, this is where they'd be copied to.
+# Phase 2b: Embed the FFmpegBuild frameworks the binary links against.
+#
+# These used to be statically linked, and an earlier revision of this script
+# recorded that as a comment saying "if FFmpegBuild ever switches to dynamic
+# frameworks, this is where they'd be copied to". It since did (LGPL wants the
+# libraries relinkable), and a comment cannot notice that. The shipped 6.5.6
+# demo died at launch on a reporter's machine with
+#   Library not loaded: @rpath/Libavcodec.framework/Versions/A/Libavcodec
+# (AetherPlayer#2). So the copy below is followed by a check that actually
+# fails the build, rather than a note describing what someone ought to do.
+echo "    embedding frameworks..."
+FW_SRC="$(dirname "$BINARY")"
+mkdir -p "$APP_DIR/Contents/Frameworks"
+fw_count=0
+for fw in "$FW_SRC"/*.framework; do
+  [ -d "$fw" ] || continue
+  cp -R "$fw" "$APP_DIR/Contents/Frameworks/"
+  fw_count=$((fw_count + 1))
+done
+echo "    embedded $fw_count framework(s) from $FW_SRC"
+
+# The xcframework payloads are mode 555 and `cp -R` preserves that, so codesign
+# below fails with a bare "Permission denied" when it tries to replace their
+# existing signature. Restore owner write on the copies.
+chmod -R u+w "$APP_DIR/Contents/Frameworks"
+
+# The binary's own LC_RPATH does not point at Contents/Frameworks, so add it.
+# Duplicate entries are harmless but noisy, so only add when absent.
+if ! otool -l "$APP_DIR/Contents/MacOS/DemoPlayerMac" | grep -q "@executable_path/../Frameworks"; then
+  install_name_tool -add_rpath "@executable_path/../Frameworks" \
+    "$APP_DIR/Contents/MacOS/DemoPlayerMac"
+fi
+
+# Guard, both halves. Presence alone proves nothing: a bundle can hold every
+# framework and still abort in dyld when no rpath points at Contents/Frameworks,
+# which is exactly how this failed once while a presence-only check passed.
+if ! otool -l "$APP_DIR/Contents/MacOS/DemoPlayerMac" | grep -q "@executable_path/../Frameworks"; then
+  echo "FAIL: the binary carries no rpath for Contents/Frameworks, so dyld cannot" >&2
+  echo "      find the embedded frameworks no matter what was copied in." >&2
+  exit 1
+fi
+
+# ...and every @rpath load command must resolve to something inside the bundle.
+# This is the check whose absence shipped a demo that could not launch.
+unresolved=0
+while read -r dep; do
+  [ -n "$dep" ] || continue
+  rel="${dep#@rpath/}"
+  if [ ! -e "$APP_DIR/Contents/Frameworks/$rel" ]; then
+    echo "    UNRESOLVED: $dep"
+    unresolved=$((unresolved + 1))
+  fi
+done < <(otool -L "$APP_DIR/Contents/MacOS/DemoPlayerMac" | awk '/@rpath\//{print $1}')
+if [ "$unresolved" -gt 0 ]; then
+  echo "FAIL: $unresolved @rpath dependency/dependencies missing from the bundle." >&2
+  echo "      The .app would die at launch with a dyld 'Library not loaded' abort." >&2
+  exit 1
+fi
+echo "    all @rpath dependencies resolve inside the bundle"
 
 # Phase 3: Inject Info.plist + Hardened Runtime entitlements.
 echo "==> [3/6] Writing Info.plist + entitlements..."
@@ -148,13 +203,23 @@ cat > "$ENTITLEMENTS" <<ENT
 ENT
 
 # Phase 4: Code-sign with Hardened Runtime.
+# Nested code signs first, inside out: signing the .app seals whatever its
+# Frameworks/ already contains, so an unsigned framework there makes the
+# --strict verify below fail (and notarization reject the submission).
 echo "==> [4/6] Code-signing..."
+for fw in "$APP_DIR/Contents/Frameworks"/*.framework; do
+  [ -d "$fw" ] || continue
+  codesign --force --options runtime --timestamp \
+    --sign "$DEVELOPER_ID" \
+    "$fw"
+done
+
 codesign --force --options runtime --timestamp \
   --entitlements "$ENTITLEMENTS" \
   --sign "$DEVELOPER_ID" \
   "$APP_DIR"
 
-codesign --verify --verbose=2 --strict "$APP_DIR"
+codesign --verify --verbose=2 --strict --deep "$APP_DIR"
 
 # Phase 5: Notarize (if profile provided).
 if [[ -n "$NOTARY_PROFILE" ]]; then

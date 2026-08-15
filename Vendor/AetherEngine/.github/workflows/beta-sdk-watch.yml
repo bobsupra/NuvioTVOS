@@ -1,0 +1,77 @@
+name: Beta SDK watch
+
+# #351: in the 27 SDK `AVSampleBufferDisplayLayer` is annotated `@MainActor`, which leaves twelve
+# isolation diagnostics in the renderer. They are warnings, so nothing is built against them; the
+# decision is to act only once one of them becomes an error, or once a floor raise is on the table
+# for other reasons. Nothing was watching for that. CI pins `latest-stable`, so it never sees a beta
+# SDK, and #313 reached us only because an outside reporter built the engine directly instead of
+# consuming it, which is the one shape where Xcode does not hide a dependency's warnings.
+#
+# This job is that watcher, and deliberately not a gate. It runs weekly instead of on pushes, so a
+# beta that hardens one of the twelve arrives as a failed scheduled run rather than as a blocked
+# merge.
+#
+# The runner label matters more than it looks. `xcode-27` is a preview image that ships Xcode 27
+# beta as its only Xcode and as the default, so there is nothing to select and nothing to pin. The
+# obvious spelling, `macos-15` plus `xcode-version: latest`, was measured first and resolves to
+# Xcode 26.3: a green run that reads like a beta check and is a second copy of CI. Being a preview
+# image, it can queue, and the label will move when 27 goes GA. Either failure mode is loud, which
+# is the point.
+
+on:
+  schedule:
+    - cron: '0 6 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  build-beta-sdk:
+    name: swift build (Xcode 27 beta SDK)
+    runs-on: xcode-27
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      # Which toolchain actually answered is the first thing to read here: a run on anything below
+      # 27 proves nothing about the annotation, whatever its conclusion says.
+      - name: Show toolchain
+        run: |
+          swift --version
+          xcodebuild -version
+          xcodebuild -showsdks
+
+      # tools-version 6.0 means Swift 6 language mode, the same mode the #313 reporter built in.
+      - name: swift build
+        run: |
+          set -o pipefail
+          swift build 2>&1 | tee build.log
+
+      # The build failing is the signal to act. This count is the early warning ahead of it: it
+      # moves when the annotation moves, which is worth seeing while it is still free.
+      #
+      # Count distinct file:line sites, not matching lines. Each diagnostic prints twice, once as
+      # the message and once as the caret line under the source excerpt, and the compiler colours
+      # both even through the pipe, so the naive `grep -c` reports double and the ANSI runs break
+      # any pattern that spans the severity. `error` is in the alternation on purpose: on the day
+      # this workflow earns its keep the build fails, and a summary that only counts warnings would
+      # report zero on exactly that run.
+      - name: Isolation diagnostics
+        if: always()
+        run: |
+          sites=$(sed -E $'s/\x1b\\[[0-9;]*m//g' build.log \
+            | grep -oE '[^ ]+\.swift:[0-9]+:[0-9]+: (warning|error): [^[]*main actor-isolated[^[]*' \
+            | sed -E 's#^.*/Sources/#Sources/#' | sort -u || true)
+          count=$(printf '%s' "$sites" | grep -c . || true)
+          # Also to stdout: the step summary is readable in the UI but not through the API, so the
+          # log is the only place a later run can be compared against from a terminal.
+          printf 'main-actor isolation sites: %s\n%s\n' "${count:-0}" "${sites:-(none)}"
+          {
+            echo "## Main-actor isolation sites: ${count:-0}"
+            echo
+            echo '```'
+            printf '%s\n' "${sites:-(none)}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

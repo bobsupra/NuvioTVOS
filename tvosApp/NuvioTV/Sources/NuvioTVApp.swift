@@ -8,6 +8,7 @@
 import SwiftUI
 import Foundation
 import UIKit
+import OSLog
 
 @main
 struct NuvioTVApp: App {
@@ -15,6 +16,32 @@ struct NuvioTVApp: App {
         WindowGroup {
             ContentView()
         }
+    }
+}
+
+/// Temporary Home performance tracing. Enabled only by DEBUG builds so the
+/// release app does not pay for the timestamps or console formatting.
+enum TVHomeDebugTrace {
+    // Intentionally always enabled while this diagnostic build is being
+    // profiled. Remove the trace calls after the scrolling source is fixed.
+    private static let enabled = true
+    private static let logger = Logger(
+        subsystem: "com.pyksel.nuviotvos",
+        category: "TVTrace"
+    )
+
+    static func now() -> UInt64 {
+        DispatchTime.now().uptimeNanoseconds
+    }
+
+    static func elapsedMilliseconds(since start: UInt64) -> String {
+        String(format: "%.1f", Double(now() - start) / 1_000_000)
+    }
+
+    static func log(_ message: @autoclosure () -> String) {
+        guard enabled else { return }
+        let line = "[TVTrace] \(message())"
+        print(line)
     }
 }
 
@@ -281,6 +308,7 @@ struct ContentView: View {
         .onOpenURL(perform: handleDeepLink)
         .onAppear {
             syncManager.attach(authManager: authManager, profileViewModel: profileViewModel)
+            ICloudSettingsSyncManager.shared.start()
             guard !resolvedInitialScreen else { return }
             resolvedInitialScreen = true
             // Skip the login gate if a session was restored or the user has
@@ -520,6 +548,9 @@ struct ContentView: View {
     /// Backs out of Details to the title it was opened from (a "More like this"
     /// chain), or to the screen that opened the root Details.
     private func leaveDetails() {
+        TVHomeDebugTrace.log(
+            "details.leave backStackRemaining=\(detailsBackStack.count) returnDest=\(detailsReturnDestination)"
+        )
         withAnimation(.easeInOut(duration: 0.24)) {
             if let previous = detailsBackStack.popLast() {
                 activeScreen = .details(id: previous.id, type: previous.type)
@@ -543,6 +574,9 @@ struct ContentView: View {
         type: String,
         returnDestination: DetailsReturnDestination = .main
     ) {
+        TVHomeDebugTrace.log(
+            "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
+        )
         detailsBackStack.removeAll()
         detailsReturnDestination = returnDestination
         activeScreen = .details(id: id, type: type)
@@ -1868,6 +1902,14 @@ private struct CrossfadingBackdrop: View {
     }
 }
 
+extension CrossfadingBackdrop: Equatable {
+    static func == (lhs: CrossfadingBackdrop, rhs: CrossfadingBackdrop) -> Bool {
+        lhs.url == rhs.url
+            && lhs.placeholder == rhs.placeholder
+            && lhs.alignment == rhs.alignment
+    }
+}
+
 /// Small in-memory cache + loader for backdrop images so revisiting a poster is
 /// instant (no decode flicker) and repeated focus changes don't refetch.
 private actor BackdropImageCache {
@@ -1889,7 +1931,8 @@ private actor BackdropImageCache {
     }
 }
 
-/// Composites the active profile's avatar (catalog face over its accent circle)
+/// Composites the active profile's avatar (catalog face or custom web image
+/// over its accent circle)
 /// into a static, circular bitmap for use as the profile tab's icon.
 ///
 /// tvOS tab items can only display a still image, not a live `AsyncImage`/SwiftUI
@@ -1910,11 +1953,10 @@ final class ProfileTabAvatarRenderer: ObservableObject {
 
     func refresh(avatarId: String?) {
         guard let avatarId, !avatarId.isEmpty,
-              let item = AvatarCatalogStore.shared.item(for: avatarId),
-              let url = item.imageURL else {
-            // No avatar chosen, or the catalog hasn't loaded yet: show the
-            // symbol. Clearing `renderedAvatarId` lets a later `refresh` (once
-            // the catalog arrives) re-attempt the render.
+              let url = AvatarCatalogStore.shared.imageURL(for: avatarId) else {
+            // No avatar chosen, or the catalog/custom URL is not available:
+            // show the symbol. Clearing `renderedAvatarId` lets a later
+            // refresh (once the catalog arrives) re-attempt the render.
             renderedAvatarId = nil
             image = nil
             return
@@ -1922,7 +1964,10 @@ final class ProfileTabAvatarRenderer: ObservableObject {
         guard avatarId != renderedAvatarId else { return }
         renderedAvatarId = avatarId
         image = nil
-        let background = UIColor(item.backgroundColor)
+        let background = UIColor(
+            AvatarCatalogStore.shared.item(for: avatarId)?.backgroundColor
+                ?? Color(red: 0.12, green: 0.30, blue: 0.55)
+        )
         Task { await render(avatarId: avatarId, url: url, background: background) }
     }
 
@@ -2262,45 +2307,6 @@ private final class TVHomeRowScrollStore {
     }
 }
 
-/// Supplies the native vertical scroll state that tvOS uses to collapse the
-/// sidebar pill. This noninteractive scroll view mirrors whether focus is at
-/// the top of the catalog without coupling the pill to Home's clipped scroller.
-private struct HomeTabBarScrollState: View {
-    let rowIndex: Int
-
-    var body: some View {
-        GeometryReader { geometry in
-            ScrollViewReader { proxy in
-                ScrollView(.vertical, showsIndicators: false) {
-                    VStack(spacing: 0) {
-                        Color.clear
-                            .frame(height: geometry.size.height)
-                            .id(0)
-                        Color.clear
-                            .frame(height: geometry.size.height)
-                            .id(1)
-                    }
-                }
-                .onAppear {
-                    scroll(to: rowIndex, using: proxy)
-                }
-                .onChange(of: rowIndex) { _, newValue in
-                    scroll(to: newValue, using: proxy)
-                }
-            }
-        }
-        .allowsHitTesting(false)
-        .accessibilityHidden(true)
-    }
-
-    private func scroll(to rowIndex: Int, using proxy: ScrollViewProxy) {
-        var transaction = Transaction()
-        transaction.animation = nil
-        withTransaction(transaction) {
-            proxy.scrollTo(rowIndex == 0 ? 0 : 1, anchor: .top)
-        }
-    }
-}
 
 struct TVHomeView: View {
     /// Failure sets a retry already ran against without improving them, keyed by
@@ -2366,6 +2372,13 @@ struct TVHomeView: View {
     /// Add-on/catalog settings the last completed load actually read.
     @State private var lastLoadedInputSignature: String?
     @State private var continueWatching: [ContinueWatchingItem] = []
+    /// Derived once when Continue Watching changes. Recomputing these from the
+    /// entire history inside `body` made every focus update scale with the
+    /// number of loaded progress items.
+    @State private var continueWatchingMetas: [NuvioMeta] = []
+    @State private var continueWatchingByMetaId: [String: ContinueWatchingItem] = [:]
+    @State private var continueWatchingIndexByMetaId: [String: Int] = [:]
+    @State private var continueWatchingIDs: [String] = []
     @State private var displayedProgressSource: TraktWatchProgressSource?
     @State private var continueWatchingRefreshGeneration = 0
     @State private var continueWatchingRefreshTask: Task<Void, Never>?
@@ -2414,14 +2427,12 @@ struct TVHomeView: View {
     @FocusState private var focusedCardID: String?
 
     var body: some View {
+        let _ = TVHomeDebugTrace.log("home.body.render active=\(isActive) isEnabled=\(isEnabled)")
         ZStack(alignment: .topLeading) {
             // Match Android's AppTabHost ownership: only the selected tab owns
             // a Home render tree. TVHomeStore and this view's @State preserve
             // data/position, while image, focus, and row subtrees are released
-            // for Settings instead of continuing to participate in updates.
             if isActive {
-            HomeTabBarScrollState(rowIndex: focusedRowIndex)
-
             // 1. Bottom Layer: Full Screen Crossfading Backdrop
             // Collection folder heroes: top-trailing crop (Android TopEnd) so
             // portrait hero art isn't center-cropped with the subject too high.
@@ -2437,6 +2448,7 @@ struct TVHomeView: View {
                 placeholder: Color.nuvioBackground(amoled: amoled, body: bodyColor),
                 alignment: focusedCollectionFolder != nil ? .topTrailing : .center
             )
+            .equatable()
             .ignoresSafeArea()
             .frame(maxWidth: .infinity, maxHeight: .infinity)
             
@@ -2514,6 +2526,7 @@ struct TVHomeView: View {
                             TVHeroView(meta: heroMeta, continueItem: heroContinueItem(for: heroMeta)) {
                                 navigateToDetailsFromHome(id: heroMeta.id, type: heroMeta.type)
                             }
+                            .equatable()
                         }
                     }
                     
@@ -2538,16 +2551,14 @@ struct TVHomeView: View {
                                 heroBleed: horizontalEdgeInset
                             )
                         } else {
-                            // Native vertical scrolling for the rows, mirroring
-                            // Grid View: LazyVStack materializes only viewport
-                            // rows and tvOS scrolls natively as focus moves.
-                            // The manual offset stack this replaces translated
-                            // every row on each Up/Down press, which stalled the
-                            // main thread on Homes with many sections (e.g. GG's
-                            // 20) even with a bounded focus window.
+                            // Native vertical scrolling for the rows:
+                            // Using a non-lazy VStack inside ScrollView ensures
+                            // all catalog rows remain mounted and ready in memory.
+                            // This eliminates synchronous row mount spikes (44ms stalls)
+                            // when moving vertically between rows.
                             ScrollViewReader { verticalScrollProxy in
                                 ScrollView(.vertical, showsIndicators: false) {
-                                    LazyVStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
+                                    VStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
                                         ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
                                         if section.isLoadingPlaceholder {
                                             TVLoadingCatalogRow(title: section.title)
@@ -2555,8 +2566,7 @@ struct TVHomeView: View {
                                                     height: estimatedHeight(for: section),
                                                     alignment: .topLeading
                                                 )
-                                                .id(section.id)
-                                        } else if !section.collectionFolders.isEmpty {
+                                                      } else if !section.collectionFolders.isEmpty {
                                             TVCollectionFolderRow(
                                                 id: section.id,
                                                 title: section.title,
@@ -2572,28 +2582,27 @@ struct TVHomeView: View {
                                                 retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                                 suppressFocusAnimations: suppressReturnFocusAnimations
                                                     && focusedRowIndex == index,
+                                                entryLocked: focusedRowIndex != index,
                                                 onInitialFocusRequested: {
                                                     didRequestInitialCardFocus = true
                                                 },
                                                 onFocus: { folder in
                                                     let cardKey = "\(section.id)\u{1}\(folder.id)"
                                                     if focusWork.restoringOverlayCardID == cardKey {
-                                                        // A focus restore is not a directional
-                                                        // move; the native scroller follows
-                                                        // focus, so just release the lock.
                                                         completeOverlayFocusRestore(for: cardKey)
-                                                    }
-                                                    if focusWork.restoringOverlayCardID != cardKey {
-                                                        overlayRestoreCardID = nil
                                                     }
                                                     let changedRow = focusedRowIndex != index
                                                     if changedRow {
                                                         focusedRowIndex = index
-                                                    }
-                                                    withAnimation(
-                                                        changedRow ? TVHomeLayout.verticalScrollAnimation : nil
-                                                    ) {
-                                                        verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        withAnimation(TVHomeLayout.verticalScrollAnimation) {
+                                                            verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        }
+                                                    } else {
+                                                        var transaction = Transaction()
+                                                        transaction.animation = nil
+                                                        withTransaction(transaction) {
+                                                            verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        }
                                                     }
                                                     focusedCardID = cardKey
                                                     settleFolderFocus(folder, in: section.id)
@@ -2603,8 +2612,9 @@ struct TVHomeView: View {
                                                     onOpenCollectionFolder(folder, section.title)
                                                 }
                                             )
+                                            .equatable()
                                             .id(section.id)
-                                        } else {
+                                         } else {
                                             TVCatalogRow(
                                                 id: section.id,
                                                 title: section.title,
@@ -2624,32 +2634,43 @@ struct TVHomeView: View {
                                                 retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                                 suppressFocusAnimations: suppressReturnFocusAnimations
                                                     && focusedRowIndex == index,
+                                                entryLocked: focusedRowIndex != index,
                                                 onInitialFocusRequested: {
                                                     didRequestInitialCardFocus = true
                                                 },
                                                 onFocus: { meta in
+                                                    let focusStarted = TVHomeDebugTrace.now()
                                                     let cardKey = "\(section.id)\u{1}\(meta.id)"
+                                                    let changedRow = focusedRowIndex != index
+                                                    TVHomeDebugTrace.log(
+                                                        "home.focus.begin section=\(section.id) meta=\(meta.id) "
+                                                            + "changedRow=\(changedRow) fromRow=\(focusedRowIndex) toRow=\(index)"
+                                                    )
                                                     if focusWork.restoringOverlayCardID == cardKey {
-                                                        // A focus restore is not a directional
-                                                        // move; the native scroller follows
-                                                        // focus, so just release the lock.
                                                         completeOverlayFocusRestore(for: cardKey)
                                                     }
-                                                    if focusWork.restoringOverlayCardID != cardKey {
-                                                        overlayRestoreCardID = nil
-                                                    }
-                                                    let changedRow = focusedRowIndex != index
                                                     if changedRow {
                                                         focusedRowIndex = index
-                                                    }
-                                                    withAnimation(
-                                                        changedRow ? TVHomeLayout.verticalScrollAnimation : nil
-                                                    ) {
-                                                        verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        TVHomeDebugTrace.log(
+                                                            "home.scrollTo section=\(section.id) anchor=top"
+                                                        )
+                                                        withAnimation(TVHomeLayout.verticalScrollAnimation) {
+                                                            verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        }
+                                                    } else {
+                                                        var transaction = Transaction()
+                                                        transaction.animation = nil
+                                                        withTransaction(transaction) {
+                                                            verticalScrollProxy.scrollTo(section.id, anchor: .top)
+                                                        }
                                                     }
                                                     focusedCardID = cardKey
                                                     settleCatalogFocus(on: meta, in: section.id)
                                                     scheduleLandscapeFocus(cardKey: cardKey)
+                                                    TVHomeDebugTrace.log(
+                                                        "home.focus.end section=\(section.id) meta=\(meta.id) "
+                                                            + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: focusStarted))"
+                                                    )
                                                 },
                                                 onBlur: { meta in
                                                     clearLandscapeFocus(cardKey: "\(section.id)\u{1}\(meta.id)")
@@ -2678,6 +2699,7 @@ struct TVHomeView: View {
                                                 },
                                                 onLongPress: longPressHandler(for: section.id)
                                             )
+                                            .equatable()
                                             .id(section.id)
                                         }  // end catalog vs collection branch
                                         }
@@ -2685,6 +2707,16 @@ struct TVHomeView: View {
                                     .frame(maxWidth: .infinity, alignment: .leading)
                                     .padding(.top, TVHomeLayout.rowsTopPadding)
                                     .padding(.bottom, 80)
+
+                                    // The final row otherwise hits the
+                                    // ScrollView's bottom limit before it can
+                                    // reach the same fixed position as the
+                                    // preceding rows. Keep a full viewport of
+                                    // non-focusable runway, plus the 24pt
+                                    // design inset, after the last catalog.
+                                    Color.clear
+                                        .frame(height: proxy.size.height + TVHomeLayout.finalRowScrollRunway)
+                                        .accessibilityHidden(true)
                                 }
                             }
                         }
@@ -2695,13 +2727,17 @@ struct TVHomeView: View {
                     // focus, so the first Menu press can still reach the sidebar,
                     // while returning from the sidebar restores the saved card.
                     .focusSection()
-                    .defaultFocusIfAvailable($focusedCardID, shouldRestoreHomeFocus ? store.lastFocusedCardID : nil)
+                    .defaultFocusIfAvailable($focusedCardID, store.lastFocusedCardID ?? focusWork.pendingOverlayRestoreCardID)
                 }
             }
             // Ignore the bottom safe-area inset too, so the scrolling rows window
             // runs to the screen's bottom edge instead of stopping short and
             // leaving a black bar below the lowest visible row.
             .ignoresSafeArea(.container, edges: [.top, .bottom])
+            .onExitCommand {
+                TVHomeDebugTrace.log("home.exitCommand openMenu")
+                focusedCardID = nil
+            }
 
             }
         }
@@ -2745,7 +2781,7 @@ struct TVHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingDismissStore.changedNotification)) { _ in
             let remaining = continueWatching.filter { !ContinueWatchingDismissStore.isDismissed($0) }
             if remaining.count != continueWatching.count {
-                continueWatching = remaining
+                setContinueWatching(remaining)
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification)) { _ in
@@ -2911,6 +2947,9 @@ struct TVHomeView: View {
         // card is unfocusable (the Settings sidebar trick), so the engine can
         // only land back on the saved card -- no scroll-to-top flash.
         .onChange(of: isEnabled) { _, enabled in
+            TVHomeDebugTrace.log(
+                "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+            )
             // TabView may disable an unselected Home tab. Only Details/Player
             // restoration happens while Home is still the selected tab.
             guard isActive else {
@@ -2922,28 +2961,41 @@ struct TVHomeView: View {
                 // Direct Home → Details navigation already captured the target
                 // in reference storage. Avoid publishing the one-card lock now:
                 // doing so rebuilds every resident shelf before Details can draw.
-                if focusWork.defersOverlayPreparation { return }
+                if focusWork.defersOverlayPreparation {
+                    TVHomeDebugTrace.log("home.overlay.disabled deferring preparation")
+                    focusWork.landscapeFocusTask?.cancel()
+                    focusWork.pendingLandscapeFocusedId = nil
+                    focusWork.focusSettleTask?.cancel()
+                    return
+                }
 
                 // Home remains mounted underneath full-screen overlays. Disable
                 // its focus-driven springs before focus is removed so restoring
                 // the saved card cannot bounce the vertical row stack.
                 armReturnFocusAnimationSuppression()
                 overlayRestoreGeneration &+= 1
-                overlayRestoreCardID = focusedCardID ?? store.lastFocusedCardID
+                let target = focusedCardID ?? store.lastFocusedCardID
+                TVHomeDebugTrace.log("home.overlay.disabled setting target=\(target ?? "nil")")
+                overlayRestoreCardID = target
             } else if focusWork.defersOverlayPreparation {
                 let target = focusWork.pendingOverlayRestoreCardID
                 focusWork.defersOverlayPreparation = false
                 focusWork.pendingOverlayRestoreCardID = nil
-                guard let target else { return }
+                guard let target else {
+                    TVHomeDebugTrace.log("home.overlay.enabled defersPrep with nil target")
+                    return
+                }
 
                 // Build the restriction only on the return path. Details is no
                 // longer competing with this Home render, and the delayed focus
                 // writes below run after the target modifier is mounted.
                 armReturnFocusAnimationSuppression()
                 overlayRestoreGeneration &+= 1
+                TVHomeDebugTrace.log("home.overlay.enabled restoring to target=\(target) gen=\(overlayRestoreGeneration)")
                 overlayRestoreCardID = target
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             } else if let target = overlayRestoreCardID {
+                TVHomeDebugTrace.log("home.overlay.enabled fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
         }
@@ -2951,7 +3003,7 @@ struct TVHomeView: View {
         // still names the card that just left, and because every other card is
         // unfocusable while a capture stands, focus lands nowhere at all. Hand
         // the slot to whatever moved into it instead.
-        .onChange(of: continueWatching.map(\.meta.id)) { _, ids in
+        .onChange(of: continueWatchingIDs) { _, ids in
             let previous = continueWatchingCardIDs
             continueWatchingCardIDs = ids
             guard let target = overlayRestoreCardID,
@@ -3142,16 +3194,30 @@ struct TVHomeView: View {
     }
 
     private func restoreOverlayFocus(to target: String, generation: Int) {
+        TVHomeDebugTrace.log("home.restoreOverlayFocus begin target=\(target) gen=\(generation)")
         focusWork.restoringOverlayCardID = target
-        for delay in [0.12, 0.45] {
+        focusedCardID = target
+        // Fire multiple focus writes across the transition window. The first
+        // writes land while Details is fading; later writes cover the moment
+        // DetailsScreen is actually removed from the ZStack (details.disappear)
+        // which can be delayed if the main thread is busy (e.g. StreamsRepo).
+        for delay in [0.04, 0.12, 0.25, 0.45, 1.0] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+                    TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
                     focusedCardID = target
                 }
             }
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+        // Safety fallback: the lock MUST survive the entire Details exit
+        // transition including details.disappear (ZStack re-layout). On a
+        // busy main thread this can take well over 1s. Use a generous timeout
+        // so the lock is still active when tvOS re-evaluates focus geometry
+        // after removing DetailsScreen; completeOverlayFocusRestore is the
+        // normal (fast) cleanup path once the target card confirms focus.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+                TVHomeDebugTrace.log("home.restoreOverlayFocus safety cleanup target=\(target)")
                 overlayRestoreCardID = nil
                 if focusWork.restoringOverlayCardID == target {
                     focusWork.restoringOverlayCardID = nil
@@ -3168,11 +3234,13 @@ struct TVHomeView: View {
     private func completeOverlayFocusRestore(for cardKey: String) {
         guard focusWork.restoringOverlayCardID == cardKey else { return }
         let generation = overlayRestoreGeneration
+        TVHomeDebugTrace.log("home.completeOverlayFocusRestore start cardKey=\(cardKey) gen=\(generation)")
         DispatchQueue.main.async {
             guard overlayRestoreGeneration == generation,
                   focusWork.restoringOverlayCardID == cardKey,
                   overlayRestoreCardID == cardKey else { return }
 
+            TVHomeDebugTrace.log("home.completeOverlayFocusRestore done cardKey=\(cardKey)")
             focusWork.restoringOverlayCardID = nil
             var transaction = Transaction()
             transaction.animation = nil
@@ -3262,7 +3330,7 @@ struct TVHomeView: View {
         let resumeSection = TVHomeSection(
             id: TVHomeSection.continueWatchingId,
             title: "Continue Watching",
-            items: continueWatching.map(\.meta)
+            items: continueWatchingMetas
         )
         let allSections = continueWatching.isEmpty ? store.sections : [resumeSection] + store.sections
 
@@ -3279,17 +3347,6 @@ struct TVHomeView: View {
                 !ContentReleasePolicy.isUnreleased($0, today: today)
             }
             return copy
-        }
-    }
-
-    /// One progress bar per card, and a card is a title — so two rows for the
-    /// same series (a remote provider can hand back a playback per episode)
-    /// have to collapse rather than trap. `uniqueKeysWithValues` crashes on the
-    /// collision; keep the most recent entry, which is the one the card is
-    /// meant to resume.
-    private var continueWatchingByMetaId: [String: ContinueWatchingItem] {
-        Dictionary(continueWatching.map { ($0.meta.id, $0) }) { older, newer in
-            newer.lastWatchedAt > older.lastWatchedAt ? newer : older
         }
     }
 
@@ -3404,7 +3461,8 @@ struct TVHomeView: View {
     }
 
     private func shouldDisplayContinueWatchingItem(_ item: ContinueWatchingItem) -> Bool {
-        isVisible(item.meta)
+        (!item.isUpNextEntry || ContinueWatchingFeatureFlags.nextUpCardsEnabled)
+            && isVisible(item.meta)
             && (showUnairedNextUp || !item.isUpNextEntry || item.hasAired || item.isAiringToday)
             && !ContinueWatchingDismissStore.isDismissed(item)
     }
@@ -3880,9 +3938,15 @@ struct TVHomeView: View {
         let targetFolderId = focusWork.pendingFocusedFolder?.id
         let targetSectionId = focusWork.pendingSectionId
         let hasFolderPending = targetFolderId != nil
+        let delay = heroSettleNanoseconds
+        TVHomeDebugTrace.log(
+            "hero.schedule section=\(targetSectionId ?? "nil") meta=\(targetMetaId ?? "nil") "
+                + "folder=\(targetFolderId ?? "nil") delayMs=\(delay / 1_000_000)"
+        )
 
         focusWork.focusSettleTask = Task { @MainActor in
-            try? await Task.sleep(nanoseconds: heroSettleNanoseconds)
+            let started = TVHomeDebugTrace.now()
+            try? await Task.sleep(nanoseconds: delay)
             guard !Task.isCancelled else { return }
 
             if hasFolderPending {
@@ -3902,6 +3966,9 @@ struct TVHomeView: View {
                 if focusedMeta != nil {
                     focusedMeta = nil
                 }
+                TVHomeDebugTrace.log(
+                    "hero.publish folder=\(folder.id) elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+                )
                 return
             }
 
@@ -3918,6 +3985,12 @@ struct TVHomeView: View {
             if focusedMeta?.id != settledMeta.id {
                 focusedMeta = settledMeta
             }
+
+            TVHomeDebugTrace.log(
+                "hero.publish section=\(targetSectionId) meta=\(settledMeta.id) "
+                    + "enrich=\(settledMeta.needsHeroMetadataEnrichment) "
+                    + "elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
 
             // Third-party catalog responses are often intentionally compact
             // and omit runtime/status and shelf artwork. Once focus settles,
@@ -4066,7 +4139,11 @@ struct TVHomeView: View {
 
         let targetKey = cardKey
         let delaySeconds = max(1, focusedPosterBackdropDelay)
+        TVHomeDebugTrace.log(
+            "backdrop.schedule card=\(cardKey) delayMs=\(delaySeconds * 1_000)"
+        )
         focusWork.landscapeFocusTask = Task { @MainActor in
+            let started = TVHomeDebugTrace.now()
             try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
             guard !Task.isCancelled,
                   focusWork.pendingLandscapeFocusedId == targetKey else {
@@ -4074,6 +4151,9 @@ struct TVHomeView: View {
             }
 
             landscapeFocusedId = targetKey
+            TVHomeDebugTrace.log(
+                "backdrop.publish card=\(targetKey) elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
+            )
         }
     }
 
@@ -4120,10 +4200,43 @@ struct TVHomeView: View {
         }
     }
 
+    /// Publishes Continue Watching and its derived lookup data together. The
+    /// row is updated from notifications and source refreshes, while Home can
+    /// re-evaluate its body dozens of times during focus movement; keeping the
+    /// metadata array and progress index out of those body computations is the
+    /// important part of this helper.
+    private func setContinueWatching(_ items: [ContinueWatchingItem]) {
+        TVHomeDebugTrace.log(
+            "cw.set incoming=\(items.count) showing=\(items.count) "
+                + "upNext=\(items.filter(\.isUpNextEntry).count)"
+        )
+        var byMetaId = Dictionary<String, ContinueWatchingItem>(
+            minimumCapacity: items.count
+        )
+        var indexByMetaId = Dictionary<String, Int>(minimumCapacity: items.count)
+        for (index, item) in items.enumerated() {
+            if let existing = byMetaId[item.meta.id], existing.lastWatchedAt >= item.lastWatchedAt {
+                continue
+            }
+            byMetaId[item.meta.id] = item
+            indexByMetaId[item.meta.id] = index
+        }
+
+        continueWatching = items
+        // The full series episode guide remains on the source item for resume,
+        // episode lookup, and playback. The row cards only need presentation
+        // metadata; keeping hundreds of `videos` entries in every SwiftUI card
+        // value makes repeated focus/layout passes carry unnecessary payload.
+        continueWatchingMetas = items.map { $0.meta.persistenceSnapshot }
+        continueWatchingByMetaId = byMetaId
+        continueWatchingIndexByMetaId = indexByMetaId
+        continueWatchingIDs = items.map(\.meta.id)
+    }
+
     private func refreshContinueWatching() {
         guard !usesRemoteProgress else {
             if displayedProgressSource != selectedProgressSource {
-                continueWatching = []
+                setContinueWatching([])
                 displayedProgressSource = selectedProgressSource
             }
             #if DEBUG
@@ -4149,9 +4262,11 @@ struct TVHomeView: View {
         let visibleItems = byId.values
             .sorted { $0.recencySortDate > $1.recencySortDate }
             .filter(shouldDisplayContinueWatchingItem)
-        continueWatching = ContinueWatchingSortPolicy.sorted(
-            visibleItems,
-            preference: continueWatchingSort
+        setContinueWatching(
+            ContinueWatchingSortPolicy.sorted(
+                visibleItems,
+                preference: continueWatchingSort
+            )
         )
         displayedProgressSource = .nuvioSync
         #if DEBUG
@@ -4180,19 +4295,27 @@ struct TVHomeView: View {
     /// Everything is already in the local ledger, so this only costs metadata
     /// lookups for titles this device has not rendered before.
     private func loadMoreContinueWatchingIfNeeded(currentItem: NuvioMeta) {
+        let continueIndex = continueWatchingIndexByMetaId[currentItem.id]
+        TVHomeDebugTrace.log(
+            "cw.approach id=\(currentItem.id) index=\(continueIndex.map(String.init) ?? "nil") "
+                + "count=\(continueWatching.count) canMore=\(ContinueWatchingBuilder.canLoadMore) "
+                + "loading=\(isLoadingMoreContinueWatching)"
+        )
         guard !usesRemoteProgress,
               ContinueWatchingBuilder.canLoadMore,
               !isLoadingMoreContinueWatching,
-              let index = continueWatching.firstIndex(where: { $0.meta.id == currentItem.id }),
+              let index = continueIndex,
               index >= max(continueWatching.count - TVHomeRowPrefetchThreshold, 0) else {
             return
         }
         isLoadingMoreContinueWatching = true
+        TVHomeDebugTrace.log("cw.approach loadNextPage start count=\(continueWatching.count)")
         Task { @MainActor in
             defer { isLoadingMoreContinueWatching = false }
             _ = await ContinueWatchingBuilder.loadNextPage()
             guard !usesRemoteProgress else { return }
             refreshContinueWatching()
+            TVHomeDebugTrace.log("cw.approach loadNextPage end count=\(continueWatching.count)")
         }
     }
 
@@ -4276,9 +4399,11 @@ struct TVHomeView: View {
             shouldDisplayContinueWatchingItem($0)
                 && seenMetaIds.insert($0.meta.id).inserted
         }
-        continueWatching = ContinueWatchingSortPolicy.sorted(
-            visibleItems,
-            preference: continueWatchingSort
+        setContinueWatching(
+            ContinueWatchingSortPolicy.sorted(
+                visibleItems,
+                preference: continueWatchingSort
+            )
         )
         displayedProgressSource = source
 
@@ -4870,6 +4995,7 @@ private struct TVHeroView: View {
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
 
     var body: some View {
+        let _ = TVHomeDebugTrace.log("hero.render meta=\(meta.id)")
         VStack(alignment: .leading, spacing: 18) {
             if let logoUrl = meta.logoUrl {
                 CachedHeroLogo(url: logoUrl, title: meta.name)
@@ -4918,6 +5044,22 @@ private struct TVHeroView: View {
             return overview
         }
         return meta.description
+    }
+}
+
+extension TVHeroView: Equatable {
+    static func == (lhs: TVHeroView, rhs: TVHeroView) -> Bool {
+        lhs.meta.id == rhs.meta.id
+            && lhs.meta.name == rhs.meta.name
+            && lhs.meta.logoUrl == rhs.meta.logoUrl
+            && lhs.meta.description == rhs.meta.description
+            && lhs.meta.year == rhs.meta.year
+            && lhs.meta.rating == rhs.meta.rating
+            && lhs.meta.runtime == rhs.meta.runtime
+            && lhs.meta.genres == rhs.meta.genres
+            && lhs.continueItem?.meta.id == rhs.continueItem?.meta.id
+            && lhs.continueItem?.episodeLabel == rhs.continueItem?.episodeLabel
+            && lhs.continueItem?.remainingText == rhs.continueItem?.remainingText
     }
 }
 
@@ -5296,6 +5438,7 @@ private struct TVCatalogRow: View {
     /// Off-window rows stay mounted to preserve decoded artwork, but do not
     /// contribute cards to the tvOS focus graph.
     var allowsFocus: Bool = true
+    var entryLocked: Bool = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (NuvioMeta) -> Void
     let onBlur: (NuvioMeta) -> Void
@@ -5373,6 +5516,12 @@ private struct TVCatalogRow: View {
         return titleWatched ? true : nil
     }
 
+    private var defaultFocusCardKey: String? {
+        guard !items.isEmpty else { return nil }
+        let idx = min(max(effectiveScrollIndex, 0), items.count - 1)
+        return "\(id)\u{1}\(items[idx].id)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // Keep the section title above the card strip (landscape art / focus
@@ -5389,6 +5538,8 @@ private struct TVCatalogRow: View {
                 .zIndex(0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+        .defaultFocusIfAvailable(externalFocus, defaultFocusCardKey)
     }
 
     // A definite-size clipping window for the cards. A GeometryReader imposes
@@ -5398,6 +5549,8 @@ private struct TVCatalogRow: View {
     // the window via a manual offset; overflow is clipped.
     private var cardStrip: some View {
         GeometryReader { geo in
+            let rowTraceEnabled = true
+            let rowLayoutStarted = TVHomeDebugTrace.now()
             let stripWidth = geo.size.width + horizontalEdgeInset * 2
             let rowHomeLayout = homeLayout
             let rowPosterLabels = posterLabels
@@ -5408,8 +5561,19 @@ private struct TVCatalogRow: View {
             let rowCardSpacing: CGFloat = rowHomeLayout == "Compact" ? 22 : 28
             let visibleCardCount = max(1, Int(ceil(stripWidth / (rowPosterWidth + rowCardSpacing))) + 1)
             let materializedIndices = materializedCardIndices(visibleCardCount: visibleCardCount)
+            let guideEntries = materializedIndices.reduce(into: 0) { total, itemIndex in
+                total += items[itemIndex].videos?.count ?? 0
+            }
+            let _ = traceRowLayout(
+                enabled: rowTraceEnabled,
+                rowID: id,
+                itemCount: items.count,
+                mountedCount: materializedIndices.count,
+                guideEntries: guideEntries,
+                index: effectiveScrollIndex
+            )
 
-            HStack(alignment: .bottom, spacing: rowCardSpacing) {
+            HStack(alignment: .top, spacing: rowCardSpacing) {
                 ForEach(materializedIndices, id: \.self) { itemIndex in
                     let item = items[itemIndex]
                     let cardKey = "\(id)\u{1}\(item.id)"
@@ -5429,6 +5593,11 @@ private struct TVCatalogRow: View {
                         shouldRequestInitialFocus: shouldRequestInitialFocus,
                         onInitialFocusRequested: shouldRequestInitialFocus ? onInitialFocusRequested : nil,
                         onFocus: { focused in
+                            let focusStarted = TVHomeDebugTrace.now()
+                            TVHomeDebugTrace.log(
+                                "focus.begin row=\(id) index=\(itemIndex) items=\(items.count) "
+                                    + "mounted=\(materializedIndices.count) meta=\(focused.id)"
+                            )
                             if effectiveScrollIndex != itemIndex {
                                 let updateScrollPosition = {
                                     scrollIndex = itemIndex
@@ -5446,8 +5615,19 @@ private struct TVCatalogRow: View {
                                     }
                                 }
                             }
+                            let approachStarted = TVHomeDebugTrace.now()
                             onApproachEnd(focused)
+                            TVHomeDebugTrace.log(
+                                "focus.approach row=\(id) index=\(itemIndex) "
+                                    + "elapsedMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: approachStarted))"
+                            )
+                            let parentStarted = TVHomeDebugTrace.now()
                             onFocus(focused)
+                            TVHomeDebugTrace.log(
+                                "focus.end row=\(id) index=\(itemIndex) "
+                                    + "parentMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: parentStarted)) "
+                                    + "totalMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: focusStarted))"
+                            )
                         },
                         onBlur: { blurred in
                             onBlur(blurred)
@@ -5466,7 +5646,10 @@ private struct TVCatalogRow: View {
                         onSelect(item)
                     }
                     .equatable()
-                    .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
+                    .disabled(
+                        (restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
+                        || (entryLocked && itemIndex != effectiveScrollIndex)
+                    )
                 }
             }
             .padding(.leading, CGFloat(materializedIndices.first ?? 0) * (rowPosterWidth + rowCardSpacing))
@@ -5484,18 +5667,61 @@ private struct TVCatalogRow: View {
             )
             .frame(
                 width: stripWidth,
-                height: (rowHomeLayout == "Compact" ? 255 : 315)
-                    + (rowPosterLabels ? 48 : 0)
-                    + TVHomeLayout.stripVerticalPadding * 2,
-                alignment: .leading
+                height: stripHeight,
+                alignment: .topLeading
             )
             .clipped()
             .offset(x: -horizontalEdgeInset)
             // `scrollIndex` is animated explicitly in the focus callback so
             // user navigation still springs while restoration can snap quietly.
             .animation(rowCardFocusAnimations ? TVHomeLayout.scrollAnimation : nil, value: landscapeFocusedId)
+            .onAppear {
+                guard rowTraceEnabled else { return }
+                TVHomeDebugTrace.log(
+                    "row.layout.appear row=\(id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: rowLayoutStarted))"
+                )
+            }
         }
         .frame(height: stripHeight)
+    }
+
+    private func traceRowLayout(
+        enabled: Bool,
+        rowID: String,
+        itemCount: Int,
+        mountedCount: Int,
+        guideEntries: Int,
+        index: Int
+    ) {
+        TVHomeDebugTrace.log("row.layout row=\(rowID) items=\(itemCount) mounted=\(mountedCount) index=\(index)")
+    }
+}
+
+extension TVCatalogRow: Equatable {
+    static func == (lhs: TVCatalogRow, rhs: TVCatalogRow) -> Bool {
+        let lhsTargetInRow = lhs.restrictFocusToCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
+        let rhsTargetInRow = rhs.restrictFocusToCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
+        let restrictEqual = (lhsTargetInRow == rhsTargetInRow)
+            && (!lhsTargetInRow || lhs.restrictFocusToCardKey == rhs.restrictFocusToCardKey)
+
+        let lhsRetainInRow = lhs.retainFocusAppearanceForCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
+        let rhsRetainInRow = rhs.retainFocusAppearanceForCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
+        let retainEqual = (lhsRetainInRow == rhsRetainInRow)
+            && (!lhsRetainInRow || lhs.retainFocusAppearanceForCardKey == rhs.retainFocusAppearanceForCardKey)
+
+        return lhs.id == rhs.id
+            && lhs.title == rhs.title
+            && lhs.horizontalEdgeInset == rhs.horizontalEdgeInset
+            && lhs.items == rhs.items
+            && lhs.watchedTitleKeys == rhs.watchedTitleKeys
+            && lhs.initialScrollIndex == rhs.initialScrollIndex
+            && lhs.initialFocusCardKey == rhs.initialFocusCardKey
+            && lhs.landscapeFocusedId == rhs.landscapeFocusedId
+            && restrictEqual
+            && retainEqual
+            && lhs.suppressFocusAnimations == rhs.suppressFocusAnimations
+            && lhs.allowsFocus == rhs.allowsFocus
+            && lhs.entryLocked == rhs.entryLocked
     }
 }
 
@@ -5890,6 +6116,7 @@ private struct TVCollectionFolderRow: View {
     var retainFocusAppearanceForCardKey: String? = nil
     var suppressFocusAnimations = false
     var allowsFocus = true
+    var entryLocked = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (TVCollectionFolderItem) -> Void
     let onSelect: (TVCollectionFolderItem) -> Void
@@ -5958,6 +6185,12 @@ private struct TVCollectionFolderRow: View {
         return Array(lowerBound...upperBound)
     }
 
+    private var defaultFocusFolderKey: String? {
+        guard !folders.isEmpty else { return nil }
+        let idx = min(max(scrollIndex, 0), folders.count - 1)
+        return "\(id)\u{1}\(folders[idx].id)"
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             Text(title)
@@ -5971,6 +6204,8 @@ private struct TVCollectionFolderRow: View {
                 .zIndex(0)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+        .defaultFocusIfAvailable(externalFocus, defaultFocusFolderKey)
         .onAppear {
             if scrollIndex != initialScrollIndex {
                 scrollIndex = initialScrollIndex
@@ -5986,7 +6221,6 @@ private struct TVCollectionFolderRow: View {
             let rowSmoothFocus = smoothFocus
             let rowFocusHighlighter = focusHighlighter
             let rowSpacing = TVCollectionFolderCardLayout.rowSpacing(layoutMode: rowHomeLayout)
-            let imageHeight = TVCollectionFolderCardLayout.cardHeight(layoutMode: rowHomeLayout)
             let scrollX = TVCollectionFolderCardLayout.scrollOffset(
                 to: scrollIndex,
                 folders: folders,
@@ -5997,7 +6231,7 @@ private struct TVCollectionFolderRow: View {
                 layoutMode: rowHomeLayout
             )
 
-            HStack(alignment: .bottom, spacing: rowSpacing) {
+            HStack(alignment: .top, spacing: rowSpacing) {
                 ForEach(materializedIndices, id: \.self) { index in
                     let folder = folders[index]
                     let cardKey = "\(id)\u{1}\(folder.id)"
@@ -6023,7 +6257,10 @@ private struct TVCollectionFolderRow: View {
                         allowsFocus: allowsFocus,
                         onSelect: { onSelect(folder) }
                     )
-                    .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
+                    .disabled(
+                        (restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
+                        || (entryLocked && index != scrollIndex)
+                    )
                 }
             }
             .padding(
@@ -6038,10 +6275,8 @@ private struct TVCollectionFolderRow: View {
             .offset(x: horizontalEdgeInset + TVLayout.rowLeading - scrollX)
             .frame(
                 width: stripWidth,
-                height: imageHeight
-                    + (rowPosterLabels && folders.contains { !$0.hideTitle } ? 48 : 0)
-                    + TVHomeLayout.stripVerticalPadding * 2,
-                alignment: .leading
+                height: stripHeight,
+                alignment: .topLeading
             )
             .clipped()
             .offset(x: -horizontalEdgeInset)
@@ -6051,6 +6286,32 @@ private struct TVCollectionFolderRow: View {
             )
         }
         .frame(height: stripHeight)
+    }
+}
+
+extension TVCollectionFolderRow: Equatable {
+    static func == (lhs: TVCollectionFolderRow, rhs: TVCollectionFolderRow) -> Bool {
+        let lhsTargetInRow = lhs.restrictFocusToCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
+        let rhsTargetInRow = rhs.restrictFocusToCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
+        let restrictEqual = (lhsTargetInRow == rhsTargetInRow)
+            && (!lhsTargetInRow || lhs.restrictFocusToCardKey == rhs.restrictFocusToCardKey)
+
+        let lhsRetainInRow = lhs.retainFocusAppearanceForCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
+        let rhsRetainInRow = rhs.retainFocusAppearanceForCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
+        let retainEqual = (lhsRetainInRow == rhsRetainInRow)
+            && (!lhsRetainInRow || lhs.retainFocusAppearanceForCardKey == rhs.retainFocusAppearanceForCardKey)
+
+        return lhs.id == rhs.id
+            && lhs.title == rhs.title
+            && lhs.horizontalEdgeInset == rhs.horizontalEdgeInset
+            && lhs.folders == rhs.folders
+            && lhs.initialScrollIndex == rhs.initialScrollIndex
+            && lhs.initialFocusCardKey == rhs.initialFocusCardKey
+            && restrictEqual
+            && retainEqual
+            && lhs.suppressFocusAnimations == rhs.suppressFocusAnimations
+            && lhs.allowsFocus == rhs.allowsFocus
+            && lhs.entryLocked == rhs.entryLocked
     }
 }
 
@@ -6729,25 +6990,18 @@ struct CollectionFolderBrowseView: View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 12) {
                 ForEach(Array(tabLabels.enumerated()), id: \.offset) { index, label in
-                    Button {
+                    CollectionFolderTabButton(
+                        label: label,
+                        isSelected: selectedTabIndex == index
+                    ) {
                         selectedTabIndex = index
-                        focusedItemID = displayedGridItems.first?.id
-                    } label: {
-                        Text(label)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(selectedTabIndex == index ? .black : .white.opacity(0.85))
-                            .padding(.horizontal, 22)
-                            .frame(height: 48)
-                            .background(
-                                Capsule(style: .continuous)
-                                    .fill(selectedTabIndex == index ? Color.white : Color.white.opacity(0.12))
-                            )
                     }
-                    .buttonStyle(PosterCardButtonStyle())
                 }
             }
             .padding(.horizontal, 60)
+            .padding(.vertical, 8)
         }
+        .scrollClipDisabledIfAvailable()
         .focusSection()
     }
 
@@ -7282,6 +7536,64 @@ private struct CollectionFolderHomeStyleRow: View {
     }
 }
 
+/// Pill tab button for CollectionFolderBrowseView (Grid view mode).
+/// Displays a clear focus outline (theme accent color) when navigated to,
+/// and highlights selected tabs.
+private struct CollectionFolderTabButton: View {
+    let label: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+    @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 20, weight: .semibold))
+                .foregroundColor(textColor)
+                .padding(.horizontal, 22)
+                .frame(height: 48)
+                .background(
+                    backgroundColor,
+                    in: Capsule(style: .continuous)
+                )
+                .overlay(
+                    Capsule(style: .continuous)
+                        .strokeBorder(
+                            isFocused ? AppFocusOutline.color : .clear,
+                            lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                        )
+                )
+                .shadow(
+                    color: .black.opacity(isFocused ? 0.45 : 0.0),
+                    radius: isFocused ? 12 : 0
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(isFocused ? 1.08 : 1.0)
+        .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : .easeOut(duration: 0.12), value: isFocused)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+    }
+
+    private var textColor: Color {
+        if isFocused {
+            return .black
+        }
+        return isSelected ? .black : .white.opacity(0.85)
+    }
+
+    private var backgroundColor: Color {
+        if isFocused {
+            return .white
+        }
+        return isSelected ? Color.white : Color.white.opacity(0.12)
+    }
+}
+
 /// Poster card chrome matching Search / Library grids (Tabs view mode).
 private struct CollectionFolderResultCard: View {
     let meta: NuvioMeta
@@ -7579,8 +7891,11 @@ private enum TVHomeLayout {
     /// Keep the first catalog heading close to the hero description.
     static let heroBottomPadding: CGFloat = 20
     static let rowsTopPadding: CGFloat = 4
+    /// Extra scroll room so the last row can reach the same fixed anchor as
+    /// earlier rows instead of being clamped to the viewport bottom.
+    static let finalRowScrollRunway: CGFloat = 24
     /// Focus breathing room above/below cards inside a strip.
-    static let stripVerticalPadding: CGFloat = 28
+    static let stripVerticalPadding: CGFloat = 24
     /// Section title line (~30pt) + VStack spacing under the title (~10pt) + slack.
     static let rowTitleBlock: CGFloat = 46
 

@@ -96,7 +96,9 @@ public class ProfileManager {
     private static let maxProfiles = 6
     private static let maxProfileIdCharacters = 64
     private static let maxProfileNameCharacters = 80
-    private static let maxAvatarIdCharacters = 128
+    // Catalog ids are short, but web-panel avatar URLs may include long query
+    // strings (for example signed image links).
+    private static let maxAvatarIdCharacters = 2048
 
     private let profilesURL: URL?
 

@@ -33,6 +33,10 @@ struct SearchView: View {
     /// instead of snapping back to the first result.
     @State private var lastFocusedResultID: String?
     @State private var shouldRestoreResultFocus = false
+    /// Debounced arming of the restore flag: a rapid vertical move blips
+    /// `focusedResultID` to nil while the next lazy cell materializes, and
+    /// arming instantly on that blip bounces focus back to the previous card.
+    @State private var restoreArmTask: Task<Void, Never>?
     /// Card to actively re-focus once the Details overlay dismisses; captured
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreResultID: String?
@@ -105,12 +109,13 @@ struct SearchView: View {
         }
         .onChange(of: focusedResultID) { _, newValue in
             if let newValue {
+                restoreArmTask?.cancel()
                 lastFocusedResultID = newValue
                 shouldRestoreResultFocus = false
                 // Restoration complete -- lift the focus restriction.
                 if isEnabled, newValue == overlayRestoreResultID { overlayRestoreResultID = nil }
             } else if lastFocusedResultID != nil {
-                shouldRestoreResultFocus = true
+                scheduleRestoreArm()
             }
         }
         // Overlay dismissal re-places focus geometrically without consulting
@@ -124,6 +129,19 @@ struct SearchView: View {
             } else if let target = overlayRestoreResultID {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
+        }
+    }
+
+    /// Arms the restore flag only after focus has stayed off the cards long
+    /// enough that the nil is a real departure (menu/tab) instead of the
+    /// one-frame blip of a rapid vertical move between lazy cells.
+    private func scheduleRestoreArm() {
+        guard lastFocusedResultID != nil, focusedResultID == nil else { return }
+        restoreArmTask?.cancel()
+        restoreArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, focusedResultID == nil else { return }
+            shouldRestoreResultFocus = true
         }
     }
 

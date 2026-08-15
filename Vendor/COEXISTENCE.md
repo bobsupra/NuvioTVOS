@@ -1,6 +1,6 @@
 # AetherEngine + MPVKit coexistence
 
-**Status:** Simulator Debug build succeeded with both stacks embedded (2026-07-20).  
+**Status:** Simulator Debug build succeeded with both stacks embedded (2026-08-12).
 **Device validation:** still required on physical Apple TV before treating the gate as fully closed.
 
 ## Problem
@@ -11,16 +11,16 @@ MPVKit and AetherEngine’s FFmpegBuild both ship frameworks/modules named `Liba
 
 | Package | Location | Change |
 |---|---|---|
-| FFmpegBuild 2.4.0 | `Vendor/FFmpegBuild` | Frameworks/modules renamed to `AetherLib*`; install names rewritten; headers rewritten to use `<AetherLib…/…>` cross-includes |
-| AetherEngine 6.7.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*` |
+| FFmpegBuild 2.4.2 | `Vendor/FFmpegBuild` | Frameworks/modules renamed to `AetherLib*`; install names rewritten; headers rewritten to use `<AetherLib…/…>` cross-includes |
+| AetherEngine 6.21.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*` |
 
 Refresh script: `Vendor/namespace_ffmpegbuild.py` (re-run after restoring upstream `Lib*.xcframework` trees).
 
 ## App integration
 
 - Xcode links **MPVKit** (local) + **AetherEngine** (local Vendor).
-- The AetherEngine product is **dynamic**, creating a Mach-O two-level namespace
-  boundary between its `AetherLib*` imports and MPVKit's static FFmpeg objects.
+- The AetherEngine product is **static**; its FFmpeg dependencies remain namespaced as `AetherLib*`,
+  keeping their headers and framework identities separate from MPVKit's static FFmpeg objects.
 - Default backend: **Aether** via `PlaybackSessionCoordinator`.
 - One-way fallback: Aether → MPV on terminal error / audio delay / amplification / dual A/V URL / ASS Scale.
 - The retired AVPlayer/Dolby Vision remux path has been deleted; app code does

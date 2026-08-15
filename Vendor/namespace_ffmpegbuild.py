@@ -58,6 +58,28 @@ def rewrite_deps(binary: Path) -> None:
         run(["install_name_tool", "-change", path, new_path, str(binary)])
 
 
+def remove_code_signature(binary: Path) -> None:
+    """Remove the upstream signature after renaming the Mach-O and bundle.
+
+    Xcode may preserve an existing framework CodeDirectory identifier while
+    signing an embedded package. After namespacing, that leaves (for example)
+    ``com.aetherengine.Libzimg`` inside ``AetherLibzimg.framework`` and
+    installd rejects the app before launch. The bundle's Info.plist is updated
+    below and the consuming app supplies the final platform signature, so the
+    vendored binary must not carry the upstream identifier.
+    """
+    result = subprocess.run(
+        ["codesign", "--remove-signature", str(binary)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if result.returncode not in (0, 1):
+        raise RuntimeError(
+            f"codesign --remove-signature failed for {binary}: {result.stderr.strip()}"
+        )
+
+
 def update_framework_plist(plist_path: Path, framework: str) -> None:
     with plist_path.open("rb") as f:
         data = plistlib.load(f)
@@ -222,6 +244,7 @@ def process_xcframework(old: str) -> None:
             try:
                 install_name_id(binary, new)
                 rewrite_deps(binary)
+                remove_code_signature(binary)
             except subprocess.CalledProcessError as e:
                 print(f"  WARN install_name_tool failed: {e}", file=sys.stderr)
 

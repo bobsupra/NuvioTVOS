@@ -983,7 +983,16 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         clearPlaybackError()
         guard let ctx = mpv else { return }
         mpv = nil  // nil first so the event loop stops reading
-        mpv_terminate_destroy(ctx)
+
+        // libmpv's avfoundation audio output tears down AVAudioSession from
+        // inside mpv_terminate_destroy(). That teardown can synchronously
+        // reconfigure the audio route, so doing it on the main actor triggers
+        // Xcode's "AVAudioSession Hang Risk" warning and can stall dismissal.
+        // Use the existing serial event queue so teardown does not race the
+        // event pump; the nil assignment above makes all later calls no-op.
+        eventQueue.async {
+            mpv_terminate_destroy(ctx)
+        }
     }
 
     // MARK: - State Update

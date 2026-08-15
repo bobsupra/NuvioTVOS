@@ -9,6 +9,8 @@ struct PlaybackDebugInfo: Equatable {
     var resolution: String
     var frameRate: String
     var audio: String
+    /// Backend-specific routing facts shown only in the playback debug overlay.
+    var diagnostics: [String] = []
 
     var screenLines: [String] {
         [

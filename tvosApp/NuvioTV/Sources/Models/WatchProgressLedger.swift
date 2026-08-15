@@ -242,6 +242,23 @@ enum WatchProgressLedger {
             }
         }
 
+        // A refresh that did not change the merged ledger (the common case on
+        // a background pull of an account that has been quiet) must not
+        // re-encode and rewrite the whole 500+ row payload on disk. Compare
+        // value-by-value under each key: `survivors` comes from a dictionary
+        // so its order is unspecified, while `records()` is in stored file
+        // order, and a same-key new row must still persist.
+        let currentByKey = Dictionary(
+            records().map { ($0.progressKey, $0) },
+            uniquingKeysWith: { _, newer in newer }
+        )
+        let survivorByKey = Dictionary(
+            survivors.map { ($0.progressKey, $0) },
+            uniquingKeysWith: { _, newer in newer }
+        )
+        if currentByKey == survivorByKey {
+            return (true, removedKeys)
+        }
         return (persist(survivors), removedKeys)
     }
 

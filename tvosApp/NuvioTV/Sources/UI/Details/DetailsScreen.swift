@@ -81,6 +81,7 @@ struct DetailsScreen: View {
         self.initialStreamPickerEpisode = initialStreamPickerEpisode
         self.onInitialStreamPickerPresented = onInitialStreamPickerPresented
         _viewModel = StateObject(wrappedValue: DetailsViewModel(repository: repository))
+        TVHomeDebugTrace.log("details.init id=\(id) type=\(type)")
     }
 
     var body: some View {
@@ -100,17 +101,18 @@ struct DetailsScreen: View {
                     uiState: viewModel.uiState,
                     onPlayClick: {
                         // Movie (or a series with no episode list): make sure streams
-                        // are loaded for the title id, then either auto-select or open the picker.
+                        // are loaded for the canonical title id, then either auto-select
+                        // or open the picker.
                         pendingEpisodeSubtitle = ""
                         pendingEpisode = nil
-                        startStreamFlow(streamId: id, type: viewModel.uiState.meta?.type ?? type, reload: viewModel.uiState.streams.isEmpty)
+                        startStreamFlow(streamId: viewModel.uiState.meta?.streamId ?? id, type: viewModel.uiState.meta?.type ?? type, reload: viewModel.uiState.streams.isEmpty)
                     },
                     onPlayManually: {
                         // Hold-to-play-manually: always open the picker even when Auto Select is on.
                         pendingEpisodeSubtitle = ""
                         pendingEpisode = nil
                         startStreamFlow(
-                            streamId: id,
+                            streamId: viewModel.uiState.meta?.streamId ?? id,
                             type: viewModel.uiState.meta?.type ?? type,
                             reload: viewModel.uiState.streams.isEmpty,
                             forceManualPicker: true
@@ -241,8 +243,13 @@ struct DetailsScreen: View {
             }
         }
         .onAppear {
+            TVHomeDebugTrace.log("details.appear id=\(id) type=\(type)")
             viewModel.loadDetails(id: id, type: type)
             presentInitialStreamPickerIfNeeded()
+        }
+        .onDisappear {
+            TVHomeDebugTrace.log("details.disappear id=\(id) type=\(type)")
+            viewModel.cancelAllTasks()
         }
     }
 
@@ -270,7 +277,7 @@ struct DetailsScreen: View {
             viewModel.prepareStreams(forId: episode.id, type: "series")
         } else {
             pendingEpisodeSubtitle = ""
-            viewModel.prepareStreams(forId: id, type: meta.type)
+            viewModel.prepareStreams(forId: meta.streamId, type: meta.type)
         }
         isStreamPickerPresented = true
     }

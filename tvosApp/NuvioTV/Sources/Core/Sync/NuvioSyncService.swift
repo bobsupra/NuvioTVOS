@@ -523,7 +523,7 @@ final class NuvioSyncManager: ObservableObject {
             }
             let remoteName = remote.name.isEmpty ? "Nuvio User" : remote.name
             return remoteName == local.name
-                && (remote.avatarId ?? "") == local.avatarId
+                && remote.effectiveAvatarValue == local.avatarId
                 && remote.usesPrimaryAddons == local.usesPrimaryAddons
                 && remote.usesPrimaryPlugins == local.usesPrimaryPlugins
         }
@@ -1508,7 +1508,9 @@ private enum ProfileSyncIndexStore {
                     name: remote.name.isEmpty ? "Nuvio User" : remote.name,
                     isPinProtected: remote.pinEnabled ?? preservedProfile?.isPinProtected ?? false,
                     isAdmin: remote.profileIndex == 1,
-                    avatarId: remote.avatarId?.isEmpty == false ? remote.avatarId! : "",
+                    // The web app stores custom image links in avatar_url,
+                    // while catalog selections use avatar_id.
+                    avatarId: remote.effectiveAvatarValue,
                     usesPrimaryAddons: remote.usesPrimaryAddons,
                     usesPrimaryPlugins: remote.usesPrimaryPlugins
                 )
@@ -1569,6 +1571,16 @@ fileprivate final class NuvioAPIClient {
     private var lastPulledProfileSettingsJSON: [String: Any]?
     private var lastPulledMobileProfileSettingsJSON: [String: Any]?
     private var lastPulledHomeCatalogSettingsJSON: [String: Any]?
+
+    private static func validAvatarURL(_ value: String) -> String? {
+        guard let url = URL(string: value),
+              let scheme = url.scheme?.lowercased(),
+              (scheme == "http" || scheme == "https"),
+              url.host != nil else {
+            return nil
+        }
+        return value
+    }
 
     func pullProfiles(session: AuthSession) async throws -> [RemoteProfile] {
         let rows: LossyRows<RemoteProfile> = try await rpcRows(
@@ -1877,11 +1889,15 @@ fileprivate final class NuvioAPIClient {
                 "uses_primary_addons": profile.usesPrimaryAddons,
                 "uses_primary_plugins": profile.usesPrimaryPlugins
             ]
-            // Omitting avatar_id preserves a custom remote avatar. The public
+            // Custom links are a separate server field from catalog avatar ids.
+            // Omitting both fields preserves a custom remote avatar. The public
             // API defines an explicit null/empty value as a clear, and tvOS
             // currently has no explicit "remove avatar" action.
-            if !profile.avatarId.isEmpty {
-                payload["avatar_id"] = profile.avatarId
+            let avatarValue = profile.avatarId.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let avatarURL = Self.validAvatarURL(avatarValue) {
+                payload["avatar_url"] = avatarURL
+            } else if !avatarValue.isEmpty {
+                payload["avatar_id"] = avatarValue
             }
             return payload
         }
@@ -2658,6 +2674,12 @@ fileprivate final class NuvioAPIClient {
         if let string = value as? String {
             return ["type": "string", "value": string]
         }
+        if let data = value as? Data {
+            // UserDefaults-backed `@AppStorage<Data>` preferences (currently
+            // the selected Home hero catalogs) are still profile settings.
+            // JSON cannot carry raw bytes, so use a portable base64 value.
+            return ["type": "data", "value": data.base64EncodedString()]
+        }
         if let bool = value as? Bool {
             return ["type": "boolean", "value": bool]
         }
@@ -2679,6 +2701,9 @@ fileprivate final class NuvioAPIClient {
         switch type {
         case "string":
             return value as? String
+        case "data":
+            guard let base64 = value as? String else { return nil }
+            return Data(base64Encoded: base64)
         case "boolean":
             return value as? Bool
         case "int":
@@ -2830,14 +2855,21 @@ private struct RemoteProfile: Decodable {
     let profileIndex: Int
     let name: String
     let avatarId: String?
+    let avatarUrl: String?
     let usesPrimaryAddons: Bool
     let usesPrimaryPlugins: Bool
     let pinEnabled: Bool?
+
+    var effectiveAvatarValue: String {
+        let url = avatarUrl?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return url.isEmpty ? (avatarId ?? "") : url
+    }
 
     enum CodingKeys: String, CodingKey {
         case profileIndex
         case name
         case avatarId
+        case avatarUrl
         case usesPrimaryAddons
         case usesPrimaryPlugins
         case pinEnabled
@@ -2848,6 +2880,7 @@ private struct RemoteProfile: Decodable {
         profileIndex = try container.decode(Int.self, forKey: .profileIndex)
         name = (try? container.decode(String.self, forKey: .name)) ?? ""
         avatarId = try? container.decodeIfPresent(String.self, forKey: .avatarId)
+        avatarUrl = try? container.decodeIfPresent(String.self, forKey: .avatarUrl)
         usesPrimaryAddons = (try? container.decode(Bool.self, forKey: .usesPrimaryAddons)) ?? false
         usesPrimaryPlugins = (try? container.decode(Bool.self, forKey: .usesPrimaryPlugins)) ?? false
         pinEnabled = try? container.decodeIfPresent(Bool.self, forKey: .pinEnabled)
@@ -2857,6 +2890,7 @@ private struct RemoteProfile: Decodable {
         profileIndex = profile.profileIndex
         name = profile.name
         avatarId = profile.avatarId
+        avatarUrl = profile.avatarUrl
         usesPrimaryAddons = profile.usesPrimaryAddons
         usesPrimaryPlugins = profile.usesPrimaryPlugins
         self.pinEnabled = pinEnabled

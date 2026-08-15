@@ -100,7 +100,8 @@ class PlayerViewModel: ObservableObject {
     /// Whether the Next Episode card is visible (near the end of an episode
     /// that has a follow-up).
     @Published var showNextEpisodeCard: Bool = false
-    /// Seconds left before the card auto-hides, or nil while controls are shown.
+    /// Seconds left before Auto-Play advances, or nil while controls are shown
+    /// or Auto-Play is disabled.
     @Published var nextEpisodeCountdown: Int?
     /// True while the next episode's stream is being resolved and loaded, so the
     /// card can show a spinner instead of a Play button.
@@ -124,12 +125,14 @@ class PlayerViewModel: ObservableObject {
     private var isAdvanceInFlight: Bool = false
     private var autoHiddenNextEpisodeCard = false
     private var nextEpisodeAutoHideDeadline: Date?
+    private var nextEpisodeAutoPlayDeadline: Date?
     private var autoPlayNextEnabled = false
     private var autoPlayNextCountdownSeconds = 10
     /// Fallback when IntroDB has no ending marker: show the Next Episode card
     /// this many seconds before the end. When an ending skip exists, the card
     /// arms at the same moment as Skip Ending instead.
     private static let nextCardLeadSeconds: Double = 120
+    private static let nextEpisodeAutoHideSeconds = 5
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
 
@@ -143,13 +146,12 @@ class PlayerViewModel: ObservableObject {
     @Published private(set) var activeEngineKind: PlayerEngineKind = .aether
     /// Short on-screen note after engine selection (native DV vs HDR fallback).
     @Published private(set) var hdrModeToast: String?
-    #if DEBUG
     @Published private(set) var playbackDebugInfo: PlaybackDebugInfo?
     @Published private(set) var playbackDebugReason = ""
     @Published private(set) var isPlaybackDebugHUDVisible = false
+    @Published private(set) var isPlaybackDebugEnabled = false
     private var playbackDebugHUDBackend: PlayerEngineKind?
     private var didShowPlaybackDebugHUDForStream = false
-    #endif
 
     /// Backend used for transport / poll — switches with `activeEngineKind`.
     private var engine: PlaybackEngineControlling {
@@ -316,10 +318,10 @@ class PlayerViewModel: ObservableObject {
             self?.hdrModeToast = message
             self?.showPlayerToast(message)
             self?.activeEngineKind = self?.sessionCoordinator.activeBackend ?? .mpv
-            #if DEBUG
-            self?.playbackDebugHUDBackend = nil
-            self?.isPlaybackDebugHUDVisible = true
-            #endif
+            if self?.isPlaybackDebugEnabled == true {
+                self?.playbackDebugHUDBackend = nil
+                self?.isPlaybackDebugHUDVisible = true
+            }
         }
     }
 
@@ -501,21 +503,28 @@ class PlayerViewModel: ObservableObject {
         preserveSessionPreferences: Bool = false
     ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
-        #if DEBUG
-        playbackDebugInfo = PlaybackDebugInfo(
-            player: "Selecting player…",
-            pipeline: "Starting",
-            videoCodec: "Detecting",
-            dynamicRange: "Detecting",
-            resolution: "Detecting",
-            frameRate: "Detecting",
-            audio: "Detecting"
-        )
-        playbackDebugReason = "Waiting for playback metadata"
-        isPlaybackDebugHUDVisible = true
-        playbackDebugHUDBackend = nil
-        didShowPlaybackDebugHUDForStream = false
-        #endif
+        isPlaybackDebugEnabled = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
+        if isPlaybackDebugEnabled {
+            playbackDebugInfo = PlaybackDebugInfo(
+                player: "Selecting player…",
+                pipeline: "Starting",
+                videoCodec: "Detecting",
+                dynamicRange: "Detecting",
+                resolution: "Detecting",
+                frameRate: "Detecting",
+                audio: "Detecting"
+            )
+            playbackDebugReason = "Waiting for playback metadata"
+            isPlaybackDebugHUDVisible = true
+            playbackDebugHUDBackend = nil
+            didShowPlaybackDebugHUDForStream = false
+        } else {
+            playbackDebugInfo = nil
+            playbackDebugReason = ""
+            isPlaybackDebugHUDVisible = false
+            playbackDebugHUDBackend = nil
+            didShowPlaybackDebugHUDForStream = false
+        }
         subtitleFetchTask?.cancel()
         subtitleFetchTask = nil
         isLoadingExternalSubtitles = false
@@ -664,6 +673,7 @@ class PlayerViewModel: ObservableObject {
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
         nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
         nextEpisode = Self.nextEpisode(after: current, in: episodes)
     }
 
@@ -703,8 +713,13 @@ class PlayerViewModel: ObservableObject {
             if showNextEpisodeCard != showControls {
                 showNextEpisodeCard = showControls
             }
-            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
             nextEpisodeAutoHideDeadline = nil
+            if showControls {
+                if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
+                nextEpisodeAutoPlayDeadline = nil
+            } else {
+                updateNextEpisodeAutoPlayState()
+            }
             return
         }
 
@@ -713,25 +728,42 @@ class PlayerViewModel: ObservableObject {
         if showControls {
             if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
             nextEpisodeAutoHideDeadline = nil
-            return
-        }
-
-        guard autoPlayNextEnabled else {
-            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
-            nextEpisodeAutoHideDeadline = nil
+            nextEpisodeAutoPlayDeadline = nil
             return
         }
 
         if nextEpisodeAutoHideDeadline == nil {
-            nextEpisodeAutoHideDeadline = Date().addingTimeInterval(Double(autoPlayNextCountdownSeconds))
-            nextEpisodeCountdown = autoPlayNextCountdownSeconds
+            nextEpisodeAutoHideDeadline = Date().addingTimeInterval(Double(Self.nextEpisodeAutoHideSeconds))
         }
 
         guard let deadline = nextEpisodeAutoHideDeadline else { return }
         let secondsLeft = deadline.timeIntervalSinceNow
         if secondsLeft <= 0.05 {
-            nextEpisodeCountdown = nil
+            autoHiddenNextEpisodeCard = true
+            showNextEpisodeCard = false
             nextEpisodeAutoHideDeadline = nil
+        }
+
+        updateNextEpisodeAutoPlayState()
+    }
+
+    private func updateNextEpisodeAutoPlayState() {
+        guard autoPlayNextEnabled else {
+            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
+            nextEpisodeAutoPlayDeadline = nil
+            return
+        }
+
+        if nextEpisodeAutoPlayDeadline == nil {
+            nextEpisodeAutoPlayDeadline = Date().addingTimeInterval(Double(autoPlayNextCountdownSeconds))
+            nextEpisodeCountdown = autoPlayNextCountdownSeconds
+        }
+
+        guard let deadline = nextEpisodeAutoPlayDeadline else { return }
+        let secondsLeft = deadline.timeIntervalSinceNow
+        if secondsLeft <= 0.05 {
+            nextEpisodeCountdown = nil
+            nextEpisodeAutoPlayDeadline = nil
             advance()
         } else {
             let countdown = max(1, Int(secondsLeft.rounded(.up)))
@@ -757,6 +789,7 @@ class PlayerViewModel: ObservableObject {
         if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
         autoHiddenNextEpisodeCard = false
         nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
     }
 
     // MARK: - IntroDB skip segments
@@ -872,6 +905,8 @@ class PlayerViewModel: ObservableObject {
         isAdvanceInFlight = true
         isAdvancingEpisode = true
         nextEpisodeCountdown = nil
+        nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
 
         // Mark the finishing episode watched. With Trakt selected its scrobble
         // history produces the remote Next Up entry; Nuvio Sync keeps the
@@ -935,6 +970,7 @@ class PlayerViewModel: ObservableObject {
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
         nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
         isAdvanceInFlight = false
         isAdvancingEpisode = false
         isReloadingStream = false
@@ -973,6 +1009,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeCountdown = nil
         autoHiddenNextEpisodeCard = false
         nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
         status = .error("This stream link has expired. Go back and start it again to load a fresh stream.")
     }
 
@@ -1061,6 +1098,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeCountdown = nil
         autoHiddenNextEpisodeCard = false
         nextEpisodeAutoHideDeadline = nil
+        nextEpisodeAutoPlayDeadline = nil
         status = .buffering
         engine.pausePlayback()
         if let toast { showPlayerToast(toast) }
@@ -1118,8 +1156,19 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    #if DEBUG
     private func updatePlaybackDebugHUD(from controller: PlaybackEngineControlling) {
+        let enabled = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
+        if isPlaybackDebugEnabled != enabled {
+            isPlaybackDebugEnabled = enabled
+            if !enabled {
+                isPlaybackDebugHUDVisible = false
+                playbackDebugInfo = nil
+                playbackDebugReason = ""
+                return
+            }
+        }
+        guard isPlaybackDebugEnabled else { return }
+
         let info = controller.playbackDebugInfo
         if playbackDebugInfo != info {
             playbackDebugInfo = info
@@ -1142,7 +1191,6 @@ class PlayerViewModel: ObservableObject {
 
         print("[PlaybackDebug] \(([info.screenLines, ["POLICY   \(playbackDebugReason)"]].flatMap { $0 }).joined(separator: " | "))")
     }
-    #endif
 
     // MARK: - Polling (mirrors MPV state into the published properties)
 
@@ -1347,9 +1395,7 @@ class PlayerViewModel: ObservableObject {
         let latestStatus = (isAwaitingStreamStart && engineStatus == .paused) ? .buffering : engineStatus
         if status != latestStatus { status = latestStatus }
 
-        #if DEBUG
         updatePlaybackDebugHUD(from: c)
-        #endif
 
         // The controls are shown on launch (showControls defaults to true) but the
         // auto-hide timer is only armed by user transport actions. Arm it whenever
@@ -2273,6 +2319,17 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
+        // Both playback backends can resolve the preference during load. Keep that
+        // selection instead of replacing it with the first matching row: Aether's
+        // ranked choice deliberately prefers a full track over an empty forced one.
+        if Self.shouldPreserveBackendSubtitleSelection(
+            subtitles.first(where: { $0.isSelected }),
+            preferredLanguages: preferredLanguages
+        ) {
+            didApplySubtitlePreference = true
+            return
+        }
+
         let loadedExternalURLs = Set(subtitles.map(\.externalFilename).filter { !$0.isEmpty })
         for language in preferredLanguages {
             if let matchingTrack = subtitles.first(where: { track in
@@ -2297,6 +2354,22 @@ class PlayerViewModel: ObservableObject {
         guard let off = subtitles.first(where: { $0.id == "off" }) else { return }
         didApplySubtitlePreference = true
         selectSubtitle(off, persist: false)
+    }
+
+    static func shouldPreserveBackendSubtitleSelection(
+        _ selectedTrack: SubtitleTrack?,
+        preferredLanguages: [String]
+    ) -> Bool {
+        guard let selectedTrack,
+              selectedTrack.id != "off",
+              selectedTrack.isSelected else {
+            return false
+        }
+
+        return preferredLanguages.contains { language in
+            SubtitleLanguagePreferences.matches(selectedTrack.language, target: language) ||
+            SubtitleLanguagePreferences.matches(selectedTrack.name, target: language)
+        }
     }
 
     func selectAudio(_ track: AudioTrack, persist: Bool = true) {

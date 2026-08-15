@@ -438,6 +438,11 @@ public final class AetherEngine: ObservableObject {
     @Published public internal(set) var activeAudioTrackIndex: Int?
     @Published public internal(set) var videoFormat: VideoFormat = .sdr
 
+    /// Format selected after source probing and display-capability clamping, before the panel handshake
+    /// decides what can be published as the on-screen output format. Kept separate from `videoFormat` so
+    /// the playback debug HUD can show exactly where an HDR title became SDR.
+    @Published public internal(set) var effectiveVideoFormat: VideoFormat = .sdr
+
     /// Source video format before panel clamping. Differs from `videoFormat` when the panel can't present the
     /// source (e.g. DV on SDR panel): `videoFormat` reads `.sdr` (what's on screen), this stays `.dolbyVision`.
     /// Use for media-attribute labels (Stats for Nerds); use `videoFormat` for panel-rendering UI.
@@ -447,6 +452,41 @@ public final class AetherEngine: ObservableObject {
     /// Dolby Vision profile number (5, 7, 8, 10) of the source, or nil when not DV. Companion to
     /// `sourceVideoFormat` for Stats-for-Nerds labels ("Dolby Vision P5"); read from the dvcC record.
     @Published public internal(set) var sourceDVProfile: Int? = nil
+
+    /// Compact display/routing trace for the host playback debug overlay. This intentionally exposes the
+    /// decision inputs, not just the final badge: tvOS can report HDR eligibility, reject the deprecated
+    /// HDR10 mode bit, or leave the panel proof at SDR while the source/effective format is HDR.
+    public var displayDebugLines: [String] {
+        let name: (VideoFormat) -> String = { format in
+            switch format {
+            case .sdr:         return "SDR"
+            case .hdr10:       return "HDR10/PQ"
+            case .hdr10Plus:   return "HDR10+"
+            case .dolbyVision: return "Dolby Vision"
+            case .hlg:         return "HLG"
+            }
+        }
+        let caps = Self.displayCapabilities
+        let profile = sourceDVProfile.map { "P\($0)" } ?? "-"
+        let session = nativeVideoSession.map { native in
+            "master=\(native.servingMasterPlaylist ? "yes" : "no") sourceHDR=\(native.servedSourceIsHDR ? "yes" : "no") dv=\(native.effectiveDvMode ? "yes" : "no")"
+        } ?? "master=- sourceHDR=- dv=-"
+        let outputReason: String
+        if effectiveVideoFormat == .sdr {
+            outputReason = "no-HDR-effective-format"
+        } else if videoFormat == .sdr {
+            outputReason = "panel-not-proven-HDR"
+        } else {
+            outputReason = "accepted"
+        }
+        return [
+            "HDRSRC   \(name(sourceVideoFormat)) \(profile) → effective \(name(effectiveVideoFormat))",
+            "HDRCAP   eligible=\(caps.supportsHDR ? "Y" : "N") DV=\(caps.supportsDolbyVision ? "Y" : "N") HDR10=\(caps.supportsHDR10 ? "Y" : "N") HLG=\(caps.supportsHLG ? "Y" : "N")",
+            "HDRDEC   output=\(name(videoFormat)) reason=\(outputReason)",
+            "HDRCRIT  \(displayCriteria.debugSummary())",
+            "HDRHLS   route=\(videoRoute.rawValue) \(session)",
+        ]
+    }
 
     /// Nominal source frame rate (fps) from the container's `avg_frame_rate` (falling back to `r_frame_rate`),
     /// or nil when the source has no video or libavformat couldn't derive one. Companion to `sourceVideoFormat`
@@ -2630,6 +2670,7 @@ public final class AetherEngine: ObservableObject {
         // Reset format/dimension state so paths that skip the probe (nativeRemoteHLS) or find no video
         // don't keep publishing the predecessor's values (e.g. Live TV after an HDR10 film kept reporting .hdr10).
         videoFormat = .sdr
+        effectiveVideoFormat = .sdr
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
         sourceVideoFrameRate = nil
@@ -2674,7 +2715,6 @@ public final class AetherEngine: ObservableObject {
         var detectedDVProfileNum: Int? = nil
         var detectedRate: Double? = nil
         var detectedVideoBitrate: Int64 = 0
-        var detectedDVProfile: Bool = false
         var detectedCodecID: AVCodecID = AV_CODEC_ID_NONE
         var detectedFieldOrder: AVFieldOrder = AV_FIELD_UNKNOWN
         var probedAudioTracks: [TrackInfo] = []
@@ -2716,12 +2756,8 @@ public final class AetherEngine: ObservableObject {
             if videoIdx >= 0, let stream = probe.stream(at: videoIdx) {
                 detectedFormat = Self.detectVideoFormat(stream: stream)
                 effectiveFormat = Self.effectiveVideoFormat(detected: detectedFormat, stream: stream)
+                effectiveVideoFormat = effectiveFormat
                 detectedRate = Self.detectFrameRate(stream: stream)
-                // DrHurt #4 (2026-05-26): use source-detected DV, not effective-format, so codecTag=dvh1
-                // asks AVDisplayManager for DV mode on every DV source. AVPlayer's HLS tone-mapper downgrades
-                // DV->HDR10 when the panel can't host it; we don't pre-strip engine-side. Pairs with
-                // always-emit-SUPPLEMENTAL + no-strip in HLSVideoEngine's profile81/profile84 emission.
-                detectedDVProfile = (detectedFormat == .dolbyVision)
                 detectedDVProfileNum = Self.dvProfile(stream: stream)
                 detectedCodecID = stream.pointee.codecpar.pointee.codec_id
                 detectedFieldOrder = stream.pointee.codecpar.pointee.field_order
@@ -2961,7 +2997,10 @@ public final class AetherEngine: ObservableObject {
         var criteriaUnchanged = false
         switch Self.loadDisplayCriteriaAction(suppressDisplayCriteria: options.suppressDisplayCriteria, audioOnlyPath: false) {
         case .applyFresh:
-            let codecTag: FourCharCode? = detectedDVProfile ? 0x64766831 : nil
+            // Match the criterion to the effective output, not merely the source metadata.
+            // P8.1/P8.4/P7 on a non-DV panel are routed as plain HDR10/HLG hvc1; asking
+            // AVDisplayManager for dvh1 in that case can leave an HDR10-only panel at SDR.
+            let codecTag: FourCharCode? = effectiveFormat == .dolbyVision ? 0x64766831 : nil
             switch displayCriteria.apply(
                 format: effectiveFormat,
                 frameRate: snappedRate,
@@ -2972,7 +3011,14 @@ public final class AetherEngine: ObservableObject {
                 didSwitchPanel = true
                 // #339: consumesRecord: false, the play gate after loadNative is entitled to the same
                 // start/end timestamps; spending them here made it pay Stage 1's grace for a settled switch.
-                await displayCriteria.waitForSwitch(consumesRecord: false)
+                // HDR VOD must not build its master while an SDR→HDR HDMI switch is still running:
+                // AVPlayer can reject the otherwise-correct PQ master in that window, after which the
+                // reactive fallback permanently serves media.m3u8 (HDR metadata is no longer signalled).
+                // Live keeps the bounded cap because a live zap cannot wait behind the display handshake.
+                await displayCriteria.waitForSwitch(
+                    consumesRecord: false,
+                    settleCap: (!options.isLive && effectiveFormat != .sdr) ? .awaitObservedEnd : .standard
+                )
                 // Superseded during panel handshake: close local probe and unwind.
                 if loadGeneration != gen {
                     probe.markClosed()
@@ -3014,7 +3060,9 @@ public final class AetherEngine: ObservableObject {
         if options.suppressDisplayCriteria {
             panelHDRAfterHandshake = options.panelIsInHDRMode
         } else {
-            panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR()
+            panelHDRAfterHandshake = displayCriteria.currentPanelIsHDR(
+                eligibleForHDRPlayback: Self.displayCapabilities.supportsHDR
+            )
         }
         #if os(iOS)
         // The iPhone built-in display has no HDMI Match-Content handshake; it renders HDR/DV natively
@@ -4168,6 +4216,7 @@ public final class AetherEngine: ObservableObject {
         // recaptures them from the reopened demuxer.
         mediaChapters = []
         videoFormat = .sdr
+        effectiveVideoFormat = .sdr
         sourceVideoFormat = .sdr
         sourceDVProfile = nil
         sourceVideoFrameRate = nil

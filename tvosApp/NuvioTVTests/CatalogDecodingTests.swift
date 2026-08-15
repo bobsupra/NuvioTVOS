@@ -171,6 +171,22 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertEqual(unsupported.values, [])
     }
 
+    func testCustomAvatarLinkResolvesOutsideTheCatalog() async {
+        let link = " https://images.example.test/avatar.png?size=512 "
+        let resolved = await MainActor.run {
+            AvatarCatalogStore.shared.imageURL(for: link)
+        }
+
+        XCTAssertEqual(
+            resolved?.absoluteString,
+            "https://images.example.test/avatar.png?size=512"
+        )
+        let unsupported = await MainActor.run {
+            AvatarCatalogStore.shared.imageURL(for: "file:///tmp/avatar.png")
+        }
+        XCTAssertNil(unsupported)
+    }
+
     /// The actual bug: one off-spec `director` inside a catalog page.
     func testCatalogPageSurvivesOffSpecPeopleField() throws {
         let json = Data("""
