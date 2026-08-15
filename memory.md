@@ -377,17 +377,22 @@ the release version and `BUILD` with the next integer build number.
 
 1. Copy the archived `NuvioTV.app` into a fresh staging directory as
    `Payload/NuvioTV.app`.
-2. ZIP the `Payload` root into
-   `artifacts/NuvioTV-X.Y.Z-unsigned-release.ipa` using `ditto`.
-3. Verify all of the following:
+2. Clean all macOS extended attributes and AppleDouble metadata files (`dot_clean`,
+   `xattr -rc`, `find ... -name "._*" -delete`). Apple's `installd` / `IXPlaceholder`
+   will abort installation with `APIInternalError (Failed to create CFBundle from .../._TopShelf.appex)`
+   if `._` files are present in the zip package.
+3. ZIP the `Payload` root into `artifacts/NuvioTV-X.Y.Z-unsigned-release.ipa` using:
+   `COPYFILE_DISABLE=1 zip -r -y -X artifacts/NuvioTV-X.Y.Z-unsigned-release.ipa Payload`
+4. Verify all of the following:
    - `unzip -tq` reports no compressed-data errors
+   - `unzip -l artifacts/...ipa | grep "\._"` returns no `._` files
    - app version and build equal `X.Y.Z (BUILD)`
    - Top Shelf version and build equal `X.Y.Z (BUILD)`
    - the main executable is Mach-O `arm64`
    - the app bundle reports “code object is not signed at all”
    - byte size is recorded
    - SHA-256 is recorded
-4. The archive, staging folder, and IPA are intentionally ignored by Git and
+5. The archive, staging folder, and IPA are intentionally ignored by Git and
    uploaded as release artifacts. Do not force-add them to the repository.
 
 ### 8. Review and commit the exact source state
