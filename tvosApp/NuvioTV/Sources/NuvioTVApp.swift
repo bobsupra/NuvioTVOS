@@ -377,6 +377,12 @@ struct ContentView: View {
         }
         .onReceive(profileViewModel.$activeProfile) { profile in
             syncManager.activeProfileChanged(profile)
+            SMBServerStore.shared.reload()
+            JellyfinServerStore.shared.reload()
+            Task {
+                await SMBSessionManager.shared.connectAll()
+                await JellyfinSessionManager.shared.connectAll()
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             switch phase {
@@ -966,6 +972,7 @@ struct ContentView: View {
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
         if !isTrailer,
+           url.scheme?.lowercased() != "smb",
            let launchURL = player.launchURL(for: url, subtitleURLs: subtitleURLs),
            UIApplication.shared.canOpenURL(launchURL) {
             UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
@@ -2356,7 +2363,11 @@ struct TVHomeView: View {
     @AppStorage(SettingsKey.tmdbLanguage) private var tmdbLanguage = "en"
     @AppStorage(SettingsKey.tmdbUseArtwork) private var tmdbUseArtwork = true
     @AppStorage(SettingsKey.tmdbUseBasicInfo) private var tmdbUseBasicInfo = true
+    @AppStorage(SettingsKey.smbLocalRowEnabled) private var smbLocalRowEnabled = true
+    @AppStorage(SettingsKey.jellyfinLocalRowEnabled) private var jellyfinLocalRowEnabled = true
 
+    @State private var localTitlesSection: TVHomeSection?
+    @State private var jellyfinSection: TVHomeSection?
     @State private var isLoading = true
     @State private var focusedMeta: NuvioMeta?
     /// Collection folder currently focused on Home. When set, the hero shows
@@ -2752,6 +2763,18 @@ struct TVHomeView: View {
         }
         .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
             await refreshCollectionSections(for: contentIdentity)
+        }
+        .task(id: "\(contentIdentity.profileId):smbLocalTitles:\(smbLocalRowEnabled)") {
+            await loadLocalTitlesSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SMBLibraryIndex.changedNotification)) { _ in
+            Task { await loadLocalTitlesSection() }
+        }
+        .task(id: "\(contentIdentity.profileId):jellyfinTitles:\(jellyfinLocalRowEnabled)") {
+            await loadJellyfinSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: JellyfinLibraryIndex.changedNotification)) { _ in
+            Task { await loadJellyfinSection() }
         }
         .onAppear {
             #if DEBUG
@@ -3332,7 +3355,9 @@ struct TVHomeView: View {
             title: "Continue Watching",
             items: continueWatchingMetas
         )
-        let allSections = continueWatching.isEmpty ? store.sections : [resumeSection] + store.sections
+        let pinnedSections = (continueWatching.isEmpty ? [] : [resumeSection])
+            + [localTitlesSection, jellyfinSection].compactMap { $0 }
+        let allSections = pinnedSections + store.sections
 
         // The common path does not need to copy and filter every add-on row on
         // each focus update. Keep the original copy-on-write item arrays intact.
@@ -3341,7 +3366,11 @@ struct TVHomeView: View {
         let today = ContentReleasePolicy.todayIsoDay()
         return allSections.map { section in
             // Collection folder rows don't carry title posters; leave them intact.
-            if !section.collectionFolders.isEmpty { return section }
+            if !section.collectionFolders.isEmpty
+                || section.id == TVHomeSection.localTitlesId
+                || section.id == TVHomeSection.jellyfinId {
+                return section
+            }
             var copy = section
             copy.items = section.items.filter {
                 !ContentReleasePolicy.isUnreleased($0, today: today)
@@ -4427,13 +4456,115 @@ struct TVHomeView: View {
         RemoteTrackingState.isProgressSourceAuthenticated
     }
 
+    private func beginSimklHomeLoadingDiagnostic(generation: Int) {
+        simklLoadingTimeoutTask?.cancel()
+        simklLoadingStartedAt = Date()
+        simklLoadingDebugInfo = nil
+        simklLoadingTimeoutTask = Task { @MainActor in
+            do {
+                try await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled,
+                  generation == continueWatchingRefreshGeneration,
+                  selectedProgressSource == .simkl else { return }
+            simklLoadingDebugInfo = makeSimklHomeLoadingDebugInfo()
+        }
+    }
+
+    private func finishSimklHomeLoadingDiagnostic() {
+        simklLoadingTimeoutTask?.cancel()
+        simklLoadingTimeoutTask = nil
+        simklLoadingStartedAt = nil
+        simklLoadingDebugInfo = nil
+    }
+
+    private func makeSimklHomeLoadingDebugInfo() -> String {
+        let profileStore = ProfileSettings.store(for: contentIdentity.profileId)
+        let scope = contentIdentity.profileId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let authenticated = SimklRuntimeSession.authenticatedState(
+            store: profileStore,
+            profileScope: scope.isEmpty ? "default" : scope
+        ) != nil
+        let elapsed = simklLoadingStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 60
+
+        return [
+            "SIMKL DEBUG REPORT",
+            "reason=Home Continue Watching did not finish after \(elapsed) seconds",
+            "stage=Home Simkl progress refresh",
+            "source=\(selectedProgressSource.rawValue)",
+            "client_id_configured=\(SimklConfig.isConfigured(in: profileStore))",
+            "authenticated=\(authenticated)",
+            "home_catalog_loading=\(isLoading)",
+            "home_sections=\(store.sections.count)",
+            "profile_id=\(contentIdentity.profileId)",
+            "app_version=\(SimklConfig.appVersion)",
+            "os=\(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "next=possible Simkl/network timeout, expired credentials, or Home waiting on a provider response"
+        ].joined(separator: "\n")
+    }
+
     private func refreshWatchedTitles() {
         watchedTitleKeys = WatchedStore.visibleWholeTitleIdentityKeys()
+    }
+
+    @MainActor
+    private func loadLocalTitlesSection() async {
+        guard smbLocalRowEnabled else {
+            localTitlesSection = nil
+            return
+        }
+        let indexed = SMBLibraryIndex.shared.titles()
+        guard !indexed.isEmpty else {
+            localTitlesSection = nil
+            return
+        }
+        var metasByContentId: [String: NuvioMeta] = [:]
+        var iterator = indexed.makeIterator()
+        let repository = self.repository
+        await withTaskGroup(of: (String, NuvioMeta?).self) { group in
+            func startNext() {
+                guard let title = iterator.next() else { return }
+                group.addTask { @MainActor in
+                    (title.contentId, try? await repository.getMetadata(id: title.contentId, type: title.type))
+                }
+            }
+            for _ in 0..<6 { startNext() }
+            while let (contentId, meta) = await group.next() {
+                if let meta { metasByContentId[contentId] = meta }
+                startNext()
+            }
+        }
+        let metas = indexed.compactMap { metasByContentId[$0.contentId] }
+        localTitlesSection = metas.isEmpty ? nil : TVHomeSection(
+            id: TVHomeSection.localTitlesId,
+            title: L10n.string("home_local_titles", fallback: "Local titles"),
+            items: metas
+        )
+    }
+
+    @MainActor
+    private func loadJellyfinSection() async {
+        guard jellyfinLocalRowEnabled else {
+            jellyfinSection = nil
+            return
+        }
+        let metas = JellyfinLibraryIndex.shared.titles().compactMap {
+            JellyfinLibraryIndex.shared.meta(forContentId: $0.contentId)
+        }
+        jellyfinSection = metas.isEmpty ? nil : TVHomeSection(
+            id: TVHomeSection.jellyfinId,
+            title: L10n.string("home_jellyfin_titles", fallback: "Jellyfin"),
+            items: metas
+        )
     }
 }
 
 struct TVHomeSection: Identifiable {
     static let continueWatchingId = "continue_watching"
+    static let localTitlesId = "local_titles"
+    static let jellyfinId = "jellyfin_titles"
     /// Id prefix for rows built from account-synced collections.
     static let collectionIdPrefix = "collection_"
 
