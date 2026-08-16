@@ -52,6 +52,70 @@ final class StreamsRepository: ObservableObject {
         return (season, episode)
     }
 
+    nonisolated private static func baseContentId(from videoId: String) -> String {
+        String(videoId.split(separator: ":").first ?? Substring(videoId))
+    }
+
+    private func localStreamGroup(videoId: String) -> AddonStreamGroup? {
+        let contentId = Self.baseContentId(from: videoId)
+        let episode = Self.seasonEpisode(fromVideoId: videoId)
+        let servers = Dictionary(uniqueKeysWithValues: SMBServerStore.shared.servers.map { ($0.id, $0) })
+        let streams = SMBLibraryIndex.shared.files(
+            forContentId: contentId,
+            season: episode.season,
+            episode: episode.episode
+        ).compactMap { file -> NuvioStream? in
+            guard let server = servers[file.serverID] else { return nil }
+            return NuvioStream(
+                url: file.streamPath(hostAndPort: server.hostAndPort),
+                name: server.displayName,
+                description: ByteCountFormatter.string(fromByteCount: file.size, countStyle: .file),
+                addonName: "Local (SMB)",
+                filename: file.filename,
+                videoSize: file.size
+            )
+        }
+        guard !streams.isEmpty else { return nil }
+        return AddonStreamGroup(
+            addonId: "local.smb",
+            displayName: "Local (SMB)",
+            streams: streams,
+            isLoading: false
+        )
+    }
+
+    private func jellyfinStreamGroup(videoId: String) -> AddonStreamGroup? {
+        let contentId = Self.baseContentId(from: videoId)
+        let episode = Self.seasonEpisode(fromVideoId: videoId)
+        guard let title = JellyfinLibraryIndex.shared.titles().first(where: { $0.contentId == contentId }),
+              let server = JellyfinServerStore.shared.server(id: title.serverID),
+              let baseURL = server.baseURL else {
+            return nil
+        }
+        let token = JellyfinCredentialStore.token(forServerID: server.id)
+        let streams = title.items
+            .filter { $0.season == episode.season && $0.episode == episode.episode }
+            .compactMap { item -> NuvioStream? in
+                guard let url = item.streamURL(baseURL: baseURL, accessToken: token) else { return nil }
+                return NuvioStream(
+                    url: url.absoluteString,
+                    name: server.displayName,
+                    description: item.size.map {
+                        ByteCountFormatter.string(fromByteCount: $0, countStyle: .file)
+                    },
+                    addonName: "Jellyfin",
+                    videoSize: item.size
+                )
+            }
+        guard !streams.isEmpty else { return nil }
+        return AddonStreamGroup(
+            addonId: "local.jellyfin",
+            displayName: "Jellyfin",
+            streams: streams,
+            isLoading: false
+        )
+    }
+
     // MARK: - Public API
 
     func load(
@@ -129,9 +193,12 @@ final class StreamsRepository: ObservableObject {
     // MARK: - Discovery
 
     private func runDiscovery(requestKey: String, type: String, videoId: String) async {
+        let ownedGroups = [localStreamGroup(videoId: videoId), jellyfinStreamGroup(videoId: videoId)]
+            .compactMap { $0 }
         state = StreamsDiscoveryState(
             requestKey: requestKey,
             revision: state.revision &+ 1,
+            groups: ownedGroups,
             isAnyLoading: true
         )
 
@@ -147,9 +214,9 @@ final class StreamsRepository: ObservableObject {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: [],
+                groups: ownedGroups,
                 isAnyLoading: false,
-                emptyStateReason: .noAddonsConfigured,
+                emptyStateReason: ownedGroups.isEmpty ? .noAddonsConfigured : nil,
                 hasResolvedTargets: true
             )
             print("[StreamsRepo] no enabled add-ons")
@@ -182,9 +249,9 @@ final class StreamsRepository: ObservableObject {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: [],
+                groups: ownedGroups,
                 isAnyLoading: false,
-                emptyStateReason: .noCompatibleAddons,
+                emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
                 hasResolvedTargets: true
             )
             print("[StreamsRepo] no compatible stream add-ons")
@@ -192,7 +259,7 @@ final class StreamsRepository: ObservableObject {
         }
 
         // Create every group as loading *before* any request so chips appear immediately.
-        let initialGroups = targets.map {
+        let initialGroups = ownedGroups + targets.map {
             AddonStreamGroup(
                 addonId: $0.addonId,
                 displayName: $0.displayName,

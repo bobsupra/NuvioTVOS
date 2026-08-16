@@ -20,6 +20,7 @@ import SMBClient
 public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
     public struct SMBError: Error, CustomStringConvertible, LocalizedError {
         public let message: String
+        public init(message: String) { self.message = message }
         public var description: String { "SMB: \(message)" }
         public var errorDescription: String? { description }
     }
@@ -36,10 +37,36 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
 
     /// Connect, authenticate (NTLMv2 / guest / anonymous), tree-connect to
     /// `share`, open `path` read-only, and stat it for its size. `server` is
-    /// e.g. `smb://host` or `smb://host:445`.
+    /// e.g. `smb://host` or `smb://host:445`. An empty `user` means "no
+    /// explicit account" and drives a guest-then-anonymous fallback — see
+    /// `SMBAuth.loginCredentialLess`. Prefer `connect(server:share:path:auth:)`
+    /// when the caller already has an explicit `SMBAuthMode` (e.g. from a host
+    /// app's saved server config): it authenticates exactly as chosen, with no
+    /// implicit fallback.
     public static func connect(
         server: URL, share: String, path: String,
         user: String, password: String, domain: String = ""
+    ) async throws -> SMBConnection {
+        try await connect(server: server, share: share, path: path) { client in
+            try await SMBAuth.loginCredentialLess(client, user: user, password: password, domain: domain)
+        }
+    }
+
+    /// Connect using an explicit `SMBAuthMode` — the same authentication
+    /// `SMBBrowser` performs for a Settings server row, so a stream configured
+    /// there plays back with identical auth behavior (no implicit fallback for
+    /// `.anonymous`/`.guest`; a rejected login surfaces as a real error).
+    public static func connect(
+        server: URL, share: String, path: String, auth: SMBAuthMode
+    ) async throws -> SMBConnection {
+        try await connect(server: server, share: share, path: path) { client in
+            try await SMBAuth.login(client, mode: auth)
+        }
+    }
+
+    private static func connect(
+        server: URL, share: String, path: String,
+        login: (SMBClient) async throws -> Void
     ) async throws -> SMBConnection {
         guard let host = server.host, !host.isEmpty else {
             throw SMBError(message: "no host in \(server.absoluteString)")
@@ -47,28 +74,11 @@ public final class SMBConnection: ByteRangeSource, @unchecked Sendable {
         let client = server.port.map { SMBClient(host: host, port: $0) }
             ?? SMBClient(host: host)
 
-        // An empty username means "no explicit account": try guest first, then
-        // fall back to a fully anonymous NTLM session if the server rejects it.
-        // This mirrors the guest/anonymous behaviour of the previous backend.
-        // The fallback is scoped to the no-account case (`account == nil`): when
-        // an explicit username was supplied, a login failure is a real auth
-        // error and must propagate rather than silently downgrading to an
-        // anonymous session. Callers signal "no account" with an empty username
-        // (see `SMBURL`, which leaves an omitted user empty rather than
-        // substituting "guest", otherwise this fallback could never fire).
-        let account = user.isEmpty ? nil : user
-        let secret = password.isEmpty ? nil : password
-        let realm = domain.isEmpty ? nil : domain
-
         // `login` negotiates and opens the NWConnection before it can throw, so
         // any failure past this point leaves a live socket. Tear it down before
         // rethrowing so failed connects don't leak a connection until dealloc.
         do {
-            do {
-                try await client.login(username: account ?? "guest", password: secret, domain: realm)
-            } catch where account == nil {
-                try await client.login(username: nil, password: nil)
-            }
+            try await login(client)
 
             try await client.connectShare(share)
 

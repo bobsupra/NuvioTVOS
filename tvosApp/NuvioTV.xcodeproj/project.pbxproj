@@ -25,6 +25,22 @@
 		A1L100020000000000000002 /* NuvioTV/Sources/Core/AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1L100010000000000000001 /* NuvioTV/Sources/Core/AppLanguage.swift */; };
 		A1L100040000000000000004 /* NuvioTV/Resources/AppLanguageCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A1L100030000000000000003 /* NuvioTV/Resources/AppLanguageCatalog.json */; };
 		AE00BF010000000000000001 /* AetherEngine in Frameworks */ = {isa = PBXBuildFile; productRef = AE00PD010000000000000001 /* AetherEngine */; };
+		A21100000000000000000002 /* AetherEngineSMB in Frameworks */ = {isa = PBXBuildFile; productRef = A21100000000000000000001 /* AetherEngineSMB */; };
+		A21300000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift */; };
+		A21300000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift */; };
+		A21300000000000000000003 /* NuvioTV/Sources/Core/SMB/SMBLibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000003 /* NuvioTV/Sources/Core/SMB/SMBLibraryIndex.swift */; };
+		A21300000000000000000004 /* NuvioTV/Sources/Core/SMB/SMBLibraryResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000004 /* NuvioTV/Sources/Core/SMB/SMBLibraryResolver.swift */; };
+		A21300000000000000000005 /* NuvioTV/Sources/Core/SMB/SMBLibraryScanner.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000005 /* NuvioTV/Sources/Core/SMB/SMBLibraryScanner.swift */; };
+		A21300000000000000000006 /* NuvioTV/Sources/Core/SMB/SMBServerConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000006 /* NuvioTV/Sources/Core/SMB/SMBServerConfig.swift */; };
+		A21300000000000000000007 /* NuvioTV/Sources/Core/SMB/SMBServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000007 /* NuvioTV/Sources/Core/SMB/SMBServerStore.swift */; };
+		A21300000000000000000008 /* NuvioTV/Sources/Core/SMB/SMBSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000008 /* NuvioTV/Sources/Core/SMB/SMBSessionManager.swift */; };
+		A21300000000000000000009 /* NuvioTV/Sources/Core/Jellyfin/JellyfinClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000009 /* NuvioTV/Sources/Core/Jellyfin/JellyfinClient.swift */; };
+		A2130000000000000000000A /* NuvioTV/Sources/Core/Jellyfin/JellyfinCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000A /* NuvioTV/Sources/Core/Jellyfin/JellyfinCredentialStore.swift */; };
+		A2130000000000000000000B /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryIndex.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000B /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryIndex.swift */; };
+		A2130000000000000000000C /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryResolver.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000C /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryResolver.swift */; };
+		A2130000000000000000000D /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerConfig.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000D /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerConfig.swift */; };
+		A2130000000000000000000E /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000E /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerStore.swift */; };
+		A2130000000000000000000F /* NuvioTV/Sources/Core/Jellyfin/JellyfinSessionManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A2120000000000000000000F /* NuvioTV/Sources/Core/Jellyfin/JellyfinSessionManager.swift */; };
 		AE10B001 /* NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F001 /* NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift */; };
 		AE10B002 /* NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F002 /* NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift */; };
 		AE10B003 /* NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F003 /* NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift */; };
@@ -177,6 +193,21 @@
 		A1L100030000000000000003 /* NuvioTV/Resources/AppLanguageCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = NuvioTV/Resources/AppLanguageCatalog.json; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = NuvioTV/SplashScreen.storyboard; sourceTree = "<group>"; };
 		AE10F001 /* NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackTrackInfo.swift; sourceTree = "<group>"; };
+		A21200000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift; sourceTree = "<group>"; };
+		A21200000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift; sourceTree = "<group>"; };
+		A21200000000000000000003 /* NuvioTV/Sources/Core/SMB/SMBLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBLibraryIndex.swift; sourceTree = "<group>"; };
+		A21200000000000000000004 /* NuvioTV/Sources/Core/SMB/SMBLibraryResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBLibraryResolver.swift; sourceTree = "<group>"; };
+		A21200000000000000000005 /* NuvioTV/Sources/Core/SMB/SMBLibraryScanner.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBLibraryScanner.swift; sourceTree = "<group>"; };
+		A21200000000000000000006 /* NuvioTV/Sources/Core/SMB/SMBServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBServerConfig.swift; sourceTree = "<group>"; };
+		A21200000000000000000007 /* NuvioTV/Sources/Core/SMB/SMBServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBServerStore.swift; sourceTree = "<group>"; };
+		A21200000000000000000008 /* NuvioTV/Sources/Core/SMB/SMBSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/SMB/SMBSessionManager.swift; sourceTree = "<group>"; };
+		A21200000000000000000009 /* NuvioTV/Sources/Core/Jellyfin/JellyfinClient.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinClient.swift; sourceTree = "<group>"; };
+		A2120000000000000000000A /* NuvioTV/Sources/Core/Jellyfin/JellyfinCredentialStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinCredentialStore.swift; sourceTree = "<group>"; };
+		A2120000000000000000000B /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryIndex.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryIndex.swift; sourceTree = "<group>"; };
+		A2120000000000000000000C /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryResolver.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryResolver.swift; sourceTree = "<group>"; };
+		A2120000000000000000000D /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerConfig.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinServerConfig.swift; sourceTree = "<group>"; };
+		A2120000000000000000000E /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerStore.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinServerStore.swift; sourceTree = "<group>"; };
+		A2120000000000000000000F /* NuvioTV/Sources/Core/Jellyfin/JellyfinSessionManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Jellyfin/JellyfinSessionManager.swift; sourceTree = "<group>"; };
 		AE10F002 /* NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackCacheSettings.swift; sourceTree = "<group>"; };
 		AE10F003 /* NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackLoadRequest.swift; sourceTree = "<group>"; };
 		AE10F004 /* NuvioTV/Sources/Core/Player/PlaybackEngineState.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PlaybackEngineState.swift; sourceTree = "<group>"; };
@@ -287,6 +318,7 @@
 			files = (
 				7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */,
 				AE00BF010000000000000001 /* AetherEngine in Frameworks */,
+				A21100000000000000000002 /* AetherEngineSMB in Frameworks */,
 				0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
@@ -580,6 +612,7 @@
 			packageProductDependencies = (
 				A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */,
 				AE00PD010000000000000001 /* AetherEngine */,
+				A21100000000000000000001 /* AetherEngineSMB */,
 			);
 			productName = NuvioTV;
 			productReference = 13B07F961A680F5B00A75B9A /* NuvioTV.app */;
@@ -739,6 +772,21 @@
 			buildActionMask = 2147483647;
 			files = (
 				C0D310010000000000000001 /* NuvioTV/Sources/NuvioTVApp.swift in Sources */,
+				A21300000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift in Sources */,
+				A21300000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift in Sources */,
+				A21300000000000000000003 /* NuvioTV/Sources/Core/SMB/SMBLibraryIndex.swift in Sources */,
+				A21300000000000000000004 /* NuvioTV/Sources/Core/SMB/SMBLibraryResolver.swift in Sources */,
+				A21300000000000000000005 /* NuvioTV/Sources/Core/SMB/SMBLibraryScanner.swift in Sources */,
+				A21300000000000000000006 /* NuvioTV/Sources/Core/SMB/SMBServerConfig.swift in Sources */,
+				A21300000000000000000007 /* NuvioTV/Sources/Core/SMB/SMBServerStore.swift in Sources */,
+				A21300000000000000000008 /* NuvioTV/Sources/Core/SMB/SMBSessionManager.swift in Sources */,
+				A21300000000000000000009 /* NuvioTV/Sources/Core/Jellyfin/JellyfinClient.swift in Sources */,
+				A2130000000000000000000A /* NuvioTV/Sources/Core/Jellyfin/JellyfinCredentialStore.swift in Sources */,
+				A2130000000000000000000B /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryIndex.swift in Sources */,
+				A2130000000000000000000C /* NuvioTV/Sources/Core/Jellyfin/JellyfinLibraryResolver.swift in Sources */,
+				A2130000000000000000000D /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerConfig.swift in Sources */,
+				A2130000000000000000000E /* NuvioTV/Sources/Core/Jellyfin/JellyfinServerStore.swift in Sources */,
+				A2130000000000000000000F /* NuvioTV/Sources/Core/Jellyfin/JellyfinSessionManager.swift in Sources */,
 				A1L100020000000000000002 /* NuvioTV/Sources/Core/AppLanguage.swift in Sources */,
 				C0D310020000000000000002 /* NuvioTV/Sources/Models/CatalogModels.swift in Sources */,
 				C0D310030000000000000003 /* NuvioTV/Sources/Data/Repository/CatalogRepository.swift in Sources */,
@@ -1202,6 +1250,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */;
 			productName = AetherEngine;
+		};
+		A21100000000000000000001 /* AetherEngineSMB */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */;
+			productName = AetherEngineSMB;
 		};
 /* End XCSwiftPackageProductDependency section */
 	};

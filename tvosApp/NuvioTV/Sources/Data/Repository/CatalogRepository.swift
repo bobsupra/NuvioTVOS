@@ -577,6 +577,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
+            return jellyfinMeta
+        }
         if let cached = cachedMetadata(for: id) {
             return await TmdbDetailsService.localizedMetadata(for: cached)
         }
@@ -585,6 +588,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
+        if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
+            return jellyfinMeta
+        }
         removeCachedMetadata(for: id)
         return try await loadMetadata(id: id, type: type)
     }
