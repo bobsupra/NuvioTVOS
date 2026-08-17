@@ -320,8 +320,9 @@ struct LibraryItemButton: View {
         .focused($isFocused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: item.id))
         .focusEffectDisabledIfAvailable()
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
+        .titleActionsContextMenu(
+            meta: item.asNuvioMeta,
+            onOpenDetails: action
         )
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
         .zIndex(showsFocusedAppearance ? 1 : 0)

@@ -4539,6 +4539,9 @@ private struct SimklConnectedSettingsSheet: View {
                                 .font(.system(size: 18, weight: .semibold))
                                 .foregroundColor(.red.opacity(0.9))
                         }
+                        if let report = viewModel.loadingDebugInfo, !report.isEmpty {
+                            SimklLoadingDebugReport(report: report)
+                        }
                     }
                     .frame(width: 1_000, alignment: .leading)
                     .padding(.horizontal, 52)
@@ -4734,6 +4737,7 @@ private struct SimklPINLoginSheet: View {
                 Text(viewModel.statusMessage ?? "Starting Simkl login…")
                     .font(.system(size: 20, weight: .medium))
                     .foregroundColor(.white.opacity(0.64))
+                debugReport
                 dialogButton(
                     title: L10n.string("action_cancel", fallback: "Cancel"),
                     isPrimary: false
@@ -4808,6 +4812,7 @@ private struct SimklPINLoginSheet: View {
                     .font(.system(size: 22, weight: .medium))
                     .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
                     .multilineTextAlignment(.center)
+                debugReport
                 HStack(spacing: 18) {
                     dialogButton(
                         title: L10n.string("action_close", fallback: "Close"),
@@ -4845,12 +4850,48 @@ private struct SimklPINLoginSheet: View {
     }
 
     @ViewBuilder
+    private var debugReport: some View {
+        if let report = viewModel.loadingDebugInfo, !report.isEmpty {
+            SimklLoadingDebugReport(report: report)
+        }
+    }
+
+    @ViewBuilder
     private func dialogButton(
         title: String,
         isPrimary: Bool,
         action: @escaping () -> Void
     ) -> some View {
         ProviderLoginGlassButton(title: title, isPrimary: isPrimary, action: action)
+    }
+}
+
+private struct SimklLoadingDebugReport: View {
+    let report: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("SIMKL DEBUG REPORT")
+                .font(.system(size: 18, weight: .bold, design: .monospaced))
+                .foregroundColor(.yellow)
+
+            ScrollView {
+                Text(report)
+                    .font(.system(size: 14, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.82))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 190)
+            .padding(14)
+            .background(Color.black.opacity(0.36), in: RoundedRectangle(cornerRadius: 12))
+
+            Text("Read or screenshot this report and send it to the developer.")
+                .font(.system(size: 16, weight: .medium))
+                .foregroundColor(.white.opacity(0.58))
+        }
+        .frame(maxWidth: 820)
     }
 }
 
@@ -6083,16 +6124,6 @@ private struct AdvancedSettingsView: View {
                     fallback: "Sync configurations across all Apple TVs on the same iCloud account"
                 )
             ) {
-                SettingsToggleRow(
-                    title: L10n.string("tvos_account_icloud_sync", fallback: "iCloud Settings Sync"),
-                    subtitle: L10n.string(
-                        "tvos_account_icloud_sync_subtitle",
-                        fallback: "Sync themes, layout, player preferences, and integration keys across Apple TVs on this iCloud account"
-                    ),
-                    isOn: $iCloudSyncEnabled,
-                    accentColor: accentColor
-                )
-
                 if iCloudSyncEnabled {
                     SettingsActionRow(
                         title: L10n.string("tvos_settings_icloud_sync_now", fallback: "Sync Now"),
@@ -8069,6 +8100,7 @@ private struct AddonReorderButton: View {
 /// Settings → Layout → Home Catalogs: reorder the rows Home shows. The list
 /// comes from the snapshot Home writes on every load; moves persist to the
 /// active profile's settings and re-apply to a mounted Home immediately.
+@MainActor
 private struct HomeCatalogOrderSection: View {
     let accentColor: Color
     @State private var rows: [TVHomeCatalogOrder.SnapshotRow] = []
@@ -11562,11 +11594,15 @@ private extension View {
 private struct ClearPresentationBackgroundIfAvailable: ViewModifier {
     @ViewBuilder
     func body(content: Content) -> some View {
-        if #available(tvOS 16.4, *) {
+        #if os(iOS)
+        if #available(iOS 16.4, *) {
             content.presentationBackground(.clear)
         } else {
             content
         }
+        #else
+        content
+        #endif
     }
 }
 

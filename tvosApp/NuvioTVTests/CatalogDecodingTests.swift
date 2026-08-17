@@ -216,4 +216,166 @@ final class CatalogDecodingTests: XCTestCase {
             ["Leonardo DiCaprio", "Elliot Page"]
         )
     }
+
+    // MARK: - WatchedStore Caching & Snapshot Indexing Tests
+
+    func testWatchedSnapshotIndexedLookups() {
+        let movieMeta = NuvioMeta(
+            id: "tt0133093",
+            name: "The Matrix",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0133093",
+            tmdbId: 603,
+            type: "movie",
+            year: 1999,
+            genres: ["Action", "Sci-Fi"],
+            rating: 8.7,
+            releaseInfo: "1999",
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        )
+
+        let seriesMeta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0903747",
+            tmdbId: 1396,
+            type: "series",
+            year: 2008,
+            genres: ["Crime", "Drama"],
+            rating: 9.5,
+            releaseInfo: "2008-2013",
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        )
+
+        let items = [
+            WatchedStoreItem(meta: movieMeta, watchedAt: Date(), sources: [TraktWatchProgressSource.nuvioSync.rawValue]),
+            WatchedStoreItem(meta: seriesMeta, watchedAt: Date(), season: 1, episode: 1, sources: [TraktWatchProgressSource.nuvioSync.rawValue]),
+            WatchedStoreItem(meta: seriesMeta, watchedAt: Date(), season: 1, episode: 2, sources: [TraktWatchProgressSource.nuvioSync.rawValue]),
+            WatchedStoreItem(meta: seriesMeta, watchedAt: Date(), season: 2, episode: 1, sources: [TraktWatchProgressSource.nuvioSync.rawValue])
+        ]
+
+        let snapshot = WatchedSnapshot(items: items, source: .nuvioSync)
+
+        // Movie whole-title lookups
+        XCTAssertTrue(snapshot.contains(metaId: "tt0133093", type: "movie"))
+        XCTAssertTrue(snapshot.contains(metaId: "TT0133093", type: "movie"))
+        XCTAssertTrue(snapshot.contains(meta: movieMeta))
+        XCTAssertFalse(snapshot.contains(metaId: "tt9999999", type: "movie"))
+
+        // Series title does not have whole-title mark
+        XCTAssertFalse(snapshot.contains(metaId: "tt0903747", type: "series"))
+        XCTAssertFalse(snapshot.contains(meta: seriesMeta))
+
+        // Episode lookups
+        XCTAssertTrue(snapshot.containsEpisode(metaId: "tt0903747", season: 1, episode: 1))
+        XCTAssertTrue(snapshot.containsEpisode(metaId: "tt0903747", season: 1, episode: 2))
+        XCTAssertTrue(snapshot.containsEpisode(metaId: "tt0903747", season: 2, episode: 1))
+        XCTAssertFalse(snapshot.containsEpisode(metaId: "tt0903747", season: 1, episode: 3))
+
+        XCTAssertTrue(snapshot.containsEpisode(meta: seriesMeta, season: 1, episode: 1))
+        XCTAssertFalse(snapshot.containsEpisode(meta: seriesMeta, season: 3, episode: 1))
+
+        // Episode keys
+        let episodeKeys = snapshot.watchedEpisodeKeys(metaId: "tt0903747")
+        XCTAssertEqual(episodeKeys, ["1:1", "1:2", "2:1"])
+
+        let metaEpisodeKeys = snapshot.watchedEpisodeKeys(meta: seriesMeta)
+        XCTAssertEqual(metaEpisodeKeys, ["1:1", "1:2", "2:1"])
+
+        // Catalog series title fallback match
+        let localSeriesMeta = NuvioMeta(
+            id: "cinemeta:series:custom123",
+            name: "Breaking Bad",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            type: "series",
+            year: 2008,
+            genres: nil,
+            rating: nil,
+            releaseInfo: "2008",
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        )
+        let catalogEpisodeKeys = snapshot.catalogWatchedEpisodeKeys(meta: localSeriesMeta)
+        XCTAssertEqual(catalogEpisodeKeys, ["1:1", "1:2", "2:1"])
+    }
+
+    func testWatchedStoreCachingAndInvalidation() {
+        let testProfile = "test_profile_\(UUID().uuidString)"
+        WatchedStore.setActiveProfile(testProfile)
+        WatchedStore.invalidateCache()
+
+        let meta = NuvioMeta(
+            id: "tt0088763",
+            name: "Back to the Future",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0088763",
+            tmdbId: 105,
+            type: "movie",
+            year: 1985,
+            genres: ["Adventure", "Comedy", "Sci-Fi"],
+            rating: 8.5,
+            releaseInfo: "1985",
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil
+        )
+
+        // Initially empty
+        XCTAssertFalse(WatchedStore.contains(meta: meta))
+        XCTAssertEqual(WatchedStore.items().count, 0)
+
+        // Mark watched
+        let marked = WatchedStore.markWatched(meta)
+        XCTAssertTrue(marked)
+
+        // Cached lookup should be immediate and true
+        XCTAssertTrue(WatchedStore.contains(meta: meta))
+        XCTAssertTrue(WatchedStore.contains(metaId: "tt0088763", type: "movie"))
+        XCTAssertEqual(WatchedStore.items().count, 1)
+
+        // Snapshot lookup
+        let snapshot = WatchedStore.currentSnapshot()
+        XCTAssertTrue(snapshot.contains(meta: meta))
+
+        // Cleanup
+        WatchedStore.eraseProfile(testProfile)
+        XCTAssertFalse(WatchedStore.contains(meta: meta))
+        XCTAssertEqual(WatchedStore.items().count, 0)
+    }
 }

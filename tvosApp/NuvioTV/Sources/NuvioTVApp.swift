@@ -29,7 +29,6 @@ enum TVHomeDebugTrace {
         subsystem: "com.pyksel.nuviotvos",
         category: "TVTrace"
     )
-
     static func now() -> UInt64 {
         DispatchTime.now().uptimeNanoseconds
     }
@@ -173,6 +172,10 @@ struct ContentView: View {
     /// Where the root Details screen should return. This is normally Home, but
     /// a title opened from a collection must return to that collection.
     @State private var detailsReturnDestination: DetailsReturnDestination = .main
+    /// Bumped only after the Details view has actually left the hierarchy.
+    /// Home uses this lifecycle signal to request focus at the first moment
+    /// tvOS can accept it, instead of guessing with delayed timers.
+    @State private var detailsDidDisappearGeneration: UInt = 0
     @StateObject private var authManager = AuthManager()
     @StateObject private var profileViewModel = ProfileViewModel()
     @StateObject private var syncManager = NuvioSyncManager()
@@ -457,8 +460,16 @@ struct ContentView: View {
 
     private var isOverlayPresented: Bool {
         if isResolvingContinueWatchingStream { return true }
-        if cardMenuMeta != nil || continueWatchingMenuItem != nil { return true }
         return fullScreenOverlayPresented
+    }
+
+    /// Full-screen overlays already hide Home with alpha zero. Propagating
+    /// `.disabled` through that hidden tree changes `isEnabled` for every
+    /// resident card and forces the shelves to lay themselves out again while
+    /// Details is entering. Keep the environment lock for visible menus, where
+    /// Home still needs to stay on screen but must not receive focus.
+    private var shouldDisableHomeContent: Bool {
+        isOverlayPresented && !fullScreenOverlayPresented
     }
 
     /// Details/Player fully replace Home, so the tab view fades to black under
@@ -508,15 +519,6 @@ struct ContentView: View {
             continueWatchingPlaybackTask?.cancel()
             continueWatchingPlaybackTask = nil
             isResolvingContinueWatchingStream = false
-            return
-        }
-        if cardMenuMeta != nil {
-            withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
-            cardMenuReturnDestination = .main
-            return
-        }
-        if continueWatchingMenuItem != nil {
-            withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
             return
         }
         switch activeScreen {
@@ -958,11 +960,13 @@ struct ContentView: View {
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
         httpHeaders: [String: String] = [:],
-        origin: PlaybackOrigin = .main
+        origin: PlaybackOrigin = .main,
+        customPlayer: ExternalPlayer? = nil
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
-        let player = ExternalPlayer.from(store.string(forKey: SettingsKey.externalPlayer))
+        let defaultPlayer = ExternalPlayer.from(store.string(forKey: SettingsKey.externalPlayer))
+        let player = customPlayer ?? defaultPlayer
         let forwardSubtitles = (store.object(forKey: SettingsKey.externalPlayerForwardSubtitles) as? Bool) ?? true
         let subtitleURLs = forwardSubtitles
             ? externalSubtitles.compactMap { URL(string: $0.url) }
@@ -1022,7 +1026,7 @@ struct ContentView: View {
     private var appContainer: some View {
         ZStack {
             mainTabView
-                .disabled(isOverlayPresented)
+                .disabled(shouldDisableHomeContent)
                 // `.disabled` stops the tab *content* from taking focus, but the
                 // sidebar/tab bar itself can still attract the focus engine while
                 // an overlay is settling; focus landing there un-highlights the
@@ -1042,6 +1046,9 @@ struct ContentView: View {
                 detailsScreen(contentId: contentId, contentType: contentType)
                     .id("\(contentType):\(contentId)")
                     .transition(.opacity)
+                    .onDisappear {
+                        detailsDidDisappearGeneration &+= 1
+                    }
                     .zIndex(1)
             }
 
@@ -1183,60 +1190,6 @@ struct ContentView: View {
                     .zIndex(3)
             }
 
-            if let menuMeta = cardMenuMeta {
-                CardActionMenuOverlay(
-                    meta: menuMeta,
-                    onDetails: {
-                        // Hand off to Details without a focus flash: the tab view
-                        // stays covered because activeScreen becomes .details in
-                        // the same transaction the menu clears.
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            cardMenuMeta = nil
-                            openDetailsRoot(
-                                id: menuMeta.id,
-                                type: menuMeta.type,
-                                returnDestination: cardMenuReturnDestination
-                            )
-                            cardMenuReturnDestination = .main
-                        }
-                    },
-                    onDismiss: {
-                        withAnimation(.easeInOut(duration: 0.2)) { cardMenuMeta = nil }
-                        cardMenuReturnDestination = .main
-                    }
-                )
-                .transition(.opacity)
-                .zIndex(3)
-            }
-
-            if let menuItem = continueWatchingMenuItem {
-                ContinueWatchingActionMenuOverlay(
-                    item: menuItem,
-                    onDetails: {
-                        withAnimation(.easeInOut(duration: 0.28)) {
-                            continueWatchingMenuItem = nil
-                            openDetailsRoot(id: menuItem.meta.id, type: menuItem.meta.type)
-                        }
-                    },
-                    onPlayManually: {
-                        playContinueWatchingManually(menuItem)
-                    },
-                    onStartFromBeginning: {
-                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
-                        resumePlayback(menuItem, startFromBeginning: true)
-                    },
-                    onRemove: {
-                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
-                        removeFromContinueWatching(menuItem)
-                    },
-                    onDismiss: {
-                        withAnimation(.easeInOut(duration: 0.2)) { continueWatchingMenuItem = nil }
-                    }
-                )
-                .transition(.opacity)
-                .zIndex(3)
-            }
-
             // The adaptive tab sidebar is briefly expanded while its first
             // focus pass runs. Keep the full tab container covered while Home
             // loads so its loading/card default focus and native scroll state
@@ -1269,6 +1222,8 @@ struct ContentView: View {
             homeStore: homeStore,
             homeCatalogRevision: syncManager.homeCatalogRevision,
             homeCollectionsRevision: syncManager.homeCollectionsRevision,
+            isFullScreenOverlayPresented: fullScreenOverlayPresented,
+            detailsDidDisappearGeneration: detailsDidDisappearGeneration,
             accountEmail: authManager.currentEmail,
             isAuthenticated: authManager.isAuthenticated,
             sessionNeedsReauthentication: authManager.sessionNeedsReauthentication,
@@ -1364,6 +1319,15 @@ struct ContentView: View {
             onResumePlayback: { item in
                 resumePlayback(item)
             },
+            onPlayContinueWatchingManually: { item in
+                playContinueWatchingManually(item)
+            },
+            onStartContinueWatchingFromBeginning: { item in
+                resumePlayback(item, startFromBeginning: true)
+            },
+            onRemoveFromContinueWatching: { item in
+                removeFromContinueWatching(item)
+            },
             onLongPressCard: { meta in
                 cardMenuReturnDestination = .main
                 withAnimation(.easeInOut(duration: 0.2)) {
@@ -1394,7 +1358,7 @@ struct ContentView: View {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
             },
-            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes in
+            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
@@ -1408,7 +1372,8 @@ struct ContentView: View {
                         externalSubtitles: externalSubtitles,
                         resumeFrom: isTrailer ? nil : Self.resumePosition(for: meta, episode: currentEpisode),
                         httpHeaders: httpHeaders,
-                        origin: .details
+                        origin: .details,
+                        customPlayer: player
                     )
                 }
             },
@@ -1782,6 +1747,40 @@ private struct ContinueWatchingPlaybackLoadingView: View {
     }
 }
 
+private struct SimklHomeLoadingDebugReport: View {
+    let report: String
+
+    var body: some View {
+        VStack(spacing: 12) {
+            Text("SIMKL DEBUG REPORT")
+                .font(.system(size: 20, weight: .bold, design: .monospaced))
+                .foregroundColor(.yellow)
+
+            ScrollView {
+                Text(report)
+                    .font(.system(size: 15, weight: .medium, design: .monospaced))
+                    .foregroundColor(.white.opacity(0.86))
+                    .multilineTextAlignment(.leading)
+                    .fixedSize(horizontal: false, vertical: true)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(maxHeight: 250)
+            .padding(16)
+            .background(Color.black.opacity(0.72), in: RoundedRectangle(cornerRadius: 14))
+
+            Text("Read or screenshot this report and send it to the developer.")
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(.white.opacity(0.66))
+        }
+        .padding(22)
+        .background(Color.black.opacity(0.84), in: RoundedRectangle(cornerRadius: 18))
+        .overlay {
+            RoundedRectangle(cornerRadius: 18)
+                .stroke(Color.yellow.opacity(0.45), lineWidth: 1)
+        }
+    }
+}
+
 /// Shown between login and who's-watching while the first account pull is in
 /// flight, so profile names arrive before the selection grid renders.
 private struct AccountSyncWaitView: View {
@@ -2013,6 +2012,8 @@ private struct TVMainTabView: View {
     @ObservedObject var homeStore: TVHomeStore
     let homeCatalogRevision: UInt
     let homeCollectionsRevision: UInt
+    let isFullScreenOverlayPresented: Bool
+    let detailsDidDisappearGeneration: UInt
     let accountEmail: String?
     let isAuthenticated: Bool
     let sessionNeedsReauthentication: Bool
@@ -2028,6 +2029,9 @@ private struct TVMainTabView: View {
     let onRequestAccountRefresh: () -> Void
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
+    var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
+    var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
+    var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
     let onLongPressCard: (NuvioMeta) -> Void
     /// Long press on a Continue Watching card, which gets its own resume-centric
     /// menu instead of the generic title actions.
@@ -2108,6 +2112,8 @@ private struct TVMainTabView: View {
                 store: homeStore,
                 repository: CinemetaCatalogRepository(),
                 isActive: selectedTab == .home,
+                isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+                detailsDidDisappearGeneration: detailsDidDisappearGeneration,
                 isProfileSwitching: isProfileSwitching,
                 contentIdentity: TVHomeContentIdentity(
                     profileId: activeProfile?.id ?? "none",
@@ -2117,6 +2123,9 @@ private struct TVMainTabView: View {
                 onNavigateToDetails: onNavigateToDetails,
                 onOpenCollectionFolder: onOpenCollectionFolder,
                 onResumePlayback: onResumePlayback,
+                onPlayContinueWatchingManually: onPlayContinueWatchingManually,
+                onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
+                onRemoveFromContinueWatching: onRemoveFromContinueWatching,
                 onLongPressCard: onLongPressCard,
                 onLongPressContinueWatching: onLongPressContinueWatching,
                 onRequestAccountRefresh: onRequestAccountRefresh
@@ -2327,6 +2336,8 @@ struct TVHomeView: View {
     @ObservedObject var store: TVHomeStore
     let repository: CatalogRepository
     let isActive: Bool
+    let isFullScreenOverlayPresented: Bool
+    let detailsDidDisappearGeneration: UInt
     /// True while a freshly picked profile is being prepared. Keeps Home's own
     /// loader on screen for that whole beat, so the switch shows one screen
     /// instead of a cover handing over to a spinner.
@@ -2336,6 +2347,9 @@ struct TVHomeView: View {
     let onNavigateToDetails: (String, String) -> Void
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
+    var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
+    var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
+    var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
     var onLongPressCard: ((NuvioMeta) -> Void)? = nil
     /// Raised instead of `onLongPressCard` for cards in the Continue Watching
     /// row, which carry resume actions the generic title menu has no use for.
@@ -2393,6 +2407,9 @@ struct TVHomeView: View {
     @State private var displayedProgressSource: TraktWatchProgressSource?
     @State private var continueWatchingRefreshGeneration = 0
     @State private var continueWatchingRefreshTask: Task<Void, Never>?
+    @State private var simklLoadingDebugInfo: String?
+    @State private var simklLoadingTimeoutTask: Task<Void, Never>?
+    @State private var simklLoadingStartedAt: Date?
     @State private var isLoadingMoreContinueWatching = false
     /// Rows the current load still owes, rendered as spinner skeletons until
     /// their catalog answers. Empty whenever no load is in flight.
@@ -2593,7 +2610,6 @@ struct TVHomeView: View {
                                                 retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                                 suppressFocusAnimations: suppressReturnFocusAnimations
                                                     && focusedRowIndex == index,
-                                                entryLocked: focusedRowIndex != index,
                                                 onInitialFocusRequested: {
                                                     didRequestInitialCardFocus = true
                                                 },
@@ -2645,7 +2661,6 @@ struct TVHomeView: View {
                                                 retainFocusAppearanceForCardKey: overlayRestoreCardID,
                                                 suppressFocusAnimations: suppressReturnFocusAnimations
                                                     && focusedRowIndex == index,
-                                                entryLocked: focusedRowIndex != index,
                                                 onInitialFocusRequested: {
                                                     didRequestInitialCardFocus = true
                                                 },
@@ -2696,10 +2711,6 @@ struct TVHomeView: View {
                                                     {
                                                         onResumePlayback(item)
                                                     } else {
-                                                        // Latch the visual focus before
-                                                        // Details takes ownership of the
-                                                        // focus engine, avoiding a one-
-                                                        // frame outline flicker on entry.
                                                         let cardKey = "\(section.id)\u{1}\(meta.id)"
                                                         navigateToDetailsFromHome(
                                                             id: meta.id,
@@ -2708,7 +2719,18 @@ struct TVHomeView: View {
                                                         )
                                                     }
                                                 },
-                                                onLongPress: longPressHandler(for: section.id)
+                                                onLongPress: longPressHandler(for: section.id),
+                                                onOpenDetails: { meta in
+                                                    let cardKey = "\(section.id)\u{1}\(meta.id)"
+                                                    navigateToDetailsFromHome(
+                                                        id: meta.id,
+                                                        type: meta.type,
+                                                        restoreCardID: cardKey
+                                                    )
+                                                },
+                                                onPlayContinueWatchingManually: onPlayContinueWatchingManually,
+                                                onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
+                                                onRemoveFromContinueWatching: onRemoveFromContinueWatching
                                             )
                                             .equatable()
                                             .id(section.id)
@@ -2750,6 +2772,15 @@ struct TVHomeView: View {
                 focusedCardID = nil
             }
 
+            }
+
+            if let report = simklLoadingDebugInfo, !report.isEmpty {
+                SimklHomeLoadingDebugReport(report: report)
+                    .frame(maxWidth: 920)
+                    .padding(.horizontal, 48)
+                    .padding(.top, 48)
+                    .zIndex(20)
+                    .allowsHitTesting(false)
             }
         }
         .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
@@ -2920,6 +2951,7 @@ struct TVHomeView: View {
             homeReloadTask?.cancel()
             continueWatchingRefreshTask?.cancel()
             continueWatchingRefreshTask = nil
+            finishSimklHomeLoadingDiagnostic()
             continueWatchingRefreshGeneration &+= 1
         }
         .onChange(of: isLoading) { _, loading in
@@ -2962,65 +2994,36 @@ struct TVHomeView: View {
                 shouldRestoreHomeFocus = true
             }
         }
-        // The tab view is `.disabled` while Details/Player covers it. On
-        // dismissal the focus engine re-places focus geometrically (top-left
-        // card) WITHOUT consulting the armed `defaultFocus` -- that only fires
-        // for scoped entries like coming back from the sidebar. So capture the
-        // card when the overlay goes up; while the capture is set every other
-        // card is unfocusable (the Settings sidebar trick), so the engine can
-        // only land back on the saved card -- no scroll-to-top flash.
+        // Visible menus still toggle Home's disabled environment. Full-screen
+        // overlays do not: their opacity-zero Home tree is already unfocusable,
+        // and handling the overlay transition directly avoids invalidating all
+        // resident shelves on Details entry.
         .onChange(of: isEnabled) { _, enabled in
             TVHomeDebugTrace.log(
                 "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
             )
-            // TabView may disable an unselected Home tab. Only Details/Player
-            // restoration happens while Home is still the selected tab.
-            guard isActive else {
-                overlayRestoreGeneration &+= 1
-                overlayRestoreCardID = nil
-                return
-            }
-            if !enabled {
-                // Direct Home → Details navigation already captured the target
-                // in reference storage. Avoid publishing the one-card lock now:
-                // doing so rebuilds every resident shelf before Details can draw.
-                if focusWork.defersOverlayPreparation {
-                    TVHomeDebugTrace.log("home.overlay.disabled deferring preparation")
-                    focusWork.landscapeFocusTask?.cancel()
-                    focusWork.pendingLandscapeFocusedId = nil
-                    focusWork.focusSettleTask?.cancel()
-                    return
-                }
-
-                // Home remains mounted underneath full-screen overlays. Disable
-                // its focus-driven springs before focus is removed so restoring
-                // the saved card cannot bounce the vertical row stack.
-                armReturnFocusAnimationSuppression()
-                overlayRestoreGeneration &+= 1
-                let target = focusedCardID ?? store.lastFocusedCardID
-                TVHomeDebugTrace.log("home.overlay.disabled setting target=\(target ?? "nil")")
-                overlayRestoreCardID = target
-            } else if focusWork.defersOverlayPreparation {
-                let target = focusWork.pendingOverlayRestoreCardID
-                focusWork.defersOverlayPreparation = false
-                focusWork.pendingOverlayRestoreCardID = nil
-                guard let target else {
-                    TVHomeDebugTrace.log("home.overlay.enabled defersPrep with nil target")
-                    return
-                }
-
-                // Build the restriction only on the return path. Details is no
-                // longer competing with this Home render, and the delayed focus
-                // writes below run after the target modifier is mounted.
-                armReturnFocusAnimationSuppression()
-                overlayRestoreGeneration &+= 1
-                TVHomeDebugTrace.log("home.overlay.enabled restoring to target=\(target) gen=\(overlayRestoreGeneration)")
-                overlayRestoreCardID = target
-                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
-            } else if let target = overlayRestoreCardID {
-                TVHomeDebugTrace.log("home.overlay.enabled fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
-                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
-            }
+            // Full-screen transitions have their own handler below. This one
+            // remains for the visible card-menu path and inactive TabView tabs.
+            guard !isFullScreenOverlayPresented else { return }
+            handleHomeOverlayStateChange(isPresented: !enabled)
+        }
+        .onChange(of: isFullScreenOverlayPresented) { _, presented in
+            TVHomeDebugTrace.log(
+                "home.overlay.fullScreen changed to \(presented) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+            )
+            handleHomeOverlayStateChange(isPresented: presented)
+        }
+        .onChange(of: detailsDidDisappearGeneration) { _, generation in
+            guard !isFullScreenOverlayPresented else { return }
+            guard let target = overlayRestoreCardID,
+                  focusWork.restoringOverlayCardID == target else { return }
+            TVHomeDebugTrace.log(
+                "home.details.disappeared generation=\(generation) restoring target=\(target)"
+            )
+            // Details is now out of the hierarchy, so this is the first focus
+            // request that tvOS can actually commit. The card's focus callback
+            // will release the one-card lock on the next run-loop turn.
+            focusedCardID = target
         }
         // Removing a card takes the focus capture with it: the restore target
         // still names the card that just left, and because every other card is
@@ -3152,7 +3155,18 @@ struct TVHomeView: View {
                                     onResumePlayback(item)
                                 }
                             },
-                            onLongPress: longPressHandler(for: section.id)
+                            onLongPress: longPressHandler(for: section.id),
+                            onOpenDetails: { meta in
+                                let cardKey = "\(section.id)\u{1}\(meta.id)"
+                                navigateToDetailsFromHome(
+                                    id: meta.id,
+                                    type: meta.type,
+                                    restoreCardID: cardKey
+                                )
+                            },
+                            onPlayContinueWatchingManually: onPlayContinueWatchingManually,
+                            onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
+                            onRemoveFromContinueWatching: onRemoveFromContinueWatching
                         )
                     } else {
                         TVHomeCatalogGridSection(
@@ -3216,31 +3230,104 @@ struct TVHomeView: View {
         return String(key.dropFirst(prefix.count))
     }
 
-    private func restoreOverlayFocus(to target: String, generation: Int) {
-        TVHomeDebugTrace.log("home.restoreOverlayFocus begin target=\(target) gen=\(generation)")
+    /// Handles focus capture for both visible menus and full-screen overlays.
+    /// Full-screen presentation intentionally does not toggle Home's disabled
+    /// environment, so this transition hook replaces the old Details-specific
+    /// `isEnabled` callback without rebuilding every resident shelf.
+    private func handleHomeOverlayStateChange(isPresented: Bool) {
+        // TabView may disable an unselected Home tab. Only overlay restoration
+        // while Home remains selected should touch the saved focus target.
+        guard isActive else {
+            overlayRestoreGeneration &+= 1
+            overlayRestoreCardID = nil
+            return
+        }
+
+        if isPresented {
+            // Direct Home → Details navigation already captured the target in
+            // reference storage. Avoid publishing the one-card lock now; doing
+            // so would rebuild every resident shelf before Details can draw.
+            if focusWork.defersOverlayPreparation {
+                TVHomeDebugTrace.log("home.overlay.presentation deferring preparation")
+                focusWork.landscapeFocusTask?.cancel()
+                focusWork.pendingLandscapeFocusedId = nil
+                focusWork.focusSettleTask?.cancel()
+                return
+            }
+
+            // For visible menus and non-Home overlay entry, capture the target
+            // before focus is removed so the return path cannot jump to the
+            // first card.
+            armReturnFocusAnimationSuppression()
+            overlayRestoreGeneration &+= 1
+            let target = focusedCardID ?? store.lastFocusedCardID
+            TVHomeDebugTrace.log("home.overlay.presentation setting target=\(target ?? "nil")")
+            overlayRestoreCardID = target
+        } else if focusWork.defersOverlayPreparation {
+            let target = focusWork.pendingOverlayRestoreCardID
+            focusWork.defersOverlayPreparation = false
+            focusWork.pendingOverlayRestoreCardID = nil
+            guard let target else {
+                TVHomeDebugTrace.log("home.overlay.dismissal defersPrep with nil target")
+                return
+            }
+
+            // Build the restriction only on return. Details is no longer
+            // competing with this Home render, and delayed focus writes run
+            // after the target modifier is mounted.
+            armReturnFocusAnimationSuppression()
+            overlayRestoreGeneration &+= 1
+            TVHomeDebugTrace.log("home.overlay.dismissal restoring to target=\(target) gen=\(overlayRestoreGeneration)")
+            overlayRestoreCardID = target
+            restoreOverlayFocus(
+                to: target,
+                generation: overlayRestoreGeneration,
+                waitForDetailsDisappearance: true
+            )
+        } else if let target = overlayRestoreCardID {
+            TVHomeDebugTrace.log("home.overlay.dismissal fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        }
+    }
+
+    private func restoreOverlayFocus(
+        to target: String,
+        generation: Int,
+        waitForDetailsDisappearance: Bool = false
+    ) {
+        TVHomeDebugTrace.log(
+            "home.restoreOverlayFocus begin target=\(target) gen=\(generation) "
+                + "waitForDetailsDisappearance=\(waitForDetailsDisappearance)"
+        )
         focusWork.restoringOverlayCardID = target
-        focusedCardID = target
-        // Fire multiple focus writes across the transition window. The first
-        // writes land while Details is fading; later writes cover the moment
-        // DetailsScreen is actually removed from the ZStack (details.disappear)
-        // which can be delayed if the main thread is busy (e.g. StreamsRepo).
-        for delay in [0.04, 0.12, 0.25, 0.45, 1.0] {
-            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
-                if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
-                    TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
-                    focusedCardID = target
+
+        if waitForDetailsDisappearance {
+            // The Details view is still mounted at this point. Its actual
+            // onDisappear callback will issue the first focus request that
+            // tvOS can commit; timer writes here only create a visible delay.
+            TVHomeDebugTrace.log("home.restoreOverlayFocus waiting for details.disappear")
+        } else {
+            focusedCardID = target
+            // Visible menus do not have a Details transition to wait for, so
+            // retain their short retry window.
+            for delay in [0.04, 0.12, 0.25, 0.45] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+                        TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
+                        focusedCardID = target
+                    }
                 }
             }
         }
-        // Safety fallback: the lock MUST survive the entire Details exit
-        // transition including details.disappear (ZStack re-layout). On a
-        // busy main thread this can take well over 1s. Use a generous timeout
-        // so the lock is still active when tvOS re-evaluates focus geometry
-        // after removing DetailsScreen; completeOverlayFocusRestore is the
-        // normal (fast) cleanup path once the target card confirms focus.
+
+        // Safety fallback if the lifecycle callback is lost. Normally the
+        // target card's focus callback clears the lock much earlier.
         DispatchQueue.main.asyncAfter(deadline: .now() + 3.0) {
             if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
                 TVHomeDebugTrace.log("home.restoreOverlayFocus safety cleanup target=\(target)")
+                if waitForDetailsDisappearance {
+                    focusedCardID = target
+                }
                 overlayRestoreCardID = nil
                 if focusWork.restoringOverlayCardID == target {
                     focusWork.restoringOverlayCardID = nil
@@ -4365,6 +4452,18 @@ struct TVHomeView: View {
         let generation = continueWatchingRefreshGeneration
         let profileID = ContinueWatchingStore.activeProfileId
         let source = selectedProgressSource
+        let isSimklRefresh = source == .simkl
+
+        if isSimklRefresh {
+            beginSimklHomeLoadingDiagnostic(generation: generation)
+        } else {
+            finishSimklHomeLoadingDiagnostic()
+        }
+        defer {
+            if isSimklRefresh, generation == continueWatchingRefreshGeneration {
+                finishSimklHomeLoadingDiagnostic()
+            }
+        }
 
         #if DEBUG
         print("[ContinueWatching] Refresh \(generation) started source=\(source.rawValue) profile=\(profileID ?? "none")")
@@ -5569,13 +5668,16 @@ private struct TVCatalogRow: View {
     /// Off-window rows stay mounted to preserve decoded artwork, but do not
     /// contribute cards to the tvOS focus graph.
     var allowsFocus: Bool = true
-    var entryLocked: Bool = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (NuvioMeta) -> Void
     let onBlur: (NuvioMeta) -> Void
     let onApproachEnd: (NuvioMeta) -> Void
     let onSelect: (NuvioMeta) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
+    var onOpenDetails: ((NuvioMeta) -> Void)? = nil
+    var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
+    var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
+    var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
 
     // Nil means this row was just remounted: render from the cached index on its
     // very first frame instead of briefly drawing at zero. That first-frame jump
@@ -5766,6 +5868,16 @@ private struct TVCatalogRow: View {
                         externalFocus: externalFocus,
                         externalFocusValue: cardKey,
                         onLongPress: onLongPress,
+                        onOpenDetails: onOpenDetails != nil ? { onOpenDetails?(item) } : nil,
+                        onPlayManually: (id == TVHomeSection.continueWatchingId && progressItem != nil) ? {
+                            if let p = progressItem { onPlayContinueWatchingManually?(p) }
+                        } : nil,
+                        onStartFromBeginning: (id == TVHomeSection.continueWatchingId && progressItem != nil) ? {
+                            if let p = progressItem { onStartContinueWatchingFromBeginning?(p) }
+                        } : nil,
+                        onRemoveFromContinueWatching: (id == TVHomeSection.continueWatchingId && progressItem != nil) ? {
+                            if let p = progressItem { onRemoveFromContinueWatching?(p) }
+                        } : nil,
                         layoutMode: rowHomeLayout,
                         showPosterLabels: rowPosterLabels,
                         smoothFocusAnimations: rowCardFocusAnimations,
@@ -5777,10 +5889,7 @@ private struct TVCatalogRow: View {
                         onSelect(item)
                     }
                     .equatable()
-                    .disabled(
-                        (restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
-                        || (entryLocked && itemIndex != effectiveScrollIndex)
-                    )
+                    .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
                 }
             }
             .padding(.leading, CGFloat(materializedIndices.first ?? 0) * (rowPosterWidth + rowCardSpacing))
@@ -5828,11 +5937,16 @@ private struct TVCatalogRow: View {
     }
 }
 
+// CRITICAL PERFORMANCE INVARIANT: Do NOT pass active-row state (such as
+// `focusedRowIndex != index`) or intra-row focus state into this row or evaluate
+// it in `==`. Rows MUST remain completely memoized across focus transitions so
+// SwiftUI skips re-evaluating unaffected shelves (a 90%+ diffing reduction).
 extension TVCatalogRow: Equatable {
     static func == (lhs: TVCatalogRow, rhs: TVCatalogRow) -> Bool {
         let lhsTargetInRow = lhs.restrictFocusToCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
         let rhsTargetInRow = rhs.restrictFocusToCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
-        let restrictEqual = (lhsTargetInRow == rhsTargetInRow)
+        let restrictEqual = (lhs.restrictFocusToCardKey != nil) == (rhs.restrictFocusToCardKey != nil)
+            && (lhsTargetInRow == rhsTargetInRow)
             && (!lhsTargetInRow || lhs.restrictFocusToCardKey == rhs.restrictFocusToCardKey)
 
         let lhsRetainInRow = lhs.retainFocusAppearanceForCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
@@ -5852,7 +5966,6 @@ extension TVCatalogRow: Equatable {
             && retainEqual
             && lhs.suppressFocusAnimations == rhs.suppressFocusAnimations
             && lhs.allowsFocus == rhs.allowsFocus
-            && lhs.entryLocked == rhs.entryLocked
     }
 }
 
@@ -6247,7 +6360,6 @@ private struct TVCollectionFolderRow: View {
     var retainFocusAppearanceForCardKey: String? = nil
     var suppressFocusAnimations = false
     var allowsFocus = true
-    var entryLocked = false
     let onInitialFocusRequested: () -> Void
     let onFocus: (TVCollectionFolderItem) -> Void
     let onSelect: (TVCollectionFolderItem) -> Void
@@ -6388,10 +6500,7 @@ private struct TVCollectionFolderRow: View {
                         allowsFocus: allowsFocus,
                         onSelect: { onSelect(folder) }
                     )
-                    .disabled(
-                        (restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
-                        || (entryLocked && index != scrollIndex)
-                    )
+                    .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey)
                 }
             }
             .padding(
@@ -6420,11 +6529,16 @@ private struct TVCollectionFolderRow: View {
     }
 }
 
+// CRITICAL PERFORMANCE INVARIANT: Do NOT pass active-row state (such as
+// `focusedRowIndex != index`) or intra-row focus state into this row or evaluate
+// it in `==`. Rows MUST remain completely memoized across focus transitions so
+// SwiftUI skips re-evaluating unaffected shelves (a 90%+ diffing reduction).
 extension TVCollectionFolderRow: Equatable {
     static func == (lhs: TVCollectionFolderRow, rhs: TVCollectionFolderRow) -> Bool {
         let lhsTargetInRow = lhs.restrictFocusToCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
         let rhsTargetInRow = rhs.restrictFocusToCardKey?.hasPrefix("\(rhs.id)\u{1}") == true
-        let restrictEqual = (lhsTargetInRow == rhsTargetInRow)
+        let restrictEqual = (lhs.restrictFocusToCardKey != nil) == (rhs.restrictFocusToCardKey != nil)
+            && (lhsTargetInRow == rhsTargetInRow)
             && (!lhsTargetInRow || lhs.restrictFocusToCardKey == rhs.restrictFocusToCardKey)
 
         let lhsRetainInRow = lhs.retainFocusAppearanceForCardKey?.hasPrefix("\(lhs.id)\u{1}") == true
@@ -6442,7 +6556,6 @@ extension TVCollectionFolderRow: Equatable {
             && retainEqual
             && lhs.suppressFocusAnimations == rhs.suppressFocusAnimations
             && lhs.allowsFocus == rhs.allowsFocus
-            && lhs.entryLocked == rhs.entryLocked
     }
 }
 
@@ -7261,7 +7374,7 @@ struct CollectionFolderBrowseView: View {
             returning: [CollectionFolderSourceLoad].self
         ) { group in
             for (index, source) in sources.enumerated() {
-                group.addTask {
+                group.addTask { @MainActor [repository] in
                     do {
                         let page = try await CollectionSourceResolver(repository: repository)
                             .browse(source)
@@ -7799,10 +7912,9 @@ private struct CollectionFolderResultCard: View {
         .focused($focused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: meta.id))
         .focusEffectDisabledIfAvailable()
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                onLongPress?()
-            }
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: action
         )
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: focused)
         .zIndex(focused ? 1 : 0)

@@ -569,6 +569,10 @@ private struct ProductionBrowseCard: View {
         .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
         .focusEffectDisabledIfAvailable()
+        .titleActionsContextMenu(
+            meta: title.asMeta,
+            onOpenDetails: onSelect
+        )
         .scaleEffect(isFocused ? 1.06 : 1)
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: isFocused)
         .zIndex(isFocused ? 1 : 0)

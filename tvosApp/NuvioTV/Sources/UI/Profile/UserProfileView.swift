@@ -13,6 +13,7 @@ public struct UserProfileView: View {
     @FocusState private var focusedItem: String?
 
     private static let addProfileFocusId = "add_profile"
+    private static let retryFocusId = "retry_account_sync"
 
     public init(
         viewModel: ProfileViewModel,
@@ -56,13 +57,21 @@ public struct UserProfileView: View {
                     if let accountSyncError, let onRetryAccountSync {
                         Spacer().frame(height: 18)
                         HStack(spacing: 18) {
-                            Text(accountSyncError)
-                                .font(.custom("Inter-Regular", size: 20))
-                                .foregroundColor(.orange.opacity(0.9))
-                                .lineLimit(2)
+                            VStack(alignment: .leading, spacing: 6) {
+                                Text(accountSyncError)
+                                    .font(.custom("Inter-Regular", size: 20))
+                                    .foregroundColor(.orange.opacity(0.9))
+                                    .fixedSize(horizontal: false, vertical: true)
+
+                                Text("Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data.")
+                                    .font(.custom("Inter-Regular", size: 16))
+                                    .foregroundColor(.white.opacity(0.72))
+                                    .fixedSize(horizontal: false, vertical: true)
+                            }
 
                             Button("Retry", action: onRetryAccountSync)
                                 .buttonStyle(.bordered)
+                                .focused($focusedItem, equals: Self.retryFocusId)
                         }
                         .frame(maxWidth: 900)
                     }
@@ -124,7 +133,23 @@ public struct UserProfileView: View {
                 }
             }
             .animation(.easeInOut(duration: 0.18), value: showingAddProfile)
-            .onAppear { AvatarCatalogStore.shared.loadIfNeeded() }
+            .onAppear {
+                AvatarCatalogStore.shared.loadIfNeeded()
+                focusRetryIfNeeded()
+            }
+            .onChange(of: accountSyncError) { _, _ in
+                focusRetryIfNeeded()
+            }
+        }
+    }
+
+    private func focusRetryIfNeeded() {
+        guard accountSyncError != nil, onRetryAccountSync != nil else { return }
+        // The profile cards are the only other focusable controls on this
+        // screen. Explicitly target Retry when the account bootstrap fails so
+        // the Siri Remote can activate recovery even when the cards are empty.
+        DispatchQueue.main.async {
+            focusedItem = Self.retryFocusId
         }
     }
 

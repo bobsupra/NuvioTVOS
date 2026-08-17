@@ -3865,6 +3865,186 @@ enum LargePayloadStore {
     }
 }
 
+/// An in-memory, pre-indexed lookup snapshot for watched history.
+/// Precalculates hash sets and dictionaries so UI elements (like `WatchedCheckmarkBadge`)
+/// can query watched status in O(1) time with 0 JSON decodes and 0 disk I/O.
+struct WatchedSnapshot {
+    let source: TraktWatchProgressSource
+    let visibleItems: [WatchedStoreItem]
+
+    /// Keyed by "\(type)|\(identityKey)" so series and movies with overlapping IDs cannot collide.
+    let wholeTitleIdentityKeysByType: [String: Set<String>]
+    /// Set of all catalog title keys (e.g. "series\u{1f}imdb:tt1234567")
+    let wholeTitleCatalogIdentityKeys: Set<String>
+    /// Whole title meta IDs (lowercased) keyed by normalized type: [type: Set<metaId.lowercased()>]
+    let wholeTitleMetaIdsByType: [String: Set<String>]
+    /// Series year entries keyed by normalized title: [normalizedTitle: [year: Int?]]
+    let wholeTitleSeriesByNormalizedTitle: [String: [Int?]]
+
+    /// Episode keys ("\(season):\(episode)") keyed by "\(type)|\(identityKey)"
+    let episodeKeysByIdentityKey: [String: Set<String>]
+    /// Episode keys keyed by meta ID (lowercased): [metaId.lowercased(): Set<"season:episode">]
+    let episodeKeysByMetaId: [String: Set<String>]
+    /// Episode keys grouped by normalized series title and year
+    let episodeKeysBySeriesTitle: [String: [(year: Int?, keys: Set<String>)]]
+
+    init(items: [WatchedStoreItem], source: TraktWatchProgressSource) {
+        self.source = source
+        let visible = items.filter { $0.isVisible(under: source) }
+        self.visibleItems = visible
+
+        var wholeTitleKeysByType: [String: Set<String>] = [:]
+        var wholeTitleCatalogKeys = Set<String>()
+        var metaIdsByType: [String: Set<String>] = [:]
+        var seriesByNormalizedTitle: [String: [Int?]] = [:]
+
+        var epByIdentity: [String: Set<String>] = [:]
+        var epByMetaId: [String: Set<String>] = [:]
+        var epBySeriesTitle: [String: [(year: Int?, keys: Set<String>)]] = [:]
+
+        for item in visible {
+            let type = WatchedStore.normalizedType(item.meta.type)
+            let isEpisode = item.season != nil && item.episode != nil
+
+            if !isEpisode {
+                let contentKeys = WatchedStore.contentIdentityKeys(for: item.meta)
+                for key in contentKeys {
+                    let typeKey = "\(type)|\(key)"
+                    wholeTitleKeysByType[type, default: []].insert(typeKey)
+                }
+                wholeTitleCatalogKeys.formUnion(WatchedStore.catalogTitleIdentityKeys(for: item.meta))
+
+                let lowerId = item.meta.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !lowerId.isEmpty {
+                    metaIdsByType[type, default: []].insert(lowerId)
+                }
+
+                if type == "series" {
+                    let normTitle = WatchedStore.normalizedCatalogTitle(item.meta.name)
+                    if !normTitle.isEmpty {
+                        seriesByNormalizedTitle[normTitle, default: []].append(item.meta.year)
+                    }
+                }
+            } else if let season = item.season, let episode = item.episode {
+                let epKey = "\(season):\(episode)"
+                let lowerId = item.meta.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if !lowerId.isEmpty {
+                    epByMetaId[lowerId, default: []].insert(epKey)
+                }
+
+                let contentKeys = WatchedStore.contentIdentityKeys(for: item.meta)
+                for key in contentKeys {
+                    let typeKey = "\(type)|\(key)"
+                    epByIdentity[typeKey, default: []].insert(epKey)
+                }
+
+                if type == "series" {
+                    let normTitle = WatchedStore.normalizedCatalogTitle(item.meta.name)
+                    if !normTitle.isEmpty {
+                        let year = item.meta.year
+                        if var existing = epBySeriesTitle[normTitle] {
+                            if let idx = existing.firstIndex(where: { $0.year == year }) {
+                                existing[idx].keys.insert(epKey)
+                            } else {
+                                existing.append((year: year, keys: [epKey]))
+                            }
+                            epBySeriesTitle[normTitle] = existing
+                        } else {
+                            epBySeriesTitle[normTitle] = [(year: year, keys: [epKey])]
+                        }
+                    }
+                }
+            }
+        }
+
+        self.wholeTitleIdentityKeysByType = wholeTitleKeysByType
+        self.wholeTitleCatalogIdentityKeys = wholeTitleCatalogKeys
+        self.wholeTitleMetaIdsByType = metaIdsByType
+        self.wholeTitleSeriesByNormalizedTitle = seriesByNormalizedTitle
+        self.episodeKeysByIdentityKey = epByIdentity
+        self.episodeKeysByMetaId = epByMetaId
+        self.episodeKeysBySeriesTitle = epBySeriesTitle
+    }
+
+    func contains(metaId: String, type: String) -> Bool {
+        let normType = WatchedStore.normalizedType(type)
+        let lowerId = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return wholeTitleMetaIdsByType[normType]?.contains(lowerId) ?? false
+    }
+
+    func contains(meta: NuvioMeta) -> Bool {
+        let type = WatchedStore.normalizedType(meta.type)
+        guard let storedKeys = wholeTitleIdentityKeysByType[type], !storedKeys.isEmpty else {
+            return false
+        }
+        let contentKeys = WatchedStore.contentIdentityKeys(for: meta)
+        return contentKeys.contains { storedKeys.contains("\(type)|\($0)") }
+    }
+
+    func containsCatalogTitle(meta: NuvioMeta) -> Bool {
+        if contains(meta: meta) { return true }
+        guard WatchedStore.normalizedType(meta.type) == "series" else { return false }
+        let normTitle = WatchedStore.normalizedCatalogTitle(meta.name)
+        guard !normTitle.isEmpty, let years = wholeTitleSeriesByNormalizedTitle[normTitle] else {
+            return false
+        }
+        if let targetYear = meta.year {
+            return years.contains { $0 == nil || $0 == targetYear }
+        }
+        return true
+    }
+
+    func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {
+        let lowerId = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return episodeKeysByMetaId[lowerId]?.contains("\(season):\(episode)") ?? false
+    }
+
+    func containsEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
+        let type = WatchedStore.normalizedType(meta.type)
+        let targetEpKey = "\(season):\(episode)"
+        let contentKeys = WatchedStore.contentIdentityKeys(for: meta)
+        return contentKeys.contains { key in
+            episodeKeysByIdentityKey["\(type)|\(key)"]?.contains(targetEpKey) ?? false
+        }
+    }
+
+    func watchedEpisodeKeys(metaId: String) -> Set<String> {
+        let lowerId = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return episodeKeysByMetaId[lowerId] ?? []
+    }
+
+    func watchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
+        let type = WatchedStore.normalizedType(meta.type)
+        let contentKeys = WatchedStore.contentIdentityKeys(for: meta)
+        var result = Set<String>()
+        for key in contentKeys {
+            if let matched = episodeKeysByIdentityKey["\(type)|\(key)"] {
+                result.formUnion(matched)
+            }
+        }
+        return result
+    }
+
+    func catalogWatchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
+        var result = watchedEpisodeKeys(meta: meta)
+        guard WatchedStore.normalizedType(meta.type) == "series" else { return result }
+        let normTitle = WatchedStore.normalizedCatalogTitle(meta.name)
+        guard !normTitle.isEmpty, let seriesEntries = episodeKeysBySeriesTitle[normTitle] else {
+            return result
+        }
+        for entry in seriesEntries {
+            if let targetYear = meta.year, let entryYear = entry.year {
+                if targetYear == entryYear {
+                    result.formUnion(entry.keys)
+                }
+            } else {
+                result.formUnion(entry.keys)
+            }
+        }
+        return result
+    }
+}
+
 enum WatchedStore {
     static let changedNotification = Notification.Name("nuvio.tv.watched.changed")
 
@@ -3875,6 +4055,14 @@ enum WatchedStore {
     /// Last durable-storage result, for diagnostics on physical devices where
     /// Application Support writes can fail while Simulator succeeds.
     static private(set) var persistenceDiagnostic = "not attempted"
+
+    private static let cacheLock = NSRecursiveLock()
+    private static var cachedItems: [WatchedStoreItem]?
+    private static var cachedKey: String?
+    private static var cachedData: Data?
+    private static var cachedSnapshot: WatchedSnapshot?
+    private static var cachedSource: TraktWatchProgressSource?
+    private static var cacheGeneration = 0
 
     private enum PersistenceError: LocalizedError {
         case storageUnavailable(String)
@@ -3891,9 +4079,94 @@ enum WatchedStore {
     }
 
     static func setActiveProfile(_ profileId: String?) {
+        cacheLock.lock()
+        let changed = (activeProfileId != profileId)
         activeProfileId = profileId
+        if changed {
+            invalidateCacheLocked()
+        }
+        cacheLock.unlock()
+
+        warmup(profileId: profileId)
         migrateSourcesIfNeeded()
         NotificationCenter.default.post(name: changedNotification, object: nil)
+    }
+
+    static func invalidateCache() {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        invalidateCacheLocked()
+    }
+
+    private static func invalidateCacheLocked() {
+        cacheGeneration &+= 1
+        cachedItems = nil
+        cachedKey = nil
+        cachedData = nil
+        cachedSnapshot = nil
+        cachedSource = nil
+    }
+
+    /// Pre-warms the in-memory cache in the background off the main actor.
+    static func warmup(profileId: String? = nil) {
+        let state = warmupState(profileId: profileId)
+        Task.detached(priority: .userInitiated) {
+            guard !state.isAlreadyCached else { return }
+            guard let data = readData(forKey: state.key) else { return }
+
+            let decodeStart = DispatchTime.now()
+            if let decoded = try? makeDecoder().decode([WatchedStoreItem].self, from: data)
+                .sorted(by: { $0.watchedAt > $1.watchedAt }) {
+                let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - decodeStart.uptimeNanoseconds) / 1_000_000.0
+                print("[WatchedStore] Background warmed \(decoded.count) items (\(data.count) bytes) in \(String(format: "%.2f", elapsedMs))ms for profile: \(state.profileId ?? "default")")
+                installWarmedItems(
+                    decoded,
+                    data: data,
+                    profileId: state.profileId,
+                    key: state.key,
+                    generation: state.generation
+                )
+            }
+        }
+    }
+
+    private struct WarmupState {
+        let profileId: String?
+        let key: String
+        let generation: Int
+        let isAlreadyCached: Bool
+    }
+
+    private static func warmupState(profileId: String?) -> WarmupState {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        let targetProfile = profileId ?? activeProfileId
+        let key = storageKey(for: targetProfile)
+        return WarmupState(
+            profileId: targetProfile,
+            key: key,
+            generation: cacheGeneration,
+            isAlreadyCached: cachedKey == key && cachedItems != nil
+        )
+    }
+
+    private static func installWarmedItems(
+        _ items: [WatchedStoreItem],
+        data: Data,
+        profileId: String?,
+        key: String,
+        generation: Int
+    ) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        guard activeProfileId == profileId, cacheGeneration == generation else { return }
+        guard cachedKey != key || cachedItems == nil else { return }
+        cachedItems = items
+        cachedKey = key
+        cachedData = data
+        cachedSnapshot = nil
     }
 
     /// Attributes rows written before `sources` existed.
@@ -3938,44 +4211,82 @@ enum WatchedStore {
     }
 
     static func items() -> [WatchedStoreItem] {
-        guard let data = readData(forKey: storageKey) else { return [] }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return itemsLocked()
+    }
+
+    private static func itemsLocked() -> [WatchedStoreItem] {
+        let key = storageKey
+        if cachedKey == key, let cachedItems {
+            return cachedItems
+        }
+        guard let data = readData(forKey: key) else {
+            cachedItems = []
+            cachedKey = key
+            cachedData = nil
+            cachedSnapshot = nil
+            return []
+        }
+        let decodeStart = DispatchTime.now()
         do {
-            return try makeDecoder().decode([WatchedStoreItem].self, from: data)
+            let decoded = try makeDecoder().decode([WatchedStoreItem].self, from: data)
                 .sorted { $0.watchedAt > $1.watchedAt }
+            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - decodeStart.uptimeNanoseconds) / 1_000_000.0
+            print("[WatchedStore] Decoded \(decoded.count) items (\(data.count) bytes) in \(String(format: "%.2f", elapsedMs))ms for profile: \(activeProfileId ?? "default")")
+            cachedItems = decoded
+            cachedKey = key
+            cachedData = data
+            cachedSnapshot = nil
+            return decoded
         } catch {
             // Keep the payload intact so a later successful write can replace
             // it; silent decode-to-empty would wipe history on the next mark.
             persistenceDiagnostic = "decode failed: \(diagnosticText(for: error))"
+            print("[WatchedStore] Decode failed for \(key): \(error.localizedDescription)")
             return []
         }
+    }
+
+    /// Precomputed indexed lookup snapshot for O(1) queries.
+    static func currentSnapshot() -> WatchedSnapshot {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        let key = storageKey
+        let currentSource = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+
+        if cachedKey == key,
+           let snapshot = cachedSnapshot,
+           cachedSource == currentSource {
+            return snapshot
+        }
+
+        let allItems = itemsLocked()
+        let snapshot = WatchedSnapshot(items: allItems, source: currentSource)
+        cachedSnapshot = snapshot
+        cachedSource = currentSource
+        return snapshot
     }
 
     /// Whole-title watched state (movies, or a series marked watched
     /// explicitly). Episode-level entries deliberately don't count here so one
     /// finished episode doesn't checkmark the whole series poster.
     static func contains(metaId: String, type: String) -> Bool {
-        visibleItems().contains {
-            $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
-                && $0.meta.type.caseInsensitiveCompare(type) == .orderedSame
-                && $0.season == nil && $0.episode == nil
-        }
+        currentSnapshot().contains(metaId: metaId, type: type)
     }
 
     /// Rows the selected backend actually has — which is what every "is this
     /// watched?" question in the UI means. ``items()`` stays the full local
     /// union, because sync pushes and history transfers work from that.
     static func visibleItems() -> [WatchedStoreItem] {
-        let source = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
-        return items().filter { $0.isVisible(under: source) }
+        currentSnapshot().visibleItems
     }
 
     /// Alias-aware keys for catalog badges. A Trakt IMDb row and a TMDB-backed
     /// catalog preview for the same title must resolve to the same checkmark.
     static func visibleWholeTitleIdentityKeys() -> Set<String> {
-        Set(visibleItems().flatMap { item -> [String] in
-            guard item.season == nil, item.episode == nil else { return [] }
-            return Array(catalogTitleIdentityKeys(for: item.meta))
-        })
+        currentSnapshot().wholeTitleCatalogIdentityKeys
     }
 
     static func catalogTitleIdentityKeys(for meta: NuvioMeta) -> Set<String> {
@@ -3984,56 +4295,32 @@ enum WatchedStore {
     }
 
     static func contains(meta: NuvioMeta) -> Bool {
-        visibleItems().contains {
-            sameContent($0.meta, meta) && $0.season == nil && $0.episode == nil
-        }
+        currentSnapshot().contains(meta: meta)
     }
 
     /// Catalog cards can use a provider-local id while the watched marker was
     /// saved from the canonical Details response. Fall back to the normalized
     /// series title/year in that case so the portrait checkmark still appears.
     static func containsCatalogTitle(meta: NuvioMeta) -> Bool {
-        visibleItems().contains {
-            guard $0.season == nil, $0.episode == nil else { return false }
-            return sameContent($0.meta, meta) || sameCatalogSeriesTitle($0.meta, meta)
-        }
+        currentSnapshot().containsCatalogTitle(meta: meta)
     }
 
     static func containsEpisode(metaId: String, season: Int, episode: Int) -> Bool {
-        visibleItems().contains {
-            $0.meta.id.caseInsensitiveCompare(metaId) == .orderedSame
-                && $0.season == season && $0.episode == episode
-        }
+        currentSnapshot().containsEpisode(metaId: metaId, season: season, episode: episode)
     }
 
     static func containsEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
-        visibleItems().contains {
-            sameContent($0.meta, meta) && $0.season == season && $0.episode == episode
-        }
+        currentSnapshot().containsEpisode(meta: meta, season: season, episode: episode)
     }
 
     /// "season:episode" keys of every watched episode of a series, for the
     /// Details episode strip.
     static func watchedEpisodeKeys(metaId: String) -> Set<String> {
-        Set(visibleItems().compactMap { item in
-            guard item.meta.id.caseInsensitiveCompare(metaId) == .orderedSame,
-                  let season = item.season,
-                  let episode = item.episode else {
-                return nil
-            }
-            return "\(season):\(episode)"
-        })
+        currentSnapshot().watchedEpisodeKeys(metaId: metaId)
     }
 
     static func watchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
-        Set(visibleItems().compactMap { item in
-            guard sameContent(item.meta, meta),
-                  let season = item.season,
-                  let episode = item.episode else {
-                return nil
-            }
-            return "\(season):\(episode)"
-        })
+        currentSnapshot().watchedEpisodeKeys(meta: meta)
     }
 
     /// Episode keys for a catalog badge. Some add-ons return a provider-local
@@ -4041,14 +4328,7 @@ enum WatchedStore {
     /// show by its canonical id. Prefer normal id matching, then allow an exact
     /// normalized title match when the years do not conflict.
     static func catalogWatchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
-        Set(visibleItems().compactMap { item in
-            guard let season = item.season,
-                  let episode = item.episode,
-                  sameContent(item.meta, meta) || sameCatalogSeriesTitle(item.meta, meta) else {
-                return nil
-            }
-            return "\(season):\(episode)"
-        })
+        currentSnapshot().catalogWatchedEpisodeKeys(meta: meta)
     }
 
     /// Toggles whole-title watched state and returns the **actual** persisted
@@ -4670,7 +4950,7 @@ enum WatchedStore {
         return true
     }
 
-    private static func normalizedCatalogTitle(_ title: String) -> String {
+    static func normalizedCatalogTitle(_ title: String) -> String {
         title.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
             .filter { $0.isLetter || $0.isNumber }
     }
@@ -4767,11 +5047,11 @@ enum WatchedStore {
 
     private static let identityTrimmingCharacters = CharacterSet.whitespacesAndNewlines
 
-    private static func contentIdentityKeys(for meta: NuvioMeta) -> Set<String> {
+    static func contentIdentityKeys(for meta: NuvioMeta) -> Set<String> {
         contentIdentityKeys(metaId: meta.id, imdbId: meta.imdbId, tmdbId: meta.tmdbId)
     }
 
-    private static func contentIdentityKeys(
+    static func contentIdentityKeys(
         metaId: String,
         imdbId: String?,
         tmdbId: Int?
@@ -4797,7 +5077,7 @@ enum WatchedStore {
         return keys
     }
 
-    private static func normalizedType(_ type: String) -> String {
+    static func normalizedType(_ type: String) -> String {
         switch type.lowercased() {
         case "series", "tv", "show", "tvshow": return "series"
         default: return type.lowercased()
@@ -4999,19 +5279,39 @@ enum WatchedStore {
 
     @discardableResult
     private static func persist(_ items: [WatchedStoreItem]) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+
+        let encodeStart = DispatchTime.now()
         let data: Data
         do {
             data = try makeEncoder().encode(items)
         } catch {
             persistenceDiagnostic = "encode failed: \(diagnosticText(for: error))"
-            print("Nuvio watched storage encode failed: \(error.localizedDescription)")
+            print("[WatchedStore] Watched storage encode failed: \(error.localizedDescription)")
             return false
         }
+        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - encodeStart.uptimeNanoseconds) / 1_000_000.0
 
-        let saved = writeData(data, forKey: storageKey, verify: { payload in
+        let key = storageKey
+        if cachedKey == key, let cachedData, cachedData == data {
+            return true
+        }
+
+        let saved = writeData(data, forKey: key, verify: { payload in
             _ = try makeDecoder().decode([WatchedStoreItem].self, from: payload)
         })
         guard saved else { return false }
+
+        let sorted = items.sorted { $0.watchedAt > $1.watchedAt }
+        cacheGeneration &+= 1
+        cachedItems = sorted
+        cachedKey = key
+        cachedData = data
+        cachedSnapshot = nil
+        persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
+        print("[WatchedStore] Saved \(items.count) items (\(data.count) bytes, encoded in \(String(format: "%.2f", elapsedMs))ms)")
+
         NotificationCenter.default.post(name: changedNotification, object: nil)
         return true
     }
@@ -5046,6 +5346,7 @@ enum WatchedStore {
     /// (tests, in particular, which run inside the app's own container and so
     /// share these files with a real install) must use this instead.
     static func eraseProfile(_ profileId: String) {
+        invalidateCache()
         let keys = [storageKey(for: profileId), tombstoneStorageKey(for: profileId)]
         for key in keys {
             UserDefaults.standard.removeObject(forKey: key)
@@ -5062,6 +5363,7 @@ enum WatchedStore {
     /// Deletes every profile's watched marks and tombstones (the tombstone keys
     /// share `baseKey` as their prefix) on sign-out.
     static func eraseAllProfiles() {
+        invalidateCache()
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys
             .filter { $0.hasPrefix(baseKey) }

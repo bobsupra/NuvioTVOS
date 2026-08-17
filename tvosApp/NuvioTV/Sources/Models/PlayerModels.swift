@@ -159,6 +159,18 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     /// Every option's display label, in the order shown in Settings.
     static var settingsOptions: [String] { allCases.map(\.rawValue) }
 
+    /// System SF Symbol icon name for the player option.
+    var systemImage: String {
+        switch self {
+        case .builtIn: return "play.tv.fill"
+        case .infuse: return "play.circle.fill"
+        case .vlc: return "cone.fill"
+        case .outplayer: return "arrow.up.right.video.fill"
+        case .nplayer: return "play.rectangle.fill"
+        case .vidhub: return "play.square.fill"
+        }
+    }
+
     /// Resolve a stored setting value, defaulting to the built-in player.
     static func from(_ rawValue: String?) -> ExternalPlayer {
         guard let rawValue, let player = ExternalPlayer(rawValue: rawValue) else { return .builtIn }

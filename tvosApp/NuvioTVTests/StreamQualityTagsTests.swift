@@ -178,5 +178,35 @@ final class StreamQualityTagsTests: XCTestCase {
         XCTAssertNotNil(infuse)
         XCTAssertTrue(infuse!.absoluteString.contains("sub="))
         XCTAssertTrue(infuse!.absoluteString.contains("infuse://"))
+
+        let vlc = ExternalPlayer.vlc.launchURL(for: stream, subtitleURLs: [sub])
+        XCTAssertNotNil(vlc)
+        XCTAssertTrue(vlc!.absoluteString.contains("vlc-x-callback://"))
+        XCTAssertTrue(vlc!.absoluteString.contains("sub="))
+
+        let outplayer = ExternalPlayer.outplayer.launchURL(for: stream)
+        XCTAssertNotNil(outplayer)
+        XCTAssertTrue(outplayer!.absoluteString.starts(with: "outplayer://"))
+
+        let nplayer = ExternalPlayer.nplayer.launchURL(for: stream)
+        XCTAssertNotNil(nplayer)
+        XCTAssertTrue(nplayer!.absoluteString.starts(with: "nplayer-https://"))
+
+        let vidhub = ExternalPlayer.vidhub.launchURL(for: stream)
+        XCTAssertNotNil(vidhub)
+        XCTAssertTrue(vidhub!.absoluteString.starts(with: "vidhub://"))
+
+        let builtIn = ExternalPlayer.builtIn.launchURL(for: stream)
+        XCTAssertNil(builtIn)
+    }
+
+    func testExternalPlayerSystemImagesAndLabels() {
+        for player in ExternalPlayer.allCases {
+            XCTAssertFalse(player.systemImage.isEmpty)
+            XCTAssertFalse(player.rawValue.isEmpty)
+            XCTAssertEqual(ExternalPlayer.from(player.rawValue), player)
+        }
+        XCTAssertEqual(ExternalPlayer.from("Unknown"), .builtIn)
+        XCTAssertEqual(ExternalPlayer.from(nil), .builtIn)
     }
 }

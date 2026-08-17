@@ -46,20 +46,19 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.2.8** is the latest tvOS release.
+**Beta 3.2.9** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.8/NuvioTV-3.2.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.9/NuvioTV-3.2.9-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.9) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.2.8
+### New in Beta 3.2.9
 
-- Eliminates Home vertical scrolling lag and optimizes view rendering with `Equatable` conformances and deferred secondary Details screen enrichment.
-- Adds iCloud Settings Sync to synchronize themes, player preferences, and integration keys across Apple TVs on the same iCloud account.
-- Enhances Simkl integration with Keychain token mirroring for iCloud multi-device sync and concurrent Continue Watching metadata resolution.
-- Updates AetherEngine to 6.21.0 and FFmpegBuild to 2.4.2 with live HLS rotation, subtitle delivery & proxying, PGS palette recovery, and backend-selected subtitle preference preservation.
-- Enriches catalog and search results with full metadata, Stremio logos, and debounced instant loading state.
+- Adds native SMB network file sharing and Jellyfin server streaming with intelligent filename parsing and credential management (**Settings → Integrations → Local Servers**).
+- Refactors PosterCard into modular components with unified badge overlays, progress bars, and smoother focus styling.
+- Hardens Simkl authentication, token refresh lifecycle, and Nuvio sync error handling.
+- Strengthens stream quality tag parsing for 4K UHD, HDR10+, Dolby Vision, Dolby Atmos, and IMAX Enhanced.
 
 ### The new player
 

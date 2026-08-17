@@ -15,7 +15,7 @@ struct DetailsScreen: View {
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
     /// The last two carry series context for the player's next-episode auto-play;
     /// both are empty/nil for movies and trailers.
-    let onPlayClick: (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void
+    let onPlayClick: (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?) -> Void
     let onBack: () -> Void
     /// Open another title (More Like This / production catalog).
     var onOpenTitle: ((String, String) -> Void)? = nil
@@ -64,7 +64,7 @@ struct DetailsScreen: View {
         initiallyPresentStreamPicker: Bool = false,
         initialStreamPickerEpisode: NuvioVideo? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
-        onPlayClick: @escaping (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo]) -> Void,
+        onPlayClick: @escaping (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?) -> Void,
         onBack: @escaping () -> Void,
         onOpenTitle: ((String, String) -> Void)? = nil,
         onOpenProduction: ((MetaCompany) -> Void)? = nil,
@@ -93,7 +93,7 @@ struct DetailsScreen: View {
                 ErrorView(
                     error: error,
                     onRetry: { viewModel.loadDetails(id: id, type: type) },
-                    onBack: onBack
+                    onBack: handleBack
                 )
             } else if viewModel.uiState.meta != nil {
                 #if os(tvOS)
@@ -147,7 +147,7 @@ struct DetailsScreen: View {
                     onCommentSelect: { comment in
                         expandedComment = comment
                     },
-                    onBack: onBack
+                    onBack: handleBack
                 )
                 // While the stream picker is open it sits on top as a full-screen
                 // overlay; disable the details content so the focus engine can't
@@ -159,13 +159,13 @@ struct DetailsScreen: View {
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
-                            onPlayClick(url, [:], meta, "", [], nil, [])
+                            onPlayClick(url, [:], meta, "", [], nil, [], nil)
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
                     onWatchedClick: { viewModel.toggleWatched() },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
-                    onBack: onBack
+                    onBack: handleBack
                 )
                 #endif
             }
@@ -200,8 +200,8 @@ struct DetailsScreen: View {
                     emptyReason: viewModel.uiState.streamsEmptyReason,
                     includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
                     isResolvingDebrid: isResolvingDebrid,
-                    onSelect: { stream in
-                        playStream(stream, meta: meta)
+                    onSelect: { stream, player in
+                        playStream(stream, meta: meta, player: player)
                     },
                     onDismiss: {
                         isStreamPickerPresented = false
@@ -228,7 +228,7 @@ struct DetailsScreen: View {
             } else if isStreamPickerPresented {
                 isStreamPickerPresented = false
             } else {
-                onBack()
+                handleBack()
             }
         }
         #endif
@@ -251,6 +251,15 @@ struct DetailsScreen: View {
             TVHomeDebugTrace.log("details.disappear id=\(id) type=\(type)")
             viewModel.cancelAllTasks()
         }
+    }
+
+    /// Stop Details work before asking the parent to remove this screen.
+    /// Waiting for onDisappear is too late: enrichment can still publish
+    /// updates while the opacity transition is trying to tear Details down.
+    private func handleBack() {
+        TVHomeDebugTrace.log("details.back.cancelTasks id=\(id)")
+        viewModel.cancelAllTasks()
+        onBack()
     }
 
     private func presentInitialStreamPickerIfNeeded() {
@@ -332,11 +341,11 @@ struct DetailsScreen: View {
     /// Plays a chosen stream. Direct URLs go straight to the player; torrent-only
     /// streams are resolved through the configured debrid provider first, keeping
     /// the picker's spinner up until a link comes back (or the attempt fails).
-    private func playStream(_ stream: NuvioStream, meta: NuvioMeta) {
+    private func playStream(_ stream: NuvioStream, meta: NuvioMeta, player: ExternalPlayer? = nil) {
         LastStreamQualityStore.save(metaId: meta.id, stream: stream)
         if let url = stream.url, !url.isEmpty {
             isStreamPickerPresented = false
-            onPlayClick(url, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
+            onPlayClick(url, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player)
             return
         }
 
@@ -351,7 +360,7 @@ struct DetailsScreen: View {
                 isResolvingDebrid = false
                 if case let .success(url, _, _)? = result {
                     isStreamPickerPresented = false
-                    onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta))
+                    onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player)
                 }
             }
         }
@@ -411,7 +420,7 @@ struct DetailsScreen: View {
             let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
 
             await MainActor.run {
-                onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [])
+                onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
             }
         }
     }
@@ -1633,6 +1642,7 @@ struct TvDetailsContent: View {
                                             }
                                         },
                                         onSelect: onEpisodeSelected,
+                                        onPlayManually: onEpisodePlayManually,
                                         onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
                                         episodeFocus: $episodeFocus,
                                         restrictFocusToKey: restoreEpisodeKey,
@@ -2212,10 +2222,17 @@ private struct TvDetailsActionButton: View {
     let onFocus: () -> Void
     var longPressAction: (() -> Void)? = nil
 
+    @State private var didTriggerLongPress = false
     private var isFocused: Bool { focus.wrappedValue == tag }
 
     var body: some View {
-        Button(action: action) {
+        Button(action: {
+            if didTriggerLongPress {
+                didTriggerLongPress = false
+                return
+            }
+            action()
+        }) {
             HStack(spacing: 16) {
                 Image(systemName: systemName)
                     .font(.system(size: isPrimary ? 30 : 36, weight: .bold))
@@ -2242,10 +2259,16 @@ private struct TvDetailsActionButton: View {
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
+            didTriggerLongPress = false
         }
         .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.55).onEnded { _ in
+            LongPressGesture(minimumDuration: 0.48).onEnded { _ in
+                guard longPressAction != nil else { return }
+                didTriggerLongPress = true
                 longPressAction?()
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    didTriggerLongPress = false
+                }
             }
         )
         .accessibilityElement(children: .ignore)
@@ -3088,6 +3111,7 @@ private struct TvDetailsEpisodes: View {
     let continueItem: ContinueWatchingItem?
     let onFocus: () -> Void
     let onSelect: (NuvioVideo) -> Void
+    var onPlayManually: ((NuvioVideo) -> Void)? = nil
     let onEpisodeMenuPresented: (Bool) -> Void
     var episodeFocus: FocusState<String?>.Binding
     /// While set, only the control with this key can take focus — see the
@@ -3101,6 +3125,7 @@ private struct TvDetailsEpisodes: View {
     @State private var episodeScrollIndex: Int
     @State private var watchedEpisodeKeys: Set<String>
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
+    @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
 
     init(
         meta: NuvioMeta,
@@ -3109,6 +3134,7 @@ private struct TvDetailsEpisodes: View {
         continueItem: ContinueWatchingItem?,
         onFocus: @escaping () -> Void,
         onSelect: @escaping (NuvioVideo) -> Void,
+        onPlayManually: ((NuvioVideo) -> Void)? = nil,
         onEpisodeMenuPresented: @escaping (Bool) -> Void,
         episodeFocus: FocusState<String?>.Binding,
         restrictFocusToKey: String?,
@@ -3122,6 +3148,7 @@ private struct TvDetailsEpisodes: View {
         self.continueItem = continueItem
         self.onFocus = onFocus
         self.onSelect = onSelect
+        self.onPlayManually = onPlayManually
         self.onEpisodeMenuPresented = onEpisodeMenuPresented
         self.episodeFocus = episodeFocus
         self.restrictFocusToKey = restrictFocusToKey
@@ -3193,6 +3220,8 @@ private struct TvDetailsEpisodes: View {
                         onMenuOpened: { onEpisodeMenuPresented(true) },
                         onMenuClosed: { onEpisodeMenuPresented(false) },
                         action: { onSelect(video) },
+                        onPlayManually: onPlayManually != nil ? { onPlayManually?(video) } : nil,
+                        smartStreamSelection: smartStreamSelection,
                         focus: episodeFocus,
                         restrictFocusToKey: effectiveFocusRestriction,
                         onMoveDown: onMoveDownFromEpisode
@@ -3402,6 +3431,8 @@ private struct TvEpisodeCard: View {
     let onMenuOpened: () -> Void
     let onMenuClosed: () -> Void
     let action: () -> Void
+    var onPlayManually: (() -> Void)? = nil
+    var smartStreamSelection: Bool = false
     var focus: FocusState<String?>.Binding
     let restrictFocusToKey: String?
     let onMoveDown: () -> Void
@@ -3518,6 +3549,17 @@ private struct TvEpisodeCard: View {
                 }
             )
             .contextMenu {
+                if smartStreamSelection, let onPlayManually {
+                    Button {
+                        performAfterMenuDismissal(onPlayManually)
+                    } label: {
+                        Label(
+                            "Choose Source Manually",
+                            systemImage: "list.bullet"
+                        )
+                    }
+                }
+
                 Button {
                     performAfterMenuDismissal(onToggleWatched)
                 } label: {
@@ -3794,7 +3836,7 @@ private struct TvStreamPickerOverlay: View {
     let includeDebrid: Bool
     /// A torrent stream is being turned into a playable link right now.
     let isResolvingDebrid: Bool
-    let onSelect: (NuvioStream) -> Void
+    let onSelect: (NuvioStream, ExternalPlayer?) -> Void
     let onDismiss: () -> Void
 
     /// Filter by stable add-on id (not display name).
@@ -4129,7 +4171,8 @@ private struct TvStreamPickerOverlay: View {
                                 presentation: streamCardPresentations[stream.id]
                                     ?? TvStreamCardPresentation(pending: badgeSettings),
                                 externalFocus: $focusedItem,
-                                action: { onSelect(stream) }
+                                action: { onSelect(stream, nil) },
+                                onSelectPlayer: { player in onSelect(stream, player) }
                             )
                         }
 
@@ -4385,6 +4428,7 @@ private struct TvStreamCard: View {
     private let showAddonLogo: Bool
     let externalFocus: FocusState<String?>.Binding
     let action: () -> Void
+    var onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
 
     /// Local focus drives appearance only for this card, so focus moves do not
     /// push `isFocused` through the parent ForEach for every sibling.
@@ -4398,7 +4442,8 @@ private struct TvStreamCard: View {
         stream: NuvioStream,
         presentation: TvStreamCardPresentation,
         externalFocus: FocusState<String?>.Binding,
-        action: @escaping () -> Void
+        action: @escaping () -> Void,
+        onSelectPlayer: ((ExternalPlayer) -> Void)? = nil
     ) {
         self.stream = stream
         self.importedBadges = presentation.importedBadges
@@ -4407,6 +4452,7 @@ private struct TvStreamCard: View {
         self.showAddonLogo = presentation.showAddonLogo
         self.externalFocus = externalFocus
         self.action = action
+        self.onSelectPlayer = onSelectPlayer
         let lines = Self.nameLines(for: stream)
         self.primaryName = lines.first ?? "Stream"
         let rest = lines.dropFirst().joined(separator: " ")
@@ -4501,9 +4547,22 @@ private struct TvStreamCard: View {
         .focusEffectDisabledIfAvailable()
         .scaleEffect(isFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
+        .contextMenu {
+            Section("Play with") {
+                ForEach(ExternalPlayer.allCases) { player in
+                    Button {
+                        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                            onSelectPlayer?(player)
+                        }
+                    } label: {
+                        Label(player.rawValue, systemImage: player.systemImage)
+                    }
+                }
+            }
+        }
     }
 
-    private static func nameLines(for stream: NuvioStream) -> [String] {
+    static func nameLines(for stream: NuvioStream) -> [String] {
         let raw = stream.name?.trimmingCharacters(in: .whitespacesAndNewlines)
         let lines = raw?
             .components(separatedBy: .newlines)

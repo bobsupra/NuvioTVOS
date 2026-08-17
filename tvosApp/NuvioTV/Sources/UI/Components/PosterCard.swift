@@ -43,8 +43,12 @@ struct PosterCard: View {
     var externalFocus: FocusState<String?>.Binding? = nil
     var externalFocusValue: String? = nil
     /// Fired when the card is held (Siri Remote select press-and-hold), to raise
-    /// the liquid-glass quick-actions menu. Nil disables the long-press.
+    /// the quick-actions menu. Nil disables the long-press.
     var onLongPress: ((NuvioMeta) -> Void)? = nil
+    var onOpenDetails: (() -> Void)? = nil
+    var onPlayManually: (() -> Void)? = nil
+    var onStartFromBeginning: (() -> Void)? = nil
+    var onRemoveFromContinueWatching: (() -> Void)? = nil
     var layoutMode: String = "Modern"
     var showPosterLabels: Bool = false
     var smoothFocusAnimations: Bool = true
@@ -77,21 +81,23 @@ struct PosterCard: View {
 
     var body: some View {
         #if os(tvOS)
-        posterContent
-            .contentShape(Rectangle())
-            .focusable(allowsFocus)
-            .focused($isFocused)
-            .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue ?? meta.id))
-            .nuvioFocusEffectDisabledIfAvailable()
-            .onTapGesture(perform: onClick)
-            // Press-and-hold the select button while the card is focused to
-            // raise the liquid-glass quick-actions menu. Kept simultaneous so
-            // a normal select still fires `onClick`.
-            .simultaneousGesture(
-                LongPressGesture(minimumDuration: 0.45).onEnded { _ in
-                    onLongPress?(meta)
-                }
-            )
+        Button(action: onClick) {
+            posterContent
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .disabled(!allowsFocus)
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: externalFocusValue ?? meta.id))
+        .nuvioFocusEffectDisabledIfAvailable()
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: onOpenDetails ?? onClick,
+            continueProgress: continueProgress,
+            continueIsUpNext: continueIsUpNext,
+            onPlayManually: onPlayManually,
+            onStartFromBeginning: onStartFromBeginning,
+            onRemoveFromContinueWatching: onRemoveFromContinueWatching
+        )
             .onChange(of: isFocused) { _, focused in
                 if focused {
                     TVHomeDebugTrace.log(
@@ -155,6 +161,15 @@ struct PosterCard: View {
             posterContent
         }
         .buttonStyle(PosterCardButtonStyle())
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: onOpenDetails ?? onClick,
+            continueProgress: continueProgress,
+            continueIsUpNext: continueIsUpNext,
+            onPlayManually: onPlayManually,
+            onStartFromBeginning: onStartFromBeginning,
+            onRemoveFromContinueWatching: onRemoveFromContinueWatching
+        )
         .frame(width: cardWidth, height: totalCardHeight, alignment: .topLeading)
         #endif
     }
@@ -639,6 +654,10 @@ extension PosterCard: Equatable {
             && lhs.shouldRequestInitialFocus == rhs.shouldRequestInitialFocus
             && lhs.externalFocusValue == rhs.externalFocusValue
             && (lhs.onLongPress != nil) == (rhs.onLongPress != nil)
+            && (lhs.onOpenDetails != nil) == (rhs.onOpenDetails != nil)
+            && (lhs.onPlayManually != nil) == (rhs.onPlayManually != nil)
+            && (lhs.onStartFromBeginning != nil) == (rhs.onStartFromBeginning != nil)
+            && (lhs.onRemoveFromContinueWatching != nil) == (rhs.onRemoveFromContinueWatching != nil)
             && lhs.layoutMode == rhs.layoutMode
             && lhs.showPosterLabels == rhs.showPosterLabels
             && lhs.smoothFocusAnimations == rhs.smoothFocusAnimations
@@ -802,62 +821,64 @@ struct PosterGridCard: View {
     }
 
     var body: some View {
-        Button(action: action) {
-            VStack(alignment: .leading, spacing: 12) {
-                CachedPosterArtwork(
-                    urlString: meta.posterUrl,
-                    preloadURLString: nil,
-                    width: width,
-                    height: height,
-                    maximumWidth: width,
-                    minimumSwapDelay: 0,
-                    onPreloadFinished: {}
-                ) {
-                    placeholder
-                }
-                .frame(width: width, height: height)
-                .clipShape(shape)
-                .overlay(alignment: .topTrailing) {
-                    if let isWatched {
-                        if isWatched { WatchedCheckmarkIcon() }
-                    } else {
-                        WatchedCheckmarkBadge(meta: meta)
-                    }
-                }
-                .overlay(
-                    shape.stroke(
-                        showsFocusedAppearance ? AppFocusOutline.color : .clear,
-                        lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
-                    )
-                )
-                .shadow(
-                    color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2),
-                    radius: showsFocusedAppearance ? 16 : 6
-                )
-
-                if posterLabels || forceShowLabels {
-                    VStack(alignment: .leading, spacing: 3) {
-                        Text(meta.name)
-                            .font(.system(size: 20, weight: .semibold))
-                            .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
-                            .lineLimit(1)
-                        Text(subtitle)
-                            .font(.system(size: 16, weight: .medium))
-                            .foregroundColor(.white.opacity(0.45))
-                            .lineLimit(1)
-                    }
-                    .frame(width: width, alignment: .leading)
+        let cardContent = VStack(alignment: .leading, spacing: 12) {
+            CachedPosterArtwork(
+                urlString: meta.posterUrl,
+                preloadURLString: nil,
+                width: width,
+                height: height,
+                maximumWidth: width,
+                minimumSwapDelay: 0,
+                onPreloadFinished: {}
+            ) {
+                placeholder
+            }
+            .frame(width: width, height: height)
+            .clipShape(shape)
+            .overlay(alignment: .topTrailing) {
+                if let isWatched {
+                    if isWatched { WatchedCheckmarkIcon() }
+                } else {
+                    WatchedCheckmarkBadge(meta: meta)
                 }
             }
-            .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
+            .overlay(
+                shape.stroke(
+                    showsFocusedAppearance ? AppFocusOutline.color : .clear,
+                    lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                )
+            )
+            .shadow(
+                color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2),
+                radius: showsFocusedAppearance ? 16 : 6
+            )
+
+            if posterLabels || forceShowLabels {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text(meta.name)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(showsFocusedAppearance ? .white : .white.opacity(0.78))
+                        .lineLimit(1)
+                    Text(subtitle)
+                        .font(.system(size: 16, weight: .medium))
+                        .foregroundColor(.white.opacity(0.45))
+                        .lineLimit(1)
+                }
+                .frame(width: width, alignment: .leading)
+            }
+        }
+        Button(action: action) {
+            cardContent
+                .scaleEffect(showsFocusedAppearance ? 1.06 : 1.0)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($focused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: focusValue ?? meta.id))
         .focusEffectDisabledIfAvailable()
         .modifier(OptionalMoveCommandHandler(handler: onMove))
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: action
         )
         .onChange(of: focused) { _, isFocused in
             if isFocused { onFocus?(meta) }
@@ -1506,23 +1527,24 @@ struct WatchedCheckmarkBadge: View {
 
     @MainActor
     private func refresh() async {
+        let snapshot = WatchedStore.currentSnapshot()
         let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
         guard isSeries else {
-            isWatched = meta.map { WatchedStore.contains(meta: $0) }
-                ?? WatchedStore.contains(metaId: metaId, type: type)
+            isWatched = meta.map { snapshot.contains(meta: $0) }
+                ?? snapshot.contains(metaId: metaId, type: type)
             return
         }
 
-        if meta.map({ WatchedStore.containsCatalogTitle(meta: $0) })
-            ?? WatchedStore.contains(metaId: metaId, type: type) {
+        if meta.map({ snapshot.containsCatalogTitle(meta: $0) })
+            ?? snapshot.contains(metaId: metaId, type: type) {
             isWatched = true
             return
         }
 
         // No watched episodes means this cannot be a completed series, and it
         // also lets untouched catalog cards avoid a metadata network request.
-        let previewWatchedKeys = meta.map { WatchedStore.catalogWatchedEpisodeKeys(meta: $0) }
-            ?? WatchedStore.watchedEpisodeKeys(metaId: metaId)
+        let previewWatchedKeys = meta.map { snapshot.catalogWatchedEpisodeKeys(meta: $0) }
+            ?? snapshot.watchedEpisodeKeys(metaId: metaId)
         guard !previewWatchedKeys.isEmpty else {
             isWatched = false
             return
@@ -1546,10 +1568,11 @@ struct WatchedCheckmarkBadge: View {
             preview: meta
         ), !Task.isCancelled else { return }
 
-        isWatched = WatchedStore.containsCatalogTitle(meta: fullMeta)
+        let freshSnapshot = WatchedStore.currentSnapshot()
+        isWatched = freshSnapshot.containsCatalogTitle(meta: fullMeta)
             || CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
                 videos: fullMeta.videos,
-                watchedEpisodeKeys: WatchedStore.catalogWatchedEpisodeKeys(meta: fullMeta)
+                watchedEpisodeKeys: freshSnapshot.catalogWatchedEpisodeKeys(meta: fullMeta)
             )
     }
 }
@@ -1670,138 +1693,121 @@ struct PosterCard_Previews: PreviewProvider {
 }
 #endif
 
-#if os(tvOS)
-// MARK: - Card quick-actions menu
+// MARK: - Title actions native context menu
 
-/// Full-screen dimmed overlay with a liquid-glass panel of quick actions for a
-/// title (Go to details / Add to library / Mark as watched), raised by
-/// long-pressing a poster card. Presented over the tab view like Details/Player,
-/// so the app's existing focus-restore machinery returns focus to the
-/// originating card on dismiss.
-struct CardActionMenuOverlay: View {
+/// Native tvOS/iOS context menu for titles (Go to details / Add to library / Mark as watched / Continue watching actions)
+struct TitleActionsMenuContent: View {
     let meta: NuvioMeta
-    let onDetails: () -> Void
-    let onDismiss: () -> Void
-
-    private enum Field: Hashable { case details, library, watched }
-
-    @State private var inLibrary = false
-    @State private var isWatched = false
-    @State private var isSavingWatched = false
-    @FocusState private var focused: Field?
-
+    var onOpenDetails: (() -> Void)? = nil
+    var continueProgress: Double? = nil
+    var continueIsUpNext: Bool = false
+    var onPlayManually: (() -> Void)? = nil
+    var onStartFromBeginning: (() -> Void)? = nil
+    var onRemoveFromContinueWatching: (() -> Void)? = nil
     var body: some View {
-        ZStack {
-            // No full-screen scrim: the panel is liquid glass floating over a
-            // still-visible Home. A whisper of dim keeps the panel legible
-            // without blacking out the surroundings.
-            Color.black.opacity(0.14)
-                .ignoresSafeArea()
-
-            GlassControlsContainer {
-                VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(meta.name)
-                            .font(.system(size: 30, weight: .bold))
-                            .foregroundColor(.white)
-                            .lineLimit(2)
-                        Text("Title actions")
-                            .font(.system(size: 17, weight: .medium))
-                            .foregroundColor(.white.opacity(0.55))
-                    }
-                    .padding(.bottom, 4)
-
-                    CardActionMenuButton(
-                        title: "Go to details",
-                        systemImage: "info.circle",
-                        isFocused: focused == .details,
-                        action: onDetails
-                    )
-                    .focused($focused, equals: .details)
-
-                    CardActionMenuButton(
-                        title: inLibrary ? "Remove from library" : "Add to library",
-                        systemImage: inLibrary ? "checkmark" : "plus",
-                        isFocused: focused == .library,
-                        action: toggleLibrary
-                    )
-                    .focused($focused, equals: .library)
-
-                    CardActionMenuButton(
-                        title: isWatched ? "Mark as unwatched" : "Mark as watched",
-                        systemImage: isWatched ? "eye.slash" : "eye",
-                        isFocused: focused == .watched,
-                        action: toggleWatched
-                    )
-                    .focused($focused, equals: .watched)
-                }
-                .padding(26)
-                .frame(width: 440, alignment: .leading)
-                .glassRoundedRect(cornerRadius: 28)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
-                )
-                .focusSection()
-            }
-        }
-        .onAppear {
-            inLibrary = LibraryStore.contains(metaId: meta.id, type: meta.type)
-            isWatched = WatchedStore.contains(meta: meta)
-            // Seed focus on the first action once the overlay has taken over from
-            // the (fading, unfocusable) tab view behind it.
-            DispatchQueue.main.async { focused = .details }
-        }
-        // Re-grab focus if the engine drops it while the tab view fades out, so
-        // the menu never ends up with nothing highlighted.
-        .onChange(of: focused) { _, newValue in
-            if newValue == nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    if focused == nil { focused = .details }
-                }
-            }
-        }
-        .onExitCommand(perform: onDismiss)
+        contextMenuContent
     }
 
-    private func toggleLibrary() {
+    @ViewBuilder
+    private var contextMenuContent: some View {
+        if continueProgress != nil || continueIsUpNext {
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    onOpenDetails?()
+                }
+            } label: {
+                Label("Go to details", systemImage: "info.circle")
+            }
+
+            if let onPlayManually {
+                Button {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        onPlayManually()
+                    }
+                } label: {
+                    Label("Play manually", systemImage: "play.fill")
+                }
+            }
+
+            if let onStartFromBeginning, !continueIsUpNext {
+                Button {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        onStartFromBeginning()
+                    }
+                } label: {
+                    Label("Start from beginning", systemImage: "arrow.counterclockwise")
+                }
+            }
+
+            if let onRemoveFromContinueWatching {
+                Button(role: .destructive) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                        onRemoveFromContinueWatching()
+                    }
+                } label: {
+                    Label("Remove", systemImage: "trash")
+                }
+            }
+        } else {
+            let inLibrary = LibraryStore.contains(metaId: meta.id, type: meta.type)
+            let isItemWatched = WatchedStore.contains(meta: meta)
+
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    onOpenDetails?()
+                }
+            } label: {
+                Label("Go to details", systemImage: "info.circle")
+            }
+
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    toggleLibrary(currentlyInLibrary: inLibrary)
+                }
+            } label: {
+                Label(
+                    inLibrary ? "Remove from library" : "Add to library",
+                    systemImage: inLibrary ? "checkmark" : "plus"
+                )
+            }
+
+            Button {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    toggleWatched()
+                }
+            } label: {
+                Label(
+                    isItemWatched ? "Mark as unwatched" : "Mark as watched",
+                    systemImage: isItemWatched ? "eye.slash" : "eye"
+                )
+            }
+        }
+    }
+
+    private func toggleLibrary(currentlyInLibrary: Bool) {
         guard TraktSettingsStore.librarySourceMode != .local else {
-            inLibrary = LibraryStore.toggle(meta: meta)
+            _ = LibraryStore.toggle(meta: meta)
             return
         }
 
-        // Do not put an item into Nuvio Sync when the selected destination is
-        // Trakt. A missing/expired Trakt session simply leaves the menu state
-        // unchanged instead of creating a hidden local-only save.
         guard SelectedLibraryService.isSelectedAndAuthenticated else { return }
 
-        let desiredMembership = !inLibrary
-        inLibrary = desiredMembership
+        let desiredMembership = !currentlyInLibrary
         Task {
-            let succeeded = await SelectedLibraryService.setWatchlist(
+            _ = await SelectedLibraryService.setWatchlist(
                 meta,
                 isInWatchlist: desiredMembership
             )
-            guard !Task.isCancelled else { return }
-            if !succeeded {
-                inLibrary = !desiredMembership
-            }
         }
     }
 
     private func toggleWatched() {
-        guard !isSavingWatched else { return }
         let isSeries = ["series", "tv", "show", "tvshow"].contains(meta.type.lowercased())
         guard isSeries else {
-            isWatched = WatchedStore.toggle(meta: meta)
+            _ = WatchedStore.toggle(meta: meta)
             return
         }
 
-        // Catalog cards normally have no episode guide. Resolve it before the
-        // series action so this control writes only aired regular episodes,
-        // matching the Details action instead of falling back to a bare title
-        // mark with no episode boundaries.
-        isSavingWatched = true
         Task {
             let fullMeta = await CatalogWatchedMetadataCache.shared.fullMetadata(
                 metaId: meta.id,
@@ -1809,156 +1815,56 @@ struct CardActionMenuOverlay: View {
                 preview: meta
             ) ?? meta
             guard !Task.isCancelled else { return }
-            let result = WatchedStore.toggle(meta: fullMeta)
-            await MainActor.run {
-                isWatched = result
-                isSavingWatched = false
-            }
+            _ = WatchedStore.toggle(meta: fullMeta)
         }
     }
 }
 
-/// Quick actions for a Continue Watching card, which are about the *resume*
-/// rather than the title: pick a stream by hand, restart the episode, or drop
-/// the card. Same glass panel as `CardActionMenuOverlay`, but a long press on a
-/// Continue Watching card raises this one instead — library/watched toggles are
-/// meaningless for something already in progress.
-struct ContinueWatchingActionMenuOverlay: View {
-    let item: ContinueWatchingItem
-    let onDetails: () -> Void
-    let onPlayManually: () -> Void
-    let onStartFromBeginning: () -> Void
-    let onRemove: () -> Void
-    let onDismiss: () -> Void
+struct TitleActionsContextMenu: ViewModifier {
+    let meta: NuvioMeta
+    var onOpenDetails: (() -> Void)? = nil
+    var continueProgress: Double? = nil
+    var continueIsUpNext: Bool = false
+    var onPlayManually: (() -> Void)? = nil
+    var onStartFromBeginning: (() -> Void)? = nil
+    var onRemoveFromContinueWatching: (() -> Void)? = nil
 
-    private enum Field: Hashable { case details, manual, restart, remove }
-
-    @FocusState private var focused: Field?
-
-    /// A Next Up card is a suggestion for an episode that has never been played,
-    /// so there is no progress to restart from — matching the phone's sheet.
-    private var showsStartFromBeginning: Bool { !item.isUpNextEntry }
-
-    var body: some View {
-        ZStack {
-            Color.black.opacity(0.14)
-                .ignoresSafeArea()
-
-            GlassControlsContainer {
-                VStack(alignment: .leading, spacing: 12) {
-                    VStack(alignment: .leading, spacing: 2) {
-                        Text(item.meta.name)
-                            .font(.system(size: 30, weight: .bold))
-                            .foregroundColor(.white)
-                            .lineLimit(2)
-                        Text(item.episodeDisplayLine ?? "Continue watching")
-                            .font(.system(size: 17, weight: .medium))
-                            .foregroundColor(.white.opacity(0.55))
-                            .lineLimit(1)
-                    }
-                    .padding(.bottom, 4)
-
-                    CardActionMenuButton(
-                        title: "Go to details",
-                        systemImage: "info.circle",
-                        isFocused: focused == .details,
-                        action: onDetails
-                    )
-                    .focused($focused, equals: .details)
-
-                    CardActionMenuButton(
-                        title: "Play manually",
-                        systemImage: "play.fill",
-                        isFocused: focused == .manual,
-                        action: onPlayManually
-                    )
-                    .focused($focused, equals: .manual)
-
-                    if showsStartFromBeginning {
-                        CardActionMenuButton(
-                            title: "Start from beginning",
-                            systemImage: "arrow.counterclockwise",
-                            isFocused: focused == .restart,
-                            action: onStartFromBeginning
-                        )
-                        .focused($focused, equals: .restart)
-                    }
-
-                    CardActionMenuButton(
-                        title: "Remove",
-                        systemImage: "trash",
-                        isFocused: focused == .remove,
-                        isDestructive: true,
-                        action: onRemove
-                    )
-                    .focused($focused, equals: .remove)
-                }
-                .padding(26)
-                .frame(width: 440, alignment: .leading)
-                .glassRoundedRect(cornerRadius: 28)
-                .overlay(
-                    RoundedRectangle(cornerRadius: 28, style: .continuous)
-                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+    func body(content: Content) -> some View {
+        content
+            .contextMenu {
+                TitleActionsMenuContent(
+                    meta: meta,
+                    onOpenDetails: onOpenDetails,
+                    continueProgress: continueProgress,
+                    continueIsUpNext: continueIsUpNext,
+                    onPlayManually: onPlayManually,
+                    onStartFromBeginning: onStartFromBeginning,
+                    onRemoveFromContinueWatching: onRemoveFromContinueWatching
                 )
-                .focusSection()
             }
-        }
-        .onAppear {
-            // Seed focus on the first action once the overlay has taken over from
-            // the (fading, unfocusable) tab view behind it.
-            DispatchQueue.main.async { focused = .details }
-        }
-        // Re-grab focus if the engine drops it while the tab view fades out, so
-        // the menu never ends up with nothing highlighted.
-        .onChange(of: focused) { _, newValue in
-            if newValue == nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                    if focused == nil { focused = .details }
-                }
-            }
-        }
-        .onExitCommand(perform: onDismiss)
     }
 }
 
-private struct CardActionMenuButton: View {
-    let title: String
-    let systemImage: String
-    let isFocused: Bool
-    /// Tints the resting state to mark an action that discards something. The
-    /// focused state stays black-on-white like every other row, so the panel
-    /// never grows a second highlight treatment.
-    var isDestructive: Bool = false
-    let action: () -> Void
-
-    private var restingColor: Color {
-        isDestructive ? Color(red: 0.93, green: 0.45, blue: 0.55) : .white
-    }
-
-    var body: some View {
-        // Mirrors the profile page's TVProfileActionButton: the focused state is
-        // a white-*tinted* glass (via loginGlassCapsule) that blends inside the
-        // GlassEffectContainer, instead of an opaque white fill that bleeds a
-        // glow/halo around itself.
-        Button(action: action) {
-            HStack(spacing: 12) {
-                Image(systemName: systemImage)
-                    .font(.system(size: 20, weight: .semibold))
-                    .frame(width: 26)
-                Text(title)
-                    .font(.system(size: 22, weight: .semibold))
-                Spacer(minLength: 0)
-            }
-            .foregroundColor(isFocused ? .black : restingColor)
-            .padding(.horizontal, 22)
-            .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
-            .loginGlassCapsule(highlighted: isFocused)
-            .contentShape(Capsule())
-            .scaleEffect(isFocused ? 1.03 : 1)
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .animation(.easeOut(duration: 0.12), value: isFocused)
+extension View {
+    func titleActionsContextMenu(
+        meta: NuvioMeta,
+        onOpenDetails: (() -> Void)? = nil,
+        continueProgress: Double? = nil,
+        continueIsUpNext: Bool = false,
+        onPlayManually: (() -> Void)? = nil,
+        onStartFromBeginning: (() -> Void)? = nil,
+        onRemoveFromContinueWatching: (() -> Void)? = nil
+    ) -> some View {
+        modifier(
+            TitleActionsContextMenu(
+                meta: meta,
+                onOpenDetails: onOpenDetails,
+                continueProgress: continueProgress,
+                continueIsUpNext: continueIsUpNext,
+                onPlayManually: onPlayManually,
+                onStartFromBeginning: onStartFromBeginning,
+                onRemoveFromContinueWatching: onRemoveFromContinueWatching
+            )
+        )
     }
 }
-#endif

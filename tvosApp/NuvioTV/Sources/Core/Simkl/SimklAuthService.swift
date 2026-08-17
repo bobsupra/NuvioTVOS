@@ -817,6 +817,7 @@ final class SimklSettingsViewModel: ObservableObject {
     @Published var pollInterval = 5
     @Published var statusMessage: String?
     @Published var errorMessage: String?
+    @Published var loadingDebugInfo: String?
     @Published var isTransferringHistory = false
     @Published var isTransferringLibrary = false
     @Published var isTransferringProgress = false
@@ -830,6 +831,10 @@ final class SimklSettingsViewModel: ObservableObject {
 
     private let store: UserDefaults
     private let service: SimklAuthService
+    private var connectionTask: Task<Void, Never>?
+    private var loadingTimeoutTask: Task<Void, Never>?
+    private var loadingStage = "none"
+    private var loadingStartedAt: Date?
     private var pollTask: Task<Void, Never>?
     private var historyTransferTask: Task<Void, Never>?
     private var libraryTransferTask: Task<Void, Never>?
@@ -851,6 +856,8 @@ final class SimklSettingsViewModel: ObservableObject {
     }
 
     deinit {
+        connectionTask?.cancel()
+        loadingTimeoutTask?.cancel()
         pollTask?.cancel()
         historyTransferTask?.cancel()
         libraryTransferTask?.cancel()
@@ -912,9 +919,13 @@ final class SimklSettingsViewModel: ObservableObject {
         isLoading = true
         statusMessage = nil
         errorMessage = nil
-        Task {
+        beginLoadingTimeout(stage: "requesting PIN from Simkl (GET /oauth/pin)")
+        connectionTask?.cancel()
+        connectionTask = Task { [weak self] in
+            guard let self else { return }
             do {
                 let response = try await service.startPINAuth()
+                guard !Task.isCancelled else { return }
                 deviceUserCode = response.userCode
                 verificationURI = response.verificationURI
                 pinExpiresAtMillis = Date().timeIntervalSince1970 * 1000.0 + Double(response.expiresIn * 1000)
@@ -922,20 +933,29 @@ final class SimklSettingsViewModel: ObservableObject {
                 mode = .awaitingApproval
                 statusMessage = "Waiting for approval…"
                 isLoading = false
+                finishLoading(clearDebug: true)
                 startPolling()
             } catch {
+                guard !Task.isCancelled else { return }
                 errorMessage = error.localizedDescription
                 isLoading = false
+                finishLoading(clearDebug: false)
             }
         }
     }
 
     func cancelPINFlow() {
+        connectionTask?.cancel()
+        connectionTask = nil
+        loadingTimeoutTask?.cancel()
+        loadingTimeoutTask = nil
+        isLoading = false
         pollTask?.cancel()
         isPolling = false
         service.clearPINFlow()
         statusMessage = nil
         errorMessage = nil
+        loadingDebugInfo = nil
         reload()
     }
 
@@ -945,6 +965,10 @@ final class SimklSettingsViewModel: ObservableObject {
     }
 
     func disconnect() {
+        connectionTask?.cancel()
+        connectionTask = nil
+        loadingTimeoutTask?.cancel()
+        loadingTimeoutTask = nil
         pollTask?.cancel()
         historyTransferTask?.cancel()
         libraryTransferTask?.cancel()
@@ -960,6 +984,7 @@ final class SimklSettingsViewModel: ObservableObject {
         progressTransferProgress = nil
         progressTransferSourceLabel = nil
         isLoading = true
+        finishLoading(clearDebug: true)
         service.logout()
         isLoading = false
         isStatsLoading = false
@@ -985,6 +1010,9 @@ final class SimklSettingsViewModel: ObservableObject {
               !isTransferringProgress else { return }
         isLoading = true
         isStatsLoading = includeStats
+        beginLoadingTimeout(stage: includeStats
+            ? "loading Simkl account, watch history, library, and stats"
+            : "loading Simkl account details")
         Task {
             _ = await service.refreshUserSettingsIfNeeded()
             if includeStats {
@@ -992,6 +1020,7 @@ final class SimklSettingsViewModel: ObservableObject {
                 isStatsLoading = false
             }
             isLoading = false
+            finishLoading(clearDebug: true)
             reload()
         }
     }
@@ -1004,6 +1033,7 @@ final class SimklSettingsViewModel: ObservableObject {
         isStatsLoading = true
         statusMessage = "Syncing Simkl…"
         errorMessage = nil
+        beginLoadingTimeout(stage: "refreshing Simkl account, history, library, and stats")
         Task {
             _ = await service.fetchUserSettings()
             async let stats = service.fetchUserStats()
@@ -1019,6 +1049,7 @@ final class SimklSettingsViewModel: ObservableObject {
             connectedStats = await stats
             isStatsLoading = false
             isLoading = false
+            finishLoading(clearDebug: true)
             statusMessage = historySynced
                 ? "Simkl sync completed."
                 : "Simkl account refreshed, but watch history could not be imported."
@@ -1276,4 +1307,66 @@ final class SimklSettingsViewModel: ObservableObject {
             }
         }
     }
+
+    private func beginLoadingTimeout(stage: String) {
+        loadingTimeoutTask?.cancel()
+        loadingStage = stage
+        loadingStartedAt = Date()
+        loadingDebugInfo = nil
+
+        loadingTimeoutTask = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+            } catch {
+                return
+            }
+
+            guard let self,
+                  !Task.isCancelled,
+                  self.isLoading,
+                  self.loadingStage == stage else {
+                return
+            }
+
+            self.loadingDebugInfo = self.makeLoadingDebugInfo()
+            self.statusMessage = "Simkl is still loading. Read or screenshot the debug report and send it to the developer."
+        }
+    }
+
+    private func finishLoading(clearDebug: Bool) {
+        loadingTimeoutTask?.cancel()
+        loadingTimeoutTask = nil
+        loadingStartedAt = nil
+        if clearDebug {
+            loadingDebugInfo = nil
+        }
+    }
+
+    private func makeLoadingDebugInfo() -> String {
+        let state = service.currentState()
+        let elapsed = loadingStartedAt.map { Int(Date().timeIntervalSince($0)) } ?? 60
+        let pinReceived = !(state.userCode?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "").isEmpty
+        let modeName: String
+        switch mode {
+        case .disconnected: modeName = "disconnected"
+        case .awaitingApproval: modeName = "awaiting_approval"
+        case .connected: modeName = "connected"
+        }
+
+        return [
+            "SIMKL DEBUG REPORT",
+            "reason=no Simkl result after \(elapsed) seconds",
+            "stage=\(loadingStage)",
+            "endpoint=https://api.simkl.com",
+            "request_timeout_seconds=30",
+            "client_id_configured=\(service.hasRequiredCredentials())",
+            "pin_received=\(pinReceived)",
+            "polling=\(isPolling)",
+            "mode=\(modeName)",
+            "app_version=\(SimklConfig.appVersion)",
+            "os=\(ProcessInfo.processInfo.operatingSystemVersionString)",
+            "next=possible DNS/network/VPN issue, Simkl outage, or a request stuck before an HTTP response"
+        ].joined(separator: "\n")
+    }
+
 }

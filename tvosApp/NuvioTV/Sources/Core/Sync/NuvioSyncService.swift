@@ -8,6 +8,7 @@
 
 import Combine
 import Foundation
+import UIKit
 
 @MainActor
 final class NuvioSyncManager: ObservableObject {
@@ -68,6 +69,11 @@ final class NuvioSyncManager: ObservableObject {
     /// A refresh that arrived while a pull was running, replayed on completion.
     private var pendingResyncRequested = false
     private var automaticAccountPullRetryCount = 0
+    /// The backend uses this heartbeat to show the Apple TV under the account's
+    /// linked devices. Keep it well below the server's stale-device window,
+    /// without adding a request to every foreground refresh.
+    private var lastDeviceRegistrationAt: Date?
+    private static let deviceRegistrationInterval: TimeInterval = 15 * 60
     /// Identifies the pull that currently owns `pullTask` and the post-login
     /// loading gate. A cancelled pull can unwind after its replacement starts;
     /// without an ownership token, that stale task can reveal the local Guest
@@ -92,7 +98,7 @@ final class NuvioSyncManager: ObservableObject {
 
     /// The attached manager, for the few callers that need to reach sync from
     /// outside the view tree. Weak so the root owning it stays authoritative.
-    static private(set) weak var current: NuvioSyncManager?
+    @MainActor static private(set) weak var current: NuvioSyncManager?
 
     func attach(authManager: AuthManager, profileViewModel: ProfileViewModel) {
         // `onAppear` may run again after SwiftUI rebuilds the root. Refresh the
@@ -273,6 +279,9 @@ final class NuvioSyncManager: ObservableObject {
                 }
             }
             observedAuthUserId = userId
+            if !isSameAccount {
+                lastDeviceRegistrationAt = nil
+            }
             Self.accountSyncDiagnostic = "scheduled"
             if AuthConfig.isConfigured {
                 isPullingAccountProfiles = true
@@ -296,6 +305,7 @@ final class NuvioSyncManager: ObservableObject {
             pendingResyncRequested = false
             observedAuthUserId = nil
             observedActiveProfileId = nil
+            lastDeviceRegistrationAt = nil
             isPullingAccountProfiles = false
             profileSyncError = nil
         case .loading:
@@ -794,6 +804,7 @@ final class NuvioSyncManager: ObservableObject {
     ) async throws -> (session: AuthSession, profiles: [RemoteProfile]) {
         let delays: [UInt64] = [0, 1, 2, 3, 4, 5]
         var lastError: Error = AuthError(message: "The account session is not ready yet.")
+        var attemptedDeviceRegistration = false
 
         for (attempt, delay) in delays.enumerated() {
             if delay > 0 {
@@ -808,6 +819,27 @@ final class NuvioSyncManager: ObservableObject {
                 // the backoff and ends on the same failure.
                 if authManager.sessionNeedsReauthentication { break }
                 continue
+            }
+
+            // Newer Nuvio backends keep a separate linked-device record. Older
+            // tvOS builds never registered it, which left this Apple TV absent
+            // from the account page even when authentication succeeded. The
+            // registration is deliberately best-effort so an older backend
+            // remains usable.
+            let shouldRegisterDevice = !attemptedDeviceRegistration && (
+                lastDeviceRegistrationAt == nil
+                    || Date().timeIntervalSince(lastDeviceRegistrationAt ?? .distantPast)
+                        >= Self.deviceRegistrationInterval
+            )
+            if shouldRegisterDevice {
+                attemptedDeviceRegistration = true
+                do {
+                    try await client.registerCurrentDevice(session: session)
+                    lastDeviceRegistrationAt = Date()
+                    print("Nuvio sync registered this Apple TV as a linked device.")
+                } catch {
+                    print("Nuvio device registration skipped: \(error.localizedDescription)")
+                }
             }
 
             do {
@@ -1580,6 +1612,32 @@ fileprivate final class NuvioAPIClient {
             return nil
         }
         return value
+    }
+
+    /// Registers this installation in the account's linked-device list. This
+    /// is separate from the sync origin ID: the latter prevents a client from
+    /// reacting to its own writes, while this RPC gives the account page a
+    /// human-readable device and client version.
+    @MainActor
+    func registerCurrentDevice(session: AuthSession) async throws {
+        let device = UIDevice.current
+        let clientVersion = Bundle.main.object(
+            forInfoDictionaryKey: "CFBundleShortVersionString"
+        ) as? String ?? "dev"
+        let deviceName = device.name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let platform = "\(device.systemName) \(device.systemVersion)"
+
+        try await rpcVoid(
+            "register_current_device",
+            session: session,
+            params: [
+                "p_installation_id": SyncClientIdentity.current(),
+                "p_client_name": "Nuvio tvOS",
+                "p_client_version": clientVersion,
+                "p_platform": platform,
+                "p_device_name": deviceName.isEmpty ? "Apple TV" : deviceName
+            ]
+        )
     }
 
     func pullProfiles(session: AuthSession) async throws -> [RemoteProfile] {

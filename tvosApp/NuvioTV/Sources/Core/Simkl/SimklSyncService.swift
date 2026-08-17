@@ -1078,10 +1078,12 @@ struct SimklHistoryTransferService {
         if transferred == total {
             await progress(100)
         }
-        NotificationCenter.default.post(
-            name: TraktSettingsStore.continueWatchingChangedNotification,
-            object: nil
-        )
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
+        }
         return result(
             total: total,
             transferred: transferred,
@@ -1662,10 +1664,12 @@ struct SimklProgressTransferService {
         if transferred == total {
             await progress(100)
         }
-        NotificationCenter.default.post(
-            name: TraktSettingsStore.continueWatchingChangedNotification,
-            object: nil
-        )
+        await MainActor.run {
+            NotificationCenter.default.post(
+                name: TraktSettingsStore.continueWatchingChangedNotification,
+                object: nil
+            )
+        }
         return SimklProgressTransferResult(
             total: total,
             transferred: transferred,

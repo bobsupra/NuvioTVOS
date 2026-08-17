@@ -435,8 +435,9 @@ private struct DiscoverCard: View {
         .focused($focused)
         .modifier(ExternalFocusBinding(binding: externalFocus, id: meta.id))
         .focusEffectDisabledIfAvailable()
-        .simultaneousGesture(
-            LongPressGesture(minimumDuration: 0.45).onEnded { _ in onLongPress?() }
+        .titleActionsContextMenu(
+            meta: meta,
+            onOpenDetails: action
         )
         .onChange(of: focused) { _, isFocused in onFocusChange?(isFocused) }
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)

@@ -66,9 +66,11 @@ final class ICloudSettingsSyncManager: ObservableObject {
             object: NSUbiquitousKeyValueStore.default,
             queue: .main
         ) { [weak self] notification in
-            guard let self, self.isEnabled else { return }
             let changedKeys = notification.userInfo?[NSUbiquitousKeyValueStoreChangedKeysKey] as? [String]
-            self.applyRemoteChanges(changedKeys: changedKeys)
+            Task { @MainActor [weak self] in
+                guard let self, self.isEnabled else { return }
+                self.applyRemoteChanges(changedKeys: changedKeys)
+            }
         })
 
         // Outbound local changes
@@ -77,8 +79,10 @@ final class ICloudSettingsSyncManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            guard let self, self.isEnabled, !self.isApplyingRemote else { return }
-            self.schedulePush()
+            Task { @MainActor [weak self] in
+                guard let self, self.isEnabled, !self.isApplyingRemote else { return }
+                self.schedulePush()
+            }
         })
 
         // Initial check and registration with iCloud
