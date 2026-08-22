@@ -28,119 +28,135 @@ public struct UserProfileView: View {
     }
 
     public var body: some View {
-        NavigationView {
-            ZStack {
-                ProfileBackground()
+        ZStack {
+            ProfileBackground()
 
-                VStack(spacing: 0) {
-                    Spacer().frame(height: 162)
+            VStack(spacing: 0) {
+                Spacer().frame(height: 162)
 
-                    Text("Who's watching?")
-                        .font(.custom("Inter-Bold", size: 62))
-                        .foregroundColor(.white)
+                Text("Who's watching?")
+                    .font(.custom("Inter-Bold", size: 62))
+                    .foregroundColor(.white)
 
-                    Spacer().frame(height: 14)
+                Spacer().frame(height: 14)
 
-                    Text("Select a profile to continue")
-                        .font(.custom("Inter-Regular", size: 28))
-                        .foregroundColor(.white.opacity(0.6))
+                Text("Select a profile to continue")
+                    .font(.custom("Inter-Regular", size: 28))
+                    .foregroundColor(.white.opacity(0.6))
 
-                    if let profileCreationError = viewModel.profileCreationError {
-                        Spacer().frame(height: 18)
-                        Text(profileCreationError)
-                            .font(.custom("Inter-Regular", size: 20))
-                            .foregroundColor(.red.opacity(0.9))
-                            .lineLimit(2)
-                            .frame(maxWidth: 900)
-                    }
-
-                    if let accountSyncError, let onRetryAccountSync {
-                        Spacer().frame(height: 18)
-                        HStack(spacing: 18) {
-                            VStack(alignment: .leading, spacing: 6) {
-                                Text(accountSyncError)
-                                    .font(.custom("Inter-Regular", size: 20))
-                                    .foregroundColor(.orange.opacity(0.9))
-                                    .fixedSize(horizontal: false, vertical: true)
-
-                                Text("Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data.")
-                                    .font(.custom("Inter-Regular", size: 16))
-                                    .foregroundColor(.white.opacity(0.72))
-                                    .fixedSize(horizontal: false, vertical: true)
-                            }
-
-                            Button("Retry", action: onRetryAccountSync)
-                                .buttonStyle(.bordered)
-                                .focused($focusedItem, equals: Self.retryFocusId)
-                        }
+                if let profileCreationError = viewModel.profileCreationError {
+                    Spacer().frame(height: 18)
+                    Text(profileCreationError)
+                        .font(.custom("Inter-Regular", size: 20))
+                        .foregroundColor(.red.opacity(0.9))
+                        .lineLimit(2)
                         .frame(maxWidth: 900)
-                    }
+                }
 
-                    Spacer()
+                if let accountSyncError, let onRetryAccountSync {
+                    Spacer().frame(height: 18)
+                    HStack(spacing: 18) {
+                        VStack(alignment: .leading, spacing: 6) {
+                            Text(accountSyncError)
+                                .font(.custom("Inter-Regular", size: 20))
+                                .foregroundColor(.orange.opacity(0.9))
+                                .fixedSize(horizontal: false, vertical: true)
 
-                    // Centered single row of profiles.
-                    HStack(alignment: .top, spacing: 56) {
-                        ForEach(viewModel.profiles, id: \.id) { profile in
-                            ProfileCard(
-                                profile: profile,
-                                isFocused: focusedItem == profile.id
-                            ) {
-                                handleProfileSelection(profile)
-                            }
-                            .focused($focusedItem, equals: profile.id)
+                            Text("Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data.")
+                                .font(.custom("Inter-Regular", size: 16))
+                                .foregroundColor(.white.opacity(0.72))
+                                .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        AddProfileButton(
-                            isFocused: focusedItem == Self.addProfileFocusId
+                        Button("Retry", action: onRetryAccountSync)
+                            .buttonStyle(.bordered)
+                            .focused($focusedItem, equals: Self.retryFocusId)
+                    }
+                    .frame(maxWidth: 900)
+                }
+
+                Spacer()
+
+                // Centered single row of profiles.
+                HStack(alignment: .top, spacing: 56) {
+                    ForEach(viewModel.profiles, id: \.id) { profile in
+                        ProfileCard(
+                            profile: profile,
+                            isFocused: focusedItem == profile.id
                         ) {
-                            showingAddProfile = true
+                            handleProfileSelection(profile)
                         }
-                        .focused($focusedItem, equals: Self.addProfileFocusId)
+                        .focused($focusedItem, equals: profile.id)
                     }
-                    .padding(.horizontal, 80)
-                    .frame(maxWidth: .infinity)
 
-                    Spacer()
-
-                    Spacer().frame(height: 56)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-                .disabled(viewModel.isPinEntryVisible || showingAddProfile)
-
-                if viewModel.isPinEntryVisible {
-                    ProfilePinView(viewModel: viewModel)
-                }
-
-                if showingAddProfile {
-                    AddProfileView(
-                        isPresented: $showingAddProfile,
-                        name: $newProfileName,
-                        pin: $newProfilePin,
-                        avatarId: $newProfileAvatarId
+                    AddProfileButton(
+                        isFocused: focusedItem == Self.addProfileFocusId
                     ) {
-                        viewModel.createProfile(
-                            name: newProfileName,
-                            pin: newProfilePin.isEmpty ? nil : newProfilePin,
-                            avatarId: newProfileAvatarId,
-                            onCreated: onProfileCreated
-                        )
-                        newProfileName = ""
-                        newProfilePin = ""
-                        newProfileAvatarId = ProfileAvatarCatalog.defaultId
+                        showingAddProfile = true
                     }
-                    .transition(.opacity)
-                    .zIndex(2)
+                    .focused($focusedItem, equals: Self.addProfileFocusId)
                 }
+                .padding(.horizontal, 80)
+                .frame(maxWidth: .infinity)
+                .defaultFocusIfAvailable($focusedItem, initialFocusTarget())
+
+                Spacer()
+
+                Spacer().frame(height: 56)
             }
-            .animation(.easeInOut(duration: 0.18), value: showingAddProfile)
-            .onAppear {
-                AvatarCatalogStore.shared.loadIfNeeded()
-                focusRetryIfNeeded()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .disabled(viewModel.isPinEntryVisible || showingAddProfile)
+
+            if viewModel.isPinEntryVisible {
+                ProfilePinView(viewModel: viewModel)
             }
-            .onChange(of: accountSyncError) { _, _ in
-                focusRetryIfNeeded()
+
+            if showingAddProfile {
+                AddProfileView(
+                    isPresented: $showingAddProfile,
+                    name: $newProfileName,
+                    pin: $newProfilePin,
+                    avatarId: $newProfileAvatarId
+                ) {
+                    viewModel.createProfile(
+                        name: newProfileName,
+                        pin: newProfilePin.isEmpty ? nil : newProfilePin,
+                        avatarId: newProfileAvatarId,
+                        onCreated: onProfileCreated
+                    )
+                    newProfileName = ""
+                    newProfilePin = ""
+                    newProfileAvatarId = ProfileAvatarCatalog.defaultId
+                }
+                .transition(.opacity)
+                .zIndex(2)
             }
         }
+        .animation(.easeInOut(duration: 0.18), value: showingAddProfile)
+        .onAppear {
+            AvatarCatalogStore.shared.loadIfNeeded()
+            if accountSyncError != nil, onRetryAccountSync != nil {
+                focusRetryIfNeeded()
+            } else if focusedItem == nil {
+                focusedItem = initialFocusTarget()
+            }
+        }
+        .onChange(of: accountSyncError) { _, _ in
+            focusRetryIfNeeded()
+        }
+    }
+
+    private func initialFocusTarget() -> String? {
+        if accountSyncError != nil, onRetryAccountSync != nil {
+            return Self.retryFocusId
+        }
+        let activeOrLastId = viewModel.activeProfile?.id
+            ?? viewModel.lastActiveProfileId
+            ?? UserDefaults.standard.string(forKey: "nuvio.lastActiveProfileId")
+        if let activeOrLastId, viewModel.profiles.contains(where: { $0.id == activeOrLastId }) {
+            return activeOrLastId
+        }
+        return viewModel.profiles.first?.id
     }
 
     private func focusRetryIfNeeded() {
@@ -383,7 +399,6 @@ final class AvatarCatalogStore: ObservableObject {
         do {
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
-                print("Avatar catalog load failed: HTTP \((response as? HTTPURLResponse)?.statusCode ?? -1)")
                 scheduleRetry()
                 return
             }
@@ -393,9 +408,7 @@ final class AvatarCatalogStore: ObservableObject {
             if let encoded = try? JSONEncoder().encode(items) {
                 UserDefaults.standard.set(encoded, forKey: Self.cacheKey)
             }
-            print("Avatar catalog loaded \(items.count) avatar(s).")
         } catch {
-            print("Avatar catalog load failed: \(error.localizedDescription)")
             scheduleRetry()
         }
     }
@@ -406,7 +419,6 @@ final class AvatarCatalogStore: ObservableObject {
     /// than leaving the profile without its picture until the app restarts.
     private func scheduleRetry() {
         guard attempts < Self.maxAttempts else {
-            print("Avatar catalog load gave up after \(attempts) attempt(s).")
             return
         }
         let delay = Double(attempts) * 2
@@ -468,6 +480,68 @@ enum ProfileAvatarCatalog {
     static func symbolName(for id: String?) -> String { "person.crop.circle" }
 }
 
+/// In-memory and persistent disk cache for avatar images matching Android's Glide/Coil behavior.
+/// Eliminates CPU decoding spikes, redundant network queries, and socket allocations on screen appearance.
+@MainActor
+final class ProfileAvatarCache {
+    static let shared = ProfileAvatarCache()
+    private let cache = NSCache<NSURL, UIImage>()
+    private let diskCacheDirectory: URL
+
+    private init() {
+        cache.countLimit = 200
+        cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB
+        let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first!
+        diskCacheDirectory = caches.appendingPathComponent("ProfileAvatars", isDirectory: true)
+        try? FileManager.default.createDirectory(at: diskCacheDirectory, withIntermediateDirectories: true)
+    }
+
+    private func diskFileURL(for url: URL) -> URL {
+        let safeName = url.absoluteString.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? UUID().uuidString
+        return diskCacheDirectory.appendingPathComponent(safeName)
+    }
+
+    func image(for url: URL) -> UIImage? {
+        if let memory = cache.object(forKey: url as NSURL) {
+            return memory
+        }
+        let diskURL = diskFileURL(for: url)
+        if let data = try? Data(contentsOf: diskURL),
+           let image = UIImage(data: data) {
+            cache.setObject(image, forKey: url as NSURL)
+            return image
+        }
+        return nil
+    }
+
+    func setImage(_ image: UIImage, for url: URL) {
+        cache.setObject(image, forKey: url as NSURL)
+        let diskURL = diskFileURL(for: url)
+        if let data = image.pngData() {
+            try? data.write(to: diskURL, options: .atomic)
+        }
+    }
+
+    func fetchImage(for url: URL) async -> UIImage? {
+        if let memory = cache.object(forKey: url as NSURL) {
+            return memory
+        }
+        let diskURL = diskFileURL(for: url)
+        if let diskData = try? Data(contentsOf: diskURL),
+           let diskImage = UIImage(data: diskData) {
+            cache.setObject(diskImage, forKey: url as NSURL)
+            return diskImage
+        }
+        guard let (data, _) = try? await URLSession.shared.data(from: url),
+              let decoded = UIImage(data: data) else {
+            return nil
+        }
+        cache.setObject(decoded, forKey: url as NSURL)
+        try? data.write(to: diskURL, options: .atomic)
+        return decoded
+    }
+}
+
 /// Renders a profile's avatar: the synced catalog image over its accent color,
 /// a custom web image, or the brand gradient when no avatar is set.
 struct ProfileAvatarView: View {
@@ -476,6 +550,7 @@ struct ProfileAvatarView: View {
     var isFocused: Bool = false
 
     @ObservedObject private var catalog = AvatarCatalogStore.shared
+    @State private var loadedImage: UIImage? = nil
 
     var body: some View {
         let catalogItem = catalog.item(for: avatarId)
@@ -495,15 +570,11 @@ struct ProfileAvatarView: View {
                 )
             }
 
-            if let imageURL {
-                AsyncImage(url: imageURL) { phase in
-                    if let image = phase.image {
-                        image.resizable().aspectRatio(contentMode: .fill)
-                    } else {
-                        Color.clear
-                    }
-                }
-            } else if catalogItem == nil {
+            if let displayImage = currentImage(for: imageURL) {
+                Image(uiImage: displayImage)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+            } else if catalogItem == nil && imageURL == nil {
                 Image(systemName: "sparkles")
                     .font(.system(size: size * 0.42, weight: .bold))
                     .foregroundColor(.white)
@@ -517,7 +588,20 @@ struct ProfileAvatarView: View {
                 .stroke(isFocused ? AppFocusOutline.color : Color.white.opacity(0.28), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .shadow(color: .black.opacity(0.24), radius: isFocused ? 24 : 10, x: 0, y: 8)
-        .onAppear { catalog.loadIfNeeded() }
+        .task(id: imageURL) {
+            guard let imageURL else { return }
+            if let img = await ProfileAvatarCache.shared.fetchImage(for: imageURL) {
+                self.loadedImage = img
+            }
+        }
+    }
+
+    private func currentImage(for url: URL?) -> UIImage? {
+        guard let url else { return nil }
+        if let hit = ProfileAvatarCache.shared.image(for: url) {
+            return hit
+        }
+        return loadedImage
     }
 }
 

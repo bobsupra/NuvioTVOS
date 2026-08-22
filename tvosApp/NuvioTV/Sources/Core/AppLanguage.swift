@@ -341,6 +341,10 @@ enum L10n {
             return string("nav_library", fallback: "Library")
         case "Default":
             return string("tvos_settings_option_default", fallback: "Default")
+        case "Streaming Style":
+            return string("layout_cw_sort_streaming", fallback: "Streaming Style")
+        case "Separate Upcoming Row":
+            return string("layout_cw_sort_separate_upcoming", fallback: "Separate Upcoming Row")
         case "Recently watched":
             return string("tvos_settings_option_recently_watched", fallback: "Recently watched")
         case "Release order":

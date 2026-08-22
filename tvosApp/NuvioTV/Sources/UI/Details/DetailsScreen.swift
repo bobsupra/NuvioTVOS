@@ -1954,11 +1954,26 @@ struct TvDetailsContent: View {
         }
 
         // No progress entry (e.g. the episode just finished): continue with the
-        // first episode that hasn't been watched yet.
+        // episode after the furthest completed/watched episode, ignoring earlier skipped episodes.
         let watched = WatchedStore.watchedEpisodeKeys(meta: meta)
-        if !watched.isEmpty,
-           let next = episodes.first(where: { $0.season > 0 && !watched.contains("\($0.season):\($0.episode)") }) {
-            return (next, "Next S\(next.season) E\(next.episode)", true)
+        if !watched.isEmpty {
+            let watchedPairs: [(season: Int, episode: Int)] = watched.compactMap { key in
+                let parts = key.split(separator: ":").compactMap { Int($0) }
+                guard parts.count == 2, parts[0] > 0, parts[1] > 0 else { return nil }
+                return (parts[0], parts[1])
+            }
+            if let latestWatched = watchedPairs.max(by: { ($0.season, $0.episode) < ($1.season, $1.episode) }),
+               let next = episodes.first(where: {
+                   $0.season > 0
+                       && ($0.season, $0.episode) > (latestWatched.season, latestWatched.episode)
+                       && !watched.contains("\($0.season):\($0.episode)")
+               }) {
+                let verb = EpisodeReleasePolicy.hasAired(next.released) ? "Next" : "Upcoming"
+                return (next, "\(verb) S\(next.season) E\(next.episode)", EpisodeReleasePolicy.hasAired(next.released))
+            }
+            if let firstUnwatched = episodes.first(where: { $0.season > 0 && !watched.contains("\($0.season):\($0.episode)") }) {
+                return (firstUnwatched, "Next S\(firstUnwatched.season) E\(firstUnwatched.episode)", true)
+            }
         }
 
         let first = firstPlayableEpisode(episodes)
@@ -3437,6 +3452,9 @@ private struct TvEpisodeCard: View {
     let restrictFocusToKey: String?
     let onMoveDown: () -> Void
 
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+
     private var cardKey: String { TvEpisodeFocus.card(video.id) }
     private var watchedKey: String { TvEpisodeFocus.watched(video.id) }
     private var isFocused: Bool { focus.wrappedValue == cardKey }
@@ -3445,6 +3463,14 @@ private struct TvEpisodeCard: View {
     private let cardWidth: CGFloat = TvEpisodeCardLayout.width
     private let thumbHeight: CGFloat = 300
     private let cardHeight: CGFloat = TvEpisodeCardLayout.height
+
+    private var episodeCornerRadius: CGFloat {
+        AppCardStyle.episodeCornerRadius(for: cardCornerRadiusSetting)
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: episodeCornerRadius, style: .continuous)
+    }
 
     var body: some View {
         ZStack(alignment: .topTrailing) {
@@ -3469,7 +3495,16 @@ private struct TvEpisodeCard: View {
                         .foregroundColor(.white)
                         .padding(.horizontal, 16)
                         .padding(.vertical, 8)
-                        .background(Color.black.opacity(0.52), in: Capsule())
+                        .background {
+                            if liquidGlassCards {
+                                Capsule()
+                                    .fill(Color.white.opacity(0.14))
+                                    .modifier(LiquidGlassBadgeModifier(cornerRadius: 16))
+                            } else {
+                                Capsule()
+                                    .fill(Color.black.opacity(0.52))
+                            }
+                        }
 
                     Text(video.title)
                         .font(.system(size: 30, weight: .bold))
@@ -3511,16 +3546,52 @@ private struct TvEpisodeCard: View {
                     continueProgressOverlay
                 }
                 .frame(width: cardWidth, height: cardHeight)
-                .background(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .fill(isFocused ? Color(white: 0.17) : Color.tvCard)
-                )
-                .clipShape(RoundedRectangle(cornerRadius: 24, style: .continuous))
+                .background {
+                    if liquidGlassCards {
+                        #if os(tvOS)
+                        if #available(tvOS 26.0, *) {
+                            shape
+                                .fill(isFocused ? Color.white.opacity(0.18) : Color.white.opacity(0.08))
+                                .glassEffect(.regular, in: shape)
+                        } else {
+                            shape
+                                .fill(.ultraThinMaterial)
+                                .overlay(
+                                    shape.fill(isFocused ? Color.white.opacity(0.16) : Color.white.opacity(0.06))
+                                )
+                        }
+                        #else
+                        shape
+                            .fill(.ultraThinMaterial)
+                            .overlay(
+                                shape.fill(isFocused ? Color.white.opacity(0.16) : Color.white.opacity(0.06))
+                            )
+                        #endif
+                    } else {
+                        shape.fill(isFocused ? Color(white: 0.17) : Color.tvCard)
+                    }
+                }
+                .clipShape(shape)
+                .overlay {
+                    if liquidGlassCards {
+                        shape.strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(isFocused ? 0.65 : 0.28),
+                                    Color.white.opacity(isFocused ? 0.20 : 0.08),
+                                    Color.white.opacity(isFocused ? 0.40 : 0.14)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: isFocused ? 2 : 1
+                        )
+                    }
+                }
                 .overlay(
-                    RoundedRectangle(cornerRadius: 24, style: .continuous)
-                        .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
+                    shape.stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
                 )
-                .shadow(color: .black.opacity(isFocused ? 0.4 : 0.16), radius: isFocused ? 26 : 10, y: 12)
+                .shadow(color: .black.opacity(isFocused ? (liquidGlassCards ? 0.5 : 0.4) : 0.16), radius: isFocused ? 26 : 10, y: 12)
                 // The badge is part of the card's own content, so it scales and
                 // fades with the card and can never be left behind by whatever
                 // is drawn over the top. The focusable control below only draws

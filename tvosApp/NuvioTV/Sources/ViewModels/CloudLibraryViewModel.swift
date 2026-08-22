@@ -6,6 +6,8 @@ import SwiftUI
 @MainActor
 final class CloudLibraryViewModel: ObservableObject {
     @Published private(set) var items: [CloudItem] = []
+    @Published var selectedProviderId: String? = nil
+    @Published var selectedType: CloudItemType? = nil
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
     /// `stableKey`+file id currently being resolved, so its row can show a spinner.
@@ -17,6 +19,26 @@ final class CloudLibraryViewModel: ObservableObject {
         self.service = CloudLibraryService(store: store)
     }
 
+    var isAvailable: Bool { service.isAvailable }
+
+    var availableProviders: [ConnectedCloudProvider] { service.connectedProviders }
+
+    var availableTypes: [CloudItemType] {
+        let matchingProviderItems = items.filter { item in
+            selectedProviderId == nil || item.providerId == selectedProviderId
+        }
+        let types = Array(Set(matchingProviderItems.map(\.type))).sorted { $0.rawValue < $1.rawValue }
+        return types.isEmpty ? CloudItemType.allCases : types
+    }
+
+    var filteredItems: [CloudItem] {
+        items.filter { item in
+            let matchesProvider = selectedProviderId == nil || item.providerId == selectedProviderId
+            let matchesType = selectedType == nil || item.type == selectedType
+            return matchesProvider && matchesType
+        }
+    }
+
     var providerName: String { service.providerName ?? "Cloud" }
 
     func load() async {
@@ -24,11 +46,13 @@ final class CloudLibraryViewModel: ObservableObject {
         errorMessage = nil
         do {
             items = try await service.loadItems()
-            if items.isEmpty { errorMessage = "No files in your \(providerName) cloud." }
+            if items.isEmpty {
+                errorMessage = L10n.string("cloud_library_empty_message", fallback: "No playable cloud files match the current filters.")
+            }
         } catch is CancellationError {
             // Screen went away; ignore.
         } catch {
-            errorMessage = "Couldn't load your \(providerName) library."
+            errorMessage = L10n.string("cloud_library_load_failed", fallback: "Couldn't load your \(providerName) library.")
         }
         isLoading = false
     }
@@ -46,11 +70,11 @@ final class CloudLibraryViewModel: ObservableObject {
             case let .success(url, filename, _):
                 onResolved(url, .cloudPlaceholder(id: "cloud:\(file.id)", name: filename ?? file.name))
             case .missingCredentials:
-                errorMessage = "Add your \(providerName) API key in Settings."
+                errorMessage = L10n.string("cloud_library_play_not_connected", fallback: "Add your \(providerName) API key in Settings.")
             case .notPlayable:
-                errorMessage = "That file can't be played."
+                errorMessage = L10n.string("cloud_library_no_playable_files", fallback: "That file can't be played.")
             case let .failed(message):
-                errorMessage = message ?? "Couldn't get a link for that file."
+                errorMessage = message ?? L10n.string("cloud_library_play_failed", fallback: "Couldn't get a link for that file.")
             }
         }
     }

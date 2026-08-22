@@ -452,6 +452,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
+        let t0 = CFAbsoluteTimeGetCurrent()
         Self.homeAddonFetchDiagnostic = "loading"
         print("Home addons: \(Self.configuredStreamAddonManifestURLs.count) configured manifest url(s)")
 
@@ -546,8 +547,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
             )
         }
 
+        let tEnd = CFAbsoluteTimeGetCurrent()
         Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
-        print("Home addons: \(Self.homeAddonFetchDiagnostic)")
+        print("Home addons: \(Self.homeAddonFetchDiagnostic) (total \(String(format: "%.1f", (tEnd - t0)*1000))ms)")
         return (orderedAddonCatalogs(catalogs), hadFailures)
     }
 
@@ -626,7 +628,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // phone app (tmdb:, kitsu:, ...) must come from the configured add-ons.
         if resolvedId.hasPrefix("tt") {
             do {
-                let url = baseURL.appendingPathComponent("meta/\(metaType)/\(resolvedId).json")
+                let url = baseURL
+                    .appendingPathComponent("meta")
+                    .appendingPathComponent(metaType)
+                    .appendingPathComponent("\(resolvedId).json")
                 let response: CinemetaMetaResponse = try await fetch(url)
                 let meta = await TmdbDetailsService.localizedMetadata(
                     for: response.meta.toMeta(fallbackType: metaType)
@@ -692,10 +697,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
-    /// Full ordered add-on state for Settings. The legacy URL fields are still
-    /// merged in so manually pasted add-ons appear even before a state blob exists.
-    static var configuredStreamAddonPreferences: [StreamAddonPreference] {
-        let defaults = ProfileSettings.current
+    static func configuredStreamAddonPreferences(in defaults: UserDefaults = ProfileSettings.current) -> [StreamAddonPreference] {
         var preferences: [StreamAddonPreference] = []
         if let json = defaults.string(forKey: SettingsKey.streamAddonManifestStates),
            let data = json.data(using: .utf8),
@@ -706,6 +708,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
             StreamAddonPreference(url: $0.absoluteString, enabled: true)
         })
         return normalizedPreferences(preferences)
+    }
+
+    /// Full ordered add-on state for Settings. The legacy URL fields are still
+    /// merged in so manually pasted add-ons appear even before a state blob exists.
+    static var configuredStreamAddonPreferences: [StreamAddonPreference] {
+        configuredStreamAddonPreferences(in: ProfileSettings.current)
     }
 
     static func setConfiguredStreamAddonPreferences(

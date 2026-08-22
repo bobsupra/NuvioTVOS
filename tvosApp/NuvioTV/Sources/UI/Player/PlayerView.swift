@@ -11,6 +11,7 @@ struct PlayerView: View {
     let httpHeaders: [String: String]
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
+    var playbackOrigin: PlaybackOrigin = .main
     /// Episode context for the in-player Next Episode card. Empty for movies/trailers.
     var episodes: [NuvioVideo] = []
     var currentEpisode: NuvioVideo? = nil
@@ -357,7 +358,8 @@ struct PlayerView: View {
                 subtitle: subtitle,
                 httpHeaders: httpHeaders,
                 externalSubtitles: externalSubtitles,
-                resumeFrom: resumeFrom
+                resumeFrom: resumeFrom,
+                playbackOrigin: playbackOrigin
             )
             if subtitle != PlaybackMarkers.trailerSubtitle {
                 viewModel.fetchExternalSubtitles(
@@ -379,8 +381,15 @@ struct PlayerView: View {
             }
         }
         .onDisappear {
-            PlaybackWakeLock.release()
-            viewModel.shutdown()
+            if !PictureInPictureManager.shared.isPictureInPictureActive {
+                PlaybackWakeLock.release()
+                viewModel.shutdown()
+            }
+        }
+        .onChange(of: viewModel.isPictureInPictureActive) { _, isActive in
+            if isActive {
+                onBack()
+            }
         }
         .onChange(of: viewModel.status) { _, status in
             // Keep reasserting while the player is up — never re-enable sleep
@@ -637,10 +646,15 @@ struct AetherPlayerSurface: UIViewControllerRepresentable {
     let controller: AetherPlaybackController
 
     func makeUIViewController(context: Context) -> AetherPlaybackController {
-        controller
+        controller.rebindSurface()
+        PictureInPictureManager.shared.fullscreenSurfaceDidRebind()
+        return controller
     }
 
-    func updateUIViewController(_ uiViewController: AetherPlaybackController, context: Context) {}
+    func updateUIViewController(_ uiViewController: AetherPlaybackController, context: Context) {
+        uiViewController.rebindSurface()
+        PictureInPictureManager.shared.fullscreenSurfaceDidRebind()
+    }
 }
 
 private struct RemoteSeekPressCatcher: UIViewControllerRepresentable {

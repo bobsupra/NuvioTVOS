@@ -46,19 +46,19 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.2.9** is the latest tvOS release.
+**Beta 3.3** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.2.9/NuvioTV-3.2.9-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.2.9) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3/NuvioTV-3.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.2.9
+### New in Beta 3.3
 
-- Adds native SMB network file sharing and Jellyfin server streaming with intelligent filename parsing and credential management (**Settings → Integrations → Local Servers**).
-- Refactors PosterCard into modular components with unified badge overlays, progress bars, and smoother focus styling.
-- Hardens Simkl authentication, token refresh lifecycle, and Nuvio sync error handling.
-- Strengthens stream quality tag parsing for 4K UHD, HDR10+, Dolby Vision, Dolby Atmos, and IMAX Enhanced.
+- Introduces **Cloud Library** to browse, index, search, and stream remote cloud storage and debrid torrent downloads directly within Nuvio TV.
+- Adds native Apple TV **Picture in Picture (PiP)** support for Aether playback with dynamic surface rebinding and background continuation.
+- Overhauls the **Library** view with new filtering tabs, customizable sorting, and refined responsive poster grids.
+- Upgrades player side panels with live audio delay, subtitle timing offsets, audio boost, and enhanced subtitle styling.
 
 ### The new player
 

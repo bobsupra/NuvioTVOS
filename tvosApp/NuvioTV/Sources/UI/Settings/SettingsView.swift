@@ -158,6 +158,9 @@ enum SettingsKey {
     static let continueWatchingSort = "nuvio.tv.settings.layout.continueWatchingSort"
     static let upNextFromFurthestEpisode = "nuvio.tv.settings.layout.upNextFromFurthestEpisode"
     static let showUnairedNextUp = "nuvio.tv.settings.layout.showUnairedNextUp"
+    static let cardCornerRadius = "nuvio.tv.settings.layout.cardCornerRadius"
+    static let cardSize = "nuvio.tv.settings.layout.cardSize"
+    static let liquidGlassCards = "nuvio.tv.settings.layout.liquidGlassCards"
     static let hideUnreleased = "nuvio.tv.settings.layout.hideUnreleased"
     static let showFullDates = "nuvio.tv.settings.layout.showFullDates"
 
@@ -277,6 +280,7 @@ enum SettingsKey {
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
         searchStyle,
         continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
+        cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates,
         traktConnected, traktClientID, traktClientSecret,
         traktContinueWatchingDaysCap, traktShowMetaComments,
@@ -1939,7 +1943,11 @@ private struct AppearanceSettingsView: View {
     @AppStorage(SettingsKey.language) private var languageTag = ""
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.amoledSurfaces) private var amoledSurfaces = false
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @ObservedObject private var localeManager = AppLocaleManager.shared
+
+    private let cardRadiusOptions = CardCornerRadiusOption.allCases.map(\.rawValue)
 
     private var accentSwatches: [SettingsSwatch] {
         SettingsAccent.allCases.map { SettingsSwatch(id: $0.rawValue, label: $0.rawValue, color: $0.color) }
@@ -1955,6 +1963,46 @@ private struct AppearanceSettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(
+                title: L10n.string("settings_poster_card_style", fallback: "Card & Poster Style"),
+                subtitle: L10n.string(
+                    "settings_poster_description",
+                    fallback: "Customize card corner radius and Apple TV liquid glass appearance"
+                )
+            ) {
+                CardStyleLivePreview(
+                    cornerRadiusOption: CardCornerRadiusOption.from(rawValue: cardCornerRadius),
+                    isLiquidGlass: liquidGlassCards,
+                    accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("settings_poster_card_radius", fallback: "Corner Radius"),
+                    subtitle: L10n.string(
+                        "tvos_card_radius_subtitle",
+                        fallback: "Choose sharp, subtle, classic, rounded, or pill card corners"
+                    ),
+                    selection: $cardCornerRadius,
+                    options: cardRadiusOptions,
+                    accentColor: accentColor
+                )
+                .onAppear {
+                    if CardCornerRadiusOption(rawValue: cardCornerRadius) == nil {
+                        cardCornerRadius = CardCornerRadiusOption.from(rawValue: cardCornerRadius).rawValue
+                    }
+                }
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_liquid_glass_cards", fallback: "Liquid Glass Cards"),
+                    subtitle: L10n.string(
+                        "tvos_liquid_glass_cards_subtitle",
+                        fallback: "Apply Apple TV frosted liquid glass effect, specular reflections, and translucent materials to portrait, landscape, and episode cards"
+                    ),
+                    isOn: $liquidGlassCards,
+                    accentColor: accentColor
+                )
+            }
+
             SettingsGroup(
                 title: L10n.string("tvos_appearance_focus_outline", fallback: "Focus Outline"),
                 subtitle: L10n.string(
@@ -2038,6 +2086,585 @@ private struct AppearanceSettingsView: View {
                 languageTag = resolved.tag
             }
         }
+        .onChange(of: cardCornerRadius) { _, _ in
+            ProfileSettings.notifySettingsChanged()
+        }
+        .onChange(of: theme) { _, _ in
+            ProfileSettings.notifySettingsChanged()
+        }
+        .onChange(of: bodyColor) { _, _ in
+            ProfileSettings.notifySettingsChanged()
+        }
+        .onChange(of: amoled) { _, _ in
+            ProfileSettings.notifySettingsChanged()
+        }
+        .onChange(of: liquidGlassCards) { _, _ in
+            ProfileSettings.notifySettingsChanged()
+        }
+    }
+}
+
+// MARK: - Card Style Live Preview
+
+private struct CardStyleLivePreview: View {
+    let cornerRadiusOption: CardCornerRadiusOption
+    let isLiquidGlass: Bool
+    let accentColor: Color
+
+    private var portraitRadius: CGFloat {
+        cornerRadiusOption.radius
+    }
+
+    private var landscapeRadius: CGFloat {
+        AppCardStyle.episodeCornerRadius(for: cornerRadiusOption.rawValue)
+    }
+
+    var body: some View {
+        VStack(spacing: 16) {
+            HStack(spacing: 28) {
+                // Portrait Poster Preview
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("PORTRAIT")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.white.opacity(0.55))
+                        .tracking(1.2)
+
+                    ZStack(alignment: .bottomLeading) {
+                        LinearGradient(
+                            colors: [
+                                accentColor.opacity(0.35),
+                                Color(red: 0.14, green: 0.08, blue: 0.26),
+                                Color(red: 0.06, green: 0.04, blue: 0.12)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+
+                        Image(systemName: "film.stack.fill")
+                            .font(.system(size: 38))
+                            .foregroundColor(.white.opacity(0.35))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        LinearGradient(
+                            colors: [.clear, .black.opacity(0.85)],
+                            startPoint: .center,
+                            endPoint: .bottom
+                        )
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Interstellar")
+                                .font(.system(size: 16, weight: .bold))
+                                .foregroundColor(.white)
+                            Text("★ 8.7 · 2014")
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.65))
+                        }
+                        .padding(12)
+                    }
+                    .frame(width: 140, height: 210)
+                    .clipShape(RoundedRectangle(cornerRadius: portraitRadius, style: .continuous))
+                    .modifier(
+                        LiquidGlassCardModifier(
+                            cornerRadius: portraitRadius,
+                            isFocused: true,
+                            isEnabled: isLiquidGlass
+                        )
+                    )
+                    .overlay(
+                        RoundedRectangle(cornerRadius: portraitRadius, style: .continuous)
+                            .stroke(AppFocusOutline.color, lineWidth: AppFocusOutline.width)
+                    )
+                }
+
+                // Landscape / Episode Card Preview
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("LANDSCAPE / EPISODE")
+                        .font(.system(size: 13, weight: .bold))
+                        .foregroundColor(.white.opacity(0.55))
+                        .tracking(1.2)
+
+                    ZStack(alignment: .bottomLeading) {
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.10, green: 0.18, blue: 0.32),
+                                Color(red: 0.05, green: 0.08, blue: 0.16)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+
+                        Image(systemName: "play.tv.fill")
+                            .font(.system(size: 38))
+                            .foregroundColor(.white.opacity(0.30))
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+
+                        // Episode badge
+                        VStack {
+                            HStack {
+                                Spacer()
+                                Text("EPISODE 4")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 12)
+                                    .padding(.vertical, 6)
+                                    .background {
+                                        if isLiquidGlass {
+                                            Capsule()
+                                                .fill(Color.white.opacity(0.18))
+                                                .modifier(LiquidGlassBadgeModifier(cornerRadius: 12))
+                                        } else {
+                                            Capsule().fill(Color.black.opacity(0.60))
+                                        }
+                                    }
+                                    .padding(12)
+                            }
+                            Spacer()
+                        }
+
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.1),
+                                .init(color: .black.opacity(0.85), location: 0.75)
+                            ],
+                            startPoint: .center,
+                            endPoint: .bottom
+                        )
+
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Point of No Return")
+                                .font(.system(size: 18, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                            Text("48m remaining")
+                                .font(.system(size: 13, weight: .medium))
+                                .foregroundColor(.white.opacity(0.65))
+
+                            // Mini progress bar
+                            GeometryReader { pGeo in
+                                ZStack(alignment: .leading) {
+                                    Capsule().fill(Color.white.opacity(0.20))
+                                    Capsule().fill(accentColor)
+                                        .frame(width: pGeo.size.width * 0.65)
+                                }
+                            }
+                            .frame(height: 4)
+                            .padding(.top, 4)
+                        }
+                        .padding(14)
+                    }
+                    .frame(width: 340, height: 210)
+                    .clipShape(RoundedRectangle(cornerRadius: landscapeRadius, style: .continuous))
+                    .modifier(
+                        LiquidGlassCardModifier(
+                            cornerRadius: landscapeRadius,
+                            isFocused: true,
+                            isEnabled: isLiquidGlass
+                        )
+                    )
+                }
+            }
+            .padding(.vertical, 16)
+            .padding(.horizontal, 24)
+            .frame(maxWidth: .infinity)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.04))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .stroke(Color.white.opacity(0.08), lineWidth: 1)
+            )
+        }
+        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: cornerRadiusOption)
+        .animation(.spring(response: 0.32, dampingFraction: 0.78), value: isLiquidGlass)
+    }
+}
+
+// MARK: - Home Layout Live Preview
+
+private struct HomeLayoutLivePreview: View {
+    let layout: String
+    let heroEnabled: Bool
+    let posterLabels: Bool
+    let catalogAddonNames: Bool
+    let accentColor: Color
+
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadius = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+
+    private func cardCornerRadius(forWidth width: CGFloat, isLandscape: Bool = false) -> CGFloat {
+        let opt = CardCornerRadiusOption.from(rawValue: cardCornerRadius)
+        if opt == .sharp { return 0 }
+        if isLandscape {
+            let fullRadius = AppCardStyle.episodeCornerRadius(for: cardCornerRadius)
+            return max(1, fullRadius * (width / 340.0))
+        } else {
+            let fullRadius = opt.radius
+            return max(1, fullRadius * (width / 210.0))
+        }
+    }
+
+    private var miniCornerRadius: CGFloat {
+        cardCornerRadius(forWidth: 66, isLandscape: false)
+    }
+
+    private var miniShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: miniCornerRadius, style: .continuous)
+    }
+
+    private var miniLandscapeCornerRadius: CGFloat {
+        cardCornerRadius(forWidth: 172, isLandscape: true)
+    }
+
+    private var miniLandscapeShape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: miniLandscapeCornerRadius, style: .continuous)
+    }
+
+    private struct MovieItem {
+        let title: String
+        let colors: [Color]
+        let hasWatchedBadge: Bool
+    }
+
+    private let movies: [MovieItem] = [
+        MovieItem(title: "The Invite", colors: [Color(red: 0.76, green: 0.65, blue: 0.48), Color(red: 0.18, green: 0.12, blue: 0.08)], hasWatchedBadge: false),
+        MovieItem(title: "Don't Say Good Luck", colors: [Color(red: 0.28, green: 0.48, blue: 0.36), Color(red: 0.08, green: 0.16, blue: 0.10)], hasWatchedBadge: false),
+        MovieItem(title: "Project Hail Mary", colors: [Color(red: 0.20, green: 0.45, blue: 0.72), Color(red: 0.05, green: 0.12, blue: 0.25)], hasWatchedBadge: true),
+        MovieItem(title: "Masters of Universe", colors: [Color(red: 0.78, green: 0.35, blue: 0.18), Color(red: 0.22, green: 0.08, blue: 0.06)], hasWatchedBadge: false),
+        MovieItem(title: "Disclosure Day", colors: [Color(red: 0.45, green: 0.60, blue: 0.68), Color(red: 0.12, green: 0.16, blue: 0.20)], hasWatchedBadge: false),
+        MovieItem(title: "Severance", colors: [Color(red: 0.15, green: 0.45, blue: 0.55), Color(red: 0.04, green: 0.10, blue: 0.15)], hasWatchedBadge: false),
+        MovieItem(title: "Fallout", colors: [Color(red: 0.75, green: 0.55, blue: 0.15), Color(red: 0.18, green: 0.12, blue: 0.04)], hasWatchedBadge: true)
+    ]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            // Centered 16:9 Widescreen TV Mockup
+            ZStack(alignment: .topLeading) {
+                // Cinematic Full-Bleed Ambient Backdrop
+                ZStack {
+                    LinearGradient(
+                        colors: [
+                            Color(red: 0.14, green: 0.18, blue: 0.24),
+                            Color(red: 0.08, green: 0.10, blue: 0.14),
+                            Color(red: 0.04, green: 0.05, blue: 0.08)
+                        ],
+                        startPoint: .topTrailing,
+                        endPoint: .bottomLeading
+                    )
+
+                    // Left & Bottom gradient shadow
+                    LinearGradient(
+                        stops: [
+                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.95), location: 0.0),
+                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.70), location: 0.45),
+                            .init(color: .clear, location: 0.85)
+                        ],
+                        startPoint: .leading,
+                        endPoint: .trailing
+                    )
+
+                    LinearGradient(
+                        stops: [
+                            .init(color: .clear, location: 0.2),
+                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.85), location: 0.7),
+                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08), location: 1.0)
+                        ],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                }
+
+                // Screen Layout Contents
+                VStack(alignment: .leading, spacing: 6) {
+                    Spacer(minLength: 0)
+
+                    if heroEnabled {
+                        heroDetailsSection
+                            .transition(.opacity.combined(with: .scale(scale: 0.98, anchor: .top)))
+                    }
+
+                    if layout == "Grid View" {
+                        gridViewSection
+                            .transition(.opacity)
+                    } else if layout == "Compact" {
+                        compactRowsSection
+                            .transition(.opacity)
+                    } else {
+                        modernRowsSection
+                            .transition(.opacity)
+                    }
+                }
+                .padding(.horizontal, 20)
+                .padding(.top, 12)
+                .padding(.bottom, 8)
+            }
+            .frame(width: 640, height: 330)
+            .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .stroke(Color.white.opacity(0.12), lineWidth: 1)
+            )
+            .shadow(color: .black.opacity(0.50), radius: 20, y: 8)
+        }
+        .padding(.vertical, 16)
+        .padding(.horizontal, 24)
+        .frame(maxWidth: .infinity)
+        .background(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 18, style: .continuous)
+                .stroke(Color.white.opacity(0.08), lineWidth: 1)
+        )
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: layout)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: heroEnabled)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: posterLabels)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: catalogAddonNames)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: cardCornerRadius)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: liquidGlassCards)
+    }
+
+    // MARK: - Hero Details Section (Matches Modern Home reference)
+
+    private var heroDetailsSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            // Glowing stylized title logo
+            Text("OBSESSION")
+                .font(.system(size: 24, weight: .black, design: .rounded))
+                .foregroundStyle(
+                    LinearGradient(
+                        colors: [.white, Color(red: 0.85, green: 0.92, blue: 1.0)],
+                        startPoint: .top,
+                        endPoint: .bottom
+                    )
+                )
+
+            // Metadata line
+            HStack(spacing: 5) {
+                Text("Movie · Horror · 1h 49m · May 15, 2026 · IMDb 7.9")
+                    .font(.system(size: 9, weight: .medium))
+                    .foregroundColor(.white.opacity(0.70))
+            }
+
+            // Multi-line synopsis
+            Text("After breaking the mysterious \"One Wish Willow\" to win his crush's heart, a hopeless romantic finds himself getting exactly what he asked for but soon discovers that some desires come at a dark, sinister price.")
+                .font(.system(size: 7.8, weight: .regular))
+                .foregroundColor(.white.opacity(0.68))
+                .lineLimit(2)
+                .frame(maxWidth: 420, alignment: .leading)
+                .lineSpacing(1.5)
+        }
+        .padding(.bottom, 4)
+    }
+
+    // MARK: - Row Header
+
+    @ViewBuilder
+    private func rowHeader(title: String, addon: String) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.system(size: 11.5, weight: .bold))
+                .foregroundColor(.white.opacity(0.92))
+
+            if catalogAddonNames {
+                Text(addon)
+                    .font(.system(size: 8, weight: .semibold))
+                    .foregroundColor(accentColor)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(accentColor.opacity(0.18), in: Capsule())
+            }
+        }
+    }
+
+    // MARK: - Modern Rows Layout (Expanded 16:9 Focused Card + Portrait Row)
+
+    private var modernRowsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            // First Row
+            VStack(alignment: .leading, spacing: 4) {
+                rowHeader(title: "Popular - Movies", addon: "Cinemeta")
+
+                HStack(spacing: 10) {
+                    // 1. FOCUSED CARD (Expands to 16:9 Landscape Card)
+                    VStack(alignment: .leading, spacing: 2) {
+                        ZStack {
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.12, green: 0.18, blue: 0.28),
+                                    Color(red: 0.05, green: 0.07, blue: 0.12)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+
+                            VStack(spacing: 2) {
+                                Text("FOCUS")
+                                    .font(.system(size: 13, weight: .heavy, design: .monospaced))
+                                    .tracking(3)
+                                    .foregroundStyle(
+                                        LinearGradient(
+                                            colors: [.cyan, .white, .orange],
+                                            startPoint: .leading,
+                                            endPoint: .trailing
+                                        )
+                                    )
+                                Text("F E A T U R E S")
+                                    .font(.system(size: 6, weight: .bold))
+                                    .tracking(2)
+                                    .foregroundColor(.white.opacity(0.70))
+                            }
+                        }
+                        .frame(width: 172, height: 98)
+                        .clipShape(miniLandscapeShape)
+                        .modifier(
+                            LiquidGlassCardModifier(
+                                cornerRadius: miniLandscapeCornerRadius,
+                                isFocused: true,
+                                isEnabled: liquidGlassCards
+                            )
+                        )
+                        .overlay(
+                            miniLandscapeShape
+                                .stroke(AppFocusOutline.color, lineWidth: 2)
+                        )
+
+                        if posterLabels {
+                            Text("Obsession")
+                                .font(.system(size: 7.5, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
+                                .frame(width: 172, alignment: .leading)
+                        }
+                    }
+
+                    // 2. PORTRAIT POSTER CARDS
+                    ForEach(0..<5, id: \.self) { idx in
+                        let item = movies[idx % movies.count]
+                        miniPortraitCard(width: 66, height: 98, item: item)
+                    }
+                }
+            }
+
+            // Second Row Peeking (Popular - Series)
+            VStack(alignment: .leading, spacing: 4) {
+                rowHeader(title: "Popular - Series", addon: "TMDB")
+
+                HStack(spacing: 10) {
+                    ForEach(2..<8, id: \.self) { idx in
+                        let item = movies[idx % movies.count]
+                        miniPortraitCard(width: 66, height: 40, item: item, isPeeking: true)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Compact Rows Layout
+
+    private var compactRowsSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            VStack(alignment: .leading, spacing: 4) {
+                rowHeader(title: "Popular - Movies", addon: "Cinemeta")
+
+                HStack(spacing: 8) {
+                    ForEach(0..<8, id: \.self) { idx in
+                        let item = movies[idx % movies.count]
+                        miniPortraitCard(width: 62, height: 86, item: item, isFocused: idx == 0)
+                    }
+                }
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                rowHeader(title: "Popular - Series", addon: "TMDB")
+
+                HStack(spacing: 8) {
+                    ForEach(1..<9, id: \.self) { idx in
+                        let item = movies[idx % movies.count]
+                        miniPortraitCard(width: 62, height: 86, item: item)
+                    }
+                }
+            }
+        }
+    }
+
+    // MARK: - Grid View Layout
+
+    private var gridViewSection: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            rowHeader(title: "All Catalogs Grid", addon: "7 × 3 Grid")
+
+            LazyVGrid(
+                columns: Array(repeating: GridItem(.fixed(75), spacing: 10), count: 7),
+                spacing: 6
+            ) {
+                ForEach(0..<(heroEnabled ? 7 : 14), id: \.self) { idx in
+                    let item = movies[idx % movies.count]
+                    miniPortraitCard(width: 75, height: heroEnabled ? 80 : 92, item: item, isFocused: idx == 0)
+                }
+            }
+        }
+    }
+
+    // MARK: - Mini Portrait Card
+
+    private func miniPortraitCard(
+        width: CGFloat,
+        height: CGFloat,
+        item: MovieItem,
+        isFocused: Bool = false,
+        isPeeking: Bool = false
+    ) -> some View {
+        let radius = cardCornerRadius(forWidth: width, isLandscape: false)
+        let shape = RoundedRectangle(cornerRadius: radius, style: .continuous)
+
+        return VStack(alignment: .leading, spacing: 2) {
+            ZStack(alignment: .topTrailing) {
+                LinearGradient(
+                    colors: item.colors,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                // Watched checkmark badge (like Project Hail Mary in screenshot)
+                if item.hasWatchedBadge && !isPeeking {
+                    Circle()
+                        .fill(Color(red: 0.10, green: 0.75, blue: 0.40))
+                        .frame(width: 12, height: 12)
+                        .overlay(
+                            Image(systemName: "checkmark")
+                                .font(.system(size: 7, weight: .heavy))
+                                .foregroundColor(.white)
+                        )
+                        .padding(4)
+                }
+            }
+            .frame(width: width, height: height)
+            .clipShape(shape)
+            .modifier(
+                LiquidGlassCardModifier(
+                    cornerRadius: radius,
+                    isFocused: isFocused,
+                    isEnabled: liquidGlassCards
+                )
+            )
+            .overlay(
+                shape
+                    .stroke(
+                        isFocused ? AppFocusOutline.color : Color.clear,
+                        lineWidth: isFocused ? 2 : 0
+                    )
+            )
+
+            if posterLabels && !isPeeking {
+                Text(item.title)
+                    .font(.system(size: 7, weight: isFocused ? .bold : .medium))
+                    .foregroundColor(isFocused ? .white : .white.opacity(0.65))
+                    .lineLimit(1)
+                    .frame(width: width, alignment: .leading)
+            }
+        }
     }
 }
 
@@ -2065,7 +2692,7 @@ private struct LayoutDiscoverySettingsView: View {
     // Do not offer Home/Library as dead selections that merely hide Discover.
     private let discoverLocations = ["Search", "Off"]
     private let searchStyles = ["Netflix", "Classic"]
-    private let continueWatchingSorts = ["Default", "Recently watched", "Release order", "Next up"]
+    private let continueWatchingSorts = ["Default", "Streaming Style", "Separate Upcoming Row"]
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
@@ -2076,11 +2703,19 @@ private struct LayoutDiscoverySettingsView: View {
                     fallback: "How the home screen presents rows and artwork"
                 )
             ) {
+                HomeLayoutLivePreview(
+                    layout: homeLayout,
+                    heroEnabled: heroEnabled,
+                    posterLabels: posterLabels,
+                    catalogAddonNames: catalogAddonNames,
+                    accentColor: accentColor
+                )
+
                 SettingsOptionRow(
                     title: L10n.string("tvos_layout_layout", fallback: "Layout"),
                     subtitle: L10n.string(
                         "tvos_layout_layout_subtitle",
-                        fallback: "Modern and Compact use rows; Grid View shows each catalog in a 6 by 3 poster grid"
+                        fallback: "Modern and Compact use rows; Grid View shows each catalog in a 7 by 3 poster grid"
                     ),
                     selection: $homeLayout,
                     options: layouts,
@@ -2216,15 +2851,24 @@ private struct LayoutDiscoverySettingsView: View {
                 }
 
                 SettingsOptionRow(
-                    title: L10n.string("tvos_layout_continue_watching", fallback: "Continue Watching"),
+                    title: L10n.string("layout_cw_sort_mode", fallback: "Sort Order"),
                     subtitle: L10n.string(
-                        "tvos_layout_continue_watching_subtitle",
-                        fallback: "Default order for resume rows"
+                        "layout_cw_sort_mode_sub",
+                        fallback: "How Continue Watching items are arranged"
                     ),
                     selection: $continueWatchingSort,
                     options: continueWatchingSorts,
                     accentColor: accentColor
                 )
+                .onAppear {
+                    if !continueWatchingSorts.contains(continueWatchingSort) {
+                        continueWatchingSort = "Default"
+                    }
+                }
+                .onChange(of: continueWatchingSort) { _, _ in
+                    NotificationCenter.default.post(name: TraktSettingsStore.continueWatchingChangedNotification, object: nil)
+                    NotificationCenter.default.post(name: ContinueWatchingStore.changedNotification, object: nil)
+                }
 
                 SettingsToggleRow(
                     title: L10n.string(
@@ -2367,6 +3011,7 @@ private struct HeroCatalogSelectionRow: View {
         // it has no items to draw a hero from — so it is not offered here.
         catalogs = layoutVisibleHomeCatalogRows().filter {
             $0.id != TVHomeSection.continueWatchingId
+                && $0.id != TVHomeSection.upcomingId
                 && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
                 && TVHomeCatalogOrder.isRowEnabled($0)
         }

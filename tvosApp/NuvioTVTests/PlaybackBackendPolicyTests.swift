@@ -1771,6 +1771,35 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         )
     }
 
+    func testWatchedEpisodeWithPartialProgressSeedsNextUpAndLeavesCandidates() {
+        let meta = makeSeries()
+        // Save an in-progress playback position (e.g. 70%)
+        ContinueWatchingStore.save(
+            meta: meta,
+            streamUrl: "https://example.test/show.s01e05.mkv",
+            position: 1_400,
+            duration: 2_000,
+            season: 1,
+            episode: 5,
+            episodeId: "tt-test:1:5"
+        )
+        // Episode is marked watched in WatchedStore
+        WatchedStore.markWatched(meta, season: 1, episode: 5)
+
+        // Must NOT appear as an in-progress resume candidate
+        XCTAssertFalse(
+            WatchProgressLedger.continueWatchingCandidates()
+                .contains { $0.progressKey == "tt-test_s1e5" },
+            "an episode in WatchedStore must not be treated as an in-progress resume candidate"
+        )
+        // Must appear in upNextSeeds so Episode 6 can be surfaced
+        XCTAssertTrue(
+            WatchProgressLedger.upNextSeeds()
+                .contains { $0.progressKey == "tt-test_s1e5" },
+            "an episode in WatchedStore must be included in upNextSeeds to advance Next Up"
+        )
+    }
+
     /// A metadata rebuild can overlap the final playback save. Its old input
     /// must not be allowed to replace the newer display-only Next Up card.
     @MainActor
@@ -2411,6 +2440,127 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         XCTAssertEqual(item.upNextBadgeText, "NEXT UP")
     }
 
+    func testContinueWatchingDefaultSortsByRecencyAndPreservesTies() {
+        let tieDate = Date(timeIntervalSince1970: 2_000)
+        let older = makeSortItem(id: "older", lastWatchedAt: Date(timeIntervalSince1970: 1_000))
+        let tieFirst = makeSortItem(id: "tie-first", lastWatchedAt: tieDate)
+        let tieSecond = makeSortItem(id: "tie-second", lastWatchedAt: tieDate)
+        let newer = makeSortItem(id: "newer", lastWatchedAt: Date(timeIntervalSince1970: 3_000))
+
+        let sorted = ContinueWatchingSortPolicy.sorted(
+            [older, tieFirst, newer, tieSecond],
+            preference: "Default"
+        )
+
+        XCTAssertEqual(sorted.map(\.meta.id), ["newer", "tie-first", "tie-second", "older"])
+    }
+
+    func testContinueWatchingStreamingStyleSortsReleasedAndUpcomingGroups() {
+        let drop = makeSortItem(
+            id: "drop",
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 200),
+            released: isoDay(daysAgo: 1),
+            isUpNext: true
+        )
+        let watched = makeSortItem(
+            id: "watched",
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 10)
+        )
+        let upcomingLate = makeSortItem(
+            id: "upcoming-late",
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 30),
+            released: isoDay(daysFromToday: 5),
+            isUpNext: true
+        )
+        let upcomingSoon = makeSortItem(
+            id: "upcoming-soon",
+            lastWatchedAt: Date().addingTimeInterval(-86_400 * 40),
+            released: isoDay(daysFromToday: 2),
+            isUpNext: true
+        )
+
+        let sorted = ContinueWatchingSortPolicy.sorted(
+            [upcomingLate, watched, upcomingSoon, drop],
+            preference: "Streaming Style"
+        )
+
+        XCTAssertEqual(sorted.map(\.meta.id), ["drop", "watched", "upcoming-soon", "upcoming-late"])
+    }
+
+    func testContinueWatchingSeparateUpcomingRowSplitsAndSortsBothRows() {
+        let upcomingLate = makeSortItem(
+            id: "upcoming-late",
+            lastWatchedAt: Date(timeIntervalSince1970: 1_000),
+            released: isoDay(daysFromToday: 6),
+            isUpNext: true
+        )
+        let released = makeSortItem(
+            id: "released",
+            lastWatchedAt: Date(timeIntervalSince1970: 3_000)
+        )
+        let upcomingSoon = makeSortItem(
+            id: "upcoming-soon",
+            lastWatchedAt: Date(timeIntervalSince1970: 2_000),
+            released: isoDay(daysFromToday: 1),
+            isUpNext: true
+        )
+        let items = [upcomingLate, released, upcomingSoon]
+
+        XCTAssertEqual(
+            ContinueWatchingSortPolicy.sorted(items, preference: "Separate Upcoming Row").map(\.meta.id),
+            ["released"]
+        )
+        XCTAssertEqual(
+            ContinueWatchingSortPolicy.upcomingItems(items).map(\.meta.id),
+            ["upcoming-soon", "upcoming-late"]
+        )
+    }
+
+    func testUpcomingSortUsesCorrectedEpisodeGuideDateOverStaleStoredDate() {
+        let correctedDate = isoDay(daysFromToday: 4)
+        let correctedMeta = makeMeta(id: "corrected", type: "series", videos: [
+            NuvioVideo(
+                id: "corrected:1:1",
+                title: "Episode One",
+                season: 1,
+                episode: 1,
+                thumbnail: nil,
+                overview: nil,
+                released: correctedDate,
+                rating: nil
+            )
+        ])
+        let corrected = ContinueWatchingItem(
+            meta: correctedMeta,
+            streamUrl: "",
+            position: 1,
+            duration: 1_000,
+            lastWatchedAt: Date(timeIntervalSince1970: 1_000),
+            season: 1,
+            episode: 1,
+            // The persisted value is stale; the episode guide is authoritative.
+            released: isoDay(daysAgo: 1),
+            isUpNext: true
+        )
+        let middle = makeSortItem(
+            id: "middle",
+            lastWatchedAt: Date(timeIntervalSince1970: 2_000),
+            released: isoDay(daysFromToday: 2),
+            isUpNext: true
+        )
+        let later = makeSortItem(
+            id: "later",
+            lastWatchedAt: Date(timeIntervalSince1970: 3_000),
+            released: isoDay(daysFromToday: 6),
+            isUpNext: true
+        )
+
+        XCTAssertEqual(
+            ContinueWatchingSortPolicy.upcomingItems([later, corrected, middle]).map(\.meta.id),
+            ["middle", "corrected", "later"]
+        )
+    }
+
     /// A drop is ordered by its air date, so a show returning today outranks a
     /// title watched yesterday instead of sinking to the seed's age.
     func testNewEpisodeDropSortsByItsAirDateRatherThanTheSeedWatch() {
@@ -2487,6 +2637,35 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
             components.year ?? 2026,
             components.month ?? 1,
             components.day ?? 1
+        )
+    }
+
+    private func isoDay(daysFromToday: Int) -> String {
+        let day = Calendar.current.date(byAdding: .day, value: daysFromToday, to: Date()) ?? Date()
+        let components = Calendar(identifier: .gregorian)
+            .dateComponents(in: TimeZone.current, from: day)
+        return String(
+            format: "%04d-%02d-%02d",
+            components.year ?? 2026,
+            components.month ?? 1,
+            components.day ?? 1
+        )
+    }
+
+    private func makeSortItem(
+        id: String,
+        lastWatchedAt: Date,
+        released: String? = nil,
+        isUpNext: Bool = false
+    ) -> ContinueWatchingItem {
+        ContinueWatchingItem(
+            meta: makeDatedMeta(id: id, released: released ?? "2000-01-01"),
+            streamUrl: "",
+            position: 100,
+            duration: 1_000,
+            lastWatchedAt: lastWatchedAt,
+            released: released,
+            isUpNext: isUpNext
         )
     }
 

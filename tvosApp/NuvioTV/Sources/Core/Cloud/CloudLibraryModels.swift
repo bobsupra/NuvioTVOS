@@ -8,11 +8,26 @@ import Foundation
 // app's `core/cloud`.
 
 /// The kind of cloud entry, which decides how its download link is requested.
-enum CloudItemType: String {
+enum CloudItemType: String, CaseIterable, Identifiable {
     case torrent
     case usenet
     case webDownload
     case file
+
+    var id: String { rawValue }
+
+    var localizedTitle: String {
+        switch self {
+        case .torrent:
+            return L10n.string("cloud_library_type_torrents", fallback: "Torrents")
+        case .usenet:
+            return L10n.string("cloud_library_type_usenet", fallback: "Usenet")
+        case .webDownload:
+            return L10n.string("cloud_library_type_web", fallback: "Web")
+        case .file:
+            return L10n.string("cloud_library_type_files", fallback: "Files")
+        }
+    }
 }
 
 /// One playable (or non-playable) file inside a cloud item.

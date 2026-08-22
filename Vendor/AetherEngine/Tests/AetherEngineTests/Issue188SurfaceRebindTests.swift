@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import QuartzCore
 @testable import AetherEngine
 
 /// #188: `AetherPlayerSurface.updateUIView` was empty, so it only called `bind(view:)` from
@@ -62,6 +63,29 @@ struct Issue188SurfaceRebindTests {
         engine.bind(view: view)
         engine.bind(view: view)
 
+        #expect(host.playerLayer.superlayer === view.layer)
+    }
+
+    @MainActor
+    @Test("Rebinding repairs a hosted layer removed or reparented by the host")
+    func rebindRepairsDetachedOrReparentedLayer() async throws {
+        let engine = try AetherEngine()
+        try await engine.loadRemoteHLS(
+            url: URL(string: "http://127.0.0.1:9/live.m3u8")!,
+            options: LoadOptions(isLive: true, nativeRemoteHLS: true))
+        let host = try #require(engine.nativeHost)
+        let view = AetherPlayerView(frame: .init(x: 0, y: 0, width: 640, height: 360))
+        engine.bind(view: view)
+
+        host.playerLayer.removeFromSuperlayer()
+        #expect(host.playerLayer.superlayer == nil)
+        engine.bind(view: view)
+        #expect(host.playerLayer.superlayer === view.layer)
+
+        let foreignContainer = CALayer()
+        foreignContainer.addSublayer(host.playerLayer)
+        #expect(host.playerLayer.superlayer === foreignContainer)
+        engine.bind(view: view)
         #expect(host.playerLayer.superlayer === view.layer)
     }
 }

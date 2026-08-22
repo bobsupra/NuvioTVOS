@@ -465,7 +465,21 @@ enum WatchProgressLedger {
     /// Rows that should appear as real resume progress, newest first and at most
     /// one per series. Mirrors `continueWatchingProgressEntries`.
     static func continueWatchingCandidates() -> [WatchProgressRecord] {
-        let inProgress = records().filter { hasStarted($0) && !isComplete($0) }
+        let inProgress = records().filter { record in
+            guard hasStarted(record), !isComplete(record) else { return false }
+            // An episode or movie already marked watched in WatchedStore has been completed
+            // and should not be offered as an in-progress resume row.
+            if record.isEpisode, let season = record.season, let episode = record.episode {
+                if WatchedStore.containsEpisode(metaId: record.contentId, season: season, episode: episode) {
+                    return false
+                }
+            } else if !record.isEpisode {
+                if WatchedStore.contains(metaId: record.contentId, type: record.contentType) {
+                    return false
+                }
+            }
+            return true
+        }
         let episodes = inProgress.filter(\.isEpisode)
         let others = inProgress.filter { !$0.isEpisode }
 
@@ -483,7 +497,15 @@ enum WatchProgressLedger {
         preferFurthestEpisode: Bool = UpNextEpisodeSelectionPolicy.prefersFurthestEpisode
     ) -> [WatchProgressRecord] {
         let completedEpisodes = records()
-            .filter { $0.isEpisode && $0.isSeries && isComplete($0) && ($0.season ?? 0) > 0 }
+            .filter { $0.isEpisode && $0.isSeries && ($0.season ?? 0) > 0 }
+            .filter { record in
+                if isComplete(record) { return true }
+                if let season = record.season, let episode = record.episode,
+                   WatchedStore.containsEpisode(metaId: record.contentId, season: season, episode: episode) {
+                    return true
+                }
+                return false
+            }
 
         var selectedBySeries: [String: WatchProgressRecord] = [:]
         for candidate in completedEpisodes {

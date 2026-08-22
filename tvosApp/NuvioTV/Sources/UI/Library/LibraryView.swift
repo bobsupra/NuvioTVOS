@@ -12,13 +12,39 @@ private enum LibraryGridMetrics {
     static let pageInset: CGFloat = 36
 }
 
+enum LibrarySourceMode: String, CaseIterable, Identifiable {
+    case saved
+    case cloud
+
+    var id: String { rawValue }
+
+    var localizedTitle: String {
+        switch self {
+        case .saved:
+            return L10n.string("library_source_saved", fallback: "Saved")
+        case .cloud:
+            return L10n.string("library_source_cloud", fallback: "Cloud")
+        }
+    }
+}
+
 public struct LibraryView: View {
     @StateObject private var viewModel: LibraryViewModel
+    @StateObject private var cloudViewModel: CloudLibraryViewModel
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
-    /// Opens the debrid Cloud Library screen; shown only when a supported
-    /// provider (Premiumize / TorBox) with an API key is configured.
+    /// Opens the debrid Cloud Library screen; kept for external callers.
     var onOpenCloudLibrary: (() -> Void)? = nil
+    var onPlayCloudFile: ((URL, NuvioMeta) -> Void)? = nil
+
+    @State private var sourceMode: LibrarySourceMode = .saved
+    @State private var openCloudItem: CloudItem? = nil
+    @FocusState private var cloudFocusedKey: String?
+    @State private var lastFocusedCloudItemID: String?
+    @State private var shouldRestoreCloudFocus = false
+    @State private var restoreCloudArmTask: Task<Void, Never>?
+    @State private var overlayRestoreCloudItemID: String?
+
     @FocusState private var focusedItemID: String?
     /// Last card focused in the grid, kept so returning from details (which
     /// steals focus and nils `focusedItemID`) restores that card instead of
@@ -41,25 +67,25 @@ public struct LibraryView: View {
     @AppStorage(SettingsKey.torboxAccessToken) private var torboxAccessToken = ""
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
 
-    init(viewModel: LibraryViewModel, onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil, onOpenCloudLibrary: (() -> Void)? = nil) {
+    init(
+        viewModel: LibraryViewModel,
+        store: UserDefaults = ProfileSettings.current,
+        onContentClick: @escaping (String, String) -> Void,
+        onLongPress: ((NuvioMeta) -> Void)? = nil,
+        onOpenCloudLibrary: (() -> Void)? = nil,
+        onPlayCloudFile: ((URL, NuvioMeta) -> Void)? = nil
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
+        _cloudViewModel = StateObject(wrappedValue: CloudLibraryViewModel(store: store))
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
         self.onOpenCloudLibrary = onOpenCloudLibrary
+        self.onPlayCloudFile = onPlayCloudFile
     }
 
     /// Cloud Library is only reachable for the providers that expose one.
     private var cloudLibraryAvailable: Bool {
-        switch DebridProviderKind(settingsValue: debridProvider) {
-        case .torbox:
-            return !torboxAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .premiumize:
-            return !premiumizeAccessToken.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
-                !debridApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        case .none, .realDebrid, .allDebrid, .debridLink:
-            return false
-        }
+        cloudViewModel.isAvailable
     }
     
     public var body: some View {
@@ -71,111 +97,149 @@ public struct LibraryView: View {
                     .font(.system(size: 46, weight: .bold))
                     .foregroundColor(.white)
 
-                // Controls
+                // Source switch: Saved | Cloud
                 HStack(spacing: 16) {
-                    FilterMenu(
-                        label: "\(L10n.string("library_filter_sort", fallback: "Sort")): \(viewModel.sortOption.localizedTitle)"
-                    ) {
-                        ForEach(LibraryViewModel.SortOption.allCases) { option in
-                            Button { viewModel.sortOption = option } label: {
-                                menuItem(option.localizedTitle, selected: viewModel.sortOption == option)
-                            }
-                        }
-                    }
-
-                    FilterMenu(
-                        label: "\(L10n.string("tvos_library_group", fallback: "Group")): \(viewModel.groupOption.localizedTitle)"
-                    ) {
-                        ForEach(LibraryViewModel.GroupOption.allCases) { option in
-                            Button { viewModel.groupOption = option } label: {
-                                menuItem(option.localizedTitle, selected: viewModel.groupOption == option)
-                            }
-                        }
-                    }
-
-                    FilterMenu(
-                        label: "\(L10n.string("tvos_library_content", fallback: "Content")): \(selectedTypeLabel)"
-                    ) {
-                        Button { viewModel.contentTypeFilter = nil } label: {
-                            menuItem(
-                                L10n.string("library_type_all", fallback: "All"),
-                                selected: viewModel.contentTypeFilter == nil
-                            )
-                        }
-                        ForEach(viewModel.availableContentTypes, id: \.self) { type in
-                            Button { viewModel.contentTypeFilter = type } label: {
-                                menuItem(
-                                    viewModel.typeLabel(type),
-                                    selected: viewModel.contentTypeFilter == type
-                                )
-                            }
-                        }
-                    }
-
-                    FilterMenu(
-                        label: "\(L10n.string("library_filter_genre", fallback: "Genre")): \(viewModel.genreFilter ?? L10n.string("library_type_all", fallback: "All"))"
-                    ) {
-                        Button { viewModel.genreFilter = nil } label: {
-                            menuItem(
-                                L10n.string("library_type_all", fallback: "All"),
-                                selected: viewModel.genreFilter == nil
-                            )
-                        }
-                        ForEach(viewModel.availableGenres, id: \.self) { genre in
-                            Button { viewModel.genreFilter = genre } label: {
-                                menuItem(genre, selected: viewModel.genreFilter == genre)
-                            }
-                        }
-                    }
-
-                    if cloudLibraryAvailable, let onOpenCloudLibrary {
-                        Button(action: onOpenCloudLibrary) {
-                            Label(
-                                L10n.string("library_source_cloud", fallback: "Cloud"),
-                                systemImage: "cloud"
-                            )
-                        }
-                    }
-                }
-                .disabled(overlayRestoreItemID != nil)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 20) {
-                        ForEach(viewModel.sortedAndGroupedItems.keys.sorted(), id: \.self) { group in
-                            if viewModel.groupOption != .none {
-                                Text(group.capitalized)
-                                    .font(.system(size: 28, weight: .semibold))
-                                    .foregroundColor(.white.opacity(0.85))
-                                    .frame(maxWidth: .infinity, alignment: .leading)
-                            }
-
-                            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: LibraryGridMetrics.posterGap) {
-                                ForEach(viewModel.sortedAndGroupedItems[group] ?? [], id: \.id) { item in
-                                    LibraryItemButton(
-                                        item: item,
-                                        externalFocus: $focusedItemID,
-                                        retainFocusAppearance: overlayRestoreItemID == item.id,
-                                        onLongPress: onLongPress.map { cb in { cb(item.asNuvioMeta) } }
-                                    ) {
-                                        overlayRestoreItemID = item.id
-                                        lastFocusedItemID = item.id
-                                        onContentClick(item.id, item.contentType)
-                                    }
-                                    .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
+                    ForEach(LibrarySourceMode.allCases) { mode in
+                        SourceModeChip(
+                            title: mode.localizedTitle,
+                            isSelected: sourceMode == mode
+                        ) {
+                            if sourceMode != mode {
+                                withAnimation(.easeInOut(duration: 0.2)) {
+                                    sourceMode = mode
+                                }
+                                if mode == .cloud {
+                                    Task { await cloudViewModel.load() }
                                 }
                             }
                         }
                     }
-                    .padding(.top, 16)
-                    .padding(.horizontal, 12)
-                    .padding(.bottom, 90)
-                    .frame(maxWidth: .infinity, alignment: .leading)
                 }
-                .focusSection()
-                .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
+                .disabled(overlayRestoreItemID != nil || overlayRestoreCloudItemID != nil)
+
+                // Controls row (Dynamic based on Saved vs Cloud)
+                HStack(spacing: 16) {
+                    if sourceMode == .saved {
+                        FilterMenu(
+                            label: "\(L10n.string("library_filter_sort", fallback: "Sort")): \(viewModel.sortOption.localizedTitle)"
+                        ) {
+                            ForEach(LibraryViewModel.SortOption.allCases) { option in
+                                Button { viewModel.sortOption = option } label: {
+                                    menuItem(option.localizedTitle, selected: viewModel.sortOption == option)
+                                }
+                            }
+                        }
+
+                        FilterMenu(
+                            label: "\(L10n.string("tvos_library_group", fallback: "Group")): \(viewModel.groupOption.localizedTitle)"
+                        ) {
+                            ForEach(LibraryViewModel.GroupOption.allCases) { option in
+                                Button { viewModel.groupOption = option } label: {
+                                    menuItem(option.localizedTitle, selected: viewModel.groupOption == option)
+                                }
+                            }
+                        }
+
+                        FilterMenu(
+                            label: "\(L10n.string("tvos_library_content", fallback: "Content")): \(selectedTypeLabel)"
+                        ) {
+                            Button { viewModel.contentTypeFilter = nil } label: {
+                                menuItem(
+                                    L10n.string("library_type_all", fallback: "All"),
+                                    selected: viewModel.contentTypeFilter == nil
+                                )
+                            }
+                            ForEach(viewModel.availableContentTypes, id: \.self) { type in
+                                Button { viewModel.contentTypeFilter = type } label: {
+                                    menuItem(
+                                        viewModel.typeLabel(type),
+                                        selected: viewModel.contentTypeFilter == type
+                                    )
+                                }
+                            }
+                        }
+
+                        FilterMenu(
+                            label: "\(L10n.string("library_filter_genre", fallback: "Genre")): \(viewModel.genreFilter ?? L10n.string("library_type_all", fallback: "All"))"
+                        ) {
+                            Button { viewModel.genreFilter = nil } label: {
+                                menuItem(
+                                    L10n.string("library_type_all", fallback: "All"),
+                                    selected: viewModel.genreFilter == nil
+                                )
+                            }
+                            ForEach(viewModel.availableGenres, id: \.self) { genre in
+                                Button { viewModel.genreFilter = genre } label: {
+                                    menuItem(genre, selected: viewModel.genreFilter == genre)
+                                }
+                            }
+                        }
+                    } else {
+                        // Cloud filters: Select provider & Select type
+                        FilterMenu(
+                            label: "\(L10n.string("cloud_library_select_provider", fallback: "Select provider")): \(cloudSelectedProviderLabel)"
+                        ) {
+                            Button {
+                                cloudViewModel.selectedProviderId = nil
+                            } label: {
+                                menuItem(
+                                    L10n.string("cloud_library_provider_all", fallback: L10n.string("library_type_all", fallback: "All")),
+                                    selected: cloudViewModel.selectedProviderId == nil
+                                )
+                            }
+                            ForEach(cloudViewModel.availableProviders) { prov in
+                                Button {
+                                    cloudViewModel.selectedProviderId = prov.id
+                                } label: {
+                                    menuItem(
+                                        prov.displayName,
+                                        selected: cloudViewModel.selectedProviderId == prov.id
+                                    )
+                                }
+                            }
+                        }
+
+                        FilterMenu(
+                            label: "\(L10n.string("cloud_library_select_type", fallback: "Select type")): \(cloudSelectedTypeLabel)"
+                        ) {
+                            Button {
+                                cloudViewModel.selectedType = nil
+                            } label: {
+                                menuItem(
+                                    L10n.string("cloud_library_type_all", fallback: L10n.string("library_type_all", fallback: "All")),
+                                    selected: cloudViewModel.selectedType == nil
+                                )
+                            }
+                            ForEach(cloudViewModel.availableTypes) { type in
+                                Button {
+                                    cloudViewModel.selectedType = type
+                                } label: {
+                                    menuItem(
+                                        type.localizedTitle,
+                                        selected: cloudViewModel.selectedType == type
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+                .disabled(overlayRestoreItemID != nil || overlayRestoreCloudItemID != nil)
+                .zIndex(1)
+
+                if sourceMode == .saved {
+                    savedContent
+                } else {
+                    cloudContent
+                }
             }
             .padding(.horizontal, LibraryGridMetrics.pageInset)
             .padding(.top, 56)
+            .ignoresSafeArea(edges: .bottom)
+        }
+        .onExitCommand {
+            if openCloudItem != nil {
+                closeCloudItem()
+            }
         }
         .onChange(of: focusedItemID) { _, newValue in
             if let newValue {
@@ -188,20 +252,299 @@ public struct LibraryView: View {
                 scheduleRestoreArm()
             }
         }
+        .onChange(of: cloudFocusedKey) { _, newValue in
+            if let newValue {
+                restoreCloudArmTask?.cancel()
+                lastFocusedCloudItemID = newValue
+                shouldRestoreCloudFocus = false
+                if isEnabled, newValue == overlayRestoreCloudItemID { overlayRestoreCloudItemID = nil }
+            } else if lastFocusedCloudItemID != nil {
+                scheduleRestoreCloudArm()
+            }
+        }
         // Overlay dismissal re-places focus geometrically without consulting
-        // `defaultFocus`. While `overlayRestoreItemID` is set every other card
-        // is unfocusable, so the engine can only land back on the saved card
-        // -- no scroll-to-top flash. See TVHomeView for the full story.
+        // `defaultFocus`. While `overlayRestoreItemID` / `overlayRestoreCloudItemID`
+        // is set every other card is unfocusable, so the engine can only land back
+        // on the saved item -- no scroll-to-top flash.
         .onChange(of: isEnabled) { _, enabled in
             if !enabled {
                 overlayRestoreGeneration &+= 1
                 overlayRestoreItemID = focusedItemID ?? lastFocusedItemID
-            } else if let target = overlayRestoreItemID {
-                restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+                overlayRestoreCloudItemID = cloudFocusedKey ?? lastFocusedCloudItemID
+            } else {
+                if let target = overlayRestoreItemID {
+                    restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+                }
+                if let cloudTarget = overlayRestoreCloudItemID {
+                    restoreCloudOverlayFocus(to: cloudTarget, generation: overlayRestoreGeneration)
+                }
             }
         }
         .task {
             await viewModel.refreshSelectedLibrary()
+            if cloudViewModel.isAvailable {
+                await cloudViewModel.load()
+            }
+        }
+    }
+
+    private var cloudSelectedProviderLabel: String {
+        if let id = cloudViewModel.selectedProviderId,
+           let prov = cloudViewModel.availableProviders.first(where: { $0.id == id }) {
+            return prov.displayName
+        }
+        return L10n.string("cloud_library_provider_all", fallback: L10n.string("library_type_all", fallback: "All"))
+    }
+
+    private var cloudSelectedTypeLabel: String {
+        if let type = cloudViewModel.selectedType {
+            return type.localizedTitle
+        }
+        return L10n.string("cloud_library_type_all", fallback: L10n.string("library_type_all", fallback: "All"))
+    }
+
+    private var savedContent: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                ForEach(viewModel.sortedAndGroupedItems.keys.sorted(), id: \.self) { group in
+                    if viewModel.groupOption != .none {
+                        Text(group.capitalized)
+                            .font(.system(size: 28, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.85))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+
+                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: LibraryGridMetrics.posterGap) {
+                        ForEach(viewModel.sortedAndGroupedItems[group] ?? [], id: \.id) { item in
+                            LibraryItemButton(
+                                item: item,
+                                externalFocus: $focusedItemID,
+                                retainFocusAppearance: overlayRestoreItemID == item.id,
+                                onLongPress: onLongPress.map { cb in { cb(item.asNuvioMeta) } }
+                            ) {
+                                overlayRestoreItemID = item.id
+                                lastFocusedItemID = item.id
+                                onContentClick(item.id, item.contentType)
+                            }
+                            .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
+                        }
+                    }
+                }
+            }
+            .padding(.top, 16)
+            .padding(.horizontal, 12)
+            .padding(.bottom, 90)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .focusSection()
+        .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
+    }
+
+    @ViewBuilder
+    private var cloudContent: some View {
+        if cloudViewModel.isLoading && cloudViewModel.items.isEmpty {
+            centeredMessage {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.6)
+            }
+        } else if let openItem = openCloudItem {
+            cloudFileList(for: openItem)
+        } else if !cloudViewModel.isAvailable {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "cloud.slash")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(L10n.string("cloud_library_connect_title", fallback: "No cloud account connected"))
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(L10n.string("cloud_library_connect_message", fallback: "Connect an account in Connected Services settings to browse playable files from your cloud library."))
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else if let error = cloudViewModel.errorMessage, cloudViewModel.items.isEmpty {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "exclamationmark.triangle")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(error)
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundColor(.white.opacity(0.7))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else if cloudViewModel.filteredItems.isEmpty {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "tray")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(cloudViewModel.errorMessage ?? L10n.string("cloud_library_empty_title", fallback: "Nothing here yet"))
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(L10n.string("cloud_library_empty_message", fallback: "No playable cloud files match the current filters."))
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else {
+            cloudItemList
+        }
+    }
+
+    private var cloudItemList: some View {
+        ScrollView {
+            LazyVStack(spacing: 16) {
+                ForEach(cloudViewModel.filteredItems, id: \.stableKey) { item in
+                    CloudRow(
+                        title: item.name,
+                        subtitle: cloudItemSubtitle(for: item),
+                        externalFocus: $cloudFocusedKey,
+                        focusId: item.stableKey,
+                        retainFocusAppearance: overlayRestoreCloudItemID == item.stableKey,
+                        isBusy: false
+                    ) {
+                        overlayRestoreCloudItemID = item.stableKey
+                        lastFocusedCloudItemID = item.stableKey
+                        openCloudItemEntry(item)
+                    }
+                    .disabled(overlayRestoreCloudItemID != nil && overlayRestoreCloudItemID != item.stableKey)
+                }
+            }
+            .padding(.top, 16)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 90)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .focusSection()
+        .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? cloudViewModel.filteredItems.first?.stableKey)
+    }
+
+    private func cloudFileList(for item: CloudItem) -> some View {
+        let defaultFileKey = item.playableFiles.first.map { "\(item.stableKey):\($0.id)" }
+        return ScrollView {
+            LazyVStack(spacing: 16) {
+                HStack {
+                    Button {
+                        closeCloudItem()
+                    } label: {
+                        HStack(spacing: 10) {
+                            Image(systemName: "chevron.left")
+                                .font(.system(size: 20, weight: .semibold))
+                            Text(item.name)
+                                .font(.system(size: 24, weight: .semibold))
+                                .lineLimit(1)
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 24)
+                        .frame(height: 52)
+                        .modifier(GlassChipBackground(filled: false))
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+                    Spacer()
+                }
+                .padding(.bottom, 8)
+
+                ForEach(item.playableFiles) { file in
+                    let key = "\(item.stableKey):\(file.id)"
+                    CloudRow(
+                        title: file.name,
+                        subtitle: CloudLibraryView.sizeText(file.sizeBytes),
+                        externalFocus: $cloudFocusedKey,
+                        focusId: key,
+                        retainFocusAppearance: overlayRestoreCloudItemID == key,
+                        isBusy: cloudViewModel.resolvingKey == key
+                    ) {
+                        overlayRestoreCloudItemID = key
+                        lastFocusedCloudItemID = key
+                        cloudViewModel.play(item: item, file: file) { url, meta in
+                            onPlayCloudFile?(url, meta)
+                        }
+                    }
+                    .disabled(overlayRestoreCloudItemID != nil && overlayRestoreCloudItemID != key)
+                }
+            }
+            .padding(.top, 16)
+            .padding(.horizontal, 24)
+            .padding(.bottom, 90)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .focusSection()
+        .defaultFocusIfAvailable($cloudFocusedKey, lastFocusedCloudItemID ?? defaultFileKey)
+    }
+
+    private func cloudItemSubtitle(for item: CloudItem) -> String {
+        var parts: [String] = []
+        let count = item.playableFiles.count
+        if count > 1 { parts.append("\(count) files") }
+        if let size = CloudLibraryView.sizeText(item.sizeBytes) { parts.append(size) }
+        if let status = item.status, !status.isEmpty { parts.append(status.capitalized) }
+        return parts.joined(separator: "  ·  ")
+    }
+
+    private func centeredMessage<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
+        content()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func openCloudItemEntry(_ item: CloudItem) {
+        let playable = item.playableFiles
+        if playable.count == 1 {
+            cloudViewModel.play(item: item, file: playable[0]) { url, meta in
+                onPlayCloudFile?(url, meta)
+            }
+        } else if !playable.isEmpty {
+            openCloudItem = item
+            let firstKey = "\(item.stableKey):\(playable[0].id)"
+            overlayRestoreCloudItemID = firstKey
+            lastFocusedCloudItemID = firstKey
+            shouldRestoreCloudFocus = true
+            cloudFocusedKey = firstKey
+            for delay in [0.05, 0.15, 0.35] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if openCloudItem?.stableKey == item.stableKey {
+                        cloudFocusedKey = firstKey
+                    }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if overlayRestoreCloudItemID == firstKey {
+                    overlayRestoreCloudItemID = nil
+                }
+            }
+        }
+    }
+
+    private func closeCloudItem() {
+        let key = openCloudItem?.stableKey
+        openCloudItem = nil
+        if let key {
+            overlayRestoreCloudItemID = key
+            lastFocusedCloudItemID = key
+            shouldRestoreCloudFocus = true
+            cloudFocusedKey = key
+            for delay in [0.05, 0.15, 0.35] {
+                DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                    if openCloudItem == nil {
+                        cloudFocusedKey = key
+                    }
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                if overlayRestoreCloudItemID == key {
+                    overlayRestoreCloudItemID = nil
+                }
+            }
         }
     }
 
@@ -218,6 +561,16 @@ public struct LibraryView: View {
         }
     }
 
+    private func scheduleRestoreCloudArm() {
+        guard lastFocusedCloudItemID != nil, cloudFocusedKey == nil else { return }
+        restoreCloudArmTask?.cancel()
+        restoreCloudArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled, cloudFocusedKey == nil else { return }
+            shouldRestoreCloudFocus = true
+        }
+    }
+
     private func restoreOverlayFocus(to target: String, generation: Int) {
         for delay in [0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -229,6 +582,21 @@ public struct LibraryView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             if overlayRestoreGeneration == generation, overlayRestoreItemID == target {
                 overlayRestoreItemID = nil
+            }
+        }
+    }
+
+    private func restoreCloudOverlayFocus(to target: String, generation: Int) {
+        for delay in [0.12, 0.45] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
+                if overlayRestoreGeneration == generation, overlayRestoreCloudItemID == target {
+                    cloudFocusedKey = target
+                }
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
+            if overlayRestoreGeneration == generation, overlayRestoreCloudItemID == target {
+                overlayRestoreCloudItemID = nil
             }
         }
     }
@@ -269,28 +637,35 @@ struct LibraryItemButton: View {
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 12) {
-                AsyncImage(url: URL(string: item.poster ?? "")) { phase in
-                    switch phase {
-                    case .success(let image):
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
-                    default:
-                        ZStack {
-                            Rectangle()
-                                .fill(Color.white.opacity(0.07))
-                            Image(systemName: item.contentType == "series" ? "tv" : "film")
-                                .font(.system(size: 40))
-                                .foregroundColor(.white.opacity(0.25))
-                        }
+                CachedPosterArtwork(
+                    urlString: item.poster,
+                    width: LibraryGridMetrics.posterWidth,
+                    height: LibraryGridMetrics.posterHeight,
+                    maximumWidth: LibraryGridMetrics.posterWidth
+                ) {
+                    ZStack {
+                        Rectangle()
+                            .fill(Color.white.opacity(0.07))
+                        Image(systemName: item.contentType == "series" ? "tv" : "film")
+                            .font(.system(size: 40))
+                            .foregroundColor(.white.opacity(0.25))
                     }
                 }
                 .frame(width: LibraryGridMetrics.posterWidth, height: LibraryGridMetrics.posterHeight)
                 .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+                .modifier(
+                    LiquidGlassCardModifier(
+                        cornerRadius: cardCornerRadius,
+                        isFocused: showsFocusedAppearance,
+                        isEnabled: liquidGlassCards
+                    )
+                )
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(metaId: item.id, type: item.contentType)
                 }
@@ -349,7 +724,7 @@ struct LibraryItemButton: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        16
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
     }
 }
 
@@ -379,5 +754,32 @@ extension StremioMeta {
             country: nil,
             released: nil
         )
+    }
+}
+
+struct SourceModeChip: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+    @FocusState private var focused: Bool
+
+    var body: some View {
+        Button(action: action) {
+            Text(title)
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(isSelected || focused ? .black : .white.opacity(0.9))
+                .padding(.horizontal, 32)
+                .frame(height: 60)
+                .modifier(GlassChipBackground(filled: isSelected || focused))
+                .overlay(
+                    Capsule()
+                        .strokeBorder(focused ? AppFocusOutline.color : .clear, lineWidth: focused ? AppFocusOutline.width : 0)
+                )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(focused ? 1.05 : 1.0)
+        .animation(.easeOut(duration: 0.14), value: focused)
     }
 }

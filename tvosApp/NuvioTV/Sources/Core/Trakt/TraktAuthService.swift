@@ -143,7 +143,7 @@ enum TraktDefaults {
     /// selected source matching, a Simkl-only account silently scrobbled nowhere.
     /// Connecting a tracker now selects it (see `selectWatchProgressSourceOnConnect`).
     static let watchProgressSource = TraktWatchProgressSource.nuvioSync
-    static let librarySourceMode = TraktLibrarySourceMode.trakt
+    static let librarySourceMode = TraktLibrarySourceMode.local
     static let moreLikeThisSource = TraktMoreLikeThisSource.trakt
 }
 

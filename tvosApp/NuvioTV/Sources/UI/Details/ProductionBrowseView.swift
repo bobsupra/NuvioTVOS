@@ -504,6 +504,16 @@ private struct ProductionBrowseCard: View {
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+
+    private var cardCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+    }
 
     init(
         title: RelatedTitle,
@@ -519,7 +529,7 @@ private struct ProductionBrowseCard: View {
         Button(action: onSelect) {
             VStack(alignment: .leading, spacing: 12) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    shape
                         .fill(Color.white.opacity(0.08))
                     if let poster = title.posterURL, let url = URL(string: poster) {
                         AsyncImage(url: url) { phase in
@@ -538,13 +548,19 @@ private struct ProductionBrowseCard: View {
                     }
                 }
                 .frame(width: TmdbBrowseGridMetrics.posterWidth, height: TmdbBrowseGridMetrics.posterHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .clipShape(shape)
+                .modifier(
+                    LiquidGlassCardModifier(
+                        cornerRadius: cardCornerRadius,
+                        isFocused: isFocused,
+                        isEnabled: liquidGlassCards
+                    )
+                )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(
-                            isFocused ? AppFocusOutline.color : .clear,
-                            lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
-                        )
+                    shape.stroke(
+                        isFocused ? AppFocusOutline.color : .clear,
+                        lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width
+                    )
                 )
                 .shadow(
                     color: .black.opacity(isFocused ? 0.5 : 0.2),

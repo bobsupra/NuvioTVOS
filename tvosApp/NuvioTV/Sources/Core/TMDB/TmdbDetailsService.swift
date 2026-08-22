@@ -166,6 +166,7 @@ enum TmdbDetailsService {
     private static let apiBase = URL(string: "https://api.themoviedb.org/3")!
     private static let imageBase = "https://image.tmdb.org/t/p/"
     private static let localizedDetailsCache = TmdbLocalizedDetailsCache()
+    private static let findCache = TmdbFindCache()
 
     private static var apiKey: String? {
         let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
@@ -580,6 +581,9 @@ enum TmdbDetailsService {
     }
 
     private static func findByImdb(_ imdbId: String) async -> (id: Int, mediaType: String)? {
+        if let cached = await findCache.value(for: imdbId) {
+            return cached
+        }
         guard let apiKey else { return nil }
         var components = URLComponents(
             url: apiBase.appendingPathComponent("find/\(imdbId)"),
@@ -598,10 +602,14 @@ enum TmdbDetailsService {
             return nil
         }
         if let movie = decoded.movieResults?.first {
-            return (movie.id, "movie")
+            let result = (movie.id, "movie")
+            await findCache.insert(result, for: imdbId)
+            return result
         }
         if let show = decoded.tvResults?.first {
-            return (show.id, "tv")
+            let result = (show.id, "tv")
+            await findCache.insert(result, for: imdbId)
+            return result
         }
         return nil
     }
@@ -972,6 +980,18 @@ private struct TmdbCreatorDTO: Decodable {
     enum CodingKeys: String, CodingKey {
         case id, name
         case profilePath = "profile_path"
+    }
+}
+
+private actor TmdbFindCache {
+    private var values: [String: (id: Int, mediaType: String)] = [:]
+
+    func value(for key: String) -> (id: Int, mediaType: String)? {
+        values[key]
+    }
+
+    func insert(_ value: (id: Int, mediaType: String), for key: String) {
+        values[key] = value
     }
 }
 

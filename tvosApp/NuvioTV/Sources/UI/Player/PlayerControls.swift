@@ -2,6 +2,7 @@ import SwiftUI
 
 private enum PlayerControlFocus: Hashable {
     case play
+    case pip
     case episodes
     case sources
     case settings
@@ -17,27 +18,8 @@ struct PlayerControls: View {
 
     @FocusState private var focusedControl: PlayerControlFocus?
 
-    private var progress: CGFloat {
-        let duration = max(viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration, 0.001)
-        let position = (viewModel.clock.duration > 0 ? viewModel.clock.position : viewModel.time.current)
-            + viewModel.pendingSeekDelta
-        return CGFloat(min(max(position / duration, 0), 1))
-    }
-
     private var isShowingPause: Bool {
         viewModel.status == .playing
-    }
-
-    private var displayCurrent: Double {
-        let position = (viewModel.clock.duration > 0 ? viewModel.clock.position : viewModel.time.current)
-            + viewModel.pendingSeekDelta
-        let duration = viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration
-        return min(max(position, 0), max(duration, 0))
-    }
-
-    private var displayRemaining: Double {
-        let duration = viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration
-        return max(0, duration - displayCurrent)
     }
 
     var body: some View {
@@ -119,6 +101,7 @@ struct PlayerControls: View {
     /// Left-to-right order of currently visible transport buttons.
     private var transportFocusOrder: [PlayerControlFocus] {
         var order: [PlayerControlFocus] = [.play]
+        if viewModel.isPictureInPictureSupported { order.append(.pip) }
         if viewModel.canShowEpisodesPanel { order.append(.episodes) }
         if viewModel.canShowSourcesPanel { order.append(.sources) }
         order.append(.settings)
@@ -246,6 +229,20 @@ struct PlayerControls: View {
 
             Spacer()
 
+            if viewModel.isPictureInPictureSupported {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .pip,
+                    isFocused: focusedControl == .pip
+                ) {
+                    viewModel.togglePictureInPicture()
+                } icon: {
+                    Image(systemName: "pip.enter")
+                }
+                .id("pip_button")
+            }
+
             if viewModel.canShowEpisodesPanel {
                 glassIconButton(
                     size: 70,
@@ -364,31 +361,11 @@ struct PlayerControls: View {
     }
 
     private var finiteTimelineBar: some View {
-        VStack(spacing: 8) {
-            let duration = max(viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration, 0.001)
-            let buffered = viewModel.clock.buffered
-            PlayerProgressTrack(
-                played: Double(progress),
-                buffered: buffered / duration,
-                height: isTimelineFocused ? 10 : 7,
-                showThumb: isTimelineFocused,
-                emphasized: isTimelineFocused,
-                glassTrack: true
-            )
-            .frame(height: 14)
-
-            HStack {
-                Text(PlayerTime.formatted(time: displayCurrent))
-                if viewModel.pendingSeekDelta != 0 {
-                    Text(PlayerTimeFormat.signedDelta(viewModel.pendingSeekDelta))
-                        .foregroundColor(.white.opacity(0.85))
-                }
-                Spacer()
-                Text("-" + PlayerTime.formatted(time: displayRemaining))
-            }
-            .font(.system(size: 22, weight: .bold))
-            .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
-        }
+        PlayerTimelineBar(
+            clock: viewModel.clock,
+            isTimelineFocused: isTimelineFocused,
+            pendingSeekDelta: viewModel.pendingSeekDelta
+        )
         .focusable(
             viewModel.showControls
                 && !viewModel.showSettingsPanel
@@ -407,6 +384,57 @@ struct PlayerControls: View {
         .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
         .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
+    }
+}
+
+// MARK: - Isolated Timeline Bar
+
+private struct PlayerTimelineBar: View {
+    @ObservedObject var clock: PlaybackClock
+    let isTimelineFocused: Bool
+    let pendingSeekDelta: Double
+
+    private var duration: Double {
+        max(clock.duration, 0.001)
+    }
+
+    private var displayCurrent: Double {
+        let position = clock.position + pendingSeekDelta
+        return min(max(position, 0), max(clock.duration, 0))
+    }
+
+    private var displayRemaining: Double {
+        max(0, clock.duration - displayCurrent)
+    }
+
+    private var progress: CGFloat {
+        CGFloat(min(max((clock.position + pendingSeekDelta) / duration, 0), 1))
+    }
+
+    var body: some View {
+        VStack(spacing: 8) {
+            PlayerProgressTrack(
+                played: Double(progress),
+                buffered: clock.buffered / duration,
+                height: isTimelineFocused ? 10 : 7,
+                showThumb: isTimelineFocused,
+                emphasized: isTimelineFocused,
+                glassTrack: true
+            )
+            .frame(height: 14)
+
+            HStack {
+                Text(PlayerTime.formatted(time: displayCurrent))
+                if pendingSeekDelta != 0 {
+                    Text(PlayerTimeFormat.signedDelta(pendingSeekDelta))
+                        .foregroundColor(.white.opacity(0.85))
+                }
+                Spacer()
+                Text("-" + PlayerTime.formatted(time: displayRemaining))
+            }
+            .font(.system(size: 22, weight: .bold))
+            .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
+        }
     }
 }
 
@@ -477,7 +505,6 @@ extension View {
     }
 
 }
-
 // MARK: - Next episode card
 //
 // Next-episode prompt shown near the end of an episode. Liquid Glass card with
@@ -489,6 +516,16 @@ struct NextEpisodeOverlay: View {
     let countdown: Int?
     let isAdvancing: Bool
     var isFocused: Bool
+
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+
+    private var overlayCornerRadius: CGFloat {
+        max(14, AppCardStyle.episodeCornerRadius(for: cardCornerRadiusSetting))
+    }
+
+    private var thumbCornerRadius: CGFloat {
+        max(6, AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16) * 0.75)
+    }
 
     private var episodeLine: String {
         "S\(episode.season) E\(episode.episode) • \(episode.title)"
@@ -520,9 +557,8 @@ struct NextEpisodeOverlay: View {
                         .foregroundColor(.white.opacity(0.7))
                 } else if let countdown, !isAdvancing {
                     Text("Playing in \(countdown)s")
-                        .font(.system(size: 20, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
-                        .contentTransition(.numericText())
+                        .font(.system(size: 20, weight: .bold))
+                        .foregroundColor(Color(red: 0.96, green: 0.77, blue: 0.22))
                 }
             }
 
@@ -532,9 +568,9 @@ struct NextEpisodeOverlay: View {
         }
         .padding(18)
         .frame(width: 780)
-        .glassRoundedRect(cornerRadius: 26)
+        .glassRoundedRect(cornerRadius: overlayCornerRadius)
         .overlay(
-            RoundedRectangle(cornerRadius: 26, style: .continuous)
+            RoundedRectangle(cornerRadius: overlayCornerRadius, style: .continuous)
                 .strokeBorder(isFocused ? AppFocusOutline.color : Color.white.opacity(0.14), lineWidth: isFocused ? AppFocusOutline.width : 1)
         )
         .shadow(color: .black.opacity(0.55), radius: 22, x: 0, y: 10)
@@ -560,7 +596,7 @@ struct NextEpisodeOverlay: View {
             }
         }
         .frame(width: 158, height: 90)
-        .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
     }
 
     private var playButton: some View {

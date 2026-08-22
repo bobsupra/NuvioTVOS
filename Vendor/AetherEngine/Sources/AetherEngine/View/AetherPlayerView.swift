@@ -91,14 +91,25 @@ public final class AetherPlayerView: PlatformBaseView {
     /// animations so swaps don't flash. Idempotent if the same layer is
     /// already attached.
     func attach(_ layer: CALayer) {
-        if hostedLayer === layer { return }
+        #if canImport(UIKit)
+        let isAlreadySublayer = layer.superlayer === self.layer
+        #elseif canImport(AppKit)
+        let isAlreadySublayer = layer.superlayer === self.layer
+        #endif
+        if hostedLayer === layer && isAlreadySublayer { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hostedLayer?.removeFromSuperlayer()
+        if hostedLayer !== layer {
+            hostedLayer?.removeFromSuperlayer()
+        }
         #if canImport(UIKit)
-        self.layer.addSublayer(layer)
+        if layer.superlayer !== self.layer {
+            self.layer.addSublayer(layer)
+        }
         #elseif canImport(AppKit)
-        self.layer?.addSublayer(layer)
+        if layer.superlayer !== self.layer {
+            self.layer?.addSublayer(layer)
+        }
         // Resize the video layer in lockstep with the view's bounds during a
         // live window drag. Without this it only catches up on the next layout()
         // pass, and because an NSView's layer is anchored bottom-left that lag
@@ -111,9 +122,8 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.commit()
     }
 
-    /// Engine-internal. Remove the current hosted layer without
-    /// replacement (used on unbind / teardown).
-    func detach() {
+    /// Remove the current hosted layer without replacement (used on unbind / teardown).
+    public func detach() {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)

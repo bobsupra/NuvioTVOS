@@ -65,6 +65,12 @@ struct PlayerPanelRow: View {
     var selected: Bool = false
     var isFocused: Bool = false
 
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+
+    private var rowCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+    }
+
     var body: some View {
         HStack(spacing: 16) {
             VStack(alignment: .leading, spacing: 4) {
@@ -104,7 +110,7 @@ struct PlayerPanelRow: View {
         .padding(.vertical, 16)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(
-            RoundedRectangle(cornerRadius: 16, style: .continuous)
+            RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                 .fill(isFocused ? Color.white : Color.white.opacity(0.07))
         )
         .scaleEffect(isFocused ? 1.02 : 1)
@@ -118,47 +124,77 @@ struct PlayerEpisodesPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
     @FocusState private var focusedID: String?
 
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+
+    private var rowCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 18)
+    }
+
+    private var thumbCornerRadius: CGFloat {
+        max(4, AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16) * 0.6)
+    }
+
     private var episodes: [NuvioVideo] {
         viewModel.panelEpisodes
     }
 
+    private var targetEpisodeId: String? {
+        viewModel.panelCurrentEpisodeId ?? episodes.first?.id
+    }
+
     var body: some View {
         PlayerSidePanelChrome(title: "Episodes", onExit: { viewModel.closeSidePanel() }) {
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if episodes.isEmpty {
-                        Button {} label: {
-                            PlayerPanelRow(
-                                title: "Episodes unavailable",
-                                subtitle: "No episode list for this session.",
-                                isFocused: focusedID == "empty"
-                            )
-                        }
-                        .buttonStyle(PosterCardButtonStyle())
-                        .focusEffectDisabledIfAvailable()
-                        .focused($focusedID, equals: "empty")
-                    } else {
-                        ForEach(episodes) { episode in
-                            let isCurrent = episode.id == viewModel.panelCurrentEpisodeId
-                            Button {
-                                viewModel.selectEpisode(episode)
-                            } label: {
-                                episodeRow(episode, isCurrent: isCurrent, isFocused: focusedID == episode.id)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if episodes.isEmpty {
+                            Button {} label: {
+                                PlayerPanelRow(
+                                    title: "Episodes unavailable",
+                                    subtitle: "No episode list for this session.",
+                                    isFocused: focusedID == "empty"
+                                )
                             }
                             .buttonStyle(PosterCardButtonStyle())
                             .focusEffectDisabledIfAvailable()
-                            .focused($focusedID, equals: episode.id)
+                            .focused($focusedID, equals: "empty")
+                            .id("empty")
+                        } else {
+                            ForEach(episodes) { episode in
+                                let isCurrent = episode.id == viewModel.panelCurrentEpisodeId
+                                Button {
+                                    viewModel.selectEpisode(episode)
+                                } label: {
+                                    episodeRow(episode, isCurrent: isCurrent, isFocused: focusedID == episode.id)
+                                }
+                                .buttonStyle(PosterCardButtonStyle())
+                                .focusEffectDisabledIfAvailable()
+                                .focused($focusedID, equals: episode.id)
+                                .id(episode.id)
+                            }
                         }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 12)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 12)
+                .focusSection()
+                .onAppear {
+                    scrollToTarget(proxy: proxy)
+                }
             }
-            .focusSection()
         }
-        .onAppear {
-            DispatchQueue.main.async {
-                focusedID = viewModel.panelCurrentEpisodeId ?? episodes.first?.id
+    }
+
+    private func scrollToTarget(proxy: ScrollViewProxy) {
+        guard let target = targetEpisodeId else { return }
+        DispatchQueue.main.async {
+            focusedID = target
+            proxy.scrollTo(target, anchor: .center)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            focusedID = target
+            withAnimation(.easeInOut(duration: 0.15)) {
+                proxy.scrollTo(target, anchor: .center)
             }
         }
     }
@@ -180,7 +216,7 @@ struct PlayerEpisodesPanel: View {
                 }
             }
             .frame(width: 150, height: 84)
-            .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+            .clipShape(RoundedRectangle(cornerRadius: thumbCornerRadius, style: .continuous))
 
             VStack(alignment: .leading, spacing: 4) {
                 Text("S\(episode.season) E\(episode.episode)")
@@ -207,11 +243,11 @@ struct PlayerEpisodesPanel: View {
         }
         .padding(14)
         .background(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                 .fill(isFocused ? Color.white : Color.white.opacity(0.07))
         )
         .overlay(
-            RoundedRectangle(cornerRadius: 18, style: .continuous)
+            RoundedRectangle(cornerRadius: rowCornerRadius, style: .continuous)
                 .strokeBorder(isCurrent && !isFocused ? Color.white.opacity(0.35) : .clear, lineWidth: 2)
         )
         .scaleEffect(isFocused ? 1.02 : 1)
@@ -225,76 +261,89 @@ struct PlayerSourcesPanel: View {
     @ObservedObject var viewModel: PlayerViewModel
     @FocusState private var focusedID: String?
 
+    private var targetSourceId: String? {
+        if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
+            return current.id
+        }
+        return viewModel.availableSources.first?.id
+    }
+
     var body: some View {
         PlayerSidePanelChrome(title: "Sources", onExit: { viewModel.closeSidePanel() }) {
-            ScrollView {
-                LazyVStack(spacing: 12) {
-                    if viewModel.isLoadingSources {
-                        HStack(spacing: 14) {
-                            ProgressView()
-                                .progressViewStyle(.circular)
-                                .tint(.white)
-                            Text("Searching sources…")
-                                .font(.system(size: 22, weight: .medium))
-                                .foregroundStyle(.white.opacity(0.8))
-                        }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 12)
-                    } else if viewModel.availableSources.isEmpty {
-                        Button {} label: {
-                            PlayerPanelRow(
-                                title: "No sources found",
-                                subtitle: "None of your stream add-ons returned a link.",
-                                isFocused: focusedID == "empty"
-                            )
-                        }
-                        .buttonStyle(PosterCardButtonStyle())
-                        .focusEffectDisabledIfAvailable()
-                        .focused($focusedID, equals: "empty")
-                    } else {
-                        ForEach(viewModel.availableSources, id: \.id) { stream in
-                            let selected = viewModel.isCurrentSource(stream)
-                            Button {
-                                viewModel.selectSource(stream)
-                            } label: {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 12) {
+                        if viewModel.isLoadingSources {
+                            HStack(spacing: 14) {
+                                ProgressView()
+                                    .progressViewStyle(.circular)
+                                    .tint(.white)
+                                Text("Searching sources…")
+                                    .font(.system(size: 22, weight: .medium))
+                                    .foregroundStyle(.white.opacity(0.8))
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 12)
+                        } else if viewModel.availableSources.isEmpty {
+                            Button {} label: {
                                 PlayerPanelRow(
-                                    title: stream.panelTitle,
-                                    subtitle: stream.panelSubtitle,
-                                    trailing: stream.panelResolutionLabel,
-                                    selected: selected,
-                                    isFocused: focusedID == stream.id
+                                    title: "No sources found",
+                                    subtitle: "None of your stream add-ons returned a link.",
+                                    isFocused: focusedID == "empty"
                                 )
                             }
                             .buttonStyle(PosterCardButtonStyle())
                             .focusEffectDisabledIfAvailable()
-                            .focused($focusedID, equals: stream.id)
+                            .focused($focusedID, equals: "empty")
+                            .id("empty")
+                        } else {
+                            ForEach(viewModel.availableSources, id: \.id) { stream in
+                                let selected = viewModel.isCurrentSource(stream)
+                                Button {
+                                    viewModel.selectSource(stream)
+                                } label: {
+                                    PlayerPanelRow(
+                                        title: stream.panelTitle,
+                                        subtitle: stream.panelSubtitle,
+                                        trailing: stream.panelResolutionLabel,
+                                        selected: selected,
+                                        isFocused: focusedID == stream.id
+                                    )
+                                }
+                                .buttonStyle(PosterCardButtonStyle())
+                                .focusEffectDisabledIfAvailable()
+                                .focused($focusedID, equals: stream.id)
+                                .id(stream.id)
+                            }
                         }
                     }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 12)
                 }
-                .padding(.horizontal, 10)
-                .padding(.vertical, 12)
+                .focusSection()
+                .onAppear {
+                    viewModel.loadSourcesIfNeeded()
+                    scrollToTarget(proxy: proxy)
+                }
+                .onChange(of: viewModel.availableSources.map(\.id)) { _, sourceIDs in
+                    guard !sourceIDs.isEmpty else { return }
+                    scrollToTarget(proxy: proxy)
+                }
             }
-            .focusSection()
-        }
-        .onAppear {
-            viewModel.loadSourcesIfNeeded()
-            requestSourceFocus()
-        }
-        .onChange(of: viewModel.availableSources.map(\.id)) { _, sourceIDs in
-            guard !sourceIDs.isEmpty,
-                  focusedID == nil || !sourceIDs.contains(focusedID ?? "") else {
-                return
-            }
-            requestSourceFocus()
         }
     }
 
-    private func requestSourceFocus() {
+    private func scrollToTarget(proxy: ScrollViewProxy) {
+        guard let target = targetSourceId else { return }
         DispatchQueue.main.async {
-            if let current = viewModel.availableSources.first(where: { viewModel.isCurrentSource($0) }) {
-                focusedID = current.id
-            } else {
-                focusedID = viewModel.availableSources.first?.id
+            focusedID = target
+            proxy.scrollTo(target, anchor: .center)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+            guard let target = targetSourceId else { return }
+            focusedID = target
+            withAnimation(.easeInOut(duration: 0.15)) {
+                proxy.scrollTo(target, anchor: .center)
             }
         }
     }

@@ -511,13 +511,18 @@ enum CatalogWatchedPolicy {
         videos: [NuvioVideo]?,
         watchedEpisodeKeys: Set<String>
     ) -> Bool {
-        let airedEpisodes = (videos ?? []).filter {
-            $0.season > 0 && $0.episode > 0 && EpisodeReleasePolicy.hasAired($0.released)
+        guard let videos, !videos.isEmpty, !watchedEpisodeKeys.isEmpty else { return false }
+        var airedCount = 0
+        for video in videos {
+            guard video.season > 0, video.episode > 0 else { continue }
+            guard EpisodeReleasePolicy.hasAired(video.released) else { continue }
+            airedCount += 1
+            let key = "\(video.season):\(video.episode)"
+            if !watchedEpisodeKeys.contains(key) {
+                return false
+            }
         }
-        guard !airedEpisodes.isEmpty else { return false }
-        return airedEpisodes.allSatisfy {
-            watchedEpisodeKeys.contains("\($0.season):\($0.episode)")
-        }
+        return airedCount > 0
     }
 }
 
@@ -1164,11 +1169,20 @@ struct ContinueWatchingItem: Identifiable, Codable {
 /// Every recency comparison here reads `recencySortDate` rather than
 /// `lastWatchedAt`: the two differ only for a genuine new drop, which ranks by
 /// its air date so a returning show surfaces the day it returns instead of at
-/// the age of the episode that seeded it. "Default" is ordered by the same key
-/// before it ever reaches this type — see `refreshContinueWatching()`.
+/// the age of the episode that seeded it.
 enum ContinueWatchingSortPolicy {
+    static func isUpcomingItem(_ item: ContinueWatchingItem) -> Bool {
+        item.isUpNextEntry && !item.hasAired && !item.isAiringToday
+    }
+
     static func sorted(_ items: [ContinueWatchingItem], preference: String) -> [ContinueWatchingItem] {
         switch preference {
+        case "Streaming Style":
+            let (released, unreleased) = partitionByAirStatus(items)
+            return released + unreleased
+        case "Separate Upcoming Row":
+            let (released, _) = partitionByAirStatus(items)
+            return released
         case "Recently watched":
             return items.enumerated()
                 .sorted { lhs, rhs in
@@ -1202,9 +1216,69 @@ enum ContinueWatchingSortPolicy {
                     return lhs.offset < rhs.offset
                 }
                 .map(\.element)
+        case "Default":
+            return sortByRecency(items)
         default:
             return items
         }
+    }
+
+    /// Extracts the unaired/upcoming episodes for a dedicated Upcoming row,
+    /// ordered with soonest air date first.
+    static func upcomingItems(_ items: [ContinueWatchingItem]) -> [ContinueWatchingItem] {
+        let (_, unreleased) = partitionByAirStatus(items)
+        return unreleased
+    }
+
+    static func partitionByAirStatus(
+        _ items: [ContinueWatchingItem]
+    ) -> (released: [ContinueWatchingItem], unreleased: [ContinueWatchingItem]) {
+        var released: [ContinueWatchingItem] = []
+        var unreleased: [ContinueWatchingItem] = []
+        for item in items {
+            if isUpcomingItem(item) {
+                unreleased.append(item)
+            } else {
+                released.append(item)
+            }
+        }
+        let sortedReleased = sortByRecency(released)
+        let sortedUnreleased = unreleased.enumerated().sorted { lhs, rhs in
+            let dateL = airDate(lhs.element)
+            let dateR = airDate(rhs.element)
+            switch (dateL, dateR) {
+            case let (dateL?, dateR?) where dateL != dateR:
+                return dateL < dateR
+            case (_?, nil):
+                return true
+            case (nil, _?):
+                return false
+            default:
+                return lhs.offset < rhs.offset
+            }
+        }.map(\.element)
+
+        return (sortedReleased, sortedUnreleased)
+    }
+
+    private static func sortByRecency(_ items: [ContinueWatchingItem]) -> [ContinueWatchingItem] {
+        items.enumerated()
+            .sorted { lhs, rhs in
+                if lhs.element.recencySortDate != rhs.element.recencySortDate {
+                    return lhs.element.recencySortDate > rhs.element.recencySortDate
+                }
+                return lhs.offset < rhs.offset
+            }
+            .map(\.element)
+    }
+
+    private static func airDate(_ item: ContinueWatchingItem) -> Date? {
+        for value in [item.episodeVideo?.released, item.released] {
+            if let date = EpisodeReleasePolicy.releaseDate(for: value) {
+                return date
+            }
+        }
+        return nil
     }
 
     private static func releaseKey(_ item: ContinueWatchingItem) -> String {
@@ -2332,7 +2406,8 @@ enum ContinueWatchingDismissStore {
     static let changedNotification = Notification.Name("nuvio.tv.continueWatching.dismissed")
 
     private static let baseKey = "nuvio.tv.continueWatching.dismissedKeys"
-    private static let separator = "\u{1f}"
+    private static let separator = "|"
+    private static let legacySeparator = "\u{1f}"
 
     private(set) static var activeProfileId: String?
 
@@ -2342,15 +2417,19 @@ enum ContinueWatchingDismissStore {
         activeProfileId = profileId
     }
 
-    private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId?.trimmingCharacters(in: .whitespacesAndNewlines), !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
+    }
+
+    private static var storageKey: String {
+        storageKey(for: activeProfileId)
     }
 
     /// Scoped counterpart to ``eraseAllProfiles()`` — see
     /// ``WatchedStore/eraseProfile(_:)``.
     static func eraseProfile(_ profileId: String) {
-        let key = profileId.isEmpty ? baseKey : "\(baseKey).\(profileId)"
+        let key = storageKey(for: profileId)
         UserDefaults.standard.removeObject(forKey: key)
     }
 
@@ -2364,19 +2443,46 @@ enum ContinueWatchingDismissStore {
         return "\(id)\(separator)\(season ?? -1)\(separator)\(episode ?? -1)"
     }
 
+    private static func legacyKey(contentId: String, season: Int?, episode: Int?) -> String {
+        let id = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        return "\(id)\(legacySeparator)\(season ?? -1)\(legacySeparator)\(episode ?? -1)"
+    }
+
     static func keys() -> Set<String> {
-        Set(UserDefaults.standard.stringArray(forKey: storageKey) ?? [])
+        keys(profileId: activeProfileId)
+    }
+
+    static func keys(profileId: String?) -> Set<String> {
+        Set(UserDefaults.standard.stringArray(forKey: storageKey(for: profileId)) ?? [])
     }
 
     static func isDismissed(_ item: ContinueWatchingItem) -> Bool {
         let current = keys()
         guard !current.isEmpty else { return false }
-        return current.contains(key(for: item))
+        let numbers = item.episodeNumbers
+        let id = item.meta.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let exact = key(contentId: id, season: numbers?.season, episode: numbers?.episode)
+        let wildcard = "\(id)\(separator)-1\(separator)-1"
+        let legacyExact = legacyKey(contentId: id, season: numbers?.season, episode: numbers?.episode)
+        let legacyWildcard = "\(id)\(legacySeparator)-1\(legacySeparator)-1"
+        return current.contains(exact) || current.contains(wildcard) || current.contains(legacyExact) || current.contains(legacyWildcard)
     }
 
     static func dismiss(_ item: ContinueWatchingItem) {
         var current = keys()
-        guard current.insert(key(for: item)).inserted else { return }
+        let numbers = item.episodeNumbers
+        let specificKey = key(contentId: item.meta.id, season: numbers?.season, episode: numbers?.episode)
+        current.insert(specificKey)
+        if numbers == nil {
+            current.insert("\(item.meta.id.trimmingCharacters(in: .whitespacesAndNewlines))\(separator)-1\(separator)-1")
+        }
+        persist(current)
+    }
+
+    static func dismiss(contentId: String) {
+        var current = keys()
+        let id = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        current.insert("\(id)\(separator)-1\(separator)-1")
         persist(current)
     }
 
@@ -2384,19 +2490,32 @@ enum ContinueWatchingDismissStore {
     static func clear(contentId: String) {
         let current = keys()
         guard !current.isEmpty else { return }
-        let prefix = "\(contentId.trimmingCharacters(in: .whitespacesAndNewlines))\(separator)"
-        let remaining = current.filter { !$0.hasPrefix(prefix) }
+        let id = contentId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let prefix1 = "\(id)\(separator)"
+        let prefix2 = "\(id)\(legacySeparator)"
+        let remaining = current.filter { !$0.hasPrefix(prefix1) && !$0.hasPrefix(prefix2) && $0 != id }
         guard remaining.count != current.count else { return }
         persist(remaining)
     }
 
-    private static func persist(_ keys: Set<String>) {
+    static func replaceKeys(_ keys: Set<String>, profileId: String?) {
+        persist(keys, profileId: profileId)
+    }
+
+    private static func persist(_ keys: Set<String>, profileId: String? = activeProfileId) {
+        let targetKey = storageKey(for: profileId)
         if keys.isEmpty {
-            UserDefaults.standard.removeObject(forKey: storageKey)
+            UserDefaults.standard.removeObject(forKey: targetKey)
         } else {
-            UserDefaults.standard.set(Array(keys), forKey: storageKey)
+            UserDefaults.standard.set(Array(keys), forKey: targetKey)
         }
-        NotificationCenter.default.post(name: changedNotification, object: nil)
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        } else {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+            }
+        }
     }
 
     /// Deletes every profile's removals (and the legacy shared set) on sign-out.
@@ -3134,6 +3253,10 @@ enum CollectionsStore {
 
         // Prefer re-encoded raw rows so a double-encoded string input is stored cleanly.
         let storeData = (try? JSONSerialization.data(withJSONObject: rows)) ?? json
+        if let currentData = readData(forKey: storageKey), currentData == storeData {
+            rememberPulledIds(decoded.map(\.id))
+            return
+        }
         _ = writeData(storeData, forKey: storageKey)
         rememberPulledIds(decoded.map(\.id))
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -5610,6 +5733,19 @@ enum WatchedStore {
 enum ProfileSettings {
     private static let suitePrefix = "nuvio.tv.profile.settings"
     private static let seededFlag = "nuvio.tv.profile.settings.seeded"
+    static let settingsChangedNotification = Notification.Name("nuvio.tv.profile.settings.changed")
+
+    static func notifySettingsChanged() {
+        if Thread.isMainThread {
+            NotificationCenter.default.post(name: settingsChangedNotification, object: nil)
+            NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
+        } else {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: settingsChangedNotification, object: nil)
+                NotificationCenter.default.post(name: UserDefaults.didChangeNotification, object: nil)
+            }
+        }
+    }
 
     /// Settings store for the active profile. `.standard` until one is loaded
     /// (e.g. on the login / "Who's watching?" screens).

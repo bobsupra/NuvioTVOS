@@ -32,7 +32,7 @@ final class PlaybackClock: ObservableObject {
 @MainActor
 class PlayerViewModel: ObservableObject {
     @Published var status: PlayerStatus = .idle
-    @Published var time: PlayerTime = PlayerTime()
+    var time: PlayerTime = PlayerTime()
     /// High-frequency time/scrub state for HUDs. Mirrors `time` on each tick.
     let clock = PlaybackClock()
     @Published var subtitles: [SubtitleTrack] = []
@@ -92,6 +92,14 @@ class PlayerViewModel: ObservableObject {
     /// Seconds to wait after pausing before the metadata sheet appears.
     private static let pauseOverlayDelaySeconds: UInt64 = 5
 
+    // MARK: - Picture in Picture
+    var isPictureInPictureSupported: Bool {
+        PictureInPictureManager.shared.isPictureInPictureSupported && activeEngineKind == .aether
+    }
+    @Published var isPictureInPictureActive: Bool = false
+    @Published var isPictureInPicturePossible: Bool = false
+    private var cancellables = Set<AnyCancellable>()
+
     // MARK: Next episode
 
     /// The episode that will play after this one, if any. Drives the Next
@@ -137,7 +145,7 @@ class PlayerViewModel: ObservableObject {
     private static let skipSegmentStartLead: Double = 0.35
 
     /// Owns Aether (default) and the one-way MPV compatibility fallback.
-    let sessionCoordinator = PlaybackSessionCoordinator()
+    var sessionCoordinator: PlaybackSessionCoordinator
     /// Convenience: libmpv Metal host (fallback / forced MPV).
     var playerController: MPVPlayerViewController { sessionCoordinator.mpvController }
     /// Aether surface host.
@@ -165,6 +173,7 @@ class PlayerViewModel: ObservableObject {
     private var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
     private var activeHTTPHeaders: [String: String] = [:]
+    private var activePlaybackOrigin: PlaybackOrigin = .main
     private var livePlaybackHasStarted = false
     private var liveBufferingBeganAt: Date?
     /// HLS playlist refreshes briefly report loading during healthy playback.
@@ -300,7 +309,18 @@ class PlayerViewModel: ObservableObject {
     private let loadTimeoutSeconds: UInt64 = 30
 
     init() {
+        // A PiP restore creates this view model after the app has already
+        // dismissed the original PlayerView. Adopt the retained coordinator
+        // before SwiftUI mounts a surface so it never binds a fresh, empty
+        // Aether controller for the first render pass.
+        sessionCoordinator = PictureInPictureManager.shared.activeCoordinator
+            ?? PlaybackSessionCoordinator()
         sessionCoordinator.prepareControllers()
+        bindSessionCoordinatorCallbacks()
+        setupPipObservers()
+    }
+
+    private func bindSessionCoordinatorCallbacks() {
         let suspend: (Int64, Int64) -> Void = { [weak self] positionMs, durationMs in
             Task { @MainActor [weak self] in
                 self?.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
@@ -334,7 +354,9 @@ class PlayerViewModel: ObservableObject {
         Task { @MainActor in
             poll?.invalidate()
             hide?.invalidate()
-            coordinator.stopAll()
+            if !PictureInPictureManager.shared.isPictureInPictureActive {
+                coordinator.stopAll()
+            }
         }
     }
 
@@ -344,10 +366,41 @@ class PlayerViewModel: ObservableObject {
         subtitle: String,
         httpHeaders: [String: String] = [:],
         externalSubtitles: [NuvioSubtitle] = [],
-        resumeFrom: Double?
+        resumeFrom: Double?,
+        playbackOrigin: PlaybackOrigin = .main
     ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
+        activePlaybackOrigin = playbackOrigin
         if !hasLoaded { sessionTrackSelection = nil }
+
+        // Adopt active Picture in Picture session if already playing this content
+        let pipManager = PictureInPictureManager.shared
+        if let activeCoord = pipManager.activeCoordinator,
+           pipManager.activeContext?.url == url,
+           pipManager.isPictureInPictureActive
+            || pipManager.isRestoringUIInProgress
+            || sessionCoordinator === activeCoord {
+            self.sessionCoordinator = activeCoord
+            bindSessionCoordinatorCallbacks()
+            self.activeEngineKind = activeCoord.activeBackend
+            self.hasLoaded = true
+            activeCoord.aetherController.rebindSurface()
+            applyStreamState(
+                url: url,
+                meta: meta,
+                subtitle: subtitle,
+                httpHeaders: httpHeaders,
+                externalSubtitles: externalSubtitles,
+                // The retained Aether clock is authoritative on PiP restore;
+                // the original launch resume would seek the adopted session
+                // backward during the first tick.
+                resumeFrom: nil
+            )
+            tick()
+            startPolling()
+            return
+        }
+
         applyStreamState(
             url: url,
             meta: meta,
@@ -417,6 +470,26 @@ class PlayerViewModel: ObservableObject {
         startPolling()
         configureWheelTrackingIfNeeded()
         startLoadWatchdog()
+
+        if !isTrailerPlayback {
+            let context = ActivePlaybackContext(
+                url: url,
+                meta: meta,
+                subtitle: subtitle,
+                httpHeaders: httpHeaders,
+                externalSubtitles: externalSubtitles,
+                resumeFrom: resumeFrom,
+                episodes: seriesEpisodes,
+                currentEpisode: currentEpisodeVideo,
+                autoPlayNextEnabled: autoPlayNextEnabled,
+                autoPlayNextCountdownSeconds: autoPlayNextCountdownSeconds,
+                playbackOrigin: activePlaybackOrigin
+            )
+            PictureInPictureManager.shared.registerSession(
+                coordinator: sessionCoordinator,
+                context: context
+            )
+        }
     }
 
     /// Aether-first policy with MPV one-way fallback. Native DV remux is disabled
@@ -675,6 +748,26 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
         nextEpisode = Self.nextEpisode(after: current, in: episodes)
+
+        if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
+            let context = ActivePlaybackContext(
+                url: url,
+                meta: meta,
+                subtitle: subtitle,
+                httpHeaders: activeHTTPHeaders,
+                externalSubtitles: pendingExternalSubtitles,
+                resumeFrom: pendingResumeSeconds,
+                episodes: episodes,
+                currentEpisode: current,
+                autoPlayNextEnabled: autoPlayEnabled,
+                autoPlayNextCountdownSeconds: autoPlayCountdownSeconds,
+                playbackOrigin: activePlaybackOrigin
+            )
+            PictureInPictureManager.shared.registerSession(
+                coordinator: sessionCoordinator,
+                context: context
+            )
+        }
     }
 
     private static func nextEpisode(after current: NuvioVideo?, in episodes: [NuvioVideo]) -> NuvioVideo? {
@@ -1512,6 +1605,15 @@ class PlayerViewModel: ObservableObject {
 
     func shutdown() {
         guard !didShutdown else { return }
+        if PictureInPictureManager.shared.isPictureInPictureActive {
+            // Keep playback and session alive for PiP
+            pollTimer?.invalidate()
+            pollTimer = nil
+            controlsHideTimer?.invalidate()
+            controlsHideTimer = nil
+            cancelPauseOverlaySchedule()
+            return
+        }
         didShutdown = true
         pollTimer?.invalidate()
         pollTimer = nil
@@ -1547,6 +1649,8 @@ class PlayerViewModel: ObservableObject {
         saveProgress(force: true)
         // Leave the fallback host destroyed so re-entry cannot resume a ghost pipeline.
         playerController.destroyPlayer()
+        aetherController.destroyPlayer()
+        PictureInPictureManager.shared.invalidateSession()
         status = .idle
     }
 
@@ -3262,6 +3366,43 @@ class PlayerViewModel: ObservableObject {
         value.count == 11 && value.allSatisfy { char in
             char.isLetter || char.isNumber || char == "_" || char == "-"
         }
+    }
+
+    // MARK: - Picture in Picture Methods
+
+    func startPictureInPicture() {
+        PictureInPictureManager.shared.startPictureInPicture()
+    }
+
+    func stopPictureInPicture() {
+        PictureInPictureManager.shared.stopPictureInPicture()
+    }
+
+    func togglePictureInPicture() {
+        if isPictureInPictureActive {
+            stopPictureInPicture()
+        } else {
+            startPictureInPicture()
+        }
+    }
+
+    private func setupPipObservers() {
+        isPictureInPictureActive = PictureInPictureManager.shared.isPictureInPictureActive
+        isPictureInPicturePossible = PictureInPictureManager.shared.isPictureInPicturePossible
+
+        PictureInPictureManager.shared.$isPictureInPictureActive
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] active in
+                self?.isPictureInPictureActive = active
+            }
+            .store(in: &cancellables)
+
+        PictureInPictureManager.shared.$isPictureInPicturePossible
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] possible in
+                self?.isPictureInPicturePossible = possible
+            }
+            .store(in: &cancellables)
     }
 }
 

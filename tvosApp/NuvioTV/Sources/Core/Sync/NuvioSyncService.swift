@@ -145,7 +145,21 @@ final class NuvioSyncManager: ObservableObject {
             Task { @MainActor in self?.schedulePush() }
         })
         observers.append(center.addObserver(
+            forName: ContinueWatchingDismissStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.schedulePush() }
+        })
+        observers.append(center.addObserver(
             forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in self?.schedulePush() }
+        })
+        observers.append(center.addObserver(
+            forName: ProfileSettings.settingsChangedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
@@ -224,7 +238,7 @@ final class NuvioSyncManager: ObservableObject {
               completedInitialPullKeys.contains(key) else { return }
 
         homeCatalogPushTask?.cancel()
-        homeCatalogPushTask = Task { @MainActor [weak self] in
+        homeCatalogPushTask = Task(priority: .utility) { @MainActor [weak self] in
             do {
                 try await Task.sleep(nanoseconds: 500_000_000)
             } catch {
@@ -558,7 +572,7 @@ final class NuvioSyncManager: ObservableObject {
 
         profileSyncError = nil
         isPullingAccountProfiles = true
-        profileSelectionRefreshTask = Task { @MainActor [weak self] in
+        profileSelectionRefreshTask = Task(priority: .utility) { @MainActor [weak self] in
             await self?.refreshProfilesForSelection()
         }
     }
@@ -663,7 +677,7 @@ final class NuvioSyncManager: ObservableObject {
         automaticAccountPullRetryCount = 0
         pullTask?.cancel()
         activePullKey = currentSyncKey()
-        pullTask = Task { @MainActor [weak self] in
+        pullTask = Task(priority: .utility) { @MainActor [weak self] in
             if !force {
                 try? await Task.sleep(nanoseconds: 500_000_000)
             }
@@ -762,7 +776,7 @@ final class NuvioSyncManager: ObservableObject {
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
 
         pushTask?.cancel()
-        pushTask = Task { @MainActor [weak self] in
+        pushTask = Task(priority: .utility) { @MainActor [weak self] in
             do {
                 try await Task.sleep(nanoseconds: 1_500_000_000)
             } catch {
@@ -956,11 +970,10 @@ final class NuvioSyncManager: ObservableObject {
                 )
                 try ensureStillSyncing(profileId: activeProfile.id)
                 lastPulledAddonRows = remoteAddons
-                let appliedCount = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
-                // Mirror Android's DataStore Flow: publish immediately after
-                // this profile-scoped input lands instead of waiting for the
-                // unrelated library/progress pulls below to finish.
-                homeCatalogRevision &+= 1
+                let (appliedCount, didChange) = client.applyAddons(remoteAddons, localProfileId: activeProfile.id)
+                if didChange {
+                    homeCatalogRevision &+= 1
+                }
                 Self.addonSyncDiagnostic = "remote \(remoteAddons.count), enabled \(appliedCount)"
                 print("Nuvio sync pulled \(appliedCount) enabled add-on(s).")
             } catch is CancellationError {
@@ -996,8 +1009,10 @@ final class NuvioSyncManager: ObservableObject {
                     remoteProfileId: remoteProfileId
                 ) {
                     try ensureStillSyncing(profileId: activeProfile.id)
-                    client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
-                    homeCatalogRevision &+= 1
+                    let didChange = client.applyHomeCatalogSettings(catalogSettings, localProfileId: activeProfile.id)
+                    if didChange {
+                        homeCatalogRevision &+= 1
+                    }
                     Self.catalogSettingsSyncDiagnostic = "pulled \(catalogSettings.items.count) item(s)"
                     print("Nuvio sync pulled home catalog settings (\(catalogSettings.items.count) item(s)).")
                 } else {
@@ -1447,9 +1462,16 @@ final class NuvioSyncManager: ObservableObject {
     /// of. The local store keeps the merged view either way; this gates the
     /// upload, not the merge.
     private static func ownsWatchState(for profileId: String) -> Bool {
-        TraktSettingsStore.watchProgressSource(
-            in: ProfileSettings.store(for: profileId)
-        ) == .nuvioSync
+        let store = ProfileSettings.store(for: profileId)
+        let source = TraktSettingsStore.watchProgressSource(in: store)
+        switch source {
+        case .nuvioSync:
+            return true
+        case .trakt:
+            return !TraktAuthStore.state(in: store).isAuthenticated(in: store)
+        case .simkl:
+            return !SimklAuthStore.state(in: store, profileScope: profileId).isAuthenticated(in: store)
+        }
     }
 
     /// Whether Nuvio Sync owns the library, on the same rule as
@@ -1458,9 +1480,16 @@ final class NuvioSyncManager: ObservableObject {
     /// `LibraryStore` this push reads from. The two settings are independent,
     /// so a profile can own one and not the other.
     private static func ownsLibrary(for profileId: String) -> Bool {
-        TraktSettingsStore.librarySourceMode(
-            in: ProfileSettings.store(for: profileId)
-        ) == .local
+        let store = ProfileSettings.store(for: profileId)
+        let mode = TraktSettingsStore.librarySourceMode(in: store)
+        switch mode {
+        case .local:
+            return true
+        case .trakt:
+            return !TraktAuthStore.state(in: store).isAuthenticated(in: store)
+        case .simkl:
+            return !SimklAuthStore.state(in: store, profileScope: profileId).isAuthenticated(in: store)
+        }
     }
 
     private static func watchStateSyncEnabled(for profileId: String) -> Bool {
@@ -1583,6 +1612,365 @@ private enum SyncClientIdentity {
     }
 }
 
+/// Translates between tvOS card styling presets (points & labels) and Android TV's
+/// `PosterCardStyleRepository` preferences (dp values & landscape/label toggles).
+enum PosterCardStyleSyncMapper {
+    static let featureKey = "poster_card_style_settings_payload"
+
+    static func cornerRadiusDp(for rawValue: String?) -> Int {
+        let option = CardCornerRadiusOption.from(rawValue: rawValue)
+        switch option {
+        case .sharp: return 0
+        case .subtle: return 4
+        case .classic: return 8
+        case .rounded: return 12
+        case .pill: return 16
+        }
+    }
+
+    static func cornerRadiusOption(for dp: Int) -> CardCornerRadiusOption {
+        if dp <= 0 {
+            return .sharp
+        } else if dp <= 6 {
+            return .subtle
+        } else if dp <= 10 {
+            return .classic
+        } else if dp <= 14 {
+            return .rounded
+        } else {
+            return .pill
+        }
+    }
+
+    static func widthDp(for rawValue: String?) -> Int {
+        let option = CardSizeOption.from(rawValue: rawValue)
+        switch option {
+        case .compact: return 104
+        case .dense: return 112
+        case .standard: return 120
+        case .balanced: return 126
+        case .comfort: return 134
+        case .large: return 140
+        }
+    }
+
+    static func cardSizeOption(for widthDp: Int) -> CardSizeOption {
+        if widthDp < 108 {
+            return .compact
+        } else if widthDp <= 116 {
+            return .dense
+        } else if widthDp <= 123 {
+            return .standard
+        } else if widthDp <= 130 {
+            return .balanced
+        } else if widthDp <= 137 {
+            return .comfort
+        } else {
+            return .large
+        }
+    }
+
+    static func exportPayload(
+        cardCornerRadius: String?,
+        cardSize: String?,
+        existingPayload: String?
+    ) -> String {
+        var existingDict: [String: Any] = [:]
+        if let payload = existingPayload?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !payload.isEmpty,
+           let data = payload.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            existingDict = parsed
+        }
+
+        let cornerRadius = cornerRadiusDp(for: cardCornerRadius)
+        let width = widthDp(for: cardSize)
+        let height = (width * 3) / 2
+        let catalogLandscapeModeEnabled = existingDict["catalogLandscapeModeEnabled"] as? Bool ?? false
+        let hideLabelsEnabled = existingDict["hideLabelsEnabled"] as? Bool ?? false
+
+        let payloadDict: [String: Any] = [
+            "widthDp": width,
+            "heightDp": height,
+            "cornerRadiusDp": cornerRadius,
+            "catalogLandscapeModeEnabled": catalogLandscapeModeEnabled,
+            "hideLabelsEnabled": hideLabelsEnabled
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: payloadDict, options: [.sortedKeys]),
+           let jsonString = String(data: data, encoding: .utf8) {
+            return jsonString
+        }
+        return ""
+    }
+
+    static func importPayload(_ remote: Any?) -> (cornerRadiusOption: CardCornerRadiusOption?, cardSizeOption: CardSizeOption?) {
+        guard let remote else { return (nil, nil) }
+        var dict: [String: Any]?
+        if let jsonString = remote as? String,
+           let data = jsonString.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            dict = parsed
+        } else if let parsed = remote as? [String: Any] {
+            dict = parsed
+        }
+        guard let dict else { return (nil, nil) }
+
+        var radiusResult: CardCornerRadiusOption?
+        if let cornerRadiusDp = (dict["cornerRadiusDp"] as? NSNumber)?.intValue {
+            radiusResult = cornerRadiusOption(for: cornerRadiusDp)
+        }
+
+        var sizeResult: CardSizeOption?
+        if let widthDp = (dict["widthDp"] as? NSNumber)?.intValue {
+            sizeResult = cardSizeOption(for: widthDp)
+        }
+
+        return (radiusResult, sizeResult)
+    }
+}
+
+/// Translates Continue Watching and Up Next preferences between tvOS settings and Android TV's
+/// `ContinueWatchingPreferencesRepository` payload.
+enum ContinueWatchingSyncMapper {
+    static let featureKey = "continue_watching_settings_payload"
+
+    static func sortModeToWire(_ sortMode: String?) -> String {
+        switch sortMode?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "streaming style":
+            return "STREAMING_STYLE"
+        case "separate upcoming row":
+            return "DEFAULT"
+        default:
+            return "DEFAULT"
+        }
+    }
+
+    static func sortModeFromWire(_ wire: String?) -> String {
+        switch wire?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() {
+        case "STREAMING_STYLE":
+            return "Streaming Style"
+        default:
+            return "Default"
+        }
+    }
+
+    static func exportPayload(
+        localProfileId: String? = nil,
+        upNextFromFurthestEpisode: Bool,
+        showUnairedNextUp: Bool,
+        continueWatchingSort: String?,
+        existingPayload: String?
+    ) -> String {
+        var existingDict: [String: Any] = [:]
+        if let payload = existingPayload?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !payload.isEmpty,
+           let data = payload.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            existingDict = parsed
+        }
+
+        let isVisible = existingDict["isVisible"] as? Bool ?? true
+        let style = existingDict["style"] as? String ?? "Card"
+        let useEpisodeThumbnails = existingDict["use_episode_thumbnails_in_cw"] as? Bool ?? true
+        let blurNextUp = existingDict["blur_continue_watching_next_up"] as? Bool ?? false
+        let existingDismissed = Set(existingDict["dismissedNextUpKeys"] as? [String] ?? [])
+        let localDismissed = ContinueWatchingDismissStore.keys(profileId: localProfileId)
+        let mergedDismissed = Array(existingDismissed.union(localDismissed)).sorted()
+        let showResumePromptOnLaunch = existingDict["showResumePromptOnLaunch"] as? Bool ?? true
+        let sortMode = sortModeToWire(continueWatchingSort)
+
+        let payloadDict: [String: Any] = [
+            "isVisible": isVisible,
+            "style": style,
+            "upNextFromFurthestEpisode": upNextFromFurthestEpisode,
+            "use_episode_thumbnails_in_cw": useEpisodeThumbnails,
+            "show_unaired_next_up": showUnairedNextUp,
+            "blur_continue_watching_next_up": blurNextUp,
+            "dismissedNextUpKeys": mergedDismissed,
+            "showResumePromptOnLaunch": showResumePromptOnLaunch,
+            "sort_mode": sortMode
+        ]
+
+        if let data = try? JSONSerialization.data(withJSONObject: payloadDict, options: [.sortedKeys]),
+           let jsonString = String(data: data, encoding: .utf8) {
+            return jsonString
+        }
+        return ""
+    }
+
+    static func importPayload(_ remote: Any?) -> (upNextFromFurthestEpisode: Bool?, showUnairedNextUp: Bool?, sortMode: String?, dismissedKeys: Set<String>?) {
+        guard let remote else { return (nil, nil, nil, nil) }
+        var dict: [String: Any]?
+        if let jsonString = remote as? String,
+           let data = jsonString.data(using: .utf8),
+           let parsed = (try? JSONSerialization.jsonObject(with: data)) as? [String: Any] {
+            dict = parsed
+        } else if let parsed = remote as? [String: Any] {
+            dict = parsed
+        }
+        guard let dict else { return (nil, nil, nil, nil) }
+
+        let upNext = dict["upNextFromFurthestEpisode"] as? Bool
+        let showUnaired = (dict["show_unaired_next_up"] as? Bool) ?? (dict["showUnairedNextUp"] as? Bool)
+        var sortMode: String?
+        if let rawSort = dict["sort_mode"] as? String {
+            sortMode = sortModeFromWire(rawSort)
+        }
+        let dismissedKeys = (dict["dismissedNextUpKeys"] as? [String]).map { Set($0) }
+
+        return (upNext, showUnaired, sortMode, dismissedKeys)
+    }
+}
+
+/// Translates between tvOS player/playback settings and Android TV / mobile `player_settings`.
+enum PlayerSettingsSyncMapper {
+    static let featureKey = "player_settings"
+
+    static let remoteToLocalKeyMappings: [(remote: String, local: String)] = [
+        ("preferred_audio_language", SettingsKey.audioLanguage),
+        ("preferred_subtitle_language", SettingsKey.subtitleLanguage),
+        ("secondary_preferred_subtitle_language", SettingsKey.subtitleLanguageSecondary),
+        ("subtitle_use_forced_subtitles", SettingsKey.forcedSubtitles),
+        ("stream_auto_play_next_episode_enabled", SettingsKey.autoPlayNext),
+        ("stream_auto_play_timeout_seconds", SettingsKey.autoPlayNextCountdown),
+        ("stream_cached_only", SettingsKey.cachedOnlyStreams),
+        ("cached_only_streams", SettingsKey.cachedOnlyStreams),
+        ("smart_stream_selection", SettingsKey.smartStreamSelection),
+        ("smart_stream_quality", SettingsKey.smartStreamQuality),
+        ("external_player_forward_subtitles", SettingsKey.externalPlayerForwardSubtitles),
+        ("frame_rate_matching", SettingsKey.frameRateMatching)
+    ]
+
+    static let localToRemoteKeyMappings: [(local: String, remote: String)] = [
+        (SettingsKey.audioLanguage, "preferred_audio_language"),
+        (SettingsKey.subtitleLanguage, "preferred_subtitle_language"),
+        (SettingsKey.subtitleLanguageSecondary, "secondary_preferred_subtitle_language"),
+        (SettingsKey.forcedSubtitles, "subtitle_use_forced_subtitles"),
+        (SettingsKey.autoPlayNext, "stream_auto_play_next_episode_enabled"),
+        (SettingsKey.autoPlayNextCountdown, "stream_auto_play_timeout_seconds"),
+        (SettingsKey.cachedOnlyStreams, "stream_cached_only"),
+        (SettingsKey.smartStreamSelection, "smart_stream_selection"),
+        (SettingsKey.smartStreamQuality, "smart_stream_quality"),
+        (SettingsKey.externalPlayerForwardSubtitles, "external_player_forward_subtitles"),
+        (SettingsKey.frameRateMatching, "frame_rate_matching")
+    ]
+}
+
+/// Translates between tvOS MDBList integration settings and Android TV / mobile `mdblist_settings`.
+enum MdbListSyncMapper {
+    static let featureKey = "mdblist_settings"
+
+    static let remoteToLocalKeyMappings: [(remote: String, local: String)] = [
+        ("mdblist_enabled", SettingsKey.mdbListEnabled),
+        ("mdblist_api_key", SettingsKey.mdbListApiKey),
+        ("mdblist_use_imdb", SettingsKey.mdbListUseImdb),
+        ("mdblist_use_tmdb", SettingsKey.mdbListUseTmdb),
+        ("mdblist_use_tomatoes", SettingsKey.mdbListUseTomatoes),
+        ("mdblist_use_metacritic", SettingsKey.mdbListUseMetacritic),
+        ("mdblist_use_trakt", SettingsKey.mdbListUseTrakt),
+        ("mdblist_use_letterboxd", SettingsKey.mdbListUseLetterboxd),
+        ("mdblist_use_audience", SettingsKey.mdbListUseAudience)
+    ]
+
+    static let localToRemoteKeyMappings: [(local: String, remote: String)] = [
+        (SettingsKey.mdbListEnabled, "mdblist_enabled"),
+        (SettingsKey.mdbListApiKey, "mdblist_api_key"),
+        (SettingsKey.mdbListUseImdb, "mdblist_use_imdb"),
+        (SettingsKey.mdbListUseTmdb, "mdblist_use_tmdb"),
+        (SettingsKey.mdbListUseTomatoes, "mdblist_use_tomatoes"),
+        (SettingsKey.mdbListUseMetacritic, "mdblist_use_metacritic"),
+        (SettingsKey.mdbListUseTrakt, "mdblist_use_trakt"),
+        (SettingsKey.mdbListUseLetterboxd, "mdblist_use_letterboxd"),
+        (SettingsKey.mdbListUseAudience, "mdblist_use_audience")
+    ]
+}
+
+/// Translates between tvOS theme / focus accent / AMOLED settings and Android TV's `theme_settings`.
+enum ThemeSettingsSyncMapper {
+    static let featureKey = "theme_settings"
+
+    static func themeToWire(_ theme: String?) -> String? {
+        guard let theme = theme?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(), !theme.isEmpty else {
+            return nil
+        }
+        switch theme {
+        case "rose", "pink": return "ROSE"
+        case "emerald", "green": return "EMERALD"
+        case "amber", "yellow", "orange": return "AMBER"
+        case "violet", "purple": return "VIOLET"
+        case "sky", "ocean", "blue": return "OCEAN"
+        case "crimson", "red": return "CRIMSON"
+        case "white": return "WHITE"
+        default:
+            return theme.uppercased()
+        }
+    }
+
+    static func wireToTheme(_ wire: String?) -> String? {
+        guard let wire = wire?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased(), !wire.isEmpty else {
+            return nil
+        }
+        switch wire {
+        case "ROSE": return SettingsAccent.rose.rawValue
+        case "EMERALD": return SettingsAccent.emerald.rawValue
+        case "AMBER": return SettingsAccent.amber.rawValue
+        case "VIOLET": return SettingsAccent.violet.rawValue
+        case "OCEAN": return SettingsAccent.sky.rawValue
+        case "WHITE": return SettingsAccent.white.rawValue
+        case "CRIMSON": return SettingsAccent.rose.rawValue
+        default: return nil
+        }
+    }
+
+    static func exportPayload(localProfileId: String, existing: [String: Any]? = nil) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        var result = existing ?? [:]
+
+        if let theme = defaults.string(forKey: SettingsKey.theme),
+           let wireTheme = themeToWire(theme) {
+            result["selectedTheme"] = [
+                "type": "string",
+                "value": wireTheme
+            ]
+        }
+
+        if let amoled = defaults.object(forKey: SettingsKey.amoled) as? Bool {
+            result["amoledEnabled"] = [
+                "type": "boolean",
+                "value": amoled
+            ]
+        }
+
+        if let liquidGlass = defaults.object(forKey: SettingsKey.liquidGlassCards) as? Bool {
+            result["liquidGlassNativeTabBarEnabled"] = [
+                "type": "boolean",
+                "value": liquidGlass
+            ]
+        }
+
+        return result
+    }
+
+    static func importPayload(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+
+        let rawTheme = (remote["selectedTheme"] as? [String: Any])?["value"] as? String ?? remote["selectedTheme"] as? String
+        if let localTheme = wireToTheme(rawTheme) {
+            defaults.set(localTheme, forKey: SettingsKey.theme)
+        }
+
+        if let rawAmoled = (remote["amoledEnabled"] as? [String: Any])?["value"] as? Bool ?? remote["amoledEnabled"] as? Bool {
+            defaults.set(rawAmoled, forKey: SettingsKey.amoled)
+        }
+
+        if let rawLiquidGlass = (remote["liquidGlassNativeTabBarEnabled"] as? [String: Any])?["value"] as? Bool ?? remote["liquidGlassNativeTabBarEnabled"] as? Bool {
+            defaults.set(rawLiquidGlass, forKey: SettingsKey.liquidGlassCards)
+        }
+    }
+}
+
 fileprivate final class NuvioAPIClient {
     private static let pullPageSize = 500
     private static let settingsPlatform = "tv"
@@ -1593,6 +1981,16 @@ fileprivate final class NuvioAPIClient {
     private static let debridSettingsFeature = "debrid_settings"
     /// Shared with Android TV's TMDB settings repository.
     private static let tmdbSettingsFeature = "tmdb_settings"
+    /// Shared with Android TV's PosterCardStyleRepository.
+    private static let posterCardStyleSettingsFeature = "poster_card_style_settings_payload"
+    /// Shared with Android TV's PlayerSettingsStorage.
+    private static let playerSettingsFeature = "player_settings"
+    /// Shared with Android TV's ContinueWatchingPreferencesRepository.
+    private static let continueWatchingSettingsFeature = "continue_watching_settings_payload"
+    /// Shared with Android TV's MdbListSettingsStorage.
+    private static let mdbListSettingsFeature = "mdblist_settings"
+    /// Shared with Android TV's ThemeSettingsStorage.
+    private static let themeSettingsFeature = "theme_settings"
 
     private let session: URLSession = .shared
     private let decoder: JSONDecoder = {
@@ -1758,7 +2156,7 @@ fileprivate final class NuvioAPIClient {
         return try JSONSerialization.data(withJSONObject: blob)
     }
 
-    func applyAddons(_ addons: [RemoteAddon], localProfileId: String) -> Int {
+    func applyAddons(_ addons: [RemoteAddon], localProfileId: String) -> (appliedCount: Int, didChange: Bool) {
         let preferences = addons
             .sorted { $0.sortOrder < $1.sortOrder }
             .compactMap { addon -> StreamAddonPreference? in
@@ -1767,8 +2165,12 @@ fileprivate final class NuvioAPIClient {
             }
 
         let defaults = ProfileSettings.store(for: localProfileId)
-        CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences, in: defaults)
-        return preferences.filter(\.enabled).count
+        let currentPreferences = CinemetaCatalogRepository.configuredStreamAddonPreferences(in: defaults)
+        let didChange = currentPreferences != preferences
+        if didChange {
+            CinemetaCatalogRepository.setConfiguredStreamAddonPreferences(preferences, in: defaults)
+        }
+        return (preferences.filter(\.enabled).count, didChange)
     }
 
     /// Home-catalog settings platforms in priority order — the shared blob the
@@ -1879,7 +2281,8 @@ fileprivate final class NuvioAPIClient {
     /// set of catalogs hidden from Home (so the repository drops them). Catalog
     /// keys use `<addonId>_<type>_<catalogId>`; collection keys use
     /// `collection_<collectionId>` so rows can be ordered alongside catalogs.
-    func applyHomeCatalogSettings(_ payload: HomeCatalogSyncPayload, localProfileId: String) {
+    @discardableResult
+    func applyHomeCatalogSettings(_ payload: HomeCatalogSyncPayload, localProfileId: String) -> Bool {
         let catalogItems = payload.items.filter { !$0.isCollection }
         let collectionItems = payload.items.filter(\.isCollection)
 
@@ -1902,15 +2305,24 @@ fileprivate final class NuvioAPIClient {
             .filter { !$0.isEmpty }
 
         let defaults = ProfileSettings.store(for: localProfileId)
-        if let data = try? JSONEncoder().encode(orderKeys) {
-            defaults.set(data, forKey: SettingsKey.homeCatalogSyncedOrder)
+        let currentOrderData = defaults.data(forKey: SettingsKey.homeCatalogSyncedOrder)
+        let currentDisabledData = defaults.data(forKey: SettingsKey.homeCatalogDisabled)
+        let currentDisabledColData = defaults.data(forKey: SettingsKey.homeCollectionDisabled)
+
+        let newOrderData = try? JSONEncoder().encode(orderKeys)
+        let newDisabledData = try? JSONEncoder().encode(disabledKeys)
+        let newDisabledColData = try? JSONEncoder().encode(disabledCollectionIds)
+
+        let didChange = (currentOrderData != newOrderData)
+            || (currentDisabledData != newDisabledData)
+            || (currentDisabledColData != newDisabledColData)
+
+        if didChange {
+            if let newOrderData { defaults.set(newOrderData, forKey: SettingsKey.homeCatalogSyncedOrder) }
+            if let newDisabledData { defaults.set(newDisabledData, forKey: SettingsKey.homeCatalogDisabled) }
+            if let newDisabledColData { defaults.set(newDisabledColData, forKey: SettingsKey.homeCollectionDisabled) }
         }
-        if let data = try? JSONEncoder().encode(disabledKeys) {
-            defaults.set(data, forKey: SettingsKey.homeCatalogDisabled)
-        }
-        if let data = try? JSONEncoder().encode(disabledCollectionIds) {
-            defaults.set(data, forKey: SettingsKey.homeCollectionDisabled)
-        }
+        return didChange
     }
 
     /// Replaces the profile's collections blob (`sync_push_collections`).
@@ -2002,7 +2414,18 @@ fileprivate final class NuvioAPIClient {
         // feature into the tv blob for clients that only read that platform.
         let streamBadgeFeature = (mobileFeatures[Self.streamBadgeSettingsFeature] as? [String: Any])
             ?? (features[Self.streamBadgeSettingsFeature] as? [String: Any])
-        guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil else {
+        let posterCardStyleFeature = mobileFeatures[Self.posterCardStyleSettingsFeature]
+            ?? features[Self.posterCardStyleSettingsFeature]
+        let playerFeature = (mobileFeatures[Self.playerSettingsFeature] as? [String: Any])
+            ?? (features[Self.playerSettingsFeature] as? [String: Any])
+        let continueWatchingFeature = mobileFeatures[Self.continueWatchingSettingsFeature]
+            ?? features[Self.continueWatchingSettingsFeature]
+        let mdbListFeature = (mobileFeatures[Self.mdbListSettingsFeature] as? [String: Any])
+            ?? (features[Self.mdbListSettingsFeature] as? [String: Any])
+        let themeFeature = (mobileFeatures[Self.themeSettingsFeature] as? [String: Any])
+            ?? (features[Self.themeSettingsFeature] as? [String: Any])
+
+        guard tvosFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil || posterCardStyleFeature != nil || playerFeature != nil || continueWatchingFeature != nil || mdbListFeature != nil || themeFeature != nil else {
             return false
         }
 
@@ -2013,6 +2436,11 @@ fileprivate final class NuvioAPIClient {
         importDebridSettings(debridFeature, localProfileId: localProfileId)
         importTmdbSettings(tmdbFeature, localProfileId: localProfileId)
         importStreamBadgeSettings(streamBadgeFeature, localProfileId: localProfileId)
+        importPosterCardStyleSettings(posterCardStyleFeature, localProfileId: localProfileId)
+        importPlayerSettings(playerFeature, localProfileId: localProfileId)
+        importContinueWatchingSettings(continueWatchingFeature, localProfileId: localProfileId)
+        importMdbListSettings(mdbListFeature, localProfileId: localProfileId)
+        ThemeSettingsSyncMapper.importPayload(themeFeature, localProfileId: localProfileId)
         return true
     }
 
@@ -2056,6 +2484,46 @@ fileprivate final class NuvioAPIClient {
             localProfileId: localProfileId,
             existing: existingTmdb
         )
+        let existingPosterStyle = (features[Self.posterCardStyleSettingsFeature] as? String)
+            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.posterCardStyleSettingsFeature] as? String
+        let posterStylePayload = exportPosterCardStyleSettings(
+            localProfileId: localProfileId,
+            existingPayload: existingPosterStyle
+        )
+        features[Self.posterCardStyleSettingsFeature] = posterStylePayload
+
+        let existingPlayer = (features[Self.playerSettingsFeature] as? [String: Any])
+            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.playerSettingsFeature] as? [String: Any]
+        let playerPayload = exportPlayerSettings(
+            localProfileId: localProfileId,
+            existing: existingPlayer
+        )
+        features[Self.playerSettingsFeature] = playerPayload
+
+        let existingCW = (features[Self.continueWatchingSettingsFeature] as? String)
+            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.continueWatchingSettingsFeature] as? String
+        let cwPayload = exportContinueWatchingSettings(
+            localProfileId: localProfileId,
+            existingPayload: existingCW
+        )
+        features[Self.continueWatchingSettingsFeature] = cwPayload
+
+        let existingMdbList = (features[Self.mdbListSettingsFeature] as? [String: Any])
+            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.mdbListSettingsFeature] as? [String: Any]
+        let mdbListPayload = exportMdbListSettings(
+            localProfileId: localProfileId,
+            existing: existingMdbList
+        )
+        features[Self.mdbListSettingsFeature] = mdbListPayload
+
+        let existingTheme = (features[Self.themeSettingsFeature] as? [String: Any])
+            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.themeSettingsFeature] as? [String: Any]
+        let themePayload = ThemeSettingsSyncMapper.exportPayload(
+            localProfileId: localProfileId,
+            existing: existingTheme
+        )
+        features[Self.themeSettingsFeature] = themePayload
+
         settingsJSON["features"] = features
         if settingsJSON["version"] == nil { settingsJSON["version"] = 1 }
         try await rpcVoid(
@@ -2070,7 +2538,8 @@ fileprivate final class NuvioAPIClient {
 
         // Keep the Android/mobile-compatible feature in its own blob as well.
         // Other mobile settings remain untouched by merging the latest remote
-        // document before replacing only stream_badge_settings.
+        // document before replacing stream_badge_settings, poster_card_style_settings_payload,
+        // player_settings, continue_watching_settings_payload, mdblist_settings, and theme_settings.
         do {
             var mobileSettingsJSON = try await pullProfileSettingsJSON(
                 session: session,
@@ -2079,6 +2548,11 @@ fileprivate final class NuvioAPIClient {
             ) ?? lastPulledMobileProfileSettingsJSON ?? [:]
             var mobileFeatures = mobileSettingsJSON["features"] as? [String: Any] ?? [:]
             mobileFeatures[Self.streamBadgeSettingsFeature] = exportStreamBadgeSettings(localProfileId: localProfileId)
+            mobileFeatures[Self.posterCardStyleSettingsFeature] = posterStylePayload
+            mobileFeatures[Self.playerSettingsFeature] = playerPayload
+            mobileFeatures[Self.continueWatchingSettingsFeature] = cwPayload
+            mobileFeatures[Self.mdbListSettingsFeature] = mdbListPayload
+            mobileFeatures[Self.themeSettingsFeature] = themePayload
             mobileSettingsJSON["features"] = mobileFeatures
             if mobileSettingsJSON["version"] == nil { mobileSettingsJSON["version"] = 1 }
             try await rpcVoid(
@@ -2091,10 +2565,12 @@ fileprivate final class NuvioAPIClient {
                 ]
             )
             lastPulledMobileProfileSettingsJSON = mobileSettingsJSON
+        } catch is CancellationError {
+            return
         } catch {
             // tvOS settings sync remains successful if an older backend does
             // not expose the mobile platform row/RPC yet.
-            print("Nuvio stream badge mobile sync skipped: \(error.localizedDescription)")
+            print("Nuvio mobile settings sync skipped: \(error.localizedDescription)")
         }
     }
 
@@ -2725,6 +3201,162 @@ fileprivate final class NuvioAPIClient {
             defaults.set(selected.rawValue, forKey: SettingsKey.debridProvider)
             let token = DebridCredentials.token(for: selected, store: defaults)
             defaults.set(token, forKey: SettingsKey.debridApiKey)
+        }
+    }
+
+    private func exportPosterCardStyleSettings(
+        localProfileId: String,
+        existingPayload: String?
+    ) -> String {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let radiusRaw = defaults.string(forKey: SettingsKey.cardCornerRadius)
+        let sizeRaw = defaults.string(forKey: SettingsKey.cardSize)
+        return PosterCardStyleSyncMapper.exportPayload(
+            cardCornerRadius: radiusRaw,
+            cardSize: sizeRaw,
+            existingPayload: existingPayload
+        )
+    }
+
+    private func importPosterCardStyleSettings(_ remote: Any?, localProfileId: String) {
+        guard let remote else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let (radiusOpt, sizeOpt) = PosterCardStyleSyncMapper.importPayload(remote)
+        var changed = false
+        if let radiusOpt {
+            if defaults.string(forKey: SettingsKey.cardCornerRadius) != radiusOpt.rawValue {
+                defaults.set(radiusOpt.rawValue, forKey: SettingsKey.cardCornerRadius)
+                if localProfileId == ProfileSettings.activeProfileID {
+                    UserDefaults.standard.set(radiusOpt.rawValue, forKey: SettingsKey.cardCornerRadius)
+                }
+                changed = true
+            }
+        }
+        if let sizeOpt {
+            if defaults.string(forKey: SettingsKey.cardSize) != sizeOpt.rawValue {
+                defaults.set(sizeOpt.rawValue, forKey: SettingsKey.cardSize)
+                if localProfileId == ProfileSettings.activeProfileID {
+                    UserDefaults.standard.set(sizeOpt.rawValue, forKey: SettingsKey.cardSize)
+                }
+                changed = true
+            }
+        }
+        if changed {
+            ProfileSettings.notifySettingsChanged()
+        }
+    }
+
+    private func exportPlayerSettings(
+        localProfileId: String,
+        existing: [String: Any]?
+    ) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        var feature = existing ?? [:]
+
+        for (localKey, remoteKey) in PlayerSettingsSyncMapper.localToRemoteKeyMappings {
+            guard let value = defaults.object(forKey: localKey),
+                  let encoded = Self.encodeSettingValue(value) else {
+                continue
+            }
+            feature[remoteKey] = encoded
+        }
+        return feature
+    }
+
+    private func importPlayerSettings(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote, !remote.isEmpty else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+
+        for (remoteKey, localKey) in PlayerSettingsSyncMapper.remoteToLocalKeyMappings {
+            guard let rawRemote = remote[remoteKey] else { continue }
+            if let encoded = rawRemote as? [String: Any],
+               let value = Self.decodeSettingValue(encoded) {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? String {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? Bool {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? Int {
+                defaults.set(value, forKey: localKey)
+            } else if let value = (rawRemote as? NSNumber)?.intValue {
+                defaults.set(value, forKey: localKey)
+            }
+        }
+    }
+
+    private func exportContinueWatchingSettings(
+        localProfileId: String,
+        existingPayload: String?
+    ) -> String {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let upNext = defaults.object(forKey: SettingsKey.upNextFromFurthestEpisode) as? Bool ?? true
+        let showUnaired = defaults.object(forKey: SettingsKey.showUnairedNextUp) as? Bool ?? true
+        let sort = defaults.string(forKey: SettingsKey.continueWatchingSort)
+        return ContinueWatchingSyncMapper.exportPayload(
+            localProfileId: localProfileId,
+            upNextFromFurthestEpisode: upNext,
+            showUnairedNextUp: showUnaired,
+            continueWatchingSort: sort,
+            existingPayload: existingPayload
+        )
+    }
+
+    private func importContinueWatchingSettings(_ remote: Any?, localProfileId: String) {
+        guard let remote else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+        let (upNext, showUnaired, sortMode, dismissedKeys) = ContinueWatchingSyncMapper.importPayload(remote)
+        if let upNext {
+            defaults.set(upNext, forKey: SettingsKey.upNextFromFurthestEpisode)
+        }
+        if let showUnaired {
+            defaults.set(showUnaired, forKey: SettingsKey.showUnairedNextUp)
+        }
+        if let sortMode {
+            let currentLocal = defaults.string(forKey: SettingsKey.continueWatchingSort)
+            if currentLocal != "Separate Upcoming Row" || sortMode == "Streaming Style" {
+                defaults.set(sortMode, forKey: SettingsKey.continueWatchingSort)
+            }
+        }
+        if let dismissedKeys {
+            ContinueWatchingDismissStore.replaceKeys(dismissedKeys, profileId: localProfileId)
+        }
+    }
+
+    private func exportMdbListSettings(
+        localProfileId: String,
+        existing: [String: Any]?
+    ) -> [String: Any] {
+        let defaults = ProfileSettings.store(for: localProfileId)
+        var feature = existing ?? [:]
+
+        for (localKey, remoteKey) in MdbListSyncMapper.localToRemoteKeyMappings {
+            guard let value = defaults.object(forKey: localKey),
+                  let encoded = Self.encodeSettingValue(value) else {
+                continue
+            }
+            feature[remoteKey] = encoded
+        }
+        return feature
+    }
+
+    private func importMdbListSettings(_ remote: [String: Any]?, localProfileId: String) {
+        guard let remote, !remote.isEmpty else { return }
+        let defaults = ProfileSettings.store(for: localProfileId)
+
+        for (remoteKey, localKey) in MdbListSyncMapper.remoteToLocalKeyMappings {
+            guard let rawRemote = remote[remoteKey] else { continue }
+            if let encoded = rawRemote as? [String: Any],
+               let value = Self.decodeSettingValue(encoded) {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? String {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? Bool {
+                defaults.set(value, forKey: localKey)
+            } else if let value = rawRemote as? Int {
+                defaults.set(value, forKey: localKey)
+            } else if let value = (rawRemote as? NSNumber)?.intValue {
+                defaults.set(value, forKey: localKey)
+            }
         }
     }
 

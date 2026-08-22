@@ -364,21 +364,32 @@ private struct DiscoverCard: View {
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+
+    private var cardCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+    }
 
     var body: some View {
         Button(action: action) {
             VStack(alignment: .leading, spacing: 10) {
                 ZStack(alignment: .bottom) {
-                    AsyncImage(url: URL(string: meta.posterUrl ?? "")) { phase in
-                        if case .success(let image) = phase {
-                            image.resizable().aspectRatio(contentMode: .fill)
-                        } else {
-                            ZStack {
-                                Rectangle().fill(Color.white.opacity(0.07))
-                                Image(systemName: meta.type == "series" ? "tv" : "film")
-                                    .font(.system(size: 40))
-                                    .foregroundColor(.white.opacity(0.25))
-                            }
+                    CachedPosterArtwork(
+                        urlString: meta.posterUrl,
+                        width: DiscoverGridMetrics.posterWidth,
+                        height: DiscoverGridMetrics.posterHeight,
+                        maximumWidth: DiscoverGridMetrics.posterWidth
+                    ) {
+                        ZStack {
+                            Rectangle().fill(Color.white.opacity(0.07))
+                            Image(systemName: meta.type == "series" ? "tv" : "film")
+                                .font(.system(size: 40))
+                                .foregroundColor(.white.opacity(0.25))
                         }
                     }
                     .frame(width: DiscoverGridMetrics.posterWidth, height: DiscoverGridMetrics.posterHeight)
@@ -404,13 +415,19 @@ private struct DiscoverCard: View {
                     }
                 }
                 .frame(width: DiscoverGridMetrics.posterWidth, height: DiscoverGridMetrics.posterHeight)
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                .clipShape(shape)
+                .modifier(
+                    LiquidGlassCardModifier(
+                        cornerRadius: cardCornerRadius,
+                        isFocused: showsFocusedAppearance,
+                        isEnabled: liquidGlassCards
+                    )
+                )
                 .overlay(alignment: .topTrailing) {
                     WatchedCheckmarkBadge(meta: meta)
                 }
                 .overlay(
-                    RoundedRectangle(cornerRadius: 16, style: .continuous)
-                        .stroke(showsFocusedAppearance ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
+                    shape.stroke(showsFocusedAppearance ? focusBorderColor : .clear, lineWidth: focusHighlighter ? AppFocusOutline.emphasizedWidth : AppFocusOutline.width)
                 )
                 .shadow(color: .black.opacity(showsFocusedAppearance ? 0.5 : 0.2), radius: showsFocusedAppearance ? 16 : 6)
 

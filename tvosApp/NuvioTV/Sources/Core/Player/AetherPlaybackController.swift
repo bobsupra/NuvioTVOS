@@ -1566,6 +1566,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private(set) var sourceTimeSeconds: Double = 0
     private(set) var subtitleCues: [SubtitleCue] = []
     private(set) var capabilities = PlaybackEngineCapabilities.aether
+    var isPictureInPictureActive: Bool { engine.pictureInPictureActive }
 
     var playbackDebugInfo: PlaybackDebugInfo {
         let width = Int(engine.sourceVideoWidth > 0 ? engine.sourceVideoWidth : sourceProbe?.videoWidth ?? 0)
@@ -1637,6 +1638,32 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             name: UIApplication.didEnterBackgroundNotification,
             object: nil
         )
+    }
+
+    override func viewWillAppear(_ animated: Bool) {
+        super.viewWillAppear(animated)
+        rebindSurface()
+    }
+
+    override func viewDidAppear(_ animated: Bool) {
+        super.viewDidAppear(animated)
+        rebindSurface()
+    }
+
+    override func viewDidLayoutSubviews() {
+        super.viewDidLayoutSubviews()
+        playerView.setNeedsLayout()
+        playerView.layoutIfNeeded()
+    }
+
+    func rebindSurface() {
+        // `AetherPlayerView.attach` repairs a layer that AVKit/SwiftUI removed
+        // or reparented while the controller was in PiP. Keep this operation
+        // idempotent: PlayerView's representable update runs frequently, and
+        // detaching on every update needlessly churns the render surface.
+        engine.bind(view: playerView)
+        view.setNeedsLayout()
+        view.layoutIfNeeded()
     }
 
     deinit {
@@ -2122,6 +2149,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     func destroyPlayer() {
         resetAISubtitleStartupHold()
         loadGeneration += 1
+        engine.pictureInPictureActive = false
         engine.stop(resetDisplayCriteria: true)
         subtitleCues = []
         subtitleOverlayState.reset()

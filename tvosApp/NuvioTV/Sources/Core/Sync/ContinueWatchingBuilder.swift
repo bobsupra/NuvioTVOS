@@ -237,25 +237,31 @@ enum ContinueWatchingBuilder {
 
         for entry in slice {
             let record = entry.record
+            let existing = existingById[record.contentId]
             guard let meta = metaById[record.contentId] else {
                 failedLookups += 1
+                if let existing { page.append(existing) }
                 continue
             }
-            let existing = existingById[record.contentId]
 
             if entry.isSeed {
                 guard meta.isSeries else { continue }
-                let current: (season: Int, episode: Int)
+                let current: (season: Int, episode: Int)?
                 if let season = record.season, let episode = record.episode {
                     current = (season, episode)
                 } else {
-                    guard let latest = latestEpisodeForTitleSeed(
+                    current = latestEpisodeForTitleSeed(
                         in: meta,
                         watchedAt: record.lastWatchedAt
-                    ) else { continue }
-                    current = latest
+                    )
                 }
-                guard let next = nextEpisode(after: current, in: meta) else {
+                let next: NuvioVideo?
+                if let current {
+                    next = nextEpisode(after: current, in: meta)
+                } else {
+                    next = firstReleasedEpisode(in: meta)
+                }
+                guard let next else {
                     // Caught up, or the guide could not be loaded this pass. A
                     // card already on screen must not disappear for the latter.
                     if let existing, existing.isUpNextEntry { page.append(existing) }
@@ -281,7 +287,7 @@ enum ContinueWatchingBuilder {
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
                         isUpNext: true,
-                        upNextSeedSeason: current.season
+                        upNextSeedSeason: current?.season ?? next.season
                     )
                 )
                 continue
@@ -392,9 +398,16 @@ enum ContinueWatchingBuilder {
         after current: (season: Int, episode: Int),
         in meta: NuvioMeta
     ) -> NuvioVideo? {
-        (meta.videos ?? [])
-            .filter { $0.season > 0 }
-            .sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        let allVideos = (meta.videos ?? []).sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+        let mainSeasonVideos = allVideos.filter { $0.season > 0 }
+        let videos = mainSeasonVideos.isEmpty ? allVideos : mainSeasonVideos
+
+        return videos
+            .filter { candidate in
+                // Skip episodes that have already been marked watched in WatchedStore
+                !watchedKeys.contains("\(candidate.season):\(candidate.episode)")
+            }
             .first { candidate in
                 guard (candidate.season, candidate.episode) > (current.season, current.episode) else {
                     return false
@@ -544,6 +557,21 @@ enum ContinueWatchingBuilder {
     private static func episode(in meta: NuvioMeta, season: Int?, episode: Int?) -> NuvioVideo? {
         guard let season, let episode else { return nil }
         return meta.videos?.first { $0.season == season && $0.episode == episode }
+    }
+
+    private static func firstReleasedEpisode(in meta: NuvioMeta) -> NuvioVideo? {
+        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        let allVideos = (meta.videos ?? []).sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
+        let mainSeasonVideos = allVideos.filter { $0.season > 0 }
+        let videos = mainSeasonVideos.isEmpty ? allVideos : mainSeasonVideos
+
+        return videos
+            .filter { !watchedKeys.contains("\($0.season):\($0.episode)") }
+            .first { video in
+                EpisodeReleasePolicy.hasAired(video.released)
+                    || EpisodeReleasePolicy.isAiringToday(video.released)
+                    || EpisodeReleasePolicy.showUnairedNextUp
+            }
     }
 
     private static func nonPlaceholder(_ value: String?) -> String? {

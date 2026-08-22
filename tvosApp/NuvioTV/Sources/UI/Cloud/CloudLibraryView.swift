@@ -66,14 +66,17 @@ struct CloudLibraryView: View {
                     CloudRow(
                         title: item.name,
                         subtitle: subtitle(for: item),
-                        isFocused: focused == item.stableKey,
+                        externalFocus: $focused,
+                        focusId: item.stableKey,
                         isBusy: false
                     ) { open(item) }
-                    .focused($focused, equals: item.stableKey)
                 }
             }
+            .padding(.horizontal, 12)
             .padding(.bottom, 90)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .scrollClipDisabledIfAvailable()
         .focusSection()
     }
 
@@ -85,14 +88,17 @@ struct CloudLibraryView: View {
                     CloudRow(
                         title: file.name,
                         subtitle: Self.sizeText(file.sizeBytes),
-                        isFocused: focused == key,
+                        externalFocus: $focused,
+                        focusId: key,
                         isBusy: viewModel.resolvingKey == key
                     ) { viewModel.play(item: item, file: file, onResolved: onPlay) }
-                    .focused($focused, equals: key)
                 }
             }
+            .padding(.horizontal, 12)
             .padding(.bottom, 90)
+            .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .scrollClipDisabledIfAvailable()
         .focusSection()
     }
 
@@ -131,7 +137,7 @@ struct CloudLibraryView: View {
         return parts.joined(separator: "  ·  ")
     }
 
-    private static func sizeText(_ bytes: Int64?) -> String? {
+    static func sizeText(_ bytes: Int64?) -> String? {
         guard let bytes, bytes > 0 else { return nil }
         return byteFormatter.string(fromByteCount: bytes)
     }
@@ -145,12 +151,20 @@ struct CloudLibraryView: View {
 }
 
 /// One focusable cloud row (item or file).
-private struct CloudRow: View {
+struct CloudRow: View {
     let title: String
     let subtitle: String?
-    let isFocused: Bool
+    var externalFocus: FocusState<String?>.Binding? = nil
+    var focusId: String = ""
+    var retainFocusAppearance = false
     let isBusy: Bool
     let action: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    private var showsFocusedAppearance: Bool {
+        isFocused || retainFocusAppearance
+    }
 
     var body: some View {
         Button(action: action) {
@@ -184,15 +198,18 @@ private struct CloudRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
             .background(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .fill(Color.white.opacity(isFocused ? 0.18 : 0.06))
+                    .fill(Color.white.opacity(showsFocusedAppearance ? 0.18 : 0.06))
             )
             .overlay(
                 RoundedRectangle(cornerRadius: 20, style: .continuous)
-                    .stroke(isFocused ? AppFocusOutline.color : .clear, lineWidth: isFocused ? AppFocusOutline.width : 0)
+                    .stroke(showsFocusedAppearance ? AppFocusOutline.color : .clear, lineWidth: showsFocusedAppearance ? AppFocusOutline.width : 0)
             )
-            .scaleEffect(isFocused ? 1.015 : 1)
+            .scaleEffect(showsFocusedAppearance ? 1.015 : 1)
         }
-        .buttonStyle(.plain)
-        .animation(.easeOut(duration: 0.15), value: isFocused)
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .modifier(ExternalFocusBinding(binding: externalFocus, id: focusId))
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.15), value: showsFocusedAppearance)
     }
 }

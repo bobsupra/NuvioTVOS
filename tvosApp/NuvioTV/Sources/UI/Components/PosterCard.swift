@@ -15,6 +15,133 @@ import AVKit
 import UIKit
 #endif
 
+/// Card corner radius options available in Settings (matching Android TV & Apple TV styling)
+enum CardCornerRadiusOption: String, CaseIterable, Identifiable {
+    case sharp = "Sharp (0pt)"
+    case subtle = "Subtle (8pt)"
+    case classic = "Classic (16pt)"
+    case rounded = "Rounded (22pt)"
+    case pill = "Pill (28pt)"
+
+    var id: String { rawValue }
+
+    var radius: CGFloat {
+        switch self {
+        case .sharp: return 0
+        case .subtle: return 8
+        case .classic: return 16
+        case .rounded: return 22
+        case .pill: return 28
+        }
+    }
+
+    var scale: CGFloat {
+        radius / 16.0
+    }
+
+    static func from(rawValue: String?) -> CardCornerRadiusOption {
+        guard let rawValue, !rawValue.isEmpty else { return .classic }
+        if let match = CardCornerRadiusOption(rawValue: rawValue) {
+            return match
+        }
+        let lower = rawValue.lowercased()
+        if lower.contains("sharp") || rawValue == "0" { return .sharp }
+        if lower.contains("subtle") || rawValue == "8" { return .subtle }
+        if lower.contains("classic") || lower.contains("standard") || rawValue == "16" { return .classic }
+        if lower.contains("rounded") || rawValue == "22" { return .rounded }
+        if lower.contains("pill") || rawValue == "28" { return .pill }
+        return .classic
+    }
+}
+
+/// Card size options available in Settings (matching Android TV width & size presets)
+enum CardSizeOption: String, CaseIterable, Identifiable {
+    case compact = "Compact"
+    case dense = "Dense"
+    case standard = "Standard"
+    case balanced = "Balanced"
+    case comfort = "Comfort"
+    case large = "Large"
+
+    var id: String { rawValue }
+
+    /// Width scaling multiplier (1.0 = standard 210pt on tvOS modern layout)
+    var scale: CGFloat {
+        switch self {
+        case .compact: return 0.85
+        case .dense: return 0.92
+        case .standard: return 1.00
+        case .balanced: return 1.06
+        case .comfort: return 1.12
+        case .large: return 1.18
+        }
+    }
+
+    static func from(rawValue: String?) -> CardSizeOption {
+        guard let rawValue, !rawValue.isEmpty else { return .standard }
+        if let match = CardSizeOption(rawValue: rawValue) {
+            return match
+        }
+        let lower = rawValue.lowercased()
+        if lower.contains("compact") { return .compact }
+        if lower.contains("dense") { return .dense }
+        if lower.contains("standard") { return .standard }
+        if lower.contains("balanced") { return .balanced }
+        if lower.contains("comfort") { return .comfort }
+        if lower.contains("large") { return .large }
+        return .standard
+    }
+}
+
+/// Global card styling resolver
+enum AppCardStyle {
+    static let defaultCornerRadiusRaw = CardCornerRadiusOption.classic.rawValue
+    static let defaultCardSizeRaw = CardSizeOption.standard.rawValue
+
+    static func cornerRadius(for rawValue: String?, fallback: CGFloat = 16) -> CGFloat {
+        guard let rawValue, !rawValue.isEmpty else { return fallback }
+        return CardCornerRadiusOption.from(rawValue: rawValue).radius
+    }
+
+    static func cornerRadiusScale(for rawValue: String?) -> CGFloat {
+        CardCornerRadiusOption.from(rawValue: rawValue).scale
+    }
+
+    static func cardSizeScale(for rawValue: String?) -> CGFloat {
+        CardSizeOption.from(rawValue: rawValue).scale
+    }
+
+    static func posterWidth(base: CGFloat = 210, for sizeRawValue: String?) -> CGFloat {
+        round(base * cardSizeScale(for: sizeRawValue))
+    }
+
+    static func posterHeight(base: CGFloat = 315, for sizeRawValue: String?) -> CGFloat {
+        round(base * cardSizeScale(for: sizeRawValue))
+    }
+
+    static func episodeCornerRadius(for rawValue: String?) -> CGFloat {
+        let opt = CardCornerRadiusOption.from(rawValue: rawValue)
+        switch opt {
+        case .sharp: return 0
+        case .subtle: return 12
+        case .classic: return 24
+        case .rounded: return 30
+        case .pill: return 38
+        }
+    }
+
+    static func badgeCornerRadius(for rawValue: String?, base: CGFloat = 10) -> CGFloat {
+        let opt = CardCornerRadiusOption.from(rawValue: rawValue)
+        switch opt {
+        case .sharp: return 0
+        case .subtle: return max(4, base * 0.6)
+        case .classic: return base
+        case .rounded: return base * 1.3
+        case .pill: return base * 1.8
+        }
+    }
+}
+
 /// Poster card component with focus animation (tvOS) and tap handling (iOS)
 struct PosterCard: View {
     let meta: NuvioMeta
@@ -70,6 +197,8 @@ struct PosterCard: View {
     @State private var landscapeArtworkPrepared = false
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     @State private var isTrailerPreviewActive = false
     @State private var isTrailerPreviewReady = false
     @State private var didFinishTrailerPreview = false
@@ -77,6 +206,9 @@ struct PosterCard: View {
     /// for every card passed over. Arm that preload only after focus has settled,
     /// matching Home's hero debounce.
     @State private var landscapePreloadArmed = false
+    #else
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
     #endif
 
     var body: some View {
@@ -100,11 +232,6 @@ struct PosterCard: View {
         )
             .onChange(of: isFocused) { _, focused in
                 if focused {
-                    TVHomeDebugTrace.log(
-                        "card.focus meta=\(meta.id) landscape=\(effectiveLandscape) "
-                            + "episode=\(continueEpisodeText ?? "nil") "
-                            + "episodeArt=\(continueEpisodeArtworkURL != nil)"
-                    )
                     onFocus?(meta)
                     didFinishTrailerPreview = false
                 } else {
@@ -182,6 +309,7 @@ struct PosterCard: View {
                 width: cardWidth,
                 height: cardHeight,
                 maximumWidth: artworkDecodeWidth,
+                preloadMaximumWidth: landscapeArtworkDecodeWidth,
                 minimumSwapDelay: 0,
                 onPreloadFinished: {
                     #if os(tvOS)
@@ -201,7 +329,7 @@ struct PosterCard: View {
                 // moving focus. `isActive` is intentionally delayed; mounting
                 // VideoPlayer before that delay still constructs AVKit's view
                 // hierarchy for every card passed during rapid scrolling.
-                if isFocused && isTrailerPreviewActive && trailersEnabled && !didFinishTrailerPreview {
+                if isFocused && isTrailerPreviewActive && trailersEnabled && !isContinueOrUpcomingCard && !didFinishTrailerPreview {
                     TrailerPreviewPlayer(
                         meta: meta,
                         isActive: true,
@@ -246,6 +374,13 @@ struct PosterCard: View {
             // and landscape artwork overlays. The focus border remains outside
             // this mask so its stroke stays crisp.
             .clipShape(RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous))
+            .modifier(
+                LiquidGlassCardModifier(
+                    cornerRadius: cardCornerRadius,
+                    isFocused: showsFocusedAppearance,
+                    isEnabled: liquidGlassCards
+                )
+            )
             .overlay(
                 RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
                     .stroke(focusedBorderColor, lineWidth: focusedBorderWidth)
@@ -275,11 +410,24 @@ struct PosterCard: View {
     @ViewBuilder
     private var landscapeOverlay: some View {
         ZStack(alignment: .bottomLeading) {
-            LinearGradient(
-                colors: [.clear, .black.opacity(0.78)],
-                startPoint: .center,
-                endPoint: .bottom
-            )
+            if liquidGlassCards {
+                LinearGradient(
+                    stops: [
+                        .init(color: .clear, location: 0.0),
+                        .init(color: .black.opacity(0.38), location: 0.35),
+                        .init(color: .black.opacity(0.85), location: 0.85),
+                        .init(color: .black.opacity(0.95), location: 1.0)
+                    ],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+            } else {
+                LinearGradient(
+                    colors: [.clear, .black.opacity(0.78)],
+                    startPoint: .center,
+                    endPoint: .bottom
+                )
+            }
 
             if continueEpisodeText != nil {
                 continueLandscapeSummary
@@ -352,6 +500,7 @@ struct PosterCard: View {
     @ViewBuilder
     private var continueBadge: some View {
         if let continueBadgeDisplayText {
+            let badgeRadius = AppCardStyle.badgeCornerRadius(for: cardCornerRadiusSetting, base: 10)
             Text(continueBadgeDisplayText)
                 .font(.system(size: 22, weight: .semibold))
                 .foregroundColor(.white)
@@ -359,22 +508,37 @@ struct PosterCard: View {
                 .minimumScaleFactor(0.65)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
-                .background(
-                RoundedRectangle(cornerRadius: 10, style: .continuous)
-                    .fill(continueBadgeFill)
-            )
-            .padding(16)
+                .background {
+                    if liquidGlassCards {
+                        RoundedRectangle(cornerRadius: badgeRadius, style: .continuous)
+                            .fill(continueBadgeFill.opacity(0.75))
+                            .modifier(
+                                LiquidGlassBadgeModifier(
+                                    cornerRadius: badgeRadius,
+                                    isFocused: showsFocusedAppearance
+                                )
+                            )
+                    } else {
+                        RoundedRectangle(cornerRadius: badgeRadius, style: .continuous)
+                            .fill(continueBadgeFill)
+                    }
+                }
+                .padding(16)
         }
     }
 
     private var continueBadgeFill: Color {
         guard continueIsUpNext else { return Color.black.opacity(0.72) }
-        switch (continueUpNextBadgeText ?? "Next Up").uppercased() {
-        case "NEW SEASON":
+        let badge = (continueUpNextBadgeText ?? "Next Up").uppercased()
+        if badge == "NEW SEASON" {
             return Color(red: 0xB4 / 255, green: 0x53 / 255, blue: 0x09 / 255)
-        case "NEW EPISODE":
+        } else if badge == "NEW EPISODE" {
             return Color(red: 0x1D / 255, green: 0x4E / 255, blue: 0xD8 / 255)
-        default:
+        } else if badge == "AIRING TODAY" {
+            return Color(red: 0x05 / 255, green: 0x96 / 255, blue: 0x69 / 255)
+        } else if badge.hasPrefix("AIRS IN") || badge == "COMING SOON" {
+            return Color(red: 0x47 / 255, green: 0x55 / 255, blue: 0x69 / 255)
+        } else {
             return Color.black.opacity(0.72)
         }
     }
@@ -468,7 +632,7 @@ struct PosterCard: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        16
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
     }
 
     private var landscapeArtworkURL: String? {
@@ -488,6 +652,10 @@ struct PosterCard: View {
     }
 
     private var artworkDecodeWidth: CGFloat {
+        effectiveLandscape ? 560 : cardWidth
+    }
+
+    private var landscapeArtworkDecodeWidth: CGFloat {
         560
     }
 
@@ -520,12 +688,16 @@ struct PosterCard: View {
         effectivePosterLabels
     }
 
+    private var isContinueOrUpcomingCard: Bool {
+        continueProgress != nil || continueIsUpNext || continueRemainingText != nil || continueEpisodeText != nil || continueUpNextBadgeText != nil
+    }
+
     private var trailerActivationIdentity: String {
-        "\(isFocused)\u{1f}\(effectiveLandscape)\u{1f}\(trailersEnabled)\u{1f}\(trailerDelay)"
+        "\(isFocused)\u{1f}\(effectiveLandscape)\u{1f}\(trailersEnabled)\u{1f}\(trailerDelay)\u{1f}\(isContinueOrUpcomingCard)"
     }
 
     private var isTrailerPreviewVisible: Bool {
-        isTrailerPreviewActive && isTrailerPreviewReady && !didFinishTrailerPreview
+        !isContinueOrUpcomingCard && isTrailerPreviewActive && isTrailerPreviewReady && !didFinishTrailerPreview
     }
 
     @MainActor
@@ -533,7 +705,7 @@ struct PosterCard: View {
         isTrailerPreviewActive = false
         isTrailerPreviewReady = false
         didFinishTrailerPreview = false
-        guard isFocused, effectiveLandscape, trailersEnabled else { return }
+        guard isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
 
         let delay = max(1, trailerDelay)
         do {
@@ -541,7 +713,7 @@ struct PosterCard: View {
         } catch {
             return
         }
-        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled else { return }
+        guard !Task.isCancelled, isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
         isTrailerPreviewActive = true
     }
 
@@ -569,7 +741,7 @@ struct PosterCard: View {
     }
 
     private var cardCornerRadius: CGFloat {
-        8
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 8)
     }
 
     private var landscapeLogoWidth: CGFloat {
@@ -589,6 +761,10 @@ struct PosterCard: View {
     }
 
     private var artworkDecodeWidth: CGFloat {
+        cardWidth
+    }
+
+    private var landscapeArtworkDecodeWidth: CGFloat {
         cardWidth
     }
 
@@ -735,7 +911,7 @@ private struct TrailerPreviewPlayer: View {
         let trailerMeta: NuvioMeta
         if meta.trailerYtIds?.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) == true {
             trailerMeta = meta
-        } else if let refreshed = try? await CinemetaCatalogRepository().refreshMetadata(
+        } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
             id: meta.id,
             type: meta.type
         ) {
@@ -813,11 +989,17 @@ struct PosterGridCard: View {
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
 
     private var showsFocusedAppearance: Bool { focused || retainFocusAppearance }
 
+    private var cardCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 16)
+    }
+
     private var shape: RoundedRectangle {
-        RoundedRectangle(cornerRadius: 16, style: .continuous)
+        RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
     }
 
     var body: some View {
@@ -835,6 +1017,13 @@ struct PosterGridCard: View {
             }
             .frame(width: width, height: height)
             .clipShape(shape)
+            .modifier(
+                LiquidGlassCardModifier(
+                    cornerRadius: cardCornerRadius,
+                    isFocused: showsFocusedAppearance,
+                    isEnabled: liquidGlassCards
+                )
+            )
             .overlay(alignment: .topTrailing) {
                 if let isWatched {
                     if isWatched { WatchedCheckmarkIcon() }
@@ -943,15 +1132,156 @@ struct LiquidGlassSurface: ViewModifier {
 
     @ViewBuilder
     func body(content: Content) -> some View {
+        #if os(tvOS)
         if #available(tvOS 26.0, *) {
             content
-                .background(Color.white.opacity(prominent ? 0.14 : 0.08), in: shape)
+                .background(
+                    Color.white.opacity(prominent ? 0.16 : 0.08),
+                    in: shape
+                )
                 .glassEffect(.regular, in: shape)
         } else {
             content
                 .background(.ultraThinMaterial, in: shape)
-                .background(Color.white.opacity(prominent ? 0.12 : 0.06), in: shape)
+                .background(
+                    Color.white.opacity(prominent ? 0.16 : 0.08),
+                    in: shape
+                )
         }
+        #else
+        content
+            .background(.ultraThinMaterial, in: shape)
+            .background(Color.white.opacity(prominent ? 0.16 : 0.08), in: shape)
+        #endif
+    }
+}
+
+/// Liquid Glass surface modifier for card shapes (posters, landscape cards, episode tiles).
+/// Uses native frosted glass only while focused; unfocused cards retain the
+/// specular highlight with a lightweight translucent fill.
+struct LiquidGlassCardModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    var isFocused: Bool = false
+    var isEnabled: Bool = true
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isEnabled {
+            content
+                .background {
+                    #if os(tvOS)
+                    if isFocused {
+                        if #available(tvOS 26.0, *) {
+                            shape
+                                .fill(Color.white.opacity(0.16))
+                                .glassEffect(.regular, in: shape)
+                        } else {
+                            shape
+                                .fill(.ultraThinMaterial)
+                                .overlay(shape.fill(Color.white.opacity(0.14)))
+                        }
+                    } else {
+                        shape
+                            .fill(Color.white.opacity(0.07))
+                    }
+                    #else
+                    if isFocused {
+                        shape
+                            .fill(.ultraThinMaterial)
+                            .overlay(shape.fill(Color.white.opacity(0.14)))
+                    } else {
+                        shape.fill(Color.white.opacity(0.07))
+                    }
+                    #endif
+                }
+                .overlay {
+                    // Apple TV liquid glass specular reflection border
+                    shape
+                        .strokeBorder(
+                            LinearGradient(
+                                colors: [
+                                    Color.white.opacity(isFocused ? 0.55 : 0.28),
+                                    Color.white.opacity(isFocused ? 0.20 : 0.08),
+                                    Color.white.opacity(isFocused ? 0.35 : 0.12)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: isFocused ? 1.5 : 1.0
+                        )
+                }
+        } else {
+            content
+        }
+    }
+}
+
+/// Frosted liquid glass pill/badge modifier for metadata tags, episode chips, and progress overlays.
+struct LiquidGlassBadgeModifier: ViewModifier {
+    let cornerRadius: CGFloat
+    var isFocused: Bool = true
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+    }
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if isFocused {
+            #if os(tvOS)
+            if #available(tvOS 26.0, *) {
+                content
+                    .glassEffect(.regular, in: shape)
+                    .overlay(
+                        shape.strokeBorder(
+                            LinearGradient(
+                                colors: [Color.white.opacity(0.40), Color.white.opacity(0.12)],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            ),
+                            lineWidth: 1
+                        )
+                    )
+            } else {
+                content
+                    .background(.ultraThinMaterial, in: shape)
+                    .overlay(
+                        shape.strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                    )
+            }
+            #else
+            content
+                .background(.ultraThinMaterial, in: shape)
+                .overlay(
+                    shape.strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                )
+            #endif
+        } else {
+            content.overlay(
+                shape.strokeBorder(
+                    LinearGradient(
+                        colors: [Color.white.opacity(0.28), Color.white.opacity(0.08)],
+                        startPoint: .topLeading,
+                        endPoint: .bottomTrailing
+                    ),
+                    lineWidth: 1
+                )
+            )
+        }
+    }
+}
+
+extension View {
+    func liquidGlassCard(cornerRadius: CGFloat, isFocused: Bool = false, isEnabled: Bool = true) -> some View {
+        self.modifier(LiquidGlassCardModifier(cornerRadius: cornerRadius, isFocused: isFocused, isEnabled: isEnabled))
+    }
+
+    func liquidGlassBadge(cornerRadius: CGFloat, isFocused: Bool = true) -> some View {
+        self.modifier(LiquidGlassBadgeModifier(cornerRadius: cornerRadius, isFocused: isFocused))
     }
 }
 
@@ -959,13 +1289,13 @@ struct LiquidGlassSurface: ViewModifier {
 ///
 /// This is the one place a spinner still belongs: the row's catalog request is
 /// genuinely outstanding and will either answer or fail, unlike a single poster
-/// URL that can hang forever with nothing left to report. Shares the glass
-/// surface with `ArtworkPlaceholder` so a loading row and a loaded one read as
-/// the same material.
+/// URL that can hang forever with nothing left to report. Uses the same
+/// lightweight card modifier as loaded posters so loading rows remain cheap.
 struct LoadingPosterCard: View {
     let width: CGFloat
     let height: CGFloat
     var cornerRadius: CGFloat = 16
+    var isLiquidGlassEnabled: Bool = true
 
     var body: some View {
         ZStack {
@@ -976,7 +1306,10 @@ struct LoadingPosterCard: View {
                 .tint(.white.opacity(0.55))
         }
         .frame(width: width, height: height)
-        .modifier(LiquidGlassSurface(cornerRadius: cornerRadius))
+        .modifier(LiquidGlassCardModifier(
+            cornerRadius: cornerRadius,
+            isEnabled: isLiquidGlassEnabled
+        ))
         .clipShape(RoundedRectangle(cornerRadius: cornerRadius, style: .continuous))
     }
 }
@@ -992,14 +1325,12 @@ struct LoadingPosterCard: View {
 ///
 /// A title with no artwork URL at all keeps the glyph, the same distinction
 /// Android draws with `MonochromePosterPlaceholder`.
-private struct ArtworkPlaceholder: View {
+struct ArtworkPlaceholder: View {
     let hasArtworkURL: Bool
     let cornerRadius: CGFloat
 
     var body: some View {
         ZStack {
-            // Fills the card, then takes the glass treatment on that footprint —
-            // the same surface a collection folder cover uses.
             Color.clear
 
             if !hasArtworkURL {
@@ -1010,19 +1341,45 @@ private struct ArtworkPlaceholder: View {
                     .foregroundColor(.white.opacity(0.38))
             }
         }
-        .modifier(LiquidGlassSurface(cornerRadius: cornerRadius))
+        .background(
+            RoundedRectangle(cornerRadius: cornerRadius, style: .continuous)
+                .fill(Color.white.opacity(0.07))
+        )
     }
 }
 
-private struct CachedPosterArtwork<Placeholder: View>: View {
+struct CachedPosterArtwork<Placeholder: View>: View {
     let urlString: String?
-    let preloadURLString: String?
+    var preloadURLString: String? = nil
     let width: CGFloat
     let height: CGFloat
-    let maximumWidth: CGFloat
-    let minimumSwapDelay: TimeInterval
-    let onPreloadFinished: () -> Void
+    var maximumWidth: CGFloat? = nil
+    var preloadMaximumWidth: CGFloat? = nil
+    var minimumSwapDelay: TimeInterval = 0
+    var onPreloadFinished: () -> Void = {}
     @ViewBuilder let placeholder: Placeholder
+
+    init(
+        urlString: String?,
+        preloadURLString: String? = nil,
+        width: CGFloat,
+        height: CGFloat,
+        maximumWidth: CGFloat? = nil,
+        preloadMaximumWidth: CGFloat? = nil,
+        minimumSwapDelay: TimeInterval = 0,
+        onPreloadFinished: @escaping () -> Void = {},
+        @ViewBuilder placeholder: () -> Placeholder
+    ) {
+        self.urlString = urlString
+        self.preloadURLString = preloadURLString
+        self.width = width
+        self.height = height
+        self.maximumWidth = maximumWidth
+        self.preloadMaximumWidth = preloadMaximumWidth
+        self.minimumSwapDelay = minimumSwapDelay
+        self.onPreloadFinished = onPreloadFinished
+        self.placeholder = placeholder()
+    }
 
     @State private var image: UIImage?
     @State private var loadedKey: String?
@@ -1037,7 +1394,14 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
 
     private var maxPixelSize: Int {
         let displayScale = UIScreen.main.scale
-        return max(160, Int(ceil(max(maximumWidth, height) * displayScale)))
+        let targetMaxWidth = maximumWidth ?? width
+        return max(160, Int(ceil(max(targetMaxWidth, height) * displayScale)))
+    }
+
+    private var preloadMaxPixelSize: Int {
+        let displayScale = UIScreen.main.scale
+        let targetMaxWidth = preloadMaximumWidth ?? maximumWidth ?? width
+        return max(160, Int(ceil(max(targetMaxWidth, height) * displayScale)))
     }
 
     private var cacheKey: String {
@@ -1045,7 +1409,7 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
     }
 
     private var preloadCacheKey: String {
-        "\(preloadURLString ?? "")#\(maxPixelSize)"
+        "\(preloadURLString ?? "")#\(preloadMaxPixelSize)"
     }
 
     var body: some View {
@@ -1177,7 +1541,7 @@ private struct CachedPosterArtwork<Placeholder: View>: View {
 
         let cached = await PosterArtworkCache.shared.image(
             for: url,
-            maxPixelSize: maxPixelSize
+            maxPixelSize: preloadMaxPixelSize
         )
         if let cached {
             guard !Task.isCancelled, key == preloadCacheKey else { return }
@@ -1315,11 +1679,7 @@ private actor PosterDiskCache {
 
     func data(for url: URL) -> Data? {
         let file = fileURL(for: url)
-        guard let data = try? Data(contentsOf: file, options: .mappedIfSafe) else { return nil }
-        // Touch on read so eviction keeps what is actually being looked at
-        // rather than merely what was fetched most recently.
-        try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: file.path)
-        return data
+        return try? Data(contentsOf: file, options: .mappedIfSafe)
     }
 
     func store(_ data: Data, for url: URL) {
@@ -1365,6 +1725,19 @@ private actor PosterDiskCache {
     }
 }
 
+private let posterURLSession: URLSession = {
+    let config = URLSessionConfiguration.default
+    config.timeoutIntervalForRequest = 10
+    config.timeoutIntervalForResource = 20
+    config.httpMaximumConnectionsPerHost = 10
+    config.urlCache = URLCache(
+        memoryCapacity: 20 * 1024 * 1024,
+        diskCapacity: 100 * 1024 * 1024,
+        diskPath: "nuvio_poster_urlcache"
+    )
+    return URLSession(configuration: config)
+}()
+
 /// Matches what the Android loader gets from OkHttp's defaults: a 10s ceiling
 /// instead of `URLSession`'s 60s, and a non-2xx response treated as a failure
 /// instead of being handed to the decoder as if it were image bytes.
@@ -1372,7 +1745,7 @@ private func downloadPosterData(url: URL) async -> Data? {
     var request = URLRequest(url: url)
     request.timeoutInterval = 10
 
-    guard let (data, response) = try? await URLSession.shared.data(for: request) else {
+    guard let (data, response) = try? await posterURLSession.data(for: request) else {
         return nil
     }
     if let http = response as? HTTPURLResponse, !(200..<300).contains(http.statusCode) {
@@ -1421,6 +1794,27 @@ private final class CatalogWatchedMetadataCache {
     private let repository = CinemetaCatalogRepository()
     private var metadataByKey: [String: NuvioMeta] = [:]
     private var inFlightByKey: [String: Task<NuvioMeta?, Never>] = [:]
+    private var decisionsByKey: [String: Bool] = [:]
+
+    init() {
+        NotificationCenter.default.addObserver(
+            forName: WatchedStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.decisionsByKey.removeAll()
+            }
+        }
+    }
+
+    func cachedDecision(for key: String) -> Bool? {
+        decisionsByKey[key]
+    }
+
+    func setDecision(_ isWatched: Bool, for key: String) {
+        decisionsByKey[key] = isWatched
+    }
 
     func fullMetadata(metaId: String, type: String, preview: NuvioMeta?) async -> NuvioMeta? {
         let profile = WatchedStore.activeProfileId ?? "default"
@@ -1428,12 +1822,10 @@ private final class CatalogWatchedMetadataCache {
         if let cached = metadataByKey[key] { return cached }
         if let inFlight = inFlightByKey[key] { return await inFlight.value }
 
-        let task: Task<NuvioMeta?, Never> = Task {
-            // Catalog rows may contain a partial episode list. Always resolve
-            // the full /meta payload so a recreated card cannot make a
-            // different completion decision from the same watched history.
-            if let refreshed = try? await repository.refreshMetadata(id: metaId, type: type) {
-                return refreshed
+        let task: Task<NuvioMeta?, Never> = Task(priority: .utility) {
+            // Reuses memory/disk cached metadata instead of forcing full network downloads
+            if let cached = try? await repository.getMetadata(id: metaId, type: type) {
+                return cached
             }
             // Keep an already supplied guide as a useful offline fallback.
             return preview
@@ -1527,17 +1919,26 @@ struct WatchedCheckmarkBadge: View {
 
     @MainActor
     private func refresh() async {
+        if let cached = CatalogWatchedMetadataCache.shared.cachedDecision(for: refreshIdentity) {
+            isWatched = cached
+            return
+        }
+
+        let t0 = CFAbsoluteTimeGetCurrent()
         let snapshot = WatchedStore.currentSnapshot()
         let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
         guard isSeries else {
-            isWatched = meta.map { snapshot.contains(meta: $0) }
+            let result = meta.map { snapshot.contains(meta: $0) }
                 ?? snapshot.contains(metaId: metaId, type: type)
+            isWatched = result
+            CatalogWatchedMetadataCache.shared.setDecision(result, for: refreshIdentity)
             return
         }
 
         if meta.map({ snapshot.containsCatalogTitle(meta: $0) })
             ?? snapshot.contains(metaId: metaId, type: type) {
             isWatched = true
+            CatalogWatchedMetadataCache.shared.setDecision(true, for: refreshIdentity)
             return
         }
 
@@ -1547,6 +1948,7 @@ struct WatchedCheckmarkBadge: View {
             ?? snapshot.watchedEpisodeKeys(metaId: metaId)
         guard !previewWatchedKeys.isEmpty else {
             isWatched = false
+            CatalogWatchedMetadataCache.shared.setDecision(false, for: refreshIdentity)
             return
         }
 
@@ -1559,6 +1961,7 @@ struct WatchedCheckmarkBadge: View {
                watchedEpisodeKeys: previewWatchedKeys
            ) {
             isWatched = true
+            CatalogWatchedMetadataCache.shared.setDecision(true, for: refreshIdentity)
             return
         }
 
@@ -1569,11 +1972,13 @@ struct WatchedCheckmarkBadge: View {
         ), !Task.isCancelled else { return }
 
         let freshSnapshot = WatchedStore.currentSnapshot()
-        isWatched = freshSnapshot.containsCatalogTitle(meta: fullMeta)
+        let resolved = freshSnapshot.containsCatalogTitle(meta: fullMeta)
             || CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
                 videos: fullMeta.videos,
                 watchedEpisodeKeys: freshSnapshot.catalogWatchedEpisodeKeys(meta: fullMeta)
             )
+        isWatched = resolved
+        CatalogWatchedMetadataCache.shared.setDecision(resolved, for: refreshIdentity)
     }
 }
 

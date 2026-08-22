@@ -525,7 +525,15 @@ typealias ProfileType = ProfileTypeStub
 @MainActor
 public class ProfileViewModel: ObservableObject {
     @Published public var profiles: [Profile] = []
-    @Published public var activeProfile: Profile?
+    @Published public var activeProfile: Profile? {
+        didSet {
+            if let id = activeProfile?.id {
+                lastActiveProfileId = id
+                UserDefaults.standard.set(id, forKey: "nuvio.lastActiveProfileId")
+            }
+        }
+    }
+    @Published public var lastActiveProfileId: String?
     @Published public var isPinEntryVisible = false
     @Published public var pinError: String?
     @Published public var profileCreationError: String?
@@ -555,6 +563,7 @@ public class ProfileViewModel: ObservableObject {
                 self.profileManager = ProfileManager.userDefaultsBacked()
             }
         }
+        lastActiveProfileId = UserDefaults.standard.string(forKey: "nuvio.lastActiveProfileId")
         loadProfiles()
         loadActiveProfile()
 
@@ -580,6 +589,10 @@ public class ProfileViewModel: ObservableObject {
     private static func makeDefaultProfileManager(fileManager: FileManager = .default) throws -> ProfileManager {
         var candidates: [URL] = []
 
+        if let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first {
+            candidates.append(caches.appendingPathComponent("Nuvio", isDirectory: true))
+        }
+
         if let applicationSupport = fileManager.urls(
             for: .applicationSupportDirectory,
             in: .userDomainMask
@@ -589,6 +602,7 @@ public class ProfileViewModel: ObservableObject {
 
         let homeLibrary = URL(fileURLWithPath: NSHomeDirectory(), isDirectory: true)
             .appendingPathComponent("Library", isDirectory: true)
+        candidates.append(homeLibrary.appendingPathComponent("Caches", isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true))
         candidates.append(
             homeLibrary
                 .appendingPathComponent("Application Support", isDirectory: true)
@@ -600,6 +614,9 @@ public class ProfileViewModel: ObservableObject {
         if let documentsURL {
             candidates.append(documentsURL.appendingPathComponent("Nuvio", isDirectory: true))
         }
+
+        let tmpURL = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true).appendingPathComponent("Nuvio", isDirectory: true)
+        candidates.append(tmpURL)
 
         var attemptedPaths = Set<String>()
         var lastError: Error?
