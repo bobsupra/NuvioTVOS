@@ -10,6 +10,9 @@ import os
 //
 // Nothing here imports AetherEngine. The question is a property of the transport, so the probe
 // talks to the origin the way a client would and never through the reader that is under suspicion.
+//
+// Device/ compiles this file into the host app as well, so that the television can show the resolved
+// target before a run. Keep it free of any test-framework import.
 
 // MARK: - Configuration
 
@@ -20,8 +23,10 @@ struct ProbeConfig: Sendable {
     /// How long an arm issues no reads at all. 60 s is past any viewer-pause the engine tolerates
     /// and short enough that an unbounded sender hits the abort guard rather than jetsam.
     var holdSeconds: Double
-    /// How long the held-connection arm runs. Must exceed the origin's serve window (about six
-    /// minutes on the source that opened #377) or it proves nothing.
+    /// How long the held-connection arm is prepared to wait for a refusal to arrive. Refusal windows
+    /// are not periodic and cannot be provoked: a 45 minute run against the source that opened #377
+    /// met none, on a link that produced seven inside one episode. An arm that meets no window
+    /// proves nothing, so this is a waiting budget rather than a period to exceed.
     var windowSeconds: Double
     /// Consumption rate for the held-connection arm, in bytes per second. A probe that reads as
     /// fast as it can is not a player; the interesting state is a reader that stays behind the CDN.

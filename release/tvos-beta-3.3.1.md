@@ -4,13 +4,20 @@
 
 > **New beta alerts:** [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 
-> 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting Nuvio and helping reach 100+ stars on GitHub! Your feedback, issue reports, and testing make this possible.
+> 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping reach 100+ stars on GitHub! Your feedback, issue reports, and testing make this possible.
 
-### AetherEngine 6.34.0 & FFmpegBuild 2.4.3 upgrade
+> ⚠️ **Important Re-Release Notice:** This updated build fixes a critical issue where TV shows were missing episode details and appearing as movies on the Details screen. If you installed the earlier 3.3.1 package, please reinstall/update to this build.
 
-- Updates **AetherEngine** to **6.34.0** and **FFmpegBuild** to **2.4.3** with isolated `AetherLib*` module namespaces and full MPVKit dynamic coexistence.
+### Hotfix: TV Show episode details & type classification
+
+- Fixes an issue where TV series metadata (types `"tv"`, `"show"`, `"tvshow"`) were misclassified as non-series or Live TV, causing TV shows to display as movies with missing season/episode pickers.
+- Enhances `DetailsViewModel.mergeEpisodes` to reliably merge TMDB episode metadata and overview details with Cinemeta/Stremio video arrays.
+
+### AetherEngine 6.47.0 & FFmpegBuild 2.4.3 upgrade
+
+- Updates **AetherEngine** to **6.47.0** and **FFmpegBuild** to **2.4.3** with isolated `AetherLib*` module namespaces and full MPVKit dynamic coexistence.
 - Hardens **Dolby Vision RPU conversion** (Profile 7 to Profile 8.1) with robust multi-packet framing detection (Annex-B vs length-prefixed NAL units) and fail-safe base-layer fallbacks.
-- Adds real-time **startup progress reporting** (`StartupProgressEngine`, `PlaybackErrorInfo`), live HLS reopen handling, origin request concurrency budgeting, and rate-limit backoff ladders.
+- Adds real-time **startup progress reporting** (`StartupProgressEngine`, `PlaybackErrorInfo`), live HLS reopen handling, origin request concurrency budgeting, no-cut stall watchdogs, and rate-limit backoff ladders.
 - Integrates stereo and silent audio bridge encoders for seamless audio continuity during stream transitions.
 
 ### Details screen & media discovery
@@ -26,7 +33,7 @@
 
 ### Tests
 
-- Comprehensive unit and regression test suite coverage across NuvioTV and AetherEngine (1,960 package tests and 118 app tests passed).
+- Comprehensive unit and regression test suite coverage across NuvioTV and AetherEngine.
 
 ### Known issues
 

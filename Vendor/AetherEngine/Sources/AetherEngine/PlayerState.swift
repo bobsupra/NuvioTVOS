@@ -81,10 +81,10 @@ public enum VideoRoute: String, Sendable, Equatable {
 /// regex-matching `EngineLog` for stall/reconnect, which is no longer necessary.
 ///
 /// `.stalled(reconnecting:)` reports a source-connection problem (drop / 429 / 503 backoff) distinct from
-/// `.rebuffering` (a healthy-connection buffer underrun). The associated value is `true` whenever the
-/// reader is retrying; a future "stalled, retries paused" distinction will surface as `false` without
-/// changing the case. Not available on the direct AVPlayer-HLS live path (no demuxer / reader): a reconnect
-/// there reads as `.rebuffering`.
+/// `.rebuffering` (a healthy-connection buffer underrun). The associated value is `true` while the reader is
+/// retrying and `false` once it has spent its ladder and handed the outcome to the producer's reopen, which
+/// is still a dead source but no longer one being retried (#410). Not available on the direct AVPlayer-HLS
+/// live path (no demuxer / reader): a reconnect there reads as `.rebuffering`.
 public enum PlaybackPhase: Sendable, Equatable {
     case idle
     case loading
@@ -97,16 +97,30 @@ public enum PlaybackPhase: Sendable, Equatable {
     case error(String)
 }
 
-/// Source-fetch network axis feeding `PlaybackPhase` (#85). Binary today; `.reconnecting` covers the
-/// `AVIOReader` stall / drop / backoff loop, `.flowing` covers normal delivery.
+/// Source-fetch network axis feeding `PlaybackPhase` (#85). `.flowing` covers normal delivery,
+/// `.reconnecting` the `AVIOReader` stall / drop / backoff loop, `.exhausted` a ladder that ran out and left
+/// the read (#410): the reader is gone, the producer's reopen owns the recovery, and until some reader
+/// delivers again the source is still down. `.exhausted` is deliberately NOT `.flowing`: the dying reader
+/// used to claim delivery on its way out purely so the next reader's gate could not strand the phase, which
+/// reported a healthy source across the whole reopen window.
 enum ReaderNetworkPhase: Sendable, Equatable {
     case flowing
     case reconnecting
+    case exhausted
 }
 
 extension PlaybackPhase {
     /// Pure fold of the four playback axes into one phase, with fixed precedence
-    /// (highest first): error > ended > idle > loading > seeking > stalled > rebuffering > playing/paused.
+    /// (highest first): error > ended > idle > loading > stalled > seeking > rebuffering > playing/paused.
+    ///
+    /// The reader axis outranks `isSeeking` (#410). A seek cannot land over a source that stopped
+    /// delivering, so the level stays up for the whole outage, and the seek doing it is not necessarily the
+    /// host's: the producer's restart coalescer issues its own `nativeScrub` seeks while recovering, so the
+    /// engine's recovery hid the outage it was recovering from, for as long as it lasted. A seek stays
+    /// observable through `isSeeking` and `seekEvents`; the reader axis is observable nowhere else, which is
+    /// the whole reason this phase exists. Over a delivering source nothing changes: the reader is
+    /// `.flowing` and a seek reads `.seeking` exactly as before, and a seek that can land from cache over a
+    /// reconnecting reader clears itself in milliseconds.
     static func derive(state: PlaybackState,
                        isBuffering: Bool,
                        isSeeking: Bool,
@@ -117,8 +131,12 @@ extension PlaybackPhase {
         case .idle:               return .idle
         case .loading:            return .loading
         case .playing, .paused, .seeking:
+            switch stall {
+            case .reconnecting: return .stalled(reconnecting: true)
+            case .exhausted:    return .stalled(reconnecting: false)
+            case .flowing:      break
+            }
             if isSeeking { return .seeking }
-            if stall == .reconnecting { return .stalled(reconnecting: true) }
             if isBuffering { return .rebuffering }
             return state == .paused ? .paused : .playing
         }

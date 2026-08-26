@@ -29,23 +29,36 @@ class DetailsViewModel: ObservableObject {
     }
 
     func loadDetails(id: String, type: String) {
-        let started = TVHomeDebugTrace.now()
         TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
         deferredLoadTask?.cancel()
         streamObserveTask?.cancel()
         enrichmentTask?.cancel()
-        Task {
-            uiState = DetailsUiState(isLoading: true, error: nil)
 
+        // Check if full metadata is already in memory so we can render frame 0 instantly without showing a spinner
+        if let cached = (repository as? CinemetaCatalogRepository)?.cachedMetadata(for: id),
+           CinemetaCatalogRepository.isFullMetadata(cached) {
+            uiState = DetailsUiState(
+                isLoading: false,
+                meta: cached,
+                error: nil,
+                isInWatchlist: LibraryStore.contains(metaId: cached.id, type: cached.type),
+                isWatched: WatchedStore.contains(meta: cached)
+            )
+        } else if uiState.meta?.id != id {
+            uiState = DetailsUiState(isLoading: true, error: nil)
+        }
+
+        Task {
             do {
                 let meta = try await repository.getMetadata(id: id, type: type)
-                TVHomeDebugTrace.log(
-                    "details.load.meta.success id=\(id) name=\(meta.name) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
-                )
-                uiState.meta = meta
-                uiState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
-                uiState.isWatched = WatchedStore.contains(meta: meta)
-                uiState.isLoading = false
+                
+                var primaryState = uiState
+                primaryState.meta = meta
+                primaryState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
+                primaryState.isWatched = WatchedStore.contains(meta: meta)
+                primaryState.isLoading = false
+                primaryState.error = nil
+                uiState = primaryState
 
                 // Present primary metadata immediately for instant smooth transition.
                 // Defer streams & heavy secondary enrichment until the screen transition
@@ -62,11 +75,10 @@ class DetailsViewModel: ObservableObject {
                     loadEnrichment(for: meta)
                 }
             } catch {
-                TVHomeDebugTrace.log(
-                    "details.load.meta.error id=\(id) error=\(error.localizedDescription) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
-                )
-                uiState.isLoading = false
-                uiState.error = error.localizedDescription
+                if uiState.meta == nil {
+                    uiState.isLoading = false
+                    uiState.error = error.localizedDescription
+                }
             }
         }
     }
@@ -86,16 +98,12 @@ class DetailsViewModel: ObservableObject {
     private func loadEnrichment(for meta: NuvioMeta) {
         enrichmentTask?.cancel()
         enrichmentTask = Task {
-            let started = TVHomeDebugTrace.now()
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
             uiState.isLoadingEnrichment = true
             defer {
                 if !Task.isCancelled {
                     uiState.isLoadingEnrichment = false
                 }
-                TVHomeDebugTrace.log(
-                    "details.enrich.finish id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
-                )
             }
 
             async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
@@ -105,6 +113,7 @@ class DetailsViewModel: ObservableObject {
             async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
             async let simklTask = SimklDetailsService.fetchDetails(for: meta)
             async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
+            async let tmdbEpisodesTask = meta.isSeries ? TmdbDetailsService.fetchEpisodes(for: meta) : nil
 
             let companies = await companiesTask
             let credits = await creditsTask
@@ -113,11 +122,8 @@ class DetailsViewModel: ObservableObject {
             let comments = await commentsTask
             let simkl = await simklTask
             let mdbRatings = await mdbRatingsTask
+            let tmdbEpisodes = await tmdbEpisodesTask
 
-            guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
-
-            // Use the source the user picked, then fall back through the others
-            // so the row still fills when their choice returns nothing.
             let simklRelated = simkl?.related ?? []
             let preferred: [RelatedTitle]
             switch TraktSettingsStore.moreLikeThisSource {
@@ -128,21 +134,31 @@ class DetailsViewModel: ObservableObject {
             let moreLikeThis = [preferred, tmdbRelated, traktRelated, simklRelated]
                 .first { !$0.isEmpty } ?? []
 
-            uiState.companies = companies
-            if let credits, !credits.isEmpty, let currentMeta = uiState.meta {
-                uiState.meta = credits.applying(to: currentMeta)
-                uiState.people = credits.people
+            guard !Task.isCancelled, uiState.meta?.id == meta.id else {
+                return
             }
-            if let currentMeta = uiState.meta {
-                uiState.meta = currentMeta.withExternalRatings(mdbRatings)
-            }
-            uiState.moreLikeThis = moreLikeThis
-            uiState.comments = comments
-            uiState.simklRatings = simkl?.ratings
 
-            TVHomeDebugTrace.log(
-                "details.enrich.data.set id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
-            )
+            var next = uiState
+            next.companies = companies
+            if let credits, !credits.isEmpty, let currentMeta = next.meta {
+                next.meta = credits.applying(to: currentMeta)
+                next.people = credits.people
+            }
+            if let currentMeta = next.meta {
+                next.meta = currentMeta.withExternalRatings(mdbRatings)
+            }
+            if let tmdbEpisodes, !tmdbEpisodes.isEmpty, let currentMeta = next.meta {
+                let mergedVideos = Self.mergeEpisodes(
+                    existing: currentMeta.videos,
+                    fromTmdb: tmdbEpisodes,
+                    parentId: currentMeta.id
+                )
+                next.meta = currentMeta.withVideos(mergedVideos)
+            }
+            next.moreLikeThis = moreLikeThis
+            next.comments = comments
+            next.simklRatings = simkl?.ratings
+            uiState = next
 
             // Trakt's related endpoint commonly omits usable artwork even with
             // `extended=images`. Resolve those IMDb ids through Cinemeta so the
@@ -151,9 +167,6 @@ class DetailsViewModel: ObservableObject {
             let hydrated = await hydrateRelatedArtwork(in: moreLikeThis)
             guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
             uiState.moreLikeThis = hydrated
-            TVHomeDebugTrace.log(
-                "details.enrich.hydrated.set id=\(meta.id) ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
-            )
         }
     }
 
@@ -338,4 +351,48 @@ class DetailsViewModel: ObservableObject {
         uiState.isWatched = WatchedStore.toggle(meta: meta)
     }
 
+    static func mergeEpisodes(
+        existing: [NuvioVideo]?,
+        fromTmdb tmdbVideos: [NuvioVideo]?,
+        parentId: String
+    ) -> [NuvioVideo]? {
+        guard let tmdbVideos, !tmdbVideos.isEmpty else { return existing }
+        guard let existing, !existing.isEmpty else { return tmdbVideos }
+
+        var bySeasonEp: [String: NuvioVideo] = [:]
+        for video in existing {
+            bySeasonEp["\(video.season):\(video.episode)"] = video
+        }
+
+        var result: [NuvioVideo] = []
+        for tmdb in tmdbVideos {
+            let key = "\(tmdb.season):\(tmdb.episode)"
+            if let ex = bySeasonEp.removeValue(forKey: key) {
+                result.append(NuvioVideo(
+                    id: ex.id,
+                    title: (ex.title.hasPrefix("Episode ") || ex.title.isEmpty) ? tmdb.title : ex.title,
+                    season: ex.season,
+                    episode: ex.episode,
+                    thumbnail: ex.thumbnail ?? tmdb.thumbnail,
+                    overview: (ex.overview == nil || ex.overview?.isEmpty == true) ? tmdb.overview : ex.overview,
+                    released: ex.released ?? tmdb.released,
+                    rating: ex.rating ?? tmdb.rating
+                ))
+            } else {
+                result.append(tmdb)
+            }
+        }
+
+        for remaining in bySeasonEp.values {
+            result.append(remaining)
+        }
+
+        return result.sorted {
+            (seasonSortKey($0.season), $0.episode) < (seasonSortKey($1.season), $1.episode)
+        }
+    }
+
+    private static func seasonSortKey(_ season: Int) -> Int {
+        season == 0 ? Int.max : season
+    }
 }

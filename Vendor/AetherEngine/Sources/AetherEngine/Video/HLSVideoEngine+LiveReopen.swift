@@ -800,6 +800,36 @@ extension HLSVideoEngine {
             + " (attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
             category: .session
         )
+        // AE#421: the two repairs are not interchangeable, and which one goes first is decided by
+        // whether the consumer could have the content it is silent about. Measured twice by the
+        // reporter, on an Apple TV and on a Mac: the producer had already served, the re-anchor
+        // changed nothing for the whole six-second grace (zero fetches), and the nudge that followed
+        // landed the seek in 240 ms. A re-anchor is the repair for a consumer STARVED of content
+        // nobody is producing. A consumer silent on a segment that is already on disk is not
+        // starved, and re-anchoring there throws the pump's forward work away to rebuild what it
+        // already has (the reporting run put it back from seg15 to seg3).
+        if Self.wedgeRepair(targetStored: provider?.hasStoredSegment(at: idx) ?? false) == .nudgeConsumerFirst {
+            EngineLog.emit(
+                "[HLSVideoEngine] #421 backpressure wedge with seg\(idx) already stored: the consumer "
+                + "is silent on content it can have, so nudging it before touching the producer "
+                + "(pos=\(String(format: "%.2f", anchor))s, attempt \(attempts)/\(Self.maxConsecutiveWedgeReanchors))",
+                category: .session
+            )
+            onConsumerReengageNeeded?(anchor)
+            // The nudge is cheap and reversible, but it is not guaranteed: if the consumer is still
+            // silent after the grace, fall back to the re-anchor rather than leaving it wedged.
+            afterGraceIfConsumerStaysSilent(capturedPosition: pos) { [weak self] _ in
+                guard let self else { return }
+                EngineLog.emit(
+                    "[HLSVideoEngine] #421 nudge did not re-engage the consumer within "
+                    + "\(Int(Self.consumerReengageGraceSeconds))s; re-anchoring producer to seg\(idx) after all",
+                    category: .session
+                )
+                self.requestRestart(at: idx, authoritative: true)
+            }
+            return
+        }
+
         // #79: re-anchor authoritatively. The anchor is where recovery must aim (pending seek target,
         // else AVPlayer's real position), so it must win the coalescer's pending slot over any stale
         // in-flight scrub target (else the producer settles at the scrub target and AVPlayer stays starved).
@@ -809,18 +839,8 @@ extension HLSVideoEngine {
         // never resumes REQUESTING (zero GETs, waitingToMinimizeStalls forever, item never fails).
         // Watch the provider's fetch counter through a grace window; if the consumer stays silent
         // while it still wants to play, ask the host for a re-engage nudge.
-        let fetchesAtReanchor = provider?.mediaFetchCount ?? 0
-        let epoch = sessionEpochSnapshot()
-        Task.detached(priority: .userInitiated) { [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
-            guard let self, self.isSessionEpochCurrent(epoch) else { return }
-            let fetchesNow = self.provider?.mediaFetchCount ?? 0
-            guard fetchesNow == fetchesAtReanchor,
-                  self.playIntentProvider?() == true else { return }
-            // #115: re-read the position at nudge time. On VOD the consumer keeps rendering
-            // buffered segments through the grace window, so the wedge-trip capture is behind
-            // the on-screen frame and a zero-tolerance nudge to it replays visibly.
-            let freshPos = self.currentPlaybackPositionProvider?() ?? pos
+        afterGraceIfConsumerStaysSilent(capturedPosition: pos) { [weak self] freshPos in
+            guard let self else { return }
             EngineLog.emit(
                 "[HLSVideoEngine] #65 consumer re-engage: no segment fetch for "
                 + "\(Int(Self.consumerReengageGraceSeconds))s after wedge re-anchor "
@@ -830,6 +850,37 @@ extension HLSVideoEngine {
                 category: .session
             )
             self.onConsumerReengageNeeded?(freshPos)
+        }
+    }
+
+    /// AE#421: which repair a wedge calls for.
+    enum WedgeRepair: Equatable {
+        /// The target is not produced: the consumer has nothing to fetch, so move the producer.
+        case reanchorProducer
+        /// The target is on disk: the consumer is silent about content it can have, so move IT.
+        case nudgeConsumerFirst
+    }
+
+    static func wedgeRepair(targetStored: Bool) -> WedgeRepair {
+        return targetStored ? .nudgeConsumerFirst : .reanchorProducer
+    }
+
+    /// Run `follow` once the grace window has passed WITHOUT the consumer fetching anything, so a
+    /// repair that took effect is never followed by a second one. `follow` receives the position
+    /// re-read at that moment (#115: on VOD the consumer keeps rendering buffered segments through
+    /// the window, so the trip capture is behind the on-screen frame and acting on it replays
+    /// visibly).
+    private func afterGraceIfConsumerStaysSilent(
+        capturedPosition: Double, _ follow: @escaping @Sendable (Double) -> Void
+    ) {
+        let fetchesBefore = provider?.mediaFetchCount ?? 0
+        let epoch = sessionEpochSnapshot()
+        Task.detached(priority: .userInitiated) { [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(Self.consumerReengageGraceSeconds * 1_000_000_000))
+            guard let self, self.isSessionEpochCurrent(epoch) else { return }
+            guard (self.provider?.mediaFetchCount ?? 0) == fetchesBefore,
+                  self.playIntentProvider?() == true else { return }
+            follow(self.currentPlaybackPositionProvider?() ?? capturedPosition)
         }
     }
 

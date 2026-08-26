@@ -205,12 +205,14 @@ struct RecoverySeekTargetTests {
         // Backward seek 1200 -> 1185 (15 s, inside the 30 s measurement window) into unbuffered content.
         // AVPlayer still holds a full forward buffer at the abandoned playhead: 1200 -> 1230.
         let oldPlayheadBuffer = [(start: 1200.0, end: 1230.0)]
-        // Without the exclusion bound the old buffer sits inside [1184, 1215] and reads as 15 s of
-        // "media served at the target" -- the producer served none of it, and the seek would be granted
-        // an extension while the recovery it needs is deferred.
+        // Two independent nets now keep that buffer out, and this shape trips both. The old buffer sits
+        // inside the measurement window [1184, 1215] but nowhere near the target, so AE#408's coverage
+        // gate alone already reports nothing served there, with no bound passed at all.
         #expect(NativeAVPlayerHost.bufferedSecondsInWindow(
-            ranges: oldPlayheadBuffer, target: 1185.0) == 15.0)
-        // Excluding at the frozen playhead reports the truth: nothing at the target.
+            ranges: oldPlayheadBuffer, target: 1185.0) == 0.0)
+        // The exclusion bound reaches the same verdict on its own, and stays load-bearing for the shape
+        // coverage cannot judge: a genuine island AT the target with the old buffer still above it (last
+        // case below), where the window would otherwise credit the producer with 30 s it never served.
         #expect(NativeAVPlayerHost.bufferedSecondsInWindow(
             ranges: oldPlayheadBuffer, target: 1185.0, excludeAtOrAbove: 1200.0) == 0.0)
 

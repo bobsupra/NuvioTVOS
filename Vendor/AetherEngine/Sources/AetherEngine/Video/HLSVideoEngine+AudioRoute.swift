@@ -83,6 +83,15 @@ extension HLSVideoEngine {
         avcodec_get_name(id).map { String(cString: $0) } ?? "id \(id.rawValue)"
     }
 
+    /// AE#396: "absent from this FFmpeg build" was true and useless, because the build that answered
+    /// was a second FFmpeg the host had linked ahead of AetherEngine's. The sentence read as a claim
+    /// about our build, so the reporter spent five fixtures and two devices before anyone looked at
+    /// the link. Naming the libavcodec that actually answered makes it a question about the process.
+    static func encoderAbsentMessage(missing: AVCodecID, cascadingTo: AVCodecID) -> String {
+        "[HLSVideoEngine] \(encoderLabel(missing)) bridge encoder absent from "
+        + "\(FFmpegRuntimeCheck.avcodecIdentity), cascading to \(encoderLabel(cascadingTo))"
+    }
+
     /// Guards `audioSourceStreamIndexOverride` against stale picker selections from a previous title.
     static func isAudioStream(demuxer: Demuxer, index: Int32) -> Bool {
         guard index >= 0, let stream = demuxer.stream(at: index) else {
@@ -210,8 +219,9 @@ extension HLSVideoEngine {
                     )
                 } catch AudioBridge.AudioBridgeError.encoderNotFound(let missing) where !isLastAttempt {
                     EngineLog.emit(
-                        "[HLSVideoEngine] \(Self.encoderLabel(missing)) bridge encoder absent from this FFmpeg build, "
-                        + "cascading to \(Self.encoderLabel(AudioBridge.alternateEncoder(to: missing)))",
+                        Self.encoderAbsentMessage(
+                            missing: missing,
+                            cascadingTo: AudioBridge.alternateEncoder(to: missing)),
                         category: .session
                     )
                     continue attempts

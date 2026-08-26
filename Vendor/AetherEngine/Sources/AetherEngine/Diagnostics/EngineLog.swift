@@ -53,11 +53,20 @@ public enum EngineLog {
 
     /// Emit under a specific category. `.public` privacy so Console shows the full string instead of `<private>`.
     public static func emit(_ line: String, category: Category) {
-        loggers[category]?.log("\(line, privacy: .public)")
-        handler?(line)
+        deliver(line, category: category, level: .info)
     }
 
     public static func emit(_ line: String, category: Category, level: Level) {
+        deliver(line, category: category, level: level)
+    }
+
+    /// The single funnel every line passes, which is where credentials come out (see LogRedaction).
+    /// Doing it here rather than at the call sites is what makes a URL logged by code added later safe
+    /// without its author knowing the redactor exists, and it covers OSLog as well as the host handler:
+    /// `.public` privacy means a Console.app capture or a sysdiagnose would otherwise carry the token
+    /// in clear text even for a host that scrubs its own log.
+    private static func deliver(_ line: String, category: Category, level: Level) {
+        let line = LogRedaction.redact(line)
         switch level {
         case .info:
             loggers[category]?.log("\(line, privacy: .public)")

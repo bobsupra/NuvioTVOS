@@ -376,6 +376,31 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private func setPlaylistShiftSeconds(_ value: Double) {
         shiftLock.lock(); _playlistShiftSeconds = value; shiftLock.unlock()
     }
+
+    /// AE#418 round 2: what each stored segment adds to AVPlayer's axis when AVPlayer PLACES it.
+    ///
+    /// Only an epoch's FIRST segment can carry a non-zero offset: a gate that had to open below its
+    /// boundary puts that much extra content into that one segment, and every segment the epoch cuts
+    /// after it starts exactly on its boundary. Keyed by index rather than kept as one pair, because
+    /// several epochs can leave such a segment in the cache at once; an epoch marching through an
+    /// index rewrites it axis-true, which is what `recordingEpochAt` drops the entries above for.
+    private let anchorShiftLock = NSLock()
+    private var epochShiftByIndex: [Int: Double] = [:]
+    /// The last index a fetch declared. A cold fetch reaches the provider BEFORE the producer has
+    /// opened its gate, so the placement can precede the offset it is worth; this is what lets the
+    /// gate publish for a placement that already happened.
+    private var lastPlacedIndex: Int = .min
+    /// AE#412: the index the most recent gate open belongs to and what it was worth. Separate from
+    /// `epochShiftByIndex`, which deliberately keeps no entry for a zero offset, so it cannot answer
+    /// "has this epoch opened yet" at all. Signalled through `gateOpenCondition`.
+    private var lastGateOpen: (index: Int, shift: Double)?
+    private let gateOpenCondition = NSCondition()
+    /// AE#412: indices whose epoch an AE#412 re-cut started. Such a segment goes into a timeline
+    /// AVPlayer is already building, and it puts it at its own tfdt there (measured 3 of 3 with
+    /// `play --picture-probe`: `axisErr` 0.000 at offsets of 1, 5 and 9 s), so its distance to its
+    /// advertised start is not an axis offset and must not compose into one. Guarded by
+    /// `anchorShiftLock`, alongside the table it keeps entries out of.
+    private var recutIndices: Set<Int> = []
     private let shiftLock = NSLock()
     private var _playlistShiftSeconds: Double = 0
 
@@ -496,6 +521,12 @@ public final class HLSVideoEngine: @unchecked Sendable {
     /// encoder state survives producer restarts; `startSegment()` rebases PTS on each restart.
     var audioBridge: AudioBridge?
     var segmentPlan: [Segment] = []
+
+    /// AE#408: true only while `segmentPlan` is the keyframe-aligned plan, whose boundaries are
+    /// container index entries and therefore CLAIM to be random-access points. The producer re-aims
+    /// below a boundary that breaks that claim; it must not do so for the uniform grid (which never
+    /// claimed it) or a source-declared plan (which aims below its IRAP by design, AE#268).
+    var planBoundariesClaimRandomAccess = false
 
     /// Guards subsystem refs + `sessionEpoch`. Never held across waits or network I/O so
     /// `stop()` on the main thread is never blocked behind a restart's 5 s waitForFinish.
@@ -941,6 +972,13 @@ public final class HLSVideoEngine: @unchecked Sendable {
             }
             sourceBitrate = dem.bitRate
 
+            // #409: settle the composition-offset repair while the demuxer still stands at the head.
+            // It reads a short sample and holds those packets, so nothing is consumed; doing it later
+            // would sample wherever the prewarm left the source, and hand the producer a head that is
+            // six seconds into the file. The segment plan below needs the verdict either way, because
+            // a repaired stream and the container's own index have to describe one ladder.
+            dem.decideCompositionOffsetRepair()
+
             // 2. Prewarm MKV Cues so libavformat's keyframe index is populated (1-2 byte-range reads).
             //    Bounded: a missing/out-of-bounds Cues index degrades into a multi-GB linear scan;
             //    abort past the deadline and fall back to the uniform-stride plan.
@@ -1001,6 +1039,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
                     videoTimeBase: videoTimeBase,
                     sourceDurationSeconds: durationSeconds
                 )
+                planBoundariesClaimRandomAccess = true
                 let firstKeyframePts = keyframes.sorted().first ?? 0
                 self.firstKeyframePts = firstKeyframePts
                 let firstKeyframeSeconds = Double(firstKeyframePts) * Double(videoTimeBase.num) / Double(videoTimeBase.den)
@@ -1562,6 +1601,14 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         // 7. Wire provider, server, and URL.
         let manifestCodecs = audioHLSCodecs.map { "\(primaryCodecs),\($0)" } ?? primaryCodecs
+        // AE#418: a segment AVPlayer places is what moves the axis it reads.
+        var segmentPlacedHandler: (@Sendable (Int) -> Void)?
+        if !isLiveSession {
+            segmentPlacedHandler = { [weak self] idx in
+                guard let self else { return }
+                self.handleSegmentPlaced(at: idx)
+            }
+        }
         let prov = VideoSegmentProvider(
             cache: segmentCache,
             segments: plan,
@@ -1614,7 +1661,8 @@ public final class HLSVideoEngine: @unchecked Sendable {
             stripASSMarkupInVTT: preserveASSMarkupForSubtitleTap,
             nativeSubtitleDefaultOrdinal: nativeSubtitleDefaultOrdinal,
             nativeSubtitleWholeProgram: nativeSubtitleWholeProgram,
-            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) }
+            currentShiftSeconds: { [weak self] in (self?.playlistShiftSeconds ?? 0) + (self?.subtitleStreamStartSeconds ?? 0) },
+            segmentPlacedHandler: segmentPlacedHandler
         )
         self.provider = prov
         if isLiveSession {
@@ -1653,6 +1701,15 @@ public final class HLSVideoEngine: @unchecked Sendable {
                 let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
                 dem.seek(to: Double(targetPts) * Double(tb.num) / Double(tb.den))
             }
+        }
+        // #416: the pump harvests every subtitle packet it demuxes, so where it OPENS is where its
+        // coverage of the source begins. The subtitle drain reads "nothing between this set and the
+        // playhead" out of the same store, and below this position that answer means nothing.
+        if !plan.isEmpty {
+            let openIndex = max(0, min(initialProducerBaseIndex, plan.count - 1))
+            let tb = savedVideoConfig?.timeBase ?? AVRational(num: 1, den: 1000)
+            subtitlePacketStore.noteHarvestAnchor(
+                .pump, at: Double(plan[openIndex].startPts) * Double(tb.num) / Double(tb.den))
         }
         prod.start()
 
@@ -2092,6 +2149,7 @@ public final class HLSVideoEngine: @unchecked Sendable {
             videoFallbackDurationPts: videoFallbackDurationPts,
             audioFallbackDurationPts: audioFallbackDurationPts,
             restartTargetVideoPts: videoTarget,
+            boundaryClaimsRandomAccess: planBoundariesClaimRandomAccess,
             closedCaptionStreamIndex: closedCaptionStreamIndexForSession,
             subtitleTapStreamIndices: Set(nativeSubtitleSourceStreamIndicesForSession.compactMap { $0 }),
             subtitlePacketStreamIndices: allEmbeddedSubtitleStreamIndices,   // #112 rework
@@ -2184,6 +2242,270 @@ public final class HLSVideoEngine: @unchecked Sendable {
     private func handleVideoShiftKnown(_ shiftPts: Int64, firstItemTfdtPts: Int64) {
         let seconds = shiftPts == Int64.min ? 0 : Double(shiftPts) * sourceVideoTbSeconds
         let seamItemSeconds = Double(firstItemTfdtPts) * sourceVideoTbSeconds
+        // Live rebases the whole timeline at a program boundary and nothing older comes back on
+        // screen, so its axis is the epoch's own and it publishes here as it always has.
+        guard !isLiveSession else {
+            publishPlaylistShift(seconds, seamItemSeconds: seamItemSeconds)
+            return
+        }
+        // AE#418 round 2: on VOD the axis moves when AVPlayer PLACES this segment, not when the
+        // producer writes it. Record what the segment is worth and let the placement publish it; an
+        // epoch AVPlayer never fetches from must not move the clock at all.
+        let index = segmentIndexForPlaylistTime(seamItemSeconds)
+        anchorShiftLock.lock()
+        // AE#412: a re-cut opens below its boundary on purpose, and AVPlayer places what it produces
+        // at its own tfdt, so the epoch is worth nothing to the axis. Recording zero still drops the
+        // entries at and above it, which is what the rewrite calls for.
+        let isRecut = recutIndices.remove(index) != nil
+        epochShiftByIndex = Self.epochShiftTable(
+            epochShiftByIndex, recordingEpochAt: index, shift: isRecut ? 0 : seconds)
+        let placementAlreadyHappened = lastPlacedIndex == index
+        anchorShiftLock.unlock()
+        gateOpenCondition.lock()
+        lastGateOpen = (index: index, shift: seconds)
+        gateOpenCondition.broadcast()
+        gateOpenCondition.unlock()
+        if placementAlreadyHappened {
+            handleSegmentPlaced(at: index)
+        }
+    }
+
+    /// AE#418 round 2: AVPlayer put the segment at `index` into its timeline, so whatever that
+    /// segment carries below its advertised start moves the axis by that much.
+    ///
+    /// Measured with `play --picture-probe` on a fixture whose picture states its own source time,
+    /// at re-aims of 1, 3, 5, 7, 9 and 11 s: the offset **composes**. A run keeps the offset it has
+    /// across every boundary it plays through (round 1 measured that), and re-placing an overlong
+    /// segment adds its offset again on top: a resume that opened 9 s below its boundary reads
+    /// `axisErr=-9.000`, and a seek that makes AVPlayer fetch that same segment a second time reads
+    /// `-18.000`, not `-9.000` and not the `0.000` round 1 published there.
+    ///
+    /// Round 1 keyed this to "the run began here" and answered it from the fetch sequence, which is
+    /// what the reporter's seek burst falsified: a fetch that does not follow its predecessor happens
+    /// while AVPlayer stays inside the run it is already playing, and the axis was then dropped to
+    /// zero under a picture that had not moved. Reproduced on the fixture (`start 53`, seek to 80:
+    /// `capErr=-8.983`), and gone once the axis only ever moves by what a placed segment is worth.
+    func handleSegmentPlaced(at index: Int) {
+        guard !isLiveSession else { return }
+        anchorShiftLock.lock()
+        lastPlacedIndex = index
+        let epochShift = epochShiftByIndex[index] ?? 0
+        anchorShiftLock.unlock()
+        guard epochShift != 0 else { return }
+        restartLock.lock()
+        let plannedStart = index >= 0 && index < segmentPlan.count
+            ? segmentPlan[index].startSeconds : nil
+        restartLock.unlock()
+        guard let plannedStart else { return }
+        let current = playlistShiftSeconds
+        let composed = Self.axisShift(after: current, placing: epochShift)
+        let seam = Self.seamItemSeconds(advertisedStart: plannedStart, currentShift: current)
+        EngineLog.emit(
+            "[HLSVideoEngine] #418 seg\(index) placed (advertised \(String(format: "%.3f", plannedStart))s, "
+            + "worth \(String(format: "%.3f", epochShift))s): axis shift "
+            + "\(String(format: "%.3f", current))s -> \(String(format: "%.3f", composed))s "
+            + "from item \(String(format: "%.3f", seam))s",
+            category: .session
+        )
+        publishPlaylistShift(composed, seamItemSeconds: seam)
+    }
+
+    /// AE#418 round 2: the axis after AVPlayer places a segment worth `epochShift`. It composes,
+    /// because AVPlayer puts the placed segment's advertised start where its CURRENT mapping says
+    /// that position is, not where the playlist says it is.
+    static func axisShift(after currentShift: Double, placing epochShift: Double) -> Double {
+        return currentShift + epochShift
+    }
+
+    /// The item position the placed segment's content begins at: its advertised start, read through
+    /// the axis that was in effect before it landed. Everything below that is still the old epoch's.
+    static func seamItemSeconds(advertisedStart: Double, currentShift: Double) -> Double {
+        return advertisedStart - currentShift
+    }
+
+    /// Record what the epoch beginning at `index` is worth, dropping every entry at or above it: a
+    /// producer that starts writing there rewrites those segments on their own boundaries, so an
+    /// older epoch's offset must stop being claimed for them.
+    static func epochShiftTable(
+        _ table: [Int: Double], recordingEpochAt index: Int, shift: Double
+    ) -> [Int: Double] {
+        var next = table.filter { $0.key < index }
+        if shift != 0 { next[index] = shift }
+        return next
+    }
+
+    /// AVPlayer discards a sub-second axis offset at a seek and snaps back to the playlist; a larger
+    /// one it keeps. Measured on the fixture: `-0.500` and `-0.875` read `axisErr=0.000` after a seek,
+    /// `-1.000`, `-1.083`, `-1.292`, `-1.500`, `-3.000`, `-4.000`, `-7.000`, `-9.000` and `-11.000`
+    /// all survive one unchanged. Anything below this is worth less than the frame it would move.
+    static let axisSnapsBelowSeconds = 1.0
+
+    static func axisShiftAfterSeek(_ shift: Double) -> Double {
+        return abs(shift) < axisSnapsBelowSeconds ? 0 : shift
+    }
+
+    /// AE#418 round 2: the host seeked and the axis was small enough for AVPlayer to throw away.
+    /// Publishing zero from the landing forward is what keeps the clock over the picture; the seam
+    /// leaves everything below the landing on the axis its bytes were placed with.
+    func snapAxisAfterSeek(landingItemSeconds: Double) {
+        guard !isLiveSession else { return }
+        let current = playlistShiftSeconds
+        let snapped = Self.axisShiftAfterSeek(current)
+        guard snapped != current else { return }
+        EngineLog.emit(
+            "[HLSVideoEngine] #418 axis \(String(format: "%.3f", current))s discarded at the seek "
+            + "landing \(String(format: "%.3f", landingItemSeconds))s (AVPlayer snaps a sub-second axis)",
+            category: .session
+        )
+        publishPlaylistShift(snapped, seamItemSeconds: landingItemSeconds)
+    }
+
+    /// AE#412: how long to give a re-cut its gate open before the seek goes out without it. A restart
+    /// is a demuxer seek plus a scan to the covering random-access point; past this the seek is worth
+    /// more than the correction, and the landing degrades to what it does today.
+    static let recutGateWaitSeconds: TimeInterval = 2.0
+
+    /// AE#412: how far below a cold seek target AVPlayer is assumed to reach for a random-access
+    /// point. It reaches back a fixed span and does NOT search for one: measured with
+    /// `play --picture-probe` on a 4 s grid, the first fetch of a cold seek was the segment holding
+    /// `target - 8 s` in one run shape and `target - 6 s` in another, on the case fixture and on a
+    /// control whose every segment is independent alike. 4 s is deliberately below both, so a landing
+    /// AVPlayer would have managed on its own is never re-cut; the cost of the margin is a re-cut
+    /// that was not strictly needed, not a landing that is wrong.
+    static let coldSeekLookbackSeconds: Double = 4.0
+
+    /// AE#412: the item position to seek AVPlayer to, having first made sure the segment it lands in
+    /// can start a decode run there.
+    ///
+    /// Audio routes packets by plan boundary while video routes them keyframe-gated, so inside a
+    /// keyframe drought audio opens boundaries the cutter folded and those segments carry no
+    /// random-access point at all. Because AVPlayer's reach back is fixed rather than a search, a
+    /// drought wider than that reach leaves the picture starting at the next sync sample ABOVE the
+    /// target, and the seek silently skips content. Measured on a 12 s drought, seeking back from
+    /// 88 s: a seek to 50.0 s landed at 55.0 s and one to 54.0 s at 54.96 s, while the same source cut
+    /// on its real sync samples landed exactly on every target tested.
+    ///
+    /// The repair is the producer's own gate: a restart anchored at that index opens on the covering
+    /// random-access point, so the segment begins at or below its advertised start and covers the
+    /// target. The seek target is NOT moved to compensate: measured 3 of 3, AVPlayer puts the re-cut
+    /// segment at its own tfdt inside the timeline it is already building (`axisErr` 0.000), so item
+    /// time is source time and a correction would land exactly that far past the target instead.
+    ///
+    /// Runs off the main actor (it parks on the pump). Returns `itemSeconds` unchanged whenever there
+    /// is nothing to act on: live, no recorded reach for the landing segment, a random-access point
+    /// already within reach below the target, or a re-cut whose gate did not open in time.
+    func preparedSeekLanding(itemSeconds: Double) -> Double {
+        guard !isLiveSession, let provider else { return itemSeconds }
+        let index = segmentIndexForPlaylistTime(itemSeconds)
+        guard let reach = provider.videoReach(at: index) else { return itemSeconds }
+        guard let advertised = advertisedStartSeconds(index) else { return itemSeconds }
+        let covering = coveringSyncItemSeconds(atOrBelow: itemSeconds, from: index, provider: provider)
+        guard Self.needsRecut(landingReach: reach,
+                              offsetIntoSegment: itemSeconds - advertised,
+                              coveringSyncDistance: covering.map { itemSeconds - $0 }) else {
+            return itemSeconds
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] #412 seek to item \(String(format: "%.3f", itemSeconds))s lands in seg\(index) "
+            + "(advertised \(String(format: "%.3f", advertised))s), which cannot start a decode run there "
+            + "and no random-access point is within reach below it; re-cutting from the covering one",
+            category: .session
+        )
+        gateOpenCondition.lock()
+        lastGateOpen = nil
+        gateOpenCondition.unlock()
+        anchorShiftLock.lock()
+        recutIndices.insert(index)
+        anchorShiftLock.unlock()
+        requestRestart(at: index, authoritative: true)
+        guard let shift = awaitGateOpen(forIndex: index, timeout: Self.recutGateWaitSeconds) else {
+            anchorShiftLock.lock()
+            recutIndices.remove(index)
+            anchorShiftLock.unlock()
+            EngineLog.emit(
+                "[HLSVideoEngine] #412 seg\(index) re-cut did not open a gate within "
+                + "\(String(format: "%.1f", Self.recutGateWaitSeconds))s; seeking on the uncorrected position",
+                category: .session
+            )
+            return itemSeconds
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] #412 seg\(index) re-cut opened \(String(format: "%.3f", shift))s below its "
+            + "boundary and now covers item \(String(format: "%.3f", itemSeconds))s",
+            category: .session
+        )
+        return itemSeconds
+    }
+
+    /// AE#412 pure decision: whether the segment a cold seek lands in has to be re-cut before the
+    /// seek goes out.
+    ///
+    /// Three ways it does not. The segment carries a random-access point at or below the target, so
+    /// it opens a run there itself. Or one sits close enough below the target that AVPlayer's fixed
+    /// reach back picks it up out of an earlier segment, which is the case that lands exactly today.
+    /// Anything else leaves the picture starting above the target, which is the defect.
+    ///
+    /// `coveringSyncDistance` is how far BELOW the target the nearest known random-access point sits;
+    /// nil when none is known down there.
+    static func needsRecut(
+        landingReach: SegmentCache.VideoReach,
+        offsetIntoSegment: Double,
+        coveringSyncDistance: Double?
+    ) -> Bool {
+        if landingReach.serves(offsetSeconds: offsetIntoSegment) { return false }
+        guard let coveringSyncDistance else { return true }
+        return coveringSyncDistance > coldSeekLookbackSeconds
+    }
+
+    /// `segmentPlan[index].startSeconds` on the AVPlayer/playlist axis, taking `restartLock` itself.
+    private func advertisedStartSeconds(_ index: Int) -> Double? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        guard index >= 0, index < segmentPlan.count else { return nil }
+        return segmentPlan[index].startSeconds
+    }
+
+    /// AE#412: the highest recorded random-access point at or below `itemSeconds`, walking down from
+    /// `index` until one segment starts below AVPlayer's reach. nil when nothing down there carries
+    /// one, and also when a walked segment made no claim: an unrecorded segment might well carry a
+    /// sync sample, and re-cutting on a guess would cost a restart on a landing that works today.
+    private func coveringSyncItemSeconds(
+        atOrBelow itemSeconds: Double, from index: Int, provider: VideoSegmentProvider
+    ) -> Double? {
+        var best: Double?
+        var j = index
+        while j >= 0 {
+            guard let advertised = advertisedStartSeconds(j) else { return best }
+            guard let reach = provider.videoReach(at: j) else { return itemSeconds }
+            if case .syncAt(let offset) = reach {
+                let sync = advertised + offset
+                if sync <= itemSeconds { best = max(best ?? sync, sync) }
+            }
+            if advertised <= itemSeconds - Self.coldSeekLookbackSeconds { return best }
+            j -= 1
+        }
+        return best
+    }
+
+    /// Blocks until the epoch anchored at `index` has opened its video gate, and answers what it
+    /// opened worth. nil on timeout. Polls against the condition rather than nesting locks: the pump
+    /// records under `anchorShiftLock` and signals under `gateOpenCondition`, and taking them in the
+    /// other order here would be the classic inversion.
+    private func awaitGateOpen(forIndex index: Int, timeout: TimeInterval) -> Double? {
+        let deadline = Date().addingTimeInterval(timeout)
+        while true {
+            gateOpenCondition.lock()
+            if let open = lastGateOpen, open.index == index {
+                gateOpenCondition.unlock()
+                return open.shift
+            }
+            let signalled = gateOpenCondition.wait(until: deadline)
+            gateOpenCondition.unlock()
+            if !signalled, Date() >= deadline { return nil }
+        }
+    }
+
+    private func publishPlaylistShift(_ seconds: Double, seamItemSeconds: Double) {
         setPlaylistShiftSeconds(seconds)
         // Refresh every native subtitle store's shift so cuesInWindow stays on the correct AVPlayer
         // axis after a restart (matroska seek can land past the planned keyframe, #55). Snapshot under
@@ -2252,6 +2574,19 @@ public final class HLSVideoEngine: @unchecked Sendable {
         restartLock.lock()
         defer { restartLock.unlock() }
         return provider?.mediaFetchCount ?? 0
+    }
+
+    /// #405: segments the producer has finalized this session, the counterpart to
+    /// `mediaFetchCountSnapshot`. One counts the consumer asking, this one counts the producer
+    /// delivering, and the stall ladder needs both to tell a dead consumer from a starved origin.
+    /// nil when there is no local producer at all (a remote HLS session AVPlayer fetches directly),
+    /// which is a different situation from a producer that stopped: callers must not read the
+    /// absence as zero progress. Monotonic: the live window slides by moving `firstVisible` and
+    /// evicting cache, never by dropping entries from the segment list.
+    var liveSegmentCountSnapshot: Int? {
+        restartLock.lock()
+        defer { restartLock.unlock() }
+        return provider.map { $0.liveContinuationPoint().nextIndex }
     }
 
     /// #178: called by the engine when a NEW user seek is dispatched. A recovery re-anchor still
@@ -2504,6 +2839,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
 
         let elapsedMs = msSince(restartStart)
         let absoluteTargetSeconds = Double(targetStartPts) * Double(videoTb.num) / Double(videoTb.den)
+        // #416: the outgoing pump's run ends where it got to and the new one begins here. Whatever
+        // lies between the two was skipped, and a subtitle set stranded on the near side of that
+        // gap can no longer be read as the line still on screen at the landing.
+        subtitlePacketStore.noteHarvestAnchor(.pump, at: absoluteTargetSeconds)
         // build = everything after the seek (re-validation, muxer/producer construction, start).
         let buildMs = max(0, elapsedMs - stopWaitMs - (reopenMs ?? 0) - seekMs)
         EngineLog.emit(

@@ -1,0 +1,77 @@
+# AE#377. The package alone cannot run on an Apple TV: a SwiftPM test target is tool-hosted, and
+# tool-hosted testing does not exist on device destinations ("Select a host application for the
+# test target"). So the same sources get a second home here, as a unit-test bundle hosted by a
+# minimal app. Nothing is duplicated: both targets read Tests/TransportProbe/ next door.
+#
+# Regenerate with `xcodegen generate --spec project.yml` from this directory. The generated
+# project is committed so that running the probe needs Xcode and nothing else.
+name: TransportProbe
+options:
+  bundleIdPrefix: de.superuser404.transportprobe
+  createIntermediateGroups: true
+  deploymentTarget:
+    tvOS: "17.0"
+
+settings:
+  base:
+    SWIFT_VERSION: "6.0"
+    TARGETED_DEVICE_FAMILY: "3"
+    CODE_SIGN_STYLE: Automatic
+    # One knob for both ids. If a team cannot register these, override it on the command line
+    # (PROBE_BUNDLE_PREFIX=com.example.probe) rather than editing two targets, and note that
+    # overriding PRODUCT_BUNDLE_IDENTIFIER directly would hand the app and the test bundle the
+    # same identifier.
+    PROBE_BUNDLE_PREFIX: de.superuser404.transportprobe
+    ENABLE_USER_SCRIPT_SANDBOXING: YES
+    SWIFT_UPCOMING_FEATURE_CONCISE_MAGIC_FILE: YES
+
+targets:
+  TransportProbeHost:
+    type: application
+    platform: tvOS
+    sources:
+      - path: Host
+      # Compiled into the app as well as the test bundle, so the television can show which target a
+      # device build actually carries. Keep both files free of any test-framework import.
+      - path: ../Tests/TransportProbe/ProbeTarget.swift
+      - path: ../Tests/TransportProbe/ProbeSupport.swift
+    info:
+      path: Host/Info.plist
+      properties:
+        CFBundleDisplayName: Transport probe
+        # The probe is pointed at whatever origin produced the failure, and that includes plain
+        # http, both for a real source and for window-origin.py on the same network. Without this
+        # an http target fails as an ATS error, which reads like a finding and is not one.
+        NSAppTransportSecurity:
+          NSAllowsArbitraryLoads: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PROBE_BUNDLE_PREFIX).host
+        GENERATE_INFOPLIST_FILE: NO
+
+  TransportProbe:
+    type: bundle.unit-test
+    platform: tvOS
+    sources:
+      - path: ../Tests/TransportProbe
+    dependencies:
+      - target: TransportProbeHost
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PROBE_BUNDLE_PREFIX).tests
+        GENERATE_INFOPLIST_FILE: YES
+        TEST_HOST: $(BUILT_PRODUCTS_DIR)/TransportProbeHost.app/TransportProbeHost
+        BUNDLE_LOADER: $(TEST_HOST)
+
+schemes:
+  TransportProbe:
+    build:
+      targets:
+        TransportProbeHost: all
+        TransportProbe: [test]
+    run:
+      config: Debug
+    test:
+      config: Debug
+      targets:
+        - TransportProbe

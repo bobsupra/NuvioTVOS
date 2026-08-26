@@ -64,6 +64,19 @@ jobs:
             -derivedDataPath .build/xcode-tvos \
             CODE_SIGNING_ALLOWED=NO
 
+      # The transport probe also builds as an app-hosted test bundle, because a SwiftPM test target
+      # is tool-hosted and tool-hosted testing does not exist on device destinations. That project
+      # runs nowhere in CI either, and the person who discovers it stopped building is the one who
+      # needed it that evening.
+      - name: Build the transport probe's device harness (AE#377)
+        run: |
+          xcodebuild build-for-testing \
+            -project Probes/TransportProbe/Device/TransportProbe.xcodeproj \
+            -scheme TransportProbe \
+            -destination 'generic/platform=tvOS Simulator' \
+            -derivedDataPath .build/xcode-probe \
+            CODE_SIGNING_ALLOWED=NO
+
   build-ios:
     name: xcodebuild (iOS Simulator)
     runs-on: macos-15

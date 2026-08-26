@@ -99,6 +99,12 @@ enum SubtitleDeliveryStatement {
         /// store on a different horizon. A window carrying a wrong end with `gapAt` absent said
         /// nothing at all until this count existed (the reporter's observation, exactly).
         var endsWithheld = 0
+        /// #416: bitmap events this tick refused to let claim the landing, because the source
+        /// between the set and the playhead was never read and an empty store there is not
+        /// evidence of anything. Its own field for the same reason `endsWithheld` has one: a
+        /// refusal that only shows up as a missing cue is indistinguishable from a delivery that
+        /// never arrived, and those two have opposite next steps.
+        var landingWithheld = 0
 
         /// Cues an event carried that the gate did not pass. The subtraction is safe: `admitted`
         /// can exceed the tick's own `cues` when a finalized candidate seeded by an earlier tick is
@@ -131,6 +137,9 @@ enum SubtitleDeliveryStatement {
         var admitted = 0
         /// Cues the insert took. `admitted - published` is the re-decode the store deduped.
         var published = 0
+        /// #416: events whose behind-playhead cues were refused the landing for want of read
+        /// ground. Counted here so the tick can total it into the delivery line.
+        var landingWithheld = 0
     }
 
     struct Statement: Equatable, Sendable {
@@ -177,6 +186,9 @@ enum SubtitleDeliveryStatement {
         }
         if tally.endsWithheld > 0 {
             trailing.append("endsWithheld=\(tally.endsWithheld)")
+        }
+        if tally.landingWithheld > 0 {
+            trailing.append("landingWithheld=\(tally.landingWithheld)")
         }
         return (fields + trailing).joined(separator: " ")
     }

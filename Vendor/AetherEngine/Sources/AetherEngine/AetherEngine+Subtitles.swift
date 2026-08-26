@@ -270,6 +270,12 @@ extension AetherEngine {
         guard !subtitleDrainTargets.isEmpty, let store = activeSubtitlePacketStore else { return }
         store.setProtectedStreams(Set(subtitleDrainTargets.values))   // #166: re-assert protection
         let playhead = sourceTime
+        // #416: the pump is rendering the frame at the playhead, so it has necessarily read from
+        // wherever it opened up to here. That is what the pump can state without a hook in its read
+        // loop, and it is exactly the stretch a landing claim rests on: the ground between a set
+        // decoded behind the playhead and the playhead itself. Its lookahead beyond the playhead
+        // comes from the packets it harvests, which the store notes as it takes them.
+        store.noteHarvestReach(.pump, through: playhead)
         // #271: wall time since the previous tick, so a tick that itself ran long cannot be read as
         // a seek by the next one. See SubtitleOverlayDrainer.drainPlan.
         let tickUptime = Double(DispatchTime.now().uptimeNanoseconds) / 1_000_000_000
@@ -425,6 +431,7 @@ extension AetherEngine {
                         let applied = applySubtitleEvent(event, to: &cues, channel: channel)
                         tally.admitted += applied.admitted
                         tally.published += applied.published
+                        tally.landingWithheld += applied.landingWithheld   // #416
                         if applied.changed { didMutate = true }
                     }
                 }
@@ -788,6 +795,10 @@ extension AetherEngine {
             demuxer: demuxer, to: startAt, anchorStreamIndex: seekAnchor,
             fallbackDuration: engineDisplayDuration,
             timeout: Self.sideReaderSeekBudgetSeconds)
+        // #416: this session reads forwards from here, and nothing below it is this reader's to
+        // claim. Stated even when the positioning fell back or failed: what the loop then reads is
+        // still forwards from wherever it sits, and the anchor is the earliest it can be.
+        store.noteHarvestAnchor(.prefetch, at: startAt)
         if landed != .seek {
             EngineLog.emit(
                 "[AetherEngine] #151 forward prefetch seek to \(String(format: "%.2f", startAt))s timed out "
@@ -963,9 +974,21 @@ extension AetherEngine {
         // #112/#143: during a reconstruction pass any decoded composition at/behind the playhead becomes the
         // held active-line candidate, emitted once when the decode reaches the playhead (see
         // PGSStaleArrivalGate.admitDuringReconstruction).
+        // #416: a bitmap set decoded behind the playhead claims to be the line still on screen
+        // there, and that claim rests on the store being empty between the two. Ask the harvest
+        // whether it ever read that stretch before reading its silence as an answer.
+        // Asked for bitmap events only: a text cue carries its own duration, so it claims nothing
+        // about the ground behind it, and a dense text track would pay the lookup per packet.
+        let groundIsRead = event.isPGS
+            ? subtitleLandingGroundIsRead(cues: event.cues, playhead: sourceTime)
+            : true
+        // A false answer here means an actual refusal: the helper returns true when the event
+        // carries no cue behind the playhead, so there is nothing that could have been refused.
+        if !groundIsRead { applied.landingWithheld += 1 }
         let admitted = pgsStaleArrivalGates[channel, default: PGSStaleArrivalGate()]
             .admit(cues: event.cues, isPGS: event.isPGS,
-                   isSelfContained: event.isSelfContainedPGS, playhead: sourceTime)
+                   isSelfContained: event.isSelfContainedPGS, playhead: sourceTime,
+                   groundIsRead: groundIsRead)
         applied.admitted += admitted.count
         for cue in admitted {
             if insertSorted(cue, into: &cues) {
@@ -981,6 +1004,22 @@ extension AetherEngine {
     @discardableResult
     private func insertSorted(_ cue: SubtitleCue, into cues: inout [SubtitleCue]) -> Bool {
         Self.insertCueSorted(cue, into: &cues, nextID: &nextRetainedSubtitleCueID)
+    }
+
+    /// #416: was the source between the newest of these cues that lies behind `playhead` and the
+    /// playhead itself actually read by some harvest run?
+    ///
+    /// Only that one cue matters: it is the one the gate would make the landing's active line, and
+    /// the only stretch its claim depends on is the one between it and the playhead. Cues at or
+    /// after the playhead need no ground, and an event carrying none behind it asks nothing here.
+    ///
+    /// Coverage is a property of the SOURCE, not of a stream: a reader demuxes every stream it
+    /// passes over, so a span one of them read is read for all of them.
+    private func subtitleLandingGroundIsRead(cues: [SubtitleCue], playhead: Double) -> Bool {
+        guard let store = activeSubtitlePacketStore else { return true }
+        guard let newestBehind = cues.lazy.map(\.startTime).filter({ $0 <= playhead }).max()
+        else { return true }
+        return store.hasReadSpan(from: newestBehind, through: playhead)
     }
 
     /// #107: close every non-image cue (text or rich text) whose window covers `trimAt` (teletext

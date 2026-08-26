@@ -252,11 +252,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
         "Talk-Show", "Game-Show"
     ]
 
-    private func cachedMetadata(for id: String) -> NuvioMeta? {
+    func cachedMetadata(for id: String) -> NuvioMeta? {
         Self.metadataCacheQueue.sync { Self.cachedMetaById[id] }
     }
 
-    private func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
+    func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
         Self.metadataCacheQueue.sync {
             if let requestedID {
                 Self.cachedMetaById[requestedID] = meta
@@ -265,9 +265,24 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    static func isFullMetadata(_ meta: NuvioMeta) -> Bool {
+        if meta.isSeries {
+            return meta.videos != nil
+        } else {
+            return (meta.tmdbId != nil && meta.tmdbId! > 0) || (meta.director != nil && !meta.director!.isEmpty) || (meta.trailerYtIds != nil && !meta.trailerYtIds!.isEmpty)
+        }
+    }
+
     private func cacheMetadata(_ items: [NuvioMeta]) {
         Self.metadataCacheQueue.sync {
             for item in items {
+                if let existing = Self.cachedMetaById[item.id] {
+                    let existingIsFull = Self.isFullMetadata(existing)
+                    let newIsFull = Self.isFullMetadata(item)
+                    if existingIsFull && !newIsFull {
+                        continue
+                    }
+                }
                 Self.cachedMetaById[item.id] = item
             }
         }
@@ -452,9 +467,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
-        let t0 = CFAbsoluteTimeGetCurrent()
         Self.homeAddonFetchDiagnostic = "loading"
-        print("Home addons: \(Self.configuredStreamAddonManifestURLs.count) configured manifest url(s)")
 
         for manifestURL in Self.configuredStreamAddonManifestURLs {
             guard !Task.isCancelled else { break }
@@ -548,9 +561,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             )
         }
 
-        let tEnd = CFAbsoluteTimeGetCurrent()
         Self.homeAddonFetchDiagnostic = reports.isEmpty ? "no add-on catalogs" : reports.joined(separator: "; ")
-        print("Home addons: \(Self.homeAddonFetchDiagnostic) (total \(String(format: "%.1f", (tEnd - t0)*1000))ms)")
         return (orderedAddonCatalogs(catalogs), hadFailures)
     }
 
@@ -584,7 +595,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
             return jellyfinMeta
         }
         if let cached = cachedMetadata(for: id) {
-            return await TmdbDetailsService.localizedMetadata(for: cached)
+            let isFull = Self.isFullMetadata(cached)
+            if isFull {
+                return await TmdbDetailsService.localizedMetadata(for: cached)
+            }
         }
 
         return try await loadMetadata(id: id, type: type)
@@ -599,7 +613,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func loadMetadata(id: String, type: String) async throws -> NuvioMeta {
-
         // Query the correct endpoint based on the caller-provided type. The
         // Details screen uses a fresh repository (empty cache) so this always
         // fetches the full /meta payload — real episodes and per-episode ratings.
@@ -737,12 +750,12 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private static func isSeriesType(_ type: String) -> Bool {
-        ["series", "show", "tvshow"].contains(type.lowercased())
+        ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
     }
 
     static func isLiveContentType(_ type: String) -> Bool {
         switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "channel", "live", "livetv", "live-tv", "tv", "iptv", "radio":
+        case "channel", "live", "livetv", "live-tv", "iptv", "radio":
             return true
         default:
             return false

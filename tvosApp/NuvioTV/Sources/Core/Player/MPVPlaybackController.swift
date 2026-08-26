@@ -1767,7 +1767,6 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                         let level = String(cString: msg.pointee.level!)
                         let text = String(cString: msg.pointee.text!)
                         self.appendPlaybackLog(prefix: prefix, level: level, text: text)
-                        print("[MPV][\(prefix)] \(level): \(text)", terminator: "")
                     }
                 default:
                     break

@@ -208,8 +208,6 @@ final class StreamsRepository: ObservableObject {
             return CinemetaCatalogRepository.normalizedManifestURL(from: pref.url)
         }
 
-        print("[StreamsRepo] configured=\(preferences.count) enabled=\(enabledURLs.count) type=\(type) id=\(videoId)")
-
         guard !enabledURLs.isEmpty else {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
@@ -219,7 +217,6 @@ final class StreamsRepository: ObservableObject {
                 emptyStateReason: ownedGroups.isEmpty ? .noAddonsConfigured : nil,
                 hasResolvedTargets: true
             )
-            print("[StreamsRepo] no enabled add-ons")
             return
         }
 
@@ -243,8 +240,6 @@ final class StreamsRepository: ObservableObject {
             )
         }
 
-        print("[StreamsRepo] compatible=\(targets.count) of enabled=\(enabledURLs.count)")
-
         guard !targets.isEmpty else {
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
@@ -254,7 +249,6 @@ final class StreamsRepository: ObservableObject {
                 emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
                 hasResolvedTargets: true
             )
-            print("[StreamsRepo] no compatible stream add-ons")
             return
         }
 
@@ -386,7 +380,6 @@ final class StreamsRepository: ObservableObject {
                 addonName: target.displayName,
                 logo: target.logo
             )
-            print("[StreamsRepo] completed addon=\(target.displayName) id=\(target.addonId) streams=\(streams.count)")
             return GroupUpdate(
                 addonId: target.addonId,
                 group: AddonStreamGroup(

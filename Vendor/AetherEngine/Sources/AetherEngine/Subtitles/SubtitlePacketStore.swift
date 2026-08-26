@@ -99,6 +99,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
     private var totalBytes: Int = 0
     /// #362: monotonic harvest order, stamped on every appended entry. See `StoredSubtitlePacket`.
     private var appendCounter: UInt64 = 0
+    /// #416: which spans of the source the readers have actually read. Lives here because this is
+    /// the object whose EMPTINESS gets interpreted: every "no packet between here and there" answer
+    /// this store gives is only as good as the reading behind it. See `SubtitleHarvestCoverage`.
+    private var coverage = SubtitleHarvestCoverage()
     private var protectedStreams: Set<Int32> = []
     private var lastTouchByStream: [Int32: UInt64] = [:]
     private var touchCounter: UInt64 = 0
@@ -122,6 +126,46 @@ final class SubtitlePacketStore: @unchecked Sendable {
     func setProtectedStreams(_ indices: Set<Int32>) {
         lock.lock(); defer { lock.unlock() }
         protectedStreams = indices
+    }
+
+    // MARK: - #416: harvest coverage
+
+    /// #416: a reader has positioned at `seconds` and reads forwards from there. Announced by every
+    /// reposition of every reader that writes here, because an unannounced one would let the run
+    /// below be extended across ground nobody read.
+    func noteHarvestAnchor(_ writer: Writer, at seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteAnchor(writer, at: seconds)
+    }
+
+    /// #416: that reader's current run has read one step further, through `seconds`.
+    func noteHarvestProgress(_ writer: Writer, through seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteProgress(writer, through: seconds)
+    }
+
+    /// #416: that reader's current run has REACHED `seconds` from its anchor, however far that is
+    /// in one note. For a claim resting on an invariant rather than on observed steps; see
+    /// `SubtitleHarvestCoverage.noteReach`.
+    func noteHarvestReach(_ writer: Writer, through seconds: Double) {
+        lock.lock(); defer { lock.unlock() }
+        coverage.noteReach(writer, through: seconds)
+    }
+
+    /// #416: was the whole span between `from` and `through` read by some run this session?
+    ///
+    /// True when nothing has ever been noted. A path whose readers do not report coverage must keep
+    /// behaving exactly as it did before this existed: the caller's alternative to a proof is a
+    /// refusal, and refusing on ignorance would dark landings that are perfectly sound.
+    func hasReadSpan(from: Double, through: Double) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.isEmpty || coverage.covers(from: from, through: through)
+    }
+
+    /// Introspection for tests and diagnostics.
+    var harvestCoverageSpans: [SubtitleHarvestCoverage.Span] {
+        lock.lock(); defer { lock.unlock() }
+        return coverage.sortedSpans()
     }
 
     func append(streamIndex: Int32, ptsSeconds: Double, durationSeconds: Double,
@@ -262,6 +306,10 @@ final class SubtitlePacketStore: @unchecked Sendable {
                       flags: Int32, payload: Data, assembleSplitDisplaySets: Bool,
                       writer: Writer = .pump, webvttSettings: String? = nil) {
         lock.lock(); defer { lock.unlock() }
+        // #416: a harvested packet is a position its writer demonstrably read, so the run reaches
+        // it. This is what gives the pump the forward lookahead its playhead-based note cannot
+        // state, which is the region a backward seek into already-produced content lands in.
+        if let ptsSeconds { coverage.noteReach(writer, through: ptsSeconds) }
         guard assembleSplitDisplaySets else {
             guard let ptsSeconds else { return }
             appendLocked(streamIndex: streamIndex, ptsSeconds: ptsSeconds,
@@ -417,5 +465,6 @@ final class SubtitlePacketStore: @unchecked Sendable {
         totalBytes = 0
         touchCounter = 0
         appendCounter = 0
+        coverage = SubtitleHarvestCoverage()
     }
 }

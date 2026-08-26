@@ -6987,8 +6987,8 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 6.34.0",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.34.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 6.47.0",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.47.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(

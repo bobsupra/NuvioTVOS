@@ -102,4 +102,36 @@ struct RemoteHLSFormatDetectionTests {
         #expect(!RemoteHLSFormatDetection.shouldApplyDisplayCriteria(
             format: .hdr10, suppressDisplayCriteria: true))
     }
+
+    // MARK: - codecName
+
+    /// The bypass has no libav context, so the only codec evidence is the sample type. Mapping it back to
+    /// the libavcodec spelling is what lets one host field mean the same thing on both paths; handing a
+    /// panel 'hvc1' here and "hevc" from the probe would make the same source read as two codecs.
+    @Test("Sample types map to the libavcodec spelling", arguments: [
+        (FourCharCode(0x68766331), "hevc"),  // 'hvc1'
+        (FourCharCode(0x68657631), "hevc"),  // 'hev1'
+        (FourCharCode(0x64766831), "hevc"),  // 'dvh1', DV carries an HEVC base layer
+        (FourCharCode(0x64766865), "hevc"),  // 'dvhe'
+        (FourCharCode(0x61766331), "h264"),  // 'avc1'
+        (FourCharCode(0x61766333), "h264"),  // 'avc3'
+        (FourCharCode(0x64766176), "h264"), // 'dvav', DV over an AVC base layer
+        (FourCharCode(0x61763031), "av1"),   // 'av01'
+        (FourCharCode(0x76703039), "vp9"),   // 'vp09'
+    ])
+    func subTypeMapsToCodecName(_ subType: FourCharCode, _ expected: String) {
+        #expect(RemoteHLSFormatDetection.codecName(videoSubType: subType) == expected)
+    }
+
+    @Test("An unmapped sample type reports its FourCC rather than nothing")
+    func unknownSubTypeFallsBackToFourCC() {
+        // 'zzzz'. A codec we cannot name is still a codec the viewer is watching, and a raw tag in the
+        // panel is a lead; nil reads as "no video track", which would be a lie.
+        #expect(RemoteHLSFormatDetection.codecName(videoSubType: 0x7A7A7A7A) == "zzzz")
+    }
+
+    @Test("No sample type reports nothing")
+    func nilSubTypeIsNil() {
+        #expect(RemoteHLSFormatDetection.codecName(videoSubType: nil) == nil)
+    }
 }

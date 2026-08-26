@@ -101,7 +101,7 @@ func printUsage() {
       aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--gen-highbitrate-seed]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
-      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]
+      aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
                            [--master] [--discontinuity-at N] [--slow-refresh]
                            [--drop-segment N] [--encrypted] [--fmp4] [--self-test]
       aetherctl hlslive --segments a.ts,b.ts,c.ts [--seconds N] [--segment-seconds N] [--disc i,j]
@@ -518,6 +518,7 @@ if first == "play" {
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
     let frameTimes = takeFlag("--frame-times", from: &rest)
+    let pictureProbe = takeFlag("--picture-probe", from: &rest)
     // #316: declare sidecar subtitles at load, the LoadOptions.externalSubtitles a host passes.
     // Comma-separated `lang=path-or-url` entries, e.g. --sidecar en=/tmp/en.srt,de=/tmp/de.srt.
     // On the nativeRemoteHLS bypass this is what makes the engine stand up its rewritten master.
@@ -585,7 +586,7 @@ if first == "play" {
         exit(64)
     }
     exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
-                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, sidecars: sidecars,
+                 censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,

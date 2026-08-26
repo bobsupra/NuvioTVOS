@@ -75,6 +75,10 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// Deinterlaced frames dropped for carrying no PTS (see the drop site in decode()). Guarded by `lock`.
     private var droppedUntimestampedFields = 0
 
+    /// #407: frames whose PTS was reconstructed from `best_effort_timestamp` (see the repair site
+    /// in drainDecodedFrames()). Guarded by `lock`.
+    private var repairedTimestamps = 0
+
     /// GPU-side copy from the hw-deinterlace filter's pool buffers into `pixelBufferPool` (see
     /// the VT branch in emit()). Created lazily on the first hw frame; guarded by `lock`.
     private var transferSession: VTPixelTransferSession?
@@ -156,6 +160,18 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         EngineLog.emit("[SWDecoder] Opened: \(codecpar.pointee.width)x\(codecpar.pointee.height), codec=\(String(cString: codec.pointee.name)), threads=\(ctx.pointee.thread_count), \(use10Bit ? "10-bit" : "8-bit")", category: .swPlayback)
     }
 
+    /// #407: the timestamp to put on a decoded frame that carries none, or nil when the frame is
+    /// already timed (the common case, and the one that must stay untouched: a decoder-set PTS is
+    /// always at least as good as the reconstruction, and `best_effort_timestamp` can trail it).
+    ///
+    /// `AV_NOPTS_VALUE` is `Int64.min`. `best_effort_timestamp` is libavcodec's own
+    /// `guess_correct_pts(pts, pkt_dts)`, so a frame with neither cannot be timed by any means the
+    /// decoder has and stays unschedulable; the layer below drops it rather than wedging the queue.
+    static func repairedPTS(pts: Int64, bestEffort: Int64) -> Int64? {
+        guard pts == Int64.min, bestEffort != Int64.min else { return nil }
+        return bestEffort
+    }
+
     /// What to do with a packet after `avcodec_send_packet` returned `ret` (#220).
     enum PacketSendDisposition: Equatable {
         /// The decoder took the packet.
@@ -218,6 +234,29 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
             guard codecContext != nil else { lock.unlock(); break }
             let ret = avcodec_receive_frame(ctx, f)
             guard ret >= 0 else { lock.unlock(); break }
+
+            // #407: repair the frame's own timestamp BEFORE anything reads it. A frame that reaches
+            // the renderer with no PTS is unschedulable and gets dropped there, so every consumer
+            // below (captions, the deinterlace graph, emit) has to see the repaired value, not just
+            // the one that happens to be looked at last. `best_effort_timestamp` is libavcodec's
+            // guess_correct_pts(pts, pkt_dts), the same reconstruction every other FFmpeg-based
+            // player consumes, and it is the only timestamp left when the container carried decode
+            // timestamps alone: Matroska V_MS/VFW/FOURCC tracks (VC-1, the legacy MS codecs) put the
+            // block time in DTS, and live MPEG-TS delivers untimed pictures outright. The demuxer's
+            // `+genpts` normally fills those in a packet earlier; this is the layer that has to hold
+            // when it cannot (an open that never got the flag, a frame the reconstruction skipped).
+            if let repaired = Self.repairedPTS(
+                pts: f.pointee.pts, bestEffort: f.pointee.best_effort_timestamp
+            ) {
+                f.pointee.pts = repaired
+                repairedTimestamps += 1
+                if repairedTimestamps == 1 || repairedTimestamps % 250 == 0 {
+                    EngineLog.emit(
+                        "[SWDecoder] repaired \(repairedTimestamps) frame timestamp(s) from best_effort_timestamp",
+                        category: .swPlayback
+                    )
+                }
+            }
 
             // #131: A53 captions surface as decoded-frame side data on the FFmpeg path (MPEG-2
             // picture user data and friends). Presentation order by construction of decoder output.

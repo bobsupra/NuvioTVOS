@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 6.34.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 6.47.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
 
 import PackageDescription
 

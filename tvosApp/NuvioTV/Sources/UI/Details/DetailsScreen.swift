@@ -752,10 +752,8 @@ actor YouTubeTrailerResolver {
                         client: client,
                         includeReferer: false
                     )
-                    print("[TrailerResolver] HLS candidate found for \(client.key): \(candidate.height)p")
                     hlsCandidates.append(candidate)
                 } catch {
-                    print("[TrailerResolver] HLS fetch failed for \(client.key): \(error)")
                 }
             }
             guard canContinueAttempt else { return nil }
@@ -836,7 +834,6 @@ actor YouTubeTrailerResolver {
         let adaptDesc = sortedAdaptiveVideo.prefix(6).map { "\($0.clientKey):\($0.height)p" }.joined(separator: ", ")
         if !adaptDesc.isEmpty { summaryParts.append("Adaptive[\(adaptDesc)]") }
         let availableSummary = summaryParts.joined(separator: " | ")
-        print("[TrailerResolver] Probed videoId=\(videoId): Available: \(availableSummary)")
 
         let unthrottledAdaptiveVideo = sortedAdaptiveVideo.filter { $0.clientKey == "android_vr" }
         let unthrottledAdaptiveAudio = sortedAdaptiveAudio.filter { $0.clientKey == "android_vr" }
@@ -846,7 +843,6 @@ actor YouTubeTrailerResolver {
         if let bestHls = sortedHLS.first, bestHls.height >= 720 {
             let label = "\(bestHls.height)p (HLS)"
             let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected HD HLS: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: bestHls.manifestUrl,
                 audioUrl: nil,
@@ -866,7 +862,6 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(bestProg.height)p (MP4)"
             let diag = "TRAILER: \(label) [\(bestProg.clientKey)] | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected HD Progressive: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: bestProg.url,
                 audioUrl: nil,
@@ -888,7 +883,6 @@ actor YouTubeTrailerResolver {
            ) {
             let label = "\(pair.video.height)p (Adaptive)"
             let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected 1080p+ Adaptive: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: pair.video.url,
                 audioUrl: pair.audio.url,
@@ -910,7 +904,6 @@ actor YouTubeTrailerResolver {
            ) {
             let label = "\(pair.video.height)p (Adaptive)"
             let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected 720p Adaptive: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: pair.video.url,
                 audioUrl: pair.audio.url,
@@ -927,7 +920,6 @@ actor YouTubeTrailerResolver {
         if let bestHls = sortedHLS.first {
             let label = "\(bestHls.height > 0 ? "\(bestHls.height)p" : "Adaptive") (HLS)"
             let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected Fallback HLS: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: bestHls.manifestUrl,
                 audioUrl: nil,
@@ -947,7 +939,6 @@ actor YouTubeTrailerResolver {
         ) {
             let label = "\(progressiveMatch.height)p (MP4)"
             let diag = "TRAILER: \(label) [\(progressiveMatch.clientKey)] fallback | Available: \(availableSummary)"
-            print("[TrailerResolver] Selected Progressive fallback: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: progressiveMatch.url,
                 audioUrl: nil,
@@ -960,7 +951,6 @@ actor YouTubeTrailerResolver {
             )
         }
 
-        print("[TrailerResolver] No reachable stream candidate found for videoId=\(videoId)")
         return nil
     }
 
@@ -1150,7 +1140,6 @@ actor YouTubeTrailerResolver {
             }
             let label = decoded.quality ?? decoded.resolution ?? "1080p (Proxy)"
             let diag = "TRAILER: \(label) [backend proxy]"
-            print("[TrailerResolver] Selected Backend proxy: \(diag)")
             return TrailerPlaybackSource(
                 videoUrl: resolved,
                 audioUrl: nil,
@@ -1158,7 +1147,6 @@ actor YouTubeTrailerResolver {
                 diagnostics: diag
             )
         } catch {
-            print("[TrailerResolver] Backend proxy resolution failed: \(error.localizedDescription)")
             return nil
         }
     }
@@ -1876,12 +1864,12 @@ struct TvDetailsContent: View {
     /// remembered entry anchor, matching Settings' pre-spatial focus lock.
     @State private var focusedDetailsSection: TvDetailsFocusSection = .actions
     @State private var detailsFocusMoveGeneration = 0
+    @State private var pendingPlayFocusGeneration: Int?
     /// Episode control to re-focus once the stream picker closes, captured when
     /// this content gets disabled. Same approach Home uses for the card you
     /// left when entering Details — see `restoreEpisodeFocus`.
     @State private var restoreEpisodeKey: String?
     @State private var restoreGeneration = 0
-    @State private var detailsScrollOffset: CGFloat = 0
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
     /// Bumped whenever a watched mark or a progress write lands. Resume progress
@@ -1889,10 +1877,6 @@ struct TvDetailsContent: View {
     /// without this the episode strip keeps drawing the bar it rendered with —
     /// marking an episode watched cleared the stores but nothing re-read them.
     @State private var progressRevision = 0
-
-    private var detailsScrollShadowProgress: CGFloat {
-        min(max(detailsScrollOffset / 120, 0), 1)
-    }
 
     var body: some View {
         if let meta = uiState.meta {
@@ -1904,27 +1888,21 @@ struct TvDetailsContent: View {
                 ZStack(alignment: .topLeading) {
                     TvDetailsBackdrop(meta: meta)
 
-                    // Android's scrolled details state dims the cinematic
-                    // artwork behind the content while keeping the artwork
-                    // visible. This ramps in with the scroll transition.
-                    Color.black
-                        .opacity(0.78 * detailsScrollShadowProgress)
-                        .ignoresSafeArea()
-                        .allowsHitTesting(false)
+                    TvDetailsScrolledBackdropDimmer()
 
                     ScrollViewReader { scrollProxy in
                         ScrollView(.vertical, showsIndicators: false) {
-                            VStack(alignment: .leading, spacing: 34) {
-                                GeometryReader { geometry in
-                                    Color.clear
-                                        .preference(
-                                            key: TvDetailsScrollOffsetKey.self,
-                                            value: geometry.frame(in: .named("tv-details-scroll")).minY
-                                        )
-                                }
-                                .frame(height: 0)
-                                .id(TvDetailsScrollID.topSection)
+                            GeometryReader { geometry in
+                                Color.clear
+                                    .preference(
+                                        key: TvDetailsScrollOffsetKey.self,
+                                        value: geometry.frame(in: .named("tv-details-scroll")).minY
+                                    )
+                            }
+                            .frame(height: 0)
+                            .id(TvDetailsScrollID.topSection)
 
+                            VStack(alignment: .leading, spacing: 34) {
                                 TvDetailsLogo(meta: meta)
                                     .padding(.bottom, 10)
 
@@ -1964,12 +1942,11 @@ struct TvDetailsContent: View {
                                     onTrailerClick: onTrailerClick,
                                     focus: $actionFocus,
                                     entryLocked: focusedDetailsSection != .actions,
+                                    playEntryLocked: focusedDetailsSection == .episodes,
                                     onFocus: {
+                                        guard focusedDetailsSection != .actions else { return }
                                         focusedDetailsSection = .actions
-                                        // The initial Play focus is already at the top;
-                                        // only animate when returning from a lower section.
-                                        guard detailsScrollOffset > 1 else { return }
-                                        withAnimation(.easeOut(duration: 0.3)) {
+                                        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                             scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
                                         }
                                     }
@@ -1980,7 +1957,7 @@ struct TvDetailsContent: View {
                                 .disabled(
                                     restoreEpisodeKey != nil
                                         || !isDetailsFocusReachable(.actions)
-                                )
+                                    )
 
                                 TvDetailsSummary(meta: meta, simkl: uiState.simklRatings)
 
@@ -1991,8 +1968,10 @@ struct TvDetailsContent: View {
                                         seriesRating: meta.rating,
                                         continueItem: continueItem,
                                         onFocus: {
+                                            cancelPendingFocusHandoff()
+                                            guard focusedDetailsSection != .episodes else { return }
                                             focusedDetailsSection = .episodes
-                                            withAnimation(.easeOut(duration: 0.3)) {
+                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                                             }
                                         },
@@ -2002,7 +1981,9 @@ struct TvDetailsContent: View {
                                         episodeFocus: $episodeFocus,
                                         restrictFocusToKey: restoreEpisodeKey,
                                         entryLocked: focusedDetailsSection != .episodes,
-                                        onMoveUpFromSeason: focusPlayFromEpisodes,
+                                        onMoveUpFromSeason: {
+                                            focusPlayFromEpisodes(using: scrollProxy)
+                                        },
                                         onMoveDownFromEpisode: focusCastHeaderFromEpisodes
                                     )
                                     .padding(.top, 24)
@@ -2020,8 +2001,9 @@ struct TvDetailsContent: View {
                                     headerFocus: $castHeaderFocus,
                                     entryLocked: focusedDetailsSection != .cast,
                                     onFocus: {
+                                        guard focusedDetailsSection != .cast else { return }
                                         focusedDetailsSection = .cast
-                                        withAnimation(.easeOut(duration: 0.3)) {
+                                        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                             scrollProxy.scrollTo(TvDetailsScrollID.castSection, anchor: .top)
                                         }
                                     }
@@ -2042,8 +2024,9 @@ struct TvDetailsContent: View {
                                             onOpenTitle?(item.id, item.type)
                                         },
                                         onFocus: {
+                                            guard focusedDetailsSection != .related else { return }
                                             focusedDetailsSection = .related
-                                            withAnimation(.easeOut(duration: 0.3)) {
+                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.moreLikeThisSection, anchor: .top)
                                             }
                                         }
@@ -2068,8 +2051,9 @@ struct TvDetailsContent: View {
                                             onOpenProduction?(company)
                                         },
                                         onFocus: {
+                                            guard focusedDetailsSection != .network else { return }
                                             focusedDetailsSection = .network
-                                            withAnimation(.easeOut(duration: 0.3)) {
+                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.networkSection, anchor: .top)
                                             }
                                         }
@@ -2091,8 +2075,9 @@ struct TvDetailsContent: View {
                                             onOpenProduction?(company)
                                         },
                                         onFocus: {
+                                            guard focusedDetailsSection != .production else { return }
                                             focusedDetailsSection = .production
-                                            withAnimation(.easeOut(duration: 0.3)) {
+                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.productionSection, anchor: .top)
                                             }
                                         }
@@ -2113,8 +2098,9 @@ struct TvDetailsContent: View {
                                             onCommentSelect?(comment)
                                         },
                                         onFocus: {
+                                            guard focusedDetailsSection != .comments else { return }
                                             focusedDetailsSection = .comments
-                                            withAnimation(.easeOut(duration: 0.3)) {
+                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
                                                 scrollProxy.scrollTo(TvDetailsScrollID.commentsSection, anchor: .top)
                                             }
                                         }
@@ -2133,14 +2119,11 @@ struct TvDetailsContent: View {
                             .padding(.top, 78)
                             .padding(.bottom, 96)
                             .frame(width: detailsWidth(proxy, hasEpisodes: !episodes.isEmpty), alignment: .leading)
-                            .frame(minHeight: proxy.size.height, alignment: .topLeading)
+                            .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .topLeading)
                         }
                         .scrollClipDisabledIfAvailable()
                         .coordinateSpace(name: "tv-details-scroll")
-                        .modifier(TvDetailsScrollTracker(offset: $detailsScrollOffset))
                     }
-
-                    TvDetailsScrollTransitionShadow(progress: detailsScrollShadowProgress)
                 }
             }
             .background(Color.black.ignoresSafeArea())
@@ -2214,17 +2197,49 @@ struct TvDetailsContent: View {
         }
     }
 
+    /// Cancel a scroll-first handoff when a newly focused episode control
+    /// indicates that the user changed direction.
+    private func cancelPendingFocusHandoff() {
+        guard pendingPlayFocusGeneration != nil else { return }
+        pendingPlayFocusGeneration = nil
+        detailsFocusMoveGeneration &+= 1
+    }
+
     /// Route the season strip back to the primary action explicitly. tvOS has
     /// no spatial candidate above later season pills because Play sits at the
     /// far-left edge, so geometry alone can leave focus stuck on Season 2/3.
-    private func focusPlayFromEpisodes() {
+    private func focusPlayFromEpisodes(using scrollProxy: ScrollViewProxy) {
         detailsFocusMoveGeneration &+= 1
         let generation = detailsFocusMoveGeneration
-        focusedDetailsSection = .actions
-        actionFocus = .play
-        DispatchQueue.main.async {
-            guard detailsFocusMoveGeneration == generation else { return }
-            actionFocus = .play
+        pendingPlayFocusGeneration = generation
+        // Keep the episode section active until the scroll has finished. This
+        // prevents tvOS from disabling the focused card and choosing an early
+        // spatial replacement while the top section is moving into place.
+        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+            scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + TvDetailsScrollTiming.focusHandoffDelay) {
+            guard detailsFocusMoveGeneration == generation,
+                  pendingPlayFocusGeneration == generation else { return }
+            var transaction = Transaction()
+            transaction.disablesAnimations = true
+            withTransaction(transaction) {
+                pendingPlayFocusGeneration = nil
+                focusedDetailsSection = .actions
+                actionFocus = .play
+            }
+
+            // tvOS may reassert its spatial choice on the next run-loop turn.
+            DispatchQueue.main.async {
+                guard detailsFocusMoveGeneration == generation else { return }
+                if actionFocus != .play {
+                    var transaction = Transaction()
+                    transaction.disablesAnimations = true
+                    withTransaction(transaction) {
+                        actionFocus = .play
+                    }
+                }
+            }
         }
     }
 
@@ -2233,8 +2248,9 @@ struct TvDetailsContent: View {
     private func focusCastHeaderFromEpisodes() {
         detailsFocusMoveGeneration &+= 1
         let generation = detailsFocusMoveGeneration
-        focusedDetailsSection = .cast
+        pendingPlayFocusGeneration = nil
         castHeaderFocus = .creatorAndCast
+
         DispatchQueue.main.async {
             guard detailsFocusMoveGeneration == generation else { return }
             castHeaderFocus = .creatorAndCast
@@ -2353,6 +2369,14 @@ struct TvDetailsContent: View {
     }
 }
 
+private enum TvDetailsScrollTiming {
+    static let duration = 0.3
+    /// The trace shows tvOS needs roughly 35–50 ms to commit programmatic
+    /// focus. Arm the handoff in the scroll's final phase so visible focus and
+    /// the explicit scroll settle together at approximately 300 ms.
+    static let focusHandoffDelay = 0.25
+}
+
 private enum TvDetailsScrollID {
     static let topSection = "tv-details-top-section"
     static let castSection = "tv-details-cast-section"
@@ -2371,19 +2395,26 @@ private struct TvDetailsScrollOffsetKey: PreferenceKey {
     }
 }
 
-private struct TvDetailsScrollTracker: ViewModifier {
-    @Binding var offset: CGFloat
+private struct TvDetailsScrolledBackdropDimmer: View {
+    @State private var offset: CGFloat = 0
 
-    func body(content: Content) -> some View {
-        if #available(tvOS 18.0, *) {
-            content.onScrollGeometryChange(for: CGFloat.self) { geometry in
-                geometry.contentOffset.y
-            } action: { _, newOffset in
-                offset = max(0, newOffset)
-            }
-        } else {
-            content.onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
-                offset = max(0, -minY)
+    private var progress: CGFloat {
+        min(max(offset / 120, 0), 1)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.black
+                .opacity(0.78 * progress)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
+
+            TvDetailsScrollTransitionShadow(progress: progress)
+        }
+        .onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
+            let newOffset = max(0, -minY)
+            if abs(newOffset - offset) > 1 {
+                offset = newOffset
             }
         }
     }
@@ -2517,6 +2548,7 @@ private struct TvDetailsActionRow: View {
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
     let entryLocked: Bool
+    let playEntryLocked: Bool
     let onFocus: () -> Void
 
     var body: some View {
@@ -2533,6 +2565,7 @@ private struct TvDetailsActionRow: View {
                 onFocus: onFocus,
                 longPressAction: onPlayLongPress
             )
+            .disabled(playEntryLocked)
 
             TvDetailsActionButton(
                 title: nil,
@@ -3124,13 +3157,23 @@ private struct TvDetailsCompanyCard: View {
     let onFocus: () -> Void
 
     @FocusState private var isFocused: Bool
+    @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
+    @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
+
+    private var cardCornerRadius: CGFloat {
+        AppCardStyle.cornerRadius(for: cardCornerRadiusSetting, fallback: 14)
+    }
+
+    private var shape: RoundedRectangle {
+        RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
+    }
 
     var body: some View {
         Button(action: onSelect) {
             VStack(spacing: 14) {
                 ZStack {
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .fill(Color.white)
+                    shape
+                        .fill(Color.white.opacity(liquidGlassCards ? 0.90 : 1))
                     if let logo = company.logoURL, let url = URL(string: logo) {
                         AsyncImage(url: url) { phase in
                             if case .success(let image) = phase {
@@ -3155,12 +3198,19 @@ private struct TvDetailsCompanyCard: View {
                     }
                 }
                 .frame(width: 200, height: 100)
+                .clipShape(shape)
+                .modifier(
+                    LiquidGlassCardModifier(
+                        cornerRadius: cardCornerRadius,
+                        isFocused: isFocused,
+                        isEnabled: liquidGlassCards
+                    )
+                )
                 .overlay(
-                    RoundedRectangle(cornerRadius: 14, style: .continuous)
-                        .stroke(
-                            isFocused ? AppFocusOutline.color : Color.clear,
-                            lineWidth: isFocused ? AppFocusOutline.width : 0
-                        )
+                    shape.stroke(
+                        isFocused ? AppFocusOutline.color : Color.clear,
+                        lineWidth: isFocused ? AppFocusOutline.width : 0
+                    )
                 )
 
                 Text(company.name)
@@ -3594,7 +3644,8 @@ private struct TvDetailsEpisodes: View {
                         smartStreamSelection: smartStreamSelection,
                         focus: episodeFocus,
                         restrictFocusToKey: effectiveFocusRestriction,
-                        onMoveDown: onMoveDownFromEpisode
+                        onMoveDown: onMoveDownFromEpisode,
+                        onMoveUp: seasons.count <= 1 ? onMoveUpFromSeason : nil
                     )
                 }
             }
@@ -3782,7 +3833,9 @@ private struct TvSeasonPill: View {
             if focused { onFocus() }
         }
         .onMoveCommand { direction in
-            if direction == .up { onMoveUp() }
+            if direction == .up {
+                onMoveUp()
+            }
         }
     }
 }
@@ -3806,6 +3859,7 @@ private struct TvEpisodeCard: View {
     var focus: FocusState<String?>.Binding
     let restrictFocusToKey: String?
     let onMoveDown: () -> Void
+    var onMoveUp: (() -> Void)? = nil
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
@@ -4025,7 +4079,11 @@ private struct TvEpisodeCard: View {
             }
         }
         .onMoveCommand { direction in
-            if direction == .down { onMoveDown() }
+            if direction == .down {
+                onMoveDown()
+            } else if direction == .up {
+                onMoveUp?()
+            }
         }
     }
 
@@ -4200,7 +4258,10 @@ private struct TvEpisodeCard: View {
     }
 
     private var dateText: String? {
-        NuvioDateDisplay.formattedDate(video.released)
+        if let formatted = NuvioDateDisplay.formattedDate(video.released) {
+            return formatted
+        }
+        return "TBD"
     }
 }
 

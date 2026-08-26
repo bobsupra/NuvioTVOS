@@ -2219,7 +2219,7 @@ struct TitleActionsMenuContent: View {
     private var contextMenuContent: some View {
         if continueProgress != nil || continueIsUpNext {
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                     onOpenDetails?()
                 }
             } label: {
@@ -2228,7 +2228,7 @@ struct TitleActionsMenuContent: View {
 
             if let onPlayManually {
                 Button {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                         onPlayManually()
                     }
                 } label: {
@@ -2238,7 +2238,7 @@ struct TitleActionsMenuContent: View {
 
             if let onStartFromBeginning, !continueIsUpNext {
                 Button {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                         onStartFromBeginning()
                     }
                 } label: {
@@ -2248,7 +2248,7 @@ struct TitleActionsMenuContent: View {
 
             if let onRemoveFromContinueWatching {
                 Button(role: .destructive) {
-                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                         onRemoveFromContinueWatching()
                     }
                 } label: {
@@ -2260,7 +2260,7 @@ struct TitleActionsMenuContent: View {
             let isItemWatched = WatchedStore.contains(meta: meta)
 
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                     onOpenDetails?()
                 }
             } label: {
@@ -2268,7 +2268,7 @@ struct TitleActionsMenuContent: View {
             }
 
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                     toggleLibrary(currentlyInLibrary: inLibrary)
                 }
             } label: {
@@ -2279,7 +2279,7 @@ struct TitleActionsMenuContent: View {
             }
 
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
                     toggleWatched()
                 }
             } label: {

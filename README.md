@@ -57,7 +57,8 @@ The IPA requires a compatible tvOS development or sideloading signing workflow b
 
 ### New in Beta 3.3.1
 
-- Updates **AetherEngine** to **6.34.0** and **FFmpegBuild** to **2.4.3** with hardened Dolby Vision RPU conversion, startup progress reporting, and MPVKit coexistence.
+- **Hotfix (Re-Release):** Fixes a critical issue where TV shows were missing episode details and appearing as movies on the Details screen; enhances episode merging from TMDB.
+- Updates **AetherEngine** to **6.47.0** and **FFmpegBuild** to **2.4.3** with hardened Dolby Vision RPU conversion, startup progress reporting, no-cut stall watchdogs, and MPVKit coexistence.
 - Expands the **Details screen** with trailer playback, interactive cast/crew lists, studio navigation, and high-DPI backdrop transitions.
 - Refines player controls with live subtitle timing adjustments, audio delay sliders, and audio boost controls.
 - Improves stream source selection, cached-only badges, and smart binge auto-play source retention.

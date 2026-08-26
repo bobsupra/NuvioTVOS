@@ -546,8 +546,8 @@ Navigating vertically between catalog rows on Home (e.g. between "Popular - Seri
 
 ## AetherEngine and FFmpegBuild vendor upgrade runbook
 
-Last verified: 2026-08-23 while upgrading AetherEngine 6.21.0 to 6.34.0 and
-FFmpegBuild 2.4.2 to 2.4.3.
+Last verified: 2026-08-26 while upgrading AetherEngine 6.34.0 to 6.47.0 and
+FFmpegBuild 2.4.3.
 
 This repository does **not** consume stock AetherEngine and FFmpegBuild. It
 ships locally patched copies under `Vendor/` so AetherEngine's FFmpeg dynamic

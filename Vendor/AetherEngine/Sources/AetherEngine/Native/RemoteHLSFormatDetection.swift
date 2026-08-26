@@ -39,4 +39,35 @@ enum RemoteHLSFormatDetection {
     static func shouldApplyDisplayCriteria(format: VideoFormat, suppressDisplayCriteria: Bool) -> Bool {
         format != .sdr && !suppressDisplayCriteria
     }
+
+    /// Video sample types the bypass can name, mapped to the libavcodec spelling the probe path publishes.
+    /// Dolby Vision tags resolve to their base-layer codec ('dvh1'/'dvhe' are HEVC, 'dvav' is AVC): the DV
+    /// signaling already reaches the host through `sourceVideoFormat`, so repeating it here would cost the
+    /// codec row its actual answer.
+    private static let codecNamesBySubType: [FourCharCode: String] = [
+        0x68766331: "hevc",  // 'hvc1'
+        0x68657631: "hevc",  // 'hev1'
+        0x64766831: "hevc",  // 'dvh1'
+        0x64766865: "hevc",  // 'dvhe'
+        0x61766331: "h264",  // 'avc1'
+        0x61766333: "h264",  // 'avc3'
+        0x64766176: "h264",  // 'dvav'
+        0x61763031: "av1",   // 'av01'
+        0x76703039: "vp9",   // 'vp09'
+        0x6D703476: "mpeg4", // 'mp4v'
+    ]
+
+    /// Codec name for a video sample type, in the same vocabulary `avcodec_get_name` gives the probe path,
+    /// so one published field means one thing whichever path loaded the source. An unmapped type reports its
+    /// FourCC: a codec we cannot name is still one the viewer is watching, and nil is reserved for "no video
+    /// track at all". Pure so it is unit-testable.
+    static func codecName(videoSubType: FourCharCode?) -> String? {
+        guard let videoSubType else { return nil }
+        if let known = codecNamesBySubType[videoSubType] { return known }
+        let bytes = [
+            UInt8((videoSubType >> 24) & 0xFF), UInt8((videoSubType >> 16) & 0xFF),
+            UInt8((videoSubType >> 8) & 0xFF), UInt8(videoSubType & 0xFF),
+        ]
+        return String(bytes: bytes, encoding: .macOSRoman)
+    }
 }

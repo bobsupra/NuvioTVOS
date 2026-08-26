@@ -16,8 +16,13 @@ import AetherLibavutil
 
 /// Dedupes `ReaderNetworkPhase` emissions so a flapping origin does not spam the callback (#85).
 /// Mutated only on the demux thread (the read loop), so it needs no locking.
+///
+/// The first statement always goes out, `.flowing` included (#410). The gate is per reader INSTANCE while
+/// the phase it feeds is per engine, so a reader installed by a reopen starts with no opinion rather than
+/// with the assumption that it already reported delivery: assuming it is what let a fresh reader recover in
+/// silence and strand the engine on the previous reader's last word.
 struct NetworkPhaseGate {
-    private var last: ReaderNetworkPhase = .flowing
+    private var last: ReaderNetworkPhase?
     mutating func shouldEmit(_ next: ReaderNetworkPhase) -> Bool {
         guard next != last else { return false }
         last = next
@@ -218,8 +223,27 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         return " from \(host), a target the source resolved freshly"
     }
 
-    private static func isResolvedExpiryStatus(_ status: Int) -> Bool {
-        return status == 401 || status == 403 || status == 404 || status == 410
+    /// Statuses that say the RESOLVED address is the problem, so the productive move is one
+    /// re-resolve through the source URL for a fresh redirect rather than another attempt against
+    /// the same pinned target.
+    ///
+    /// #405: 407 belongs here and used to fall through all three classifiers (no pin drop from the
+    /// status, mid-stream cap of 12, the pin dropped only later by the unproductive-streak rule).
+    /// On a redirect chain a 407 from the pinned media host cannot mean "authenticate to your
+    /// proxy": the request went out direct, which is exactly why CFNetwork logs it as *Received
+    /// unexpected proxy response*, and a genuinely configured proxy is answered by URLSession's own
+    /// auth challenge long before a status reaches us. What it means is that the pinned lease is
+    /// gone or an interception answered in its place, and re-resolving is the only move that can
+    /// work (field trace: two wasted attempts, then the reader re-resolved and connected).
+    ///
+    /// 402 and 451 are the same shape from panels that answer an expired subscription or a
+    /// geo-refusal per edge node: the source still mints working targets, this one stopped being
+    /// one. Rate-limit statuses stay OUT (429/503/509 mean the origin is metering us and the pin is
+    /// fine, #71/#307); so does every 5xx, which `isResolvedHardServerError` handles with its own
+    /// reason string.
+    static func isResolvedExpiryStatus(_ status: Int) -> Bool {
+        return status == 401 || status == 402 || status == 403 || status == 404
+            || status == 407 || status == 410 || status == 451
     }
 
     /// Rate-limit-shaped statuses: the origin is metering us, not failing. 429/503 carry
@@ -1531,12 +1555,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if let spanLine { EngineLog.emit(spanLine, category: .demux) }
                 totalRead += n
                 diag.recordDetourServe(ms: 0, fetched: false)
-                // No ladder reset. These spans are bytes fetched earlier and kept, and the line
-                // above says so itself: "no reconnect for it". Clearing the streaks here is the
-                // #380 window-serve mistake in the branch that runs FIRST, before every network
-                // path, and unlike the detour it is not taken out of service on a metered origin,
-                // so the parse's return to the head could hold a refusing origin at streak=0.
-                emitNetworkPhase(.flowing)
+                // No ladder reset, and no phase either (#410): these spans are bytes fetched earlier
+                // and kept, and the line above says so itself ("no reconnect for it"). Clearing the
+                // streaks here is the #380 window-serve mistake in the branch that runs FIRST, before
+                // every network path, and unlike the detour it is not taken out of service on a metered
+                // origin, so the parse's return to the head could hold a refusing origin at streak=0.
+                // Reporting `.flowing` off the same serve made the host read a delivering source out of
+                // read-ahead the origin paid for before it died.
                 continue
             }
 
@@ -1636,8 +1661,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         if fetched {
                             unproductiveReconnects = 0
                             rateLimitStreak = 0
+                            emitNetworkPhase(.flowing)   // the fetch crossed the network: the origin is serving (#85/#410)
                         }
-                        emitNetworkPhase(.flowing)   // detour cache served: not stalled (#85)
                         detourTrackSequential(at: curPosition, length: n)
                         continue
                     case .rateLimited(let retryAfter):
@@ -1648,6 +1673,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // the 429 churn the cache exists to remove). Give up cleanly at the cap.
                         if recordRateLimitAndShouldGiveUp() {
                             EngineLog.emit("[AVIOReader] Detour rate-limit gave up at offset \(curPosition) (\(rateLimitStreak) consecutive rate-limited)", category: .demux)
+                            emitNetworkPhase(.exhausted)   // ladder spent on the detour arm too (#410)
                             return totalRead > 0 ? Int32(totalRead) : -1
                         }
                         // #392: the detour fetches through the same pinned target, and this arm
@@ -1655,6 +1681,11 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         // given up on here (a failed read), never re-resolved. It is also the arm a
                         // backward read after a long pause lands on, i.e. exactly when a lease has
                         // died. Same decision as both reconnect ladders, in the same one place.
+                        // #410: a metered detour fetch is a source-connection problem by the same
+                        // definition as a metered reconnect, and it is the arm that carries a throttling
+                        // origin (#69/#71), so leaving it silent hid exactly the case `.stalled` was added
+                        // for. The ladder was already charged above; only the axis was missing.
+                        emitNetworkPhase(.reconnecting)
                         let repinned = dropPinIfTheRefusalCallsForIt(isRateLimited: true)
                         let backoffStart = DispatchTime.now()
                         backoffBeforeReconnect(streak: repinned ? 0 : rateLimitStreak, retryAfter: retryAfter)
@@ -1697,8 +1728,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if connFirstDataSeen {
                     unproductiveReconnects = 0      // real progress
                     rateLimitStreak = 0             // real progress clears the 429 give-up streak (#71)
+                    emitNetworkPhase(.flowing)      // recovered: source delivering again (#85/#410)
                 }
-                emitNetworkPhase(.flowing)      // recovered: source delivering again (#85)
                 // No flow installed and the consumer has drawn down to low water: request at the
                 // frontier. #220/#310 built this for PLANNED ends (a range delivered in full, a
                 // high-water end); #309 made it the rule for every reason there is no flow, because
@@ -1765,9 +1796,9 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                         diag.recordDetourServe(ms: 0, fetched: false)   // resident-only path
                         winCond.lock(); position = curPosition + Int64(n); winCond.broadcast(); winCond.unlock()
                         totalRead += n
-                        // No ladder reset: `allowFetch: false` cannot have crossed the network, so
-                        // this serve says nothing about an origin that is refusing (#380).
-                        emitNetworkPhase(.flowing)   // detour cache served: not stalled (#85)
+                        // No ladder reset and no phase: `allowFetch: false` cannot have crossed the
+                        // network, so this serve says nothing about an origin that is refusing
+                        // (#380/#410).
                         detourTrackSequential(at: curPosition, length: n)
                         continue
                     case .rateLimited, .miss:
@@ -1791,7 +1822,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
                 if !signaled {
                     if recordReconnectAndShouldGiveUp() {
                         EngineLog.emit("[AVIOReader] \(label) stall gave up at offset \(frontier) (\(unproductiveReconnects) unproductive)\(isLive ? " [live source lost]" : "")", category: .demux)
-                        emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
+                        emitNetworkPhase(.exhausted)   // ladder spent; the reopen owns recovery, the source is still down (#410)
                         if isLive {
                             return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio
                         }
@@ -1841,7 +1872,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if giveUp {
                 let streakDesc = isRateLimited ? "\(rateLimitStreak) consecutive rate-limited" : "\(unproductiveReconnects) unproductive"
                 EngineLog.emit("[AVIOReader] \(label) reconnect exhausted at offset \(frontier) status=\(status) (\(streakDesc))\(isLive ? " [live source lost]" : "")", category: .demux)
-                emitNetworkPhase(.flowing)   // reader is exiting; let state carry the terminal outcome (#85)
+                emitNetworkPhase(.exhausted)   // ladder spent; the reopen owns recovery, the source is still down (#410)
                 if isLive {
                     return totalRead > 0 ? Int32(totalRead) : FFmpegErr.eio
                 }

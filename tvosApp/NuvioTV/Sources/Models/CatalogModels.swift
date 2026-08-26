@@ -94,7 +94,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     /// library/watch-state snapshots.
     let externalRatings: [NuvioExternalRating]?
 
-    var isSeries: Bool { type == "series" }
+    var isSeries: Bool { ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
 
     /// Canonical stream lookup id: the additive-imdb id when known (what stream
     /// add-ons declare in their `idPrefixes`), otherwise the meta id. Items can
@@ -277,6 +277,35 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             videos: videos,
             trailerYtIds: trailerYtIds,
             externalRatings: ratings.isEmpty ? nil : ratings
+        )
+    }
+
+    func withVideos(_ newVideos: [NuvioVideo]?) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: name,
+            description: description,
+            posterUrl: posterUrl,
+            backgroundUrl: backgroundUrl,
+            logoUrl: logoUrl,
+            imdbId: imdbId,
+            tmdbId: tmdbId,
+            type: type,
+            year: year,
+            genres: genres,
+            rating: rating,
+            releaseInfo: releaseInfo,
+            runtime: runtime,
+            cast: cast,
+            director: director,
+            writer: writer,
+            certification: certification,
+            country: country,
+            released: released,
+            status: status,
+            videos: newVideos ?? videos,
+            trailerYtIds: trailerYtIds,
+            externalRatings: externalRatings
         )
     }
 
@@ -3265,13 +3294,7 @@ enum CollectionsStore {
             return try? JSONDecoder().decode(NuvioCollection.self, from: data)
         }
         if !rows.isEmpty && decoded.isEmpty {
-            print("CollectionsStore.applyRemote: refused — 0/\(rows.count) collections decoded")
             return
-        }
-        if decoded.count != rows.count {
-            print("CollectionsStore.applyRemote: partial decode \(decoded.count)/\(rows.count)")
-        } else {
-            print("CollectionsStore.applyRemote: \(decoded.count) collection(s)")
         }
 
         if collections() == decoded {
@@ -3812,13 +3835,6 @@ enum CollectionsStore {
         }
 
         let merged = order.compactMap { byId[$0] }
-        let preserved = merged.count - local.count
-        if preserved > 0 {
-            print("CollectionsStore.mergeLocalEdit: kept \(preserved) remote-only collection(s)")
-        }
-        if !intentionalDeletes.isEmpty {
-            print("CollectionsStore.mergeLocalEdit: dropped \(intentionalDeletes.count) intentionally deleted id(s)")
-        }
         return merged
     }
 
@@ -4262,11 +4278,8 @@ enum WatchedStore {
             guard !state.isAlreadyCached else { return }
             guard let data = readData(forKey: state.key) else { return }
 
-            let decodeStart = DispatchTime.now()
             if let decoded = try? makeDecoder().decode([WatchedStoreItem].self, from: data)
                 .sorted(by: { $0.watchedAt > $1.watchedAt }) {
-                let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - decodeStart.uptimeNanoseconds) / 1_000_000.0
-                print("[WatchedStore] Background warmed \(decoded.count) items (\(data.count) bytes) in \(String(format: "%.2f", elapsedMs))ms for profile: \(state.profileId ?? "default")")
                 installWarmedItems(
                     decoded,
                     data: data,
@@ -4376,12 +4389,9 @@ enum WatchedStore {
             cachedSnapshot = nil
             return []
         }
-        let decodeStart = DispatchTime.now()
         do {
             let decoded = try makeDecoder().decode([WatchedStoreItem].self, from: data)
                 .sorted { $0.watchedAt > $1.watchedAt }
-            let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - decodeStart.uptimeNanoseconds) / 1_000_000.0
-            print("[WatchedStore] Decoded \(decoded.count) items (\(data.count) bytes) in \(String(format: "%.2f", elapsedMs))ms for profile: \(activeProfileId ?? "default")")
             cachedItems = decoded
             cachedKey = key
             cachedData = data
@@ -5431,7 +5441,6 @@ enum WatchedStore {
 
     @discardableResult
     private static func persist(_ items: [WatchedStoreItem]) -> Bool {
-        let encodeStart = DispatchTime.now()
         let data: Data
         do {
             data = try makeEncoder().encode(items)
@@ -5440,7 +5449,6 @@ enum WatchedStore {
             print("[WatchedStore] Watched storage encode failed: \(error.localizedDescription)")
             return false
         }
-        let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - encodeStart.uptimeNanoseconds) / 1_000_000.0
 
         cacheLock.lock()
         let key = storageKey
@@ -5464,7 +5472,6 @@ enum WatchedStore {
         cachedData = data
         cachedSnapshot = nil
         persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
-        print("[WatchedStore] Saved \(items.count) items (\(data.count) bytes, encoded in \(String(format: "%.2f", elapsedMs))ms)")
         cacheLock.unlock()
 
         NotificationCenter.default.post(name: changedNotification, object: nil)

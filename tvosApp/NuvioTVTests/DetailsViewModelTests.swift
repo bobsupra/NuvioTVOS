@@ -243,17 +243,32 @@ final class DetailsViewModelTests: XCTestCase {
         }
     }
 
-    // MARK: - Live TV Tests
+    // MARK: - Live TV & Series Type Tests
 
     func testLiveContentTypeRecognition() {
-        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("tv"))
         XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("channel"))
         XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("live"))
         XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("livetv"))
         XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("live-tv"))
         XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("iptv"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("radio"))
+        XCTAssertFalse(CinemetaCatalogRepository.isLiveContentType("tv"))
         XCTAssertFalse(CinemetaCatalogRepository.isLiveContentType("movie"))
         XCTAssertFalse(CinemetaCatalogRepository.isLiveContentType("series"))
+    }
+
+    func testSeriesTypeRecognition() {
+        let metaSeries = NuvioMeta(id: "1", name: "S1", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "series", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaShow = NuvioMeta(id: "2", name: "S2", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "show", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaTv = NuvioMeta(id: "3", name: "S3", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "tv", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaTvShow = NuvioMeta(id: "4", name: "S4", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "tvshow", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaMovie = NuvioMeta(id: "5", name: "M1", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "movie", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+
+        XCTAssertTrue(metaSeries.isSeries)
+        XCTAssertTrue(metaShow.isSeries)
+        XCTAssertTrue(metaTv.isSeries)
+        XCTAssertTrue(metaTvShow.isSeries)
+        XCTAssertFalse(metaMovie.isSeries)
     }
 
     func testLiveTVFallbackTitleFormatting() {
@@ -264,10 +279,10 @@ final class DetailsViewModelTests: XCTestCase {
 
     func testCinemetaCatalogRepositoryLiveTVMetadataResolution() async throws {
         let repo = CinemetaCatalogRepository()
-        let meta = try await repo.getMetadata(id: "usatv_espn_hd", type: "tv")
+        let meta = try await repo.getMetadata(id: "usatv_espn_hd", type: "channel")
         XCTAssertEqual(meta.id, "usatv_espn_hd")
         XCTAssertEqual(meta.name, "ESPN HD")
-        XCTAssertEqual(meta.type, "tv")
+        XCTAssertEqual(meta.type, "channel")
         XCTAssertFalse(meta.isSeries)
     }
 

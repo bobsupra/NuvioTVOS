@@ -212,6 +212,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// Current engine playlist shift (AVPlayer clock = source_pts - shift), read at serve time so whole-program
     /// cues land on the same AVPlayer axis as the video even when the shift was not known at load (Sodalite#32).
     private let currentShiftSeconds: @Sendable () -> Double
+    /// AE#418: fired with the index AVPlayer just placed into its timeline. What that segment
+    /// carries below its advertised start is what moves the axis every consumer folds with.
+    private let segmentPlacedHandler: (@Sendable (Int) -> Void)?
     /// Sodalite#32 Phase 2: tap-fed stores can carry raw ASS event lines (the overlay renders the
     /// styling); the WebVTT rendition must serve plain text, so strip at build time.
     private let stripASSMarkupInVTT: Bool
@@ -363,7 +366,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stripASSMarkupInVTT: Bool = false,
         nativeSubtitleDefaultOrdinal: Int = 0,
         nativeSubtitleWholeProgram: Bool = false,
-        currentShiftSeconds: @escaping @Sendable () -> Double = { 0 }
+        currentShiftSeconds: @escaping @Sendable () -> Double = { 0 },
+        segmentPlacedHandler: (@Sendable (Int) -> Void)? = nil
     ) {
         self.cache = cache
         self.segments = segments
@@ -398,6 +402,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         self.nativeSubtitleDefaultOrdinal = nativeSubtitleDefaultOrdinal
         self.nativeSubtitleWholeProgram = nativeSubtitleWholeProgram
         self.currentShiftSeconds = currentShiftSeconds
+        self.segmentPlacedHandler = segmentPlacedHandler
     }
 
     /// Append a finalized live segment. Index must equal segments.count; out-of-order ignored.
@@ -652,6 +657,22 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (index, cache.foldCount(index))
     }
 
+    /// AE#412: what the stored segment at `index` offers a cold arrival, or nil when the producer
+    /// made no claim for it. See `SegmentCache.VideoReach`.
+    func videoReach(at index: Int) -> SegmentCache.VideoReach? {
+        return cache.videoReach(index)
+    }
+
+    /// AE#421: whether the segment for `index` is already on disk, answered without reading it.
+    ///
+    /// This is what separates the two repairs for a wedge. A producer re-anchor is the fix for a
+    /// consumer STARVED of content nobody is producing; a consumer silent on a segment that is
+    /// already stored is not starved, and re-anchoring throws away the pump's forward work to
+    /// rebuild what it already has.
+    func hasStoredSegment(at index: Int) -> Bool {
+        return cache.peekURL(index: index) != nil
+    }
+
     /// What to do with a request for a non-resident index, given how often pumps have folded it (#358).
     enum FoldedTargetDecision: Equatable {
         /// Nobody has folded this index: it is ordinary read-ahead, wait for the producer.
@@ -663,6 +684,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         /// Folded again after that re-anchor, which is the repair reproducing its own trigger. No
         /// further attempt changes the outcome, so the source fails instead of freezing.
         case fail
+    }
+
+    /// AE#418 round 2: whether this request puts a segment into AVPlayer's timeline anew.
+    ///
+    /// Round 1 asked a narrower question here, whether the fetch BEGAN a decode run, and answered it
+    /// from the fetch order: anything that did not follow its predecessor. The reporter's seek burst
+    /// falsified that. A fetch out of sequence happens while AVPlayer stays inside the run it is
+    /// already playing, so the axis was republished from under a picture that had not moved.
+    ///
+    /// What the axis actually turns on is placement, and every fetch is one, whatever its order.
+    /// Asking for the SAME index again is the one exception: that is a retry of a placement already
+    /// counted, and counting it twice would move the axis by an offset AVPlayer applied once.
+    static func placesSegmentAnew(index: Int, previousTarget: Int) -> Bool {
+        return index != previousTarget
     }
 
     static func foldedTargetDecision(folds: Int, alreadyReanchoredHere: Bool) -> FoldedTargetDecision {
@@ -684,6 +719,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
+
+        // AE#418: AVPlayer places this segment at the position the PLAYLIST gives it, read through
+        // the axis its timeline already carries (measured with `play --picture-probe`). So a segment
+        // whose content starts below its advertised start moves the axis by that much, every time it
+        // is placed. A re-request of the same index is a retry of one placement, not a second one.
+        if Self.placesSegmentAnew(index: index, previousTarget: previousTarget) {
+            segmentPlacedHandler?(index)
+        }
 
         // #358: the consumer is asking for a plan index a pump folded away, because no keyframe
         // reached its boundary. The playlist offers it regardless, so waiting here is waiting for
@@ -725,11 +768,25 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             // Cache gate: backwardWindow=20 covers Continuous-Audio handover refetches (~7-10 segments
             // backward); unconditional proactive restart re-armed the FLAC bridge and caused audible glitches.
             if cache.peekURL(index: index) != nil {
+                let frontier = cache.contiguousForwardFrontier(from: index)
+                let front = activeMarchFront
+                if Self.residentBackwardTargetKeepsProducer(
+                    index: index, residentFrontier: frontier, activeMarchFront: front,
+                    prefetchDepth: Self.forwardWaitWindow
+                ) {
+                    EngineLog.emit(
+                        "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): "
+                        + "resident through seg\(frontier) (march front \(front)), no restart",
+                        category: .session
+                    )
+                    return
+                }
                 EngineLog.emit(
-                    "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): resident in cache, no restart",
+                    "[HLSVideoEngine] declareTarget backward jump \(previousTarget) -> \(index): resident "
+                    + "only through seg\(frontier), which is below the march front \(front), so the band "
+                    + "ends in a gap nothing is producing",
                     category: .session
                 )
-                return
             }
             EngineLog.emit(
                 "[HLSVideoEngine] declareTarget backward jump \(previousTarget) → \(index), proactively restarting producer",
@@ -988,6 +1045,33 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             )
         }
         return bytes
+    }
+
+    /// AE#408 pure decision: a backward target jump landed on a segment that is still resident. May the
+    /// producer stay anchored where it is?
+    ///
+    /// The residency gate exists for the Continuous-Audio handover refetch (~7-10 segments backward into
+    /// content the ACTIVE pump is still writing): restarting there re-arms the FLAC bridge and glitches
+    /// the audio. Residency of the target segment alone does not carry that, because a scrub band left by
+    /// an EARLIER pump is resident too, and it ends. Nothing else aims the producer at the new target, so
+    /// the band running out is what finally does it: the consumer asks for the first index above it, the
+    /// out-of-range restart fires, and the whole re-anchor is paid at the one moment the buffer is empty.
+    /// Measured on the `aetherctl play` repro (backward seek to seg38 into a 3-segment band, pump anchored
+    /// at seg99): the ask for seg41 arrived 4 s later with 5 s of buffer left. With a longer band the pump
+    /// instead sat parked for 24 s until the #65 backpressure wedge breaker moved it.
+    ///
+    /// Two shapes still keep the producer:
+    ///
+    /// - The resident run reaches the active march front. There is no gap to fall into: the band carries
+    ///   the consumer straight back into the pump's own output. This is the handover case.
+    /// - The run is at least a prefetch window deep. AVPlayer asks for a segment 5-7 ahead of what it is
+    ///   playing, so the existing out-of-range restart runs with a full cushion, and re-anchoring early
+    ///   would re-produce content that is already on disk.
+    static func residentBackwardTargetKeepsProducer(
+        index: Int, residentFrontier: Int, activeMarchFront: Int, prefetchDepth: Int
+    ) -> Bool {
+        if residentFrontier >= activeMarchFront { return true }
+        return residentFrontier - index >= prefetchDepth
     }
 
     private func activeProducerCovers(_ index: Int) -> Bool {

@@ -87,7 +87,6 @@ import AetherEngine
 // MARK: - Constants
 
 private let tsPacketSize = 188
-private let windowSize = 6
 private let slowRefreshDelay: Double = 8.0
 
 // MARK: - Entry point
@@ -105,6 +104,7 @@ func runHLSFixture(args: [String]) -> Int32 {
     guard segmentsDir != nil || (!rest.isEmpty && !rest[0].hasPrefix("-")) else {
         print("ERROR: hlsfixture requires <input.ts> as first argument (or --segments-dir <dir>)")
         print("Usage: aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N]")
+        print("       [--target-duration N] [--window N]")
         print("       [--master] [--codecs STR] [--resolution WxH] [--discontinuity-at N] [--slow-refresh]")
         print("       [--drop-segment N] [--encrypted] [--fmp4] [--self-test]")
         return 64
@@ -118,8 +118,24 @@ func runHLSFixture(args: [String]) -> Int32 {
         print("ERROR: --segment-seconds must be >= 1 (got \(segSeconds))")
         return 64
     }
+    // AE#374: advertised TARGETDURATION, independent of the real cut size. Default keeps the tight
+    // ceil(max EXTINF); `--target-duration <segment+1>` is the padded shape a packager commonly serves.
+    let advertisedTD  = takeIntFlag("--target-duration", from: &rest)
+    // AE#374: sliding-window depth. Three segments is the HLS minimum and the shallowest window a
+    // startup gate wanting 3 x TD of content can be handed.
+    let windowSegs    = takeIntFlag("--window", from: &rest) ?? 6
     let discAt        = takeIntFlag("--discontinuity-at", from: &rest)
     let dropSeg       = takeIntFlag("--drop-segment", from: &rest)
+    // An advertised TD below ceil(max EXTINF) is not a stricter origin, it is an invalid playlist.
+    if let td = advertisedTD, td < segSeconds {
+        print("ERROR: --target-duration must be >= --segment-seconds (HLS requires TD >= ceil(max EXTINF));"
+              + " got \(td) < \(segSeconds)")
+        return 64
+    }
+    guard windowSegs >= 3 else {
+        print("ERROR: --window must be >= 3 (HLS live playlists carry at least three segments); got \(windowSegs)")
+        return 64
+    }
     let withMaster    = takeFlag("--master",       from: &rest)
     let codecs        = takeStringFlag("--codecs", from: &rest)
     let resolution    = takeStringFlag("--resolution", from: &rest)
@@ -162,11 +178,14 @@ func runHLSFixture(args: [String]) -> Int32 {
         return 1
     }
     print("[HLSFixture] slices=\(slices.count) segmentSeconds=\(segSeconds)"
+          + " advertisedTD=\(advertisedTD ?? segSeconds) window=\(windowSegs)"
           + (segmentsDir == nil ? "" : " (pre-cut segments)"))
 
     let config = HLSFixtureConfig(
         slices: slices,
         segmentSeconds: segSeconds,
+        targetDurationSeconds: advertisedTD,
+        windowSegments: windowSegs,
         withMaster: withMaster,
         codecs: codecs,
         resolution: resolution,
@@ -348,6 +367,14 @@ private func loadAndSlice(path: String) throws -> [[UInt8]] {
 struct HLSFixtureConfig {
     let slices: [[UInt8]]
     let segmentSeconds: Int
+    /// AE#374: advertised `#EXT-X-TARGETDURATION`. nil = `segmentSeconds`, the tight `ceil(max EXTINF)`.
+    /// Packagers commonly pad it (`segment + 1`) to widen a client's unchanged-playlist patience, and the
+    /// engine seeds its own served TD floor from whatever the upstream advertises (`LiveCadencePolicy`),
+    /// so the padding costs `3 x` itself in first-serve holdback. Reproducible only if it is expressible.
+    var targetDurationSeconds: Int? = nil
+    /// AE#374: how many segments the sliding window keeps visible. The startup gate wants `3 x TD` of
+    /// content behind the live edge, so window depth and advertised TD are the two halves of one cost.
+    var windowSegments: Int = 6
     let withMaster: Bool
     /// CODECS / RESOLUTION for the master's variants. nil leaves them off, which is what a variant
     /// with no `AVAssetVariant.videoAttributes` looks like to AVFoundation.
@@ -619,12 +646,12 @@ final class HLSFixtureServer: @unchecked Sendable {
 
     private func mediaPlaylist() -> String {
         let seq = currentSequence()
-        let start = max(0, seq - windowSize + 1)
+        let start = max(0, seq - config.windowSegments + 1)
 
         var lines: [String] = []
         lines.append("#EXTM3U")
         lines.append("#EXT-X-VERSION:3")
-        lines.append("#EXT-X-TARGETDURATION:\(config.segmentSeconds)")
+        lines.append("#EXT-X-TARGETDURATION:\(config.targetDurationSeconds ?? config.segmentSeconds)")
         lines.append("#EXT-X-MEDIA-SEQUENCE:\(start)")
 
         if config.encrypted {

@@ -201,12 +201,21 @@ enum TmdbDetailsService {
     static func resolveTmdbId(for meta: NuvioMeta) async -> (id: Int, mediaType: String)? {
         guard isEnabled, apiKey != nil else { return nil }
         let mediaType = isSeries(meta.type) ? "tv" : "movie"
-        if let tmdbId = meta.tmdbId, tmdbId > 0 {
+        let imdb = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id.split(separator: ":").first.map(String.init) : nil)
+
+        // 1. If an IMDb id is available, resolve via TMDB's authoritative /find/ endpoint first
+        // to guarantee the correct TMDB id and avoid stale/incorrect moviedb_id values from Cinemeta.
+        if let imdb, imdb.hasPrefix("tt"), let resolved = await findByImdb(imdb) {
+            return resolved
+        }
+
+        // 2. Fallback to meta.tmdbId or tmdb: prefix id if available
+        let tmdbId = meta.tmdbId ?? (meta.id.hasPrefix("tmdb:") ? Int(meta.id.dropFirst(5)) : nil)
+        if let tmdbId, tmdbId > 0 {
             return (tmdbId, mediaType)
         }
-        let imdb = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id.split(separator: ":").first.map(String.init) : nil)
-        guard let imdb, imdb.hasPrefix("tt") else { return nil }
-        return await findByImdb(imdb)
+
+        return nil
     }
 
     static func fetchCompanies(for meta: NuvioMeta) async -> [MetaCompany] {
@@ -396,6 +405,96 @@ enum TmdbDetailsService {
             mediaType: resolved.mediaType,
             limit: limit
         )
+    }
+
+    /// Fetches full season and episode listings from TMDB, enabling unreleased/TBD episodes
+    /// and accurate episode thumbnails/titles for ongoing and announced TV series.
+    static func fetchEpisodes(for meta: NuvioMeta) async -> [NuvioVideo]? {
+        guard useEpisodes,
+              let apiKey,
+              let resolved = await resolveTmdbId(for: meta),
+              resolved.mediaType == "tv" else {
+            return nil
+        }
+
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("tv/\(resolved.id)"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: preferredLanguage)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let showDetails = try? JSONDecoder().decode(TmdbTvShowDetailsResponse.self, from: data) else {
+            return nil
+        }
+
+        let seasonNumbers = (showDetails.seasons ?? []).compactMap { season -> Int? in
+            guard let num = season.seasonNumber, num >= 0 else { return nil }
+            return num
+        }
+
+        return await withTaskGroup(of: [NuvioVideo].self, returning: [NuvioVideo]?.self) { group in
+            for seasonNum in seasonNumbers {
+                group.addTask {
+                    await fetchSeasonEpisodes(
+                        parentId: meta.id,
+                        tmdbId: resolved.id,
+                        seasonNumber: seasonNum,
+                        apiKey: apiKey
+                    )
+                }
+            }
+            var allVideos: [NuvioVideo] = []
+            for await seasonVideos in group {
+                allVideos.append(contentsOf: seasonVideos)
+            }
+            return allVideos.isEmpty ? nil : allVideos
+        }
+    }
+
+    private static func fetchSeasonEpisodes(
+        parentId: String,
+        tmdbId: Int,
+        seasonNumber: Int,
+        apiKey: String
+    ) async -> [NuvioVideo] {
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("tv/\(tmdbId)/season/\(seasonNumber)"),
+            resolvingAgainstBaseURL: false
+        )!
+        components.queryItems = [
+            URLQueryItem(name: "api_key", value: apiKey),
+            URLQueryItem(name: "language", value: preferredLanguage)
+        ]
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let seasonDetails = try? JSONDecoder().decode(TmdbSeasonDetailsResponse.self, from: data) else {
+            return []
+        }
+
+        let baseParentId = parentId.hasPrefix("tt") ? parentId : "tmdb:\(tmdbId)"
+        return (seasonDetails.episodes ?? []).compactMap { ep -> NuvioVideo? in
+            guard let epNum = ep.episodeNumber else { return nil }
+            let epSeason = ep.seasonNumber ?? seasonNumber
+            let ratingStr = ep.voteAverage.flatMap { $0 > 0 ? String(format: "%.1f", $0) : nil }
+            return NuvioVideo(
+                id: "\(baseParentId):\(epSeason):\(epNum)",
+                title: nonEmpty(ep.name) ?? "Episode \(epNum)",
+                season: epSeason,
+                episode: epNum,
+                thumbnail: imageURL(ep.stillPath, size: "w500"),
+                overview: nonEmpty(ep.overview),
+                released: nonEmpty(ep.airDate),
+                rating: ratingStr
+            )
+        }
     }
 
     /// Applies the selected TMDB language to user-facing text while retaining
@@ -975,6 +1074,58 @@ private struct TmdbDetailsResponse: Decodable {
         case productionCompanies = "production_companies"
         case networks
         case createdBy = "created_by"
+    }
+}
+
+private struct TmdbTvShowDetailsResponse: Decodable {
+    let seasons: [TmdbSeasonOverviewDTO]?
+}
+
+private struct TmdbSeasonOverviewDTO: Decodable {
+    let id: Int?
+    let seasonNumber: Int?
+    let episodeCount: Int?
+    let airDate: String?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case seasonNumber = "season_number"
+        case episodeCount = "episode_count"
+        case airDate = "air_date"
+    }
+}
+
+private struct TmdbSeasonDetailsResponse: Decodable {
+    let id: Int?
+    let seasonNumber: Int?
+    let posterPath: String?
+    let episodes: [TmdbEpisodeDTO]?
+
+    enum CodingKeys: String, CodingKey {
+        case id
+        case seasonNumber = "season_number"
+        case posterPath = "poster_path"
+        case episodes
+    }
+}
+
+private struct TmdbEpisodeDTO: Decodable {
+    let id: Int?
+    let name: String?
+    let overview: String?
+    let airDate: String?
+    let episodeNumber: Int?
+    let seasonNumber: Int?
+    let stillPath: String?
+    let voteAverage: Double?
+
+    enum CodingKeys: String, CodingKey {
+        case id, name, overview
+        case airDate = "air_date"
+        case episodeNumber = "episode_number"
+        case seasonNumber = "season_number"
+        case stillPath = "still_path"
+        case voteAverage = "vote_average"
     }
 }
 

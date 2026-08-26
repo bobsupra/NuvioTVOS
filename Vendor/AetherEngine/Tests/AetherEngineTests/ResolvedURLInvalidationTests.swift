@@ -519,4 +519,28 @@ struct ResolvedURLInvalidationTests {
         #expect(AVIOReader.isRateLimitStatus(509))
         #expect(!AVIOReader.isRateLimitStatus(500))
     }
+
+    /// #405 (Syravo field trace): a 407 from the PINNED media host of a redirect chain fell through
+    /// all three classifiers. No pin drop from the status, counted against the full mid-stream cap
+    /// of 12, and the pin dropped only later by the unproductive-streak rule, so the first attempt
+    /// after the refusal went back to the address that had just refused. The request went out
+    /// direct (CFNetwork logs it as an unexpected proxy response), so on that chain 407 cannot mean
+    /// "authenticate to your proxy": the lease is gone, and re-resolving is the only move that
+    /// works.
+    @Test("407, 402 and 451 are resolved-address expiry, not transients")
+    func leaseRefusalsClassifyAsExpiry() {
+        #expect(AVIOReader.isResolvedExpiryStatus(407), "the field case: a stale lease on a pinned target")
+        #expect(AVIOReader.isResolvedExpiryStatus(402), "panels answer an expired subscription per edge")
+        #expect(AVIOReader.isResolvedExpiryStatus(451), "a geo-refusing edge node; the source still mints working ones")
+        #expect(AVIOReader.isResolvedExpiryStatus(401))
+        #expect(AVIOReader.isResolvedExpiryStatus(403))
+        #expect(AVIOReader.isResolvedExpiryStatus(404))
+        #expect(AVIOReader.isResolvedExpiryStatus(410))
+        #expect(!AVIOReader.isResolvedExpiryStatus(429), "metering is not expiry; re-resolving spends the request there is no room for (#307)")
+        #expect(!AVIOReader.isResolvedExpiryStatus(503))
+        #expect(!AVIOReader.isResolvedExpiryStatus(509))
+        #expect(!AVIOReader.isResolvedExpiryStatus(500), "5xx has its own class and its own reason string")
+        #expect(!AVIOReader.isResolvedExpiryStatus(200))
+        #expect(!AVIOReader.isResolvedExpiryStatus(206))
+    }
 }

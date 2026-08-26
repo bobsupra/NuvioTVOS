@@ -9,6 +9,25 @@ import Foundation
 // across the producer/provider threads and capture in @Sendable closures.
 final class SegmentCache: @unchecked Sendable {
 
+    /// AE#412: where a stored segment's first random-access point sits, as an offset from the
+    /// segment's ADVERTISED start (its plan boundary). An offset, not an absolute time, so it is
+    /// independent of the item / source / display axes and survives an epoch that opened early.
+    ///
+    /// `<= 0` means the segment opens on a sync sample and serves any position inside it. A positive
+    /// offset means the first sync sample sits that far in, so only positions at or after it can
+    /// start a decode run. `.none` means the segment carries no sync sample at all: audio cut it on
+    /// a plan boundary the keyframe-gated cutter had folded, so nothing in it can start one.
+    enum VideoReach: Equatable, Sendable {
+        case syncAt(offsetSeconds: Double)
+        case none
+
+        /// Whether a cold arrival aiming `offsetSeconds` into this segment can be served from it.
+        func serves(offsetSeconds: Double) -> Bool {
+            guard case .syncAt(let syncOffset) = self else { return false }
+            return syncOffset <= offsetSeconds
+        }
+    }
+
     private let condition = NSCondition()
 
     private let forwardWindow: Int
@@ -55,6 +74,10 @@ final class SegmentCache: @unchecked Sendable {
     /// Plan index -> how many pumps passed it without opening a segment (#358). Survives producer
     /// restarts on purpose: the repeat across a restart is the signal.
     private var foldCounts: [Int: Int] = [:]
+    /// AE#412: what a stored segment's video is worth to a COLD arrival, per index. Absent = the
+    /// producer did not record it (live, or an unresolved time base), and callers must treat that
+    /// as "no claim" rather than as bad news.
+    private var videoReaches: [Int: VideoReach] = [:]
     /// #369: log-classification threshold: a run wider than this is a discontinuity-scale cut
     /// leap, not a long GOP. (It used to DROP such runs from the counters on the assumption they
     /// were repositions; the field case was a 2^33 wrap folding 312 indices, and dropping it left
@@ -171,7 +194,10 @@ final class SegmentCache: @unchecked Sendable {
     }
 
     /// Adopt a staging file via rename(2). Page cache pages stay warm; skips a Swift Data round trip.
-    func adopt(index: Int, stagingPath: URL, byteCount: Int) {
+    ///
+    /// `videoReach` (AE#412) is what this segment's video offers a cold arrival; nil leaves the
+    /// previous claim in place only if the index is re-adopted without one, which no caller does.
+    func adopt(index: Int, stagingPath: URL, byteCount: Int, videoReach: VideoReach? = nil) {
         let fileURL = sessionDir.appendingPathComponent("seg-\(index).m4s")
         let renameOK: Bool
         do {
@@ -204,6 +230,9 @@ final class SegmentCache: @unchecked Sendable {
             // A later epoch produced what an earlier one passed over: a re-anchor moved the
             // boundaries and this index is no longer a hole (#358).
             foldCounts.removeValue(forKey: index)
+            // AE#412: the claim describes THESE bytes, so a re-adoption replaces it, and an
+            // adoption that cannot state one must not leave the old epoch's claim standing.
+            videoReaches[index] = videoReach
         }
         let doomed = pruneOutsideWindow()
         condition.broadcast()
@@ -217,6 +246,7 @@ final class SegmentCache: @unchecked Sendable {
         let dir = sessionDir
         entries.removeAll(keepingCapacity: false)
         entryBytes.removeAll(keepingCapacity: false)
+        videoReaches.removeAll(keepingCapacity: false)
         initSegment = nil
         initVersions.removeAll(keepingCapacity: false)
         _totalBytes = 0
@@ -371,6 +401,16 @@ final class SegmentCache: @unchecked Sendable {
         condition.lock()
         defer { condition.unlock() }
         return foldCounts[index] ?? 0
+    }
+
+    /// AE#412: what the stored segment at `index` offers a cold arrival, or nil when nothing was
+    /// recorded for it (live, or a producer that could not resolve its time base). A caller must not
+    /// read nil as "unreachable": an unrecorded segment is exactly today's behaviour, not a defect.
+    func videoReach(_ index: Int) -> VideoReach? {
+        condition.lock()
+        defer { condition.unlock() }
+        guard entries[index] != nil else { return nil }
+        return videoReaches[index]
     }
 
     /// Record plan indices a cut jumped over. VOD only: a live playlist is built from what was
@@ -547,6 +587,7 @@ final class SegmentCache: @unchecked Sendable {
                     _totalBytes -= bytes
                     entryBytes.removeValue(forKey: k)
                     entries.removeValue(forKey: k)
+                    videoReaches.removeValue(forKey: k)
                     doomed.append(url)
                 }
             }
@@ -557,6 +598,7 @@ final class SegmentCache: @unchecked Sendable {
                 _totalBytes -= entryBytes[k] ?? byteSize(of: url)
                 entryBytes.removeValue(forKey: k)
                 entries.removeValue(forKey: k)
+                videoReaches.removeValue(forKey: k)
                 doomed.append(url)
             }
         }

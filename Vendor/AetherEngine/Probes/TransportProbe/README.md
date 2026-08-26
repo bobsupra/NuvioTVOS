@@ -7,7 +7,7 @@ failure rather than against a loopback server.
 Nothing here imports AetherEngine. The question is a property of the transport; routing it through
 the reader under suspicion would answer a different one.
 
-## Why it is a test bundle, and its own package
+## Why it is a test bundle, a package, and also an Xcode project
 
 tvOS has no command line, so an executable cannot run on the device that has the failure. An XCTest
 bundle can. The same code runs under `swift test` on macOS, where the earlier loopback attempt
@@ -17,27 +17,66 @@ It is a separate package because the engine's package scheme carries `aetherctl`
 `Foundation.Process` and cannot build for tvOS. The device that has the failure could not otherwise
 build the harness meant to measure it.
 
-## Run it
+The package alone still cannot reach an Apple TV. A SwiftPM test target is tool-hosted, and
+tool-hosted testing does not exist on device destinations:
 
-1. Put the source URL in `Tests/TransportProbe/ProbeTarget.swift`. That file is the whole
-   configuration, and it is a source file rather than an environment variable on purpose:
-   `TEST_RUNNER_`-prefixed settings are forwarded to UI-test runner apps, not to a unit-test bundle,
-   and a tvOS run with them set skipped the entire suite in silence. Measured, not assumed.
-2. Run it:
-
-```bash
-cd Probes/TransportProbe
-xcodebuild test -scheme TransportProbe-Package \
-  -destination 'platform=tvOS,id=<device-udid>' \
-  -test-timeouts-enabled NO \
-  -allowProvisioningUpdates
+```
+Cannot test target "TransportProbe" on "<device>": Tool-hosted testing is unavailable on device
+destinations. Select a host application for the test target, or use a simulator destination instead.
 ```
 
-Device UDIDs: `xcrun devicectl list devices`. In Xcode, open this directory as a package and run the
-test bundle against the Apple TV; the same file supplies the URL.
+So `Device/` carries an Xcode project with the host application that message asks for. It compiles
+the same files from `Tests/TransportProbe/`, nothing is duplicated, and the generated project is
+committed so a device run needs Xcode and nothing else. The host app earns its place twice beyond
+existing: it disables the screen saver, because an Apple TV that sleeps during a fifteen minute arm
+suspends the process and takes the held connection with it, which would read as the origin cutting
+it; and it prints the resolved target on the television, so a run whose configuration never arrived
+is visible before it reports as a skipped, green, empty suite.
 
-On macOS the environment still works and overrides the file, which keeps a local shakedown to one
-line: `AE_PROBE_URL='…' swift test`.
+## Run it
+
+The configuration lives in `Tests/TransportProbe/ProbeTarget.swift`, in every case. Put the source
+URL there first.
+
+That file is the whole configuration, and it is a source file rather than an environment variable on
+purpose: **no environment channel reaches a test process on a tvOS destination, simulator included.**
+`TEST_RUNNER_`-prefixed settings are forwarded to UI-test runner apps, not to a unit-test bundle, and
+a plain environment is not carried into a simulated process either. A tvOS run with the variables set
+takes the defaults and reports green, which is measured rather than assumed: the first such run
+skipped the entire suite in silence. Environment variables work on macOS and only there.
+
+**Apple TV.** From `Device/`:
+
+```bash
+xcodebuild test -project TransportProbe.xcodeproj -scheme TransportProbe \
+  -destination 'platform=tvOS,id=<device-udid>' \
+  -test-timeouts-enabled NO \
+  -allowProvisioningUpdates \
+  DEVELOPMENT_TEAM=<your team id>
+```
+
+Device UDIDs: `xcrun devicectl list devices`. In Xcode, open `Device/TransportProbe.xcodeproj`, pick
+the Apple TV, and run the test action; setting the team in the target editor does the same thing.
+
+If a team cannot register `de.superuser404.transportprobe.host` and `.tests`, add
+`PROBE_BUNDLE_PREFIX=com.example.probe` to that command. One knob covers both targets. Overriding
+`PRODUCT_BUNDLE_IDENTIFIER` instead would hand the app and the test bundle the same identifier and
+the install fails in a way that does not name the cause.
+
+**tvOS simulator.** Same project, simulator destination. Worth one pass to see the output before the
+device run, but the simulator does not reproduce #220, so arm C will correctly report that the run
+does not count.
+
+```bash
+xcodebuild test -project TransportProbe.xcodeproj -scheme TransportProbe \
+  -destination 'platform=tvOS Simulator,name=Apple TV 4K' -test-timeouts-enabled NO
+```
+
+**macOS.** The package, where the environment does work and keeps a shakedown to one line:
+
+```bash
+AE_PROBE_URL='…' swift test
+```
 
 With no URL in either place the whole suite is disabled and reports as skipped, which is what lets
 CI compile it without reaching the network.
@@ -55,6 +94,10 @@ AE_PROBE_URL=http://127.0.0.1:8477/big.bin AE_PROBE_WINDOW_SECONDS=110 \
   AE_PROBE_CANARY_URL=http://127.0.0.1:8477/neutral swift test
 ```
 
+That one line is macOS only. To point a simulator or a device at the local origin, put the same
+values in `ProbeTarget.swift`; the host app allows plain http for exactly this reason, so an http
+origin produces a measurement instead of an App Transport Security error that reads like a finding.
+
 Loopback makes arm B inconclusive by construction (250 ms of loopback is gigabytes), which is the
 harness telling the truth about itself.
 
@@ -71,15 +114,20 @@ Names: `resolve()`, `streamBackpressure()`, `dataTaskSuspendControl()`, `heldAcr
 ## The arms
 
 They are serialized and run in order. About 20 minutes for the set. Each arm waits for the origin
-to serve before it starts, because a source that refuses four minutes in ten would otherwise decide
-the run by timing.
+to serve before it starts, so a run that begins inside a refusal measures the transport instead of
+the timing.
+
+**Refusal windows are not periodic.** They recur, seven of them inside one episode, but a 45 minute
+arm D against the same source met none at all and its 135 canaries were served without exception.
+Whatever gates the refusal is not a clock and cannot currently be provoked, so arm D is a waiting
+game: `windowSeconds` is how long it is prepared to wait, not a period it has to exceed.
 
 | arm | duration | question |
 | --- | --- | --- |
 | A resolve | seconds | which edge answers, http/1.1 or h2, does it range |
 | B stream hold | ~2 min | does a stream task stop the sender when reads stop |
 | C data task + suspend | ~2 min | positive control: it must NOT stop the sender (#220) |
-| D held across the window | ~15 min | does a held connection cross the origin's refusal window |
+| D held across the window | `windowSeconds`, 15 min by default | does a held connection cross a refusal window, if one arrives |
 
 **Arm C is the one that validates the run.** #220 measured 911 MB arriving after a `suspend()`. If
 arm C reports a small "delivered DURING hold" and a flat footprint, this harness is not reproducing
@@ -88,11 +136,13 @@ attempt ended.
 
 **Arm D can end the plan on its own.** If the held stream gaps at the same moment its canary flips
 to 429, the origin cuts held connections too, no transport change helps, and nobody should write it.
+An arm that ends without a canary flip decides nothing either way, and says so, because it never met
+the case. It costs roughly 5 GB an hour at 20 Mbps, which is the price of waiting for one.
 
 ## Knobs
 
 Every knob exists in both places: a field in `ProbeTarget.swift` (0 or empty means "default") and an
-environment variable that overrides it.
+environment variable that overrides it on macOS. On tvOS the field is the only channel.
 
 | field / variable | default | what it is |
 | --- | --- | --- |

@@ -215,7 +215,8 @@ struct Issue388RedirectChainBudgetTests {
     /// What is asserted is what the ENGINE issues, not what the origin counted: a replacement
     /// connection briefly overlaps the one it replaces at any origin (the teardown window #307/#380
     /// is about), so a peak of one at the server is not something the reader can promise. Not
-    /// opening a second request on purpose while the pump streams is.
+    /// opening a second request on purpose while the pump streams is, and the budget's own
+    /// `peakInflight` is where the reader's side of that is readable.
     @Test("a declared ceiling of one issues no detour block behind the 302", .timeLimit(.minutes(2)))
     func declaredCeilingIssuesNoSecondRequestOnTheWire() async throws {
         let total: Int64 = 64 * 1024 * 1024
@@ -252,8 +253,21 @@ struct Issue388RedirectChainBudgetTests {
             try? await Task.sleep(nanoseconds: 2_000_000)
         }
 
-        #expect(OriginRequestBudget.shared.snapshot(for: mediaURL)?.inflight == 1,
-                "the connection streaming from the media host must be on its books while it streams")
+        // The books, not the moment. `inflight` was a wall-clock reading: it is 1 only while the
+        // pump still holds its connection, and by the time this line runs the pump has usually
+        // finished its bounded refill and let go. Measured on an untouched main, 5 of 6 full-suite
+        // runs read 0 here with every other fact intact (limit 1, chain linked, all 12 MB read),
+        // while the same test passed every time in isolation and under CPU saturation. That is a
+        // flake, and lowering it to `>= 0` would only have deleted the check.
+        //
+        // `peakInflight` is a high-water mark on the reader's own tickets, so it states both
+        // halves without depending on when it is read: the host behind the 302 is the one that
+        // streamed, and the reader never held a second ticket against it while it did. That is
+        // also the exact promise this test is about, which `inflight` never measured.
+        let books = try #require(OriginRequestBudget.shared.snapshot(for: mediaURL),
+                                 "the media host behind the 302 is not on the budget's books")
+        #expect(books.peakInflight == 1,
+                "the streaming connection was on the media host's books, and alone there")
         #expect(OriginRequestBudget.shared.requiresSerialRequests(mediaURL),
                 "the pinned target is where every request after the first is keyed")
 

@@ -18,6 +18,7 @@
   <img src="https://img.shields.io/badge/Swift-6.0%2B-F05138?logo=swift&logoColor=white">
   <img src="https://img.shields.io/badge/license-LGPL--3.0%20%2B%20App%20Store%20Exception-lightgrey">
   <a href="https://aetherengine.superuser404.de"><img src="https://img.shields.io/badge/docs-aetherengine.superuser404.de-4a6eff"></a>
+  <a href="https://discord.gg/P7NvpzNqnG"><img src="https://img.shields.io/badge/Discord-join-5865F2?logo=discord&logoColor=white"></a>
   <a href="https://ko-fi.com/superuser404"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
 
@@ -324,7 +325,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.34.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.47.0")
 ```
 
 Three samples ship in `Examples/`:
@@ -491,6 +492,14 @@ A test rig that only captures stdout / stderr (`devicectl device process launch 
 EngineLog.handler = { print($0) }   // every info-level line, verbatim
 ```
 
+The first line of any session names the FFmpeg that answered, because which one does is decided by your executable's link rather than by the package graph:
+
+```
+[FFmpeg] libavcodec 62.28.102, libavformat 62.6.100, libavutil 60.13.100, libswresample 6.0.100
+```
+
+If a second FFmpeg in the app takes those symbols, that line turns into an `ERROR:` naming the mismatch and how to find it. Worth reading once per integration: the failures a wrong FFmpeg produces look like engine defects, and one cost a reporter five fixtures and two devices before anyone looked at the link. Details in [docs/api.md › One FFmpeg](docs/api.md#one-ffmpeg-and-it-has-to-be-the-engines).
+
 The handler fires from whatever thread emitted the line (demuxer, producer pump, local server, audio bridge), so it must be thread-safe and non-blocking; serialize onto a queue before writing to a file. Per-segment trace lines are emitted at `.verbose` and reach os_log's debug level only, never the handler, so the mirrored stream stays readable. `aetherctl` installs exactly this handler, which is why the CLI prints what the app hides.
 
 ## Non-goals
@@ -508,7 +517,7 @@ Things AetherEngine deliberately doesn't do, so you don't have to read the sourc
 
 Browse all of this as a searchable site at **[aetherengine.superuser404.de](https://aetherengine.superuser404.de)**, or read the source Markdown here:
 
-- **[docs/api.md](docs/api.md)**: every public surface a host consumes, and the contracts that require it to act (how a load ends, `.ended`, the live retune, the audio tap, what must be set before `load`). A test fails the build when a host-facing public symbol is named nowhere in the docs.
+- **[docs/api.md](docs/api.md)**: every public surface a host consumes, and the contracts that require it to act (how a load ends, `.ended`, the live retune, the audio tap, what must be set before `load`, and which FFmpeg your link hands the engine). A test fails the build when a host-facing public symbol is named nowhere in the docs.
 - **[docs/architecture.md](docs/architecture.md)**: the three playback pipelines, the source-file map, dependencies, the SwiftUI `Menu` pattern.
 - **[docs/formats.md](docs/formats.md)**: codec / container coverage, HDR routing, audio bridging, subtitles, frame extraction, disc playback, live ingest, and known limitations.
 - **[docs/cli.md](docs/cli.md)**: the `aetherctl` repro CLI (twenty-one subcommands).
@@ -519,10 +528,10 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.34.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.47.0")
 ```
 
-Pin to `.upToNextMinor(from: "6.34.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "6.47.0")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
@@ -562,3 +571,5 @@ The exception covers AetherEngine's own code; it does not extend to its dependen
 ### Linking the engine statically
 
 An SPM library product links statically by default, and for the engine itself that is the intended shape on the App Store path. LGPL-3.0 section 4(d)(0) would otherwise ask for your application's object code in a relinkable form; the exception's fourth bullet names end-user re-linking explicitly, so that half does not apply. What the exception does not waive is the source side: point at the exact tag you built against rather than the repository root, and if you patched the engine, publish the patched source under LGPL. No separate written offer is needed while that pointer resolves. The dependencies above keep their own terms either way, which is why the FFmpeg frameworks have to stay dynamically embedded in `YourApp.app/Frameworks/` instead of merged into the app binary.
+
+Being dynamic is not the same as being reached. The engine calls `avcodec_*` as ordinary external symbols, so a second FFmpeg elsewhere in the app can serve them instead: a static archive pulled in with `-force_load` becomes a definition inside your executable and beats every dylib, and a dependency that exports the same symbols (libVLC does, and CocoaPods sorts a pod ahead of a vendored framework) wins on order alone. Link AetherEngine's frameworks first. `nm -m <executable> | grep _avcodec_find_encoder` says who currently wins; the engine's own startup line says the same thing from the inside.

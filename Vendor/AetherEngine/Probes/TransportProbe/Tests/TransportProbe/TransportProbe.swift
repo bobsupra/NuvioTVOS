@@ -1,10 +1,11 @@
 import Foundation
 import Testing
 
-// AE#377, the deciding measurement. The origin that opened the issue refuses new requests for about
-// four minutes out of every ten and recovers on its own. No read-ahead a device can hold reaches
-// across that, so the only client shape that survives it is the one ffmpeg uses: one connection,
-// held, consumed at playback rate. The engine cannot express that today because a URLSession data
+// AE#377, the deciding measurement. The origin that opened the issue refuses new requests in windows
+// that last minutes and recover on their own: seven of them inside a single episode. They are not on
+// a clock, and cannot be provoked, so what a client meets is a refusal that arrives without notice
+// and lasts longer than any read-ahead a device can hold. The only client shape that survives that
+// is the one ffmpeg uses: one connection, held, consumed at playback rate. The engine cannot express that today because a URLSession data
 // task has no flow-control contract (#174, #220: 911 MB still arriving after a suspend), and the
 // reader therefore ends its connection at winHighWater (16 MB on VOD, #310).
 //
@@ -20,14 +21,15 @@ import Testing
 // there too. A harness in which the known failure looks healthy decides nothing. Hence: device,
 // real origin, and the positive control in the same run as the question.
 //
-// Run it (Apple TV, on the same network the failures happen on), from this directory:
+// Run it (Apple TV, on the same network the failures happen on). The URL goes in ProbeTarget.swift,
+// because no environment channel reaches a test process on a tvOS destination, simulator included:
 //
-//   xcodebuild test -scheme TransportProbe-Package \
+//   cd ../Device
+//   xcodebuild test -project TransportProbe.xcodeproj -scheme TransportProbe \
 //     -destination 'platform=tvOS,id=<device-udid>' \
-//     -test-timeouts-enabled NO -allowProvisioningUpdates \
-//     TEST_RUNNER_AE_PROBE_URL='https://…the source URL…'
+//     -test-timeouts-enabled NO -allowProvisioningUpdates DEVELOPMENT_TEAM=<team>
 //
-// The arms are serialized and ordered; the whole set is about 20 minutes. Without AE_PROBE_URL the
+// The arms are serialized and ordered; the whole set is about 20 minutes. With no URL configured the
 // suite is disabled, which is why a bare run never touches the network.
 
 @Suite(.serialized, .enabled(if: ProbeConfig.resolve() != nil))

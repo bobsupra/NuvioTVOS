@@ -34,17 +34,23 @@ extension AetherEngine {
 
     /// Seconds of AVPlayer buffer ahead of the current playhead (sum of loadedTimeRanges beyond now). 0 on SW path / pre-start.
     /// Surfaced in the 30 s memprobe and the #65 VOD shift-publish diagnostic so a stale cross-epoch buffer is visible.
-    func avPlayerBufferAheadSeconds() -> Double {
+    ///
+    /// AE#422: async, because it hops off the main actor. Its one caller emits from inside a producer
+    /// restart, which is a state where the media server may not answer, and a figure that only ever
+    /// appears in a log line must not be able to block the app to produce itself.
+    func avPlayerBufferAheadSeconds() async -> Double {
         guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return 0 }
-        let now = item.currentTime().seconds
-        var ahead = 0.0
-        for value in item.loadedTimeRanges {
-            let range = value.timeRangeValue
-            let start = range.start.seconds
-            let end = (range.start + range.duration).seconds
-            if end > now { ahead += end - max(start, now) }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            let now = item.currentTime().seconds
+            var ahead = 0.0
+            for value in item.loadedTimeRanges {
+                let range = value.timeRangeValue
+                let start = range.start.seconds
+                let end = (range.start + range.duration).seconds
+                if end > now { ahead += end - max(start, now) }
+            }
+            return ahead
         }
-        return ahead
     }
 
     // MARK: - Memory diagnostic

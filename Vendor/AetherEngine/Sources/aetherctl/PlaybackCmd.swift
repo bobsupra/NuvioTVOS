@@ -28,7 +28,7 @@ struct TeletextPageSwitchRequest {
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
 func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
-                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false,
+                    censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false, pictureProbe: Bool = false,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
                     teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
                     sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil,
@@ -50,7 +50,7 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, declaredDuration: declaredDuration, httpHeaders: httpHeaders)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, declaredDuration: declaredDuration, httpHeaders: httpHeaders)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -228,7 +228,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:]) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, pictureProbe: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:]) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -308,6 +308,7 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
     let frameProbe = frameTimes ? FrameTimeProbe() : nil
+    let picture = pictureProbe ? PictureProbe() : nil
     if let frameProbe {
         engine.setSoftwareVideoFrameTimeObserver { [weak frameProbe] frame in
             frameProbe?.record(frame)
@@ -349,6 +350,17 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
               + engine.subtitleTracks.map { "#\($0.id) \($0.name)(\($0.language ?? "?"))" }
                 .joined(separator: ", "))
     }
+    // The source identity a host stats panel reads, in one line. Printed from the session (not from a
+    // separate probe) because that is the state the panel binds to, and the two can disagree: the
+    // remote-HLS bypass runs no probe and fills these from the item's sample type instead.
+    print("  SOURCE codec=\(engine.sourceVideoCodecName ?? "nil") "
+          + "container=\(engine.sourceContainerFormat ?? "nil") "
+          + "\(engine.sourceVideoWidth)x\(engine.sourceVideoHeight) "
+          + "fps=\(engine.sourceVideoFrameRate.map { String(format: "%.3f", $0) } ?? "nil") "
+          + "bitrate=\(engine.sourceVideoBitrate) "
+          + "fmt=\(engine.sourceVideoFormat)"
+          + (engine.sourceDVProfile.map { " dvProfile=\($0)" } ?? ""))
+
     // Mimic host-app post-load calls (AetherPlayer openInternal order) to reproduce
     // host-triggered transport races the bare harness would miss.
     var frameExtractor: FrameExtractor?
@@ -483,6 +495,19 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
             line += String(format: " alead=%.2f abufs=%d", end - engine.sourceTime, monitor.bufferCount)
         }
         line += networkTelemetryFragment(engine.liveTelemetry)
+        // AE#418: the picture states its own source time, so `axisErr` is what AVPlayer did with the
+        // segment rather than what the producer wrote, and `capErr` is the same error as a host
+        // placing a cue at `sourceTime` would make it.
+        if let picture {
+            picture.attachIfNeeded(engine.currentAVPlayerItem)
+            if let sample = picture.sample() {
+                line += String(format: " pic=%.3f picItem=%.3f axisErr=%+.3f capErr=%+.3f",
+                               sample.pictureSourceTime, sample.itemTime, sample.axisError,
+                               sample.pictureSourceTime - engine.sourceTime)
+            } else {
+                line += " pic=none"
+            }
+        }
         if let frameProbe {
             let tick = frameProbe.drainTick()
             line += " ft=\(tick.frames)"

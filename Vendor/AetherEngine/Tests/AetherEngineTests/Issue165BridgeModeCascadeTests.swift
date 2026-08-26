@@ -54,4 +54,18 @@ struct Issue165BridgeModeCascadeTests {
             #expect(cascade.last == AV_CODEC_ID_EAC3)
         }
     }
+
+    /// AE#396: the message said "absent from this FFmpeg build" while the build that answered was a
+    /// second FFmpeg the host had linked ahead of ours. It read as a statement about AetherEngine's
+    /// own build, and that reading is what sent the reporter through five fixtures and two devices.
+    @Test("the encoder-absent line names the libavcodec that answered, not 'this build'")
+    func encoderAbsentLineNamesTheAnsweringLibavcodec() {
+        let message = HLSVideoEngine.encoderAbsentMessage(missing: AV_CODEC_ID_FLAC,
+                                                          cascadingTo: AV_CODEC_ID_EAC3)
+        #expect(message.contains("flac"))
+        #expect(message.contains("eac3"))
+        #expect(message.contains("libavcodec"))
+        #expect(message.contains(FFmpegRuntimeCheck.avcodecIdentity))
+        #expect(!message.contains("this FFmpeg build"))
+    }
 }

@@ -79,13 +79,26 @@ struct PGSStaleArrivalGate {
     /// delegated to `admitDuringReconstruction`, which holds the lead-in's compositions and emits only the line
     /// group active at the playhead. Outside reconstruction the #100 stale hold governs: a catch-up backlog of
     /// arrivals behind the playhead is held for successor resolution and cannot flash through the overlay.
-    mutating func admit(cues: [SubtitleCue], isPGS: Bool, isSelfContained: Bool = false, playhead: Double) -> [SubtitleCue] {
+    /// #416: `groundIsRead` says whether the source between these cues and the playhead was
+    /// actually read by some harvest run. Only a cue BEHIND the playhead needs it, and it needs it
+    /// because that is the whole of its claim: a PGS set has no end of its own, so "still on screen
+    /// at the playhead" means "nothing on this stream happened in between", and an empty store over
+    /// unread ground is not evidence of that. False makes such a cue ineligible, here and in the
+    /// reconstruction pass alike; a cue at or after the playhead is unaffected, it claims nothing
+    /// about ground behind it. Defaults to true so every caller that cannot answer keeps the
+    /// behaviour it had, which is also what an unreporting harvest path gets from the store.
+    mutating func admit(cues: [SubtitleCue], isPGS: Bool, isSelfContained: Bool = false,
+                        playhead: Double, groundIsRead: Bool = true) -> [SubtitleCue] {
         guard isPGS, !cues.isEmpty else { return cues }
         if reconstructing {
-            return admitDuringReconstruction(cues: cues, isSelfContained: isSelfContained, playhead: playhead)
+            return admitDuringReconstruction(cues: cues, isSelfContained: isSelfContained,
+                                             playhead: playhead, groundIsRead: groundIsRead)
         }
         let stale = cues.allSatisfy { $0.startTime < playhead - staleEpsilonSeconds }
         guard stale else { return cues }
+        // #416: a stale arrival publishes only if its window turns out to cover the playhead, which
+        // is the same claim over the same unread ground. Nothing to hold it for.
+        guard groundIsRead else { return [] }
         heldCues = cues
         return []
     }
@@ -104,11 +117,21 @@ struct PGSStaleArrivalGate {
     /// references are missing fails decode and never gets here), and the steady-state path outside reconstruction
     /// already publishes Normal compositions unconditionally. `isSelfContained` stays on the signature: callers
     /// keep reporting the PCS classification, which the epoch-start-aware backscan direction would need.
-    private mutating func admitDuringReconstruction(cues: [SubtitleCue], isSelfContained: Bool, playhead: Double) -> [SubtitleCue] {
+    private mutating func admitDuringReconstruction(cues: [SubtitleCue], isSelfContained: Bool,
+                                                    playhead: Double,
+                                                    groundIsRead: Bool = true) -> [SubtitleCue] {
         // #146: all objects of one display set arrive in a single decode event sharing a start, so
         // the candidate is the newest same-start GROUP behind the playhead; a same-start re-seed is
         // a re-decode of the same set and replaces the group wholesale.
-        let behind = cues.filter { $0.startTime <= playhead }
+        // #416: only a set whose ground up to the playhead was read can be that candidate. The
+        // reporter's case is a set the harvest reached just before it was re-aimed somewhere else,
+        // whose own clear sits in the stretch that was then skipped: it decodes at the landing, no
+        // successor is stored between it and the playhead because nobody looked, and the pass emits
+        // half a minute of history over the new scene. Refusing costs the landing line in the case
+        // where the set really is still up and the proof is missing, which needs a dwell long
+        // enough to span the whole unread stretch; publishing costs it in every case where it is
+        // not, which is every normally authored set in that stretch.
+        let behind = groundIsRead ? cues.filter { $0.startTime <= playhead } : []
         if let newestStart = behind.map(\.startTime).max(),
            reconstructionCandidates.first.map({ newestStart >= $0.startTime }) ?? true {
             reconstructionCandidates = behind.filter { $0.startTime == newestStart }

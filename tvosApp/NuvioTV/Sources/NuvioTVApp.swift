@@ -3119,9 +3119,6 @@ struct TVHomeView: View {
             Task { await loadJellyfinSection() }
         }
         .onAppear {
-            #if DEBUG
-            print("[ContinueWatching] Home appeared source=\(selectedProgressSource.rawValue)")
-            #endif
             // A TabView may recreate Home instead of keeping it mounted. Arm
             // before its saved focus is restored so the first layout pass is
             // already non-animated.
@@ -3285,9 +3282,6 @@ struct TVHomeView: View {
             }
         }
         .onDisappear {
-            #if DEBUG
-            print("[ContinueWatching] Home disappeared; cancelling refresh")
-            #endif
             focusWork.cancelAll()
             homeReloadTask?.cancel()
             continueWatchingRefreshTask?.cancel()
@@ -4416,7 +4410,6 @@ struct TVHomeView: View {
         var sections: [TVHomeSection] = []
         for collection in stored {
             if disabledCollectionIds.contains(collection.id) {
-                print("Home: skip disabled collection id=\(collection.id) title=\(collection.title)")
                 continue
             }
             // Keep every folder card — including empty / TMDB / Trakt-only.
@@ -4432,7 +4425,6 @@ struct TVHomeView: View {
                 )
             }
             if folders.isEmpty {
-                print("Home: skip collection with no folders id=\(collection.id) title=\(collection.title)")
                 continue
             }
             sections.append(
@@ -4445,7 +4437,6 @@ struct TVHomeView: View {
                 )
             )
         }
-        print("Home: \(sections.count)/\(stored.count) collection row(s) from store")
         return sections
     }
 
@@ -4888,13 +4879,6 @@ struct TVHomeView: View {
     /// disagrees with where focus actually is, and that is invisible otherwise.
     private func logRowWindow(_ reason: String) {
         let sections = visibleSections.filter(\.hasContent)
-        let focusIndex = focusedSectionId.flatMap { id in
-            sections.firstIndex(where: { $0.id == id })
-        }
-        print("[HomeRows] \(reason): focusedCardID=\(focusedCardID ?? "nil") "
-            + "focusedSectionId=\(focusedSectionId ?? "nil") focusedRowIndex=\(focusedRowIndex) "
-            + "resolvedIndex=\(focusIndex.map(String.init) ?? "NOT FOUND") "
-            + "sections=\(sections.count)")
     }
     #endif
 
@@ -4928,9 +4912,6 @@ struct TVHomeView: View {
     }
 
     private func scheduleContinueWatchingRefresh() {
-        #if DEBUG
-        print("[ContinueWatching] Scheduling source=\(selectedProgressSource.rawValue)")
-        #endif
         continueWatchingRefreshTask?.cancel()
         continueWatchingRefreshTask = Task {
             await refreshContinueWatchingFromSelectedSource()
@@ -4956,14 +4937,8 @@ struct TVHomeView: View {
             }
         }
 
-        #if DEBUG
-        print("[ContinueWatching] Refresh \(generation) started source=\(source.rawValue) profile=\(profileID ?? "none")")
-        #endif
         refreshContinueWatching()
         guard usesRemoteProgress else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) using local source")
-            #endif
             // The ledger this just read is only as fresh as the last account
             // pull. Ask for a new one; it lands via the store's change
             // notification, which already refreshes the row.
@@ -4976,38 +4951,20 @@ struct TVHomeView: View {
             source: source
         )
         guard !Task.isCancelled else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) discarded: task cancelled")
-            #endif
             return
         }
         guard generation == continueWatchingRefreshGeneration else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) discarded: newer generation \(continueWatchingRefreshGeneration)")
-            #endif
             return
         }
         guard profileID == ContinueWatchingStore.activeProfileId else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) discarded: profile changed")
-            #endif
             return
         }
         guard source == selectedProgressSource, usesRemoteProgress else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) discarded: source changed")
-            #endif
             return
         }
         guard let items else {
-            #if DEBUG
-            print("[ContinueWatching] Refresh \(generation) failed: provider returned nil")
-            #endif
             return
         }
-        #if DEBUG
-        print("[ContinueWatching] Refresh \(generation) displaying \(items.count) items")
-        #endif
         // The row shows one card per title, but a remote provider can return a
         // paused playback per episode — two rows for one series otherwise, and
         // a duplicate-key trap downstream. The provider already sorts newest
@@ -8562,6 +8519,9 @@ enum NuvioDateDisplay {
         guard let raw = value?.trimmingCharacters(in: .whitespacesAndNewlines),
               !raw.isEmpty else {
             return nil
+        }
+        if raw.caseInsensitiveCompare("tbd") == .orderedSame || raw.caseInsensitiveCompare("tba") == .orderedSame {
+            return "TBD"
         }
 
         let datePart = String(raw.prefix(10))

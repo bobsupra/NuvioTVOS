@@ -12,7 +12,7 @@ MPVKit and AetherEngine’s FFmpegBuild both ship frameworks/modules named `Liba
 | Package | Location | Change |
 |---|---|---|
 | FFmpegBuild 2.4.3 | `Vendor/FFmpegBuild` | Frameworks/modules renamed to `AetherLib*`; install names rewritten; headers rewritten to use `<AetherLib…/…>` cross-includes; Microsoft legacy video decoders enabled |
-| AetherEngine 6.34.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*` |
+| AetherEngine 6.47.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*` |
 
 Refresh script: `Vendor/namespace_ffmpegbuild.py` (re-run after restoring upstream `Lib*.xcframework` trees).
 

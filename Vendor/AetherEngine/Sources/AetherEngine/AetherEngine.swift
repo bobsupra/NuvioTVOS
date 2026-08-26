@@ -263,6 +263,17 @@ public final class AetherEngine: ObservableObject {
         setDeferredSeek(inFlight: false, target: nil)
     }
 
+    /// AE#412: run `preparedSeekLanding` off the main actor. It parks on the pump while a re-cut
+    /// opens its gate, and a seek must not hold the main actor for that (AE#422).
+    private static func prepareSeekLanding(
+        session: HLSVideoEngine?, itemSeconds: Double
+    ) async -> Double {
+        guard let session else { return itemSeconds }
+        return await Task.detached(priority: .userInitiated) {
+            session.preparedSeekLanding(itemSeconds: itemSeconds)
+        }.value
+    }
+
     /// Rejection path: the seek never reached a host, so it gets a standalone event and no `.began`.
     func emitSeekRejected(_ reason: SeekEvent.Rejection, target: Double) {
         emitSeekEvent(id: nextSeekEventID(), origin: .programmatic, outcome: .rejected(reason), target: target)
@@ -511,6 +522,19 @@ public final class AetherEngine: ObservableObject {
     /// stream's `codecpar.bit_rate`, or the Matroska `BPS` statistics tag when that is 0 (mkvmerge). Static
     /// container info for Stats-for-Nerds; the live per-second rate lives in `LiveTelemetry`.
     @Published public internal(set) var sourceVideoBitrate: Int64 = 0
+
+    /// Source video codec in the libavcodec vocabulary ("hevc", "h264", "av1", "mpeg2video"), nil before
+    /// load and when the source has no video track. On the probe-free native HLS bypass it is mapped back
+    /// from the item's video sample type, so one field means one thing on every path. Companion to
+    /// `sourceVideoFormat` for Stats-for-Nerds; `activeVideoDecoder` names what is decoding it, which is a
+    /// different question (a codec has more than one decoder, and the answer changes with hardware).
+    @Published public internal(set) var sourceVideoCodecName: String? = nil
+
+    /// Container libavformat opened ("matroska,webm", "mpegts", "mov,mp4,m4a,3gp,3g2,mj2"), nil before load
+    /// and on the native HLS bypass (AVFoundation opens that one, there is no libav context to ask). This is
+    /// the container that ARRIVED: on a remux or transcode session it differs from the one the host's library
+    /// holds, and that difference is the thing a stats panel exists to show.
+    @Published public internal(set) var sourceContainerFormat: String? = nil
 
     // MARK: - Disc titles / chapters (#67)
 
@@ -1512,8 +1536,8 @@ public final class AetherEngine: ObservableObject {
 
     /// Source video dimensions from the probe. Used as a bitmap-subtitle canvas fallback before the first PCS
     /// is parsed. 0 before load or when source has no video (AetherEngine#28). Also available in SourceProbe.
-    public private(set) var sourceVideoWidth: Int32 = 0
-    public private(set) var sourceVideoHeight: Int32 = 0
+    @Published public private(set) var sourceVideoWidth: Int32 = 0
+    @Published public private(set) var sourceVideoHeight: Int32 = 0
     /// Display-width multiplier for non-square source pixels: `sourceVideoWidth * this` is the width
     /// the picture presents at. 1 before load, on square-pixel sources, and whenever the declared
     /// ratio is one the engine refuses to believe (#290), so it is never a number the picture
@@ -1699,6 +1723,24 @@ public final class AetherEngine: ObservableObject {
         isLive && clockNow <= clockAtReload + progressEpsilon && isWaitingToPlay
     }
 
+    /// #405: whether stage 2 has anything to fix. Replacing the consumer's item helps a consumer
+    /// that died under a HEALTHY producer; against a producer starved by its origin it refills the
+    /// same frozen tail, parks again, and the retune the host actually needs waits out two more
+    /// grace windows (field trace: 12 s and eleven replayed seconds on a one-slot Xtream host).
+    /// Consumer fetches cannot tell the two apart, they are zero in both. The finalized-segment
+    /// count can: it is the producer answering.
+    ///
+    /// `nil` on either side means there is no local producer to ask (a remote HLS session AVPlayer
+    /// fetches itself), and absence is not starvation: stage 2 keeps its old behaviour there.
+    nonisolated static func liveProducerIsStarved(
+        isLive: Bool,
+        segmentsAtStall: Int?,
+        segmentsNow: Int?
+    ) -> Bool {
+        guard isLive, let atStall = segmentsAtStall, let now = segmentsNow else { return false }
+        return now <= atStall
+    }
+
     /// #93 round 3: item death (failedToPlayToEndTime after -12889 strikes) escalation.
     /// Deferred-confirm task (a transient that resumes within the window self-clears) plus the
     /// bounded reload budget. Cancelled on load reset; superseded by newer deaths.
@@ -1837,9 +1879,17 @@ public final class AetherEngine: ObservableObject {
         guard let host = nativeHost, let player = currentAVPlayer,
               let item = player.currentItem else { return }
         guard player.timeControlStatus != .paused else { return }
+        // AE#422: the rendered position comes from the mirror, not from `player.currentTime()`.
+        // Two reasons, and either one is enough. It is the right VALUE: this parameter exists to keep
+        // the anchor from sitting below the frame on screen (#115), and `currentTime()` is the clock,
+        // which diverges from the rendered frame during exactly the landing this runs in (#123).
+        // And it is the right THREAD: `currentTime()` is a sync XPC round trip to mediaserverd, and
+        // this line runs on the main actor in the one state where that server is not answering. The
+        // reporter measured 13.3 s of fully blocked app on such a read, returning 30 ms after the
+        // watchdog fired. The mirror is written by the periodic observer and costs a lock.
         let anchor = Self.recoveryAnchorPosition(
             frozenPosition: position, pendingSeekTarget: pendingRecoverySeekClockTarget,
-            currentRendered: player.currentTime().seconds)
+            currentRendered: renderedPositionMirror.get())
         stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
         EngineLog.emit(
             "[AetherEngine] #65 re-engaging stalled AVPlayer (\(trigger)): nudge seek to "
@@ -2079,9 +2129,11 @@ public final class AetherEngine: ObservableObject {
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
             allowPausedConsumer: allowPausedConsumer) else { return }
+        // AE#422: mirror, not `currentTime()`. See `reengageStalledConsumer`; this path runs one
+        // grace window deeper into the same stall.
         let anchor = Self.recoveryAnchorPosition(
             frozenPosition: position, pendingSeekTarget: pendingRecoverySeekClockTarget,
-            currentRendered: player.currentTime().seconds)
+            currentRendered: renderedPositionMirror.get())
         stallRecoveryWindowUntil = Date().addingTimeInterval(Self.stallRecoveryWindowSeconds)
         EngineLog.emit(
             "[AetherEngine] #65 nudge did not revive the consumer; reloading item at "
@@ -2533,6 +2585,8 @@ public final class AetherEngine: ObservableObject {
     public init() throws {
         // Route av_log into EngineLog before any libav* entry point so probe/load diagnostics are captured.
         FFmpegLogBridge.install()
+        // Which FFmpeg answers is decided by the host's link, not by the package graph (AE#396).
+        FFmpegRuntimeCheck.logOnce()
         _ = DeinterlaceHardwareWarmup.shared
 
         // Declare category + multichannel support but do NOT activate the session here.
@@ -2846,6 +2900,8 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoCodecName = nil
+        sourceContainerFormat = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
@@ -3070,6 +3126,10 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = detectedDVProfileNum
         sourceVideoFrameRate = detectedRate
         sourceVideoBitrate = detectedVideoBitrate
+        sourceVideoCodecName = detectedCodecID == AV_CODEC_ID_NONE
+            ? nil
+            : avcodec_get_name(detectedCodecID).map { String(cString: $0) }
+        sourceContainerFormat = probeOpened ? probe.containerFormatName : nil
         audioTracks = probedAudioTracks
         applyConfirmedAtmos()
         subtitleTracks = probedSubtitleTracks
@@ -3872,6 +3932,7 @@ public final class AetherEngine: ObservableObject {
             // Live SW: drive the host's ring-backed DVR reseed directly; no AVPlayer-clock translation applies.
             if softwareHost != nil, nativeHost == nil {
                 EngineLog.emit("[AetherEngine] SW live seek target=\(target)", category: .engine)
+                softwareSubtitlePacketStore?.noteHarvestAnchor(.pump, at: target)   // #416
                 await softwareHost?.seek(to: target)
                 guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
                 clock.currentTime = target
@@ -3912,7 +3973,25 @@ public final class AetherEngine: ObservableObject {
         // STC base so `target` (0-based, matching duration) lands on the source-PTS shift the producer subtracts,
         // i.e. clockTarget == the 0-based playlist time (AE#105). Origin 0 off disc, so this stays
         // `target - playlistShiftSeconds` for normal VOD; SW/audio hosts run on source time (shift 0), no-op.
-        let clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
+        var clockTarget = PresentationAxis.source(displayTime: target, origin: sourcePresentationOrigin) - playlistShiftSeconds
+        // AE#418 round 2: AVPlayer throws a sub-second axis offset away at a seek and snaps back to
+        // the playlist; a larger one it carries through unchanged (measured with `play
+        // --picture-probe`: -0.500 and -0.875 read `axisErr=0.000` after a seek, -1.000 through
+        // -11.000 all survive one). The target above is deliberately computed on the axis AVPlayer
+        // still had when the seek was issued; from the landing forward the clock describes the axis
+        // it will have instead.
+        nativeVideoSession?.snapAxisAfterSeek(landingItemSeconds: clockTarget)
+        // AE#412: inside a keyframe drought, audio opened plan boundaries the keyframe-gated cutter
+        // folded, so the landing segment can carry no random-access point at all. AVPlayer reaches
+        // back a fixed few seconds on a cold seek and does not look for one, so the picture would
+        // start at the next sync sample ABOVE the target and the seek would silently skip content
+        // (measured: a seek to 50.0 s landed at 55.0 s on a 12 s drought). This re-cuts that segment
+        // from its covering random-access point so it covers the target before the seek goes out.
+        // The target itself is unchanged: AVPlayer places the re-cut segment at its own tfdt inside
+        // the timeline it is already building. Off the main actor: it parks on the pump.
+        clockTarget = await Self.prepareSeekLanding(
+            session: nativeVideoSession, itemSeconds: clockTarget)
+        guard loadGeneration == loadGen, seekGeneration == seekGen else { return }
         let gen = loadGeneration
         // Publish the native-path seek target up front so the scrub clock snaps immediately (#37); the host
         // suppresses periodic-observer reads until landing. SW/audio hosts resolve synchronously and write
@@ -3933,6 +4012,11 @@ public final class AetherEngine: ObservableObject {
         } else if let host = audioHost {
             hostReposition = await host.seek(to: clockTarget)
         } else if let host = softwareHost {
+            // #416: the software pump is this path's subtitle harvest, and it reads forwards from
+            // wherever this reposition puts it. Everything between where it had got to and here is
+            // ground nobody read; the drain must not read an empty store there as an authored
+            // silence. Stated before the seek: the demuxer lands at or before the target.
+            softwareSubtitlePacketStore?.noteHarvestAnchor(.pump, at: clockTarget)
             hostReposition = await host.seek(to: clockTarget)
         } else {
             // #93 retest: remember the target as recovery intent BEFORE awaiting; a wedged seek
@@ -4085,8 +4169,12 @@ public final class AetherEngine: ObservableObject {
                 // window is only wide enough to keep a FAR backward target clear of it, and a near one
                 // (less than the window back) would otherwise read the old, full buffer as progress at the
                 // target and earn an extension the producer never served.
-                let targetIsland = host.bufferedSecondsAtTarget(
-                    clockTarget, excludeAtOrAbove: seekIsForward ? nil : avpReal)
+                // AE#422: one off-main reading for both figures. This loop runs while a seek is not
+                // landing, so every synchronous read here is taken in the state where the media
+                // server is least likely to answer, and it was doing four of them per pass.
+                let bufferSnapshot = await host.seekBufferSnapshot(
+                    target: clockTarget, excludeAtOrAbove: seekIsForward ? nil : avpReal)
+                let targetIsland = bufferSnapshot.targetIsland
                 if Self.shouldExtendSeekDeadlineForProgress(
                     targetIslandSeconds: targetIsland,
                     previousIslandSeconds: lastTargetIslandSeconds,
@@ -4109,7 +4197,7 @@ public final class AetherEngine: ObservableObject {
                         "[AetherEngine] seek slow but producer serving target "
                         + "(island=\(String(format: "%.2f", targetIsland))s at target, "
                         + "rendered=\(String(format: "%.2f", avpReal))s "
-                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); extending budget "
+                        + "buffered=\(String(format: "%.2f", bufferSnapshot.bufferedEnd))s); extending budget "
                         + "\(deadlineExtensionsUsed)/\(Self.nativeSeekMaxDeadlineExtensions)",
                         category: .engine
                     )
@@ -4133,7 +4221,7 @@ public final class AetherEngine: ObservableObject {
                 // the re-anchored region, and wait for it to land -- reconciling FORWARD to the target,
                 // never back to the rendered position.
                 let wasStarved = seekIsWedged(
-                    renderedTime: avpReal, bufferedEnd: host.bufferedEnd)
+                    renderedTime: avpReal, bufferedEnd: bufferSnapshot.bufferedEnd)
                 // `targetBeyondCoverage` (AE#141) was computed above, before the extend branch, so it
                 // gates both the extension and this re-anchor decision.
                 let reason = wasStarved
@@ -4165,7 +4253,7 @@ public final class AetherEngine: ObservableObject {
                         + "\(reason), "
                         + "island=\(String(format: "%.2f", targetIsland))s at target, "
                         + "rendered=\(String(format: "%.2f", avpReal))s "
-                        + "buffered=\(String(format: "%.2f", host.bufferedEnd))s); holding clock at target "
+                        + "buffered=\(String(format: "%.2f", bufferSnapshot.bufferedEnd))s); holding clock at target "
                         + "\(String(format: "%.2f", target))s"
                         + (didReanchor
                             ? " and re-anchored producer at \(String(format: "%.2f", recoveryAnchor))s, re-seeking"
@@ -4462,6 +4550,8 @@ public final class AetherEngine: ObservableObject {
         sourceDVProfile = nil
         sourceVideoFrameRate = nil
         sourceVideoBitrate = 0
+        sourceVideoCodecName = nil
+        sourceContainerFormat = nil
         sourceVideoWidth = 0
         sourceVideoHeight = 0
         sourceVideoPixelAspectRatio = 1
