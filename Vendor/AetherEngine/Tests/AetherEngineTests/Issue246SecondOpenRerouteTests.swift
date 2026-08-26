@@ -64,7 +64,8 @@ struct Issue246SecondOpenRerouteTests {
         #expect(!RemoteHLSMediaSelection.shouldReroute(failure: failure, isCustomSource: true))
     }
 
-    @Test("The raw-live misroute keeps its AE#140 fail-closed contract after the fallback open")
+    // AE#363 gave the live classification its own destination; the VOD route must still not claim it.
+    @Test("The raw-live misroute never takes the native-bypass reroute, whichever open produced it")
     func rawLiveNeverReroutes() {
         let failure = HLSVideoEngine.openFailure(from: AVIOReaderError.hlsPlaylistOnRawLivePath)
         #expect(!RemoteHLSMediaSelection.shouldReroute(failure: failure, isCustomSource: false))

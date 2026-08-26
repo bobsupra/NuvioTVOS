@@ -27,7 +27,7 @@ struct ReadErrorReviveCapTests {
                                     dvModeAvailable: false)
         engine.readErrorReviveGate = MuxerFailureReviveGate(maxAttempts: 0)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0) }
+        engine.onVODSourceFailed = { code, _, _ in failed.set(code) }
 
         engine.handleVODReadErrorExit(-5)
 

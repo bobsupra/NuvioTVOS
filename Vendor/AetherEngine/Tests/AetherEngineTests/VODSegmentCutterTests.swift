@@ -90,6 +90,21 @@ final class VODSegmentCutterTests: XCTestCase {
         XCTAssertEqual(c.index(pts: 20_000, isKeyframe: true), 2)
     }
 
+    /// #368 contract: the producer's chunk-seam rebase feeds this cutter CONTINUOUS item-axis dts,
+    /// so a seam advances at most one boundary like any other packet. A raw 2^33 wrap fed directly
+    /// (what the rebase prevents) saturates at the tail clamp in a single call — the field failure.
+    func testRebasedChunkSeamAdvancesOneBoundaryWhileRawWrapSaturates() {
+        var rebased = VODSegmentCutter(sourceBoundaries: fourSeg, planAnchorPts: 0, baseIndex: 0)
+        _ = rebased.index(pts: 0, isKeyframe: true)
+        XCTAssertEqual(rebased.index(pts: 3960, isKeyframe: false), 0)   // last pre-seam frame
+        XCTAssertEqual(rebased.index(pts: 4000, isKeyframe: true), 1)    // seam IRAP, rebased dts
+        XCTAssertEqual(rebased.index(pts: 8000, isKeyframe: true), 2)
+
+        var raw = VODSegmentCutter(sourceBoundaries: fourSeg, planAnchorPts: 0, baseIndex: 0)
+        _ = raw.index(pts: 0, isKeyframe: true)
+        XCTAssertEqual(raw.index(pts: 8_589_934_592, isKeyframe: true), 3)   // 2^33: tail clamp
+    }
+
     /// A restart whose gate overshot its target still opens at `baseIndex`: the producer rebases the
     /// gating keyframe onto the segment's advertised start, and the cutter sees exactly that.
     func testRestartGateOvershootStillOpensBaseIndex() {

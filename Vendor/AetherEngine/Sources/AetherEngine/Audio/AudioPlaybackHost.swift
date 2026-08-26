@@ -19,7 +19,8 @@ final class AudioPlaybackHost {
     @Published private(set) var currentTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    @Published private(set) var failureMessage: String?
+    /// #376: carries the classification with the message, so the engine can publish both.
+    @Published private(set) var failure: PlaybackErrorInfo?
     @Published private(set) var didReachEnd: Bool = false
 
     // MARK: - Internals
@@ -297,7 +298,9 @@ final class AudioPlaybackHost {
         let setClockArmed: @Sendable () -> Void = { [weak self] in self?.clockArmed = true }
         let getSeekGeneration: @Sendable () -> UInt64 = { [weak self] in self?.seekGeneration ?? 0 }
         let onError: @Sendable (String) -> Void = { [weak self] msg in
-            Task { @MainActor [weak self] in self?.failureMessage = msg }
+            Task { @MainActor [weak self] in
+                self?.failure = PlaybackErrorInfo(kind: .audioSessionFailed, message: msg)
+            }
         }
         let onEnd: @Sendable () -> Void = { [weak self] in
             Task { @MainActor [weak self] in

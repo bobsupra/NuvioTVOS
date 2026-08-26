@@ -567,12 +567,23 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
 
     // MARK: - Pixel Aspect Ratio (anamorphic SD)
 
-    /// The stream's declared SAR, bitstream first. Neither field alone is the whole answer: codecpar
-    /// carries what the bitstream said (the mpegts / mpeg-ps parsers fill it), while a
-    /// container-declared ratio reaches AVStream alone. Sanity is not judged here; the caller runs
-    /// both gates against the frame.
+    /// The stream's declared SAR. Neither field alone is the whole answer: codecpar carries what the
+    /// bitstream said (the mpegts / mpeg-ps parsers fill it), while a container-declared ratio
+    /// reaches AVStream alone (Matroska's DisplayWidth quotient, MP4's `pasp`).
+    ///
+    /// A container that declares a real correction wins, because it is the later authoring layer:
+    /// `mkvmerge --aspect-ratio` writes DisplayWidth and leaves the bitstream alone, so the two
+    /// disagree by design and the newer one is the intent. This is also what every ffmpeg-based
+    /// player resolves to (`av_guess_sample_aspect_ratio` returns the stream ratio wherever it is
+    /// set), and what an MP4 `pasp` means to AVFoundation. A SQUARE declaration is not a
+    /// correction and therefore not a claim to prefer, on either side: reading `1:1` out of the
+    /// bitstream as "declared" is what hid a container-declared ratio entirely.
+    ///
+    /// Sanity is not judged here; the caller runs both gates against the frame.
     static func declaredStreamSAR(bitstream: AVRational, container: AVRational) -> AVRational {
-        (bitstream.num > 0 && bitstream.den > 0) ? bitstream : container
+        if container.num > 0, container.den > 0, container.num != container.den { return container }
+        if bitstream.num > 0, bitstream.den > 0 { return bitstream }
+        return container
     }
 
     /// #177 resolution order: frame -> codec context -> stream, first sane wins. The frame usually
@@ -582,12 +593,21 @@ final class SoftwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     /// #290: sanity is judged against the coded dimensions, so a SAR whose numbers are plausible
     /// but whose display aspect is not (a live 1080p channel declaring 3:1) drops through to the
     /// next source, and to square pixels when no source survives. See `PixelAspectPolicy`.
+    ///
+    /// A square candidate does not end the search either. It corrects nothing, so treating it as an
+    /// answer only means the axes behind it are never read: an anamorphic MKV whose H.264 VUI says
+    /// square (the shape `mkvmerge --aspect-ratio` leaves behind) was drawn at its coded size while
+    /// the ratio sat in the container, one axis further down. nil and 1:1 attach the same nothing.
     static func resolveSAR(
         frame: AVRational, codecCtx: AVRational, stream: AVRational, width: Int32, height: Int32
     ) -> AVRational? {
-        PixelAspectPolicy.saneSAR(frame, width: width, height: height)
-            ?? PixelAspectPolicy.saneSAR(codecCtx, width: width, height: height)
-            ?? PixelAspectPolicy.saneSAR(stream, width: width, height: height)
+        for candidate in [frame, codecCtx, stream] {
+            if let sane = PixelAspectPolicy.saneSAR(candidate, width: width, height: height),
+               sane.num != sane.den {
+                return sane
+            }
+        }
+        return nil
     }
 
     /// #177 per-stream latch: the first sane non-square SAR wins for the rest of the stream, so

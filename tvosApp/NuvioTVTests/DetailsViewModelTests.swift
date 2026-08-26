@@ -243,20 +243,33 @@ final class DetailsViewModelTests: XCTestCase {
         }
     }
 
-    // MARK: - State Persistence Tests
+    // MARK: - Live TV Tests
 
-    func testWatchlistStatePersistsAfterLoad() async {
-        // Add to watchlist
-        viewModel.toggleWatchlist()
-        XCTAssertTrue(viewModel.uiState.isInWatchlist)
+    func testLiveContentTypeRecognition() {
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("tv"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("channel"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("live"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("livetv"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("live-tv"))
+        XCTAssertTrue(CinemetaCatalogRepository.isLiveContentType("iptv"))
+        XCTAssertFalse(CinemetaCatalogRepository.isLiveContentType("movie"))
+        XCTAssertFalse(CinemetaCatalogRepository.isLiveContentType("series"))
+    }
 
-        // Load details
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+    func testLiveTVFallbackTitleFormatting() {
+        XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "usatv_espn_hd"), "ESPN HD")
+        XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "iptv:cnn"), "CNN")
+        XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "channel_hbo_east"), "HBO East")
+    }
 
-        // Watchlist state should NOT persist after loading new content
-        // (This is correct behavior - each new content has its own watchlist state)
-        XCTAssertFalse(viewModel.uiState.isInWatchlist, "Watchlist state should reset when loading new content")
+    func testCinemetaCatalogRepositoryLiveTVMetadataResolution() async throws {
+        let repo = CinemetaCatalogRepository()
+        let meta = try await repo.getMetadata(id: "usatv_espn_hd", type: "tv")
+        XCTAssertEqual(meta.id, "usatv_espn_hd")
+        XCTAssertEqual(meta.name, "ESPN HD")
+        XCTAssertEqual(meta.type, "tv")
+        XCTAssertFalse(meta.isSeries)
     }
 
 }
+

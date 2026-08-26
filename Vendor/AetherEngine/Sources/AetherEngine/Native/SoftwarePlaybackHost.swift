@@ -52,7 +52,8 @@ final class SoftwarePlaybackHost {
     @Published private(set) var sourceClockSeconds: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    @Published private(set) var failureMessage: String?
+    /// #376: carries the classification with the message, so the engine can publish both.
+    @Published private(set) var failure: PlaybackErrorInfo?
     @Published private(set) var didReachEnd: Bool = false
 
     /// #315: `AVSampleBufferDisplayLayer.isReadyForDisplay` for the renderer's layer, this path's
@@ -292,6 +293,10 @@ final class SoftwarePlaybackHost {
 
     /// Set when pause() stopped the synchronizer; play() restores the rate (previously play() only flipped isPlaying, leaving the clock frozen).
     private var pausedByHost = false
+
+    /// AE#374: end of media parks the clock exactly once. Both demux loops can reach `onEnd`, and the
+    /// park is deferred by the queued audio tail, so the guard covers a second arrival mid-defer.
+    private var didParkClockAtEnd = false
 
     /// Invoked on the main-actor time-update cadence with the current
     /// session-relative live edge (seconds since first frame) while live.
@@ -834,6 +839,40 @@ final class SoftwarePlaybackHost {
         inFlightSeekResumeIntent = false
     }
 
+    /// AE#374: stop the master clock on the last sample instead of letting it free-run past the end.
+    ///
+    /// `.ended` is terminal, so nothing will consume the clock again, but the synchronizer used to keep
+    /// its rate: `currentTime` then walked past `duration` without bound (measured: 20.13 s published on
+    /// a 12.0 s source, against a native session that parks on 11.97 s and stays there). Deferred by the
+    /// audio still queued ahead of the playhead, because parking the synchronizer stops its renderers
+    /// too and an immediate park would cut that tail. `pausedByHost` stays false: the viewer did not
+    /// pause this, the source ran out.
+    private func parkClockAtEndOfMedia() {
+        guard !didParkClockAtEnd else { return }
+        didParkClockAtEnd = true
+        guard clockArmed, let aOut = audioOutput else { return }
+        let tail = SoftwareEndOfMediaClock.tailPlayoutSeconds(
+            clockSeconds: aOut.currentTimeSeconds,
+            lastAudioPts: demuxDiag.snapshot.lastAudioPts
+        )
+        guard tail > 0 else { return parkClockNow() }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: UInt64(tail * 1_000_000_000))
+            self?.parkClockNow()
+        }
+    }
+
+    private func parkClockNow() {
+        guard !stopRequested, let aOut = audioOutput else { return }
+        aOut.pause()
+        rate = 0
+        EngineLog.emit(
+            "[SWHost] end of media: clock parked at "
+            + "\(String(format: "%.3f", aOut.currentTimeSeconds))s",
+            category: .swPlayback
+        )
+    }
+
     /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
     func enterBackgroundAudioOnly() {
         backgroundAudioOnly = true
@@ -1105,12 +1144,19 @@ final class SoftwarePlaybackHost {
         let subTimeBases = subtitleStreamTimeBases
         let subSplitSetIndices = splitDisplaySetSubtitleStreamIndices
         let onError: @Sendable (String) -> Void = { [weak self] msg in
-            Task { @MainActor [weak self] in self?.failureMessage = msg }
+            Task { @MainActor [weak self] in
+                self?.failure = PlaybackErrorInfo(kind: .softwarePipelineFailed, message: msg)
+            }
         }
         let onEnd: @Sendable () -> Void = { [weak self] in
+            // AE#374: the diagnostic line has to say the producer is done, or a falling aLead over a
+            // frozen audio PTS reads exactly like drift on a running session.
+            self?.demuxDiag.markSourceExhausted()
             Task { @MainActor [weak self] in
-                self?.didReachEnd = true
-                self?.isPlaying = false
+                guard let self else { return }
+                self.parkClockAtEndOfMedia()
+                self.didReachEnd = true
+                self.isPlaying = false
             }
         }
 
@@ -2272,6 +2318,9 @@ final class SoftwarePlaybackHost {
     private var diagPrevDropped = 0
     private var diagPrevEnqueued = 0
     private var diagPrevDelay: TimeInterval = 0
+    /// AE#374: the post-end line reporting the parked clock has been emitted; the session is over and
+    /// the line stops rather than repeating itself at 1 Hz for as long as the host holds the engine.
+    private var didEmitParkedDiag = false
 
     /// 1 Hz [SWDiag] line: clock + clock delta, decoded-audio lead over the clock, parked
     /// video FIFO depth, rebuffer state, and the display layer's OWN drop counter with its
@@ -2282,8 +2331,16 @@ final class SoftwarePlaybackHost {
         diagTickCounter += 1
         guard diagTickCounter % 4 == 0 else { return }
         let prevClock = diagPrevClock
-        diagPrevClock = clock
         let d = demuxDiag.snapshot
+        // AE#374: past end of media the line has no news left, and a 1 Hz report of a falling aLead
+        // over a frozen audio PTS is a finding that does not exist. Keep reporting while the tail is
+        // still playing out, name the exhaustion, and fall silent on the tick that shows the clock
+        // parked on it.
+        if d.sourceExhausted {
+            if didEmitParkedDiag { return }
+            if prevClock.isFinite, clock == prevClock { didEmitParkedDiag = true }
+        }
+        diagPrevClock = clock
         let lead = d.lastAudioPts.isFinite && clock.isFinite ? d.lastAudioPts - clock : Double.nan
         let enqueued = framesEnqueued
         let dEnq = enqueued - diagPrevEnqueued
@@ -2317,6 +2374,7 @@ final class SoftwarePlaybackHost {
                 + "dclk=\(dclk.isFinite ? String(format: "%.2f", dclk) : "-") "
                 + "aLead=\(lead.isFinite ? String(format: "%.2f", lead) : "-") "
                 + "parked=\(d.parked) rebuf=\(d.rebuffering ? "y" : "n") "
+                + (d.sourceExhausted ? "eof=y " : "")
                 + "enq=+\(dEnq) layerDrop=\(dropped)(\(dDrop >= 0 ? "+" : "")\(dDrop)) "
                 + "delay=\(delay >= 0 ? String(format: "%.2f", delay) : "-")"
                 + "(\(dDelay >= 0 ? "+" : "")\(String(format: "%.2f", dDelay))) "
@@ -2358,6 +2416,7 @@ final class SWPlaybackDiagState: @unchecked Sendable {
     private var _lastAudioPts = Double.nan
     private var _parked = 0
     private var _rebuffering = false
+    private var _sourceExhausted = false
 
     func update(lastAudioPts: Double, parked: Int, rebuffering: Bool) {
         lock.lock()
@@ -2367,9 +2426,17 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         lock.unlock()
     }
 
-    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool) {
+    /// AE#374: the producer will yield nothing further. Set from the demux loops' end-of-media exit,
+    /// read by the diagnostic line, which without it describes a finished session as a drifting one.
+    func markSourceExhausted() {
+        lock.lock()
+        _sourceExhausted = true
+        lock.unlock()
+    }
+
+    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool, sourceExhausted: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (_lastAudioPts, _parked, _rebuffering)
+        return (_lastAudioPts, _parked, _rebuffering, _sourceExhausted)
     }
 }

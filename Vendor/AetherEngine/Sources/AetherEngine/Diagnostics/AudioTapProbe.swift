@@ -10,11 +10,14 @@ public enum AudioTapProbe {
         case noCacheOrProvider
         case noInitSegment
         case wavWriteFailed(String)
+        case notSoftwareRouted(String)
         public var description: String {
             switch self {
             case .noCacheOrProvider: return "session has no cache/provider"
             case .noInitSegment: return "no init segment after 30s"
             case .wavWriteFailed(let p): return "WAV write failed at \(p)"
+            case .notSoftwareRouted(let b):
+                return "source routed to \(b), not the software host; the SW sink cannot run"
             }
         }
 
@@ -97,6 +100,91 @@ public enum AudioTapProbe {
             + "discontinuities=\(sink.discontinuities) "
             + "sourceTime=[\(sink.firstSource ?? -1) ... \(sink.lastSource)] "
             + "wrote=\(outPath)"
+    }
+
+    /// What the software-path tap delivered. `run` / `runRemote` report the same numbers as a
+    /// string, but this path has to distinguish two outcomes a string hides from a caller: no
+    /// buffers at all and buffers of digital silence are different defects, and neither passes.
+    public struct SoftwareTapReport: CustomStringConvertible, Sendable {
+        public let buffers: Int
+        public let pcmSeconds: Double
+        public let discontinuities: Int
+        public let firstSource: Double?
+        public let lastSource: Double
+        public let peak: Float
+        public let outPath: String
+
+        /// True only if the tap yielded audible PCM.
+        public var delivered: Bool { buffers > 0 && peak > 0.0001 }
+
+        public var description: String {
+            "audiotap (software): buffers=\(buffers) "
+                + "pcmSeconds=\(String(format: "%.2f", pcmSeconds)) "
+                + "discontinuities=\(discontinuities) "
+                + "peak=\(String(format: "%.4f", peak)) "
+                + "sourceTime=[\(firstSource ?? -1) ... \(lastSource)] "
+                + "wrote=\(outPath)"
+        }
+    }
+
+    /// #400 software-path variant, and the reason it exists: `run` and `runRemote` drive their
+    /// readers directly, so the SW sink (`AudioTapPCMConverter`) was the one delivery path no
+    /// probe could reach, and a crash on its first multichannel buffer shipped and stayed.
+    /// This loads a real session, asserts it routed to the software host, installs the tap
+    /// through the public API and plays, so the sink runs exactly as it does in a host.
+    /// Unlike the other two modes this is bound to wall clock: the SW host decodes in real time.
+    @MainActor
+    public static func runSoftware(url: URL, durationSeconds: Double,
+                                   outPath: String) async throws -> SoftwareTapReport {
+        let engine = try AetherEngine()
+        try await engine.load(url: url)
+        guard engine.playbackBackend == .software else {
+            throw ProbeError.notSoftwareRouted(engine.playbackBackend.rawValue)
+        }
+        let stream = engine.installAudioTap()
+        engine.play()
+
+        // The stream only ends when the tap is removed, so nothing else would bound a source
+        // that never yields. removeAudioTap() finishes it, which is what releases the loop.
+        let deadline = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(durationSeconds * 3 * 1_000_000_000))
+            engine.removeAudioTap()
+        }
+        defer {
+            deadline.cancel()
+            engine.removeAudioTap()
+            engine.stop()
+        }
+
+        var samples: [Float] = []
+        var buffers = 0
+        var discontinuities = 0
+        var firstSource: Double?
+        var lastSource: Double = 0
+        var peak: Float = 0
+        for await buf in stream {
+            buffers += 1
+            if buf.discontinuity { discontinuities += 1 }
+            if firstSource == nil { firstSource = buf.sourceTime }
+            lastSource = buf.sourceTime
+            let frames = Int(buf.buffer.frameLength)
+            if let channel = buf.buffer.floatChannelData?[0] {
+                samples.append(contentsOf: UnsafeBufferPointer(start: channel, count: frames))
+                for i in 0..<frames { peak = max(peak, abs(channel[i])) }
+            }
+            if Double(samples.count) / AudioTapDefaults.sampleRate >= durationSeconds { break }
+        }
+
+        guard writeFloat32WAV(samples: samples,
+                              sampleRate: Int(AudioTapDefaults.sampleRate), to: outPath) else {
+            throw ProbeError.wavWriteFailed(outPath)
+        }
+        return SoftwareTapReport(
+            buffers: buffers,
+            pcmSeconds: Double(samples.count) / AudioTapDefaults.sampleRate,
+            discontinuities: discontinuities,
+            firstSource: firstSource, lastSource: lastSource,
+            peak: peak, outPath: outPath)
     }
 
     /// #95 remote-HLS variant: drives AudioTapHLSReader against a remote HLS URL through the real

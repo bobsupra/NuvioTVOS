@@ -215,6 +215,62 @@ enum TmdbDetailsService {
         return await fetchCompanies(tmdbId: resolved.id, mediaType: resolved.mediaType)
     }
 
+    static func fetchTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
+        guard useTrailers,
+              apiKey != nil,
+              let resolved = await resolveTmdbId(for: meta) else {
+            return nil
+        }
+        return await fetchTrailerYouTubeId(tmdbId: resolved.id, mediaType: resolved.mediaType)
+    }
+
+    static func fetchTrailerYouTubeId(tmdbId: Int, mediaType: String) async -> String? {
+        guard let apiKey else { return nil }
+
+        // 1. Try preferred language first
+        if let key = await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: preferredLanguage, apiKey: apiKey) {
+            return key
+        }
+
+        // 2. Fallback to en-US if preferred language differs
+        if preferredLanguage.caseInsensitiveCompare("en-US") != .orderedSame {
+            if let key = await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: "en-US", apiKey: apiKey) {
+                return key
+            }
+        }
+
+        // 3. Fallback to unlocalized / all languages
+        return await fetchVideosKey(tmdbId: tmdbId, mediaType: mediaType, language: nil, apiKey: apiKey)
+    }
+
+    private static func fetchVideosKey(tmdbId: Int, mediaType: String, language: String?, apiKey: String) async -> String? {
+        var components = URLComponents(
+            url: apiBase.appendingPathComponent("\(mediaType)/\(tmdbId)/videos"),
+            resolvingAgainstBaseURL: false
+        )!
+        var queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
+        if let language, !language.isEmpty {
+            queryItems.append(URLQueryItem(name: "language", value: language))
+        }
+        components.queryItems = queryItems
+        guard let url = components.url,
+              let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse,
+              (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(TmdbVideosResponse.self, from: data) else {
+            return nil
+        }
+
+        return decoded.results
+            .filter { $0.site?.caseInsensitiveCompare("YouTube") == .orderedSame }
+            .sorted { lhs, rhs in
+                if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
+                return (lhs.publishedAt ?? "") > (rhs.publishedAt ?? "")
+            }
+            .first?
+            .key
+    }
+
     static func fetchCredits(for meta: NuvioMeta) async -> TmdbCreditMetadata? {
         guard useCredits,
               let apiKey,
@@ -1221,3 +1277,29 @@ enum MdbListDetailsService {
         return nil
     }
 }
+
+private struct TmdbVideosResponse: Decodable {
+    let results: [TmdbVideoResult]
+}
+
+private struct TmdbVideoResult: Decodable {
+    let key: String?
+    let site: String?
+    let type: String?
+    let official: Bool?
+    let publishedAt: String?
+
+    enum CodingKeys: String, CodingKey {
+        case key, site, type, official
+        case publishedAt = "published_at"
+    }
+
+    var rank: Int {
+        var value = 0
+        if type?.caseInsensitiveCompare("Trailer") == .orderedSame { value += 100 }
+        if official == true { value += 50 }
+        if type?.caseInsensitiveCompare("Teaser") == .orderedSame { value += 25 }
+        return value
+    }
+}
+

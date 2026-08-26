@@ -35,7 +35,7 @@ struct SequentialOriginRepositionTests {
     func restartRefused() {
         let engine = makeEngine(sequential: true)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0) }
+        engine.onVODSourceFailed = { code, _, _ in failed.set(code) }
 
         engine.requestRestart(at: 12)
 
@@ -49,7 +49,7 @@ struct SequentialOriginRepositionTests {
         // over any pending target. Authority over the coalescer is not authority over the origin.
         let engine = makeEngine(sequential: true)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0) }
+        engine.onVODSourceFailed = { code, _, _ in failed.set(code) }
 
         engine.requestRestart(at: 40, authoritative: true)
 
@@ -62,7 +62,7 @@ struct SequentialOriginRepositionTests {
         // restart, which no-ops here (empty segment plan) without surfacing a failure.
         let engine = makeEngine(sequential: false)
         let failed = Flag()
-        engine.onVODSourceFailed = { failed.set($0) }
+        engine.onVODSourceFailed = { code, _, _ in failed.set(code) }
 
         engine.requestRestart(at: 12)
 

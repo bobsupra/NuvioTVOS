@@ -39,6 +39,9 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
     private let respond: @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive
+    /// #388: how many requests this origin tolerates at once before it answers 509, the way a
+    /// connection-capped panel does. nil keeps every existing test on the unmetered behaviour.
+    private let refuseAboveConcurrency: Int?
     private let lock = NSLock()
     private var _bytesWritten: Int64 = 0
     private var _connFDs: [Int32] = []
@@ -46,6 +49,23 @@ final class ThrottledOriginServer: @unchecked Sendable {
     private var _requestedRanges: [(start: Int64, end: Int64?)] = []
     private var _requestLog: [(path: String, start: Int64, end: Int64?)] = []
     private var _rangeHeaderPresent: [Bool] = []
+    private var _inflight = 0
+    private var _peakInflight = 0
+    private var _refusedForConcurrency = 0
+
+    /// #388: the most requests this origin ever had open at the same time. The reader's own budget
+    /// counts what it BELIEVES it issued against an origin; this counts what the origin saw, which
+    /// is the only side of the redirect the declared ceiling is supposed to be about.
+    var peakConcurrentRequests: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _peakInflight
+    }
+
+    /// Requests this origin refused because they arrived on top of `refuseAboveConcurrency`.
+    var refusedForConcurrency: Int {
+        lock.lock(); defer { lock.unlock() }
+        return _refusedForConcurrency
+    }
 
     var bytesWritten: Int64 {
         lock.lock(); defer { lock.unlock() }
@@ -89,11 +109,13 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// that difference is what let the speculative tail fetch pass every test while never once
     /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
+          refuseAboveConcurrency: Int? = nil,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
+        self.refuseAboveConcurrency = refuseAboveConcurrency
         self.firstByteDelayUs = firstByteDelayUs
         self.respond = respond
 
@@ -213,7 +235,28 @@ final class ThrottledOriginServer: @unchecked Sendable {
         _requestLog.append((path, offset, rangeEnd))
         _rangeHeaderPresent.append(hadRangeHeader)
         let requestIndex = _requestLog.count - 1
+        // #388: in flight from the moment this origin has a request to answer until its body is
+        // written. A request parked in `readRequestHeader` on a kept-alive socket is not one.
+        _inflight += 1
+        _peakInflight = max(_peakInflight, _inflight)
+        let concurrent = _inflight
+        let cap = refuseAboveConcurrency
+        if let cap, concurrent > cap { _refusedForConcurrency += 1 }
         lock.unlock()
+        defer {
+            lock.lock()
+            _inflight = max(0, _inflight - 1)
+            lock.unlock()
+        }
+
+        if let cap, concurrent > cap {
+            // What a connection-capped panel answers to the request that arrives on top of the
+            // one it is already serving (#307/#380: 509, not 429).
+            let header = "HTTP/1.1 509 Bandwidth Limit Exceeded\r\n"
+                + "Content-Length: 0\r\n"
+                + "Connection: keep-alive\r\n\r\n"
+            return writeFully(fd, Array(header.utf8))
+        }
 
         var silentAfter: Int64? = nil
         var dropAfter: Int64? = nil

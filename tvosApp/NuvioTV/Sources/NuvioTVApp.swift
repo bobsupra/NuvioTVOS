@@ -381,7 +381,7 @@ struct ContentView: View {
         }
         .onReceive(profileViewModel.$activeProfile) { profile in
             syncManager.activeProfileChanged(profile)
-            guard let profile else { return }
+            guard profile != nil else { return }
             SMBServerStore.shared.reload()
             JellyfinServerStore.shared.reload()
             Task(priority: .utility) {
@@ -608,6 +608,19 @@ struct ContentView: View {
         // Also accepts com.nuvio.app.tv and path-style /meta/… /details/…
         guard ["nuvio", "nuvio-tv", "com.nuvio.app.tv"].contains(scheme) else { return }
 
+        // Infuse returns here after its player closes. Keep this before the
+        // generic id guard: callback URLs intentionally carry only a session
+        // UUID, not a title id.
+        if let callback = ExternalPlaybackCallback.parse(url) {
+            switch activeScreen {
+            case .login, .profileSelection:
+                pendingDeepLinkURL = url
+            default:
+                handleExternalPlaybackCallback(callback)
+            }
+            return
+        }
+
         switch activeScreen {
         case .login, .profileSelection:
             pendingDeepLinkURL = url
@@ -648,6 +661,94 @@ struct ContentView: View {
 
         withAnimation(.easeInOut(duration: 0.28)) {
             openDetailsRoot(id: id, type: type)
+        }
+    }
+
+    private func handleExternalPlaybackCallback(_ callback: ExternalPlaybackCallback) {
+        let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+        guard let session = ExternalPlaybackSessionStore.consume(id: callback.id, profileID: profileID) else {
+            return
+        }
+        // An Infuse error callback means the handoff failed. Consuming the
+        // session still makes retries/idempotent duplicate callbacks harmless.
+        guard !callback.isError else { return }
+
+        let duration = session.duration.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+        let progress = callback.progress ?? callback.position.flatMap { position in
+            guard let duration, position.isFinite, position >= 0 else { return nil }
+            return position / duration
+        }
+        guard let progress, progress.isFinite, (0...1).contains(progress) else { return }
+
+        let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
+        guard !session.meta.isSeries || isEpisode else { return }
+
+        if RemoteTrackingState.isProgressSourceAuthenticated {
+            // Keep the provider-backed path aligned with built-in playback:
+            // optimistic local state plus one pause/stop report. A zero
+            // fraction is an Infuse close-before-play signal, not playback.
+            if progress > 0 {
+                let reportDuration = duration ?? 100
+                let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
+                let action: TraktScrobbleAction = progress >= WatchProgressLedger.completionFraction
+                    ? .stop
+                    : .pause
+                let store = ProfileSettings.current
+                if let duration {
+                    TraktProgressService.recordLocalPlayback(
+                        meta: session.meta,
+                        position: reportPosition,
+                        duration: duration,
+                        season: session.season,
+                        episode: session.episode,
+                        notify: action == .stop
+                    )
+                }
+                Task {
+                    _ = await TraktProgressService.reportPlayback(
+                        meta: session.meta,
+                        position: reportPosition,
+                        duration: reportDuration,
+                        season: session.season,
+                        episode: session.episode,
+                        action: action,
+                        store: store
+                    )
+                }
+            }
+            if progress >= WatchProgressLedger.completionFraction {
+                _ = WatchedStore.markWatched(
+                    session.meta,
+                    season: session.season,
+                    episode: session.episode
+                )
+            }
+            return
+        }
+
+        if progress >= WatchProgressLedger.completionFraction {
+            if let duration {
+                ContinueWatchingStore.markPlaybackCompleted(
+                    meta: session.meta,
+                    duration: duration,
+                    season: session.season,
+                    episode: session.episode
+                )
+            }
+            _ = WatchedStore.markWatched(
+                session.meta,
+                season: session.season,
+                episode: session.episode
+            )
+        } else if let duration, progress > 0 {
+            ContinueWatchingStore.save(
+                meta: session.meta,
+                streamUrl: session.sourceURL,
+                position: duration * progress,
+                duration: duration,
+                season: session.season,
+                episode: session.episode
+            )
         }
     }
 
@@ -991,13 +1092,55 @@ struct ContentView: View {
             ? externalSubtitles.compactMap { URL(string: $0.url) }
             : []
 
+        let externalSession: ExternalPlaybackSession?
+        let successCallback: URL?
+        let errorCallback: URL?
+        if player == .infuse {
+            let id = UUID().uuidString
+            let numbers: (season: Int, episode: Int)?
+            if let current = playbackCurrentEpisode, current.season > 0, current.episode > 0 {
+                numbers = (current.season, current.episode)
+            } else if let parsed = Self.episodeNumbers(fromSubtitle: subtitle) {
+                numbers = parsed
+            } else {
+                let parsed = Self.seasonEpisode(fromContentId: url.deletingPathExtension().lastPathComponent)
+                numbers = parsed.season.flatMap { season in
+                    parsed.episode.map { (season: season, episode: $0) }
+                }
+            }
+            let profileID = profileViewModel.activeProfile?.id ?? WatchedStore.activeProfileId
+            externalSession = ExternalPlaybackSession(
+                id: id,
+                meta: meta.persistenceSnapshot,
+                sourceURL: url.absoluteString,
+                season: meta.isSeries ? numbers?.season : nil,
+                episode: meta.isSeries ? numbers?.episode : nil,
+                duration: Self.runtimeSeconds(meta.runtime),
+                profileID: profileID
+            )
+            successCallback = URL(string: "nuvio-tv://external-playback/\(id)")
+            errorCallback = URL(string: "nuvio-tv://external-playback/error/\(id)")
+        } else {
+            externalSession = nil
+            successCallback = nil
+            errorCallback = nil
+        }
+
         // Hand off to the external app only when it is actually installed
         // (`canOpenURL` needs its scheme in LSApplicationQueriesSchemes); if it
         // isn't, fall through to the built-in player instead of a dead launch.
         if !isTrailer,
            url.scheme?.lowercased() != "smb",
-           let launchURL = player.launchURL(for: url, subtitleURLs: subtitleURLs),
+           let launchURL = player.launchURL(
+               for: url,
+               subtitleURLs: subtitleURLs,
+               successURL: successCallback,
+               errorURL: errorCallback
+           ),
            UIApplication.shared.canOpenURL(launchURL) {
+            if let externalSession {
+                ExternalPlaybackSessionStore.save(externalSession)
+            }
             UIApplication.shared.open(launchURL, options: [:], completionHandler: nil)
             return
         }
@@ -1556,7 +1699,10 @@ struct ContentView: View {
                     subtitles: candidate.subtitles,
                     streamName: candidate.name,
                     streamDescription: candidate.description,
-                    filename: candidate.filename
+                    filename: candidate.filename,
+                    addonName: candidate.addonName,
+                    videoSize: candidate.videoSize,
+                    provider: debrid.selectedKind.rawValue
                 )
             }
 
@@ -1573,7 +1719,10 @@ struct ContentView: View {
                 subtitles: candidate.subtitles,
                 streamName: candidate.name,
                 streamDescription: candidate.description,
-                filename: candidate.filename
+                filename: candidate.filename,
+                addonName: candidate.addonName,
+                videoSize: candidate.videoSize,
+                provider: "Direct"
             )
         }
         return nil
@@ -1594,11 +1743,13 @@ struct ContentView: View {
         let store = ProfileSettings.store(for: profileId)
         let debrid = DebridResolver(store: store)
         let cachedOnly = (store.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
+        let sortRaw = store.string(forKey: SettingsKey.streamSortOption)
+        let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValue:)) ?? .quality
         return StreamPickerListBuilder.displayedStreams(
             streams: streams,
             groups: [],
             selectedAddonId: nil,
-            sortOption: .default,
+            sortOption: sortOption,
             includeDebrid: debrid.isEnabled,
             cachedOnly: cachedOnly
         )
@@ -1634,7 +1785,10 @@ struct ContentView: View {
                 subtitles: stream.subtitles,
                 streamName: stream.name,
                 streamDescription: stream.description,
-                filename: stream.filename
+                filename: stream.filename,
+                addonName: stream.addonName,
+                videoSize: stream.videoSize,
+                provider: debrid.selectedKind.rawValue
             )
         }
 
@@ -1651,7 +1805,10 @@ struct ContentView: View {
             subtitles: stream.subtitles,
             streamName: stream.name,
             streamDescription: stream.description,
-            filename: stream.filename
+            filename: stream.filename,
+            addonName: stream.addonName,
+            videoSize: stream.videoSize,
+            provider: "Direct"
         )
     }
 
@@ -1686,6 +1843,36 @@ struct ContentView: View {
             return (nil, nil)
         }
         return (season, episode)
+    }
+
+    private static func episodeNumbers(fromSubtitle subtitle: String) -> (season: Int, episode: Int)? {
+        let pattern = #"S(\d+)\s*[·.\-–—]?\s*E(\d+)"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
+              let match = regex.firstMatch(
+                  in: subtitle,
+                  range: NSRange(subtitle.startIndex..., in: subtitle)
+              ),
+              let seasonRange = Range(match.range(at: 1), in: subtitle),
+              let episodeRange = Range(match.range(at: 2), in: subtitle),
+              let season = Int(subtitle[seasonRange]),
+              let episode = Int(subtitle[episodeRange]) else { return nil }
+        return (season, episode)
+    }
+
+    private static func runtimeSeconds(_ runtime: String?) -> Double? {
+        guard let runtime = runtime?.lowercased(), !runtime.isEmpty else { return nil }
+        let hours = firstRuntimeNumber(runtime, pattern: #"(\d+)\s*h"#) ?? 0
+        let minutes = firstRuntimeNumber(runtime, pattern: #"(\d+)\s*m(?:in)?"#)
+            ?? (hours == 0 ? firstRuntimeNumber(runtime, pattern: #"^\s*(\d+)\s*$"#) : 0)
+        let seconds = (hours * 60 + (minutes ?? 0)) * 60
+        return seconds > 0 ? Double(seconds) : nil
+    }
+
+    private static func firstRuntimeNumber(_ value: String, pattern: String) -> Int? {
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(in: value, range: NSRange(value.startIndex..., in: value)),
+              let range = Range(match.range(at: 1), in: value) else { return nil }
+        return Int(value[range])
     }
 
     @ViewBuilder

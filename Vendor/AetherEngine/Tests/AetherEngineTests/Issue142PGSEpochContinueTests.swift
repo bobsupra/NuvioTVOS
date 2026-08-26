@@ -17,7 +17,7 @@ import AetherLibavcodec
 /// connection set needs and a conformant set conveying a new object id was rejected outright. See
 /// FFmpeg PR 23851.
 ///
-/// These tests drive the shipped AetherLibavcodec pgssub decoder directly with synthetic display sets, the
+/// These tests drive the shipped Libavcodec pgssub decoder directly with synthetic display sets, the
 /// same call path EmbeddedSubtitleDecoder uses. They exist here to guard the FFmpegBuild pin: an
 /// engine built against a package without the patch fails them.
 struct Issue142PGSEpochContinueTests {

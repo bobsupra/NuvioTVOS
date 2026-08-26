@@ -14,15 +14,25 @@ struct AudioSwitchRequest {
     let delayMilliseconds: Int
 }
 
+/// A host changing the teletext caption page on a channel that is already playing (#364). nil page
+/// means back to libzvbi auto-detect. The delay is what makes the run a test of the runtime path
+/// rather than of the load option: it has to land after a teletext track is selected and showing.
+struct TeletextPageSwitchRequest {
+    let page: Int?
+    let delayMilliseconds: Int
+}
+
 /// Full playback-session smoke test: load a URL exactly like a host app (VOD by
 /// default, `--live` for the live path), autoplay, print 1 Hz transport telemetry,
 /// and optionally activate an embedded subtitle track (`--subs <codec-or-lang>`)
 /// and log every overlay cue that arrives. Repro harness for "loads but never
 /// plays" reports and for live teletext end-to-end validation (#107).
-func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
+func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool = false, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, mallocCensus: Bool = false, forceSoftware: Bool = false,
                     censusThresholdMB: Int? = nil, censusHz: Double? = nil, frameTimes: Bool = false,
                     sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil,
-                    sequentialOrigin: Bool = false, declaredDuration: Double? = nil) -> Int32 {
+                    teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil,
+                    sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil,
+                    httpHeaders: [String: String] = [:]) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         AetherEngine.setLargeAllocationCensusEnabled(
@@ -35,12 +45,12 @@ func runPlay(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liv
         print("[aetherctl] audio switch: selectAudioTrack(index: \(audioSwitch.index)) "
               + "\(audioSwitch.delayMilliseconds) ms after the load returns")
     }
-    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))")
+    print("aetherctl play: \(url.absoluteString) (seconds=\(seconds) live=\(live) nativeHLS=\(nativeHLS) liveIngest=\(liveIngest) dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") subs=\(subsPick ?? "off") hostCalls=\(hostCalls.isEmpty ? "none" : hostCalls.joined(separator: "+")) audioStats=\(audioStats) seekEvery=\(seekEvery.map { String($0) } ?? "off") seekCount=\(seekCount.map { String($0) } ?? "unbounded") seekPattern=\(seekPattern.isEmpty ? "off" : seekPattern.map { String($0) }.joined(separator: "/")) startPosition=\(startPosition.map { String($0) } ?? "0"))")
     print("")
     // CFRunLoopRun, not a blocking semaphore: AetherEngine is @MainActor, so parking the main thread would deadlock the executor.
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, startPosition: startPosition, frameTimes: frameTimes, sidecars: sidecars, audioSwitch: audioSwitch, sequentialOrigin: sequentialOrigin, declaredDuration: declaredDuration)
+        box.value = await playSmokeTest(url: url, seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: fastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: startPosition, frameTimes: frameTimes, sidecars: sidecars, audioSwitch: audioSwitch, teletextPage: teletextPage, teletextSwitch: teletextSwitch, sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests, declaredDuration: declaredDuration, httpHeaders: httpHeaders)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -218,7 +228,7 @@ private func seekIntentDrill(
 }
 
 @MainActor
-private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], startPosition: Double? = nil, frameTimes: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, sequentialOrigin: Bool = false, declaredDuration: Double? = nil) async -> Int32 {
+private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Bool = false, liveIngest: Bool = false, fastZap: Bool = false, dvrWindow: Double?, subsPick: String?, hostCalls: [String], audioStats: Bool, seekEvery: Double? = nil, seekPattern: [Double] = [], seekCount: Int? = nil, startPosition: Double? = nil, frameTimes: Bool = false, sidecars: [ExternalSubtitleTrack] = [], audioSwitch: AudioSwitchRequest? = nil, teletextPage: Int? = nil, teletextSwitch: TeletextPageSwitchRequest? = nil, sequentialOrigin: Bool = false, maxConcurrentRequests: Int? = nil, declaredDuration: Double? = nil, httpHeaders: [String: String] = [:]) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -230,7 +240,21 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
     var cancellables = Set<AnyCancellable>()
     var seenCueEnds: [Int: Double] = [:]
     var cueCount = 0
+    // #362 round 2: CUE and TRIM report arrivals and end changes, and a cue that LEAVES the window
+    // was reported by neither, so a wrong end that was later replaced read exactly like one the
+    // host still carries. `DROP` and the closing `WINDOW` dump are what make a claim about what the
+    // host holds measurable, which is the shape every report of this kind arrives in.
+    var presentCueIDs: Set<Int> = []
+    var lastCues: [SubtitleCue] = []
     engine.$subtitleCues.sink { cues in
+        let ids = Set(cues.map(\.id))
+        for gone in presentCueIDs.subtracting(ids).sorted() {
+            print(String(format: "  DROP #%d", gone))
+        }
+        presentCueIDs = ids
+        // The LAST NON-EMPTY window, not the last one: teardown publishes an empty array, so a
+        // closing dump of `cues` reports nothing carried and hides the whole session.
+        if !cues.isEmpty { lastCues = cues }
         for cue in cues {
             if let prevEnd = seenCueEnds[cue.id] {
                 if prevEnd != cue.endTime {
@@ -270,12 +294,16 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
 
     let options = LoadOptions(
         suppressDisplayCriteria: true,
+        httpHeaders: httpHeaders,
         isLive: live,
         dvrWindowSeconds: dvrWindow,
+        liveJoinProfile: fastZap ? .fastZap : .standard,
         nativeRemoteHLS: nativeHLS,
         sequentialOrigin: sequentialOrigin,
+        maxConcurrentSourceRequests: maxConcurrentRequests,
         declaredDurationSeconds: declaredDuration,
-        externalSubtitles: sidecars
+        externalSubtitles: sidecars,
+        teletextPage: teletextPage
     )
     // #311: installed BEFORE the load on purpose. The engine holds it and arms the host it builds,
     // which is the documented usage and the part a host would otherwise have to re-do per load.
@@ -293,7 +321,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
             // HLSLiveIngestReader over the upstream playlist, handed in as a custom source. Without
             // this the CLI cannot reach the ingest at all, since `--live` sends an m3u8 to the raw
             // live path by design and `hlslive` only serves local .ts files.
-            probe = try await engine.load(source: .custom(HLSLiveIngestReader(playlistURL: url),
+            probe = try await engine.load(source: .custom(HLSLiveIngestReader(playlistURL: url,
+                                                                              httpHeaders: httpHeaders),
                                                           formatHint: "mpegts"),
                                           options: options)
         } else {
@@ -354,6 +383,20 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
             // A finished stream and a stream that stopped yielding look identical from the
             // buffer counter, and they are different defects (#356).
             print("  AUDIOTAP stream finished (buffers=\(mon.bufferCount))")
+        }
+    }
+
+    // #364: the host changing the caption page on a channel that is already playing. Same detached
+    // shape as the audio switch below, for the same reason: the delay has to be elapsed time next to
+    // a running session, and here it also has to outlast the subtitle selection, or the run measures
+    // the load option it was already able to measure before.
+    if let teletextSwitch {
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: UInt64(max(0, teletextSwitch.delayMilliseconds)) * 1_000_000)
+            let target = teletextSwitch.page.map(String.init) ?? "auto"
+            print("  HOSTCALL setTeletextPage(\(target)) at +\(teletextSwitch.delayMilliseconds) ms "
+                  + "(was \(engine.teletextPage.map(String.init) ?? "auto"))")
+            engine.setTeletextPage(teletextSwitch.page)
         }
     }
 
@@ -503,7 +546,8 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
         // #220 repro affordance: a periodic short backward seek drives the subtitle drain
         // through .resetAndDecode and re-anchors the #151 forward prefetcher, the churn a
         // rebuffering remote source produces on its own. Steady-state runs cannot reach it.
-        if let seekEvery, seekEvery > 0, tick > 10, Double(tick).truncatingRemainder(dividingBy: seekEvery) == 0 {
+        if let seekEvery, seekEvery > 0, tick > 10, Double(tick).truncatingRemainder(dividingBy: seekEvery) == 0,
+           seekLandings.count < (seekCount ?? .max) {
             // #240: `--seek-pattern` walks a list of absolute targets instead of the short
             // backward hop, because the two exercise different machinery. A 6 s rewind lands in
             // the segment cache and never restarts the producer; a far seek restarts it, and the
@@ -584,6 +628,11 @@ private func playSmokeTest(url: URL, seconds: Double, live: Bool, nativeHLS: Boo
         print("active subtitle: \(finalActiveSubtitle.map(String.init) ?? "none")")
     }
     print("final t=\(String(format: "%.2f", finalTime))s state=\(String(describing: endState)) cues=\(cueCount)")
+    let closingWindow = await MainActor.run { lastCues }
+    print("WINDOW \(closingWindow.count) cues in the last published window")
+    for cue in closingWindow {
+        print(String(format: "  HELD #%d %.2f-%.2f", cue.id, cue.startTime, cue.endTime))
+    }
     if case .error(let message) = endState {
         print("VERDICT: session ended in error: \(message)")
         return 2

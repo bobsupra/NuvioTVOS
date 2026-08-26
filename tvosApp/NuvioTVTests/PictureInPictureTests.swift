@@ -115,6 +115,15 @@ final class PictureInPictureTests: XCTestCase {
         XCTAssertEqual(viewModel.isPictureInPictureActive, PictureInPictureManager.shared.isPictureInPictureActive)
     }
 
+    func testPlayerViewModelHideControls() {
+        let viewModel = PlayerViewModel()
+        viewModel.revealControls()
+        XCTAssertTrue(viewModel.showControls)
+
+        viewModel.hideControls()
+        XCTAssertFalse(viewModel.showControls)
+    }
+
     func testRestoreUICallbackFlow() {
         let manager = PictureInPictureManager.shared
         let coordinator = PlaybackSessionCoordinator()

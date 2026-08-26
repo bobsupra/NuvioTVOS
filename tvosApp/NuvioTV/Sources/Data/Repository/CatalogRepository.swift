@@ -236,8 +236,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return "cinemeta:\(cinemetaEnabled) urls:[\(urls)] disabled:[\(disabled)] order:[\(order)]"
     }
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
-    private let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
-    private var cachedMetaById: [String: NuvioMeta] = [:]
+    private static let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
+    private static var cachedMetaById: [String: NuvioMeta] = [:]
     private let builtInSubtitleAddons = [
         StremioSubtitleAddon(
             name: "OpenSubtitles v3",
@@ -253,29 +253,29 @@ final class CinemetaCatalogRepository: CatalogRepository {
     ]
 
     private func cachedMetadata(for id: String) -> NuvioMeta? {
-        metadataCacheQueue.sync { cachedMetaById[id] }
+        Self.metadataCacheQueue.sync { Self.cachedMetaById[id] }
     }
 
     private func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
-        metadataCacheQueue.sync {
+        Self.metadataCacheQueue.sync {
             if let requestedID {
-                cachedMetaById[requestedID] = meta
+                Self.cachedMetaById[requestedID] = meta
             }
-            cachedMetaById[meta.id] = meta
+            Self.cachedMetaById[meta.id] = meta
         }
     }
 
     private func cacheMetadata(_ items: [NuvioMeta]) {
-        metadataCacheQueue.sync {
+        Self.metadataCacheQueue.sync {
             for item in items {
-                cachedMetaById[item.id] = item
+                Self.cachedMetaById[item.id] = item
             }
         }
     }
 
     private func removeCachedMetadata(for id: String) {
-        metadataCacheQueue.sync {
-            _ = cachedMetaById.removeValue(forKey: id)
+        Self.metadataCacheQueue.sync {
+            _ = Self.cachedMetaById.removeValue(forKey: id)
         }
     }
 
@@ -489,6 +489,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     )
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
                     guard !items.isEmpty else { return nil }
+                    cacheMetadata(items)
                     let catalogName = catalog.name ?? catalog.id
                     return NuvioCatalog(
                         id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
@@ -602,7 +603,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // Query the correct endpoint based on the caller-provided type. The
         // Details screen uses a fresh repository (empty cache) so this always
         // fetches the full /meta payload — real episodes and per-episode ratings.
-        let metaType = Self.isSeriesType(type) ? "series" : "movie"
+        let isSeries = Self.isSeriesType(type)
+        let isLive = Self.isLiveContentType(type)
+        let metaType = isSeries ? "series" : "movie"
         var lastError: Error?
         var resolvedId = id
 
@@ -643,19 +646,68 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        for addon in await configuredAddons(supporting: "meta", type: metaType, id: resolvedId) {
-            do {
-                let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: metaType, id: resolvedId))
-                let meta = await TmdbDetailsService.localizedMetadata(
-                    for: response.meta.toMeta(fallbackType: metaType)
-                )
-                // Cache under the requested id too in case the addon
-                // canonicalizes to a different id space.
-                cacheMetadata(meta, requestedID: id)
-                return meta
-            } catch {
-                if lastError == nil { lastError = error }
+        let typesToTry: [String]
+        if isLive {
+            typesToTry = [type]
+        } else if type.lowercased() == metaType {
+            typesToTry = [type]
+        } else {
+            typesToTry = [type, metaType]
+        }
+
+        for candidateType in typesToTry {
+            for addon in await configuredAddons(supporting: "meta", type: candidateType, id: resolvedId) {
+                do {
+                    let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: candidateType, id: resolvedId))
+                    let meta = await TmdbDetailsService.localizedMetadata(
+                        for: response.meta.toMeta(fallbackType: candidateType)
+                    )
+                    // Cache under the requested id too in case the addon
+                    // canonicalizes to a different id space.
+                    cacheMetadata(meta, requestedID: id)
+                    return meta
+                } catch {
+                    if lastError == nil { lastError = error }
+                }
             }
+        }
+
+        // If no /meta endpoint returned a response, check if the item was already cached from a catalog
+        if let cached = cachedMetadata(for: id) ?? cachedMetadata(for: resolvedId) {
+            return await TmdbDetailsService.localizedMetadata(for: cached)
+        }
+
+        // For Live TV / channel items or non-IMDb streams where the add-on provides streams
+        // but no dedicated /meta endpoint, synthesize a fallback NuvioMeta so details and playback can proceed.
+        if isLive || !resolvedId.hasPrefix("tt") {
+            let fallbackMeta = NuvioMeta(
+                id: id,
+                name: Self.fallbackTitle(forId: id),
+                description: nil,
+                posterUrl: nil,
+                backgroundUrl: nil,
+                logoUrl: nil,
+                imdbId: resolvedId.hasPrefix("tt") ? resolvedId : nil,
+                tmdbId: nil,
+                type: type,
+                year: nil,
+                genres: nil,
+                rating: nil,
+                releaseInfo: nil,
+                runtime: nil,
+                cast: nil,
+                director: nil,
+                writer: nil,
+                certification: nil,
+                country: nil,
+                released: nil,
+                status: nil,
+                videos: nil,
+                trailerYtIds: nil,
+                externalRatings: nil
+            )
+            cacheMetadata(fallbackMeta, requestedID: id)
+            return fallbackMeta
         }
 
         throw lastError ?? URLError(.badServerResponse)
@@ -685,7 +737,42 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private static func isSeriesType(_ type: String) -> Bool {
-        ["series", "show", "tv", "tvshow"].contains(type.lowercased())
+        ["series", "show", "tvshow"].contains(type.lowercased())
+    }
+
+    static func isLiveContentType(_ type: String) -> Bool {
+        switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "channel", "live", "livetv", "live-tv", "tv", "iptv", "radio":
+            return true
+        default:
+            return false
+        }
+    }
+
+    static func fallbackTitle(forId id: String) -> String {
+        var title = id.trimmingCharacters(in: .whitespacesAndNewlines)
+        if let colonIndex = title.lastIndex(of: ":") {
+            title = String(title[title.index(after: colonIndex)...])
+        }
+        if title.lowercased().hasPrefix("usatv_") {
+            title = String(title.dropFirst("usatv_".count))
+        } else if title.lowercased().hasPrefix("iptv_") {
+            title = String(title.dropFirst("iptv_".count))
+        } else if title.lowercased().hasPrefix("channel_") {
+            title = String(title.dropFirst("channel_".count))
+        }
+        title = title.replacingOccurrences(of: "_", with: " ")
+            .replacingOccurrences(of: "-", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if title.isEmpty { return id }
+        let words = title.split(separator: " ")
+        return words.map { word -> String in
+            let lower = word.lowercased()
+            if ["hd", "sd", "4k", "uhd", "tv", "fhd", "usa", "uk", "espn", "cnn", "hbo", "bbc", "tnt", "tbs", "cbs", "nbc", "abc", "fox"].contains(lower) {
+                return word.uppercased()
+            }
+            return word.prefix(1).uppercased() + word.dropFirst()
+        }.joined(separator: " ")
     }
 
     /// Every enabled manifest URL — the manually entered one plus the list synced
@@ -1017,10 +1104,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
         genre: String?
     ) async throws -> CatalogPage {
         let sourceBaseURL: URL
-        if let addonId {
-            guard let resolved = await baseURL(forAddonId: addonId) else {
-                throw URLError(.badURL)
+        if let addonId, !addonId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            guard let resolved = await baseURL(
+                forAddonId: addonId,
+                contentType: contentType,
+                catalogId: catalogId
+            ) else {
+                throw CollectionSourceError.invalidResponse(
+                    "The add-on “\(addonId)” for “\(catalogId)” is not installed or available."
+                )
             }
+            sourceBaseURL = resolved
+        } else if let resolved = await baseURL(
+            forAddonId: nil,
+            contentType: contentType,
+            catalogId: catalogId
+        ) {
             sourceBaseURL = resolved
         } else {
             sourceBaseURL = baseURL
@@ -1134,7 +1233,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         for source in sources {
             guard items.count < limit else { break }
-            guard let base = await baseURL(forAddonId: source.addonId) else { continue }
+            guard let base = await baseURL(
+                forAddonId: source.addonId,
+                contentType: source.type,
+                catalogId: source.catalogId
+            ) else { continue }
             do {
                 let url = try StremioCatalogURLBuilder.url(
                     baseURL: base,
@@ -1157,15 +1260,105 @@ final class CinemetaCatalogRepository: CatalogRepository {
         return items
     }
 
-    private func baseURL(forAddonId addonId: String) async -> URL? {
-        if addonId == Self.cinemetaAddonId { return baseURL }
+    private func baseURL(
+        forAddonId addonId: String?,
+        contentType: String? = nil,
+        catalogId: String? = nil
+    ) async -> URL? {
+        let raw = addonId?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
 
-        for manifestURL in Self.configuredStreamAddonManifestURLs {
-            if let manifest = await manifest(for: manifestURL),
-               manifest.id == addonId {
-                return manifestURL.deletingLastPathComponent()
+        // 1. Direct URL provided as addonId (e.g. "https://example.com/manifest.json" or "https://example.com")
+        if raw.hasPrefix("http://") || raw.hasPrefix("https://"),
+           let directURL = URL(string: raw) {
+            return directURL.lastPathComponent.lowercased() == "manifest.json"
+                ? directURL.deletingLastPathComponent()
+                : directURL
+        }
+
+        // 2. Composite ID provided (e.g. "addon:manifestId:https://example.com/manifest.json")
+        var extractedManifestId: String?
+        if raw.hasPrefix("addon:") {
+            let components = raw.components(separatedBy: ":")
+            if components.count >= 3,
+               let schemeIndex = components.firstIndex(where: { $0 == "http" || $0 == "https" }) {
+                let urlString = components[schemeIndex...].joined(separator: ":")
+                if let url = URL(string: urlString) {
+                    return url.lastPathComponent.lowercased() == "manifest.json"
+                        ? url.deletingLastPathComponent()
+                        : url
+                }
+            }
+            if components.count >= 2 {
+                extractedManifestId = components[1]
             }
         }
+
+        // 3. Cinemeta shortcuts
+        if raw.isEmpty ||
+           raw == Self.cinemetaAddonId ||
+           raw.caseInsensitiveCompare("cinemeta") == .orderedSame ||
+           raw.caseInsensitiveCompare("com.linvo.cinemeta") == .orderedSame {
+            if catalogId == nil {
+                return baseURL
+            }
+        }
+
+        // 4. Candidate manifest URLs from settings & preferences
+        var candidateManifestURLs: [URL] = []
+        candidateManifestURLs.append(contentsOf: Self.configuredStreamAddonManifestURLs)
+        let allPrefURLs = Self.configuredStreamAddonPreferences.compactMap {
+            Self.normalizedManifestURL(from: $0.url)
+        }
+        for u in allPrefURLs where !candidateManifestURLs.contains(u) {
+            candidateManifestURLs.append(u)
+        }
+
+        // 5. Match by manifest.id or manifest URL
+        for manifestURL in candidateManifestURLs {
+            if manifestURL.absoluteString == raw ||
+               manifestURL.deletingLastPathComponent().absoluteString == raw {
+                return manifestURL.deletingLastPathComponent()
+            }
+            if let manifest = await manifest(for: manifestURL) {
+                if !raw.isEmpty,
+                   (manifest.id == raw ||
+                    manifest.id.caseInsensitiveCompare(raw) == .orderedSame ||
+                    (extractedManifestId != nil && manifest.id.caseInsensitiveCompare(extractedManifestId!) == .orderedSame)) {
+                    return manifestURL.deletingLastPathComponent()
+                }
+            }
+        }
+
+        // 6. Match by catalogId and contentType in manifest.catalogs (Fallback for custom/recs/synced catalogs)
+        if let catalogId, !catalogId.isEmpty {
+            let baseCatalogId = catalogId.components(separatedBy: ",").first ?? catalogId
+            for manifestURL in candidateManifestURLs {
+                if let manifest = await manifest(for: manifestURL),
+                   let catalogs = manifest.catalogs {
+                    let hasMatchingCatalog = catalogs.contains { cat in
+                        let idMatches = cat.id == catalogId ||
+                                        cat.id == baseCatalogId ||
+                                        cat.id.caseInsensitiveCompare(catalogId) == .orderedSame ||
+                                        cat.id.caseInsensitiveCompare(baseCatalogId) == .orderedSame
+                        let typeMatches = (contentType == nil ||
+                                           cat.type.caseInsensitiveCompare(contentType!) == .orderedSame)
+                        return idMatches && typeMatches
+                    }
+                    if hasMatchingCatalog {
+                        return manifestURL.deletingLastPathComponent()
+                    }
+                }
+            }
+        }
+
+        // 7. Fallback to Cinemeta if raw is empty or cinemeta
+        if raw.isEmpty ||
+           raw == Self.cinemetaAddonId ||
+           raw.caseInsensitiveCompare("cinemeta") == .orderedSame ||
+           raw.caseInsensitiveCompare("com.linvo.cinemeta") == .orderedSame {
+            return baseURL
+        }
+
         return nil
     }
 
@@ -1268,7 +1461,13 @@ private struct AddonManifestResource: Decodable {
     func supportsType(_ type: String, fallbackTypes: [String]) -> Bool {
         let supportedTypes = types.isEmpty ? fallbackTypes : types
         guard !supportedTypes.isEmpty else { return true }
-        return supportedTypes.contains { $0.caseInsensitiveCompare(type) == .orderedSame }
+        if supportedTypes.contains(where: { $0.caseInsensitiveCompare(type) == .orderedSame }) {
+            return true
+        }
+        if CinemetaCatalogRepository.isLiveContentType(type) {
+            return supportedTypes.contains(where: { CinemetaCatalogRepository.isLiveContentType($0) })
+        }
+        return false
     }
 
     func supportsId(_ id: String, fallbackPrefixes: [String]) -> Bool {

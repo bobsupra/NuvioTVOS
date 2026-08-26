@@ -422,6 +422,9 @@ final class MP4SegmentMuxer {
                 throw MuxerError.copyParametersFailed(code: aCopy)
             }
             audioStream.pointee.time_base = audio.timeBase
+            // AE#382: a source-container codec_tag (MPEG-TS stream type / registration descriptor) makes
+            // movenc refuse the header, which the audio cascade reads as "cannot stream-copy" and bridges.
+            Self.dropForeignAudioCodecTag(ctx: ctx, codecpar: audioStream.pointee.codecpar)
             // AE#221: repair a degenerate FLAC STREAMINFO before movenc serialises it into dfLa.
             if let streamInfo = Self.sanitizedFLACExtradata(UnsafePointer(audioStream.pointee.codecpar)) {
                 Self.replaceExtradata(audioStream.pointee.codecpar, with: streamInfo)
@@ -843,6 +846,71 @@ final class MP4SegmentMuxer {
             tag |= UInt32(ascii) << (i * 8)
         }
         return tag
+    }
+
+    /// AE#382: true when the mp4 muxer accepts `tag` for `codecID`, i.e. when the source tag may stay.
+    ///
+    /// The mpegts demuxer stamps `codecpar.codec_tag` with the PMT stream type (`0x87` for E-AC-3, `0x81`
+    /// for AC-3) or, when the PMT carries a registration descriptor, with its fourcc (`EAC3`, `AC-3`).
+    /// `avcodec_parameters_copy` carries that into the output stream, and movenc then looks the (tag, codec)
+    /// pair up in the mp4 tag table, finds nothing, and refuses the whole header: "Could not find tag for
+    /// codec eac3 in stream #1" -> `AVERROR(EINVAL)`. libavformat's own guard in `init_muxer` would have
+    /// caught it one layer earlier, but it only fires at `FF_COMPLIANCE_NORMAL`; we run
+    /// `strict_std_compliance = -2` for the Dolby Vision atoms, and below NORMAL that guard passes a foreign
+    /// tag through untouched. So the tag has to be dropped here.
+    ///
+    /// The rule mirrors `streamcopy_init` in fftools/ffmpeg_mux_init.c, which is why an `ffmpeg -c copy`
+    /// remux of the same source succeeds: keep the tag when the output format has no tag table at all, when
+    /// it maps back to the same codec id (it is already an mp4 tag; `av_codec_get_id` matches
+    /// case-insensitively, exactly like movenc's own validation, so a `AC-3` descriptor is fine), or when
+    /// mp4 knows no tag for this codec whatsoever (nothing better to offer; movenc then fails loudly and the
+    /// audio cascade bridges). Otherwise clear it and let `init_muxer` fill in the canonical tag (`ec-3`).
+    static func mp4AcceptsAudioCodecTag(
+        tags: UnsafePointer<OpaquePointer?>?,
+        codecID: AVCodecID,
+        tag: UInt32
+    ) -> Bool {
+        guard tag != 0 else { return true }
+        guard let tags else { return true }
+        if av_codec_get_id(tags, tag) == codecID { return true }
+        var canonical: UInt32 = 0
+        return av_codec_get_tag2(tags, codecID, &canonical) == 0
+    }
+
+    /// Applies `mp4AcceptsAudioCodecTag` to the muxer's own copy of the audio parameters.
+    ///
+    /// Audio only. The video tag is chosen deliberately by `VideoConfig.codecTagOverride` (every route in
+    /// `CodecRoutePolicy` sets one, which is why a TS video stream never carried its `HEVC`/`H264` tag into
+    /// the header), and the same rule would be actively wrong there: `dvh1` is not in the mp4 table at all
+    /// (mov.c handles it), so a Dolby Vision sample entry would be silently demoted to `hvc1`.
+    private static func dropForeignAudioCodecTag(
+        ctx: UnsafeMutablePointer<AVFormatContext>,
+        codecpar: UnsafeMutablePointer<AVCodecParameters>
+    ) {
+        let tag = codecpar.pointee.codec_tag
+        let codecID = codecpar.pointee.codec_id
+        guard !mp4AcceptsAudioCodecTag(
+            tags: ctx.pointee.oformat?.pointee.codec_tag,
+            codecID: codecID,
+            tag: tag
+        ) else { return }
+        codecpar.pointee.codec_tag = 0
+        EngineLog.emit(
+            "[MP4SegmentMuxer] audio codec_tag \(Self.fourCCDescription(tag)) is a source-container tag the "
+            + "mp4 muxer rejects for \(avcodec_get_name(codecID).map { String(cString: $0) } ?? "?"); "
+            + "cleared so the canonical sample entry is written (stream-copy stays available)",
+            category: .session
+        )
+    }
+
+    /// Printable form of a codec tag: the fourcc when all four bytes are printable ASCII, else hex.
+    /// An MPEG-TS PMT stream type (0x87) is not a fourcc, so printing it as one would be noise.
+    static func fourCCDescription(_ tag: UInt32) -> String {
+        let bytes = [UInt8(tag & 0xFF), UInt8((tag >> 8) & 0xFF), UInt8((tag >> 16) & 0xFF), UInt8((tag >> 24) & 0xFF)]
+        if bytes.allSatisfy({ $0 >= 0x20 && $0 < 0x7F }) {
+            return "'" + String(decoding: bytes, as: UTF8.self) + "'"
+        }
+        return String(format: "0x%08x", tag)
     }
 
     /// Mutate AV_PKT_DATA_DOVI_CONF in-place: dv_profile=8, compat=1 (HDR10), el_present_flag=0.

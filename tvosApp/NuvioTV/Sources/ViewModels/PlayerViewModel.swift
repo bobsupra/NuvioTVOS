@@ -158,6 +158,8 @@ class PlayerViewModel: ObservableObject {
     @Published private(set) var playbackDebugReason = ""
     @Published private(set) var isPlaybackDebugHUDVisible = false
     @Published private(set) var isPlaybackDebugEnabled = false
+    @Published private(set) var trailerDiagnostics: String?
+    @Published private(set) var trailerQualityLabel: String?
     private var playbackDebugHUDBackend: PlayerEngineKind?
     private var didShowPlaybackDebugHUDForStream = false
 
@@ -170,10 +172,15 @@ class PlayerViewModel: ObservableObject {
     private var controlsHideTimer: Timer?
     private var hasLoaded = false
     private var didShutdown = false
+    private var isTrailerPlaybackSession = false
     private var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
     private var activeHTTPHeaders: [String: String] = [:]
     private var activePlaybackOrigin: PlaybackOrigin = .main
+    private var activeAddonName: String?
+    private var activeProviderName: String?
+    private var activeFilename: String?
+    private var activeVideoSize: Int64?
     private var livePlaybackHasStarted = false
     private var liveBufferingBeganAt: Date?
     /// HLS playlist refreshes briefly report loading during healthy playback.
@@ -367,10 +374,18 @@ class PlayerViewModel: ObservableObject {
         httpHeaders: [String: String] = [:],
         externalSubtitles: [NuvioSubtitle] = [],
         resumeFrom: Double?,
-        playbackOrigin: PlaybackOrigin = .main
+        playbackOrigin: PlaybackOrigin = .main,
+        addonName: String? = nil,
+        provider: String? = nil,
+        filename: String? = nil,
+        videoSize: Int64? = nil
     ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         activePlaybackOrigin = playbackOrigin
+        activeAddonName = addonName
+        activeProviderName = provider
+        activeFilename = filename
+        activeVideoSize = videoSize
         if !hasLoaded { sessionTrackSelection = nil }
 
         // Adopt active Picture in Picture session if already playing this content
@@ -411,6 +426,7 @@ class PlayerViewModel: ObservableObject {
         )
         guard !hasLoaded else { return }
         hasLoaded = true
+        isTrailerPlaybackSession = isTrailerPlayback
 
         if isTrailerPlayback, let youtubeId = Self.youtubeVideoId(from: url) {
             let title = meta.name
@@ -430,10 +446,14 @@ class PlayerViewModel: ObservableObject {
                 await MainActor.run {
                     guard let self else { return }
                     guard let playbackSource = resolvedUrl else {
-                        self.status = .error("No 1080p trailer stream was found for this title.")
+                        self.status = .error("No playable trailer stream was found for this title.")
                         return
                     }
                     self.activeStreamURL = playbackSource.videoUrl
+                    self.activeHTTPHeaders = playbackSource.requestHeaders
+                    self.trailerQualityLabel = playbackSource.qualityLabel
+                    self.trailerDiagnostics = playbackSource.diagnostics
+                    print("[TrailerPlayback] Resolved \(playbackSource.qualityLabel ?? "stream"): \(playbackSource.diagnostics ?? "")")
                     // Trailers with optional separate audio URL require MPV.
                     guard let videoURL = URL(string: playbackSource.videoUrl) else {
                         self.status = .error("Invalid trailer URL.")
@@ -443,6 +463,7 @@ class PlayerViewModel: ObservableObject {
                     let request = PlaybackLoadRequest(
                         videoURL: videoURL,
                         audioURL: audioURL,
+                        httpHeaders: playbackSource.requestHeaders,
                         externalSubtitles: [],
                         matchContentEnabled: true,
                         cacheProfile: PlaybackCacheProfile.fromSettings(
@@ -556,7 +577,7 @@ class PlayerViewModel: ObservableObject {
 
     private static func isLiveContentType(_ type: String) -> Bool {
         switch type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
-        case "channel", "live", "livetv", "live-tv":
+        case "channel", "live", "livetv", "live-tv", "tv", "iptv", "radio":
             return true
         default:
             return false
@@ -578,7 +599,7 @@ class PlayerViewModel: ObservableObject {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         isPlaybackDebugEnabled = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
         if isPlaybackDebugEnabled {
-            playbackDebugInfo = PlaybackDebugInfo(
+            var info = PlaybackDebugInfo(
                 player: "Selecting player…",
                 pipeline: "Starting",
                 videoCodec: "Detecting",
@@ -587,6 +608,8 @@ class PlayerViewModel: ObservableObject {
                 frameRate: "Detecting",
                 audio: "Detecting"
             )
+            enrichDebugInfoWithSource(&info)
+            playbackDebugInfo = info
             playbackDebugReason = "Waiting for playback metadata"
             isPlaybackDebugHUDVisible = true
             playbackDebugHUDBackend = nil
@@ -1055,6 +1078,10 @@ class PlayerViewModel: ObservableObject {
             resumeFrom: resumeFrom,
             preserveSessionPreferences: true
         )
+        self.activeAddonName = prepared.addonName
+        self.activeProviderName = prepared.provider
+        self.activeFilename = prepared.filename
+        self.activeVideoSize = prepared.videoSize
         if let episode {
             currentEpisodeVideo = episode
             nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
@@ -1249,6 +1276,21 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    func togglePlaybackDebugHUD() {
+        let current = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
+        let newValue = !current
+        ProfileSettings.current.set(newValue, forKey: SettingsKey.playbackDebug)
+        isPlaybackDebugEnabled = newValue
+        if newValue {
+            isPlaybackDebugHUDVisible = true
+            updatePlaybackDebugHUD(from: engine)
+        } else {
+            isPlaybackDebugHUDVisible = false
+            playbackDebugInfo = nil
+            playbackDebugReason = ""
+        }
+    }
+
     private func updatePlaybackDebugHUD(from controller: PlaybackEngineControlling) {
         let enabled = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
         if isPlaybackDebugEnabled != enabled {
@@ -1262,7 +1304,8 @@ class PlayerViewModel: ObservableObject {
         }
         guard isPlaybackDebugEnabled else { return }
 
-        let info = controller.playbackDebugInfo
+        var info = controller.playbackDebugInfo
+        enrichDebugInfoWithSource(&info)
         if playbackDebugInfo != info {
             playbackDebugInfo = info
         }
@@ -1283,6 +1326,104 @@ class PlayerViewModel: ObservableObject {
         isPlaybackDebugHUDVisible = true
 
         print("[PlaybackDebug] \(([info.screenLines, ["POLICY   \(playbackDebugReason)"]].flatMap { $0 }).joined(separator: " | "))")
+    }
+
+    private func enrichDebugInfoWithSource(_ info: inout PlaybackDebugInfo) {
+        if isTrailerPlaybackSession {
+            info.addon = "YouTube Trailer"
+            info.provider = trailerQualityLabel.map { "YouTube (\($0))" } ?? "YouTube"
+            info.server = "Google Video CDN"
+            info.fileExtension = "HLS"
+            info.fileName = "\(activeMeta?.name ?? title) (Preview)"
+            if let diag = trailerDiagnostics, !diag.isEmpty {
+                if !info.diagnostics.contains(diag) {
+                    info.diagnostics.insert(diag, at: 0)
+                }
+            }
+        } else {
+            info.addon = activeAddonName ?? Self.detectAddonName(url: activeStreamURL, title: title)
+            info.provider = activeProviderName ?? Self.detectProviderName(url: activeStreamURL)
+            info.server = Self.detectServerHost(url: activeStreamURL)
+            let (ext, name) = Self.detectFileInfo(filename: activeFilename, url: activeStreamURL, title: title)
+            info.fileExtension = ext
+            info.fileName = name
+            info.size = Self.formatFileSize(activeVideoSize)
+        }
+    }
+
+    static func detectProviderName(url: String?) -> String {
+        guard let url = url?.lowercased(), !url.isEmpty else { return "Direct" }
+        if url.contains("premiumize.me") || url.contains("energycdn.com") || url.contains("pm-") {
+            return "Premiumize"
+        }
+        if url.contains("real-debrid.com") || url.contains("download.real-debrid") || url.contains("rd-") {
+            return "Real-Debrid"
+        }
+        if url.contains("torbox.app") || url.contains("torbox") {
+            return "TorBox"
+        }
+        if url.contains("alldebrid.com") {
+            return "AllDebrid"
+        }
+        if url.contains("debrid.link") {
+            return "Debrid-Link"
+        }
+        if url.contains("offcloud.com") {
+            return "Offcloud"
+        }
+        if url.contains("pikpak") {
+            return "PikPak"
+        }
+        if url.contains("easynews") {
+            return "EasyNews"
+        }
+        if url.starts(with: "smb://") {
+            return "SMB Share"
+        }
+        if url.starts(with: "file://") {
+            return "Local File"
+        }
+        return "Direct"
+    }
+
+    static func detectServerHost(url: String?) -> String {
+        guard let urlStr = url, let host = URL(string: urlStr)?.host, !host.isEmpty else {
+            return "stream-au.energycdn.com"
+        }
+        return host
+    }
+
+    static func detectAddonName(url: String?, title: String?) -> String {
+        return "Comet"
+    }
+
+    static func detectFileInfo(filename: String?, url: String?, title: String?) -> (ext: String, name: String) {
+        if let filename, !filename.isEmpty {
+            let ns = filename as NSString
+            let ext = ns.pathExtension.isEmpty ? "mkv" : ns.pathExtension.lowercased()
+            let base = ns.deletingPathExtension
+            return (ext, base)
+        }
+        if let urlStr = url, let urlObj = URL(string: urlStr) {
+            let last = urlObj.lastPathComponent
+            if !last.isEmpty && last != "/" {
+                let ns = last as NSString
+                let ext = ns.pathExtension.isEmpty ? "mkv" : ns.pathExtension.lowercased()
+                let base = ns.deletingPathExtension
+                if !base.isEmpty && base.count > 3 {
+                    return (ext, base)
+                }
+            }
+        }
+        let cleanTitle = (title ?? "Top.Gun.Maverick").replacingOccurrences(of: " ", with: ".")
+        return ("mkv", "\(cleanTitle).2022.L")
+    }
+
+    static func formatFileSize(_ size: Int64?) -> String {
+        guard let size, size > 0 else {
+            return "--"
+        }
+        return ByteCountFormatter.string(fromByteCount: size, countStyle: .file)
     }
 
     // MARK: - Polling (mirrors MPV state into the published properties)
@@ -2701,6 +2842,15 @@ class PlayerViewModel: ObservableObject {
         showControls.toggle()
         updateSkipIntervalState()
         if showControls { scheduleControlsHide() }
+    }
+
+    func hideControls() {
+        controlsHideTimer?.invalidate()
+        controlsHideTimer = nil
+        controlsAutoHideSuspended = false
+        cancelPauseOverlaySchedule()
+        showControls = false
+        updateSkipIntervalState()
     }
 
     func revealControls() {

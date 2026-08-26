@@ -9,7 +9,9 @@ import CryptoKit
 import ImageIO
 import SwiftUI
 #if os(tvOS)
+import AVFoundation
 import AVKit
+import CoreMedia
 #endif
 #if canImport(UIKit)
 import UIKit
@@ -325,14 +327,10 @@ struct PosterCard: View {
             // trailer is ready to draw, avoiding a black frame on slow links.
             .opacity(isTrailerPreviewVisible ? 0 : 1)
             .overlay {
-                // Do not even create AVPlayerViewController while the user is
-                // moving focus. `isActive` is intentionally delayed; mounting
-                // VideoPlayer before that delay still constructs AVKit's view
-                // hierarchy for every card passed during rapid scrolling.
-                if isFocused && isTrailerPreviewActive && trailersEnabled && !isContinueOrUpcomingCard && !didFinishTrailerPreview {
+                if isFocused && trailersEnabled && !isContinueOrUpcomingCard && !didFinishTrailerPreview {
                     TrailerPreviewPlayer(
                         meta: meta,
-                        isActive: true,
+                        isActive: isTrailerPreviewActive,
                         onPlaybackReady: {
                             guard isTrailerPreviewActive else { return }
                             isTrailerPreviewReady = true
@@ -845,6 +843,107 @@ extension PosterCard: Equatable {
 }
 
 #if os(tvOS)
+private final class TrailerPlayerLayerView: UIView {
+    var playerLayer: AVPlayerLayer {
+        layer as! AVPlayerLayer
+    }
+
+    override static var layerClass: AnyClass {
+        AVPlayerLayer.self
+    }
+
+    override init(frame: CGRect) {
+        super.init(frame: frame)
+        playerLayer.videoGravity = .resizeAspectFill
+        backgroundColor = .clear
+    }
+
+    required init?(coder: NSCoder) {
+        super.init(coder: coder)
+        playerLayer.videoGravity = .resizeAspectFill
+        backgroundColor = .clear
+    }
+}
+
+private struct TrailerPlayerSurface: UIViewRepresentable {
+    let player: AVPlayer
+    let onReadyForDisplay: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onReadyForDisplay: onReadyForDisplay)
+    }
+
+    func makeUIView(context: Context) -> TrailerPlayerLayerView {
+        let view = TrailerPlayerLayerView()
+        view.playerLayer.player = player
+        context.coordinator.observe(layer: view.playerLayer, player: player)
+        return view
+    }
+
+    func updateUIView(_ uiView: TrailerPlayerLayerView, context: Context) {
+        if uiView.playerLayer.player !== player {
+            uiView.playerLayer.player = player
+            context.coordinator.observe(layer: uiView.playerLayer, player: player)
+        }
+    }
+
+    final class Coordinator {
+        private let onReadyForDisplay: () -> Void
+        private var readyObserver: NSKeyValueObservation?
+        private var timeObserver: Any?
+        private weak var observedPlayer: AVPlayer?
+        private var didNotify = false
+
+        init(onReadyForDisplay: @escaping () -> Void) {
+            self.onReadyForDisplay = onReadyForDisplay
+        }
+
+        func observe(layer: AVPlayerLayer, player: AVPlayer) {
+            readyObserver?.invalidate()
+            if let timeObserver, let observedPlayer {
+                observedPlayer.removeTimeObserver(timeObserver)
+            }
+            self.observedPlayer = player
+            self.didNotify = false
+
+            if layer.isReadyForDisplay {
+                notifyReady()
+                return
+            }
+
+            readyObserver = layer.observe(\.isReadyForDisplay, options: [.new]) { [weak self] layer, _ in
+                if layer.isReadyForDisplay {
+                    self?.notifyReady()
+                }
+            }
+
+            timeObserver = player.addPeriodicTimeObserver(
+                forInterval: CMTime(value: 1, timescale: 30),
+                queue: .main
+            ) { [weak self] time in
+                if time.seconds > 0 {
+                    self?.notifyReady()
+                }
+            }
+        }
+
+        private func notifyReady() {
+            guard !didNotify else { return }
+            didNotify = true
+            DispatchQueue.main.async { [weak self] in
+                self?.onReadyForDisplay()
+            }
+        }
+
+        deinit {
+            readyObserver?.invalidate()
+            if let timeObserver, let observedPlayer {
+                observedPlayer.removeTimeObserver(timeObserver)
+            }
+        }
+    }
+}
+
 /// Video preview for a settled, landscape Home card. The player is
 /// created only after the configured trailer delay and is released as soon as
 /// focus leaves, so scrolling never leaves background trailer audio or decoders.
@@ -857,45 +956,51 @@ private struct TrailerPreviewPlayer: View {
     let onPlaybackFinished: () -> Void
 
     @State private var player = AVPlayer()
-    @State private var hasResolvedPreview = false
+    @State private var isRenderReady = false
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     private let resolver = YouTubeTrailerResolver()
 
     var body: some View {
-        VideoPlayer(player: player)
-            // Keep the landscape artwork visible while the trailer URL is
-            // resolving, rather than replacing it with an empty black player.
-            .opacity(isVisible ? 1 : 0)
-            .animation(.easeInOut(duration: 0.32), value: isVisible)
-            .allowsHitTesting(false)
-            .task(id: previewIdentity) {
-                await startPreview()
+        TrailerPlayerSurface(player: player) {
+            guard !isRenderReady else { return }
+            isRenderReady = true
+            if isActive {
+                onPlaybackReady()
             }
-            .onChange(of: isActive) { _, active in
-                if active {
-                    player.play()
-                    if hasResolvedPreview { onPlaybackReady() }
-                } else {
-                    player.pause()
-                }
-            }
-            .onChange(of: trailerPreviewSound) { _, soundEnabled in
-                applySoundPreference(soundEnabled)
-            }
-            .onReceive(
-                NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)
-            ) { notification in
-                guard let item = notification.object as? AVPlayerItem,
-                      item == player.currentItem else {
-                    return
-                }
-                onPlaybackFinished()
-            }
-            .onDisappear {
-                hasResolvedPreview = false
+        }
+        // Keep the landscape artwork visible while the trailer URL is
+        // resolving and buffering, only revealing the video when decoded & ready.
+        .opacity(isVisible ? 1 : 0)
+        .animation(.easeInOut(duration: 0.32), value: isVisible)
+        .allowsHitTesting(false)
+        .task(id: previewIdentity) {
+            await startPreview()
+        }
+        .onChange(of: isActive) { _, active in
+            if active {
+                player.play()
+                if isRenderReady { onPlaybackReady() }
+            } else {
                 player.pause()
-                player.replaceCurrentItem(with: nil)
             }
+        }
+        .onChange(of: trailerPreviewSound) { _, soundEnabled in
+            applySoundPreference(soundEnabled)
+        }
+        .onReceive(
+            NotificationCenter.default.publisher(for: .AVPlayerItemDidPlayToEndTime)
+        ) { notification in
+            guard let item = notification.object as? AVPlayerItem,
+                  item == player.currentItem else {
+                return
+            }
+            onPlaybackFinished()
+        }
+        .onDisappear {
+            isRenderReady = false
+            player.pause()
+            player.replaceCurrentItem(with: nil)
+        }
     }
 
     private var previewIdentity: String {
@@ -903,41 +1008,39 @@ private struct TrailerPreviewPlayer: View {
     }
 
     private var isVisible: Bool {
-        isActive && hasResolvedPreview
+        isActive && isRenderReady
     }
 
     private func startPreview() async {
-        hasResolvedPreview = false
-        let trailerMeta: NuvioMeta
-        if meta.trailerYtIds?.contains(where: { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) == true {
-            trailerMeta = meta
-        } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
-            id: meta.id,
-            type: meta.type
-        ) {
-            trailerMeta = refreshed
+        isRenderReady = false
+
+        guard let youtubeVideoId = await YouTubeTrailerResolver.preferredTrailerYouTubeId(for: meta),
+              let playbackSource = await resolver.resolvePreview(
+                  youtubeVideoId: youtubeVideoId,
+                  title: meta.name,
+                  year: meta.year.map(String.init)
+              ),
+              let url = URL(string: playbackSource.videoUrl),
+              !Task.isCancelled else {
+            return
+        }
+
+        let asset: AVURLAsset
+        if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
+            asset = AVURLAsset(
+                url: url,
+                options: [AVURLAssetHTTPUserAgentKey: userAgent]
+            )
         } else {
-            return
+            asset = AVURLAsset(url: url)
         }
-
-        guard let youtubeVideoId = trailerMeta.trailerYtIds?
-            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-            .first(where: { !$0.isEmpty }),
-            let streamURL = await resolver.resolvePreview(
-                youtubeVideoId: youtubeVideoId,
-                title: trailerMeta.name,
-                year: trailerMeta.year.map(String.init)
-            ),
-            let url = URL(string: streamURL),
-            !Task.isCancelled else {
-            return
-        }
-
-        player.replaceCurrentItem(with: AVPlayerItem(url: url))
+        let item = AVPlayerItem(asset: asset)
+        item.preferredForwardBufferDuration = 2.0
+        item.preferredPeakBitRate = 0
+        item.preferredMaximumResolution = .zero
+        player.replaceCurrentItem(with: item)
         applySoundPreference(trailerPreviewSound)
-        hasResolvedPreview = true
         if isActive {
-            onPlaybackReady()
             player.play()
         }
     }
@@ -1924,7 +2027,6 @@ struct WatchedCheckmarkBadge: View {
             return
         }
 
-        let t0 = CFAbsoluteTimeGetCurrent()
         let snapshot = WatchedStore.currentSnapshot()
         let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
         guard isSeries else {

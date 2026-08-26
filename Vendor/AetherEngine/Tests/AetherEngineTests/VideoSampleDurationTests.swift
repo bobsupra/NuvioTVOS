@@ -30,7 +30,8 @@ struct VideoSampleDurationTests {
                 existingDuration: constantDefaultDuration,
                 dts: dts[i],
                 nextDts: dts[i + 1],
-                fallback: fallback
+                fallback: fallback,
+                capTicks: 10_000   // #369: 10 s in the ms grid; irrelevant to these deltas
             )
             // Each sample duration is the true decode-order delta, not the constant 42.
             #expect(resolved == dts[i + 1] - dts[i])
@@ -45,27 +46,64 @@ struct VideoSampleDurationTests {
     func fallsBackWithoutForwardDelta() {
         // EOF tail (nextDts == nil): keep the source packet's own positive duration.
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 40, dts: 1_000, nextDts: nil, fallback: 42) == 40)
+            existingDuration: 40, dts: 1_000, nextDts: nil, fallback: 42, capTicks: 10_000) == 40)
         // Source duration missing too: use the configured fallback.
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 0, dts: 1_000, nextDts: nil, fallback: 42) == 42)
+            existingDuration: 0, dts: 1_000, nextDts: nil, fallback: 42, capTicks: 10_000) == 42)
     }
 
     @Test("A non-forward next DTS never yields a zero or negative sample duration")
     func nonForwardNextDtsStaysPositive() {
         // Equal DTS (delta 0): fall back to the positive source duration.
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 42, dts: 1_000, nextDts: 1_000, fallback: 33) == 42)
+            existingDuration: 42, dts: 1_000, nextDts: 1_000, fallback: 33, capTicks: 10_000) == 42)
         // Backward DTS with no usable source duration: fall back.
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 0, dts: 1_000, nextDts: 990, fallback: 33) == 33)
+            existingDuration: 0, dts: 1_000, nextDts: 990, fallback: 33, capTicks: 10_000) == 33)
+    }
+
+    @Test("A wrap-scale inferred delta is rejected by the discontinuity cap (#369)")
+    func wrapScaleDeltaIsCapped() {
+        // Device trace: seam-preceding dts 363524400, seam packet wrap-corrected to exactly 2^33.
+        // The look-behind delta IS the wrap (8226410192 ticks ≈ 91404 s @ 90 kHz); movenc rejected
+        // it ("Application provided duration ... is invalid") and the packet was silently lost.
+        // Cap = 10 s of 90 kHz ticks, the shared discontinuity threshold.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 1800, dts: 363_524_400, nextDts: 8_589_934_592,
+            fallback: 3600, capTicks: 900_000) == 1800)
+        // No usable source duration either: the configured fallback.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 0, dts: 363_524_400, nextDts: 8_589_934_592,
+            fallback: 3600, capTicks: 900_000) == 3600)
+        // A delta exactly at the cap still telescopes.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 1800, dts: 0, nextDts: 900_000,
+            fallback: 3600, capTicks: 900_000) == 900_000)
+    }
+
+    @Test("A declared duration wider than a discontinuity is capped like an inferred one (#369)")
+    func wrapScaleDeclaredDurationIsCapped() {
+        // EOF tail of the same wrapped stream: no forward delta exists, so the source's own
+        // duration is what reaches movenc, and a container that derived it from the wrapped clock
+        // hands over the same invalid number the inferred path is capped for.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 8_226_410_192, dts: 363_524_400, nextDts: nil,
+            fallback: 3600, capTicks: 900_000) == 3600)
+        // Same when the forward delta is unusable rather than absent.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 8_226_410_192, dts: 363_524_400, nextDts: 363_524_400,
+            fallback: 3600, capTicks: 900_000) == 3600)
+        // A declared duration exactly at the cap is still trusted.
+        #expect(HLSSegmentProducer.resolveVideoSampleDuration(
+            existingDuration: 900_000, dts: 1_000, nextDts: nil,
+            fallback: 3600, capTicks: 900_000) == 900_000)
     }
 
     @Test("A NOPTS dts or next-dts cannot produce an overflowing delta")
     func nopts() {
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 42, dts: Int64.min, nextDts: 1_000, fallback: 33) == 42)
+            existingDuration: 42, dts: Int64.min, nextDts: 1_000, fallback: 33, capTicks: 10_000) == 42)
         #expect(HLSSegmentProducer.resolveVideoSampleDuration(
-            existingDuration: 0, dts: 1_000, nextDts: Int64.min, fallback: 33) == 33)
+            existingDuration: 0, dts: 1_000, nextDts: Int64.min, fallback: 33, capTicks: 10_000) == 33)
     }
 }

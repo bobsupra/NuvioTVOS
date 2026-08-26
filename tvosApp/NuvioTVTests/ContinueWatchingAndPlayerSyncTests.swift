@@ -104,10 +104,14 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(localKeys.contains(SettingsKey.autoPlayNext))
         XCTAssertTrue(localKeys.contains(SettingsKey.autoPlayNextCountdown))
         XCTAssertTrue(localKeys.contains(SettingsKey.cachedOnlyStreams))
+        XCTAssertTrue(localKeys.contains(SettingsKey.streamSortOption))
         XCTAssertTrue(localKeys.contains(SettingsKey.smartStreamSelection))
         XCTAssertTrue(localKeys.contains(SettingsKey.smartStreamQuality))
         XCTAssertTrue(localKeys.contains(SettingsKey.externalPlayerForwardSubtitles))
         XCTAssertTrue(localKeys.contains(SettingsKey.frameRateMatching))
+        XCTAssertTrue(localKeys.contains(SettingsKey.playerShowPiP))
+        XCTAssertTrue(localKeys.contains(SettingsKey.playerShowEpisodes))
+        XCTAssertTrue(localKeys.contains(SettingsKey.playerShowSources))
 
         let remoteKeys = PlayerSettingsSyncMapper.remoteToLocalKeyMappings.map(\.remote)
         XCTAssertTrue(remoteKeys.contains("preferred_audio_language"))
@@ -118,10 +122,14 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(remoteKeys.contains("stream_auto_play_timeout_seconds"))
         XCTAssertTrue(remoteKeys.contains("stream_cached_only"))
         XCTAssertTrue(remoteKeys.contains("cached_only_streams"))
+        XCTAssertTrue(remoteKeys.contains("stream_sort_mode"))
         XCTAssertTrue(remoteKeys.contains("smart_stream_selection"))
         XCTAssertTrue(remoteKeys.contains("smart_stream_quality"))
         XCTAssertTrue(remoteKeys.contains("external_player_forward_subtitles"))
         XCTAssertTrue(remoteKeys.contains("frame_rate_matching"))
+        XCTAssertTrue(remoteKeys.contains("player_show_pip"))
+        XCTAssertTrue(remoteKeys.contains("player_show_episodes"))
+        XCTAssertTrue(remoteKeys.contains("player_show_sources"))
     }
 
     // MARK: - MDBList Settings Sync Tests

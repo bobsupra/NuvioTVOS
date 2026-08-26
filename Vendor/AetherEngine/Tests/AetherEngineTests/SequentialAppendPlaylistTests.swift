@@ -114,6 +114,83 @@ struct SequentialAppendPlaylistTests {
                 "a source running past its declared window must not outgrow the asset")
     }
 
+    // MARK: - Startup gate (#370)
+
+    @Test("one finalized segment releases the startup gate")
+    func startupGateReleasesOnFirstSegment() {
+        // A published duration needs the NEXT segment's ledger open, so the old 2-segment demand
+        // was really 3 segment opens (~12-18 s of media) through a possibly-stalling origin.
+        let provider = makeProvider()
+        provider.appendSequentialSegmentDuration(index: 0, durationSeconds: 6.0)
+        #expect(provider.waitForSequentialStartupSegments(timeout: 0.2))
+    }
+
+    @Test("an empty session times out instead of blocking past its deadline")
+    func startupGateTimesOutEmpty() {
+        let provider = makeProvider()
+        #expect(!provider.waitForSequentialStartupSegments(timeout: 0.05))
+    }
+
+    @Test("EOF with zero segments still releases the gate")
+    func startupGateReleasesOnEnded() {
+        let provider = makeProvider()
+        provider.markSequentialEnded()
+        #expect(provider.waitForSequentialStartupSegments(timeout: 0.2))
+    }
+
+    @Test("a dead pump releases a held startup GET immediately")
+    func startupGateAborts() {
+        let provider = makeProvider()
+        provider.abortSequentialStartupWait()
+        let start = Date()
+        #expect(!provider.waitForSequentialStartupSegments(timeout: 5.0))
+        #expect(Date().timeIntervalSince(start) < 1.0,
+                "the abort must release the wait, not let it sit out the timeout")
+    }
+
+    @Test("a zero-duration hole does not release the startup gate")
+    func startupGateIgnoresHoles() {
+        // The renderer gives a zero-duration entry no URI, so releasing on the entry COUNT could
+        // answer the held GET with a playlist that renders empty - the -12888 the gate exists for.
+        let provider = makeProvider()
+        provider.appendSequentialSegmentDuration(index: 0, durationSeconds: 0)
+        #expect(!provider.waitForSequentialStartupSegments(timeout: 0.05),
+                "an entry the playlist cannot advertise is not a served segment")
+        provider.appendSequentialSegmentDuration(index: 1, durationSeconds: 4.0)
+        #expect(provider.waitForSequentialStartupSegments(timeout: 0.2))
+        #expect(segmentURIs(HLSLocalServer.buildMediaPlaylistText(provider: provider)) == ["seg1.mp4"],
+                "the released playlist carries the segment the gate counted")
+    }
+
+    /// #370 follow-up: the release belongs to the failure surface, not to two call sites that
+    /// happened to be on the reported trace. A sequential origin also reaches `requestRestart`
+    /// (which it refuses) and the AE#366 / AE#169 exhaustion arms, each of which can fire before
+    /// the first duration is published.
+    @Test("a terminal source failure releases a held startup GET")
+    func terminalFailureReleasesStartupGate() {
+        let provider = makeProvider()
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/nonexistent/archive.ts"),
+                                    dvModeAvailable: false)
+        engine.provider = provider
+        let surfaced = FailureBox()
+        engine.onVODSourceFailed = { code, _, _ in surfaced.fire(code) }
+
+        engine.surfaceVODSourceFailure(FFmpegErr.einval, "Source audio cannot be muxed")
+
+        #expect(surfaced.count == 1)
+        let start = Date()
+        #expect(!provider.waitForSequentialStartupSegments(timeout: 5.0))
+        #expect(Date().timeIntervalSince(start) < 1.0,
+                "the surface must release the wait, not leave the server thread on its timeout")
+    }
+
+    private final class FailureBox: @unchecked Sendable {
+        private let lock = NSLock()
+        private var _count = 0
+        var count: Int { lock.lock(); defer { lock.unlock() }; return _count }
+        func fire(_ code: Int32) { lock.lock(); _count += 1; lock.unlock() }
+    }
+
     // MARK: - Blast radius
 
     /// Live playlists must render exactly as before. Their segment URIs carry the media sequence

@@ -7,6 +7,9 @@ import Foundation
 struct DisplayRejection: Sendable, Equatable {
     let code: Int
     let message: String
+    /// `NSError.domain` of the item error behind the rejection: the message is AVFoundation's
+    /// localized text, so the domain is what still classifies once it is published (#376).
+    let domain: String?
 }
 
 /// Pure master to media fallback decision (#98). Kept separate and pure so the gate is testable

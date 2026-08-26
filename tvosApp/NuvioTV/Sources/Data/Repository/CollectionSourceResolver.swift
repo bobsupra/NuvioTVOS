@@ -43,13 +43,12 @@ struct CollectionSourceResolver {
     func browse(_ source: NuvioCollectionSource, cursor: Int = 0) async throws -> CatalogPage {
         switch source.normalizedProvider {
         case "addon":
-            guard let addonId = nonEmpty(source.addonId),
-                  let type = nonEmpty(source.type),
+            guard let type = nonEmpty(source.type),
                   let catalogId = nonEmpty(source.catalogId) else {
                 throw CollectionSourceError.invalidAddonSource
             }
             return try await repository.browseCatalog(
-                addonId: addonId,
+                addonId: nonEmpty(source.addonId),
                 contentType: type,
                 catalogId: catalogId,
                 skip: max(cursor, 0),
@@ -557,7 +556,12 @@ enum StremioCatalogURLBuilder {
         guard var components = URLComponents(url: baseURL, resolvingAgainstBaseURL: false) else {
             throw URLError(.badURL)
         }
-        let basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        var basePath = components.percentEncodedPath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        if basePath.hasSuffix("manifest.json") {
+            basePath = (basePath as NSString).deletingLastPathComponent
+            if basePath == "/" || basePath == "." { basePath = "" }
+            basePath = basePath.trimmingCharacters(in: CharacterSet(charactersIn: "/"))
+        }
         components.percentEncodedPath = "/" + ([basePath, path]
             .filter { !$0.isEmpty }
             .joined(separator: "/"))
@@ -572,7 +576,8 @@ enum StremioCatalogURLBuilder {
     }()
 
     private static func encodedPathComponent(_ value: String) -> String {
-        value.addingPercentEncoding(withAllowedCharacters: unreserved) ?? value
+        let clean = value.removingPercentEncoding ?? value
+        return clean.addingPercentEncoding(withAllowedCharacters: unreserved) ?? clean
     }
 
     private static func encodedExtra(name: String, value: String) -> String? {

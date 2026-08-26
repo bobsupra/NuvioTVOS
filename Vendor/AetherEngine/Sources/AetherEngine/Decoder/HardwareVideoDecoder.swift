@@ -360,10 +360,8 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
     static func resolvePixelAspectRatio(
         bitstream: AVRational, container: AVRational, width: Int32, height: Int32
     ) -> AVRational? {
-        let declared = SoftwareVideoDecoder.declaredStreamSAR(bitstream: bitstream, container: container)
-        guard let sane = PixelAspectPolicy.saneSAR(declared, width: width, height: height),
-              sane.num != sane.den else { return nil }
-        return sane
+        PixelAspectPolicy.declaredPixelAspect(
+            bitstream: bitstream, container: container, width: width, height: height)
     }
 
     // MARK: - Callback handling (called from VT's queue)

@@ -21,7 +21,9 @@ final class NativeAVPlayerHost {
     @Published private(set) var renderedTime: Double = 0
     @Published private(set) var duration: Double = 0
     @Published private(set) var rate: Float = 0
-    @Published private(set) var failureMessage: String?
+    /// #376: the failure a host classifies on, message included. Published instead of a bare string so
+    /// the AVFoundation domain and code survive the hop into `state`.
+    @Published private(set) var failure: PlaybackErrorInfo?
     /// #50: monotonic token; bumped on each deferred .failed so a superseding failure or item swap cancels the in-flight confirmation.
     private var failureConfirmToken: Int = 0
     /// #50: latched on first .playing; discriminates startup failures (never played) from mid-playback transients. .failed and timeControlStatus KVOs are unsynchronized, so instantaneous status is unreliable. Reset with the item on a reused host.
@@ -87,8 +89,15 @@ final class NativeAVPlayerHost {
     /// (HEVC-in-MPEG-TS carriage, which AVFoundation's HLS demuxer does not support). The engine's
     /// remote-HLS load subscribes and reroutes the session onto the loopback live-ingest path.
     @Published private(set) var remoteHLSVideoCarriageRejected = false
-    /// Set per load; the watchdog itself starts at readyToPlay (a dead origin never reaches it).
-    private var carriageWatchdogArmed = false
+    /// AE#363: fires once when the origin refused the native mount outright (HTTP 401 / 403, measured as
+    /// NSURLError -1013 / -1102). The engine subscribes and hands the session to the live ingest, whose
+    /// fetcher is a different client: headers on every request, four concurrent fetches at most, no
+    /// AVFoundation user agent. Separate from the carriage signal because the evidence is different;
+    /// a refusal is the origin's decision, not a verdict about what AVFoundation can demux.
+    @Published private(set) var remoteHLSOriginRefused = false
+    /// Set per load; arms both live-ingest fallbacks. The carriage watchdog itself starts at
+    /// readyToPlay (a dead origin never reaches it), the refusal path fires before readiness.
+    private var ingestFallbackArmed = false
     private var carriageWatchdogTask: Task<Void, Never>?
     /// Watchdog poll cadence. The pure `Watchdog`'s grace is expressed in ticks of this length, so the
     /// grace a probe verdict removes is reported in the same unit.
@@ -268,11 +277,11 @@ final class NativeAVPlayerHost {
     /// after an in-PiP recovery reload) and the pause bounces transport for nothing. The swap
     /// keeps transport intent, clocks and the old item alive until replaceCurrentItem hands
     /// AVPlayer the fresh one.
-    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armVideoCarriageWatchdog: Bool = false, readinessDeadline: Double? = nil, isLive: Bool = false) {
+    func load(url: URL, startPosition: Double?, perFrameHDR: Bool = true, skipInitialSeek: Bool = false, forwardBufferDuration: Double = 4.0, surfaceEndFailures: Bool = false, inPlaceSwap: Bool = false, httpHeaders: [String: String] = [:], armIngestFallback: Bool = false, readinessDeadline: Double? = nil, isLive: Bool = false) {
         unloadCurrentItem(inPlaceSwap: inPlaceSwap)
 
         self.surfaceEndFailures = surfaceEndFailures
-        self.carriageWatchdogArmed = armVideoCarriageWatchdog
+        self.ingestFallbackArmed = armIngestFallback
         self.readinessDeadlineSeconds = readinessDeadline
         self.isLiveSession = isLive
         Self.nextSessionID += 1
@@ -333,12 +342,12 @@ final class NativeAVPlayerHost {
         // #293: run the carriage probe alongside the mount. Nothing is serialized in front of first
         // frame; a healthy stream's watchdog disarms and cancels it, an unjudgeable one has its verdict
         // ready by the time the watchdog arms.
-        if armVideoCarriageWatchdog {
+        if armIngestFallback {
             startCarriageProbe(asset: asset, url: url, httpHeaders: httpHeaders)
         }
         playerItem = item
         accessLogCount = 0
-        failureMessage = nil
+        failure = nil
         pendingDisplayRejection = nil
         lastSuppressedStartupFailure = nil
         isReady = false
@@ -438,7 +447,7 @@ final class NativeAVPlayerHost {
                     await self.publishDetectedVideoFormat(from: item)
                     // #168 follow-up: watch for an advertised video rendition that never builds a track
                     // (HEVC-in-MPEG-TS carriage); anchored at readyToPlay so dead origins never arm it.
-                    if self.carriageWatchdogArmed, self.carriageWatchdogTask == nil {
+                    if self.ingestFallbackArmed, self.carriageWatchdogTask == nil {
                         self.startVideoCarriageWatchdog(item: item)
                     }
                 case .failed:
@@ -708,15 +717,31 @@ final class NativeAVPlayerHost {
                     category: .engine)
                 return
             }
+            // AE#363: the origin refused this client. Publishing a terminal failure here ends a live
+            // session the engine's own fetcher may well be allowed to serve, so signal the reroute
+            // instead of surfacing, the same way a master rejection is handed to the engine below.
+            if let nsError = item.error as NSError?,
+               RemoteHLSIngestFallback.shouldRerouteOnOriginRefusal(
+                   domain: nsError.domain, code: nsError.code,
+                   armed: ingestFallbackArmed, alreadyRerouted: remoteHLSOriginRefused) {
+                EngineLog.emit(
+                    "[NativeAVPlayerHost] #\(sessionID) origin refused the native mount "
+                    + "(\(nsError.domain)/\(nsError.code)); handing the session to the live ingest (AE#363)",
+                    category: .engine)
+                remoteHLSOriginRefused = true
+                return
+            }
             if let code, MasterFallbackDecision.isMasterRejectionCode(code) {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(sessionID) startup .failed is a master rejection "
                     + "(code=\(code)); signalling engine for media fallback instead of surfacing",
                     category: .engine)
-                pendingDisplayRejection = DisplayRejection(code: code, message: desc)
+                pendingDisplayRejection = DisplayRejection(code: code,
+                                                           message: desc,
+                                                           domain: (item.error as NSError?)?.domain)
                 return
             }
-            failureMessage = desc
+            failure = PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: item.error)
             return
         }
 
@@ -744,7 +769,7 @@ final class NativeAVPlayerHost {
                     + "clock=\(String(format: "%.2f", self.renderedTime)))",
                     category: .engine
                 )
-                self.failureMessage = desc
+                self.failure = PlaybackErrorInfo(kind: .nativeItemFailed, message: desc, underlying: item.error)
             } else {
                 EngineLog.emit(
                     "[NativeAVPlayerHost] #\(self.sessionID) deferred failure cleared: player recovered "
@@ -1171,8 +1196,8 @@ final class NativeAVPlayerHost {
         }
         notificationObservers.removeAll()
         accessLogCount = 0
-        // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failureMessage/didReachEnd corrupt the new session (issue #15).
-        failureMessage = nil
+        // Clear terminal flags: keepNativeHost reload reuses the host and @Published replays on subscribe; stale failure/didReachEnd corrupt the new session (issue #15).
+        failure = nil
         didReachEnd = false
         // #315: same reason. The layer itself still reads true for a few tens of ms past this point
         // (AVFoundation clears it after the swap), so the published value leads the layer here on
@@ -1189,8 +1214,9 @@ final class NativeAVPlayerHost {
         // #168 follow-up: the carriage verdict belongs to the outgoing item.
         carriageWatchdogTask?.cancel()
         carriageWatchdogTask = nil
-        carriageWatchdogArmed = false
+        ingestFallbackArmed = false
         remoteHLSVideoCarriageRejected = false
+        remoteHLSOriginRefused = false
         carriageProbeTask?.cancel()
         carriageProbeTask = nil
         carriageProbeEvidence = .pending
@@ -1361,7 +1387,7 @@ final class NativeAVPlayerHost {
         if RemoteHLSIngestFallback.shouldRerouteOnSettledEvidence(
             carriageEvidence: carriageProbeEvidence,
             videoTrackCount: currentVideoTrackCount(),
-            armed: carriageWatchdogArmed,
+            armed: ingestFallbackArmed,
             alreadyRejected: remoteHLSVideoCarriageRejected
         ) {
             EngineLog.emit(
@@ -1429,7 +1455,7 @@ final class NativeAVPlayerHost {
                       self.playerItem === item else { return }
                 switch deadline.tick(isReady: self.isReady,
                                      carriageRerouted: self.remoteHLSVideoCarriageRejected,
-                                     hasFailed: self.failureMessage != nil) {
+                                     hasFailed: self.failure != nil) {
                 case .keepWaiting:
                     continue
                 case .disarm:
@@ -1441,7 +1467,7 @@ final class NativeAVPlayerHost {
                         + "failure in \(Int(budgetSeconds.rounded()))s; surfacing a terminal state (#334)",
                         category: .engine
                     )
-                    self.failureMessage = message
+                    self.failure = PlaybackErrorInfo(kind: .noPlayableTrackWithinBudget, message: message)
                     return
                 }
             }

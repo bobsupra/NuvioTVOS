@@ -98,6 +98,33 @@ enum RemoteHLSIngestFallback {
         return variantHasVideoAttributes.contains(true)
     }
 
+    /// AE#363: an origin that refuses the native mount outright. AVFoundation reports the refusal as an
+    /// NSURLError on the item, not as an HLS error-log entry, and the two statuses a header-enforcing
+    /// IPTV origin uses map to two distinct codes. Both were measured against a fixture origin that
+    /// answers 401 / 403 to any request without its header: HTTP 401 arrives as
+    /// `NSURLErrorUserAuthenticationRequired`, HTTP 403 as `NSURLErrorNoPermissionsToReadFile`, and
+    /// both arrive that way whether the refused request was the master playlist or the first segment.
+    ///
+    /// Transport failures are deliberately not refusals: a dead link fails the ingest the same way, so
+    /// rerouting would only spend the same failure a second time. A refusal is a decision the origin
+    /// made about a client, and the engine's own fetcher is a different client (bounded to four
+    /// concurrent fetches, no AVFoundation user agent, headers on every request).
+    static func isOriginRefusal(domain: String, code: Int) -> Bool {
+        guard domain == NSURLErrorDomain else { return false }
+        return code == NSURLErrorUserAuthenticationRequired   // HTTP 401
+            || code == NSURLErrorNoPermissionsToReadFile      // HTTP 403
+    }
+
+    /// AE#363: whether a refused native mount may hand its session to the live ingest. `armed` is the
+    /// live-bypass-with-fallback gate the carriage watchdog already rides; `alreadyRerouted` keeps one
+    /// refusal from firing twice and keeps the ingest session's own failures from bouncing back here.
+    static func shouldRerouteOnOriginRefusal(
+        domain: String, code: Int, armed: Bool, alreadyRerouted: Bool
+    ) -> Bool {
+        guard armed, !alreadyRerouted else { return false }
+        return isOriginRefusal(domain: domain, code: code)
+    }
+
     /// The watchdog runs only for live bypass sessions with the fallback enabled. Finite
     /// HEVC-in-MPEG-TS VOD uses the content-gated, seekable #268 ingest before a native mount, and hosts
     /// can opt out of this live recovery via `LoadOptions.nativeRemoteHLSIngestFallback`.

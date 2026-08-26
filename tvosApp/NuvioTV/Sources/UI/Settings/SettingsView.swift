@@ -234,6 +234,7 @@ enum SettingsKey {
     static let smartStreamQuality = "nuvio.tv.settings.playback.smartStreamQuality"
     static let smartSubtitleMatching = "nuvio.tv.settings.playback.smartSubtitleMatching"
     static let cachedOnlyStreams = "nuvio.tv.settings.playback.cachedOnlyStreams"
+    static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
     static let showAddonLogo = "nuvio.tv.settings.playback.showAddonLogo"
@@ -257,6 +258,9 @@ enum SettingsKey {
     static let playbackTrackSelections = "nuvio.tv.settings.playback.trackSelections"
     static let externalPlayerForwardSubtitles = "nuvio.tv.settings.playback.externalPlayerForwardSubtitles"
     static let assOverrideMode = "nuvio.tv.settings.playback.assOverrideMode"
+    static let playerShowPiP = "nuvio.tv.settings.playback.showPiP"
+    static let playerShowEpisodes = "nuvio.tv.settings.playback.showEpisodes"
+    static let playerShowSources = "nuvio.tv.settings.playback.showSources"
 
     static let fastNavigation = "nuvio.tv.settings.advanced.fastNavigation"
     static let smoothFocus = "nuvio.tv.settings.advanced.smoothFocus"
@@ -301,12 +305,13 @@ enum SettingsKey {
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
         playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
-        cachedOnlyStreams, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        cachedOnlyStreams, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, trailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, playbackTrackSelections,
         externalPlayerForwardSubtitles, assOverrideMode,
+        playerShowPiP, playerShowEpisodes, playerShowSources,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter
     ] + SubtitleStyleKey.all
 }
@@ -5580,6 +5585,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnlyStreams = false
+    @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
     @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
     @AppStorage(SettingsKey.streamBadgePlacement) private var streamBadgePlacement = StreamBadgePlacement.bottom.rawValue
@@ -5597,6 +5603,9 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.frameRateMatching) private var frameRateMatching = "Always"
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
     @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Strip"
+    @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
+    @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
+    @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
 
     @State private var streamBadgeURL = ""
     @State private var streamBadgeImportError: String?
@@ -5611,6 +5620,7 @@ private struct PlaybackSettingsView: View {
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max"]
     private let assModes = ["Strip", "Scale", "Force"]
+    private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
     private let autoPlayNextCountdownOptions = [5, 10, 15, 20, 30]
 
     var body: some View {
@@ -5688,6 +5698,44 @@ private struct PlaybackSettingsView: View {
                 )
             }
 
+            SettingsGroup(
+                title: L10n.string("tvos_playback_player_buttons", fallback: "Player Buttons"),
+                subtitle: L10n.string(
+                    "tvos_playback_player_buttons_subtitle",
+                    fallback: "Customize which control buttons appear in the video player"
+                )
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_player_pip", fallback: "Picture in Picture"),
+                    subtitle: L10n.string(
+                        "tvos_settings_player_pip_subtitle",
+                        fallback: "Show the Picture in Picture button in player controls"
+                    ),
+                    isOn: $playerShowPiP,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_player_episodes", fallback: "Episodes Button"),
+                    subtitle: L10n.string(
+                        "tvos_settings_player_episodes_subtitle",
+                        fallback: "Show the Episodes panel button when watching series"
+                    ),
+                    isOn: $playerShowEpisodes,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_player_sources", fallback: "Streams & Sources Button"),
+                    subtitle: L10n.string(
+                        "tvos_settings_player_sources_subtitle",
+                        fallback: "Show the alternate streams and sources button"
+                    ),
+                    isOn: $playerShowSources,
+                    accentColor: accentColor
+                )
+            }
+
             SettingsGroup(title: L10n.string("tvos_settings_smart_playback", fallback: "Smart Playback"), subtitle: L10n.string("tvos_settings_automatically_choose_streams_and_matchin_9ca69e9f", fallback: "Automatically choose streams and matching subtitles")) {
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_auto_select_stream", fallback: "Auto Select Stream"),
@@ -5719,6 +5767,14 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_cached_only", fallback: "Cached Only"),
                     subtitle: L10n.string("tvos_settings_prefer_debrid_cached_links_in_auto_selec_57c11672", fallback: "Prefer debrid-cached links in auto-select and the stream picker filter"),
                     isOn: $cachedOnlyStreams,
+                    accentColor: accentColor
+                )
+
+                SettingsOptionRow(
+                    title: L10n.string("tvos_settings_stream_sort", fallback: "Stream Sort"),
+                    subtitle: L10n.string("tvos_settings_stream_sort_subtitle", fallback: "Default ordering when opening sources (Quality merges all add-ons and ranks by 4K/1080p)"),
+                    selection: $streamSortOption,
+                    options: streamSortModes,
                     accentColor: accentColor
                 )
             }
@@ -6931,14 +6987,14 @@ private struct LicensesAttributionsSheet: View {
     private let playbackEntries: [LicenseEntry] = [
         LicenseEntry(
             id: "aetherengine",
-            title: "AetherEngine 6.21.0",
-            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.21.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
+            title: "AetherEngine 6.34.0",
+            body: "Primary playback engine. Complete corresponding source and Nuvio's pinned changes: github.com/superuser404notfound/AetherEngine/tree/6.34.0 and the Vendor/AetherEngine directory in the NuvioTV source distribution.",
             license: "LGPL-3.0 + App Store exception"
         ),
         LicenseEntry(
             id: "aether-ffmpeg",
-            title: "FFmpegBuild 2.4.2 (AetherLib*)",
-            body: "Dynamically linked, namespaced FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.4.2 and Vendor/FFmpegBuild.",
+            title: "FFmpegBuild 2.4.3 (AetherLib*)",
+            body: "Dynamically linked, namespaced FFmpeg 8.1 libraries used by AetherEngine. Relinkable frameworks, license texts, build recipe, and exact source are available at github.com/superuser404notfound/FFmpegBuild/tree/2.4.3 and Vendor/FFmpegBuild.",
             license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
         ),
         LicenseEntry(

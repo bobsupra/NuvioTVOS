@@ -926,6 +926,12 @@ public class ProfileViewModel: ObservableObject {
         guard !remoteProfiles.isEmpty else { return false }
         let preferredActiveId = activeProfile?.id
 
+        if profiles == remoteProfiles,
+           let preferredActiveId,
+           activeProfile?.id == preferredActiveId {
+            return true
+        }
+
         guard let manager = profileManager else {
             return applyProfilesInMemory(remoteProfiles, preferredActiveId: preferredActiveId)
         }

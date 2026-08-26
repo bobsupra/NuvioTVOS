@@ -89,7 +89,7 @@ final class FileHandleIOReader: IOReader, @unchecked Sendable {
 }
 
 /// Load media through load(source:) with a custom IOReader and print engine state once a second. Tests both native (seekable) and software (seekable or forward-only) paths.
-func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool) -> Int32 {
+func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil) -> Int32 {
     EngineLog.handler = { print($0) }
     var modeDesc: String
     switch (inMemory, forwardOnly) {
@@ -102,7 +102,7 @@ func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Boo
     print("aetherctl customio: \(path) (\(modeDesc))")
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
-        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnly, reload: reload, switchAudio: switchAudio, selectSubs: selectSubs, extract: extract)
+        box.value = await customIOSmokeTest(path: path, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnly, reload: reload, switchAudio: switchAudio, selectSubs: selectSubs, extract: extract, audioIndex: audioIndex)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -110,7 +110,7 @@ func runCustomIO(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Boo
 }
 
 @MainActor
-private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool) async -> Int32 {
+private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, audioOnly: Bool, reload: Bool, switchAudio: Bool, selectSubs: Bool, extract: Bool, audioIndex: Int32? = nil) async -> Int32 {
     let reader: FileHandleIOReader
     do {
         reader = try FileHandleIOReader(path: path, inMemory: inMemory, forwardOnly: forwardOnly)
@@ -132,7 +132,14 @@ private func customIOSmokeTest(path: String, inMemory: Bool, forwardOnly: Bool, 
     options.audioOnly = audioOnly
 
     do {
-        try await engine.load(source: .custom(reader), options: options)
+        // #64: the load-time audio override, the only way a forward-only custom source can end up on
+        // a track other than the container default (selectAudioTrack refuses to rebuild such a
+        // pipeline). Prints what it asked for and what it got, which is the whole measurement.
+        try await engine.load(source: .custom(reader), options: options, audioSourceStreamIndex: audioIndex)
+        if let audioIndex {
+            print("  AUDIOPICK requested=\(audioIndex) active=\(engine.activeAudioTrackIndex.map(String.init) ?? "none") "
+                  + "tracks=\(engine.audioTracks.map { "\($0.id):\($0.language ?? "und")" })")
+        }
     } catch {
         print("VERDICT: custom source failed: load error: \(error.localizedDescription)")
         engine.stop()

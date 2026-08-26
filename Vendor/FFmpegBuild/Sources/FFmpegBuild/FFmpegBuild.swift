@@ -8,5 +8,5 @@
 // minimal configuration: only demuxing + decoding, no network/TLS,
 // no encoders, no filters, no programs.
 //
-// Usage: import FFmpegBuild (or the individual Libav* modules)
+// Usage: import FFmpegBuild (or the individual AetherLib* modules)
 import Foundation

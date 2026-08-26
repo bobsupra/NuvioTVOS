@@ -3,8 +3,11 @@
 // Smallest viable AetherEngine integration. Drop this file into a new
 // SwiftUI tvOS / iOS / macOS app, add the AetherEngine Swift Package as
 // a dependency, set the file's @main App as the app entry point, and
-// run. About 90 lines of host code, everything else (HDR routing,
+// run. This file is the whole host, everything else (HDR routing,
 // Atmos passthrough, codec dispatch, subtitle decoding) is the engine.
+//
+// Live TV needs four more contracts on top of this; they are in
+// Examples/LiveHost/LiveChannelHost.swift.
 //
 // See Examples/README.md for the click-by-click setup.
 

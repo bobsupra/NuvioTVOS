@@ -118,6 +118,32 @@ struct Issue93SlowReadDiagnosticsTests {
         #expect(line.contains("unaccounted=40ms"))
     }
 
+    @Test("a slow read names the origin concurrency it was running at")
+    func slowReadCarriesTheOriginBudget() {
+        // #377: "how many requests were open against this origin" is the question a metered origin
+        // is reacting to, and it was unanswerable from outside the engine: four URLSession pools,
+        // each reporting its own cap, none reporting the sum. A slow read is when it matters.
+        var diag = SlowReadDiagnostics()
+        diag.recordIteration()
+        let origin = SlowReadDiagnostics.OriginBudgetLine(
+            inflight: 2, peak: 4, limit: 2, refusals: 3)
+        let line = try! #require(diag.line(elapsedMs: 9_000, offset: 512, generationSpan: (3, 4),
+                                           origin: origin))
+        // `total` is load-bearing: every other number on this line is this read's, so a bare
+        // refusal count reads as this read's too, and the #377 reporter read three cumulative
+        // values as a tightening meter rather than as three ladders each hitting their cap.
+        #expect(line.contains("origin=2inflight/4peak limit=2 refusals=3total"))
+
+        // Uncapped and never refused is the ordinary case and must read as such, not as a zero.
+        let quiet = SlowReadDiagnostics.OriginBudgetLine(inflight: 1, peak: 1, limit: nil, refusals: 0)
+        #expect(quiet.text == "origin=1inflight/1peak limit=none")
+
+        // Omitting it entirely leaves the historical line byte-identical, so a field trace from an
+        // older build and a new one still diff cleanly.
+        let without = try! #require(diag.line(elapsedMs: 9_000, offset: 512, generationSpan: (3, 4)))
+        #expect(!without.contains("origin="))
+    }
+
     @Test("the interactive detour fetch budget caps a starved fetch well below the chunk budget")
     func detourFetchBudgetIsTight() {
         // A 4 MB detour block over a healthy remote 4K source lands in ~1s; the full chunk budget

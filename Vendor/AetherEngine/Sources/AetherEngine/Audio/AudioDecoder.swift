@@ -118,7 +118,8 @@ final class AudioDecoder: @unchecked Sendable {
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
 
         var outLayout = AVChannelLayout()
-        av_channel_layout_default(&outLayout, channels)
+        // #401: this is the order the stamped layout has to name, so both come from one place.
+        makeResamplerOutputLayout(channels, into: &outLayout)
 
         // Input layout: frame's if valid, else a synthesised default. Key for TrueHD 7.1 (the frame has it right
         // after decoding even when codecpar didn't).

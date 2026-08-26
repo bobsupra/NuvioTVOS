@@ -4,6 +4,31 @@ import XCTest
 
 final class PlaybackBackendPolicyTests: XCTestCase {
 
+    func testMPVHTTPHeaderOptionsExtractAndEscapeHeaders() {
+        let options = MPVHTTPHeaderOptions(headers: [
+            "uSeR-aGeNt": "TrailerClient/1.0",
+            "ReFeReR": "https://example.test/embed",
+            "X-Trailer": "one,two\\three",
+            "Empty": ""
+        ])
+
+        XCTAssertEqual(options.userAgent, "TrailerClient/1.0")
+        XCTAssertEqual(options.referrer, "https://example.test/embed")
+        XCTAssertEqual(options.headerFields, "X-Trailer: one\\,two\\three")
+    }
+
+    func testMPVHTTPHeaderOptionsResetMissingValues() {
+        let options = MPVHTTPHeaderOptions(headers: [
+            "Referer": "",
+            "User-Agent": "",
+            "Authorization": "Bearer token"
+        ])
+
+        XCTAssertEqual(options.userAgent, "libmpv")
+        XCTAssertEqual(options.referrer, "")
+        XCTAssertEqual(options.headerFields, "Authorization: Bearer token")
+    }
+
     func testAISubtitleSettingsMigratesRetiredModelToSupportedDefault() {
         XCTAssertEqual(
             AISubtitleTranslationSettings.normalizedModel("gemini-2.0-flash"),

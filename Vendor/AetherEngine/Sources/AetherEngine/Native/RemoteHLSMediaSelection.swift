@@ -63,8 +63,8 @@ enum RemoteHLSMediaSelection {
     }
 
     /// Reroute only the typed VOD-path misroute, and only for URL sources: custom readers have no
-    /// URL for AVPlayer to open, and the AE#140 live raw-path misroute keeps its fail-closed
-    /// contract (live hosts choose their own DVR/rejoin options before going native).
+    /// URL for AVPlayer to open, and the live raw-path misroute has its own destination
+    /// (`shouldRouteLiveOntoIngest`, AE#363).
     ///
     /// AE#246: the classification can arrive from either open of the same source. The load-time probe
     /// is the usual one, but when that probe failed for an unrelated (transient) reason the loopback
@@ -75,6 +75,23 @@ enum RemoteHLSMediaSelection {
         guard !isCustomSource,
               let readerError = failure as? AVIOReaderError,
               case .hlsPlaylistOnVODPath = readerError else { return false }
+        return true
+    }
+
+    /// AE#363: the live counterpart, and a correction to the AE#140 fail-closed contract. That contract
+    /// was right about the loop it removed and wrong about what to do afterwards: the engine holds
+    /// `HLSLiveIngestReader`, which is the only live path that puts `LoadOptions.httpHeaders` on the
+    /// playlist, every segment and every AES key, and it told the host to go build one instead of
+    /// building it. A host whose origin enforces per-request headers (tokenized IPTV) therefore had to
+    /// wire the reader itself to reach the one path that would have worked.
+    ///
+    /// Same two guards as the VOD side: only the typed misroute, and only for URL sources, because a
+    /// custom reader has no playlist URL to ingest from and keeps the typed rejection. The reader only
+    /// classifies as `hlsPlaylistOnRawLivePath` on the live path, so `isLive` needs no guard here.
+    static func shouldRouteLiveOntoIngest(failure: Error?, isCustomSource: Bool) -> Bool {
+        guard !isCustomSource,
+              let readerError = failure as? AVIOReaderError,
+              case .hlsPlaylistOnRawLivePath = readerError else { return false }
         return true
     }
 

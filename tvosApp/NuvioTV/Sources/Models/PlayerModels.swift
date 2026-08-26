@@ -181,7 +181,12 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     /// for the built-in player (which plays in-app). Infuse supports multi-`sub=`;
     /// VLC takes the first subtitle. Source is percent-encoded so query separators
     /// in the stream URL survive.
-    func launchURL(for streamURL: URL, subtitleURLs: [URL] = []) -> URL? {
+    func launchURL(
+        for streamURL: URL,
+        subtitleURLs: [URL] = [],
+        successURL: URL? = nil,
+        errorURL: URL? = nil
+    ) -> URL? {
         guard self != .builtIn,
               let encoded = streamURL.absoluteString
                 .addingPercentEncoding(withAllowedCharacters: .externalPlayerURLValue) else {
@@ -197,6 +202,14 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
             var query = "infuse://x-callback-url/play?url=\(encoded)"
             for sub in encodedSubs.prefix(8) {
                 query += "&sub=\(sub)"
+            }
+            for (name, callback) in [("x-success", successURL), ("x-error", errorURL)] {
+                if let callback,
+                   let encodedCallback = callback.absoluteString.addingPercentEncoding(
+                       withAllowedCharacters: .externalPlayerURLValue
+                   ) {
+                    query += "&\(name)=\(encodedCallback)"
+                }
             }
             return URL(string: query)
         case .vlc:
@@ -224,6 +237,83 @@ enum ExternalPlayer: String, CaseIterable, Identifiable {
     }
 }
 
+/// The callback returned by Infuse after an external playback handoff.
+struct ExternalPlaybackCallback: Equatable {
+    let id: String
+    let isError: Bool
+    let progress: Double?
+    let position: Double?
+
+    static func parse(_ url: URL) -> ExternalPlaybackCallback? {
+        guard url.scheme?.lowercased() == "nuvio-tv",
+              url.host?.lowercased() == "external-playback" else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        let isError = parts.first?.lowercased() == "error"
+        let id = isError ? parts.dropFirst().first : parts.first
+        guard let id, !id.isEmpty else { return nil }
+        let query = URLComponents(url: url, resolvingAgainstBaseURL: false)?.queryItems ?? []
+        func number(_ name: String) -> Double? {
+            guard let raw = query.first(where: { $0.name == name })?.value,
+                  let value = Double(raw), value.isFinite else { return nil }
+            return value
+        }
+        let progress: Double?
+        if let value = number("progress") {
+            guard (0...1).contains(value) else { return nil }
+            progress = value
+        } else {
+            progress = nil
+        }
+        return ExternalPlaybackCallback(
+            id: id,
+            isError: isError,
+            progress: progress,
+            position: number("position")
+        )
+    }
+}
+
+/// Minimal durable state for one in-flight Infuse handoff. A single slot is
+/// intentional: a second handoff supersedes the first and callback IDs prevent
+/// stale callbacks from consuming the new session.
+struct ExternalPlaybackSession: Codable, Equatable {
+    let id: String
+    let meta: NuvioMeta
+    let sourceURL: String
+    let season: Int?
+    let episode: Int?
+    let duration: Double?
+    let profileID: String?
+}
+
+enum ExternalPlaybackSessionStore {
+    private static let key = "nuvio.tv.externalPlaybackSession.v1"
+
+    static func save(_ session: ExternalPlaybackSession, defaults: UserDefaults = .standard) {
+        guard let data = try? JSONEncoder().encode(session) else { return }
+        defaults.set(data, forKey: key)
+    }
+
+    static func load(defaults: UserDefaults = .standard) -> ExternalPlaybackSession? {
+        guard let data = defaults.data(forKey: key) else { return nil }
+        return try? JSONDecoder().decode(ExternalPlaybackSession.self, from: data)
+    }
+
+    /// Atomically consumes only a matching callback and profile. Replayed or
+    /// unrelated callbacks therefore become no-ops after the first delivery.
+    static func consume(
+        id: String,
+        profileID: String?,
+        defaults: UserDefaults = .standard
+    ) -> ExternalPlaybackSession? {
+        guard let session = load(defaults: defaults),
+              session.id == id,
+              session.profileID == profileID else { return nil }
+        defaults.removeObject(forKey: key)
+        return session
+    }
+}
+
 private extension CharacterSet {
     /// Percent-encoding set for embedding a full URL as a scheme value: only the
     /// RFC 3986 unreserved characters pass through, so `:` `/` `?` `&` `=` `#`
@@ -247,6 +337,9 @@ struct PreparedNextStream {
     var streamName: String? = nil
     var streamDescription: String? = nil
     var filename: String? = nil
+    var addonName: String? = nil
+    var videoSize: Int64? = nil
+    var provider: String? = nil
 }
 
 struct PlayerTime: Equatable {

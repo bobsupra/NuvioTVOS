@@ -200,6 +200,101 @@ final class StreamQualityTagsTests: XCTestCase {
         XCTAssertNil(builtIn)
     }
 
+    func testInfuseXCallbacksArePercentEncoded() {
+        let stream = URL(string: "https://cdn.example/movie.mkv?token=a&b=c")!
+        let success = URL(string: "nuvio-tv://external-playback/ABC-123")!
+        let error = URL(string: "nuvio-tv://external-playback/error/ABC-123")!
+        let launch = ExternalPlayer.infuse.launchURL(
+            for: stream,
+            successURL: success,
+            errorURL: error
+        )!
+
+        XCTAssertTrue(launch.absoluteString.contains("x-success=nuvio-tv%3A%2F%2Fexternal-playback%2FABC-123"))
+        XCTAssertTrue(launch.absoluteString.contains("x-error=nuvio-tv%3A%2F%2Fexternal-playback%2Ferror%2FABC-123"))
+        XCTAssertFalse(launch.absoluteString.contains("x-success=nuvio-tv://"))
+    }
+
+    func testExternalPlaybackCallbackParsingAndCompletionFraction() {
+        let callback = ExternalPlaybackCallback.parse(
+            URL(string: "nuvio-tv://external-playback/ABC-123?progress=0.9")!
+        )
+        XCTAssertEqual(callback?.id, "ABC-123")
+        XCTAssertEqual(callback?.progress, 0.9)
+        XCTAssertFalse(callback?.isError == true)
+
+        let error = ExternalPlaybackCallback.parse(
+            URL(string: "nuvio-tv://external-playback/error/ABC-123?position=90")!
+        )
+        XCTAssertEqual(error?.id, "ABC-123")
+        XCTAssertTrue(error?.isError == true)
+        XCTAssertEqual(error?.position, 90)
+        XCTAssertEqual(WatchProgressLedger.completionFraction, 0.90)
+    }
+
+    func testExternalPlaybackCallbackRejectsProgressOutsideDocumentedFractionBounds() {
+        XCTAssertNil(ExternalPlaybackCallback.parse(
+            URL(string: "nuvio-tv://external-playback/id?progress=-0.01")!
+        ))
+        XCTAssertNil(ExternalPlaybackCallback.parse(
+            URL(string: "nuvio-tv://external-playback/id?progress=1.01")!
+        ))
+        XCTAssertEqual(
+            ExternalPlaybackCallback.parse(
+                URL(string: "nuvio-tv://external-playback/id?progress=1")!
+            )?.progress,
+            1
+        )
+    }
+
+    func testExternalPlaybackSessionConsumptionIsIdempotentAndProfileScoped() {
+        let suiteName = "ExternalPlaybackSessionTests.\(UUID().uuidString)"
+        let defaults = UserDefaults(suiteName: suiteName)!
+        defer { defaults.removePersistentDomain(forName: suiteName) }
+        let meta = NuvioMeta(
+            id: "tt123",
+            name: "Movie",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt123",
+            tmdbId: nil,
+            type: "movie",
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: "100 min",
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        let session = ExternalPlaybackSession(
+            id: "session-1",
+            meta: meta.persistenceSnapshot,
+            sourceURL: "https://cdn.example/movie.mkv",
+            season: nil,
+            episode: nil,
+            duration: 6_000,
+            profileID: "profile-a"
+        )
+        ExternalPlaybackSessionStore.save(session, defaults: defaults)
+        XCTAssertNil(ExternalPlaybackSessionStore.consume(id: session.id, profileID: "profile-b", defaults: defaults))
+        XCTAssertEqual(
+            ExternalPlaybackSessionStore.consume(id: session.id, profileID: "profile-a", defaults: defaults),
+            session
+        )
+        XCTAssertNil(ExternalPlaybackSessionStore.consume(id: session.id, profileID: "profile-a", defaults: defaults))
+    }
+
     func testExternalPlayerSystemImagesAndLabels() {
         for player in ExternalPlayer.allCases {
             XCTAssertFalse(player.systemImage.isEmpty)

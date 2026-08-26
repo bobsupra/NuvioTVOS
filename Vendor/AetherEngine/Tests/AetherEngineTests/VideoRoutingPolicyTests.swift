@@ -38,8 +38,12 @@ struct VideoRoutingPolicyTests {
     func unenumeratedVideoCodecsAreSoftware() {
         // HLSVideoEngine accepts HEVC / H.264 / HW AV1 and throws unsupportedCodec on everything else,
         // so a codec the switch never named used to fail the load rather than fall back to libavcodec.
+        // The legacy Microsoft tail (FFmpegBuild 2.4.3) is in the same class: a decoder exists for it
+        // now, and it only ever reaches that decoder because the default here is software.
         for codec in [AV_CODEC_ID_QTRLE, AV_CODEC_ID_PRORES, AV_CODEC_ID_MJPEG,
-                      AV_CODEC_ID_THEORA, AV_CODEC_ID_RAWVIDEO, AV_CODEC_ID_CINEPAK] {
+                      AV_CODEC_ID_THEORA, AV_CODEC_ID_RAWVIDEO, AV_CODEC_ID_CINEPAK,
+                      AV_CODEC_ID_MSMPEG4V1, AV_CODEC_ID_MSMPEG4V2, AV_CODEC_ID_MSMPEG4V3,
+                      AV_CODEC_ID_WMV1, AV_CODEC_ID_WMV2, AV_CODEC_ID_WMV3] {
             #expect(VideoRoutingPolicy.requiresSoftwarePath(
                 codecID: codec, fieldOrder: AV_FIELD_PROGRESSIVE, av1Available: true))
             #expect(VideoRoutingPolicy.requiresSoftwarePath(

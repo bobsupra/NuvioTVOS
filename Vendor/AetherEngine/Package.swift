@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 6.21.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 6.34.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
 
 import PackageDescription
 
@@ -74,6 +74,17 @@ let package = Package(
             name: "aetherctl",
             dependencies: ["AetherEngine", "AetherEngineSMB"],
             path: "Sources/aetherctl"
+        ),
+        // The samples in Examples/ are drop-in files rather than apps, so nothing used to
+        // compile them and they could rot the way prose rots, except a reader trusts them
+        // more. Compiling them as a target (never a product, so no consumer builds it)
+        // makes `swift build` and CI the guard. DemoPlayerMac is its own package and
+        // excluded here; it builds with `swift build --package-path Examples/DemoPlayerMac`.
+        .target(
+            name: "ExampleSources",
+            dependencies: ["AetherEngine"],
+            path: "Examples",
+            exclude: ["README.md", "DemoPlayerMac"]
         ),
         .testTarget(
             name: "AetherEngineTests",

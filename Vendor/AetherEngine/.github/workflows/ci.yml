@@ -40,6 +40,11 @@ jobs:
       - name: swift test
         run: swift test
 
+      # The transport probe is a device harness and runs nowhere in CI, so nothing else would keep
+      # it compiling. A harness that stopped building is discovered by the person who needed it.
+      - name: build the transport probe (AE#377)
+        run: swift build --build-tests --package-path Probes/TransportProbe
+
   build-tvos:
     name: xcodebuild (tvOS Simulator)
     runs-on: macos-15

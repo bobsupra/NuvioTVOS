@@ -485,6 +485,27 @@ COMMON_FLAGS=(
     --enable-decoder=vp9 --enable-decoder=av1 --enable-decoder=libdav1d
     --enable-decoder=mpeg2video --enable-decoder=mpeg4 --enable-decoder=vc1
     --enable-decoder=qtrle
+    # Legacy Microsoft video, the MPEG-4-family tail that pre-2005 AVI rips and
+    # WMV-era remuxes still carry (FFmpegBuild#3). All are native libavcodec
+    # decoders under FFmpeg's LGPL-2.1-or-later terms: no external library, no GPL
+    # flag. msmpeg4v1/v2/v3 and wmv1/wmv2 share the msmpeg4dec object, so once v3
+    # (MS-MPEG4 v3 / "DivX 3.11", the reported case) is in, its siblings cost their
+    # decoder structs plus wmv2dsp; wmv3 (WMV9) selects the already-enabled
+    # vc1_decoder and adds little beyond its own registration. Without them
+    # avcodec_find_decoder returns nil and AetherEngine's software path fails the
+    # load with unsupportedCodec, because since FFmpegBuild#1 the routing default is
+    # software for everything the native path does not carry. The avi demuxer above
+    # is already enabled, so the AVI case is complete with the decoder alone.
+    #
+    # Deliberately NOT enabled: the asf demuxer and the wmav1 / wmav2 decoders. A
+    # native .wmv / .asf file needs all three, and half the set is worse than none:
+    # with the demuxer but no WMA decoder the file plays video with silent audio
+    # (AetherEngine's AudioCodecCompat maps an unrecognised id to .unsupported and
+    # the session drops to video-only), which presents as a playback bug rather than
+    # an honest unsupported-format error. wmv3 here covers WMV9 inside Matroska and
+    # MPEG-TS, where the container's own demuxer supplies the stream.
+    --enable-decoder=msmpeg4v1 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3
+    --enable-decoder=wmv1 --enable-decoder=wmv2 --enable-decoder=wmv3
     --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=ac3
     --enable-decoder=eac3 --enable-decoder=flac --enable-decoder=mp3
     --enable-decoder=mp3float --enable-decoder=opus --enable-decoder=vorbis

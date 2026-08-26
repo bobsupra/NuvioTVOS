@@ -12,7 +12,7 @@ struct PlayerSubtitleOverlay: View {
     let style: SubtitleStyle
 
     private var textSize: CGFloat {
-        min(max(CGFloat(style.textSize) / 100 * 42, 24), 92)
+        min(max(CGFloat(style.textSize) / 100 * 55, 24), 125)
     }
     private var textColor: Color { Color(hex: style.textColorHex) }
     private var outlineColor: Color { Color(hex: style.outlineColorHex) }
@@ -203,7 +203,7 @@ struct MPVSubtitleOverlay: View {
     let style: SubtitleStyle
 
     private var textSize: CGFloat {
-        min(max(CGFloat(style.textSize) / 100 * 42, 24), 92)
+        min(max(CGFloat(style.textSize) / 100 * 55, 24), 125)
     }
     private var textColor: Color { Color(hex: style.textColorHex) }
     private var outlineColor: Color { Color(hex: style.outlineColorHex) }

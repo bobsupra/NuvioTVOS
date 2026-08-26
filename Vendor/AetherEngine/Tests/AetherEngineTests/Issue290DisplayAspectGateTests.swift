@@ -110,12 +110,16 @@ struct Issue290DisplayAspectGateTests {
     @Test("a frame SAR that fails on the aspect drops through to the next source")
     func rejectedFrameSARFallsThrough() {
         // Live TS: the frame claims 3:1, the container says square. The claim is dropped and the
-        // picture is drawn at coded dimensions instead of a 5.33:1 band.
+        // picture is drawn at coded dimensions instead of a 5.33:1 band. The square declaration
+        // behind it is not an answer of its own (it corrects nothing), so the resolution ends in
+        // nil; both attach nothing, which is what "drawn at coded dimensions" means here.
         let resolved = SoftwareVideoDecoder.resolveSAR(
             frame: rational(3, 1), codecCtx: rational(0, 1), stream: rational(1, 1),
             width: 1920, height: 1080)
-        #expect(resolved?.num == 1)
-        #expect(resolved?.den == 1)
+        #expect(resolved == nil)
+        let (attach, latch) = SoftwareVideoDecoder.sarForAttachment(resolved: resolved, latched: nil)
+        #expect(attach == nil)
+        #expect(latch == nil)
     }
 
     @Test("no believable SAR anywhere resolves to nil, which attaches nothing")

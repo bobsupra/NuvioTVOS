@@ -119,6 +119,31 @@ enum LiveEdgePolicy {
         if segmentCount >= windowSegmentCount { return true }
         return summedDurationSeconds >= holdBackSeconds(targetDuration: targetDuration)
     }
+
+    /// AE#374: the first live manifest's own account of what it cost, for the log.
+    ///
+    /// The loopback's entire live-join latency is this one withheld response: everything the engine does
+    /// for itself is finished before the gate is entered, and the wait that follows is the runway being
+    /// filled at whatever rate the origin hands it over. `.standard` used to log only when the gate
+    /// failed, so a successful hold of eighteen seconds left no trace at all and a downstream host had to
+    /// measure it from the outside. Named here the way the reroute line names the grace it saves (#274).
+    static func firstServeAccount(waitedSeconds: TimeInterval,
+                                  segmentCount: Int,
+                                  summedDurationSeconds: Double,
+                                  targetDuration: Int) -> String {
+        let holdBack = holdBackSeconds(targetDuration: targetDuration)
+        let reached = summedDurationSeconds >= holdBack ? ">=" : "<"
+        return "first live manifest served after \(seconds(waitedSeconds))s: "
+            + "\(segmentCount) segments / \(seconds(summedDurationSeconds))s "
+            + "\(reached) \(seconds(holdBack))s holdback (TARGETDURATION \(targetDuration)s)"
+    }
+
+    /// Millisecond resolution, because the interval this reports spans four orders of magnitude: a
+    /// backlogged origin satisfies the cushion in single-digit milliseconds and a strict-realtime one
+    /// takes the full holdback.
+    static func seconds(_ value: Double) -> String {
+        String(format: "%.3f", value)
+    }
 }
 
 struct LiveTargetDurationSeal {
@@ -155,6 +180,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private let liveWindowSizing: LiveWindowSizing
     /// Only `.fastZap` sessions may serve a shallow first window after a bounded grace.
     private let allowsBoundedDegradedStart: Bool
+    /// AE#374: whether the first-serve gate has already reported the interval it held. Read and written
+    /// only under `firstSegmentCondition`, inside `waitForFirstLiveSegment` and its two account helpers.
+    private var didAccountForFirstServe = false
     /// Host override for blocking-reload (`LoadOptions.liveBlockingReload`): nil = auto (observed policy for
     /// ingest, on by default for signal-less live), true/false = force. Wins over the policy (#167).
     private let blockingReloadOverride: Bool?
@@ -281,6 +309,26 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private var _seqDurations: [Double] = []
     /// Producer reached true source EOF: the next playlist build appends ENDLIST. Guarded by stateLock.
     private var _seqEnded = false
+    /// #370: the pump died before publishing anything; a held startup-playlist GET must not sit out
+    /// the rest of its timeout for a session that is already failing. Guarded by stateLock.
+    private var _seqStartupAborted = false
+    /// #370 follow-up: how many appended entries the playlist renderer will actually advertise. A
+    /// zero-duration entry is a plan index a long GOP skipped, and `buildMediaPlaylistText` gives it
+    /// no URI, so counting raw entries would let the startup gate release onto a playlist that
+    /// renders empty. That is the very thing the gate exists to prevent (-12888 on first read), and
+    /// with the cushion down to one entry there is no longer a second entry to mask it.
+    /// Guarded by stateLock.
+    private var _seqAdvertisableCount = 0
+
+    /// #370: never hold the first media playlist for more than ONE published duration. The live
+    /// constant this gate reused (`LiveEdgePolicy.minStartupSegments = 2`) guards a SLIDING window
+    /// whose live-edge holdback can't fit one segment; an EVENT playlist starts at media sequence 0,
+    /// grows append-only, and its refresh counter already defeats AVPlayer's unchanged-playlist
+    /// patience (-12888). The cost of demanding 2 was concrete: a published duration needs the NEXT
+    /// segment's ledger open, so "2 durations" = 3 segment opens ≈ 12-18 s of media through a
+    /// possibly-stalling origin. The field session held AVPlayer's playlist GET for the full 30 s
+    /// and the asset load timed out (-12884) with ~12 s of media already on disk.
+    static let sequentialStartupSegments = 1
 
     init(
         cache: SegmentCache,
@@ -402,7 +450,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         }
         // Zero marks a plan index a long GOP skipped entirely (no media file exists); the
         // playlist renderer omits those entries. Negative values are producer bugs, clamp them.
-        _seqDurations.append(max(0, durationSeconds))
+        let clamped = max(0, durationSeconds)
+        _seqDurations.append(clamped)
+        if clamped > 0 { _seqAdvertisableCount += 1 }
         stateLock.unlock()
         firstSegmentCondition.lock()
         firstSegmentCondition.broadcast()
@@ -421,7 +471,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         firstSegmentCondition.unlock()
     }
 
-    /// Hold the first media playlist until the startup segments exist (mirrors the live gate:
+    /// Hold the first media playlist until the startup segment exists (mirrors the live gate:
     /// an empty playlist is a broken asset to AVPlayer, which never re-polls it). A fast
     /// archive origin cuts the first segments within a second.
     func waitForSequentialStartupSegments(timeout: TimeInterval) -> Bool {
@@ -430,11 +480,25 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         defer { firstSegmentCondition.unlock() }
         while true {
             stateLock.lock()
-            let ready = _seqDurations.count >= LiveEdgePolicy.minStartupSegments || _seqEnded
+            let ready = _seqAdvertisableCount >= Self.sequentialStartupSegments || _seqEnded
+            let aborted = _seqStartupAborted
             stateLock.unlock()
             if ready { return true }
+            if aborted { return false }
             if !firstSegmentCondition.wait(until: deadline) { return false }
         }
+    }
+
+    /// #370: release a held startup-playlist GET when the pump dies before publishing anything.
+    /// The session is failing anyway; holding the server thread for the rest of the timeout only
+    /// delays the host's failure surface.
+    func abortSequentialStartupWait() {
+        stateLock.lock()
+        _seqStartupAborted = true
+        stateLock.unlock()
+        firstSegmentCondition.lock()
+        firstSegmentCondition.broadcast()
+        firstSegmentCondition.unlock()
     }
 
     /// Called on each playlist build. For live: advances firstVisible to max(0, highWater - window),
@@ -938,7 +1002,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
 
     /// AE#141: whether the active producer's march can plausibly deliver `index` without a
-    /// re-anchor — at or behind its anchor-to-front span, or within the forward-wait window
+    /// re-anchor: at or behind its anchor-to-front span, or within the forward-wait window
     /// ahead of the front. The engine's seek-deadline backstop asks this before preserving a
     /// "progressing" producer whose march would never reach the pending seek target.
     func activeMarchCovers(_ index: Int) -> Bool {
@@ -1134,6 +1198,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     func waitForFirstLiveSegment(timeout: TimeInterval) -> Bool {
         guard isLive else { return true }
         let deadline = Date().addingTimeInterval(timeout)
+        // AE#374: monotonic, because this interval is a measurement and a wall-clock jump would corrupt
+        // it. The deadline above stays on `Date` because `NSCondition.wait(until:)` takes one.
+        let enteredAt = DispatchTime.now()
         let window = liveWindowSizing.windowSegmentCount
         var degradedDeadline: Date?
         var degradedGrace: TimeInterval?
@@ -1147,7 +1214,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
                                                        windowSegmentCount: window) {
-                _ = sealLiveTargetDuration(candidate: target.value)
+                let sealed = sealLiveTargetDuration(candidate: target.value)
+                accountForFirstServe(since: enteredAt, snapshot: snap, targetDuration: sealed)
                 return true
             }
             if allowsBoundedDegradedStart,
@@ -1169,20 +1237,20 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,
                                                           windowSegmentCount: window) {
-                    _ = sealLiveTargetDuration(candidate: afterTarget.value)
+                    let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                    accountForFirstServe(since: enteredAt, snapshot: after, targetDuration: sealed)
                     return true
                 }
                 if let degradedDeadline,
                    Date() >= degradedDeadline,
                    after.count >= LiveEdgePolicy.minStartupSegments {
                     let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
-                    let holdBack = LiveEdgePolicy.holdBackSeconds(targetDuration: sealed)
-                    EngineLog.emit(
-                        "[HLSVideoEngine] fastZap startup degraded, serving first playlist with "
-                        + "\(after.count) segments / \(String(format: "%.3f", after.summed))s "
-                        + "before \(String(format: "%.3f", holdBack))s holdback after "
-                        + "\(String(format: "%.3f", degradedGrace ?? 0))s grace",
-                        category: .session
+                    // AE#374: the grace is the last leg of this wait, not the wait. Reporting it alone
+                    // left a bounded start reading as a half-second one when it had held for twelve.
+                    accountForFirstServe(
+                        since: enteredAt, snapshot: after, targetDuration: sealed,
+                        note: "fastZap bounded start after "
+                            + "\(LiveEdgePolicy.seconds(degradedGrace ?? 0))s grace"
                     )
                     return true
                 }
@@ -1190,24 +1258,66 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 // Degraded start: serving before the holdback cushion is built (transcode too slow, or a
                 // strict-realtime origin that has not produced 3 x TD of content within the deadline) makes
                 // a -16832 "restarting from end of live playlist" stall right after startup likely. Observe it.
-                if after.count > 0 && !LiveEdgePolicy.startupCushionSatisfied(segmentCount: after.count,
-                                                                             summedDurationSeconds: after.summed,
-                                                                             targetDuration: afterTarget.value,
-                                                                             windowSegmentCount: window) {
-                    EngineLog.emit(
-                        "[HLSVideoEngine] WARNING: live startup degraded, serving first playlist with "
-                        + "\(after.count) segments / \(String(format: "%.1f", after.summed))s < "
-                        + "\(String(format: "%.1f", LiveEdgePolicy.holdBackSeconds(targetDuration: afterTarget.value)))s holdback "
-                        + "after \(Int(timeout))s timeout (undersized startup cushion)",
-                        category: .session
-                    )
+                guard after.count > 0 else {
+                    // AE#374: nothing was ever cut, so there is no window to account for and no manifest
+                    // worth serving. This exit used to return in silence, which from a host's side is the
+                    // one outcome indistinguishable from a merely slow origin.
+                    accountForUnservedFirstManifest(since: enteredAt)
+                    return false
                 }
-                if after.count > 0 {
-                    _ = sealLiveTargetDuration(candidate: afterTarget.value)
-                }
-                return after.count > 0
+                // The satisfied re-read above has already returned, so reaching the deadline here means the
+                // cushion is undersized by definition.
+                let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                accountForFirstServe(
+                    since: enteredAt, snapshot: after, targetDuration: sealed, warning: true,
+                    note: "\(Int(timeout))s timeout (undersized startup cushion)"
+                )
+                return true
             }
         }
+    }
+
+    /// AE#374: one account per live session, emitted at whichever exit ends the first-serve gate.
+    ///
+    /// Every `/media.m3u8` request without an `_HLS_msn` re-enters the gate, so without the latch a
+    /// steady session would repeat the line at its refresh interval. Called with `firstSegmentCondition`
+    /// held, which is what the latch is protected by.
+    private func accountForFirstServe(
+        since entered: DispatchTime,
+        snapshot: (count: Int, summed: Double, maxDuration: Double),
+        targetDuration: Int,
+        warning: Bool = false,
+        note: String? = nil
+    ) {
+        guard !didAccountForFirstServe else { return }
+        didAccountForFirstServe = true
+        let account = LiveEdgePolicy.firstServeAccount(
+            waitedSeconds: Self.secondsSince(entered),
+            segmentCount: snapshot.count,
+            summedDurationSeconds: snapshot.summed,
+            targetDuration: targetDuration
+        )
+        EngineLog.emit(
+            "[HLSVideoEngine] \(warning ? "WARNING: " : "")\(account)"
+            + (note.map { ", \($0)" } ?? ""),
+            category: .session
+        )
+    }
+
+    /// The gate's other ending: the deadline passed and not one segment was ever cut, so there is no
+    /// window to describe and the manifest cannot be served at all.
+    private func accountForUnservedFirstManifest(since entered: DispatchTime) {
+        guard !didAccountForFirstServe else { return }
+        didAccountForFirstServe = true
+        EngineLog.emit(
+            "[HLSVideoEngine] WARNING: first live manifest not served after "
+            + "\(LiveEdgePolicy.seconds(Self.secondsSince(entered)))s: no segment was cut",
+            category: .session
+        )
+    }
+
+    private static func secondsSince(_ start: DispatchTime) -> Double {
+        Double(DispatchTime.now().uptimeNanoseconds &- start.uptimeNanoseconds) / 1_000_000_000
     }
 
     func cancelWaiters() {

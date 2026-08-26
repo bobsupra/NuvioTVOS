@@ -12,6 +12,827 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.34.0] - 2026-08-21
+
+### Fixed
+
+- **The software-path audio tap trapped on the FIRST buffer of every multichannel track (AE#400).**
+  `AudioTapPCMConverter` rebuilt its input format from the channel count alone and force-unwrapped the
+  result, but `AVAudioFormat(commonFormat:sampleRate:channels:interleaved:)` returns nil for every count
+  above 2 (measured 3 through 8; this is AVFAudio behaviour on every platform, not a macOS specialty).
+  `AudioDecoder` emits the source layout up to 7.1 without downmixing, so this was not a race: any
+  multichannel track on the software path with a tap installed trapped on its first audio buffer. The
+  layout the converter needed was already attached to the sample buffer's format description by the
+  decoder, so it is read back from there now instead of being re-derived, with the engine's own mapping
+  as a fallback for a description that carries none. Reported by dlev02 from a Prism TestFlight crash.
+- **Some channel layouts convert to digital silence without reporting an error, which the crash had been
+  hiding (AE#400).** Measured: 4-channel Quadraphonic and every DiscreteInOrder layout produce a buffer
+  of zeroes with no `NSError` set, which at a tap consumer is indistinguishable from a muted source. The
+  converter now pushes one full-scale buffer through each new converter and folds the channels itself
+  when the answer is silence. The check sits on the measured behaviour rather than on a table of the
+  layouts Apple currently mixes, because such a table goes stale without saying so.
+- **The channel layout stamped on software-path audio now names the order the resampler actually wrote
+  (AE#401).** `AudioDecoder` resamples into `av_channel_layout_default(channels)` and stamped a layout
+  from a second, independent table; the two agreed only for 5.0 and 5.1. Measured per channel through a
+  real downmix: on 7.1 every channel moved and the LFE, a bass-only channel, was placed hard left at full
+  gain; on 4.0 the centre, which carries dialogue, went hard left; on 2.1 the LFE was mixed into both
+  channels instead of being dropped. 5.1 being the common multichannel case is most likely why it went
+  unseen. 7.1 is also where the mistake came from: the old comment called `AAC_7_1` "MPEG_7_1_C,
+  Hollywood L R C LFE Ls Rs Lsr Rsr", but those are two different layouts. Fixed by naming what is
+  already in the buffer (`WAVE_2_1`, `MPEG_4_0_A`, `MPEG_7_1_C`) rather than by moving the audio; 6.1 is
+  the one count no CoreAudio tag matches, so there the resampler is pointed at `6.1(back)` instead.
+  Covered by `ChannelLayoutOrderTests`, which compares placement through a real downmix and not names.
+
+### Added
+
+- **`aetherctl audiotap --software`, a headless driver for the tap path that had none.** The two existing
+  modes drive their readers directly, so the software sink, which only exists inside a real session, could
+  not be run from the CLI at all. That is how AE#400 shipped and survived: every path around it had a
+  harness. The new mode loads the source through the whole engine, refuses it if it did not route to the
+  software host, installs the tap through the public `installAudioTap()` and plays. It reports `peak` next
+  to the buffer count, and exit 3 covers both no buffers and buffers of digital silence, because both look
+  like a healthy run otherwise. `AudioTapProbe.runSoftware` backs it.
+
+## [6.33.0] - 2026-08-20
+
+### Changed
+
+- **A source that is REFUSING a session gets a stated wall-clock budget per refusal window, instead of
+  a lifetime that emerged from two constants that did not know about each other (AE#377).** The reporter
+  measured his origin with curl and 35 KB of traffic: it serves for about six minutes, refuses every NEW
+  request for about four, and recovers on its own. Seven 1 KB requests a minute apart are enough to reach
+  it, so the trigger is time, not volume, concurrency or request count, and re-resolving through the
+  source does not clear it because the source hands back the same edge host. His recovery arrived at
+  243 s. The engine gave up at 212 s, and no constant said 212: it was four paced revive attempts
+  (3, 8, 20, 45 s) each followed by a reopen that walks the reader's own seven-rung reconnect ladder
+  against the refusing origin, roughly 34 s, unpaced and uncounted on that side. `RefusingSourceReviveBudget`
+  states the figure instead (600 s), and the attempt count now follows from the pacing rather than
+  deciding the outcome. Also removes the trap in the old shape: making the reopen cheaper would have
+  silently cut a session's life by two thirds. Covered by `Issue377RefusingSourceBudgetTests`.
+- **`playbackPhase` reports `.stalled(reconnecting:)` for as long as that budget runs.** The reader emits
+  `.flowing` as it EXITS, deliberately, so the terminal outcome carries the state; between that exit and
+  the rebuilt reader's first byte there is no reader at all, so the phase read `playing` through minutes
+  in which nothing was being delivered. A host no longer has to infer the stall from silence.
+
+### Fixed
+
+- **The refusing-source budget is reset per refusal window, so a session that recovers is not penalised
+  for having recovered (AE#377).** The gate it replaces was never reset, which made its four attempts a
+  SESSION budget: a session that survived one window began the next with part of it spent and the third
+  with none. On a long title against an origin with this shape, the later windows were given up on for
+  arithmetic reasons rather than measured ones. Windows are separated by a gap longer than any that can
+  occur inside one (a ladder rung plus a reopen).
+- **The record of which redirect targets a source has dropped lives on the origin's books rather than on
+  the reader, so a rebuilt reader is not blind to it (AE#377).** A metered revive builds a fresh demuxer,
+  so the reader that meets a re-minted target is routinely not the one that dropped it: no pin, no dropped
+  slot, empty ledger, and the verdict fell through to "a target the source resolved freshly", the single
+  answer that puts origin metering back on the table. In the reporter's capture that was 32 of the refusals
+  of one host in one window, against 8 correct ones from the reader that had done the dropping. The ledger
+  is now kept on the source's chain head, merged when a chain folds, and cleared when a target answers
+  again. The give-up line reports the books it can back up (peak requests in flight, refusals, dropped
+  targets) instead of asserting that the origin is metering us. Covered by `Issue377RefusingTargetTests`
+  and `OriginRequestBudgetTests`.
+
+## [6.32.0] - 2026-08-18
+
+### Changed
+
+- **The audio bridge picks its encoder from the SOURCE, not from the mode alone: a source with two
+  channels or fewer no longer becomes an E-AC-3 bitstream (AE#395).** `.surroundCompat` exists to carry
+  SURROUND across a route that cannot take multichannel LPCM, and it was applying its E-AC-3 encoder to
+  every bridged source regardless of channel count. On a source of two channels or fewer there is no
+  surround to carry, so that encoder bought nothing and cost twice: 256 kbps lossy where the FLAC
+  encoder in the same build is lossless, and a Dolby bitstream handed to every output route, including
+  the ones that can only pass one through rather than decode it. Measured on a rebuilt MPEG-TS program
+  (H.264 + MP2 stereo + AC-3 5.1 + a second MP2 stereo), all three selectable tracks reached AVPlayer as
+  Dolby: the AC-3 5.1 stream-copied as `ac-3`, and each MP2 "stereo" track came out of the bridge as
+  `ec-3`, so "the stereo track was silent too" ruled nothing out. `.surroundCompat` now resolves to
+  E-AC-3 only above two channels and to FLAC at or below it; `.lossless` is unchanged, a surround source
+  is unchanged (5.1 PCM still bridges to `ec-3` at 768 kbps), and stream-copy is untouched. The caps and
+  the per-channel rate now key on the encoder rather than the mode, and the master playlist's `CODECS`
+  attribute and the pipeline label follow the encoder the bridge actually opened. The #165 cascade
+  became an ENCODER cascade for the same reason: a mode list would now name the same encoder twice on a
+  stereo source and land on exactly the silent video-only fallback #165 exists to prevent.
+  Route-blind by construction, the input is the source's channel count and never the current output
+  route (#34 measured route-dependent bridging wrong and it was removed). Reported by Simpendaal, whose
+  A/B on an AirPlay 2 optical adapter is what separated the two: the stream-copied AC-3 5.1 played and
+  the bridged E-AC-3 stereo of the same program did not. Covered by `Issue395StereoBridgeEncoderTests`.
+
+## [6.31.0] - 2026-08-18
+
+### Added
+
+- **`PlaybackErrorKind.audioBridgeProducedNoOutput`.** A source whose audio has to be transcoded into
+  fMP4 (MP3, MP2, DTS, TrueHD, Vorbis, PCM) produced no encoded audio at all, so the mp4 muxer could
+  not build the sample entry it derives from a written packet. It used to arrive as `.vodSourceFailed`,
+  which reads as "the source is gone" and is a reason for a host to end a fallback ladder; the source is
+  neither gone nor unreadable here, and a second player that decodes the track itself plays the file, so
+  this one is a demote.
+
+### Fixed
+
+- **A transcoding audio bridge that produces nothing now says so, instead of dying as a muxer error two
+  subsystems downstream (AE#396).** A plain SD MKV with mono MP3 audio failed on the native route at
+  nine of nine start positions, ending on `Source audio cannot be muxed (code -22)` after three
+  identical revive attempts. The muxer was right and innocent: FFmpeg's mp4 muxer can only build an
+  AC-3/E-AC-3 sample entry from a packet that has been written, and for a bridged source those packets
+  come from the bridge's encoder, which had emitted none. Nothing anywhere in the session said that.
+  Every step between a source packet and an encoded frame ends in a `return` or in a loop that stops on
+  a negative code (a packet the decoder rejects, a decoder that answers nothing, a resample that
+  converts to zero samples, an encoder that keeps its output), which is correct per packet and silent in
+  aggregate, so a bridge that emitted nothing for a whole first segment was indistinguishable from one
+  that had simply not been asked yet. `AudioBridge` now counts each of those arms and keeps the
+  decoder's own error code, reports once (`AE#396 the bridge has produced no encoded audio at all`) as
+  soon as enough source has gone in for the silence to be structural, and the deferred first cut prints
+  the bridge's account instead of announcing a prime scan it does not run on this path.
+- **A bridged session whose audio decoded to nothing fails immediately and truthfully, rather than
+  spending its revive budget re-reading the same bytes.** A producer restart rebuilds the muxer and
+  re-opens the encoder, both downstream of a failing decoder, so the same bytes were read three times
+  for the same answer. Zero decoded frames now ends the session at once; frames decoded with no packets
+  emitted is the encoder side, which a rebuild does heal, and keeps its revive.
+
+## [6.30.2] - 2026-08-18
+
+### Fixed
+
+- **The bare-AVPlayer audio host now publishes a rebuffer, so `playbackPhase` reads `.rebuffering` on the
+  audio-only path.** `AudioAVPlayerHost` fed the engine no buffering axis at all: a starved progressive
+  stream (an internet-radio origin whose connection died) sat in `waitingToPlayAtSpecifiedRate` while
+  `playbackPhase` stayed `.playing` with a frozen clock, and the phase fold could not tell a host anything
+  the clock did not already say. The host now folds AVPlayer's own signals, `timeControlStatus ==
+  .waitingToPlayAtSpecifiedRate` and `AVPlayerItemPlaybackStalled`, into an `isRebuffering` flag the engine
+  wires into `isBuffering` under its existing `.playing` gate. A wait counts only once the item has
+  played (the pre-roll of a fresh track is startup, not a rebuffer), never while the player is paused,
+  and a stall notification that lands ahead of the status change is latched until the next `.playing`
+  rather than lost. Transport reconciliation stays off on this path (the transient background `.paused`
+  that once mis-latched Now-Playing is untouched); only the buffering axis moves. The item's error log
+  entries and stall notifications are logged under `sw.playback` so a field failure on this path leaves
+  a trace. Diagnosed on tvOS 26.6 (Apple TV 4K) with an MP3/ICY station where the reload watchdog in the
+  host app was the only recovery. A starve that begins inside a seek window is re-read when the seek
+  lands, so it cannot slip past the `.seeking` gate and leave a frozen `.playing` behind. Covered by
+  `AudioAVPlayerHostRebufferingTests`. Thanks to @tschuegy for the report and the fix.
+
+## [6.30.1] - 2026-08-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.30.1))
+
+### Fixed
+
+- **A redirect pin that has gone idle is dropped by its FIRST refusal, not by the keep-pin grace
+  (#392).** The grace answers one shape, the lingering slot of #307: a connection-capped panel
+  answers 509 while the slot of the connection the reader has just replaced is still occupied
+  server-side, and that shape requires a byte of ours to have been in flight moments ago. A pin
+  that has carried nothing for a minute cannot be producing it, since the pump ends its connection
+  at the window high water and an idle reader holds nothing at the origin (#310), so what refuses
+  there is the expired lease of #380 and the grace only delays finding out: three paced attempts
+  against an address that will refuse every one of them, 12.5 s of media time in the field retest,
+  free only because 16 MB of read-ahead absorbed it. Past the idle gap the first rate-limited
+  refusal now drops the pin, and the re-resolve is not paced behind a backoff charged to the
+  address it is no longer using (a server-sent `Retry-After` still applies, since the source is the
+  same origin). A pin that is still alive pays nothing: only what happens after a refusal changes,
+  never how a healthy request is issued. The detour cache's rate-limit arm gets the same rungs; it
+  fetches through the same pinned target and carried none, so a dead lease discovered there could
+  only be given up on (a failed read), never re-resolved, and it is the arm a backward read after a
+  long pause lands on. Reported by tschuegy in the 6.30.0 retest of #380, whose trace also settled
+  what dies across an idle: the re-resolved target is the SAME edge host, so it is the
+  authorization behind the address, not the address.
+
+### Changed
+
+- **A refused response names the host that refused it (#377).** A pin is only ever recorded from a
+  2xx, so a re-resolve that lands on a refusing target was written down nowhere, and three shapes
+  that need three different fixes collapsed into one silence: the source refused the re-resolve
+  itself, the source handed back the target just dropped, or a genuinely fresh target refused. Only
+  the last means the origin is metering us. The rejection line now says which, compared on the
+  origin key rather than the whole URL, because a re-minted link carries a fresh signature for the
+  same edge host. A connection opened while a dropped pin is outstanding says it is re-resolving
+  through the source, for the target that never answers at all. The refusal is charged and stamped
+  against the host that answered rather than the one asked; chain folding (#388) lands both in one
+  bucket, so no budget moves differently.
+- **`refusals=` on a slow read says it is cumulative.** Every other number on that line belongs to
+  the one read, so a bare count read as this read's: three windows reporting 7, 14 and 28 look like
+  a meter tightening its grip, where the same numbers as increments of 7, 7 and 14 are three whole
+  reconnect ladders each hitting their give-up cap. Same trace, opposite diagnosis.
+- **Connection reuse is reported from a sample, not from a first connection.** `isReusedConnection`
+  was taken from the first metrics callback for an origin, where a connection is nearly always new,
+  so every http/1.1 origin reported "connection new" whether the session went on to reuse that
+  socket a hundred times or none, and a reader taking it at face value concludes a fresh handshake
+  per range. It is tallied across an origin's reader connections and reported once there is a
+  sample behind it.
+
+## [6.30.0] - 2026-08-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.30.0))
+
+### Added
+
+- `sourceVideoPixelAspectRatio`: the multiplier that turns the coded source size into the presented
+  one (`sourceVideoWidth * this`), for a host sizing its own overlay before a layer is laid out. It
+  is the ratio the engine itself resolved, so it stays 1 on square-pixel sources and on a declared
+  ratio the display-aspect gate refuses (#290), never a number the picture contradicts. On the paths
+  that draw, what is on screen is still the better answer: `softwareDisplaySize`,
+  `AVPlayerLayer.videoRect`. Contributed by Rasmusmart57 (#385).
+- `TrackInfo.isNativelyRenderedSubtitle`: true where the playback backend draws the track itself (a
+  remote-HLS subtitle rendition AVFoundation renders), so no cue reaches `subtitleCues` and a host's
+  overlay controls (position, delay, styling) have nothing to act on. False everywhere else.
+  Contributed by Rasmusmart57 (#385).
+
+### Fixed
+
+- **A container-declared pixel aspect reaches the picture, on every path (#385 follow-up).**
+  Matroska writes its DisplayWidth quotient and MP4 its `pasp` to `AVStream` alone (matroskadec.c,
+  mov.c) while `codecpar` keeps whatever the bitstream said, and a square bitstream ratio was read
+  as a declaration, so the resolution ended one axis above the container's. A 720x576 file whose
+  H.264 VUI says 1:1 and whose header says 64:45, which is what `mkvmerge --aspect-ratio` leaves
+  behind, was drawn at its coded shape by all three consumers: the loopback fMP4 carried `pasp` 1:1
+  (movenc writes it from the output codecpar, which the muxer copies from the source), the software
+  path presented 720x576, and a thumbnail came out 320x256 instead of 320x180. The declared ratio is
+  resolved once now, in `PixelAspectPolicy`, with the container winning where it declares a real
+  correction, which is the later authoring layer and what `av_guess_sample_aspect_ratio` returns for
+  the same file. The muxer writes that result into the codecpar it owns, so `pasp` carries the same
+  ratio the decoders attach and a ratio #290 refuses is no longer one the native path stretches to.
+
+## [6.29.0] - 2026-08-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.29.0))
+
+### Added
+
+- `PlaybackErrorKind.sourceRefused` (#378): the origin answered the source request with an HTTP
+  status instead of media (a 401/403 refusal, a 404, a 5xx), and `underlyingCode` is that status.
+  A refused source used to arrive as `sourceOpenFailed` carrying FFmpeg's "Invalid data found when
+  processing input", indistinguishable from a corrupt file, because the forward-only streaming
+  reader accepted the origin's error page as container bytes. A 429/503/509 to the same request
+  publishes the existing `sourceRateLimited` with the status in `underlyingCode`, so the split the
+  #377 contract asks a host to branch on holds at the open too.
+
+### Fixed
+
+- **E-AC-3 from MPEG-TS stream-copies again, so Atmos (JOC) survives the loopback (#382).** The
+  mpegts demuxer stamps `codec_tag` with the PMT stream type (`0x87`) or the registration
+  descriptor (`EAC3`), and that tag reached the fMP4 muxer, which refuses a tag it does not know
+  for the codec: `Could not find tag for codec eac3 in stream #1`, `-22`. The audio cascade read
+  that as "this source cannot stream-copy" and bridged, re-encoding every Atmos object away and
+  reporting DD+ 5.1 on the receiver. libavformat's own guard would have caught the foreign tag one
+  layer earlier, but only at `FF_COMPLIANCE_NORMAL`; the muxer runs at `-2` so it can write the
+  Dolby Vision atoms. The muxer now drops a source-container audio tag the mp4 muxer rejects (the
+  rule `ffmpeg -c copy` uses), so the canonical `ec-3` sample entry is written and the emitted
+  `dec3` box is byte-identical to the source's, JOC complexity index included. AC-3 and AAC from
+  MPEG-TS fall under the same rule but were measured to escape the defect already (an `AC-3`
+  registration descriptor resolves to `ac-3` case-insensitively, and the ADTS path clears the tag
+  when it synthesises the AudioSpecificConfig), so nothing changes for them. Video was never
+  affected: every route sets its tag explicitly.
+- **A redirect chain is one origin request budget, so a declared ceiling reaches the host that
+  serves (#388).** `LoadOptions.maxConcurrentSourceRequests` was registered for the origin of the
+  URL the host loaded and stopped there, which on the shape it exists for (a portal that 302s to the
+  media host counting the provider's connections) is the wrong host: the pump followed the redirect
+  and streamed from the target while holding a slot booked against the portal, so the first backward
+  read opened a detour block against a target whose books showed nothing in flight, and the panel
+  saw two requests where the host had declared one. An observed redirect is now folded into one
+  chain kept under the source's key: the ceiling covers the chain, the pump's existing ticket is
+  already the chain's, and `requiresSerialRequests` is true at the pinned target from the first
+  byte, so the detour falls back to the reposition path it already has. Deliberate consequence, and
+  the one place this departs from #377: a refusal now lowers the whole chain, portal included,
+  because a request to the portal for this source is only ever answered with a redirect to the host
+  that refused. A target that already belongs to a chain keeps it, so two portals on one edge host
+  cannot spread a ceiling declared for one of them to the other. Reported by tschuegy.
+- The forward-only streaming reader hangs up at the response header on anything but a 200/206 and
+  fails the open typed with the status, so an origin's error page never reaches the demuxer (#378).
+  After a 401/403/404/410 on the open-time data connection the HEAD / `bytes=0-1` size probes are
+  skipped: the one request still made is the unranged GET, so an origin that refuses `Range` but
+  serves a plain GET plays forward-only, and one that refuses both fails with its status. 5xx and
+  429/503/509 keep the probe ladder.
+- The tail-prefetch "no suffix range support" latch (#281) is set only by the origin's answer to the
+  range form: a 200 that ignored it, a 416 that rejected it. A 401/403/404/429/5xx on that request
+  says nothing about suffix ranges and no longer disables the prefetch for the origin for the rest of
+  the process (#378).
+- A rate-limit status read by the streaming pump is charged against the origin request budget
+  (#377/#378). The two other places that read a status already were; a raw live source opens no
+  persistent connection at all, so its 429 was seen by nobody and the budget kept offering that
+  origin its full concurrency.
+- **The software path's clock parks at end of media instead of free-running past it (#374).**
+  `.ended` stopped the demux loops and published the state, but left the master synchronizer at
+  rate 1. So a finished session kept publishing a position that grew without bound (20.13 s on a
+  12.0 s source after 20 s, where a native session on the same file parks on 11.97 s and stays
+  there), and the 1 Hz `[SWDiag]` line kept reporting an `aLead` falling at exactly 1.00 per
+  second, which is the shape of a session drifting rather than of one that finished. Two readers,
+  a downstream host and this repo, spent a round treating that as a suspected deinterlacer clock
+  defect. The clock now parks on the last sample, deferred by the audio still queued ahead of the
+  playhead so the tail plays out instead of being cut, and the diagnostic line names the
+  exhaustion (`eof=y`) then falls silent on the tick that shows the clock parked on it.
+- **A rate-limited streak that outlives the lingering-slot grace drops the pinned redirect target
+  for one re-resolve through the source (#380).** 509 has two field shapes. The one the keep-pin
+  rule was built for (#307 follow-up): a connection-capped panel refusing while the slot of the
+  connection being replaced lingers, and it frees in seconds so the pin is fine. The one it broke:
+  a resume after minutes of pause, where the reader held no connection (#310) and the pinned edge
+  target's session expired server-side, so it answers 509 forever while a fresh redirect through
+  the source connects on the first try (field trace: 20 generations of 509 across ~85 s at one
+  offset, then a source-resolved reader delivered first data in 452 ms). The pin now survives
+  `rateLimitRepinStreak` (3) paced attempts and is then dropped for exactly one re-resolve; the
+  fresh target's 200/206 re-pins, and a permanently metering origin pays the same bounded
+  give-up as before, with the re-resolve spent inside the same seven attempts.
+- **Window-served reads no longer reset the reconnect streaks (#380).** Draining read-ahead is
+  not network progress: the reset ran in the same read iteration as the faulted-refill decision,
+  so a refused replacement was charged streak=1 for as long as the runway lasted, and neither
+  the re-resolve rung nor the bounded give-up was reachable until the window was empty, and one
+  served byte after an exhaustion restarted the whole ladder. The streaks now reset only when
+  the current generation has delivered data.
+- **The faulted-refill pacing survives the reconnect it authorises (#380).**
+  `startPersistentConnection` reset the next-attempt timestamp the ladder had just set, so
+  "next attempt in Ns" fired as fast as the consumer could read, and the give-up latch was
+  erased by the next reconnect from any path. The timestamp is now released by first data or an
+  intentional reposition, the two events that genuinely end a faulted lineage.
+- **The other two served-from-memory branches stopped resetting the ladders too (#380
+  follow-up).** The read loop serves without touching the network in three places, and only the
+  window serve was fixed. The retained head/tail spans (#281) run FIRST, before every network
+  path, and their own log line says "no reconnect for it", yet the parse's return to the head
+  cleared both streaks, and unlike the detour that branch is not taken out of service on a
+  metered origin, so it is the one that reaches the field shape #380 described as "one served
+  byte reset the whole ladder and it started over". The detour cache's resident-block hit (#69)
+  did the same; it now distinguishes a block it fetched from a block it already had, which also
+  replaces the `>2 ms` heuristic the slow-read line used to count detour fetches with the
+  ground truth.
+- **The pinned redirect target is release-visible (#380 follow-up).** Which target is pinned,
+  and when the reader drops it, is half of every field trace about a redirecting origin (#307,
+  #377, #380), and with the bounded keep-pin grace, dropping it is now a decision the ladder
+  makes rather than a reaction to an expiry status. Both lines were behind `#if DEBUG`, so a
+  rung that only fires in the field was readable only by reporters building the engine
+  themselves. Both are rare by construction: a pin that does not change logs nothing.
+
+## [6.28.0] - 2026-08-17
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.28.0))
+
+### Fixed
+
+- **A rate-limited source is no longer declared dead.** The reader classifies a 429 / 503 / 509 as
+  metering rather than failure, and then threw that away on the way up: its give-up arm returns a bare
+  `-1`, so the session's revive arm saw exactly what a genuinely dead source produces. It spent both
+  of its two attempts inside a minute, each one reopening from byte 0 against an origin refusing
+  precisely that, and ended on "source not readable in this session" while the same stream played
+  instantly on a fresh press of play. A metered read error now gets its own larger budget with a
+  growing backoff (3 s, 8 s, 20 s, 45 s) instead of an immediate reopen, and the terminal surface is a
+  new `PlaybackErrorKind.sourceRateLimited`: the source is being metered, not lost, so a host that
+  reacts to a dead source by handing off to a second engine only has that engine refused by the same
+  origin. Raised by Rasmusmart57 (AetherEngine#377).
+
+### Added
+
+- **One request budget per origin, shared by every path the reader fetches on.**
+  `httpMaximumConnectionsPerHost` is a per-`URLSession` cap and `AVIOReader` fetches over four pools
+  (pump ranges, detour blocks, size probes, a per-call streaming session), so against one signed CDN
+  URL a pump range, a detour block and a probe could all be open at once, with a second reader (the
+  subtitle side demuxer) sharing the same static pools. Those caps never composed into anything. The
+  budget counts requests per origin, which is what an origin metering us counts, and unlike a
+  connection cap it is equally true over HTTP/2, where a session multiplexes every request onto one
+  connection. Counting is unconditional and capping is not: with no limit set nothing waits, and a
+  limit arrives either from the host (`LoadOptions.maxConcurrentSourceRequests`) or from the origin
+  itself, halving from the concurrency actually reached on each refusal. At one request at a time the
+  speculative parallel paths (detour blocks, tail prefetch) switch off rather than queue, each falling
+  back to the serial path it already had. Raised by Rasmusmart57 (AetherEngine#377).
+- **The negotiated transport is named once per origin, and a slow read reports the concurrency it ran
+  at.** Whether a per-session connection cap can do anything against a given CDN is unanswerable from
+  outside the engine, since over HTTP/2 it bounds nothing while the origin still counts every request.
+  `URLSessionTaskMetrics.networkProtocolName` was read nowhere; it now logs one line per origin saying
+  which case that origin is. The `slow read:` summary gains `origin=<n>inflight/<peak>peak`, the number
+  a metered origin was reacting to (AetherEngine#377).
+
+## [6.27.1] - 2026-08-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.27.1))
+
+### Added
+
+- **The first live manifest now reports the interval it was held for.** A loopback live session's whole
+  join latency is one withheld `/media.m3u8` response: the first serve waits until the window carries
+  the live-edge holdback (`3 x TARGETDURATION`, AetherEngine#189) of content behind the edge, while
+  everything else the engine does for that session finishes before the gate is even entered. Only a
+  FAILED gate used to log, so a successful hold of eighteen seconds left no trace and a host had to
+  measure it from the outside. Every exit now names what it held, the window it served and the holdback
+  it was measured against, including the exit where no segment was ever cut, which used to return in
+  silence. The bounded `.fastZap` start reported its grace alone, which is the last leg of the wait
+  rather than the wait: a start measured here at 10.284 s reported itself as 2.000 s. `docs/api.md`
+  gains the paragraph that says where a live start's seconds go, and how `startupProgress` separates
+  this wait from the probe and the display handshake. Raised by ksktech-dev (AetherEngine#374).
+
+## [6.27.0] - 2026-08-16
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.27.0))
+
+### Added
+
+- **The legacy Microsoft video tail decodes: MS-MPEG4 v1 / v2 / v3 (DivX 3.x) and WMV1 / WMV2 /
+  WMV3 (WMV9).** Routing already sent them to the software path, which is where they belong, and
+  they then failed the load with `unsupportedCodec` because the FFmpeg build compiled no decoder
+  for them: a pre-2005 AVI rip carrying MS-MPEG4 v3 stopped at `unsupportedCodec(id: 16)`, a WMV9
+  remux at `unsupportedCodec(id: 71)`. Both now open and play. The `avi` demuxer was already in the
+  build, so the AVI case needed nothing else; WMV3 covers WMV9 inside Matroska and MPEG-TS, where
+  the container's own demuxer supplies the stream. A native `.wmv` / `.asf` file still fails at
+  open: it also needs the `asf` demuxer and a WMA decoder, and half that set is worse than none,
+  since with the demuxer alone the file would play video with silent audio rather than fail
+  honestly. Costs 32 KB on an arm64 device slice. Reported by cmcpherson274 (FFmpegBuild#3).
+
+### Dependencies
+
+- FFmpegBuild 2.4.3 (the six legacy Microsoft video decoders; decoder count 40 to 46, only
+  `Libavcodec` changed).
+
+## [6.26.0] - 2026-08-15
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.26.0))
+
+### Added
+
+- `$errorInfo`, the machine-readable half of a `.error` state (#376). A `PlaybackErrorInfo`
+  carrying a stable `PlaybackErrorKind` token, the underlying `NSError` domain and code where a
+  Foundation / AVFoundation failure is involved, and the same message the state carries. The text
+  alone could not classify a failure: on the native paths it is
+  `AVPlayerItem.error.localizedDescription` forwarded verbatim, so it arrives in the device's
+  language and the domain and code behind it are gone, which put every non-English device into a
+  host's unknown bucket. `PlaybackErrorKind` is a string-backed struct rather than an enum, so a
+  kind added in a later minor release cannot break a host's switch, and its raw values are API.
+
+### Changed
+
+- Every failure now publishes through one funnel, so a `.error` state can no longer reach a host
+  without its classification. `errorInfo` is assigned before `state`, so a `$state` sink reads
+  this failure's own, and it is cleared by the state's move away from `.error`, so the two cannot
+  drift. A test fails the build if a new `state = .error(...)` appears outside the funnel.
+- `docs/api.md` had claimed the message inside `.error` is the engine's own sentence. True for the
+  half that names a cause, false for the half most failing sessions produce, and a downstream host
+  was building an analytics classifier on the strength of it.
+- The live-host sample and the README's API tour classify on `errorInfo` and keep the message for
+  the log.
+
+## [6.25.4] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.4))
+
+### Fixed
+
+- A forwarded Annex-B config record no longer carries its prefix SEI into the `hvcC` the mp4
+  muxer builds (#365). When the record and the packets are both Annex B the record has to be
+  forwarded as it is, because movenc reads it to decide whether to convert the samples, and it
+  then builds the `hvcC` itself. `ff_isom_write_hvcc` collects five NAL types, not three (VPS,
+  SPS, PPS, SEI_PREFIX, SEI_SUFFIX), so a prefix SEI in a Matroska CodecPrivate becomes a fourth
+  array in the init sample description. That is the record Apple TV's HEVC track builder rejects
+  (AE#187: `asset.tracks count=0`, no format description), and the AE#187 defense cannot reach
+  this door: it guards on `configurationVersion == 1`, which an Annex-B buffer fails by
+  construction, and the muxer-built record never passes through the engine. The
+  non-parameter-set NALs are now dropped before the muxer runs and the record stays Annex B, so
+  the decision movenc makes about the samples is unchanged.
+
+### Changed
+
+- The `#365` forward branch logs what the config record is made of (`VPS×1 (28 B), SPS×1
+  (112 B), PPS×1 (10 B), SEI_PREFIX×1 (570 B)`) and what it dropped. A record's size alone does
+  not say whether the excess is a large SPS or an SEI, and only the latter reaches the `hvcC`.
+
+## [6.25.3] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.3))
+
+### Fixed
+
+- A bitmap subtitle set no longer keeps an end it took from the far side of a stretch nobody
+  read (#362). A PGS set has no end of its own, so 6.23.1 gives an open one the PTS of the
+  next packet the store holds, which is the end the author put there. After a seek burst the
+  store also holds islands an earlier run harvested, and the first packet after a set can then
+  be a real packet that is not this set's successor (report: a set at 75.117 s closed at
+  144.978 s, its own clear at 78.579 s; a second one closed at the next SET, 78 s out). Two
+  changes. A bitmap cue's end is now re-derived on every drain tick and can only ever shorten,
+  so the clear that lands a second later trims the set even though the drain cursor has moved
+  past it and will never decode it; previously any end short of the open-ended placeholder was
+  final, and that was the whole permanence. And the derivation stops at the drain window plus
+  the forward prefetch's park margin, which is exactly as far as the harvest is designed to
+  lead, instead of reaching to whatever the store happens to hold beyond it.
+- Ends withheld for that reason are counted in the delivery statement (`endsWithheld=N`).
+  `harvestGapAt` reports where DELIVERY stopped and says nothing about an end derived from the
+  same store on a different horizon, so a window carrying a wrong end with no `gapAt` beside it
+  had no diagnostic at all.
+
+## [6.25.2] - 2026-08-14
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.2))
+
+### Fixed
+
+- A sequential-origin VOD session now folds a timeline discontinuity the way live folds a
+  program boundary (#368). IPTV timeshift archives are chunked recordings whose every chunk
+  restarts near PTS 0; libavformat's 33-bit wrap correction turns that backward seam into a
+  +2^33 leap (device: dts delta 8226410192 ticks, 363524400 + 8226410192 = 2^33 exactly),
+  which reached the keyframe-gated cutter unmodified and walked its monotonic index to the
+  plan tail. After that the session was structurally dead: the playlist froze, the
+  backpressure park waited on a segment the playlist can never advertise, and the wedge
+  recovery's reposition is exactly what a sequential origin refuses. The existing live
+  rebase (both streams, same thresholds) now also runs for sequential-origin VOD; cutter,
+  ledger and append playlist need no change because they already operate on post-shift
+  output time. No `EXT-X-DISCONTINUITY` is added at the seam: the archive is
+  content-continuous and the output timeline stays continuous after the rebase.
+- A sequential-origin session publishes the item axis, so the rebase above no longer moves
+  its playhead (#368 follow-up). The rebase keeps the item axis continuous by moving the
+  producer's shift, but `currentTime` was folded as `item + shift - origin` against an origin
+  latched once at session start, so the whole wrap landed on the scrubber: measured 250 s ->
+  63378 s on an archive whose declared duration is one hour, with `bufferedPosition` and
+  `sourceTime` following it. A sequential archive has no source axis to anchor a display
+  origin on (every chunk restarts near PTS 0), while its item axis starts at 0 by
+  construction and is exactly what `declaredDurationSeconds` measures. Every other source
+  keeps AE#270's latched origin and true source PTS.
+- A timestamp leap that escapes the timeline rebase no longer turns a VOD session into a
+  long-lived zombie (#369). Three containment gaps, one field trace: the look-behind sample
+  duration is now capped at the discontinuity threshold instead of handing movenc the wrap
+  itself as a duration (device: 8226410192 ticks, rejected as invalid, packet silently lost;
+  the write rc is now logged on first failure too); discontinuity-scale fold runs now reach
+  the fold counters instead of being discarded above 64 indices, so the #358 recovery arms
+  actually arm for exactly the folds most certain to trigger them; and the advance-path
+  backpressure park skips a release target beyond the sequential playlist's advertisable
+  frontier, which only this pump's own finalize reports can move, so parking on it was waiting
+  for oneself. Deliberately unchanged: `OutputTimestampSanitizer` keeps latching, because
+  movenc latches monotonicity on its own once a wrapped packet is accepted, and a sanitizer
+  reset would only convert garbage timestamps into rejected writes.
+- The duration cap above also covers the duration a container DECLARES, and the skipped park
+  hands its wedge detection on instead of dropping it (#369 follow-up). The cap only guarded
+  the inferred delta, but the branch that runs when no forward delta exists (the EOF tail of
+  exactly the wrapped stream the cap is for) passed the source's own number through untouched,
+  and movenc rejects a sample on the number, not on where it came from. The skipped park is
+  the more consequential one: the #207 disk park deliberately has no wedge breaker because the
+  advance park catches a frozen consumer first, so skipping the advance park left a pump that
+  races to the retention budget and then holds there forever on a consumer that will never
+  move again. It now carries the same #65 detector, whose one-second cadence this park already
+  polls at, and a trip ends the pump onto the existing re-anchor surface, which a sequential
+  origin refuses into `onVODSourceFailed` within seconds.
+- A sequential-origin session now serves its EVENT playlist from the first finalized
+  segment and no longer spends the origin's prefix on the keyframe-spacing scan (#370).
+  The startup gate reused a live sliding-window constant and demanded 2 published
+  durations, and because a duration is only final when the NEXT segment's ledger opens,
+  that meant 3 segment opens (~12-18 s of media) before AVPlayer's held playlist GET was
+  answered; on a stalling origin the GET sat out the full 30 s and the asset load died on
+  -12884 with ~12 s of media already on disk. A one-segment EVENT playlist is legal HLS
+  and the refresh counter already defeats the -12888 patience the live constant guards
+  against. The spacing scan's seek is a silent no-op on the non-seekable sequential pb, so
+  it consumed up to 30 s of the single byte-0-only connection without the pump ever seeing
+  those packets; sequential plans now go straight to the target stride (the #358 holes the
+  scan softens don't bite the append playlist, whose zero-duration holes get no URI), which
+  also stops the archive's first GOPs from being read past before the pump starts. A pump
+  that dies before publishing anything now also releases a held startup GET immediately
+  instead of letting it sit out the rest of its timeout.
+- The startup-GET release above is now tied to the failure surface rather than to two call sites,
+  and the gate counts what the playlist can advertise (#370 follow-up). A sequential origin reaches
+  three further terminal surfaces: `.muxerFailed` revives through `requestRestart`, which a
+  sequential origin refuses, and the AE#366 moov-prime and AE#169 read-error arms end on their own
+  exhaustion. Each of those can fire before the first duration is published (an E-AC-3 archive whose
+  first segment carries no audio packet is the field shape), and the held GET then still sat out its
+  full 30 s on a session that had already failed; every VOD failure now surfaces through one method
+  that releases the wait with it. The gate also counted raw appended entries, while the renderer
+  gives a zero-duration entry (a plan index a long GOP skipped) no URI, so it could have answered
+  the held GET with a playlist that renders empty, which is the -12888 the gate exists to prevent.
+  With the cushion down to one entry there is no second entry left to mask that, so the gate now
+  counts advertisable entries.
+
+## [6.25.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.1))
+
+### Fixed
+
+- A VOD source that produces nothing at all now reports it instead of leaving the
+  host on a playlist that will never gain a segment. The decision for that
+  (`isFatalVODPumpExit`, #126) is about what the pump produced, not about how it
+  died, but it only fired on a read error, so a source that runs to EOF without
+  ever writing a packet fell through every arm: measured on such a file, the host
+  sat at `state=playing phase=rebuffering` for the whole session while the
+  provider answered `404 init.mp4 empty`. It now also covers `.eof`, and the
+  gate-starvation re-anchor reports whether it actually re-anchored so a spent
+  arm reaches the same surface rather than ending on a bare return. An ordinary
+  EOF after real playback is untouched: what keeps this safe is the
+  produced-nothing condition, which such a session does not meet.
+
+## [6.25.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.25.0))
+
+### Added
+
+- `VideoNALFraming`, the framing of a packet payload (Annex B or length-prefixed).
+  `DoviRpuConverter.convertPacketToProfile81` and `enhancementLayerType` take it as a
+  defaulted parameter, so existing calls are unchanged; a caller that hands them Annex-B
+  packets now has a way to say so.
+
+### Fixed
+
+- A source whose selected audio track is sparsely interleaved no longer ends in
+  a permanent black screen (#366). The first segment of an AC-3 / E-AC-3 source
+  cannot be cut until one parsed audio packet has reached the muxer, and the
+  search for that packet read forward from where the pump stopped, bounded at
+  128 MiB. That bound is a byte bound, so what it buys shrinks as the bitrate
+  grows: five minutes of a 3 Mbps encode, ten seconds of a 97 Mbps UHD remux,
+  and a legacy dub track can have its first packet hundreds of MiB in. When the
+  forward scan comes back empty the engine now seeks to a handful of positions
+  and takes any frame the track yields there, which is enough because AC-3 and
+  E-AC-3 are one complete syncframe per packet and the prime frame's timestamp
+  is discarded anyway. Measured on a fixture whose first audio packet sits at
+  211 MiB: the forward scan and the midpoint probe find nothing, the 90 % probe
+  finds a frame after two packets, and the session plays with the audio landing
+  exactly at its source timestamp. Nothing in the container points at the track:
+  `AVStream.start_time` for that track reads 0.
+- A VOD session that exhausts its muxer-failure revive budget now reports the
+  failure to the host (#366). The arm was a bare `return`: no producer, no
+  restart and no error, so the provider answered `404 init.mp4 empty` forever
+  while AVPlayer sat in `waitingToPlay`, which reaches the viewer as a black
+  screen with nothing in it to act on. Its sibling arm for read errors has
+  surfaced its own exhaustion since AE#169. The terminal failure now carries a
+  reason as well as a code, so a source that could not be muxed no longer
+  reports itself as a failed read (three of the existing call sites, the #358
+  unproducible segment and the sequential-origin reposition among them, were
+  reporting the same wrong cause).
+
+- A HEVC source whose config record is Annex B while its packets are
+  length-prefixed no longer produces a session with no picture (#365). The mp4
+  muxer decides whether to convert samples by looking at the extradata
+  ("extradata is Annex B, assume the bitstream is too"), so on such a source it
+  ran its Annex-B converter over MP4-framed samples and emptied them: measured
+  on a 1080p fixture, a 2,158,448 B segment came out at 61,912 B while the
+  init.mp4 stayed perfectly valid and AVPlayer reached `readyToPlay` without
+  ever producing a frame. The engine now measures the framing on real packets at
+  open and converts the record to an hvcC when the two disagree, so the muxer's
+  own test comes out right. This is the shape a Matroska remux has when its
+  CodecPrivate is Annex B or missing entirely, in which case libavformat
+  synthesises Annex-B extradata from the first in-band parameter sets. The
+  predicate mirrors movenc for H.264 as well (there it reformats on anything
+  that is not an `avcC`), though an H.264 source of that shape usually fails
+  further upstream: its parser cannot split the packets either.
+- The DV Profile 7 to 8.1 rewrite is no longer a silent no-op on an Annex-B
+  source (#365). Its NAL walk assumed length prefixes, so on start-code framing
+  it read `00 00 01 40` as a 320-byte NAL, found no RPU, and shipped the P7 RPU
+  and the enhancement layer inside a container the muxer had already rewritten
+  to 8.1. It now takes the measured framing and emits the packet in the framing
+  it received.
+- The in-band parameter-set rebuild (#19) no longer runs on Annex-B extradata.
+  Bytes 21 and 22 of an Annex-B HEVC record pass its two checks by construction
+  rather than by luck (the `00 00 03` emulation-prevention pattern in a Main10
+  VPS sits exactly there), so it scanned a buffer that is not a config record at
+  all. `canonicalizeHEVCConfigRecord` has always had the `configurationVersion`
+  guard; this path never did.
+
+## [6.24.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.24.0))
+
+### Changed
+
+- A live `.m3u8` on the raw live path is now routed onto the live ingest
+  instead of failing closed (#363). The AE#140 detection stays (an `#EXTM3U`
+  body where a container's first byte belongs), only its destination changes:
+  the engine builds the `HLSLiveIngestReader` it used to name in the error, and
+  that reader puts `LoadOptions.httpHeaders` on the playlist, on every segment
+  and on every AES key, which is what a tokenized IPTV origin enforces per
+  request. `AetherEngineError.hlsPlaylistOnRawLivePath` still exists and still
+  throws for a custom `IOReader`, which has no playlist URL to ingest from.
+
+### Fixed
+
+- A live remote-HLS session that the origin refuses outright no longer dies at
+  the mount (#363). HTTP 401 and 403 reach the item as `NSURLError` -1013 and
+  -1102, and the engine now hands such a session to the live ingest, whose
+  fetcher is a different client at that origin: configured headers on every
+  request, at most four concurrent fetches, no AVFoundation user agent. Gated
+  by `LoadOptions.nativeRemoteHLSIngestFallback` like the #168 carriage
+  recovery, fires once per session, and is deliberately not remembered for the
+  next load, because a refusal can be an expired token or a full connection
+  cap rather than a property of the master.
+- `aetherctl` can drive a header-enforcing origin at last: `play --header
+  "Name: Value"` (repeatable) fills `LoadOptions.httpHeaders` and rides into
+  the ingest reader, and `hlsfixture` grew `--require-header`,
+  `--deny-status`, `--deny-user-agent`, `--deny-segments-only`,
+  `--redirect-entry` / `--redirect-host` / `--redirect-port`, `--media-origin`
+  and `--segments-dir`. The last one serves pre-cut, GOP-aligned segments, so a
+  live run can be asked whether it PLAYS rather than only whether it routed.
+
+## [6.23.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.23.1))
+
+### Fixed
+
+- A bitmap subtitle now ends where its author ended it, not where the next
+  landing happened to decode (#362). A PGS set has no end of its own; whatever
+  packet follows on the stream closes it. The drain decodes a window bounded at
+  the playhead plus its lead, and that forward edge falls wherever it falls:
+  where it landed between a set and its clear, the set was published open, the
+  cursor moved on, and the next thing to touch it was a composition at the next
+  seek landing, tens or hundreds of seconds later. The packet store already
+  held that clear, so an open set now takes its end from there, and the forward
+  prefetch parks a margin beyond the drain window so the answer is stored
+  before the set publishes.
+- A stretch of a title no longer loses its subtitles after a seek burst (#362).
+  A seek restarts the pump behind the landing while the store still holds an
+  island the previous run harvested further ahead, and the drain decoded across
+  that hole and carried its cursor past it, so the packets arriving a second
+  later were never read. A tick now stops where the harvest ORDER breaks rather
+  than where the gaps are widest, which is what separates a hole nobody has
+  read from a silence the author left. The wait ends when the harvest closes
+  the hole, when the playhead reaches it, or on a tick budget, so a silence can
+  never stall delivery, and a tick that waited states itself in the delivery
+  line.
+
+## [6.23.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.23.0))
+
+### Added
+
+- `startupProgress` publishes how far a load has come, for hosts drawing a
+  determinate loading bar instead of an indeterminate spinner (#361). It is a
+  fixed ladder of nine checkpoints, each recorded by the code that finishes the
+  work it names, so the number never runs on a timer and never advances on an
+  estimate: a slow stretch holds and a skipped one jumps. Two of those
+  checkpoints cover stretches a host previously had no visibility into at all,
+  and they are the two that dominate a slow start: the source open, split into
+  connection, container and stream analysis, and the display-criteria
+  handshake. The value is scoped to a startup generation that counts the waits
+  a user actually sat through rather than teardowns, so an engine-initiated
+  reroute (an HLS playlist discovered on the loopback path) continues the bar
+  instead of dropping it back to zero mid-load. Monotonic and deduped; a load
+  that fails or is stopped never reaches the last checkpoint.
+
+## [6.22.1] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.22.1))
+
+### Fixed
+
+- A seek no longer carries a pre-seek subtitle into the new position (#357).
+  A PGS composition has no end of its own: it is published with FFmpeg's
+  open-ended placeholder end and closed when its successor arrives. A jump
+  outruns that successor, and the retention prune filters on the end time,
+  which a placeholder can never age out of, so the old cue stayed in the
+  published window covering the new playhead and every host that asks which
+  cue is active rendered it. A reset tick now retires the unconfirmed end at
+  the start of its reconstruction window, on the store and on the #100 hold
+  alike. An authored duration is untouched.
+
+## [6.22.0] - 2026-08-13
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.22.0))
+
+### Added
+
+- `systemCaptionRequest` publishes a caption request the system made on its
+  own (Sodalite#65). iOS 26 turns captions on by itself when playback is
+  muted, when the user skips back, or when the audio language differs from the
+  system language, and none of those three toggles has a read API. What the
+  system does have is an effect: it selects a legible option in the item. The
+  engine keeps deselecting that option, because its renditions exist for PiP,
+  AirPlay and external screens and rendering one in fullscreen draws a caption
+  box over a host's own subtitles, and it now reports the request instead of
+  swallowing it. The payload is the option's language tag rather than a track
+  id, because rendition ordinals are matched by language rank and not
+  positionally.
+- `setTeletextPage(_:)` changes the teletext caption page while a channel
+  plays (#364). The page used to reach `EmbeddedSubtitleDecoder` only at
+  construction, so it was fixed for the life of a selection and a channel
+  whose caption page libzvbi does not flag as a subtitle page could only be
+  corrected by leaving it, changing a setting and coming back. It now travels
+  with the decoder rebuild the drain path already performs, and only the
+  channels actually showing a teletext track are re-decoded. `teletextPage`
+  reads the page in force; the value lands in the session's load options, so
+  the internal reopens (audio switch, background reload) replay it.
+- `aetherctl play --teletext-page N` fixes the page at load and
+  `--switch-teletext-page <page|auto>[@ms]` changes it on the playing channel,
+  which is what makes the runtime path measurable from the CLI at all.
+
+### Fixed
+
+- The native legible rendition stays deselected for the whole session rather
+  than for its first two seconds (Sodalite#65). The pin covered AVKit's
+  ready-time auto-select and nothing after it, so iOS 26's automatic captions,
+  which fire minutes into a session, had nothing holding them back and AVKit
+  rendered the rendition over the frame as an empty caption box. A
+  media-selection observer now holds the deselect for the item's whole life,
+  bounded against a selection fight it cannot win: several re-asserts inside
+  one second stand down and log instead of spinning.
+
+## [6.21.1] - 2026-08-12
+
+([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.21.1))
+
+### Fixed
+
+- A live subtitle rendition re-anchors when the source axis moves under it
+  (#359). The placement pairs a segment's wall time with the session's shift,
+  and a producer seam republishes that shift, which left every cue already
+  placed referring to an axis that no longer existed. Unfixed this reads as
+  subtitles drifting further out the longer a channel runs, and it never
+  appears in a short session, which is exactly the shape that survives a
+  test.
+
+### Added
+
+- `[LiveSubs]` states its anchor once and its running relation about every
+  30 s: the lead of the newest cue over the picture, the cue count and the
+  current shift. A viewer reporting late subtitles cannot tell a misplaced
+  anchor from a stalled fetch, and those two numbers separate them.
+
 ## [6.21.0] - 2026-08-11
 
 ([release notes](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.21.0))

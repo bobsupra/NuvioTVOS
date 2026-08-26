@@ -891,7 +891,9 @@ final class NuvioSyncManager: ObservableObject {
     private func pullThenPush(generation: UInt) async {
         // Release the who's-watching sync gate on every exit path; the happy
         // path clears it only after profile-scoped Home inputs are persisted.
-        defer { finishPull(generation: generation) }
+        defer {
+            finishPull(generation: generation)
+        }
 
         guard let authManager, let profileViewModel else {
             Self.accountSyncDiagnostic = "manager not attached"
@@ -1089,10 +1091,9 @@ final class NuvioSyncManager: ObservableObject {
                     // the title that was just deleted on screen.
                     ContinueWatchingStore.replaceAll([])
                 }
-                // Rendering is a separate, retryable pass: the rows are already
-                // durable, so a slow or failing metadata lookup can no longer
-                // cost the user their history.
-                await ContinueWatchingBuilder.rebuild(reason: "account pull")
+                if progressReconcile.didChange {
+                    await ContinueWatchingBuilder.rebuild(reason: "account pull")
+                }
                 let uploadStatus = watchStateUploadsEnabled ? "uploads on" : "uploads off"
                 Self.progressSyncDiagnostic = "profile \(activeProfile.id), remote \(remoteProgress.count), "
                     + "\(uploadStatus); \(ContinueWatchingBuilder.diagnostic); "
@@ -1836,10 +1837,14 @@ enum PlayerSettingsSyncMapper {
         ("stream_auto_play_timeout_seconds", SettingsKey.autoPlayNextCountdown),
         ("stream_cached_only", SettingsKey.cachedOnlyStreams),
         ("cached_only_streams", SettingsKey.cachedOnlyStreams),
+        ("stream_sort_mode", SettingsKey.streamSortOption),
         ("smart_stream_selection", SettingsKey.smartStreamSelection),
         ("smart_stream_quality", SettingsKey.smartStreamQuality),
         ("external_player_forward_subtitles", SettingsKey.externalPlayerForwardSubtitles),
-        ("frame_rate_matching", SettingsKey.frameRateMatching)
+        ("frame_rate_matching", SettingsKey.frameRateMatching),
+        ("player_show_pip", SettingsKey.playerShowPiP),
+        ("player_show_episodes", SettingsKey.playerShowEpisodes),
+        ("player_show_sources", SettingsKey.playerShowSources)
     ]
 
     static let localToRemoteKeyMappings: [(local: String, remote: String)] = [
@@ -1850,10 +1855,14 @@ enum PlayerSettingsSyncMapper {
         (SettingsKey.autoPlayNext, "stream_auto_play_next_episode_enabled"),
         (SettingsKey.autoPlayNextCountdown, "stream_auto_play_timeout_seconds"),
         (SettingsKey.cachedOnlyStreams, "stream_cached_only"),
+        (SettingsKey.streamSortOption, "stream_sort_mode"),
         (SettingsKey.smartStreamSelection, "smart_stream_selection"),
         (SettingsKey.smartStreamQuality, "smart_stream_quality"),
         (SettingsKey.externalPlayerForwardSubtitles, "external_player_forward_subtitles"),
-        (SettingsKey.frameRateMatching, "frame_rate_matching")
+        (SettingsKey.frameRateMatching, "frame_rate_matching"),
+        (SettingsKey.playerShowPiP, "player_show_pip"),
+        (SettingsKey.playerShowEpisodes, "player_show_episodes"),
+        (SettingsKey.playerShowSources, "player_show_sources")
     ]
 }
 

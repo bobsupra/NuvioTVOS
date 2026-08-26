@@ -840,6 +840,23 @@ enum EpisodeTagResolver {
 struct TrailerPlaybackSource {
     let videoUrl: String
     let audioUrl: String?
+    let requestHeaders: [String: String]
+    let qualityLabel: String?
+    let diagnostics: String?
+
+    init(
+        videoUrl: String,
+        audioUrl: String?,
+        requestHeaders: [String: String] = [:],
+        qualityLabel: String? = nil,
+        diagnostics: String? = nil
+    ) {
+        self.videoUrl = videoUrl
+        self.audioUrl = audioUrl
+        self.requestHeaders = requestHeaders
+        self.qualityLabel = qualityLabel
+        self.diagnostics = diagnostics
+    }
 }
 
 enum ContinueWatchingFeatureFlags {
@@ -1375,6 +1392,7 @@ enum ContinueWatchingStore {
     /// Point the store at a profile. Call on launch and on every profile switch
     /// so reads/writes land in that profile's bucket.
     static func setActiveProfile(_ profileId: String?) {
+        guard activeProfileId != profileId else { return }
         activeProfileId = profileId
         // The key check in `items()` already separates profiles; this also covers
         // re-selecting the same profile after the file changed underneath us (a
@@ -2527,7 +2545,7 @@ enum ContinueWatchingDismissStore {
     }
 }
 
-struct LibraryStoreItem: Identifiable, Codable {
+struct LibraryStoreItem: Identifiable, Codable, Equatable {
     var id: String { meta.id }
     let meta: NuvioMeta
     let addedAt: Date
@@ -2558,6 +2576,7 @@ enum LibraryStore {
     private(set) static var activeProfileId: String?
 
     static func setActiveProfile(_ profileId: String?) {
+        guard activeProfileId != profileId else { return }
         activeProfileId = profileId
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -2632,14 +2651,17 @@ enum LibraryStore {
     static func mergeRemote(_ remoteItems: [LibraryStoreItem]) {
         guard !remoteItems.isEmpty else { return }
         var byKey: [String: LibraryStoreItem] = [:]
-        (items() + remoteItems).forEach { item in
+        let current = items()
+        (current + remoteItems).forEach { item in
             let key = "\(item.meta.type.lowercased()):\(item.meta.id)"
             let existing = byKey[key]
             if existing == nil || item.addedAt > existing!.addedAt {
                 byKey[key] = item
             }
         }
-        persist(Array(byKey.values).sorted { $0.addedAt > $1.addedAt })
+        let merged = Array(byKey.values).sorted { $0.addedAt > $1.addedAt }
+        guard merged != current else { return }
+        persist(merged)
     }
 
     static func replaceAll(_ newItems: [LibraryStoreItem]) {
@@ -2707,7 +2729,7 @@ enum CollectionFolderViewMode: String, CaseIterable, Hashable {
     }
 }
 
-struct NuvioCollection: Decodable, Identifiable {
+struct NuvioCollection: Decodable, Identifiable, Equatable {
     let id: String
     let title: String
     var pinToTop: Bool
@@ -2780,7 +2802,7 @@ enum CollectionTileShape: String, CaseIterable, Identifiable, Hashable {
     }
 }
 
-struct NuvioCollectionFolder: Decodable, Identifiable {
+struct NuvioCollectionFolder: Decodable, Identifiable, Equatable {
     let id: String
     let title: String
     var coverImageUrl: String?
@@ -3029,7 +3051,7 @@ struct NuvioTmdbCollectionFilters: Decodable, Hashable {
     }
 }
 
-struct NuvioCollectionCatalogSource: Codable {
+struct NuvioCollectionCatalogSource: Codable, Equatable {
     let addonId: String
     let type: String
     let catalogId: String
@@ -3153,6 +3175,7 @@ enum CollectionsStore {
     private(set) static var activeProfileId: String?
 
     static func setActiveProfile(_ profileId: String?) {
+        guard activeProfileId != profileId else { return }
         activeProfileId = profileId
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
@@ -3251,12 +3274,13 @@ enum CollectionsStore {
             print("CollectionsStore.applyRemote: \(decoded.count) collection(s)")
         }
 
-        // Prefer re-encoded raw rows so a double-encoded string input is stored cleanly.
-        let storeData = (try? JSONSerialization.data(withJSONObject: rows)) ?? json
-        if let currentData = readData(forKey: storageKey), currentData == storeData {
+        if collections() == decoded {
             rememberPulledIds(decoded.map(\.id))
             return
         }
+
+        // Prefer re-encoded raw rows so a double-encoded string input is stored cleanly.
+        let storeData = (try? JSONSerialization.data(withJSONObject: rows)) ?? json
         _ = writeData(storeData, forKey: storageKey)
         rememberPulledIds(decoded.map(\.id))
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -3820,7 +3844,7 @@ enum CollectionsStore {
     }
 }
 
-struct WatchedStoreItem: Identifiable, Codable {
+struct WatchedStoreItem: Identifiable, Codable, Equatable {
     var id: String {
         if let season, let episode {
             return "\(meta.type):\(meta.id):s\(season)e\(episode)"
@@ -4210,6 +4234,7 @@ enum WatchedStore {
         }
         cacheLock.unlock()
 
+        guard changed else { return }
         warmup(profileId: profileId)
         migrateSourcesIfNeeded()
         NotificationCenter.default.post(name: changedNotification, object: nil)
@@ -4971,7 +4996,11 @@ enum WatchedStore {
             !stillBlocking.contains { tombstoneMatches($0, item: item) }
         }
 
-        let merged = mergedByIdentity(items() + accepted)
+        let current = items()
+        let merged = mergedByIdentity(current + accepted)
+        if merged == current {
+            return true
+        }
         guard persist(merged) else { return false }
         ContinueWatchingStore.removeWatched(merged)
         return true
@@ -5402,9 +5431,6 @@ enum WatchedStore {
 
     @discardableResult
     private static func persist(_ items: [WatchedStoreItem]) -> Bool {
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-
         let encodeStart = DispatchTime.now()
         let data: Data
         do {
@@ -5416,15 +5442,20 @@ enum WatchedStore {
         }
         let elapsedMs = Double(DispatchTime.now().uptimeNanoseconds - encodeStart.uptimeNanoseconds) / 1_000_000.0
 
+        cacheLock.lock()
         let key = storageKey
         if cachedKey == key, let cachedData, cachedData == data {
+            cacheLock.unlock()
             return true
         }
 
         let saved = writeData(data, forKey: key, verify: { payload in
             _ = try makeDecoder().decode([WatchedStoreItem].self, from: payload)
         })
-        guard saved else { return false }
+        guard saved else {
+            cacheLock.unlock()
+            return false
+        }
 
         let sorted = items.sorted { $0.watchedAt > $1.watchedAt }
         cacheGeneration &+= 1
@@ -5434,6 +5465,7 @@ enum WatchedStore {
         cachedSnapshot = nil
         persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
         print("[WatchedStore] Saved \(items.count) items (\(data.count) bytes, encoded in \(String(format: "%.2f", elapsedMs))ms)")
+        cacheLock.unlock()
 
         NotificationCenter.default.post(name: changedNotification, object: nil)
         return true

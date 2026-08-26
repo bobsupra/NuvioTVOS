@@ -18,6 +18,10 @@ struct PlayerControls: View {
 
     @FocusState private var focusedControl: PlayerControlFocus?
 
+    @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
+    @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
+    @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
+
     private var isShowingPause: Bool {
         viewModel.status == .playing
     }
@@ -29,6 +33,9 @@ struct PlayerControls: View {
                 Spacer()
                 bottomControls
             }
+        }
+        .onExitCommand {
+            viewModel.hideControls()
         }
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
             if !isPresented, viewModel.showControls {
@@ -101,9 +108,9 @@ struct PlayerControls: View {
     /// Left-to-right order of currently visible transport buttons.
     private var transportFocusOrder: [PlayerControlFocus] {
         var order: [PlayerControlFocus] = [.play]
-        if viewModel.isPictureInPictureSupported { order.append(.pip) }
-        if viewModel.canShowEpisodesPanel { order.append(.episodes) }
-        if viewModel.canShowSourcesPanel { order.append(.sources) }
+        if viewModel.isPictureInPictureSupported && playerShowPiP { order.append(.pip) }
+        if viewModel.canShowEpisodesPanel && playerShowEpisodes { order.append(.episodes) }
+        if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
         order.append(.settings)
         return order
     }
@@ -229,7 +236,7 @@ struct PlayerControls: View {
 
             Spacer()
 
-            if viewModel.isPictureInPictureSupported {
+            if viewModel.isPictureInPictureSupported && playerShowPiP {
                 glassIconButton(
                     size: 70,
                     iconSize: 28,
@@ -243,7 +250,7 @@ struct PlayerControls: View {
                 .id("pip_button")
             }
 
-            if viewModel.canShowEpisodesPanel {
+            if viewModel.canShowEpisodesPanel && playerShowEpisodes {
                 glassIconButton(
                     size: 70,
                     iconSize: 28,
@@ -257,7 +264,7 @@ struct PlayerControls: View {
                 .id("episodes_button")
             }
 
-            if viewModel.canShowSourcesPanel {
+            if viewModel.canShowSourcesPanel && playerShowSources {
                 glassIconButton(
                     size: 70,
                     iconSize: 28,
@@ -767,6 +774,7 @@ struct PlayerSettingsPanel: View {
         case audioControl(AudioControl)
         case speed(Float)
         case seekStep(Int)
+        case debugOverlay
         case aspect(String)
         case style(StyleControl)
     }
@@ -1605,6 +1613,24 @@ struct PlayerSettingsPanel: View {
                             ) {
                                 viewModel.setSeekStepSeconds(seconds)
                             }
+                        }
+                    }
+                    .padding(.vertical, 6)
+                }
+                .focusSection()
+            }
+            .frame(width: 320, alignment: .leading)
+
+            VStack(alignment: .leading, spacing: 18) {
+                columnHeader("Diagnostics")
+                ScrollView(showsIndicators: false) {
+                    VStack(spacing: 12) {
+                        simpleRow(
+                            title: "Debug Overlay",
+                            isSelected: viewModel.isPlaybackDebugEnabled,
+                            focusKey: .debugOverlay
+                        ) {
+                            viewModel.togglePlaybackDebugHUD()
                         }
                     }
                     .padding(.vertical, 6)

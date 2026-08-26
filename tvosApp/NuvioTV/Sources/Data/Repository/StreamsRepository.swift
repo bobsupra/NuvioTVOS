@@ -646,7 +646,13 @@ struct StreamAddonManifestResource: Decodable {
     func supportsType(_ type: String, fallbackTypes: [String]) -> Bool {
         let supportedTypes = types.isEmpty ? fallbackTypes : types
         guard !supportedTypes.isEmpty else { return true }
-        return supportedTypes.contains { $0.caseInsensitiveCompare(type) == .orderedSame }
+        if supportedTypes.contains(where: { $0.caseInsensitiveCompare(type) == .orderedSame }) {
+            return true
+        }
+        if CinemetaCatalogRepository.isLiveContentType(type) {
+            return supportedTypes.contains(where: { CinemetaCatalogRepository.isLiveContentType($0) })
+        }
+        return false
     }
 
     func supportsId(_ id: String, fallbackPrefixes: [String]) -> Bool {

@@ -6,9 +6,10 @@ import Foundation
 /// playlist URL onto the raw-byte live reader. The origin serves the finite #EXTM3U body at HTTP 200 and
 /// closes; the endless-feed reader then re-fetches it forever (productive-looking reconnects the #71
 /// give-up counters can't catch), so avformat_open_input never returns and load() hangs with no terminal
-/// state. AVIOReader now classifies the first bytes and fails closed before entering the reconnect loop.
-/// These cover the classifier in isolation (no network): a raw media container never opens with '#', so an
-/// #EXTM3U prefix is an unambiguous misroute.
+/// state. AVIOReader classifies the first bytes and stops before entering the reconnect loop. These cover
+/// the classifier in isolation (no network): a raw media container never opens with '#', so an #EXTM3U
+/// prefix is an unambiguous misroute. AE#363 kept the classification and changed what follows it: a URL
+/// source is routed onto the live ingest, a custom reader keeps the typed rejection.
 struct AVIOReaderHLSMisrouteTests {
 
     private func bytes(_ string: String) -> [UInt8] { Array(string.utf8) }

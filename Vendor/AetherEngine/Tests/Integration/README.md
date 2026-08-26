@@ -2,6 +2,11 @@
 
 Checks that need a running engine + a real media file, so they cannot run under `swift test`.
 
+Related, and elsewhere because it needs to build for tvOS: `Probes/TransportProbe/` measures whether
+a held `URLSessionStreamTask` gives real backpressure and survives an origin that refuses new
+requests for minutes at a time (AE#377, #310, #220). It is its own package, since the engine's
+package scheme carries `aetherctl` and cannot build for a device.
+
 ## `avplayer-open-check.swift` (#15, E8)
 
 Proves AVPlayer can OPEN the loopback HLS master that carries the native WebVTT `SUBTITLES`

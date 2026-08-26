@@ -19,7 +19,14 @@ final class AudioAVPlayerHost {
     /// Siri Remote, AirPods) plays/pauses the AVPlayer directly. Without it `state` goes stale and the play/pause
     /// toggle is swallowed (looks like "only pause works").
     @Published private(set) var timeControlStatus: AVPlayer.TimeControlStatus = .paused
-    @Published private(set) var failureMessage: String?
+    /// The item has played and is now starved: AVPlayer is `waitingToPlayAtSpecifiedRate`, or it posted
+    /// `AVPlayerItemPlaybackStalled` and has not resumed since. The engine folds this into `isBuffering`,
+    /// so `playbackPhase` reads `.rebuffering` on this path too (architecture.md promised that; the flag
+    /// never existed). Startup spin-up before the first `.playing` is not a rebuffer, and a paused player
+    /// is never one. See `rebufferingFlag(hasStartedPlaying:status:stalledSinceLastPlaying:)`.
+    @Published private(set) var isRebuffering: Bool = false
+    /// #376: carries the classification with the message, so the engine can publish both.
+    @Published private(set) var failure: PlaybackErrorInfo?
     @Published private(set) var didReachEnd: Bool = false
 
     // MARK: - Output
@@ -46,6 +53,15 @@ final class AudioAVPlayerHost {
     private var timeControlObservation: NSKeyValueObservation?
     private var endObserver: NSObjectProtocol?
     private var failObserver: NSObjectProtocol?
+    private var stallObserver: NSObjectProtocol?
+    private var errorLogObserver: NSObjectProtocol?
+
+    /// Rebuffer inputs for the current item; reset per `load()` / `stop()`. `hasStartedPlaying` latches
+    /// on the first `.playing` so the pre-roll wait of a fresh item never reads as a stall;
+    /// `stalledSinceLastPlaying` latches on `AVPlayerItemPlaybackStalled` and clears on the next `.playing`,
+    /// covering the notification arriving ahead of the status change (or a player configured not to wait).
+    private var hasStartedPlaying = false
+    private var stalledSinceLastPlaying = false
 
     private var lastRate: Float = 1.0
 
@@ -111,11 +127,14 @@ final class AudioAVPlayerHost {
         #endif
         playerItem = item
 
-        failureMessage = nil
+        failure = nil
         didReachEnd = false
         isReady = false
         currentTime = 0
         duration = 0
+        hasStartedPlaying = false
+        stalledSinceLastPlaying = false
+        isRebuffering = false
         if let start = startPosition, start > 0 {
             pendingSeek = start
             currentTime = start
@@ -163,8 +182,9 @@ final class AudioAVPlayerHost {
                 }
             case .failed:
                 let message = item.error?.localizedDescription ?? "AVPlayerItem failed (no description)"
+                let info = PlaybackErrorInfo(kind: .audioSessionFailed, message: message, underlying: item.error)
                 Task { @MainActor [weak self] in
-                    self?.failureMessage = message
+                    self?.failure = info
                 }
             default:
                 break
@@ -179,11 +199,18 @@ final class AudioAVPlayerHost {
             }
         }
 
-        // Mirror timeControlStatus so the engine reconciles transport on system-driven play/pause.
+        // Mirror timeControlStatus so the engine reconciles transport on system-driven play/pause, and fold
+        // it into the rebuffer flag: the first `.playing` opens the window in which a wait is a stall.
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
             Task { @MainActor [weak self] in
-                self?.timeControlStatus = status
+                guard let self else { return }
+                self.timeControlStatus = status
+                if status == .playing {
+                    self.hasStartedPlaying = true
+                    self.stalledSinceLastPlaying = false
+                }
+                self.refreshRebuffering()
             }
         }
 
@@ -219,9 +246,42 @@ final class AudioAVPlayerHost {
         ) { [weak self] notification in
             let err = notification.userInfo?[AVPlayerItemFailedToPlayToEndTimeErrorKey] as? NSError
             let message = err?.localizedDescription ?? "Playback failed to reach end"
+            let info = PlaybackErrorInfo(kind: .audioSessionFailed, message: message, underlying: err)
             Task { @MainActor [weak self] in
-                self?.failureMessage = message
+                self?.failure = info
             }
+        }
+
+        // A dry buffer mid-item. With `automaticallyWaitsToMinimizeStalling` (this host never turns it off)
+        // the status flips to `.waitingToPlayAtSpecifiedRate` alongside; latch it anyway so the order of the
+        // two signals cannot leave a stall unpublished.
+        stallObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.playbackStalledNotification,
+            object: item,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                EngineLog.emit("[AudioAVPlayerHost] playback stalled (buffer ran dry)", category: .swPlayback)
+                self.stalledSinceLastPlaying = true
+                self.refreshRebuffering()
+            }
+        }
+
+        // The item's own account of a failing fetch, otherwise invisible: no demuxer / reader logs on this path.
+        errorLogObserver = NotificationCenter.default.addObserver(
+            forName: AVPlayerItem.newErrorLogEntryNotification,
+            object: item,
+            queue: .main
+        ) { notification in
+            // Read the item off the notification, not `self.playerItem`: nothing here touches the host, and a
+            // load() that swapped the property would leave the line describing the wrong item (or none).
+            guard let event = (notification.object as? AVPlayerItem)?.errorLog()?.events.last else { return }
+            EngineLog.emit(
+                "[AudioAVPlayerHost] item error log: domain=\(event.errorDomain) status=\(event.errorStatusCode) "
+                + "comment=\(event.errorComment ?? "-") uri=\(event.uri ?? "-")",
+                category: .swPlayback
+            )
         }
 
         avPlayer.replaceCurrentItem(with: item)
@@ -302,6 +362,9 @@ final class AudioAVPlayerHost {
         avPlayer.replaceCurrentItem(with: nil)
         isReady = false
         playerItem = nil
+        hasStartedPlaying = false
+        stalledSinceLastPlaying = false
+        isRebuffering = false
         // Clear the staged dict so the next track starts clean; the auto-publishing session drops the Now-Playing
         // entry when the player has no current item.
         #if os(iOS) || os(tvOS)
@@ -309,9 +372,9 @@ final class AudioAVPlayerHost {
         #endif
         // Host is persistent across tracks; clear terminal flags so the next load's subscriptions (wired before
         // host.load) don't replay them: stale didReachEnd=true fired .idle mid-load (double-skip on auto-advance
-        // hosts), stale failureMessage flipped the new track to .error before it started.
+        // hosts), stale failure flipped the new track to .error before it started.
         didReachEnd = false
-        failureMessage = nil
+        failure = nil
     }
 
     var volume: Float {
@@ -342,5 +405,37 @@ final class AudioAVPlayerHost {
             NotificationCenter.default.removeObserver(failObserver)
             self.failObserver = nil
         }
+        if let stallObserver {
+            NotificationCenter.default.removeObserver(stallObserver)
+            self.stallObserver = nil
+        }
+        if let errorLogObserver {
+            NotificationCenter.default.removeObserver(errorLogObserver)
+            self.errorLogObserver = nil
+        }
+    }
+
+    // MARK: - Rebuffering
+
+    /// Idempotent recompute; publishes only on change so a redundant status write never fires the engine.
+    private func refreshRebuffering() {
+        let next = Self.rebufferingFlag(
+            hasStartedPlaying: hasStartedPlaying,
+            status: timeControlStatus,
+            stalledSinceLastPlaying: stalledSinceLastPlaying
+        )
+        if isRebuffering != next { isRebuffering = next }
+    }
+
+    /// Pure fold behind `isRebuffering`: a wait counts only once the item has played (`.playing` seen for
+    /// this item), never while the player is paused; a stall latched since the last `.playing` counts on
+    /// its own so a notification that lands ahead of the status change is not lost.
+    nonisolated static func rebufferingFlag(
+        hasStartedPlaying: Bool,
+        status: AVPlayer.TimeControlStatus,
+        stalledSinceLastPlaying: Bool
+    ) -> Bool {
+        guard hasStartedPlaying, status != .paused else { return false }
+        return status == .waitingToPlayAtSpecifiedRate || stalledSinceLastPlaying
     }
 }

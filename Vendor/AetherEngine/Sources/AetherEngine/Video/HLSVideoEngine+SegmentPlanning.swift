@@ -399,6 +399,23 @@ extension HLSVideoEngine {
     /// real film (263 s, IRAPs ~2 s apart) it found nothing, the muxer emitted an empty hvcC, and
     /// AVPlayer buffered the forward window without ever rendering a frame (AetherPlayer#2). Pass
     /// `false` for a live, forward-only feed, which cannot rewind.
+    /// Is this an hvcC that declares no parameter-set arrays, i.e. the #19 case the scan exists for?
+    ///
+    /// The `configurationVersion == 1` check is what keeps Annex-B extradata out. Bytes 21 and 22 of
+    /// an Annex-B HEVC config record pass the other two checks by construction, not by luck: the
+    /// profile_tier_level in a Main10 VPS carries the emulation-prevention pattern `00 00 03` right
+    /// there, so byte 21 reads back as naluLengthSize 4 and byte 22 as numOfArrays 0, and the scan
+    /// would run over a buffer that is not a record at all (#365). `canonicalizeHEVCConfigRecord`
+    /// has always had this guard; this path never did.
+    static func configRecordNeedsInBandRebuild(
+        _ extradata: UnsafePointer<UInt8>, size: Int
+    ) -> Bool {
+        guard size >= 23 else { return false }
+        guard extradata[0] == 1 else { return false }
+        guard extradata[22] == 0 else { return false }   // numOfArrays; non-zero means already populated
+        return Int(extradata[21] & 0x03) + 1 == 4        // naluLengthSize, byte 21 lower 2 bits + 1
+    }
+
     func rebuildHEVCExtradataWithInBandParameterSets(
         demuxer: Demuxer,
         videoStreamIndex: Int32,
@@ -408,9 +425,8 @@ extension HLSVideoEngine {
         guard codecpar.pointee.codec_id == AV_CODEC_ID_HEVC else { return nil }
         let extradataSize = Int(codecpar.pointee.extradata_size)
         guard extradataSize >= 23, let extradata = codecpar.pointee.extradata else { return nil }
-        guard extradata[22] == 0 else { return nil }  // hvcC byte 22 = numOfArrays; non-zero means already populated
-        let naluLengthSize = Int(extradata[21] & 0x03) + 1  // hvcC byte 21 lower 2 bits + 1
-        guard naluLengthSize == 4 else { return nil }
+        guard Self.configRecordNeedsInBandRebuild(extradata, size: extradataSize) else { return nil }
+        let naluLengthSize = 4   // the predicate above already required it
 
         if rewindBeforeScan { demuxer.seek(to: 0) }
 
@@ -491,6 +507,152 @@ extension HLSVideoEngine {
         appendArray(nalUnitType: 33, nal: sps)
         appendArray(nalUnitType: 34, nal: pps)
         return hvcC
+    }
+
+    /// What the muxer should ship for a source whose config record is Annex B (#365), and the
+    /// framing every NAL walker in the session should use.
+    struct VideoFramingNormalization {
+        /// Replacement config record, or nil to forward the source extradata unchanged.
+        let extradataOverride: [UInt8]?
+        /// Framing measured on real packets, or nil when nothing was measured (live, or the muxer was
+        /// never going to reformat this track anyway). Callers fall back to deriving it from the
+        /// extradata, which is only safe while the two agree.
+        let measuredFraming: VideoNALFraming?
+    }
+
+    /// Measure the video NAL framing on packets, then decide what config record the muxer gets.
+    ///
+    /// The framing question has always been answered from the extradata (`A53SEIParser.nalFraming`,
+    /// and movenc's own test). That answer is right for every source where the two agree and silently
+    /// destructive for one where they do not: with Annex-B extradata movenc converts every sample
+    /// through `ff_hevc_annexb2mp4`, which on MP4-framed samples finds start codes only where a NAL
+    /// length happens to read as `00 00 01` and drops everything else. Measured 1080p: a 2,158,448 B
+    /// segment came out at 61,912 B, AVPlayer reached `readyToPlay` and never produced a frame.
+    ///
+    /// Consumes packets and leaves the demuxer cursor where it stopped; `start()` seeks back to 0
+    /// afterwards, same contract as the in-band scan and the cue prewarm.
+    func normalizeVideoFraming(
+        demuxer: Demuxer,
+        videoStreamIndex: Int32,
+        codecpar: UnsafePointer<AVCodecParameters>,
+        isLive: Bool
+    ) -> VideoFramingNormalization {
+        let codecID = codecpar.pointee.codec_id
+        guard VideoConfigRecord.muxerWillReformatPackets(
+            codecID: codecID,
+            extradata: codecpar.pointee.extradata.map { UnsafePointer($0) },
+            size: Int(codecpar.pointee.extradata_size))
+        else { return VideoFramingNormalization(extradataOverride: nil, measuredFraming: nil) }
+
+        // Live is Annex B on both ends by construction (MPEG-TS, HLS ingest), so the two agree and
+        // there is nothing to repair; the probe would only cost packets off a forward-only feed.
+        guard !isLive else {
+            return VideoFramingNormalization(extradataOverride: nil, measuredFraming: .annexB)
+        }
+
+        let framing = probeVideoNALFraming(demuxer: demuxer, videoStreamIndex: videoStreamIndex)
+        guard case .lengthPrefixed = framing else {
+            // The record stays Annex B here: movenc reads it to decide whether to convert the samples,
+            // and these samples do need converting. What it must not keep is a prefix SEI, because the
+            // hvcC movenc then builds carries it as a fourth array (`ff_isom_write_hvcc` collects five
+            // NAL types) and Apple TV's HEVC track builder rejects such a record (AE#187). That defense
+            // sits on the record path and cannot see this one, so the SEI goes before the muxer runs.
+            let source = codecpar.pointee.extradata.map {
+                [UInt8](UnsafeBufferPointer(start: $0, count: Int(codecpar.pointee.extradata_size)))
+            } ?? []
+            let canonical = codecID == AV_CODEC_ID_HEVC
+                ? VideoConfigRecord.canonicalizeAnnexBHEVCConfigRecord(source) : nil
+            EngineLog.emit(
+                "[HLSVideoEngine] #365 the muxer will reformat this track's samples and the packets "
+                + "are \(framing == nil ? "not conclusively framed" : "Annex B"); the muxer builds the "
+                + "config record itself out of \(source.count) B of Annex B "
+                + "[\(VideoConfigRecord.annexBNALSummary(source))]"
+                + (canonical.map {
+                    ", dropped the non-parameter-set NALs before it does (→ \($0.count) B, AE#187)"
+                } ?? ", nothing to drop"),
+                category: .session
+            )
+            return VideoFramingNormalization(extradataOverride: canonical, measuredFraming: framing)
+        }
+
+        let source = [UInt8](UnsafeBufferPointer(
+            start: codecpar.pointee.extradata!, count: Int(codecpar.pointee.extradata_size)))
+        guard let record = VideoConfigRecord.fromAnnexB(
+            source, codecID: codecID,
+            width: codecpar.pointee.width, height: codecpar.pointee.height)
+        else {
+            EngineLog.emit(
+                "[HLSVideoEngine] #365 Annex-B config record on a length-prefixed source, but no "
+                + "config record could be built from it (\(source.count) B); the muxer will empty "
+                + "the video samples", category: .session
+            )
+            return VideoFramingNormalization(extradataOverride: nil, measuredFraming: framing)
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] #365 converted the Annex-B config record to a length-prefixed one: "
+            + "\(source.count) B → \(record.count) B; source packets are length-prefixed, so the "
+            + "muxer must not run its Annex-B converter over them",
+            category: .session
+        )
+        return VideoFramingNormalization(extradataOverride: record, measuredFraming: framing)
+    }
+
+    /// Framing of the video packets themselves, or nil when the sample is not conclusive.
+    ///
+    /// Decided by "does a length-prefixed walk consume the packet exactly", never by the head bytes:
+    /// a NAL of 256 to 511 bytes carries the length prefix `00 00 01 xx`, which reads as a start code
+    /// to anything that only looks at the front.
+    func probeVideoNALFraming(
+        demuxer: Demuxer,
+        videoStreamIndex: Int32,
+        packetBudget: Int = 4,
+        readBudget: Int = 512
+    ) -> VideoNALFraming? {
+        demuxer.seek(to: 0)
+        var lengthPrefixed = 0
+        var annexB = 0
+        var inspected = 0
+        var packetsRead = 0
+
+        while inspected < packetBudget && packetsRead < readBudget {
+            let readResult: UnsafeMutablePointer<AVPacket>?
+            do {
+                readResult = try demuxer.readPacket()
+            } catch {
+                break
+            }
+            guard let pkt = readResult else { break }
+            defer {
+                var maybePkt: UnsafeMutablePointer<AVPacket>? = pkt
+                trackedPacketFree(&maybePkt)
+            }
+            packetsRead += 1
+            guard pkt.pointee.stream_index == videoStreamIndex,
+                  let data = pkt.pointee.data, pkt.pointee.size > 4 else { continue }
+            inspected += 1
+            let size = Int(pkt.pointee.size)
+            if VideoConfigRecord.walksAsLengthPrefixed(data, size: size) {
+                lengthPrefixed += 1
+            } else if VideoConfigRecord.startsWithStartCode(data, size: size) {
+                annexB += 1
+            }
+        }
+
+        let framing: VideoNALFraming?
+        if lengthPrefixed > 0 && annexB == 0 {
+            framing = .lengthPrefixed(size: 4)
+        } else if annexB > 0 && lengthPrefixed == 0 {
+            framing = .annexB
+        } else {
+            framing = nil
+        }
+        EngineLog.emit(
+            "[HLSVideoEngine] video NAL framing probe: inspected=\(inspected) "
+            + "lengthPrefixed=\(lengthPrefixed) annexB=\(annexB) → "
+            + "\(framing.map { "\($0)" } ?? "inconclusive")",
+            category: .session
+        )
+        return framing
     }
 
     /// Rewrite an hvcC config record to keep only the VPS(32)/SPS(33)/PPS(34) parameter-set arrays, dropping

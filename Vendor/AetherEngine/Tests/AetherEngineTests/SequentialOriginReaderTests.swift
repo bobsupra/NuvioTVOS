@@ -60,13 +60,14 @@ struct SequentialOriginReaderTests {
         try reader.open()
 
         let (read, last) = drain(reader, upTo: total)
-        // What arrived is handed over before the error is, and it is short of the promise. NOT how
-        // much: when a body is cut off, the amount that reaches the delegate before the failure
-        // does is URLSession's to decide, and it drops whatever it has buffered at that moment.
-        // The old `>= 1 MiB` was a bet on most of the 2 MiB surviving that, and a loaded CI runner
-        // collected on it (2026-08-11: 327212 arrived). Measured locally at 1790200 of 2097152 on
-        // an idle machine, so there is no honest floor here, only a property: some, and not all.
-        #expect(read > 0)
+        // Whatever arrived is short of the promise, and the assertions stop there. How much
+        // arrives is URLSession's call: it hands over what it has buffered when the body is cut
+        // off, and on a loaded runner that can be nothing at all. `>= 1 MiB` fell first
+        // (2026-08-11 CI: 327212 arrived, measured locally at 1790200 of 2097152 on an idle
+        // machine), then the relaxed `> 0` fell the same way (2026-08-13 CI: 0 arrived). There is
+        // no floor to find, because the transport owns that number; what the reader owns is the
+        // ceiling (it cannot deliver more than the server sent) and the error it ends on.
+        #expect(read <= servedBeforeDrop)
         #expect(read < total)
         // AVERROR(EIO) = -5: a sequential origin cannot be resumed at an offset, so the loss must
         // surface as a read error the session can act on. FFmpegErr.eof here would read as

@@ -426,77 +426,45 @@ struct DetailsScreen: View {
     }
 
     private func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
-        if let ytId = meta.trailerYtIds?
-            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-            .first(where: { !$0.isEmpty }) {
-            return ytId
-        }
-
-        guard tmdbEnabled,
-              TmdbDetailsService.useTrailers,
-              !tmdbApiKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
-              let tmdbId = meta.tmdbId else {
-            return nil
-        }
-
-        return await fetchTmdbTrailerId(tmdbId: tmdbId, type: meta.type)
-    }
-
-    private func fetchTmdbTrailerId(tmdbId: Int, type: String) async -> String? {
-        let mediaPath = type.caseInsensitiveCompare("series") == .orderedSame ? "tv" : "movie"
-        var components = URLComponents(string: "https://api.themoviedb.org/3/\(mediaPath)/\(tmdbId)/videos")
-        components?.queryItems = [
-            URLQueryItem(name: "api_key", value: tmdbApiKey),
-            URLQueryItem(name: "language", value: TmdbDetailsService.preferredLanguage)
-        ]
-        guard let url = components?.url else { return nil }
-
-        do {
-            let (data, response) = try await URLSession.shared.data(from: url)
-            guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
-                return nil
-            }
-            let decoded = try JSONDecoder().decode(TmdbVideosResponse.self, from: data)
-            return decoded.results
-                .filter { $0.site?.caseInsensitiveCompare("YouTube") == .orderedSame }
-                .sorted { lhs, rhs in
-                    if lhs.rank != rhs.rank { return lhs.rank > rhs.rank }
-                    return (lhs.publishedAt ?? "") > (rhs.publishedAt ?? "")
-                }
-                .first?
-                .key
-        } catch {
-            return nil
-        }
-    }
-}
-
-private struct TmdbVideosResponse: Decodable {
-    let results: [TmdbVideoResult]
-}
-
-private struct TmdbVideoResult: Decodable {
-    let key: String?
-    let site: String?
-    let type: String?
-    let official: Bool?
-    let publishedAt: String?
-
-    enum CodingKeys: String, CodingKey {
-        case key, site, type, official
-        case publishedAt = "published_at"
-    }
-
-    var rank: Int {
-        var value = 0
-        if type?.caseInsensitiveCompare("Trailer") == .orderedSame { value += 100 }
-        if official == true { value += 50 }
-        if type?.caseInsensitiveCompare("Teaser") == .orderedSame { value += 25 }
-        return value
+        await YouTubeTrailerResolver.preferredTrailerYouTubeId(for: meta)
     }
 }
 
 actor YouTubeTrailerResolver {
+    static let shared = YouTubeTrailerResolver()
+    private var trailerIdCache: [String: String] = [:]
+
+    static func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
+        await shared.preferredTrailerYouTubeId(for: meta)
+    }
+
+    func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
+        let cacheKey = "\(meta.id)|\(meta.tmdbId ?? 0)"
+        if let cached = trailerIdCache[cacheKey] {
+            return cached.isEmpty ? nil : cached
+        }
+
+        var resolvedId: String? = nil
+
+        if let ytId = meta.trailerYtIds?
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty }) {
+            resolvedId = ytId
+        } else if let ytId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta),
+           !ytId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            resolvedId = ytId
+        } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
+            id: meta.id,
+            type: meta.type
+        ), let ytId = refreshed.trailerYtIds?
+            .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
+            .first(where: { !$0.isEmpty }) {
+            resolvedId = ytId
+        }
+
+        trailerIdCache[cacheKey] = resolvedId ?? ""
+        return resolvedId
+    }
     private struct Client {
         let key: String
         let id: String
@@ -524,8 +492,7 @@ actor YouTubeTrailerResolver {
 
     private struct HlsCandidate {
         let manifestUrl: String
-        let selectedVariantUrl: String
-        let width: Int
+        let clientKey: String
         let height: Int
         let bandwidth: Int
         let priority: Int
@@ -533,6 +500,16 @@ actor YouTubeTrailerResolver {
 
     private struct TrailerBackendResponse: Decodable {
         let url: String?
+        let videoUrl: String?
+        let streamUrl: String?
+        let hls: String?
+        let hlsUrl: String?
+        let quality: String?
+        let resolution: String?
+
+        var effectiveUrl: String? {
+            url ?? videoUrl ?? streamUrl ?? hls ?? hlsUrl
+        }
     }
 
     private static let defaultUserAgent =
@@ -541,7 +518,9 @@ actor YouTubeTrailerResolver {
     private static let fallbackApiKey = "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8"
     private static let configTTL: TimeInterval = 3 * 60 * 60
     private static let resolverBaseKey = "nuvio.tv.settings.playback.trailerResolverBaseURL"
-    static let minimumHeight = 1080
+    private static let embeddedPlayerOrigin = "https://nuvioapp.space/"
+    private static let probeTimeout: TimeInterval = 3
+    private static let attemptBudget: TimeInterval = 12
 
     private static let clients: [Client] = [
         Client(
@@ -564,6 +543,23 @@ actor YouTubeTrailerResolver {
             priority: 0
         ),
         Client(
+            key: "ios",
+            id: "5",
+            version: "20.10.1",
+            userAgent: "com.google.ios.youtube/20.10.1 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)",
+            context: [
+                "clientName": "IOS",
+                "clientVersion": "20.10.1",
+                "deviceModel": "iPhone16,2",
+                "osName": "iPhone",
+                "osVersion": "17.4.0.21E219",
+                "platform": "MOBILE",
+                "hl": "en",
+                "gl": "US"
+            ],
+            priority: 1
+        ),
+        Client(
             key: "android",
             id: "3",
             version: "20.10.35",
@@ -581,25 +577,42 @@ actor YouTubeTrailerResolver {
             priority: 1
         ),
         Client(
-            key: "ios",
-            id: "5",
-            version: "20.10.1",
-            userAgent: "com.google.ios.youtube/20.10.1 (iPhone16,2; U; CPU iOS 17_4 like Mac OS X)",
+            key: "tv_embedded",
+            id: "85",
+            version: "2.0",
+            userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 NativeClient-FreeBSD Safari/538.1",
             context: [
-                "clientName": "IOS",
-                "clientVersion": "20.10.1",
-                "deviceModel": "iPhone16,2",
-                "osName": "iPhone",
-                "osVersion": "17.4.0.21E219",
-                "platform": "MOBILE",
+                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
+                "clientVersion": "2.0",
+                "clientFormFactor": "TV",
+                "platform": "TV",
                 "hl": "en",
                 "gl": "US"
             ],
             priority: 2
+        ),
+        Client(
+            key: "web_embedded_player",
+            id: "56",
+            version: "2.20260708.00.00",
+            userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
+                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+            context: [
+                "clientName": "WEB_EMBEDDED_PLAYER",
+                "clientVersion": "2.20260708.00.00",
+                "clientFormFactor": "UNKNOWN_FORM_FACTOR",
+                "platform": "DESKTOP",
+                "hl": "en",
+                "gl": "US"
+            ],
+            priority: 3
         )
     ]
 
     private var cachedConfig: WatchConfig?
+    private var previewCache: [String: (source: TrailerPlaybackSource, date: Date)] = [:]
+    private var probeResults: [String: Bool] = [:]
+    private var attemptStartedAt: Date?
     private let session: URLSession = {
         let configuration = URLSessionConfiguration.ephemeral
         configuration.timeoutIntervalForRequest = 20
@@ -610,47 +623,91 @@ actor YouTubeTrailerResolver {
         return URLSession(configuration: configuration)
     }()
 
+    private let probeSession: URLSession = {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.timeoutIntervalForRequest = 3
+        configuration.timeoutIntervalForResource = 3
+        return URLSession(configuration: configuration)
+    }()
+
     func resolve(youtubeVideoId: String, title: String?, year: String?) async -> TrailerPlaybackSource? {
         guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
 
-        if let url = await resolveWithInnertube(videoId: youtubeVideoId, forceRefreshConfig: false) {
-            return url
+        let youtubeUrl = "https://www.youtube.com/watch?v=\(youtubeVideoId)"
+        if let source = await resolveWithBackend(
+            videoId: youtubeVideoId,
+            youtubeUrl: youtubeUrl,
+            title: title,
+            year: year
+        ) {
+            return source
         }
 
+        // Full player supports 1080p adaptive video + audio pairs as well as HLS
+        if let source = await resolveWithInnertube(
+            videoId: youtubeVideoId,
+            forceRefreshConfig: false,
+            preferIntegratedStream: false
+        ) {
+            return source
+        }
+
+        guard !Task.isCancelled else { return nil }
         cachedConfig = nil
-        if let url = await resolveWithInnertube(videoId: youtubeVideoId, forceRefreshConfig: true) {
-            return url
+
+        // Retry with refreshed config
+        if let source = await resolveWithInnertube(
+            videoId: youtubeVideoId,
+            forceRefreshConfig: true,
+            preferIntegratedStream: false
+        ) {
+            return source
+        }
+
+        return nil
+    }
+
+    /// Returns an integrated preview stream and the headers required by its
+    /// originating YouTube client.
+    func resolvePreview(youtubeVideoId: String, title: String?, year: String?) async -> TrailerPlaybackSource? {
+        guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
+
+        if let cached = previewCache[youtubeVideoId], Date().timeIntervalSince(cached.date) < 1800 {
+            return cached.source
         }
 
         let youtubeUrl = "https://www.youtube.com/watch?v=\(youtubeVideoId)"
-        return await resolveWithBackend(youtubeUrl: youtubeUrl, title: title, year: year)
-    }
-
-    /// Returns a single URL that AVPlayer can render inside a Home card. Full
-    /// trailer playback prefers the highest-quality separate video/audio pair;
-    /// previews instead need an integrated HLS or progressive stream.
-    func resolvePreview(youtubeVideoId: String, title: String?, year: String?) async -> String? {
-        guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
+        if let source = await resolveWithBackend(
+            videoId: youtubeVideoId,
+            youtubeUrl: youtubeUrl,
+            title: title,
+            year: year
+        ) {
+            previewCache[youtubeVideoId] = (source, Date())
+            return source
+        }
 
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: false,
             preferIntegratedStream: true
         ) {
-            return source.videoUrl
+            previewCache[youtubeVideoId] = (source, Date())
+            return source
         }
 
+        guard !Task.isCancelled else { return nil }
         cachedConfig = nil
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: true,
             preferIntegratedStream: true
         ) {
-            return source.videoUrl
+            previewCache[youtubeVideoId] = (source, Date())
+            return source
         }
 
-        let youtubeUrl = "https://www.youtube.com/watch?v=\(youtubeVideoId)"
-        return await resolveWithBackend(youtubeUrl: youtubeUrl, title: title, year: year)?.videoUrl
+        return nil
     }
 
     private func resolveWithInnertube(
@@ -658,22 +715,28 @@ actor YouTubeTrailerResolver {
         forceRefreshConfig: Bool,
         preferIntegratedStream: Bool = false
     ) async -> TrailerPlaybackSource? {
-        guard let config = try? await watchConfig(forceRefresh: forceRefreshConfig) else { return nil }
+        guard !Task.isCancelled else { return nil }
+        probeResults.removeAll(keepingCapacity: true)
+        attemptStartedAt = Date()
+        guard let config = try? await watchConfig(forceRefresh: forceRefreshConfig),
+              canContinueAttempt else { return nil }
         var hlsCandidates: [HlsCandidate] = []
         var progressive: [StreamCandidate] = []
         var adaptiveVideo: [StreamCandidate] = []
         var adaptiveAudio: [StreamCandidate] = []
 
         for client in Self.clients {
-            if Task.isCancelled { return nil }
+            guard canContinueAttempt else { return nil }
             guard let playerResponse = try? await fetchPlayerResponse(
                 apiKey: config.apiKey,
                 videoId: videoId,
                 client: client,
                 visitorData: config.visitorData
             ) else {
+                guard canContinueAttempt else { return nil }
                 continue
             }
+            guard canContinueAttempt else { return nil }
 
             if let status = stringValue(mapValue(playerResponse, key: "playabilityStatus"), key: "status"),
                status != "OK" {
@@ -682,10 +745,20 @@ actor YouTubeTrailerResolver {
 
             guard let streamingData = mapValue(playerResponse, key: "streamingData") else { continue }
 
-            if let manifestUrl = stringValue(streamingData, key: "hlsManifestUrl"),
-               let candidate = try? await hlsCandidate(manifestUrl: manifestUrl, priority: client.priority) {
-                hlsCandidates.append(candidate)
+            if let manifestUrl = stringValue(streamingData, key: "hlsManifestUrl") {
+                do {
+                    let candidate = try await hlsCandidate(
+                        manifestUrl: manifestUrl,
+                        client: client,
+                        includeReferer: false
+                    )
+                    print("[TrailerResolver] HLS candidate found for \(client.key): \(candidate.height)p")
+                    hlsCandidates.append(candidate)
+                } catch {
+                    print("[TrailerResolver] HLS fetch failed for \(client.key): \(error)")
+                }
             }
+            guard canContinueAttempt else { return nil }
 
             for format in listMapValue(streamingData, key: "formats") {
                 guard let url = stringValue(format, key: "url") else { continue }
@@ -750,50 +823,145 @@ actor YouTubeTrailerResolver {
             }
         }
 
-        if preferIntegratedStream,
-           let progressiveUrl = progressive
-            // YouTube's `formats` entries are muxed video+audio. Their usual
-            // 360p rendition matches the 315pt Home preview and is substantially
-            // more reliable in AVPlayer than its demuxed HLS master.
-            .filter({ $0.height > 0 })
-            .sorted(by: sortStreamCandidates)
-            .first?.url {
-            return TrailerPlaybackSource(videoUrl: progressiveUrl, audioUrl: nil)
+        let sortedHLS = hlsCandidates.sorted(by: sortHlsCandidates)
+        let sortedAdaptiveVideo = adaptiveVideo.sorted(by: sortStreamCandidates)
+        let sortedAdaptiveAudio = adaptiveAudio.sorted(by: sortStreamCandidates)
+        let sortedProgressive = progressive.filter { $0.height > 0 }.sorted(by: sortStreamCandidates)
+
+        var summaryParts: [String] = []
+        let hlsDesc = sortedHLS.map { "\($0.clientKey):\($0.height)p" }.joined(separator: ", ")
+        if !hlsDesc.isEmpty { summaryParts.append("HLS[\(hlsDesc)]") }
+        let progDesc = sortedProgressive.map { "\($0.clientKey):\($0.height)p" }.joined(separator: ", ")
+        if !progDesc.isEmpty { summaryParts.append("Prog[\(progDesc)]") }
+        let adaptDesc = sortedAdaptiveVideo.prefix(6).map { "\($0.clientKey):\($0.height)p" }.joined(separator: ", ")
+        if !adaptDesc.isEmpty { summaryParts.append("Adaptive[\(adaptDesc)]") }
+        let availableSummary = summaryParts.joined(separator: " | ")
+        print("[TrailerResolver] Probed videoId=\(videoId): Available: \(availableSummary)")
+
+        let unthrottledAdaptiveVideo = sortedAdaptiveVideo.filter { $0.clientKey == "android_vr" }
+        let unthrottledAdaptiveAudio = sortedAdaptiveAudio.filter { $0.clientKey == "android_vr" }
+
+        // 1. Prioritize HD HLS master manifest (1080p / 720p).
+        // HLS contains video+audio natively, decoded by AetherEngine / AVPlayer in full 1080p HD with zero 403 errors.
+        if let bestHls = sortedHLS.first, bestHls.height >= 720 {
+            let label = "\(bestHls.height)p (HLS)"
+            let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected HD HLS: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: bestHls.manifestUrl,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestHls.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
         }
 
-        if preferIntegratedStream,
-           let hls = hlsCandidates
-            .filter({ $0.height >= Self.minimumHeight })
-            .sorted(by: sortHlsCandidates)
-            .first {
-            // Preserve the master so its alternate audio group remains linked.
-            return TrailerPlaybackSource(videoUrl: hls.manifestUrl, audioUrl: nil)
+        // 2. Check for HD progressive streams (1080p / 720p muxed MP4)
+        if let bestProg = await firstReachable(
+            sortedProgressive.filter { $0.height >= 720 },
+            includeReferer: false
+        ) {
+            let label = "\(bestProg.height)p (MP4)"
+            let diag = "TRAILER: \(label) [\(bestProg.clientKey)] | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected HD Progressive: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: bestProg.url,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestProg.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
         }
 
-        if let video = adaptiveVideo
-            .filter({ $0.height >= Self.minimumHeight })
-            .sorted(by: sortStreamCandidates)
-            .first {
-            let audio = adaptiveAudio
-                .filter { $0.clientKey == video.clientKey }
-                .sorted(by: sortStreamCandidates)
-                .first ?? adaptiveAudio.sorted(by: sortStreamCandidates).first
-            return TrailerPlaybackSource(videoUrl: video.url, audioUrl: audio?.url)
+        // 3. For full player: Check for 1080p+ unthrottled adaptive pair
+        if !preferIntegratedStream,
+           let pair = await firstReachableAdaptivePair(
+               videos: unthrottledAdaptiveVideo.filter { $0.height >= 1080 },
+               audios: unthrottledAdaptiveAudio,
+               includeReferer: false
+           ) {
+            let label = "\(pair.video.height)p (Adaptive)"
+            let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected 1080p+ Adaptive: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: pair.video.url,
+                audioUrl: pair.audio.url,
+                requestHeaders: requestHeaders(
+                    for: pair.video.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
         }
 
-        if let hls = hlsCandidates
-            .filter({ $0.height >= Self.minimumHeight })
-            .sorted(by: sortHlsCandidates)
-            .first {
-            return TrailerPlaybackSource(videoUrl: hls.selectedVariantUrl, audioUrl: nil)
+        // 4. For full player: Check for 720p unthrottled adaptive pair
+        if !preferIntegratedStream,
+           let pair = await firstReachableAdaptivePair(
+               videos: unthrottledAdaptiveVideo.filter { $0.height >= 720 },
+               audios: unthrottledAdaptiveAudio,
+               includeReferer: false
+           ) {
+            let label = "\(pair.video.height)p (Adaptive)"
+            let diag = "TRAILER: \(label) [\(pair.video.clientKey)] | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected 720p Adaptive: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: pair.video.url,
+                audioUrl: pair.audio.url,
+                requestHeaders: requestHeaders(
+                    for: pair.video.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
         }
 
-        let progressiveUrl = progressive
-            .filter { $0.height >= Self.minimumHeight }
-            .sorted(by: sortStreamCandidates)
-            .first?.url
-        guard let progressiveUrl else { return nil }
-        return TrailerPlaybackSource(videoUrl: progressiveUrl, audioUrl: nil)
+        // 5. Fall back to any HLS stream (often contains 1080p/720p variants)
+        if let bestHls = sortedHLS.first {
+            let label = "\(bestHls.height > 0 ? "\(bestHls.height)p" : "Adaptive") (HLS)"
+            let diag = "TRAILER: \(label) [\(bestHls.clientKey)] | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected Fallback HLS: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: bestHls.manifestUrl,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestHls.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
+        // 6. Fall back to standard progressive (e.g. 360p)
+        if let progressiveMatch = await firstReachable(
+            sortedProgressive,
+            includeReferer: false
+        ) {
+            let label = "\(progressiveMatch.height)p (MP4)"
+            let diag = "TRAILER: \(label) [\(progressiveMatch.clientKey)] fallback | Available: \(availableSummary)"
+            print("[TrailerResolver] Selected Progressive fallback: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: progressiveMatch.url,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: progressiveMatch.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
+        print("[TrailerResolver] No reachable stream candidate found for videoId=\(videoId)")
+        return nil
     }
 
     private func watchConfig(forceRefresh: Bool) async throws -> WatchConfig {
@@ -808,6 +976,8 @@ actor YouTubeTrailerResolver {
         }
 
         var request = URLRequest(url: url)
+        guard let timeout = requestTimeout(cap: 8) else { throw CancellationError() }
+        request.timeoutInterval = timeout
         addDefaultHeaders(to: &request)
 
         let (data, response) = try await session.data(for: request)
@@ -836,22 +1006,35 @@ actor YouTubeTrailerResolver {
             throw URLError(.badURL)
         }
 
+        let context = client.context
+        var requestContext: [String: Any] = ["client": context]
+        if client.key == "web_embedded_player" || client.key == "tv_embedded" {
+            requestContext["thirdParty"] = [
+                "embedUrl": "https://www.youtube.com/embed/\(videoId)"
+            ]
+        }
+
         let payload: [String: Any] = [
             "videoId": videoId,
             "contentCheckOk": true,
             "racyCheckOk": true,
-            "context": ["client": client.context],
+            "context": requestContext,
             "playbackContext": [
                 "contentPlaybackContext": ["html5Preference": "HTML5_PREF_WANTS"]
             ]
         ]
 
         var request = URLRequest(url: url)
+        guard let timeout = requestTimeout(cap: 8) else { throw CancellationError() }
+        request.timeoutInterval = timeout
         request.httpMethod = "POST"
         request.httpBody = try JSONSerialization.data(withJSONObject: payload)
         addDefaultHeaders(to: &request)
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("https://www.youtube.com", forHTTPHeaderField: "Origin")
+        if client.key == "web_embedded_player" || client.key == "tv_embedded" {
+            request.setValue("https://www.youtube.com/embed/\(videoId)", forHTTPHeaderField: "Referer")
+        }
         request.setValue(client.id, forHTTPHeaderField: "X-YouTube-Client-Name")
         request.setValue(client.version, forHTTPHeaderField: "X-YouTube-Client-Version")
         request.setValue(client.userAgent, forHTTPHeaderField: "User-Agent")
@@ -867,9 +1050,15 @@ actor YouTubeTrailerResolver {
         return (try JSONSerialization.jsonObject(with: data) as? [String: Any]) ?? [:]
     }
 
-    private func hlsCandidate(manifestUrl: String, priority: Int) async throws -> HlsCandidate {
+    private func hlsCandidate(
+        manifestUrl: String,
+        client: Client,
+        includeReferer: Bool
+    ) async throws -> HlsCandidate {
         guard let url = URL(string: manifestUrl) else { throw URLError(.badURL) }
         var request = URLRequest(url: url)
+        guard let timeout = requestTimeout(cap: 6) else { throw CancellationError() }
+        request.timeoutInterval = timeout
         addDefaultHeaders(to: &request)
 
         let (data, response) = try await session.data(for: request)
@@ -885,11 +1074,10 @@ actor YouTubeTrailerResolver {
 
         var best = HlsCandidate(
             manifestUrl: manifestUrl,
-            selectedVariantUrl: manifestUrl,
-            width: 0,
+            clientKey: client.key,
             height: 0,
             bandwidth: 0,
-            priority: priority
+            priority: client.priority
         )
         for index in lines.indices {
             let line = lines[index]
@@ -900,33 +1088,46 @@ actor YouTubeTrailerResolver {
             }
 
             let attrs = parseHlsAttributeList(line)
-            let (width, height) = parseResolution(attrs["RESOLUTION"] ?? "")
+            let (_, height) = parseResolution(attrs["RESOLUTION"] ?? "")
             let bandwidth = Int(attrs["BANDWIDTH"] ?? "") ?? 0
-            let variantUrl = absolutizeUrl(baseUrl: manifestUrl, maybeRelative: lines[index + 1])
 
             if height > best.height ||
-                (height == best.height && bandwidth > best.bandwidth) ||
-                (height == best.height && bandwidth == best.bandwidth && width > best.width) {
+                (height == best.height && bandwidth > best.bandwidth) {
                 best = HlsCandidate(
                     manifestUrl: manifestUrl,
-                    selectedVariantUrl: variantUrl,
-                    width: width,
+                    clientKey: client.key,
                     height: height,
                     bandwidth: bandwidth,
-                    priority: priority
+                    priority: client.priority
                 )
             }
+        }
+
+        if best.height == 0 && text.contains("#EXTM3U") {
+            best = HlsCandidate(
+                manifestUrl: manifestUrl,
+                clientKey: client.key,
+                height: 1080,
+                bandwidth: 5_000_000,
+                priority: client.priority
+            )
         }
 
         return best
     }
 
-    private func resolveWithBackend(youtubeUrl: String, title: String?, year: String?) async -> TrailerPlaybackSource? {
+    private func resolveWithBackend(
+        videoId: String,
+        youtubeUrl: String,
+        title: String?,
+        year: String?
+    ) async -> TrailerPlaybackSource? {
         guard let baseUrl = configuredBackendBaseURL() else { return nil }
         let endpoint = baseUrl.lastPathComponent == "trailer" ? baseUrl : baseUrl.appendingPathComponent("trailer")
         guard var components = URLComponents(url: endpoint, resolvingAgainstBaseURL: false) else { return nil }
 
         components.queryItems = [
+            URLQueryItem(name: "videoId", value: videoId),
             URLQueryItem(name: "youtube_url", value: youtubeUrl),
             URLQueryItem(name: "title", value: title),
             URLQueryItem(name: "year", value: year)
@@ -936,18 +1137,28 @@ actor YouTubeTrailerResolver {
 
         do {
             var request = URLRequest(url: url)
+            request.timeoutInterval = 6
             addDefaultHeaders(to: &request)
             let (data, response) = try await session.data(for: request)
             guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
                 return nil
             }
             let decoded = try JSONDecoder().decode(TrailerBackendResponse.self, from: data)
-            guard let resolved = decoded.url,
+            guard let resolved = decoded.effectiveUrl,
                   resolved.hasPrefix("http://") || resolved.hasPrefix("https://") else {
                 return nil
             }
-            return TrailerPlaybackSource(videoUrl: resolved, audioUrl: nil)
+            let label = decoded.quality ?? decoded.resolution ?? "1080p (Proxy)"
+            let diag = "TRAILER: \(label) [backend proxy]"
+            print("[TrailerResolver] Selected Backend proxy: \(diag)")
+            return TrailerPlaybackSource(
+                videoUrl: resolved,
+                audioUrl: nil,
+                qualityLabel: label,
+                diagnostics: diag
+            )
         } catch {
+            print("[TrailerResolver] Backend proxy resolution failed: \(error.localizedDescription)")
             return nil
         }
     }
@@ -969,6 +1180,154 @@ actor YouTubeTrailerResolver {
         request.setValue(Self.defaultUserAgent, forHTTPHeaderField: "User-Agent")
     }
 
+    private func requestHeaders(for clientKey: String, includeReferer: Bool) -> [String: String] {
+        guard let client = Self.clients.first(where: { $0.key == clientKey }) else {
+            return ["User-Agent": Self.defaultUserAgent]
+        }
+        var headers = ["User-Agent": client.userAgent]
+        if includeReferer {
+            headers["Referer"] = client.key == "web_embedded_player"
+                ? Self.embeddedPlayerOrigin
+                : "https://www.youtube.com/"
+        }
+        return headers
+    }
+
+    private func addStreamHeaders(
+        to request: inout URLRequest,
+        client: Client,
+        includeReferer: Bool
+    ) {
+        request.setValue(client.userAgent, forHTTPHeaderField: "User-Agent")
+        if includeReferer {
+            request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+            request.setValue(
+                client.key == "web_embedded_player"
+                    ? Self.embeddedPlayerOrigin
+                    : "https://www.youtube.com/",
+                forHTTPHeaderField: "Referer"
+            )
+        }
+    }
+
+    private func firstReachable(
+        _ candidates: [StreamCandidate],
+        includeReferer: Bool
+    ) async -> StreamCandidate? {
+        // Keep probing sequential and bounded: each candidate is an actual
+        // network request, and a signed URL can fail independently of its API
+        // response.
+        for candidate in candidates.prefix(8) {
+            guard canContinueAttempt else { return nil }
+            if await isReachable(
+                candidate.url,
+                clientKey: candidate.clientKey,
+                includeReferer: includeReferer
+            ) {
+                return candidate
+            }
+        }
+        return nil
+    }
+
+    private func firstReachableAdaptivePair(
+        videos: [StreamCandidate],
+        audios: [StreamCandidate],
+        includeReferer: Bool
+    ) async -> (video: StreamCandidate, audio: StreamCandidate)? {
+        var pairs: [(video: StreamCandidate, audio: StreamCandidate)] = []
+        for video in videos.prefix(8) {
+            guard canContinueAttempt else { return nil }
+            let sameClient = audios.filter { $0.clientKey == video.clientKey }
+            for audio in sameClient.prefix(3) {
+                pairs.append((video: video, audio: audio))
+            }
+        }
+
+        for pair in pairs.prefix(12) {
+            guard canContinueAttempt else { return nil }
+            guard await isReachable(
+                pair.video.url,
+                clientKey: pair.video.clientKey,
+                includeReferer: includeReferer
+            ) else {
+                continue
+            }
+            guard await isReachable(
+                pair.audio.url,
+                clientKey: pair.audio.clientKey,
+                includeReferer: includeReferer
+            ) else {
+                continue
+            }
+            return pair
+        }
+        return nil
+    }
+
+    private func isReachable(
+        _ streamUrl: String,
+        clientKey: String,
+        includeReferer: Bool
+    ) async -> Bool {
+        guard canContinueAttempt else { return false }
+        if let cached = probeResults[streamUrl] {
+            return cached
+        }
+        guard let url = URL(string: streamUrl),
+              let client = Self.clients.first(where: { $0.key == clientKey }) else {
+            probeResults[streamUrl] = false
+            return false
+        }
+
+        var request = URLRequest(url: url)
+        request.httpMethod = "GET"
+        guard let timeout = requestTimeout(cap: Self.probeTimeout) else { return false }
+        request.timeoutInterval = timeout
+        request.setValue("bytes=0-1023", forHTTPHeaderField: "Range")
+        addStreamHeaders(to: &request, client: client, includeReferer: includeReferer)
+        do {
+            let (bytes, response) = try await probeSession.bytes(for: request)
+            guard let http = response as? HTTPURLResponse,
+                  http.statusCode == 206,
+                  let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+                  contentRange.hasPrefix("bytes 0-") else {
+                probeResults[streamUrl] = false
+                return false
+            }
+            // Touch only the first bounded response chunk. `bytes(for:)`
+            // avoids buffering a server that ignores the requested range.
+            var iterator = bytes.makeAsyncIterator()
+            guard (try await iterator.next()) != nil, canContinueAttempt else {
+                probeResults[streamUrl] = false
+                return false
+            }
+            let reachable = true
+            probeResults[streamUrl] = reachable
+            return reachable
+        } catch {
+            probeResults[streamUrl] = false
+            return false
+        }
+    }
+
+    private var attemptBudgetExceeded: Bool {
+        guard let attemptStartedAt else { return false }
+        return Date().timeIntervalSince(attemptStartedAt) >= Self.attemptBudget
+    }
+
+    private var canContinueAttempt: Bool {
+        !Task.isCancelled && !attemptBudgetExceeded
+    }
+
+    private func requestTimeout(cap: TimeInterval) -> TimeInterval? {
+        guard canContinueAttempt else { return nil }
+        guard let attemptStartedAt else { return cap }
+        let remaining = Self.attemptBudget - Date().timeIntervalSince(attemptStartedAt)
+        guard remaining > 0 else { return nil }
+        return min(cap, remaining)
+    }
+
     private func sortHlsCandidates(_ lhs: HlsCandidate, _ rhs: HlsCandidate) -> Bool {
         if lhs.height != rhs.height { return lhs.height > rhs.height }
         if lhs.bandwidth != rhs.bandwidth { return lhs.bandwidth > rhs.bandwidth }
@@ -976,6 +1335,10 @@ actor YouTubeTrailerResolver {
     }
 
     private func sortStreamCandidates(_ lhs: StreamCandidate, _ rhs: StreamCandidate) -> Bool {
+        let lhsTier = lhs.height >= 1080 ? (lhs.height >= 2160 ? 2160 : (lhs.height >= 1440 ? 1440 : 1080)) : lhs.height
+        let rhsTier = rhs.height >= 1080 ? (rhs.height >= 2160 ? 2160 : (rhs.height >= 1440 ? 1440 : 1080)) : rhs.height
+        if lhsTier != rhsTier { return lhsTier > rhsTier }
+        if lhs.priority != rhs.priority { return lhs.priority < rhs.priority }
         if lhs.score != rhs.score { return lhs.score > rhs.score }
         if lhs.hasN != rhs.hasN { return !lhs.hasN }
         if containerPreference(lhs.ext) != containerPreference(rhs.ext) {
@@ -1058,14 +1421,6 @@ actor YouTubeTrailerResolver {
         let parts = raw.split(separator: "x", maxSplits: 1)
         guard parts.count == 2 else { return (0, 0) }
         return (Int(parts[0]) ?? 0, Int(parts[1]) ?? 0)
-    }
-
-    private func absolutizeUrl(baseUrl: String, maybeRelative: String) -> String {
-        guard let base = URL(string: baseUrl),
-              let resolved = URL(string: maybeRelative, relativeTo: base)?.absoluteURL else {
-            return maybeRelative
-        }
-        return resolved.absoluteString
     }
 
     private func mapValue(_ dictionary: [String: Any]?, key: String) -> [String: Any]? {
@@ -3912,7 +4267,7 @@ private struct TvStreamPickerOverlay: View {
 
     /// Filter by stable add-on id (not display name).
     @State private var selectedAddonId: String?
-    @State private var sortOption: StreamSortOption = .default
+    @AppStorage(SettingsKey.streamSortOption) private var sortOption: StreamSortOption = .quality
     @State private var showSortOptions = false
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnly = false
     /// Cached filter+sort result. Rebuilt only when derivation inputs change —
@@ -4171,7 +4526,7 @@ private struct TvStreamPickerOverlay: View {
             // the add-on scroller.
             TvStreamFilterButton(
                 title: "Sort: \(sortOption.rawValue)",
-                isSelected: sortOption != .default,
+                isSelected: sortOption != .quality,
                 focusBinding: $focusedItem,
                 focusValue: sortKey,
                 action: { showSortOptions = true }

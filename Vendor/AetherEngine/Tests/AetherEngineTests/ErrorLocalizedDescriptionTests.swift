@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// AE#283: the load path publishes its terminal state as `state = .error("Failed to load: \(error.localizedDescription)")`
@@ -96,7 +97,7 @@ struct ErrorLocalizedDescriptionTests {
         HLSLocalServerError.bind(errno: 48),
         HLSSegmentProducer.ProducerError.writeHeaderFailed(code: -22),
         MP4SegmentMuxer.MuxerError.openStagingFileFailed(errno: 2),
-        AudioBridge.AudioBridgeError.encoderNotFound,
+        AudioBridge.AudioBridgeError.encoderNotFound(codecID: AV_CODEC_ID_EAC3),
         DemuxerError.openFailed(code: FFmpegErr.invalidData),
         DemuxerError.streamInfoFailed(code: FFmpegErr.eof),
         DiscError.directoryNotFound("VIDEO_TS"),

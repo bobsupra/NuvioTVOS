@@ -484,6 +484,15 @@ extension AetherEngine {
             .contains(where: { c.contains($0) })
     }
 
+    /// True when the codec is DVB Teletext, the only subtitle codec whose decode depends on a page
+    /// number (`txt_page`, see `EmbeddedSubtitleDecoder.decoderOptions`). Both spellings the track
+    /// list can carry are covered: the libzvbi DECODER name (`libzvbi_teletextdec`) when FFmpeg was
+    /// built with it, and the descriptor name (`dvb_teletext`) when it was not. Matched by substring
+    /// for the same reason `isBitmapSubtitleCodec` is (#364).
+    nonisolated static func isTeletextSubtitleCodec(_ codec: String) -> Bool {
+        codec.lowercased().contains("teletext")
+    }
+
     /// True when the codec is an in-band CEA-608/708 caption track (`eia_608` / QuickTime `c608`). These
     /// have no FFmpeg decoder, so they bypass the side-demuxer `EmbeddedSubtitleDecoder` and are served by
     /// the producer CC tap, which parses their `cc_data` directly. (#77)

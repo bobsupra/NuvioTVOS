@@ -46,19 +46,21 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3** is the latest tvOS release.
+**Beta 3.3.1** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3/NuvioTV-3.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.1/NuvioTV-3.3.1-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.1) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
+
+> 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting Nuvio and helping us reach 100+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3
+### New in Beta 3.3.1
 
-- Introduces **Cloud Library** to browse, index, search, and stream remote cloud storage and debrid torrent downloads directly within Nuvio TV.
-- Adds native Apple TV **Picture in Picture (PiP)** support for Aether playback with dynamic surface rebinding and background continuation.
-- Overhauls the **Library** view with new filtering tabs, customizable sorting, and refined responsive poster grids.
-- Upgrades player side panels with live audio delay, subtitle timing offsets, audio boost, and enhanced subtitle styling.
+- Updates **AetherEngine** to **6.34.0** and **FFmpegBuild** to **2.4.3** with hardened Dolby Vision RPU conversion, startup progress reporting, and MPVKit coexistence.
+- Expands the **Details screen** with trailer playback, interactive cast/crew lists, studio navigation, and high-DPI backdrop transitions.
+- Refines player controls with live subtitle timing adjustments, audio delay sliders, and audio boost controls.
+- Improves stream source selection, cached-only badges, and smart binge auto-play source retention.
 
 ### The new player
 

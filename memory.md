@@ -543,3 +543,253 @@ Navigating vertically between catalog rows on Home (e.g. between "Popular - Seri
   - `TVCollectionFolderRow` (`Equatable` conformance).
 - `tvosApp/NuvioTV/Sources/Models/CatalogModels.swift`
   - `NuvioMeta` (`Equatable`, `Hashable` conformances).
+
+## AetherEngine and FFmpegBuild vendor upgrade runbook
+
+Last verified: 2026-08-23 while upgrading AetherEngine 6.21.0 to 6.34.0 and
+FFmpegBuild 2.4.2 to 2.4.3.
+
+This repository does **not** consume stock AetherEngine and FFmpegBuild. It
+ships locally patched copies under `Vendor/` so AetherEngine's FFmpeg dynamic
+frameworks can coexist with MPVKit's frameworks in one app. A version-number
+edit or wholesale replacement of either directory is therefore incorrect.
+
+### Non-negotiable invariants
+
+- `Vendor/AetherEngine` is a three-way rebase, not a fresh copy. Preserve the
+  complete Nuvio delta unless the new upstream version contains an equivalent
+  fix and that equivalence is verified.
+- The `AetherEngine` library product remains static and its FFmpeg dependency
+  remains `.package(path: "../FFmpegBuild")`.
+- Every AetherEngine Swift import of an FFmpeg module remains namespaced as
+  `AetherLib*`. There must be no bare `import Libavcodec`, `Libavformat`, etc.
+- Keep the local SMB surface, including `SMBAuth.swift`, `SMBBrowser.swift`,
+  `SMBAuthTests.swift`, and the Nuvio changes in `SMBConnection.swift`.
+- Keep the Nuvio host APIs used by
+  `tvosApp/NuvioTV/Sources/Core/Player/AetherPlaybackController.swift`, notably
+  `effectiveVideoFormat` and `displayDebugLines`, unless the app is deliberately
+  migrated to an upstream replacement in the same change.
+- Preserve the AI subtitle translation flow, subtitle cue identity/timing,
+  SMB playback, MPV fallback, and Nuvio's external-subtitle registration.
+- Preserve `Vendor/namespace_ffmpegbuild.py` and
+  `tvosApp/Scripts/thin_aether_simulator_frameworks.sh`. The first rewrites
+  framework/module identities and removes stale upstream signatures; the
+  second thins and signs the embedded simulator frameworks.
+- Do not commit, push, or overwrite unrelated working-tree changes unless the
+  user explicitly requests it. The nested/untracked `MPVKit` status is commonly
+  pre-existing and must not be disturbed.
+
+### 1. Preflight and version discovery
+
+1. Record `git status --short`. Stop if relevant Vendor or player files already
+   contain unexplained user edits.
+2. Read `Vendor/README.md`, `Vendor/COEXISTENCE.md`, both vendored
+   `Package.swift` files, and `Vendor/namespace_ffmpegbuild.py`.
+3. Get the current AetherEngine and FFmpegBuild base tags from `Vendor/README.md`.
+4. Verify the requested AetherEngine tag exists upstream. Read that tag's
+   `Package.swift` and use the FFmpegBuild version it declares; never guess that
+   the two packages share a version or that `latest` is compatible.
+5. Clone the current and target tags into a directory created with `mktemp -d`.
+   Keep every experimental merge outside the repository until it is resolved.
+6. Compare upstream current-tag to target-tag changes and current-tag to the
+   local Vendor tree. This separates new upstream work from Nuvio's patches.
+
+Useful read-only checks:
+
+```sh
+git status --short
+rg -n "AetherEngine|FFmpegBuild|AetherLib|6\\.|2\\.4" \
+  Vendor/README.md Vendor/COEXISTENCE.md \
+  Vendor/AetherEngine/Package.swift Vendor/FFmpegBuild/Package.swift
+git log --oneline --max-count=12 -- Vendor/AetherEngine Vendor/FFmpegBuild
+```
+
+### 2. Rebase AetherEngine with a real three-way merge
+
+Use the old upstream AetherEngine tag as the merge base. A reliable temporary
+workflow is:
+
+1. Make a full temporary clone of upstream AetherEngine and create a branch at
+   the old tag.
+2. Overlay the current `Vendor/AetherEngine` tree onto that branch, excluding
+   `.git`, `.build`, and `.swiftpm`.
+3. In the temporary branch only, mechanically normalize `AetherLib*` imports
+   back to upstream `Lib*`. Do not normalize the real Vendor tree.
+4. Commit that reconstructed Nuvio delta in the temporary clone.
+5. Merge the new upstream tag into the temporary branch. Resolve conflicts by
+   retaining both the new upstream behavior and the Nuvio delta. Do not resolve
+   every conflict with blanket `ours` or `theirs`.
+6. Compare every manual resolution with all three versions: old upstream,
+   Nuvio-local, and new upstream. Pay special attention to loading, subtitles,
+   audio, demuxing, video routing, Dolby Vision, display criteria, diagnostics,
+   and `Package.swift`.
+7. Reapply `AetherLib*` imports to the resolved temporary tree. Use a targeted
+   import rewrite; do not globally replace prose or unrelated identifiers.
+8. Enforce the static `AetherEngine` product and local `../FFmpegBuild` path
+   dependency. Retain the SMBClient and LibDovi constraints required by the
+   target release.
+9. Synchronize the resolved tree into `Vendor/AetherEngine`, excluding the
+   temporary `.git` directory and local build caches. Include upstream-deleted
+   files as deletions and upstream-added files as additions. Inspect the exact
+   target before using any `--delete` operation.
+
+The local-only SMB files can be absent from the new upstream tag; absence is
+not permission to delete them. Newly added upstream files may appear as `??`
+in `git status` until committed. They are part of the upgrade and must not be
+forgotten in review or handoff.
+
+### 3. Dolby Vision and packet-framing safeguards
+
+Future rebases must retain these Nuvio fixes unless upstream demonstrably
+contains equivalent behavior and tests:
+
+- `DoviRpuConverter` preserves Annex-B framing and 1-, 2-, 3-, or 4-byte HEVC
+  length-prefix widths while converting Profile 7 packets to Profile 8.1.
+- A failed or oversized converted RPU degrades to a clean base-layer packet; it
+  must never leave a Profile 7 RPU in a track whose container is advertised as
+  Profile 8.1.
+- `doviConvertProbe` must not trust codec extradata blindly. Annex-B config can
+  accompany length-prefixed packets and the reverse can occur after remuxing.
+- One packet is insufficient to disambiguate framing. For example, a valid
+  four-byte length prefix `00 00 01 03` also looks like a three-byte Annex-B
+  start code, while a genuine Annex-B packet can synthetically close as a
+  length-prefixed walk. Resolve framing from multiple packets, ignore ambiguous
+  samples, use consistent unambiguous evidence, and fall back to configured
+  framing only when the sample set is inconclusive.
+- The probe buffers its small framing sample and then processes/frees every
+  packet exactly once. It does not seek, so forward-only inputs remain valid.
+- Keep both ambiguity-direction regressions in
+  `DoviRpuConverterTests.swift`.
+
+Do not “fix” an ambiguity by merely trying Annex-B first or length-prefixed
+first; either ordering corrupts the opposite valid case.
+
+### 4. Refresh FFmpegBuild without losing the fork
+
+1. Inspect the upstream old-tag to target-tag diff for all text, tests, build
+   flags, and binary frameworks.
+2. Three-way merge textual files where Nuvio has changes. In particular, do
+   not replace `build.sh` wholesale: preserve the local FFmpeg patches,
+   dynamic-framework packaging/signing behavior, GPL exclusions, and any
+   prior decoder/subtitle fixes while incorporating the target release's new
+   flags.
+3. Preserve the local `Package.swift` products and binary targets named
+   `AetherLib*`.
+4. Stage the target FFmpegBuild tag's original `Sources/Lib*.xcframework`
+   directories in `Vendor/FFmpegBuild/Sources`.
+5. Run `python3 Vendor/namespace_ffmpegbuild.py` once the original framework
+   names are present. It creates `AetherLib*.xcframework`, rewrites Mach-O IDs
+   and dependencies, bundle identifiers, module maps, and cross-framework
+   header imports, removes stale signatures, and removes the original `Lib*`
+   directories.
+6. If upstream adds or removes a framework, update the script's `LIBS` list,
+   FFmpegBuild products/targets, embed/thinning logic, and coexistence docs as
+   one change. Do not assume the historic nine-library list is permanent.
+7. Inspect `Vendor/__pycache__` after running the script. Do not include a
+   generated `.pyc` change in the upgrade.
+
+All framework slices should be refreshed from the target tag even when some
+support-library binaries happen to remain byte-identical. The package metadata
+and reproducible source must still describe one coherent release.
+
+### 5. Reconcile the app and documentation
+
+Compile errors caused by a new Aether API should normally be adapted in
+`AetherPlaybackController.swift`. Before deleting a local engine API, search
+the entire app and confirm whether Nuvio relies on it.
+
+Check at least:
+
+- load options, custom SMB readers, resume positions, request headers, external
+  subtitles, audio/subtitle selection, engine state and clock observation;
+- `AISubtitleTranslationState`, cue normalization, translation-cache resets,
+  and `PlayerSubtitleOverlay` timing;
+- playback diagnostics and `displayDebugLines`;
+- `thin_aether_simulator_frameworks.sh` and the Aether/MPV fallback policy.
+
+Update every current-version label:
+
+- `Vendor/README.md`
+- `Vendor/COEXISTENCE.md`
+- both vendored `Package.swift` header comments
+- the playback license entries in
+  `tvosApp/NuvioTV/Sources/UI/Settings/SettingsView.swift`
+
+Historical release notes, changelog entries, and comments describing an old
+bug/fix may legitimately retain old version numbers. Do not rewrite history.
+Run the upstream public-API documentation test; if a preserved Nuvio public API
+is missing from the new `docs/api.md`, document it rather than hiding it from
+the test.
+
+### 6. Required validation gates
+
+Package and source integrity:
+
+```sh
+swift package dump-package --package-path Vendor/FFmpegBuild
+swift package dump-package --package-path Vendor/AetherEngine
+rg -n '^import Lib' Vendor/AetherEngine Vendor/FFmpegBuild
+rg -n '^(<<<<<<< .+|=======|>>>>>>> .+)$' Vendor/AetherEngine Vendor/FFmpegBuild
+git diff --check
+```
+
+The two `rg` searches must return no matches.
+
+Framework integrity:
+
+```sh
+find Vendor/FFmpegBuild/Sources -maxdepth 1 -type d -name 'Lib*.xcframework'
+find Vendor/FFmpegBuild/Sources -maxdepth 1 -type d -name 'AetherLib*.xcframework'
+find Vendor/FFmpegBuild/Sources -name Info.plist -exec plutil -lint {} +
+```
+
+- No original `Lib*.xcframework` should remain.
+- The expected complete `AetherLib*.xcframework` set must exist.
+- Inspect representative device and simulator binaries with `file`, `lipo
+  -info`, and `otool -L`. Dependencies must point to
+  `@rpath/AetherLib*.framework/AetherLib*`, never the unprefixed frameworks.
+- Vendored rewritten binaries should not retain upstream `_CodeSignature`
+  directories. The app build supplies the final signature.
+
+Tests and app build:
+
+```sh
+swift test --package-path Vendor/AetherEngine
+xcodebuild build -workspace tvosApp/NuvioTV.xcworkspace \
+  -scheme NuvioTV \
+  -destination 'generic/platform=tvOS Simulator' \
+  CODE_SIGNING_ALLOWED=NO
+```
+
+Also run focused tests for every manual conflict resolution, especially
+`DoviRpuConverterTests`, `VideoConfigRecordFramingTests`, SMB tests, subtitle
+tests, and `PublicAPIDocumentationTests`.
+
+`swift test --package-path Vendor/FFmpegBuild` may compile but fail at runtime
+on macOS because standalone SwiftPM does not automatically locate the vendored
+dynamic frameworks. Do not call that a passing test. Record the loader failure,
+then rely on the package dump, binary audits, Aether tests, and the tvOS app
+build for integration evidence.
+
+The simulator build is not the final playback gate. Before release, validate
+on a physical Apple TV:
+
+1. Debug and Release/archive builds.
+2. Aether playback, external subtitles, AI translation, SMB, and MPV fallback.
+3. Aether to MPV to Aether switching for multiple cycles.
+4. Stereo, 5.1, and Atmos routes; Dolby Vision/HDR where hardware permits.
+5. Embedded framework `otool -L`, architecture, and `codesign` results.
+
+### 7. Completion checklist
+
+An agent may report the upgrade complete only when:
+
+- the three-way Aether merge and FFmpeg refresh are present in the working tree;
+- local SMB, signing, namespace, translation, diagnostics, and fallback
+  behavior are accounted for;
+- no merge markers, bare FFmpeg imports, stale current-version labels, or
+  generated cache artifacts remain;
+- the full Aether test suite and tvOS simulator build pass;
+- all review findings have been fixed and re-reviewed;
+- remaining device-only or loader-only limitations are stated explicitly; and
+- the agent clearly says whether changes were committed or pushed.

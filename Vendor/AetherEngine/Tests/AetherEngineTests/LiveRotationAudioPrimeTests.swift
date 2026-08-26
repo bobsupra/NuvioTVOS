@@ -84,10 +84,15 @@ struct LiveRotationAudioPrimeTests {
             guard audioIdx >= 0, let stream = audioDemuxer.stream(at: audioIdx) else {
                 throw RigError.noStream
             }
+            // AE#395: `.surroundCompat` resolves to FLAC for a stereo source, and FLAC's dfLa box is
+            // built from extradata at init, so it never reaches the deferred-sample-entry shape this
+            // suite is about. The subject here is the EAC3 dec3 prime, so the encoder is forced rather
+            // than inferred; a surround fixture would test the same thing at three times the PCM.
             let bridge = try AudioBridge(
                 srcCodecpar: stream.pointee.codecpar,
                 srcTimeBase: stream.pointee.time_base,
-                mode: .surroundCompat
+                mode: .surroundCompat,
+                forcedEncoder: AV_CODEC_ID_EAC3
             )
             self.bridge = bridge
             while let packet = try audioDemuxer.readPacket() {

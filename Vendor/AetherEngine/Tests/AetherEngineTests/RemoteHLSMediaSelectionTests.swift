@@ -18,7 +18,9 @@ struct RemoteHLSMediaSelectionTests {
             failure: AVIOReaderError.hlsPlaylistOnVODPath, isCustomSource: false))
     }
 
-    @Test("Live raw-path misroute keeps the AE#140 fail-closed behavior")
+    // AE#363: the live misroute has its own destination (the live ingest, `shouldRouteLiveOntoIngest`);
+    // what this pins is that it never takes the VOD side's route onto the AVPlayer bypass.
+    @Test("Live raw-path misroute never takes the native-bypass reroute")
     func noRerouteOnRawLiveMisroute() {
         #expect(!RemoteHLSMediaSelection.shouldReroute(
             failure: AVIOReaderError.hlsPlaylistOnRawLivePath, isCustomSource: false))

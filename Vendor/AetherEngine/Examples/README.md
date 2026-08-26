@@ -1,13 +1,14 @@
 # Examples
 
-Two complementary samples covering different audiences:
+Three samples covering different audiences:
 
 - **MinimalPlayer**: source-only SwiftUI drop-in for **developers** integrating AetherEngine into their own apps. Read the file, paste it into your Xcode project, change the URL.
+- **LiveHost**: the live-TV half that MinimalPlayer leaves out, the four contracts a channel needs and none of which is a compile error when it is missing.
 - **DemoPlayerMac**: standalone macOS SwiftPM app for **testers** wanting to exercise the engine against their own media without writing host code. `swift run` opens a window; drop a file on it to play.
 
 ## MinimalPlayer
 
-[`MinimalPlayer/MinimalPlayerApp.swift`](MinimalPlayer/MinimalPlayerApp.swift) is a complete SwiftUI app entry point that loads, plays, and reports state for a single source URL. About 90 lines including comments and UI state plumbing.
+[`MinimalPlayer/MinimalPlayerApp.swift`](MinimalPlayer/MinimalPlayerApp.swift) is a complete SwiftUI app entry point that loads, plays, and reports state for a single source URL, comments and UI state plumbing included.
 
 ### Try it in 5 minutes
 
@@ -17,7 +18,7 @@ Two complementary samples covering different audiences:
    ```
    https://github.com/superuser404notfound/AetherEngine
    ```
-   Dependency Rule: Up to Next Major Version, starting from `6.21.0`. Add the `AetherEngine` library product to your app target.
+   Dependency Rule: Up to Next Major Version, starting from `6.34.0`. Add the `AetherEngine` library product to your app target.
 
 3. **Drop the file in.** Replace the Xcode template's default `App.swift` (or whatever the generated `@main` file is called) with the contents of [`MinimalPlayerApp.swift`](MinimalPlayer/MinimalPlayerApp.swift). The file is self-contained: it defines both the `@main App` struct and the `ContentView`.
 
@@ -40,7 +41,20 @@ To stay readable the sample omits things real apps care about:
 - **HDR / Dolby Vision routing on tvOS.** Requires the engine-driven sole-writer pattern (see README › Host setup on tvOS). The minimal sample relies on default routing; for production tvOS hosts on HDR content, set `appliesPreferredDisplayCriteriaAutomatically = false` on your `AVPlayerViewController` and pass `LoadOptions(matchContentEnabled:, panelIsInHDRMode:)` populated from the runtime EDR state.
 - **Now Playing / lock-screen integration.** Subscribe to `engine.$currentAVPlayer` and feed it to `MPNowPlayingSession`. See `Sodalite` for a reference implementation.
 
-For all of these, read the inline docstrings on `AetherEngine`, `LoadOptions`, and `TrackInfo` in `Sources/AetherEngine/`. They're the canonical contract.
+For all of these, read [docs/api.md](../docs/api.md), the full public surface with the contracts spelled out, or the inline docstrings on `AetherEngine`, `LoadOptions`, and `TrackInfo` in `Sources/AetherEngine/`.
+
+## LiveHost
+
+[`LiveHost/LiveChannelHost.swift`](LiveHost/LiveChannelHost.swift) is the part of a live integration that no compiler will ask you about. Every piece in it exists because a shipping host got it wrong first:
+
+1. **`liveSourceReset`.** The engine parked a session it cannot revive and is asking for a fresh `load`. Unsubscribed, the channel stops while the engine still reports a session, which from the outside is a freeze with nothing in the log.
+2. **The retune needs its own guard.** Routing the answer into the manual channel-change path is the right shape, but that path carries no spacing rule, because a human paces it. Driven by the engine it loops on a dead upstream. One retune in flight, a minimum spacing, a bounded count, and then the exhausted case surfaced rather than swallowed.
+3. **`CancellationError` out of `load()` is not a failure.** It is what a superseded load throws, so every zap produces one.
+4. **The audio tap ends with its session**, including on a session-preserving reload, so a consumer re-installs on stream end.
+
+Copy the shape, not the numbers. It is a skeleton rather than an app: the UI surfaces are stubs for yours.
+
+Both loose samples are compiled by the package's `ExampleSources` target, so `swift build` and CI fail when one stops matching the API. They are never a product, so nothing reaches a consumer's build.
 
 ## DemoPlayerMac
 

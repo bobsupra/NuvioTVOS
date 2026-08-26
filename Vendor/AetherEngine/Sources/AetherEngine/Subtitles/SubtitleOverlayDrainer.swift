@@ -8,6 +8,10 @@ import Foundation
 struct SubtitleDrainCursor: Sendable {
     /// Source PTS (seconds) of the last packet handed to the decoder.
     var lastDecodedPts: Double
+    /// #362: harvest sequence of that packet, 0 when the cursor sits on a window boundary rather
+    /// than on a packet. What the next tick compares its first entry against, to see whether the
+    /// two were read by the same run or whether a hole opened right at the cursor.
+    var lastDecodedSequence: UInt64 = 0
     /// Playhead at the previous tick; a jump beyond the threshold means the user
     /// seeked (or the producer re-anchored) and the decoder must be rebuilt.
     var lastPlayhead: Double
@@ -20,6 +24,13 @@ struct SubtitleDrainCursor: Sendable {
     /// cleared by `stopSubtitleDrainer` and by every track switch, and those are the same points
     /// that empty the channel's cue array.
     var retained: SubtitleResolutionStatement.Retention? = nil
+    /// #362: the near side of a hole in the stored window this tick stopped at, the harvest
+    /// sequence there, and the ticks it may still stop there. Anchored on a position rather than a
+    /// flag, so a hole that fills in stages starts a fresh budget at each new boundary instead of
+    /// inheriting a spent one.
+    var harvestGapAt: Double? = nil
+    var harvestGapSequence: UInt64 = 0
+    var harvestGapTicksLeft: Int = 0
 }
 
 enum SubtitleDrainPlan: Equatable, Sendable {
@@ -81,6 +92,66 @@ enum SubtitleOverlayDrainer {
         var end = cap
         while end < count, ptsAt(end) == boundary { end += 1 }
         return end
+    }
+
+    /// #362: where a tick has to stop because the stored window has a hole the harvest is still
+    /// filling, rather than a stretch the author left empty. Returns how many entries may decode,
+    /// the position the hold is anchored on and the harvest sequence there, or nil when the window
+    /// reads as one run.
+    ///
+    /// After a seek the pump restarts behind the landing and fills forward while the store still
+    /// holds an island the previous run harvested further ahead, so the window reads as "packets,
+    /// hole, packets". Decoding straight across it advances the cursor to the far side, and the
+    /// cursor only ever moves forward: the hole's packets land a second later and are never read,
+    /// leaving a stretch of the film with no subtitles at all until some later seek resets the
+    /// window behind it (report: eleven authored sets between 2966.6 s and 2988.5 s delivered as
+    /// two).
+    ///
+    /// The size of the gap cannot tell the two apart, and a threshold on it is actively harmful: a
+    /// PGS set is separated from its own clear by its display duration, so a 3 s rule stopped the
+    /// tick at every authored line and delivery fell to a sixth of the sets in a fixture run.
+    /// **Harvest ORDER tells them apart.** A run reads a stream forwards, so its entries carry
+    /// ascending PTS and ascending sequence; where a PTS-ascending pair's sequence descends, the
+    /// far side was written by an EARLIER run, which means the run that wrote the near side has not
+    /// reached the far side yet and the span between them is unread. An authored silence looks
+    /// contiguous in sequence and never stops anything, however long it is.
+    ///
+    /// Stopping at the near side costs nothing visible: the drain runs a 60 s lead ahead of the
+    /// playhead, a hole is only honoured at or after the playhead (`notBefore`), so the landing
+    /// region always decodes whole, and the caller crosses the hole anyway once its tick budget is
+    /// spent. What it does change is the cursor's claim: a tick that stopped at a hole no longer
+    /// reports determination past it, which is the honest reading and the one #250 asks for.
+    ///
+    /// `resumeFrom` is the packet the cursor sits on, i.e. the last one a steady tick decoded, and
+    /// it is not optional detail: a hole that opens right at the cursor leaves a window holding
+    /// nothing but the island, so there is no pair inside it to compare and the tick would decode
+    /// the island and carry the cursor past the hole. That is the reported shape exactly (a set at
+    /// 280 s closed at 295 s, the four packets between them never read). Pass nil on a reset, whose
+    /// window starts at a backscan boundary rather than at something that was read.
+    static func harvestGapCut(count: Int, ptsAt: (Int) -> Double,
+                              sequenceAt: (Int) -> UInt64,
+                              resumeFrom: (pts: Double, sequence: UInt64)?,
+                              notBefore: Double) -> (index: Int, at: Double, sequence: UInt64)? {
+        guard count > 0 else { return nil }
+        var previous = resumeFrom
+        for index in 0..<count {
+            if let previous, previous.sequence > 0, sequenceAt(index) < previous.sequence,
+               previous.pts >= notBefore {
+                return (index, previous.pts, previous.sequence)
+            }
+            previous = (ptsAt(index), sequenceAt(index))
+        }
+        return nil
+    }
+
+    /// #362: whether a tick holding at a hole may resume. The window it now sees starts past the
+    /// hold position, so the near side is no longer in it and the pair that revealed the hole
+    /// cannot be re-formed; what answers instead is the first entry's provenance. A sequence newer
+    /// than the one held at means the filling run has reached this position and everything from
+    /// the hold to here is read; an older one is still the island on the far side of the hole.
+    static func harvestGapHoldResumes(firstSequence: UInt64?, heldSequence: UInt64) -> Bool {
+        guard let firstSequence else { return false }
+        return firstSequence > heldSequence
     }
 
     /// Whether a reconstruction pass should be finalized after its drain window has decoded.
