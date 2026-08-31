@@ -1,4 +1,5 @@
 import XCTest
+import AVFoundation
 import AetherLibavcodec
 @testable import AetherEngine
 
@@ -190,5 +191,41 @@ final class DocumentedConstantsTests: XCTestCase {
         let docs = try documentation()
         XCTAssertEqual(AetherEngine.externalSubtitleTrackIDBase, 100_000)
         assertDocumented("`100_000`", docs)
+    }
+
+    // MARK: - Rate pitch correction (#434)
+
+    /// Not a number, the same failure one step over: `setRate` documented the software path as playing
+    /// speed without pitch correction, and it never did. Both surfaces were running AVFoundation's
+    /// TimeDomain default, so the sentence read perfectly and described nothing in the build. A reporter
+    /// came within one step of gating a group-playback speed feature on decode route because of it.
+    /// The algorithm is pinned now, and this holds the three places that say so to what the code does.
+    func testRateChangesArePitchPreservingOnBothPaths() throws {
+        XCTAssertEqual(AudioRatePolicy.pitchAlgorithm, .timeDomain,
+                       "documented as TimeDomain; Varispeed is the one that lets pitch ride the rate")
+
+        // The software path, which is the surface the documentation was wrong about.
+        XCTAssertEqual(AudioOutput().renderer.audioTimePitchAlgorithm, AudioRatePolicy.pitchAlgorithm,
+                       "the SW renderer is what the synchronizer's timebase rate runs through")
+
+        // The native path, both hosts of it, via the call they share.
+        let item = AVPlayerItem(url: URL(fileURLWithPath: "/dev/null"))
+        AudioRatePolicy.apply(to: item)
+        XCTAssertEqual(item.audioTimePitchAlgorithm, AudioRatePolicy.pitchAlgorithm)
+
+        assertDocumented("Pitch-preserving on both decode routes", try documentation())
+
+        // The docstring an adopter reads in Xcode is where this drifted, so it gets pinned too.
+        let engineSource = try sourceFile("Sources/AetherEngine/AetherEngine.swift")
+        XCTAssertTrue(engineSource.contains("Both paths are pitch-preserving"),
+                      "setRate's own documentation must keep saying which paths correct pitch")
+    }
+
+    /// The docs corpus is README + docs/; a claim living in a source docstring is read straight.
+    private func sourceFile(_ relativePath: String) throws -> String {
+        guard let text = try? String(contentsOf: Self.repoRoot.appendingPathComponent(relativePath),
+                                     encoding: .utf8)
+        else { throw XCTSkip("running outside a source checkout; no sources to check against") }
+        return text
     }
 }

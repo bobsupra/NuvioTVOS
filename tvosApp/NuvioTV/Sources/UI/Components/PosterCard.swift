@@ -843,7 +843,7 @@ extension PosterCard: Equatable {
 }
 
 #if os(tvOS)
-private final class TrailerPlayerLayerView: UIView {
+final class TrailerPlayerLayerView: UIView {
     var playerLayer: AVPlayerLayer {
         layer as! AVPlayerLayer
     }
@@ -865,7 +865,7 @@ private final class TrailerPlayerLayerView: UIView {
     }
 }
 
-private struct TrailerPlayerSurface: UIViewRepresentable {
+struct TrailerPlayerSurface: UIViewRepresentable {
     let player: AVPlayer
     let onReadyForDisplay: () -> Void
 
@@ -1673,8 +1673,9 @@ private actor PosterArtworkCache {
     func image(for url: URL, maxPixelSize: Int) async -> UIImage? {
         let boundedPixelSize = min(max(maxPixelSize, 160), 1400)
         let key = "\(url.absoluteString)#\(boundedPixelSize)" as NSString
+        let volatile = PosterArtworkCachePolicy.isVolatile(url)
 
-        if let cached = cache.object(forKey: key) {
+        if !volatile, let cached = cache.object(forKey: key) {
             return cached
         }
 
@@ -1685,7 +1686,7 @@ private actor PosterArtworkCache {
         let task = Task.detached(priority: .utility) { () -> UIImage? in
             // Disk before network, like Coil. The bytes are keyed by URL alone,
             // so one stored poster serves every size a card asks for.
-            if let stored = await PosterDiskCache.shared.data(for: url),
+            if !volatile, let stored = await PosterDiskCache.shared.data(for: url),
                let image = await PosterDecodeLimiter.shared.image(
                    from: stored,
                    maxPixelSize: boundedPixelSize
@@ -1693,8 +1694,8 @@ private actor PosterArtworkCache {
                 return image
             }
 
-            guard let data = await downloadPosterData(url: url) else { return nil }
-            await PosterDiskCache.shared.store(data, for: url)
+            guard let data = await downloadPosterData(url: url, revalidate: volatile) else { return nil }
+            if !volatile { await PosterDiskCache.shared.store(data, for: url) }
             return await PosterDecodeLimiter.shared.image(
                 from: data,
                 maxPixelSize: boundedPixelSize
@@ -1705,7 +1706,7 @@ private actor PosterArtworkCache {
         let image = await task.value
         inFlight[key as String] = nil
 
-        if let image {
+        if let image, !volatile {
             cache.setObject(image, forKey: key, cost: image.decodedByteCost)
         }
         return image
@@ -1773,6 +1774,10 @@ private actor PosterDiskCache {
     /// saves, so the sweep runs once per batch of new artwork.
     private var bytesWrittenSinceTrim = 0
     private let trimInterval = 20 * 1024 * 1024
+    static let freshnessTTL: TimeInterval = 24 * 60 * 60
+    /// Refresh artwork cached by releases that treated generated poster bytes
+    /// as immutable. Future freshness is governed by `freshnessTTL`.
+    private static let storageVersion = "v2"
 
     init() {
         let caches = fileManager.urls(for: .cachesDirectory, in: .userDomainMask)[0]
@@ -1782,6 +1787,11 @@ private actor PosterDiskCache {
 
     func data(for url: URL) -> Data? {
         let file = fileURL(for: url)
+        guard let attributes = try? fileManager.attributesOfItem(atPath: file.path),
+              let modified = attributes[.modificationDate] as? Date,
+              PosterDiskCacheFreshness.isFresh(modified: modified, now: Date(), ttl: Self.freshnessTTL) else {
+            return nil
+        }
         return try? Data(contentsOf: file, options: .mappedIfSafe)
     }
 
@@ -1797,7 +1807,7 @@ private actor PosterDiskCache {
     private func fileURL(for url: URL) -> URL {
         // A poster URL can carry query parameters and characters a file name
         // cannot, so hash it rather than sanitising it.
-        let digest = SHA256.hash(data: Data(url.absoluteString.utf8))
+        let digest = SHA256.hash(data: Data("\(Self.storageVersion):\(url.absoluteString)".utf8))
         return directory.appendingPathComponent(digest.map { String(format: "%02x", $0) }.joined())
     }
 
@@ -1828,6 +1838,14 @@ private actor PosterDiskCache {
     }
 }
 
+/// Pure freshness rule for deterministic boundary tests.
+enum PosterDiskCacheFreshness {
+    static func isFresh(modified: Date, now: Date, ttl: TimeInterval) -> Bool {
+        let age = now.timeIntervalSince(modified)
+        return age >= 0 && age <= ttl
+    }
+}
+
 private let posterURLSession: URLSession = {
     let config = URLSessionConfiguration.default
     config.timeoutIntervalForRequest = 10
@@ -1844,9 +1862,22 @@ private let posterURLSession: URLSession = {
 /// Matches what the Android loader gets from OkHttp's defaults: a 10s ceiling
 /// instead of `URLSession`'s 60s, and a non-2xx response treated as a failure
 /// instead of being handed to the decoder as if it were image bytes.
-private func downloadPosterData(url: URL) async -> Data? {
+enum PosterArtworkCachePolicy {
+    private static let volatileHosts = [
+        "xperience-app.com", "btttr.cc", "ratingposterdb.com", "top-posters.com",
+        "easyratingsdb.com", "extendedratings.com", "postersplus.elfhosted.com"
+    ]
+
+    static func isVolatile(_ url: URL) -> Bool {
+        guard let host = url.host?.lowercased() else { return false }
+        return volatileHosts.contains { host == $0 || host.hasSuffix(".\($0)") }
+    }
+}
+
+private func downloadPosterData(url: URL, revalidate: Bool = false) async -> Data? {
     var request = URLRequest(url: url)
     request.timeoutInterval = 10
+    if revalidate { request.cachePolicy = .reloadIgnoringLocalCacheData }
 
     guard let (data, response) = try? await posterURLSession.data(for: request) else {
         return nil
@@ -2223,7 +2254,7 @@ struct TitleActionsMenuContent: View {
                     onOpenDetails?()
                 }
             } label: {
-                Label("Go to details", systemImage: "info.circle")
+                Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
 
             if let onPlayManually {
@@ -2232,7 +2263,7 @@ struct TitleActionsMenuContent: View {
                         onPlayManually()
                     }
                 } label: {
-                    Label("Play manually", systemImage: "play.fill")
+                    Label(L10n.string("action_play_manually", fallback: "Play manually"), systemImage: "play.fill")
                 }
             }
 
@@ -2242,7 +2273,7 @@ struct TitleActionsMenuContent: View {
                         onStartFromBeginning()
                     }
                 } label: {
-                    Label("Start from beginning", systemImage: "arrow.counterclockwise")
+                    Label(L10n.string("action_start_from_beginning", fallback: "Start from beginning"), systemImage: "arrow.counterclockwise")
                 }
             }
 
@@ -2252,7 +2283,7 @@ struct TitleActionsMenuContent: View {
                         onRemoveFromContinueWatching()
                     }
                 } label: {
-                    Label("Remove", systemImage: "trash")
+                    Label(L10n.string("action_remove", fallback: "Remove"), systemImage: "trash")
                 }
             }
         } else {
@@ -2264,7 +2295,7 @@ struct TitleActionsMenuContent: View {
                     onOpenDetails?()
                 }
             } label: {
-                Label("Go to details", systemImage: "info.circle")
+                Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
 
             Button {
@@ -2273,7 +2304,9 @@ struct TitleActionsMenuContent: View {
                 }
             } label: {
                 Label(
-                    inLibrary ? "Remove from library" : "Add to library",
+                    inLibrary
+                        ? L10n.string("action_remove_from_library", fallback: "Remove from library")
+                        : L10n.string("action_add_to_library", fallback: "Add to library"),
                     systemImage: inLibrary ? "checkmark" : "plus"
                 )
             }
@@ -2284,7 +2317,9 @@ struct TitleActionsMenuContent: View {
                 }
             } label: {
                 Label(
-                    isItemWatched ? "Mark as unwatched" : "Mark as watched",
+                    isItemWatched
+                        ? L10n.string("details_mark_as_unwatched", fallback: "Mark as unwatched")
+                        : L10n.string("details_mark_as_watched", fallback: "Mark as watched"),
                     systemImage: isItemWatched ? "eye.slash" : "eye"
                 )
             }

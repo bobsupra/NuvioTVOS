@@ -101,6 +101,73 @@ enum MallocBlockCensus {
         return Result(count: total, bytes: totalBytes, buckets: buckets, largest: largest)
     }
 
+    /// AE#445: the growth POLICY of the largest block, which names the allocator family holding it.
+    ///
+    /// `bigExact` says one block is growing. Deciding WHOSE it is took that issue three rounds, and
+    /// the ratio between two consecutive walks answers it more sharply than any size does, because
+    /// each family grows by its own fixed factor and nothing else lands on one:
+    ///
+    ///   1.25   Foundation `Data` (`__DataStorage._grow` adds `newLength >> 2` above 128 KB, rounds
+    ///          through `malloc_good_size`, and grows via `realloc`, so the region also carries the
+    ///          REALLOC tag)
+    ///   1.5    FFmpeg's AVIO dynamic buffer (`dyn_buf_write`: `size += size / 2 + 1`)
+    ///   1.0625 `av_fast_realloc` / `av_fast_malloc` (`min_size + min_size / 16 + 32`)
+    ///   2      Swift `Array` / `ContiguousArray` / `String`
+    ///
+    /// A block can climb several rungs between two walks, so a ratio is matched against the first
+    /// four powers of each factor and the fewest-rung match wins. The census tracks sizes and not
+    /// identities: if the top block changes hands the ratio belongs to no family, which is why an
+    /// unrecognised value is printed bare instead of being rounded into the nearest story.
+    static let growthFamilies: [(name: String, factor: Double)] = [
+        ("Data", 1.25),
+        ("dyn_buf", 1.5),
+        ("Array", 2.0),
+        ("av_fast_realloc", 1.0625),
+    ]
+
+    /// Relative tolerance per rung. The reporter's own ladder measured 1.2500 to 1.2502, i.e. 0.02%,
+    /// and the nearest pair of neighbouring rungs across the table sits 2.4% apart, so this
+    /// separates the families without needing them to be exact.
+    static let growthTolerance = 0.004
+
+    /// Classify one growth step. Nil when the block did not grow.
+    static func growthFamily(previousBytes: Int, currentBytes: Int) -> (ratio: Double, family: String?)? {
+        guard previousBytes > 0, currentBytes > previousBytes else { return nil }
+        let ratio = Double(currentBytes) / Double(previousBytes)
+        for rungs in 1...4 {
+            for family in growthFamilies {
+                let step = pow(family.factor, Double(rungs))
+                if abs(ratio - step) <= growthTolerance * step { return (ratio, family.name) }
+            }
+        }
+        return (ratio, nil)
+    }
+
+    /// Per-caller growth state. The 30 s memprobe walk and the 8 Hz trigger walk must not share a
+    /// previous value: each would then report the ratio the OTHER's interval produced, which is a
+    /// number about the sampler rather than about the buffer.
+    final class GrowthTracker: @unchecked Sendable {
+        private let lock = NSLock()
+        private var previousLargest = 0
+
+        /// `bigGrowth=` fragment for this caller's cadence. "flat" is emitted deliberately: a line
+        /// that only speaks while something grows cannot say that nothing did.
+        func fragment(largest: Int) -> String {
+            lock.lock()
+            let previous = previousLargest
+            previousLargest = largest
+            lock.unlock()
+            guard let step = MallocBlockCensus.growthFamily(previousBytes: previous, currentBytes: largest) else {
+                return "bigGrowth=flat "
+            }
+            let family = step.family ?? "?"
+            return String(format: "bigGrowth=%.4fx(%@) ", step.ratio, family)
+        }
+    }
+
+    static let memprobeGrowth = GrowthTracker()
+    static let triggerGrowth = GrowthTracker()
+
     /// memprobe fragment: total, summed size, and the largest buckets.
     /// Empty string when disabled, so the line shape is unchanged for normal sessions.
     static func probeFragment(topBuckets: Int = 4) -> String {
@@ -112,6 +179,7 @@ enum MallocBlockCensus {
         return "bigBlocks=\(result.count) bigMB=\(result.bytes / (1 << 20)) "
             + "bigTop=\(top.isEmpty ? "none" : top) "
             + "bigExact=\(exact.isEmpty ? "none" : exact) "
+            + memprobeGrowth.fragment(largest: result.largest.first ?? 0)
     }
 }
 

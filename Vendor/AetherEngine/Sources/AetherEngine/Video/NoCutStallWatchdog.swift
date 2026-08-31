@@ -36,6 +36,10 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         var videoPtsAdvanceSeconds: Double
         var videoPackets: Int
         var videoKeyframes: Int
+        /// AE#432: how many of `videoPackets` reached the pump without a timestamp of their own, so
+        /// `videoPtsAdvanceSeconds` is measuring a clock the engine synthesized rather than the
+        /// source's. A window that is all synthesized cannot be read as a statement about delivery.
+        var synthesizedVideoPackets: Int
         var audioPackets: Int
         var foreignPackets: Int
         var lastForeignStreamIndex: Int32
@@ -47,6 +51,10 @@ final class NoCutStallWatchdog: @unchecked Sendable {
 
     enum Decision: Equatable {
         case holdForSlowDelivery(Window)
+        /// AE#446 round 3: a starved source whose closed window is still feeding the consumer. The
+        /// exit would tear down the read that is the only thing able to see the source come back, and
+        /// a session that is still delivering pictures with it.
+        case holdForOutageRunway(Window)
         case exitForRetune(Window)
     }
 
@@ -66,6 +74,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     private var packetsReadAtWindowStart = 0
     private var videoPackets = 0
     private var videoKeyframes = 0
+    private var synthesizedVideoPackets = 0
     private var audioPackets = 0
     private var foreignPackets = 0
     private var lastForeignStreamIndex: Int32 = -1
@@ -94,11 +103,12 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         lock.unlock()
     }
 
-    func noteVideoPacket(pts: Int64, isKeyframe: Bool) {
+    func noteVideoPacket(pts: Int64, isKeyframe: Bool, synthesizedTimestamp: Bool = false) {
         lock.lock()
         defer { lock.unlock() }
         videoPackets += 1
         if isKeyframe { videoKeyframes += 1 }
+        if synthesizedTimestamp { synthesizedVideoPackets += 1 }
         guard pts != Int64.min else { return }
         if firstVideoPts == Int64.min { firstVideoPts = pts }
         lastVideoPts = pts
@@ -140,7 +150,11 @@ final class NoCutStallWatchdog: @unchecked Sendable {
 
     /// One evaluation. Returns nil while there is nothing to say: not armed, parked, already
     /// latched, or simply healthy.
-    func evaluate(now: Date) -> Decision? {
+    ///
+    /// `servingOutageRunway` is read by the caller at verdict time rather than tracked here: it is a
+    /// fact about the CONSUMER (how far into a closed window it has walked), which this watchdog
+    /// knows nothing about and which changes while the window is being judged.
+    func evaluate(now: Date, servingOutageRunway: Bool = false) -> Decision? {
         lock.lock()
         defer { lock.unlock() }
         guard !exitLatched, reading, let finalizeAt = lastFinalizeAt else { return nil }
@@ -155,7 +169,8 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             stalledFor: stalledFor,
             readRate: readRate,
             videoPtsAdvanceSeconds: ptsAdvance,
-            consecutiveHolds: consecutiveHolds
+            consecutiveHolds: consecutiveHolds,
+            servingOutageRunway: servingOutageRunway
         ) {
         case .keepReading:
             return nil
@@ -165,7 +180,9 @@ final class NoCutStallWatchdog: @unchecked Sendable {
                                     readRate: readRate, ptsAdvance: ptsAdvance)
             holdRearmedAt = now
             resetWindowCounters()
-            return .holdForSlowDelivery(window)
+            // #177's hold is a WEDGE whose PTS is still advancing, so a held window that is not one
+            // can only be the outage deferral: the two never overlap and the line can name which ran.
+            return window.isWedge ? .holdForSlowDelivery(window) : .holdForOutageRunway(window)
         case .exitForRetune:
             exitLatched = true
             return .exitForRetune(makeWindow(stalledFor: stalledFor, progress: progress,
@@ -185,6 +202,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             videoPtsAdvanceSeconds: ptsAdvance,
             videoPackets: videoPackets,
             videoKeyframes: videoKeyframes,
+            synthesizedVideoPackets: synthesizedVideoPackets,
             audioPackets: audioPackets,
             foreignPackets: foreignPackets,
             lastForeignStreamIndex: lastForeignStreamIndex,
@@ -196,6 +214,7 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         packetsReadAtWindowStart = packetsRead
         videoPackets = 0
         videoKeyframes = 0
+        synthesizedVideoPackets = 0
         audioPackets = 0
         foreignPackets = 0
         lastForeignStreamIndex = -1

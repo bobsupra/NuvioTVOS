@@ -23,6 +23,32 @@ final class LiveProductionHaltTests: XCTestCase {
             "non-halted signal-less live keeps the low-latency default")
     }
 
+    // MARK: - Delivery stall (AE#446)
+
+    /// Same policy as the halt above, applied one watchdog earlier. A source that has stopped
+    /// delivering cannot satisfy a blocking reload either, and holding the client's poll for
+    /// 3 x TARGETDURATION costs it every segment it would otherwise have fetched from the cache.
+    func testDeliveryStallBeatsOverrideAndPolicy() {
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: true, policy: nil),
+            "a source that is not delivering cannot honor blocking-reload however loudly the host asks")
+        XCTAssertFalse(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: true, override: nil, policy: nil))
+        XCTAssertTrue(
+            VideoSegmentProvider.resolveLiveBlockingReload(
+                deliveryStalled: false, override: nil, policy: nil),
+            "a delivering source keeps the low-latency default")
+    }
+
+    func testHaltAndDeliveryStallAreIndependentRoutesToTheSameAnswer() {
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: true, deliveryStalled: false, override: true, policy: nil))
+        XCTAssertFalse(VideoSegmentProvider.resolveLiveBlockingReload(
+            halted: false, deliveryStalled: true, override: true, policy: nil))
+    }
+
     // MARK: - Pump-exit classification
 
     func testHostRetuneExitsHaltLiveProduction() {
@@ -160,7 +186,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 503,
                        "a held blocking reload that cannot be satisfied must 503 (retriable), never serve the unchanged playlist (-15410)")
     }
@@ -170,7 +196,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=2")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=2")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"), "satisfied hold serves the playlist as before")
     }
@@ -182,7 +208,7 @@ final class LiveProductionHaltTests: XCTestCase {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/media.m3u8?_HLS_msn=99")!)
+        let result = try fetch(URL(string: "http://127.0.0.1:\(server.port)/\(server.pathToken)/media.m3u8?_HLS_msn=99")!)
         XCTAssertEqual(result.status, 200)
         XCTAssertTrue(result.body.contains("#EXTM3U"))
         XCTAssertEqual(provider.holdCalls, 0, "gate OFF must never park the request in waitForLiveSegment")

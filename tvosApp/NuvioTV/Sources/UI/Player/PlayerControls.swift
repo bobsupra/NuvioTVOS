@@ -1,4 +1,5 @@
 import SwiftUI
+import AVKit
 
 private enum PlayerControlFocus: Hashable {
     case play
@@ -43,14 +44,36 @@ struct PlayerControls: View {
             }
         }
         .onAppear {
-            DispatchQueue.main.async {
-                focusedControl = viewModel.isLiveStream ? .play : .timeline
+            if isPlaybackStarted,
+               !viewModel.showPauseOverlay,
+               !viewModel.postPlayState.isVisible,
+               !isSkipSegmentFocused,
+               !isNextEpisodeFocused {
+                DispatchQueue.main.async {
+                    focusedControl = viewModel.isLiveStream ? .play : .timeline
+                }
+            }
+        }
+        .onChange(of: viewModel.status) { _, status in
+            if (status == .playing || status == .paused),
+               viewModel.showControls,
+               !viewModel.showPauseOverlay,
+               !viewModel.postPlayState.isVisible,
+               !isSkipSegmentFocused,
+               !isNextEpisodeFocused,
+               focusedControl == nil {
+                DispatchQueue.main.async {
+                    focusedControl = viewModel.isLiveStream ? .play : .timeline
+                }
             }
         }
         .onChange(of: viewModel.showControls) { _, isVisible in
-            // Don't steal focus while the pause metadata sheet owns the remote.
+            // Don't steal focus while the pause metadata sheet, loading, or post play owns the remote.
             if isVisible,
+               isPlaybackStarted,
+               !viewModel.isSwitchingSource,
                !viewModel.showPauseOverlay,
+               !viewModel.postPlayState.isVisible,
                !isSkipSegmentFocused,
                !isNextEpisodeFocused {
                 DispatchQueue.main.async {
@@ -64,6 +87,9 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.showPauseOverlay) { _, visible in
+            if visible { focusedControl = nil }
+        }
+        .onChange(of: viewModel.postPlayState.isVisible) { _, visible in
             if visible { focusedControl = nil }
         }
         .onChange(of: isSkipSegmentFocused) { _, isFocused in
@@ -95,13 +121,20 @@ struct PlayerControls: View {
         }
     }
 
+    private var isPlaybackStarted: Bool {
+        viewModel.status == .playing || viewModel.status == .paused || viewModel.time.duration > 0 || viewModel.isLiveStream
+    }
+
     /// Transport + timeline are focusable whenever chrome is up. Do not gate on
     /// `focusedControl != .timeline` — toggling `.focusable` when moving between
     /// buttons left Select dead after visiting settings/episodes/sources.
     private var controlsInteractable: Bool {
         viewModel.showControls
+            && isPlaybackStarted
+            && !viewModel.isSwitchingSource
             && !viewModel.showPauseOverlay
             && !viewModel.showSettingsPanel
+            && !viewModel.postPlayState.isVisible
             && viewModel.sidePanel == nil
     }
 
@@ -515,14 +548,12 @@ extension View {
 // MARK: - Next episode card
 //
 // Next-episode prompt shown near the end of an episode. Liquid Glass card with
-// the upcoming episode's thumbnail, an optional Auto-Play countdown, and a
-// manual Play button.
+// the upcoming episode's thumbnail, and manual Play/Cancel Auto-Play actions.
 struct NextEpisodeOverlay: View {
     let episode: NuvioVideo
-    /// Seconds left before Auto-Play advances; nil while controls are visible.
-    let countdown: Int?
     let isAdvancing: Bool
     var isFocused: Bool
+    let isAutoPlayCancelled: Bool
 
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
 
@@ -551,7 +582,7 @@ struct NextEpisodeOverlay: View {
             thumbnail
 
             VStack(alignment: .leading, spacing: 4) {
-                Text("Next Episode")
+                Text(L10n.string("player_next_episode", fallback: "Next Episode"))
                     .font(.system(size: 21, weight: .semibold))
                     .foregroundColor(.white.opacity(0.62))
                 Text(episodeLine)
@@ -562,10 +593,10 @@ struct NextEpisodeOverlay: View {
                     Text(airDateText)
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
-                } else if let countdown, !isAdvancing {
-                    Text("Playing in \(countdown)s")
+                } else if isAutoPlayCancelled {
+                    Text(L10n.string("player_autoplay_cancelled", fallback: "Auto-Play cancelled"))
                         .font(.system(size: 20, weight: .bold))
-                        .foregroundColor(Color(red: 0.96, green: 0.77, blue: 0.22))
+                        .foregroundColor(.white.opacity(0.7))
                 }
             }
 
@@ -582,7 +613,6 @@ struct NextEpisodeOverlay: View {
         )
         .shadow(color: .black.opacity(0.55), radius: 22, x: 0, y: 10)
         .animation(.easeInOut(duration: 0.18), value: isFocused)
-        .animation(.easeInOut(duration: 0.2), value: countdown)
     }
 
     private var thumbnail: some View {
@@ -612,11 +642,11 @@ struct NextEpisodeOverlay: View {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: isFocused ? .black : .white))
                     .scaleEffect(0.9)
-                Text("Starting…")
+                Text(L10n.string("player_starting", fallback: "Starting…"))
             } else {
                 Image(systemName: isPlayable ? "play.fill" : "calendar")
                     .font(.system(size: 22, weight: .bold))
-                Text(isPlayable ? "Play" : "Not Yet")
+                Text(isPlayable ? L10n.string("action_play", fallback: "Play") : L10n.string("player_not_yet", fallback: "Not Yet"))
             }
         }
         .font(.system(size: 24, weight: .semibold))
@@ -1070,13 +1100,13 @@ struct PlayerSettingsPanel: View {
                     ProgressView()
                         .progressViewStyle(.circular)
                         .tint(.white)
-                    Text("Fetching add-on subtitles…")
+                    Text(L10n.string("player_fetching_addon_subtitles", fallback: "Fetching add-on subtitles…"))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.white.opacity(0.62))
                 }
             }
             if options.isEmpty {
-                Text("No subtitles available")
+                Text(L10n.string("player_no_subtitles_available", fallback: "No subtitles available"))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.45))
                     .padding(.top, 10)
@@ -1399,7 +1429,7 @@ struct PlayerSettingsPanel: View {
         VStack(alignment: .leading, spacing: 18) {
             columnHeader("Audio Tracks")
             if viewModel.audioTracks.isEmpty {
-                Text("No audio tracks available")
+                Text(L10n.string("player_no_audio_tracks_available", fallback: "No audio tracks available"))
                     .font(.system(size: 23, weight: .medium))
                     .foregroundColor(.white.opacity(0.45))
                     .padding(.top, 10)
@@ -1490,7 +1520,9 @@ struct PlayerSettingsPanel: View {
 
     private var audioAdjustmentsColumn: some View {
         let aetherAudioAdjustmentsUnavailable = viewModel.activeEngineKind == .aether
-        return VStack(alignment: .leading, spacing: 34) {
+        return VStack(alignment: .leading, spacing: 28) {
+            audioOutputSection
+
             audioStepper(
                 title: "Audio Delay",
                 value: String(format: "%.3fs", Double(viewModel.audioDelayMs) / 1000.0),
@@ -1528,6 +1560,44 @@ struct PlayerSettingsPanel: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .focusSection()
+    }
+
+    private var audioOutputSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Audio Output")
+                .font(.system(size: 27, weight: .semibold))
+                .foregroundColor(.white)
+
+            HStack(spacing: 16) {
+                Image(systemName: "airplayaudio")
+                    .font(.system(size: 26, weight: .semibold))
+                    .foregroundColor(.white)
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(viewModel.currentAudioRouteDescription)
+                        .font(.system(size: 22, weight: .semibold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+
+                    Text("Control volume with Siri Remote ± or hold TV button")
+                        .font(.system(size: 17, weight: .medium))
+                        .foregroundColor(.white.opacity(0.5))
+                        .lineLimit(1)
+                }
+
+                Spacer(minLength: 8)
+
+                SystemAudioRoutePicker()
+                    .frame(width: 80, height: 50)
+            }
+            .padding(.horizontal, 22)
+            .padding(.vertical, 14)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color.white.opacity(0.07))
+            )
+        }
     }
 
     private func audioStepper(
@@ -1645,7 +1715,7 @@ struct PlayerSettingsPanel: View {
     private var picturePage: some View {
         VStack(alignment: .leading, spacing: 18) {
             columnHeader("Aspect Ratio")
-            Text("How the video fills the screen")
+            Text(L10n.string("player_aspect_ratio_hint", fallback: "How the video fills the screen"))
                 .font(.system(size: 20, weight: .medium))
                 .foregroundColor(.white.opacity(0.5))
             ScrollView(showsIndicators: false) {
@@ -1738,5 +1808,24 @@ struct PlayerSettingsPanel: View {
         Text(title)
             .font(.system(size: 26, weight: .semibold))
             .foregroundColor(.white)
+    }
+}
+
+struct SystemAudioRoutePicker: UIViewRepresentable {
+    var tintColor: UIColor = .white
+    var activeTintColor: UIColor = .white
+
+    func makeUIView(context: Context) -> AVRoutePickerView {
+        let picker = AVRoutePickerView()
+        picker.prioritizesVideoDevices = false
+        picker.tintColor = tintColor
+        picker.activeTintColor = activeTintColor
+        picker.backgroundColor = .clear
+        return picker
+    }
+
+    func updateUIView(_ uiView: AVRoutePickerView, context: Context) {
+        uiView.tintColor = tintColor
+        uiView.activeTintColor = activeTintColor
     }
 }

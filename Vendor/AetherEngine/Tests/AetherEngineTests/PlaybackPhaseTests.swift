@@ -8,57 +8,57 @@ struct PlaybackPhaseDeriveTests {
 
     @Test("error beats every other signal")
     func errorWins() {
-        #expect(PlaybackPhase.derive(state: .error("boom"), isBuffering: true, isSeeking: true, stall: .reconnecting) == .error("boom"))
+        #expect(PlaybackPhase.derive(state: .error("boom"), isBuffering: true, isSeeking: true, stall: .reconnecting, transportHasRolled: true) == .error("boom"))
     }
 
     @Test("ended beats idle/loading/playing signals")
     func endedWins() {
-        #expect(PlaybackPhase.derive(state: .ended, isBuffering: true, isSeeking: true, stall: .reconnecting) == .ended)
+        #expect(PlaybackPhase.derive(state: .ended, isBuffering: true, isSeeking: true, stall: .reconnecting, transportHasRolled: true) == .ended)
     }
 
     @Test("idle maps straight through")
     func idlePassThrough() {
-        #expect(PlaybackPhase.derive(state: .idle, isBuffering: false, isSeeking: false, stall: .flowing) == .idle)
+        #expect(PlaybackPhase.derive(state: .idle, isBuffering: false, isSeeking: false, stall: .flowing, transportHasRolled: true) == .idle)
     }
 
     @Test("loading outranks a reconnect happening underneath startup")
     func loadingOutranksStall() {
-        #expect(PlaybackPhase.derive(state: .loading, isBuffering: false, isSeeking: false, stall: .reconnecting) == .loading)
+        #expect(PlaybackPhase.derive(state: .loading, isBuffering: false, isSeeking: false, stall: .reconnecting, transportHasRolled: true) == .loading)
     }
 
     @Test("a seek over a delivering source outranks a rebuffer")
     func seekingOutranksRebuffer() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .flowing) == .seeking)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .flowing, transportHasRolled: true) == .seeking)
     }
 
     @Test("state == .seeking but isSeeking already cleared reads as playing")
     func optimisticSeekStateWithoutInFlightIsPlaying() {
-        #expect(PlaybackPhase.derive(state: .seeking, isBuffering: false, isSeeking: false, stall: .flowing) == .playing)
+        #expect(PlaybackPhase.derive(state: .seeking, isBuffering: false, isSeeking: false, stall: .flowing, transportHasRolled: true) == .playing)
     }
 
     @Test("reconnect outranks a plain rebuffer")
     func stallOutranksRebuffer() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: false, stall: .reconnecting) == .stalled(reconnecting: true))
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: false, stall: .reconnecting, transportHasRolled: true) == .stalled(reconnecting: true))
     }
 
     @Test("rebuffer when only the buffer underran, connection healthy")
     func rebufferWhenOnlyBuffering() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: false, stall: .flowing) == .rebuffering)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: false, stall: .flowing, transportHasRolled: true) == .rebuffering)
     }
 
     @Test("clean playing")
     func playing() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: false, stall: .flowing) == .playing)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: false, stall: .flowing, transportHasRolled: true) == .playing)
     }
 
     @Test("paused is preserved when nothing else is in flight")
     func paused() {
-        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .flowing) == .paused)
+        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .flowing, transportHasRolled: true) == .paused)
     }
 
     @Test("paused while reconnecting still reports the stall")
     func pausedWhileStalled() {
-        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .reconnecting) == .stalled(reconnecting: true))
+        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .reconnecting, transportHasRolled: true) == .stalled(reconnecting: true))
     }
 }
 
@@ -70,41 +70,41 @@ struct PlaybackPhaseStallPrecedenceTests {
 
     @Test("a reconnecting reader stays visible while a seek is in flight")
     func stallOutranksSeek() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: true, stall: .reconnecting)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: true, stall: .reconnecting, transportHasRolled: true)
                 == .stalled(reconnecting: true))
     }
 
     @Test("the engine's own recovery scrub does not hide the outage it recovers from")
     func stallOutranksSeekAndRebufferTogether() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .reconnecting)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .reconnecting, transportHasRolled: true)
                 == .stalled(reconnecting: true))
     }
 
     @Test("over a delivering source a seek still reads as .seeking")
     func healthySourceKeepsSeeking() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: true, stall: .flowing) == .seeking)
-        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: true, stall: .flowing) == .seeking)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: true, stall: .flowing, transportHasRolled: true) == .seeking)
+        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: true, stall: .flowing, transportHasRolled: true) == .seeking)
     }
 
     @Test("an exhausted ladder reports the stall with retries stopped")
     func exhaustedReportsRetriesStopped() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: false, stall: .exhausted)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: false, isSeeking: false, stall: .exhausted, transportHasRolled: true)
                 == .stalled(reconnecting: false))
     }
 
     @Test("exhausted outranks seek, rebuffer and paused the same way reconnecting does")
     func exhaustedPrecedence() {
-        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .exhausted)
+        #expect(PlaybackPhase.derive(state: .playing, isBuffering: true, isSeeking: true, stall: .exhausted, transportHasRolled: true)
                 == .stalled(reconnecting: false))
-        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .exhausted)
+        #expect(PlaybackPhase.derive(state: .paused, isBuffering: false, isSeeking: false, stall: .exhausted, transportHasRolled: true)
                 == .stalled(reconnecting: false))
     }
 
     @Test("a terminal state still outranks an exhausted reader")
     func terminalOutranksExhausted() {
-        #expect(PlaybackPhase.derive(state: .error("boom"), isBuffering: false, isSeeking: false, stall: .exhausted) == .error("boom"))
-        #expect(PlaybackPhase.derive(state: .ended, isBuffering: false, isSeeking: false, stall: .exhausted) == .ended)
-        #expect(PlaybackPhase.derive(state: .loading, isBuffering: false, isSeeking: false, stall: .exhausted) == .loading)
+        #expect(PlaybackPhase.derive(state: .error("boom"), isBuffering: false, isSeeking: false, stall: .exhausted, transportHasRolled: true) == .error("boom"))
+        #expect(PlaybackPhase.derive(state: .ended, isBuffering: false, isSeeking: false, stall: .exhausted, transportHasRolled: true) == .ended)
+        #expect(PlaybackPhase.derive(state: .loading, isBuffering: false, isSeeking: false, stall: .exhausted, transportHasRolled: true) == .loading)
     }
 }
 
@@ -122,6 +122,9 @@ struct PlaybackPhaseEngineTests {
         #expect(engine.playbackPhase == .loading)
 
         engine.state = .playing
+        // AE#440: intent alone is not motion. This is the live-join hold, in miniature.
+        #expect(engine.playbackPhase == .loading)
+        engine.hasTransportRolled = true
         #expect(engine.playbackPhase == .playing)
 
         engine.isBuffering = true
@@ -145,6 +148,7 @@ struct PlaybackPhaseEngineTests {
     func stallClears() throws {
         let engine = try AetherEngine()
         engine.state = .playing
+        engine.hasTransportRolled = true
         engine.setReaderNetworkPhase(.reconnecting)
         #expect(engine.playbackPhase == .stalled(reconnecting: true))
         engine.setReaderNetworkPhase(.flowing)
@@ -157,6 +161,7 @@ struct PlaybackPhaseEngineTests {
     func exhaustedHeldAcrossReaderHandover() throws {
         let engine = try AetherEngine()
         engine.state = .playing
+        engine.hasTransportRolled = true
 
         var dyingReaderGate = NetworkPhaseGate()
         if dyingReaderGate.shouldEmit(.reconnecting) { engine.setReaderNetworkPhase(.reconnecting) }
@@ -173,7 +178,8 @@ struct PlaybackPhaseEngineTests {
 }
 
 /// The reader-side dedupe gate: emit only when the phase actually changes, so a flapping origin
-/// does not spam the callback. Demux-thread-only, no locking (#85).
+/// does not spam the callback (#85). It deduplicates for one SINK, so attaching a listener clears it
+/// (#433, `forgetForNewListener`).
 @Suite("NetworkPhaseGate (#85)")
 struct NetworkPhaseGateTests {
 

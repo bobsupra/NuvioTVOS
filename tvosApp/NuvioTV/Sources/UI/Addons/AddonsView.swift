@@ -11,12 +11,12 @@ struct AddonItem: Identifiable, Equatable {
     let isOfficial: Bool
     var isInstalled: Bool
 
-    /// Core sources that cannot be removed.
-    var isLocked: Bool { id == "cinemeta" || id == "opensubtitles-v3" }
+    /// Core sources that cannot be removed (kept for backwards compatibility if needed, defaults to unlocked).
+    var isLocked: Bool { false }
 
     static let defaults: [AddonItem] = [
-        AddonItem(id: "cinemeta", name: "Cinemeta", description: "Official Stremio metadata catalog provider for movies and series.", version: "3.0.4", logoSystemName: "film.fill", isOfficial: true, isInstalled: true),
-        AddonItem(id: "opensubtitles-v3", name: "OpenSubtitles v3", description: "Official Stremio subtitle provider for movies and series.", version: "1.0.0", logoSystemName: "captions.bubble.fill", isOfficial: true, isInstalled: true),
+        AddonItem(id: "cinemeta", name: "Cinemeta", description: "The official addon for movie and series catalogs", version: "3.0.14", logoSystemName: "arrow.triangle.2.circlepath", isOfficial: true, isInstalled: true),
+        AddonItem(id: "opensubtitles-v3", name: "OpenSubtitles v3", description: "OpenSubtitles v3 Addon for Stremio", version: "1.0.0", logoSystemName: "captions.bubble.fill", isOfficial: true, isInstalled: true),
         AddonItem(id: "youtube", name: "YouTube", description: "Watch official trailers and free YouTube channels directly inside Nuvio.", version: "2.1.0", logoSystemName: "video.fill", isOfficial: false, isInstalled: true)
     ]
 }

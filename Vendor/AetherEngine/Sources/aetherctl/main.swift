@@ -70,17 +70,19 @@ func printUsage() {
       aetherctl serve [--no-dv] [--start-position S] <url>
       aetherctl validate [--no-dv] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--seconds N] [--live] [--fast-zap] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--seconds N] [--live] [--fast-zap] [--live-start-immediately] [--dvr-window N] [--subs <codec-or-lang>]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--sequential-origin] [--declared-duration S]
              [--max-concurrent-requests N]
-                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback] <url>
+                     [--audio-stats] [--host-calls play,extractor,setrate,reloadlive,seekback,seekfar] <url>
                      (full load+play session smoke test; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
                       --audio-stats taps decoded PCM and prints per-second audio lead
                       plus PTS-continuity gaps; seekback rewinds 20 s at t=15 and
-                      returns to the live edge at t=30; --switch-audio replays a host
+                      returns to the live edge at t=30; seekfar (or seekfar@N)
+                      seeks past the produced window at t=15 (or t=N), so the landing
+                      needs a producer restart; --switch-audio replays a host
                       applying a language preference just after play, default +20 ms;
                       --teletext-page fixes the caption page at load, while
                       --switch-teletext-page changes it on the playing channel
@@ -98,7 +100,13 @@ func printUsage() {
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] <file>
-      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--gen-highbitrate-seed]
+      aetherctl customio --live [--rate-kbps N] [--seconds N] [--dvr-window N] [--report-size] [--no-wrap] [--malloc-census] [--foundation-reader] [--host-carry none|removeFirst|subdata] <file.ts>
+                         (AE#445: a host-owned live spool behind MediaSource.custom, paced at the mux rate,
+                          never EOF, unknown size; prints physFP and its slope against that rate)
+      aetherctl live [--seconds N] [--seed <path>] [--dvr-window N] [--serve-only] [--measure-rss] [--report-cache-bytes] [--rewind-test] [--reload-test] [--sw] [--drop-after N] [--discontinuity-at N] [--realtime] [--fast-zap] [--preroll N] [--rewind-hold N] [--gen-highbitrate-seed]
+                     [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N] [--live-only] [--no-blocking-reload] [--force-master]
+                     [--freeze-after N] [--unfreeze-after N] [--rewind-before-freeze N] [--force-recovery-reload-at N]
+                     [--no-blocking-reload]
       aetherctl dvr [--path native|sw|both] [--seconds N] [--dvr-window N]
       aetherctl dualsubs <file> --primary <streamIndex> --secondary <streamIndex> [--seek <seconds>]
       aetherctl hlsfixture <input.ts> [--port N] [--segment-seconds N] [--target-duration N] [--window N]
@@ -458,6 +466,34 @@ if first == "live" {
         let path = seed ?? "Fixtures/user/highbitrate-1080p.ts"
         exit(ensureHighBitrateSeed(path: path) ? 0 : 1)
     }
+    // AE#442: --freeze-after N freezes the upstream (connection open, no bytes) after N seconds, and
+    // --rewind-before-freeze N parks the playhead N seconds inside the DVR window first. Together they
+    // are the reporter's shape: a viewer minutes behind live when the source dies.
+    let freezeAfter = takeDoubleFlag("--freeze-after", from: &rest)
+    let rewindBeforeFreeze = takeDoubleFlag("--rewind-before-freeze", from: &rest)
+    // AE#446 round 2: let the frozen upstream start delivering again after N seconds, which is the
+    // only way to drive the recovery-after-an-outage path (a window closed with ENDLIST re-opening).
+    let unfreezeAfter = takeDoubleFlag("--unfreeze-after", from: &rest)
+    // AE#442: drive the stage-2 recovery reload at N seconds instead of waiting for a real item death,
+    // so where a parked live session comes back from it is measurable in one run.
+    let forceRecoveryReloadAt = takeDoubleFlag("--force-recovery-reload-at", from: &rest)
+    // AE#441 follow-up: --rewind-hold N parks the playhead N seconds behind the edge and HOLDS it there
+    // for the rest of the run, which is the regime that separates a floor doing its job from a window
+    // outrunning the reader. --freeze-after kills the source; --rewind-test samples five seconds.
+    let rewindHold = takeDoubleFlag("--rewind-hold", from: &rest)
+    // AE#446: force LoadOptions.liveBlockingReload. --no-blocking-reload never advertises
+    // CAN-BLOCK-RELOAD, which is the arm that separates "AVPlayer stopped fetching because the
+    // playlist stopped changing" from "AVPlayer stopped fetching because it is in low-latency mode".
+    let noBlockingReload = takeFlag("--no-blocking-reload", from: &rest)
+    // AE#446 round 4: --live-only loads with no DVR window, the shape of a client that keeps its
+    // rewind outside the engine. The freeze leg then measures the only timeshift such a session can
+    // have, the backlog an outage puts between the closed window's end and the source's return.
+    let liveOnly = takeFlag("--live-only", from: &rest)
+    // AE#454: --force-master routes the live session behind its master playlist and sets
+    // LoadOptions.prepareNativeSubtitles the way a real host does (unconditionally). That pairing is
+    // the device's own route, and every live leg before this ran media-direct, so nothing here had
+    // ever exercised it.
+    let liveForceMaster = takeFlag("--force-master", from: &rest)
     // --sliding: accepted but ignored; sliding is now unconditional for live sessions.
     _ = takeFlag("--sliding", from: &rest)
     rejectStrayFlags(rest, subcommand: "live")
@@ -467,7 +503,13 @@ if first == "live" {
                  reloadTest: reloadTest,
                  forceSoftware: forceSW, dropAfter: dropAfter,
                  discontinuityAt: discontinuityAt, realtime: realtime,
-                 fastZap: fastZap, pacingPreroll: preroll))
+                 fastZap: fastZap, pacingPreroll: preroll,
+                 freezeAfter: freezeAfter, unfreezeAfter: unfreezeAfter,
+                 rewindBeforeFreeze: rewindBeforeFreeze,
+                 forceRecoveryReloadAt: forceRecoveryReloadAt,
+                 rewindHold: rewindHold,
+                 blockingReload: noBlockingReload ? false : nil,
+                 liveOnly: liveOnly, forceMaster: liveForceMaster))
 }
 
 if first == "play" {
@@ -484,6 +526,17 @@ if first == "play" {
     // the UPSTREAM's observed cadence, so what a fastZap start costs depends on an origin the raw-TS
     // fixture does not have.
     let playFastZap = takeFlag("--fast-zap", from: &rest)
+    // AE#440: LoadOptions.liveJoinStartsImmediately. The join tail after the first serve, where AVPlayer
+    // holds a presented frame still while it evaluates whether its cushion will sustain playback. The
+    // hold does not reproduce on this harness (loopback answers at memory speed, so the evaluation
+    // concludes immediately); these flags drive the OTHER end of the A/B on a device.
+    //
+    // On by default in the engine since 6.55.0, so this mirrors that default rather than passing a
+    // literal `false` and silently making the CLI the one place the lever is off. The positive flag
+    // stays accepted, since the device A/B script passes it explicitly.
+    let playLiveStartImmediately = takeFlag("--live-start-immediately", from: &rest)
+    let playNoLiveStartImmediately = takeFlag("--no-live-start-immediately", from: &rest)
+    let liveStartImmediately = playLiveStartImmediately ? true : !playNoLiveStartImmediately
     let dvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
     let subsPick = takeStringFlag("--subs", from: &rest)
     let hostCalls = takeStringFlag("--host-calls", from: &rest).map { $0.split(separator: ",").map(String.init) } ?? []
@@ -585,7 +638,7 @@ if first == "play" {
         printUsage()
         exit(64)
     }
-    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
+    exit(runPlay(url: parseSourceURL(urlArg), seconds: seconds, live: live, nativeHLS: nativeHLS, liveIngest: liveIngest, fastZap: playFastZap, liveStartImmediately: liveStartImmediately, dvrWindow: dvrWindow, subsPick: subsPick, hostCalls: hostCalls, audioStats: audioStats, seekEvery: seekEvery, seekPattern: seekPattern, seekCount: seekCount, startPosition: playStartPosition, mallocCensus: mallocCensus, forceSoftware: playForceSW,
                  censusThresholdMB: censusThresholdMB, censusHz: censusHz, frameTimes: frameTimes, pictureProbe: pictureProbe, sidecars: sidecars,
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
@@ -606,11 +659,33 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     let forwardOnly = takeFlag("--forward-only", from: &rest)
     let customAudioIndex = takeIntFlag("--audio-index", from: &rest).map(Int32.init)
     let audioOnlyFlag = takeFlag("--audio-only", from: &rest)
+    // AE#445: the custom-source live shape had no harness at all, so a retention question about it
+    // could only be reasoned about. These four flags are the reporter's reader in parameters.
+    let customLive = takeFlag("--live", from: &rest)
+    let customRateKbps = takeIntFlag("--rate-kbps", from: &rest) ?? 8000
+    let customDvrWindow = takeDoubleFlag("--dvr-window", from: &rest)
+    let customReportsSize = takeFlag("--report-size", from: &rest)
+    let customNoWrap = takeFlag("--no-wrap", from: &rest)
+    let customMallocCensus = takeFlag("--malloc-census", from: &rest)
+    // AE#445 round 2: the reader arm is the measurement's subject, so it is a flag rather than a
+    // fixed choice. Default reads with pread and allocates nothing, which is the reporter's shape
+    // and measures the ENGINE; --foundation-reader restores the FileHandle arm, which allocates one
+    // autoreleased Data per read and is now the control that proves the bridge pool drains it.
+    let customFoundationReader = takeFlag("--foundation-reader", from: &rest)
+    // AE#445 round 3: a positive control for the reporter's own shape. removeFirst puts an
+    // ingest-side Data carry back on the delivery path (bounded count, unbounded backing store);
+    // subdata is the same carry re-based, i.e. the fix. Default none measures the engine alone.
+    let customHostCarry = takeStringFlag("--host-carry", from: &rest) ?? "none"
+    guard let customCarryTrim = HostCarryTrim(rawValue: customHostCarry) else {
+        print("ERROR: --host-carry expects none|removeFirst|subdata, got '\(customHostCarry)'")
+        exit(64)
+    }
     let reloadFlag = takeFlag("--reload", from: &rest)
     let switchAudioFlag = takeFlag("--switch-audio", from: &rest)
     let selectSubsFlag = takeFlag("--select-subs", from: &rest)
     let extractFlag = takeFlag("--extract", from: &rest)
-    let audioSeconds = takeDoubleFlag("--seconds", from: &rest) ?? 10
+    let secondsFlag = takeDoubleFlag("--seconds", from: &rest)
+    let audioSeconds = secondsFlag ?? 10
     // --native-subs: diagnostics affordance for mov_text subtitle track (#55); serve only.
     let nativeSubsIndex = takeIntFlag("--native-subs", from: &rest)
     // --throttle-kbps: slow-CDN simulation; starves the producer below real-time to provoke rebuffers.
@@ -651,6 +726,13 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     case "audio":
         exit(runAudio(url: url, seconds: audioSeconds))
     case "customio":
+        if customLive {
+            exit(runCustomLiveSpool(path: urlArg, seconds: secondsFlag ?? 720, rateKbps: customRateKbps,
+                                    dvrWindow: customDvrWindow, reportsSize: customReportsSize,
+                                    wraps: !customNoWrap, mallocCensus: customMallocCensus,
+                                    foundationReader: customFoundationReader,
+                                    carryTrim: customCarryTrim))
+        }
         exit(runCustomIO(path: urlArg, inMemory: inMemory, forwardOnly: forwardOnly, audioOnly: audioOnlyFlag, reload: reloadFlag, switchAudio: switchAudioFlag, selectSubs: selectSubsFlag, extract: extractFlag, audioIndex: customAudioIndex))
     default:
         printUsage()

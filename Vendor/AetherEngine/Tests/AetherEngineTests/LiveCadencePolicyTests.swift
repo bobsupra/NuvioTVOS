@@ -9,6 +9,9 @@ import XCTest
 private final class ScriptedCadence: @unchecked Sendable {
     var now: Double = 0
     var cadence: Double?
+    /// AE#447: the closed terms the floor is built from.
+    var closedCadence: Double?
+    var upstreamSegmentDuration: Double?
 }
 
 final class LiveCadencePolicyTests: XCTestCase {
@@ -49,12 +52,16 @@ final class LiveCadencePolicyTests: XCTestCase {
 
     // MARK: - LiveCadencePolicy gate latch
 
-    private func makePolicy(_ s: ScriptedCadence, cutTarget: Double = 4, discipline: Double = 12, floor: Double? = 6) -> LiveCadencePolicy {
+    private func makePolicy(_ s: ScriptedCadence, cutTarget: Double = 4, discipline: Double = 12, advertised: Double? = 6) -> LiveCadencePolicy {
         LiveCadencePolicy(
             observe: { s.cadence },
             cutTargetSeconds: cutTarget,
             disciplineObservationSeconds: discipline,
-            initialFloorSeconds: floor,
+            observeSealEvidence: {
+                LiveCadenceEvidence(closedCadenceSeconds: s.closedCadence,
+                                    servedSegmentDurationSeconds: s.upstreamSegmentDuration)
+            },
+            selfReportedTargetDurationSeconds: advertised,
             clock: { s.now }
         )
     }
@@ -76,10 +83,11 @@ final class LiveCadencePolicyTests: XCTestCase {
         let s = ScriptedCadence()
         let policy = makePolicy(s)
         s.now = 0; s.cadence = 0
-        XCTAssertEqual(policy.targetDurationFloorSeconds, 6)   // seeded by self-reported TD lower bound
-        s.now = 25; s.cadence = 20
-        XCTAssertEqual(policy.targetDurationFloorSeconds, 20)  // widened to the real gap
-        s.now = 60; s.cadence = 4
+        // AE#447: the advertised 6 is not evidence, so it does not appear here.
+        XCTAssertNil(policy.targetDurationFloorSeconds)
+        s.now = 25; s.cadence = 20; s.closedCadence = 20
+        XCTAssertEqual(policy.targetDurationFloorSeconds, 20)  // widened to the real gap, once it closed
+        s.now = 60; s.cadence = 4; s.closedCadence = 4
         XCTAssertEqual(policy.targetDurationFloorSeconds, 20)  // never shrinks back
     }
 
@@ -111,7 +119,7 @@ final class LiveCadencePolicyTests: XCTestCase {
 
     func testNoObservationYetKeepsBlockingReloadOff() {
         let s = ScriptedCadence()          // cadence stays nil (no arrival observed)
-        let policy = makePolicy(s, floor: nil)
+        let policy = makePolicy(s, advertised: nil)
         s.now = 100
         XCTAssertFalse(policy.blockingReloadEnabled)
         XCTAssertNil(policy.targetDurationFloorSeconds)
@@ -147,7 +155,9 @@ final class LiveCadencePolicyTests: XCTestCase {
         let ls = lines(HLSLocalServer.buildMediaPlaylistText(provider: provider))
         XCTAssertFalse(serverControlHasAttribute(ls, "CAN-BLOCK-RELOAD"),
                        "bursty ingest must not advertise blocking-reload (-15410)")
-        XCTAssertTrue(ls.contains("#EXT-X-TARGETDURATION:20"),
+        // AE#447: 1.5 x 14 = 21s of patience over the measured 20s inter-batch gap. The floor still
+        // covers it; it just no longer asks for 30s of patience and 60s of startup depth to do so.
+        XCTAssertTrue(ls.contains("#EXT-X-TARGETDURATION:14"),
                       "TARGETDURATION floor must cover the observed inter-batch gap (anti -12888)")
     }
 

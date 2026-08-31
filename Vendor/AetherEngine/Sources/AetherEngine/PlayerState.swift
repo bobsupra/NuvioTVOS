@@ -124,7 +124,8 @@ extension PlaybackPhase {
     static func derive(state: PlaybackState,
                        isBuffering: Bool,
                        isSeeking: Bool,
-                       stall: ReaderNetworkPhase) -> PlaybackPhase {
+                       stall: ReaderNetworkPhase,
+                       transportHasRolled: Bool) -> PlaybackPhase {
         switch state {
         case .error(let message): return .error(message)
         case .ended:              return .ended
@@ -137,6 +138,13 @@ extension PlaybackPhase {
             case .flowing:      break
             }
             if isSeeking { return .seeking }
+            // AE#440: `state` is transport INTENT, and every autostart writes it before AVPlayer has
+            // rolled anything. On a live join that gap is seconds wide, so a phase of `.playing` there
+            // describes a picture that is standing still. Until the transport has moved once, the
+            // session is still starting, which is what `.loading` already means; `.rebuffering` is
+            // reserved for an underrun after playback existed. A paused mount stays `.paused`: it is
+            // honestly not playing rather than still arriving.
+            if !transportHasRolled, state != .paused { return .loading }
             if isBuffering { return .rebuffering }
             return state == .paused ? .paused : .playing
         }
@@ -255,6 +263,57 @@ public struct LoadOptions: Sendable, Equatable {
     /// (AetherEngine#195/#208).
     public var liveJoinProfile: LiveJoinProfile = .standard
 
+    /// Cut AVPlayer's stall-avoidance wait short at the live join, once it is holding on media it has
+    /// already buffered. Live sessions on the AVPlayer-backed paths only. Default `false` (AE#440).
+    ///
+    /// A live join can present its first frame and then hold it still. AVPlayer decides for itself how
+    /// much cushion it wants before letting the rate roll (`AVPlayerWaitingToMinimizeStallsReason`), and
+    /// against a source delivered at 1x that cushion can only be bought in wall-clock time. Measured by a
+    /// host on an Apple TV 4K over 11 consecutive tunes of a raw MPEG-TS channel: 1.5 to 2.8 s of
+    /// bit-static picture on 9 of them, with the engine's clock advancing and `state` already `.playing`
+    /// throughout. Nothing set on the item shortens it (`preferredForwardBufferDuration` measured inert),
+    /// because the wait is a rate evaluation and not a buffer target.
+    ///
+    /// Set, the first such hold of a session is cut short with `playImmediately(atRate:)`, which starts on
+    /// the media already buffered. It fires at most once per load, only while the item's buffer is
+    /// non-empty (`AVPlayer.h`: over an empty buffer that call behaves as a stall instead, which is the
+    /// shape that leaves rate parked at 0), and never for the `EvaluatingBufferingRate` reason, which is
+    /// the brief monitoring period Apple documents as not worth showing a spinner for. Every later hold in
+    /// the session keeps AVPlayer's own policy, so a mid-stream rebuffer is untouched.
+    ///
+    /// The trade is the one `.fastZap` already prices, from the other end: playback starts on a thinner
+    /// cushion, so a source that hiccups right after the join rebuffers where it would otherwise have
+    /// started later and played through.
+    ///
+    /// Default `true` since 6.55.0, on a device A/B rather than an argument. Two runs of ten channel
+    /// changes on the reported stack: press-to-moving-picture fell from 6.4 / 6.5 / 7.2 s to
+    /// 4.3 / 4.8 / 5.1 / 5.6 s, first PICTURE was unchanged at 3.4 to 3.9 s in both arms (so what it
+    /// removes is exactly the frozen tail), and stalls and dropped frames stayed at zero in both. The
+    /// buffer was sampled across every hold in the control arm and read non-empty with 3.7 to 4.9 s
+    /// ahead throughout: on that stack the hold is always AVPlayer waiting on its own rate estimate,
+    /// never starvation, which is why cutting it short cost nothing. Cold joins were identical in both
+    /// arms, the guards keeping the lever out of the starved case as designed. Set `false` to keep
+    /// AVPlayer's own policy for the join.
+    public var liveJoinStartsImmediately: Bool = true
+
+    /// Whether `play()` may move a behind-live playhead by itself. Default `true`, which is the historical
+    /// behaviour (AE#444).
+    ///
+    /// Resuming a live session that has fallen behind, the engine seeks: to the live edge when the source
+    /// has no DVR window and the playhead is more than 45 s back (a live-only source retains seconds, and
+    /// the position is simply gone), and to the bottom of `seekableLiveRange` plus a margin when a DVR
+    /// window has slid past the playhead. Both are recoveries from a position that no longer exists.
+    ///
+    /// A host with live-pause semantics of its own has its own answer to the same question, and the
+    /// implicit seek makes that answer unreachable: it runs inside `play()` and lands before the host can
+    /// decide. Set `false` and `play()` moves nothing. The engine still publishes `behindLiveSeconds`,
+    /// `seekableLiveRange` and `isAtLiveEdge`, and `seekToLiveEdge()` performs the same recovery on
+    /// request, so the policy moves to the host rather than disappearing.
+    ///
+    /// The trade is that nothing then rescues a playhead the window has evicted: resuming there plays
+    /// from wherever the source can still serve, so a host that turns this off owns the eviction case too.
+    public var clampsLiveResumeToWindow: Bool = true
+
     /// AVPlayer item from the remote URL directly (Jellyfin live `master.m3u8`): no demuxer probe, no loopback. AVPlayer manages live edge / reconnect. Pair with `isLive: true`. Default `false`.
     public var nativeRemoteHLS: Bool
 
@@ -323,6 +382,12 @@ public struct LoadOptions: Sendable, Equatable {
     /// of them, so such a cap bounds nothing while the origin still counts the requests. This
     /// counts requests. The engine logs the negotiated protocol once per origin, so a report can
     /// say which case an origin is.
+    ///
+    /// #450: it is also the ONLY ceiling now. The reader's long-lived transport pool used to allow
+    /// two connections per host, process-wide across every reader and every playback surface, which
+    /// made `nil` here ("count, do not cap") untrue from the third concurrent open-ended read on,
+    /// and untrue in silence: a parked request has no callback, no error and no metrics. Several
+    /// engines on one origin are bounded by this value and by what the origin refuses, nothing else.
     public var maxConcurrentSourceRequests: Int? = nil
 
     /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
@@ -428,6 +493,8 @@ public struct LoadOptions: Sendable, Equatable {
         dvrWindowSeconds: Double? = nil,
         liveBlockingReload: Bool? = nil,
         liveJoinProfile: LiveJoinProfile = .standard,
+        liveJoinStartsImmediately: Bool = true,
+        clampsLiveResumeToWindow: Bool = true,
         nativeRemoteHLS: Bool = false,
         nativeRemoteHLSIngestFallback: Bool = true,
         preserveASSMarkup: Bool = false,
@@ -461,6 +528,8 @@ public struct LoadOptions: Sendable, Equatable {
         self.dvrWindowSeconds = dvrWindowSeconds
         self.liveBlockingReload = liveBlockingReload
         self.liveJoinProfile = liveJoinProfile
+        self.liveJoinStartsImmediately = liveJoinStartsImmediately
+        self.clampsLiveResumeToWindow = clampsLiveResumeToWindow
         self.nativeRemoteHLS = nativeRemoteHLS
         self.nativeRemoteHLSIngestFallback = nativeRemoteHLSIngestFallback
         self.preserveASSMarkup = preserveASSMarkup

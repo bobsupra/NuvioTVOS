@@ -4,6 +4,55 @@ import XCTest
 
 final class PlaybackBackendPolicyTests: XCTestCase {
 
+    func testLiveStreamFailoverRetriesCurrentURLOnceBeforeExcludingIt() {
+        let url = "https://sports.example/live.m3u8"
+        let first = LiveStreamFailoverPolicy.decide(
+            isLive: true,
+            currentURL: url,
+            retriedURLs: [],
+            failedURLs: []
+        )
+        XCTAssertTrue(first.retryCurrent)
+        XCTAssertEqual(first.exclusions, [])
+        XCTAssertEqual(first.retriedURLs, [url])
+        XCTAssertEqual(first.failedURLs, [])
+
+        let second = LiveStreamFailoverPolicy.decide(
+            isLive: true,
+            currentURL: url,
+            retriedURLs: first.retriedURLs,
+            failedURLs: first.failedURLs
+        )
+        XCTAssertFalse(second.retryCurrent)
+        XCTAssertEqual(Set(second.exclusions), [url])
+        XCTAssertEqual(second.failedURLs, [url])
+
+        // A brief successful start must not erase the one-retry decision. If
+        // the same URL fails again in this playback session, it stays excluded.
+        let afterBriefStart = LiveStreamFailoverPolicy.decide(
+            isLive: true,
+            currentURL: url,
+            retriedURLs: second.retriedURLs,
+            failedURLs: second.failedURLs
+        )
+        XCTAssertFalse(afterBriefStart.retryCurrent)
+        XCTAssertEqual(Set(afterBriefStart.exclusions), [url])
+    }
+
+    func testNonLiveFailoverExcludesCurrentURLImmediately() {
+        let url = "https://movies.example/title.mkv"
+        let decision = LiveStreamFailoverPolicy.decide(
+            isLive: false,
+            currentURL: url,
+            retriedURLs: [],
+            failedURLs: []
+        )
+        XCTAssertFalse(decision.retryCurrent)
+        XCTAssertEqual(Set(decision.exclusions), [url])
+        XCTAssertEqual(decision.retriedURLs, [])
+        XCTAssertEqual(decision.failedURLs, [url])
+    }
+
     func testMPVHTTPHeaderOptionsExtractAndEscapeHeaders() {
         let options = MPVHTTPHeaderOptions(headers: [
             "uSeR-aGeNt": "TrailerClient/1.0",
@@ -307,6 +356,41 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 stripHearingImpaired: true
             ),
             "Hello"
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                #"{\an8}{\pos(640,480)}{\fnArial}{\c&H00FF00&}Hello {literal} world"#,
+                stripHearingImpaired: false
+            ),
+            "Hello {literal} world"
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                #"Visible {not an override} text {\i1}italic{\i0}."#,
+                stripHearingImpaired: false
+            ),
+            "Visible {not an override} text italic."
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                #"{\fnArial\rAltStyle\fad(100,200)}Styled text"#,
+                stripHearingImpaired: false
+            ),
+            "Styled text"
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                #"Unclosed {\fnArial and {unknown} remain"#,
+                stripHearingImpaired: false
+            ),
+            #"Unclosed {\fnArial and {unknown} remain"#
+        )
+        XCTAssertEqual(
+            AISubtitleTranslationState.cleaned(
+                #"Keep {\caution} and {\bold text} visible"#,
+                stripHearingImpaired: false
+            ),
+            #"Keep {\caution} and {\bold text} visible"#
         )
     }
 

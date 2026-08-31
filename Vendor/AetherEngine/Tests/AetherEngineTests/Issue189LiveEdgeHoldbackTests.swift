@@ -38,8 +38,12 @@ final class Issue189LiveEdgeHoldbackTests: XCTestCase {
         XCTAssertEqual(LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 4.8, cutTargetSeconds: 4.0, cadenceFloorSeconds: nil), 6)
         // 5.76s segments: ceil(5.76)=6 already dominates the cut-target floor.
         XCTAssertEqual(LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 5.76, cutTargetSeconds: 4.0, cadenceFloorSeconds: nil), 6)
-        // Observed cadence dominates when the upstream is bursty.
-        XCTAssertEqual(LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 4.8, cutTargetSeconds: 4.0, cadenceFloorSeconds: 9.2), 10)
+        // Observed cadence dominates when the upstream is bursty, at the size its patience needs:
+        // AE#447, 1.5 x 7 = 10.5s of unchanged-playlist patience over a measured 9.2s gap. The old
+        // ceil(9.2) = 10 asked for 15s of patience and, at 3 x TD, 30s of startup depth for it.
+        let bursty = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 4.8, cutTargetSeconds: 4.0, cadenceFloorSeconds: 9.2)
+        XCTAssertEqual(bursty, 7)
+        XCTAssertGreaterThanOrEqual(Double(bursty) * LiveEdgePolicy.unchangedPlaylistPatienceMultiplier, 9.2)
     }
 
     func testHoldBackIsThreeTargetDurations() {

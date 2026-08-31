@@ -1,0 +1,68 @@
+# The versions this package builds are shell variables in build.sh, not a manifest, so no
+# dependency bot sees them. This is the thing that watches them.
+#
+# It keeps exactly one issue: opened when a pin falls behind, rewritten while it stays behind,
+# and closed by the run that finds everything current again. Nothing is posted when there is
+# nothing to do, which is what keeps it worth reading.
+name: Upstream watch
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"   # Mondays, 06:00 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # dolby_vision is pinned in the sibling repository. Checking it here keeps one place to
+      # look rather than a second watcher raising a second issue somewhere else.
+      - uses: actions/checkout@v7
+        with:
+          repository: superuser404notfound/LibDovi
+          path: .libdovi
+
+      - name: Compare pins against upstream
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set +e
+          python3 Scripts/check-upstream.py --libdovi .libdovi/build.sh > report.md
+          echo "behind=$?" >> "$GITHUB_OUTPUT"
+          set -e
+          cat report.md
+
+      - name: Raise, update or close the issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BEHIND: ${{ steps.check.outputs.behind }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          TITLE="Upstream dependencies have newer releases"
+          EXISTING=$(gh issue list --state open --limit 100 --json number,title \
+            --jq "[.[] | select(.title == \"$TITLE\")] | .[0].number // empty")
+
+          if [ "$BEHIND" = "1" ]; then
+            { cat report.md
+              printf '\n---\n\nChecked by [Upstream watch](%s). This issue is rewritten on every run and closes itself once every pin is current.\n' "$RUN_URL"
+            } > body.md
+            if [ -n "$EXISTING" ]; then
+              gh issue edit "$EXISTING" --body-file body.md
+              echo "updated #$EXISTING"
+            else
+              gh issue create --title "$TITLE" --body-file body.md
+            fi
+          elif [ -n "$EXISTING" ]; then
+            gh issue close "$EXISTING" --comment "Every pinned source is current again. Closed by [Upstream watch]($RUN_URL)."
+            echo "closed #$EXISTING"
+          else
+            echo "every pin is current, nothing to report"
+          fi

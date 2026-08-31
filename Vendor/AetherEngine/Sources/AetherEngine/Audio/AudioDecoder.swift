@@ -42,6 +42,12 @@ final class AudioDecoder: @unchecked Sendable {
     private var _loggedZeroConvert = false
     #endif
 
+    /// Input parameters the current `swrContext` was built for (#452). `decode()`/`drain()` compare
+    /// each frame against these and rebuild on a mid-stream change: a live splice can swap the
+    /// stream's audio configuration (5.1 <-> stereo at a program boundary), and a context built for
+    /// more input planes than the frame carries reads a NULL plane inside swr_convert.
+    private var configuredInput = ResamplerInputParameters()
+
     private(set) var sampleRate: Int32 = 0
     private(set) var channels: Int32 = 0
 
@@ -99,6 +105,9 @@ final class AudioDecoder: @unchecked Sendable {
             // most and recovers immediately.
             if swrContext == nil {
                 if !initResamplerFromFrame(f) { continue }
+            } else if configuredInput.differ(from: f) {
+                if let sampleBuffer = rebuildResampler(for: f) { results.append(sampleBuffer) }
+                if swrContext == nil { continue }
             }
             appendFrameToPending(f)
             if pendingSampleCount >= Self.minSamplesPerBuffer {
@@ -111,8 +120,29 @@ final class AudioDecoder: @unchecked Sendable {
         return results
     }
 
+    /// Tear down and rebuild the resampler for a frame whose input parameters changed mid-stream
+    /// (#452). Emits the accumulator first (its bytes are in the OLD output format and must be
+    /// neither dropped nor mixed with the new format's) and returns that buffer, if any. The gapless
+    /// clock's sample count is denominated in the old rate, so it resets and the next buffer
+    /// re-anchors from its own container PTS. On a failed rebuild `swrContext` stays nil and the
+    /// caller skips the frame; the next frame retries, mirroring the lazy-init failure mode.
+    private func rebuildResampler(for frame: UnsafeMutablePointer<AVFrame>) -> CMSampleBuffer? {
+        let flushed = emitPending()
+        EngineLog.emit(
+            "[AudioDecoder] input format changed mid-stream ("
+            + "\(configuredInput.rate)Hz/\(configuredInput.layout.nb_channels)ch/fmt=\(configuredInput.format.rawValue)"
+            + " -> \(frame.pointee.sample_rate)Hz/\(frame.pointee.ch_layout.nb_channels)ch/fmt=\(frame.pointee.format)"
+            + "); rebuilding resampler",
+            category: .swPlayback)
+        swr_free(&swrContext)
+        clock.reset()
+        _ = initResamplerFromFrame(frame)
+        return flushed
+    }
+
     private func initResamplerFromFrame(_ frame: UnsafeMutablePointer<AVFrame>) -> Bool {
-        // Refresh rate/channels from the frame (codecpar was a hint, the frame is truth). Once per track.
+        // Refresh rate/channels from the frame (codecpar was a hint, the frame is truth). Runs on the
+        // first frame and again after a mid-stream format change tore the context down (#452).
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
@@ -162,6 +192,9 @@ final class AudioDecoder: @unchecked Sendable {
             return false
         }
 
+        // What this context was built for; every later frame is compared against it (#452).
+        configuredInput.adopt(layout: &inLayout, format: inFmt, rate: inRate)
+
         #if DEBUG
         EngineLog.emit("[AudioDecoder] Resampler ready: \(sampleRate)Hz, \(channels)ch, inFmt=\(inFmt.rawValue)", category: .swPlayback)
         #endif
@@ -200,6 +233,9 @@ final class AudioDecoder: @unchecked Sendable {
             while avcodec_receive_frame(ctx, f) >= 0 {
                 if swrContext == nil {
                     if !initResamplerFromFrame(f) { continue }
+                } else if configuredInput.differ(from: f) {
+                    if let sampleBuffer = rebuildResampler(for: f) { results.append(sampleBuffer) }
+                    if swrContext == nil { continue }
                 }
                 appendFrameToPending(f)
                 if pendingSampleCount >= Self.minSamplesPerBuffer {
@@ -221,6 +257,8 @@ final class AudioDecoder: @unchecked Sendable {
         if swrContext != nil {
             swr_free(&swrContext)
         }
+        // The stored copy may hold an allocated channel map for custom-order layouts (#452).
+        configuredInput.release()
         codecContext = nil
         swrContext = nil
         audioFormatDescription = nil
@@ -280,6 +318,11 @@ final class AudioDecoder: @unchecked Sendable {
 
         let numSamples = Int(frame.pointee.nb_samples)
         guard numSamples > 0 else { return }
+
+        // Every plane swr will read has to be there. The compare in decode() rebuilds on a DECLARED
+        // input change; corrupt live MPEG-TS decodes to nb_samples > 0 with a NULL plane and declares
+        // nothing, and swr_convert dereferences it just the same (#452).
+        guard configuredInput.framePlanesArePresent(frame) else { return }
 
         let maxOutputSamples = Int(swr_get_out_samples(swr, frame.pointee.nb_samples))
         guard maxOutputSamples > 0 else { return }

@@ -99,7 +99,14 @@ enum AirPlayPlaylistDecision {
     static func receiverURL(base: URL, lanIP: String, playlist: ReceiverPlaylist) -> URL? {
         var components = URLComponents(url: base, resolvingAgainstBaseURL: false)
         components?.host = lanIP
-        if playlist == .media { components?.path = "/media.m3u8" }
+        if playlist == .media {
+            // Swap only the playlist name and keep whatever precedes it: the server puts a
+            // per-session token in front of every path, and overwriting the whole path here
+            // would send the receiver to an address the server refuses.
+            var parts = (components?.path ?? "").split(separator: "/", omittingEmptySubsequences: true)
+            if !parts.isEmpty { parts.removeLast() }
+            components?.path = "/" + (parts + ["media.m3u8"]).joined(separator: "/")
+        }
         return components?.url
     }
 }

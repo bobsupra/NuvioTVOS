@@ -96,8 +96,24 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var cachedQueueErrorDescription: String?
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
+    /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
+    /// decode thread writes it, and the two counts it is compared against are read under the same lock.
     private(set) var enqueueCount = 0
     private var hdr10PlusAttachedCount = 0
+
+    /// #407: frames that reached `flushFrame` and still never got to the layer, because the sample
+    /// buffer could not be built. Separate from `_untimedFramesDropped` (refused before the reorder
+    /// buffer) and from the post-seek skip, which is a decision rather than a loss. Guarded by
+    /// `reorderLock`.
+    private var _sampleBuildFailures = 0
+
+    /// #407: spacing of the timestamps actually handed to the layer, over the interval since the last
+    /// snapshot. `framesEnqueued` counts DECODER OUTPUT, so a per-second frame count reads healthy for
+    /// an even 24 fps timeline and for one carrying a doubled or a duplicate interval alike; only the
+    /// spacing separates them. Guarded by `reorderLock`, reset by `takeCadence()`.
+    private var _lastHandedPtsSeconds: Double?
+    private var _minHandedDeltaSeconds = Double.infinity
+    private var _maxHandedDeltaSeconds = -Double.infinity
 
     /// #298: frames refused at the enqueue gate for carrying an unschedulable PTS. Guarded by `reorderLock`.
     private var _untimedFramesDropped = 0
@@ -165,6 +181,37 @@ final class SampleBufferRenderer: @unchecked Sendable {
         let dropped: Int
         let corrupted: Int
         let accumulatedDelay: TimeInterval
+    }
+
+    /// #407: what the renderer itself put on the layer, as opposed to what the decoder produced.
+    /// `RenderMetrics` describes the layer's verdict on frames it received; this describes the frames
+    /// it received, which is the half no counter covered while a report of visible judder read clean
+    /// on every one of them.
+    struct Cadence: Sendable {
+        /// Cumulative frames handed to the queue target.
+        let handedOver: Int
+        /// Cumulative frames lost between the decoder callback and the layer: unschedulable
+        /// timestamps plus failed sample-buffer builds. A gap between the decoder's count and
+        /// `handedOver` that this does not account for is a post-seek skip.
+        let lostBeforeLayer: Int
+        /// Shortest and longest gap between consecutive handed-over timestamps over the interval,
+        /// nil when fewer than two frames were handed over. Source axis, seconds.
+        let minDeltaSeconds: Double?
+        let maxDeltaSeconds: Double?
+    }
+
+    /// Reads the cadence counters and resets the per-interval spacing extremes. Called at 1 Hz by the
+    /// diagnostic line; the cumulative counts survive, the min/max describe the interval only.
+    func takeCadence() -> Cadence {
+        reorderLock.lock()
+        defer { reorderLock.unlock() }
+        let minD = _minHandedDeltaSeconds.isFinite ? _minHandedDeltaSeconds : nil
+        let maxD = _maxHandedDeltaSeconds.isFinite ? _maxHandedDeltaSeconds : nil
+        _minHandedDeltaSeconds = .infinity
+        _maxHandedDeltaSeconds = -.infinity
+        return Cadence(handedOver: enqueueCount,
+                       lostBeforeLayer: _untimedFramesDropped + _sampleBuildFailures,
+                       minDeltaSeconds: minD, maxDeltaSeconds: maxD)
     }
 
     /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
@@ -298,8 +345,11 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
         while reorderBuffer.count > reorderDepth {
             let (pb, t, hdr) = reorderBuffer.removeFirst()
+            // #407: the successor is already held, so its timestamp is the frame's exact duration at
+            // no extra latency. Read before the unlock, since enqueue() runs on the decode thread.
+            let next = reorderBuffer.first?.1
             reorderLock.unlock()
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
             reorderLock.lock()
         }
 
@@ -313,6 +363,9 @@ final class SampleBufferRenderer: @unchecked Sendable {
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
+        // #407: the next frame handed over will not follow the last one, so the gap between them is
+        // not a cadence measurement. Left standing, every seek would report one enormous interval.
+        _lastHandedPtsSeconds = nil
         // #303: nothing is held any more, so the frontier is not a frontier. Left standing, a
         // backward seek would keep reporting the pre-seek timestamp and read as a cushion of
         // however far the seek travelled.
@@ -345,16 +398,28 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderBuffer.removeAll()
         reorderLock.unlock()
 
-        for (pb, t, hdr) in remaining {
-            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr)
+        for (i, (pb, t, hdr)) in remaining.enumerated() {
+            // The final frame has no successor, so it is handed over untimed in length: at end of
+            // media that is the frame that stays on screen, and a length is exactly what it must not
+            // have.
+            let next = i + 1 < remaining.count ? remaining[i + 1].1 : nil
+            flushFrame(pixelBuffer: pb, pts: t, hdr10PlusData: hdr, nextPTS: next)
         }
     }
 
     // MARK: - Internal
 
-    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?) {
+    private func flushFrame(pixelBuffer: CVPixelBuffer, pts: CMTime, hdr10PlusData: Data?,
+                            nextPTS: CMTime? = nil) {
         let outputBuffer = subtitleCompositor.composite(pixelBuffer, ptsSeconds: pts.seconds)
-        guard let sampleBuffer = createSampleBuffer(from: outputBuffer, pts: pts) else {
+        guard let sampleBuffer = createSampleBuffer(
+            from: outputBuffer, pts: pts,
+            duration: Self.frameDuration(from: pts, to: nextPTS)) else {
+            // #407: a frame the decoder produced and the layer never saw. Counted, because the
+            // per-second frame count is taken on the decoder's side of this line.
+            reorderLock.lock()
+            _sampleBuildFailures += 1
+            reorderLock.unlock()
             return
         }
         // HDR10+ attachment overrides any payload baked into the bitstream (VT may strip per-frame SEI on decode).
@@ -389,11 +454,23 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
         observer?(SoftwareVideoFrameTime(presentation: pts, generation: generation))
 
+        reorderLock.lock()
         enqueueCount += 1
+        // #407: the spacing of what the layer was given, which is the thing a frame COUNT cannot say.
+        if let previous = _lastHandedPtsSeconds {
+            let delta = CMTimeGetSeconds(pts) - previous
+            if delta.isFinite {
+                _minHandedDeltaSeconds = min(_minHandedDeltaSeconds, delta)
+                _maxHandedDeltaSeconds = max(_maxHandedDeltaSeconds, delta)
+            }
+        }
+        _lastHandedPtsSeconds = CMTimeGetSeconds(pts)
+        let handed = enqueueCount
+        reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
-        if enqueueCount == 1 || enqueueCount == 30 || enqueueCount == 100 || enqueueCount == 1000 || enqueueCount == 5000 {
+        if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
             scheduleQueueDiagnosticsRefresh()
-            EngineLog.emit("[Renderer] enqueue #\(enqueueCount): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueErrorDescription ?? "nil")", category: .swPlayback)
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueErrorDescription ?? "nil")", category: .swPlayback)
         }
     }
 
@@ -476,8 +553,21 @@ final class SampleBufferRenderer: @unchecked Sendable {
             desc, usePixelAspectRatio: true, useCleanAperture: true)
     }
 
+    /// #407: the length a frame is presented for, from the successor the reorder buffer is already
+    /// holding. `.invalid` for the last frame of a stream (nothing follows it) and for a successor
+    /// that cannot be a frame length: a non-positive gap is a duplicate or a reordering fault, and a
+    /// gap past a second is a stream discontinuity, neither of which is a duration to present for.
+    static func frameDuration(from pts: CMTime, to nextPTS: CMTime?) -> CMTime {
+        guard let nextPTS, pts.isNumeric, nextPTS.isNumeric else { return .invalid }
+        let delta = CMTimeSubtract(nextPTS, pts)
+        let seconds = CMTimeGetSeconds(delta)
+        guard seconds > 0, seconds <= 1.0 else { return .invalid }
+        return delta
+    }
+
     /// Internal (not private) for #177 regression tests: the PAR-keyed cache behavior is the fix.
-    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime) -> CMSampleBuffer? {
+    func createSampleBuffer(from pixelBuffer: CVPixelBuffer, pts: CMTime,
+                            duration: CMTime = .invalid) -> CMSampleBuffer? {
         // Cache hit avoids CMVideoFormatDescriptionCreateForImageBuffer allocation + CF refcount churn on every frame.
         let par = CVBufferCopyAttachment(pixelBuffer, kCVImageBufferPixelAspectRatioKey, nil) as? NSDictionary
         let key = FormatDescriptionKey(
@@ -523,7 +613,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         }
 
         var timing = CMSampleTimingInfo(
-            duration: .invalid,
+            duration: duration,
             presentationTimeStamp: pts,
             decodeTimeStamp: .invalid
         )

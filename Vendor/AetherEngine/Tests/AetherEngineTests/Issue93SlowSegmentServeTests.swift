@@ -296,7 +296,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, _) = Self.rawGET(port: server.port, path: "/seg1.mp4", deadline: 1.0)
+        let (raw, _) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
         let (header, body) = Self.splitResponse(raw)
         #expect(header.contains("200 OK"))
         #expect(header.contains("Content-Length: \(payload.count)"))
@@ -314,7 +314,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/seg1.mp4", deadline: 1.0)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.0)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(firstByteAfter < 0.7, "header must arrive near the slow signal, got \(firstByteAfter)s")
@@ -330,7 +330,7 @@ struct Issue93SlowSegmentServeTests {
         try server.start()
         defer { server.stop() }
 
-        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/seg1.mp4", deadline: 1.5)
+        let (raw, firstByteAfter) = Self.rawGET(port: server.port, path: "/\(server.pathToken)/seg1.mp4", deadline: 1.5)
         let (header, body) = Self.splitResponse(raw)
         #expect(firstByteAfter >= 0)
         #expect(header.contains("Transfer-Encoding: chunked"))

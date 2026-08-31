@@ -12,6 +12,840 @@ the public-API contract.
 
 _Nothing yet._
 
+## [6.57.0] - 2026-08-31
+
+### Changed
+
+- **The FFmpeg frameworks ship under an `Aether` prefix (FFmpegBuild 3.0.0).** Every FFmpeg packaged
+  for Apple platforms declares targets named `Libavcodec`, `Libavformat` and friends, and SwiftPM
+  target names are unique across the whole dependency graph, so an app whose player keeps a second
+  engine (KSPlayer, mpv, MobileVLCKit) could not resolve a graph holding this one at all: `multiple
+  similar targets 'Libavcodec', 'Libavfilter', 'Libavformat' and 3 others appear in package
+  'ffmpegbuild' and 'ffmpegkit'`. `moduleAliases` does not reach it, since it renames Swift source
+  targets rather than binary ones. Behind it sat a second collision on one install name in
+  `App.app/Frameworks/`. Both are name problems, so both are settled by naming: the modules are
+  `AetherLibavcodec` and friends, the install names follow
+  (`@rpath/AetherLibavcodec.framework/AetherLibavcodec`), and the umbrella product is
+  `AetherFFmpegBuild`. Same n8.1.2 binaries as before, and the FFmpeg C API is untouched.
+
+  **Hosts see nothing**: the public API never exposed an FFmpeg type. Only a host that imports
+  `Libav*` itself has a line to change.
+
+### Documentation
+
+- **docs/api.md gains the case a rename cannot cover.** Two dynamic framework sets coexist on their
+  own, because the two-level namespace binds per reference. A static FFmpeg in the same executable
+  still captures `_avcodec_*` for everything linked beside it, so the section now carries the recipe:
+  link the engine into a dynamic framework of the host's own and let its references bind there, with
+  the two commands that show which build actually answered.
+
+## [6.56.9] - 2026-08-30
+
+### Added
+
+- **The served rejoin placement names itself in the log (AE#454).** A field log could see the engine
+  arm a placement and could not see whether the playlist actually offered one, or at what depth. The
+  served tag now says so, and the pair is self-checking: the offset the server writes and the
+  position the fresh item reports at readiness are the same number. Bounded by the arm, so it is off
+  on every build except the ones between a rejoin swap and the item it placed running.
+
+## [6.56.8] - 2026-08-30
+
+### Fixed
+
+- **A rejoin places the item in its playlist (AE#454).** A rejoin is two operations, attaching an
+  item and placing it, and only the first was ever stated to AVPlayer at the swap: the item went out
+  with no start position, so it did what a live playlist tells any client to do, joined at its own
+  edge and started playing there, and the place the viewer held arrived afterwards as the deferred
+  seek. Reported from a device: thirteen outage swaps out of thirteen landed exactly on the held
+  place, and every one of them played 4 to 37 s ahead of it for 140 to 220 ms first, which on a
+  starving origin with a seam every 25 to 40 s reads as a channel jumping around rather than as a
+  recovery. The placement now goes into the manifest the fresh item loads
+  (`EXT-X-START:TIME-OFFSET`, `PRECISE=YES`), armed by segment rather than by seconds so a window
+  that slides between arming and serving still names the same content, and taken at the resolution
+  the playlist serves. Measured on the harness with one instrument across both arms: the fresh
+  item's first request went from eleven segments above the one the consumer had reached to the
+  segment the consumer was on, and the reported position went from 50.27 s above the held place to
+  never leaving it. The deferred seek stays as the fallback for a client that ignores the tag, and
+  is retired when the item did come up where it was asked for.
+- **An item's axis offset was measured on the item it was measured on (AE#454).** Between an
+  in-place swap and the fresh item reporting a seekable range, the retired item's offset was folded
+  into the fresh item's clock, which reads about zero, so the session published the retired item's
+  zero as its position: 70 to 80 s below the place it held in the field, and it flowed into the live
+  window's edge, which is a running maximum. The published playhead and the live window now hold
+  across the hand-off, bounded by the placement rather than by readiness. A cold join is unchanged.
+
+## [6.56.7] - 2026-08-30
+
+### Fixed
+
+- **A composition lands on the base, not on the axis (AE#418).** A reporter's retest of 6.56.6 had
+  every previous failure mode gone and exactly one frame left over on each correction, constant
+  rather than growing. The fixture pair isolates it: the FIRST placement into an item's timeline puts
+  the segment's first PRESENTED sample at its advertised start, and every later one puts its first
+  DECODED sample there instead, so a composition lands one presentation lead under the axis it
+  composes onto. Measured on two fixtures identical but for `-bf 3`: AVPlayer held a re-placed
+  segment from item 61.083 where the axis alone predicts 61.000 and the picture read -18.083 for the
+  rest of the run, against 61.000 and -18.000 without B-frames. The producer now publishes the gating
+  sample's own lead (pts minus dts) alongside the shift and the composition subtracts it, so the
+  reading confirms the prediction instead of correcting it. What this pays for is the placement that
+  cannot be measured at all, a seek burst reopening backwards inside the buffer: measured on that
+  arm, -23.166 s after two compositions and -27.166 s after three, both matching the picture exactly,
+  where 6.56.6 kept -23.083 and -27.000.
+
+## [6.56.6] - 2026-08-30
+
+### Fixed
+
+- **A measurement that may only agree is still a prediction (AE#418).** The VOD axis is read out of
+  `AVPlayerItem.loadedTimeRanges` after every seam, and that reading was then collapsed onto the
+  nearest axis the session had already published, which made the prediction the yardstick for the
+  measurement meant to check it. Reported from a retest on two devices: a reading matching no
+  prediction was thrown away, so a session kept composing to -26.152 s while two readings 400 s of
+  media apart both said -10.93 s, and one device ended 42.6 s wrong and stayed there for the rest of
+  the session; a reading one or two frames off the prediction was called a confirmation, so the
+  difference stayed in the axis and the next placement composed on top of it, walking the error past
+  the tolerance in six placements, after which every reading was refused. The reading is now the
+  axis. What decides whether it describes THIS placement is where it came from: a run that overlaps
+  nothing the item held when the placement was recorded, or one that opened above it. A start that
+  walked downward is the same run backfilling, which AVPlayer does after a run opens (measured: a run
+  that opened at 1522.6 read 1507.1 fifteen seconds later), and is never read. A placement counted
+  twice across a producer restart is undone by the next reading rather than carried, and a placement
+  superseded before its window closes says so instead of falling silent.
+
+- **The gate's offset is measured on the sample that is PRESENTED (AE#418).** It was taken on the
+  first packet's decode time. A segment opens on a random-access point in decode order, and with
+  B-frames that sample is presented `video_delay` frames after it is decoded, so the published axis
+  sat that far under the truth on every epoch of a B-frame source, which is most real content. The
+  gate's own line carried both numbers all along (`actual=42917 anchorPts=43000`), and the segment
+  bytes agree (tfdt 686672 with a first-sample composition offset of 1328 in a timescale of 16000,
+  the same 0.083 s). Measured with `play --picture-probe` on a new B-frame fixture that
+  `Scripts/timecode-fixture.sh` writes, mean `capErr` over 39 ticks: +0.113 s before, +0.031 s after,
+  against +0.030 s on the same fixture encoded without B-frames.
+
+- **A resampler reads a frame per what it was built for, at every site that keeps one (AE#452).** A
+  live transport-stream splice from 5.1 to stereo left a long-lived `SwrContext` reading six planes
+  from a frame carrying two, and the read past the end of the frame's plane array crashed the
+  session at the program boundary. The configuration a resampler was built from is a claim about
+  every later frame, so it is now re-checked per frame and the context rebuilt when it no longer
+  holds, at all three sites that keep one. Fix contributed by @tschuegy in #453, hardened across the
+  remaining sites here.
+
+## [6.56.5] - 2026-08-29
+
+### Fixed
+
+- **A live item's zero is where its playlist began, not where the producer began (AE#446).** AVPlayer
+  places a live playlist's content by the PLAYLIST it was handed, so an item's timeline starts at the
+  first segment that playlist listed. For the item a session starts with, that is the producer's first
+  segment and the two axes are the same one; for any item attached after the window has slid, which an
+  in-place swap does routinely, it is not, and the session had no term for the difference. Measured on
+  the harness: an item clock reading 70.01 s while its own seekable range ended at 42.00 s, a published
+  playhead of 71.41 s while the picture was at 121.4 s, and a rejoin to the place the viewer held that
+  aimed 50 s past it onto the live edge. The offset is measured rather than assumed and it verifies
+  itself, because one rule sizes both the playlist's first visible segment and the cache's eviction, so
+  the two floors slide together and their difference holds still (50.00 s at every sample across twelve
+  seconds of sliding). It is latched per item and re-measured when the item under the host changes, and
+  it reads 0 for the item a session starts with, so a live session that never swaps an item is
+  unchanged. Folded into the published playhead, the live edge, a seek's landing, and the sampled edge
+  a host scrub clamps against.
+
+- **The engine's own rejoin is no longer refused by the host scrubber's guard (AE#446).** The live-only
+  seek refusal is defence-in-depth for a host that draws a scrubber it should have hidden, and a client
+  that keeps its rewind outside the engine loads with no DVR window at all, so the outage swap's carried
+  position was rejected before it could land. A seek now carries its origin and only a host scrub is
+  refused; `seekableLiveRange` still reads nil on such a session, so nothing a host is told has moved.
+
+- **A rejoin's landing is measured against what the producer holds (AE#446).** At the moment a rejoin
+  runs, neither edge the engine publishes is true: `LiveWindow.edgeTime` is a running maximum an outage
+  freezes below the playhead that legitimately ran past it, and a freshly swapped item's `seekableEnd`
+  is a range it has not finished reporting. Clamping against either put a carried 71.40 s at 43.40 s,
+  four segments below the consumer's own last fetch. The resident range is sampled at the seek instead
+  (`residentCeilingOutputSeconds` is the other end of AE#441's floor), because the only thing that can
+  disqualify a position the session itself served is eviction.
+
+### Added
+
+- **`NativeAVPlayerHost.seekableStart`**, the start of the item's seekable range. Only the end was ever
+  mirrored, which follows a live edge and cannot answer whether a position is inside the item at all.
+
+- **`aetherctl live --live-only`** loads with no DVR window. Because live-only retention is a sliding
+  60 s, it is the only arm in which an item's own axis is observable at all; every DVR leg passed
+  because an 1800 s window does not slide inside one run.
+
+## [6.56.4] - 2026-08-29
+
+### Fixed
+
+- **A third concurrent reader against one origin was parked, not slowed (AE#450).** The reader's
+  long-lived transport pool allowed two connections per host, and the pool is a `static let`, so
+  those two were the whole process's allowance to one origin, shared by the pump, the subtitle side
+  reader, the forward prefetcher and one more pump per playback surface. On the bounded pool that
+  number throttles, because every request on it ends. On the open-ended pool nothing ahead of the
+  third request is going to end, so URLSession parked it with no callback, no error and no metrics,
+  the open spent its full 15 s deadline, and the load reported a source that would not open for a
+  queue the engine had built itself. The reporter measured four live tiles on one Jellyfin origin
+  while three concurrent `curl` pulls of the same endpoints flowed at full rate. What the engine
+  asks of one origin is now bounded by `OriginRequestBudget` alone (AE#377), which counts requests
+  rather than connections, waits with a budget, says that it waited, and lowers itself when the
+  origin refuses. `LoadOptions.maxConcurrentSourceRequests == nil` documented "counts but does not
+  cap" and a lower ceiling underneath it made that untrue, in silence.
+
+- **A connection that never delivers a first byte says so (AE#450).** The only line describing a
+  connection that delivers nothing was armed at the stall threshold, 20 s, which is longer than the
+  arcs that give up on a source first, so the one outcome it could never describe was the one where
+  the first byte never comes. A generation with nothing delivered is now reported at a quarter of
+  the threshold, capped at 5 s, and the line carries how many requests the engine holds open against
+  that origin next to what the transport pool allows: a request parked in the transport and an
+  origin sitting on the request look identical from everywhere downstream, and they take different
+  fixes. It reports, it never acts, so nothing about when a connection ends has changed.
+
+- **A concurrent session's segment cache is no longer swept away for being an hour old (AE#451).** A
+  session directory's creation date is when the session STARTED, so an hour in, a live session and a
+  crashed one read identically, and constructing a second `SegmentCache` deleted the running one's
+  directory with every segment in it. Each cache now holds an `flock(2)` on its own session marker for
+  its whole life and the sweep skips any candidate whose marker is still held. `flock` rather than
+  `fcntl`, because flock locks belong to the open file description, so a second cache in the same
+  process is refused too, which is the reported case; the kernel drops the lock when a process dies, so
+  a crashed sibling still sweeps on age exactly as before. An in-process registry would not have covered
+  it: a non-sandboxed process shares the temporary directory with its siblings per USER, not per process.
+
+- **A segment the cache no longer holds stops being advertised as one (AE#451).** The bookkeeping
+  outlived the file: `entries[index]` still named a deleted segment, so the server took the path,
+  stat'ed nothing, and answered 404 for an in-range VOD index, which AVPlayer treats as terminal
+  `loadFailed` rather than as something to re-fetch. The AE#50 in-range rule existed only in the data
+  path. An entry now stops answering where it is redeemed, the file path carries the same
+  classification as the data path (in range is 503, never 404), and a store into a directory that
+  vanished restores it instead of leaving the session permanently unable to write.
+
+## [6.56.3] - 2026-08-29
+
+### Fixed
+
+- **An in-place item swap keeps the contract its session was loaded under (AE#440).** A swap replaces the
+  item under a session that stays whole, but all six swap sites called the host's `load` with the item
+  arguments only, so every one of them silently re-declared the session as VOD, header-less, and buffered
+  at the loopback default. The reporter found it from outside as a live rejoin that produced no AE#440
+  line at all, decision or witness: the lever was not silent, it was disarmed. The same `isLive: false`
+  also reached the AE#287 premature-end recovery, which is gated on it, on a live session that had just
+  closed a window with ENDLIST. The load contract is now a value the host holds for the session, and
+  `swapItem` carries it forward, so a swap has no contract argument left to get wrong. On the remote-HLS
+  bypass this also restores the origin's auth headers, the adaptive forward buffer, the readiness
+  deadline and the carriage probe across a recovery reload, all of which a swap used to drop.
+
+- **A live-join witness that ended before its first sample says so instead of printing a placeholder
+  (AE#440).** A refusal whose hold ended inside the first 250 ms reported `ahead 0.00s, empty=true`, which
+  is the value the sampler was initialised with rather than anything it read, and it contradicted the
+  `empty=false` the refusal itself had measured one line earlier. The reading is now optional and the
+  line names the absence, so a reader can tell a measured starved buffer from a witness that never got
+  to look.
+
+- **A join decision abandoned mid-reading says so (AE#440).** The buffer reading behind the decision is
+  asynchronous, so a hold that ends while it is in flight is correctly left alone rather than acted on
+  from a state that no longer exists. It used to be left alone silently, which is the third and last of
+  the silent exits this report walked into, and the one a rejoin swap takes: 70 ms of hold, no line, and
+  no way from outside to tell it apart from a lever that was never armed for that path.
+
+### Changed
+
+- **A rate-only gate that reaches its cap now names what the dwell did (AE#449).** The cap line carries
+  the number of times the cadence run broke and the longest unbroken run it managed, so a `.multiple`
+  that fails to settle says whether the panel kept changing what it reported or stopped reporting at all.
+  The field capture that prompted it never reached the cap; the reporter's caution came from `mode check`
+  reading 35.456 Hz against a nominal 50.002, which cannot reach the gate's own reading (that one is a
+  single tick's mode interval, not a throughput average) but can break a run through the freshness guard.
+
+## [6.56.2] - 2026-08-29
+
+### Fixed
+
+- **A refused live-join hold now reports every ending, including the ordinary one (AE#440).** The witness
+  added in 6.56.1 promised exactly one line per refusal, on the grounds that a witness silent about its
+  own negative cannot be told from one that never ran. The first field capture produced three refusals
+  and one line. The cause was an ordering rather than a missing case: the override's one-shot is spent on
+  the `.playing` edge so it can never reach a mid-stream rebuffer, which makes the rate rolling and the
+  one-shot being spent the same event, and the witness read that spend first and as a reason to stop
+  without a line. The most common way a hold ends was therefore the one that said nothing. The ending is
+  now a pure decision and all of its branches emit, with a line of their own for an override that cut the
+  wait short (the opposite fact from the wait ending on its own) and for an item replaced under the
+  witness (a join abandoned rather than resolved). The one-witness-per-load flag is also reset per load,
+  so a reused host arms a witness on its second live join instead of none.
+
+- **A panel already holding an integer multiple of the requested rate settles the rate-only gate
+  (AE#449).** The 6.56.1 fix released the gate as soon as the panel was measurably running the requested
+  rate, and left the integer multiple spending the full 2 s cap, because one reading cannot tell a panel
+  that will stay at 50.002 Hz from one still switching to the 25 Hz that was asked for. The device
+  capture that decides it came back twice: the panel read 50.002 Hz across the whole cap with the picture
+  up at t+0.06s and visibly frozen for 2.05 s and 2.02 s, while the 50 fps tunes in the same run reached
+  motion 44 to 84 ms after picture. What separates the two cases is time rather than a single reading, so
+  a multiple now settles after 300 ms of holding that cadence unbroken, and any tick reading a different
+  cadence or none at all restarts the run. This does not claim no switch will begin later, and the 2 s
+  cap never covered that either: a real switch on this hardware runs about 2.8 s, so the gate was already
+  releasing into one.
+
+## [6.56.1] - 2026-08-29
+
+### Fixed
+
+- **The presentation axis is now measured where AVPlayer placed a segment, not predicted from a fetch
+  (AE#418).** After a seek burst the reporter's captions ran 2 to 3 s BEHIND the picture, the opposite
+  direction from every earlier round. A fetch is not a placement: during a burst AVPlayer asks for a
+  segment and seeks away before its bytes are used, so nothing on its timeline moves, while this side had
+  already folded that epoch's worth into the axis. Every later placement then composed onto a base
+  AVPlayer never carried, permanently for the session (`axis 0.000 -> -3.045 -> -5.088 -> -10.677`, where
+  the honest value was -8.634). His own host log carried the disproof in a line that was already there:
+  the item's loaded range began at 791.2 and `788.204 + 3.045 = 791.249`. After every VOD seam the engine
+  now reads `AVPlayerItem.loadedTimeRanges` for the range holding the playhead, inverts the placement,
+  and either confirms the base it composed onto or corrects it, and it only ever collapses onto an axis
+  this session published, so a range read before the bytes landed or after eviction trimmed its start is
+  refused rather than believed. The harness confirms the oracle exactly: a resume predicting a seam at
+  52.000 reads loaded [52.000-64.958], a far seek predicting 21.000 reads [21.000-38.622].
+
+- **An epoch worth nothing still publishes the seam it owns (AE#448).** After a seek whose restart opened
+  a fresh epoch, the reported clock sat about 1.7 s above the frame on screen for seven seconds and then
+  settled by itself. The axis was right throughout; the seam was missing. A placement published only when
+  the placed epoch was worth something and the shift table dropped a zero rather than recording it, so an
+  epoch whose first segment opens exactly on its boundary announced nothing, while its bytes still take
+  over everything from their placement upward. After a backward seek that stretch was still answered by an
+  older epoch's seam: `prodShift=-10.67s hostShift=-9.00s seams=2`, and the 1.667 s between them healed
+  only when playback crossed the newer seam. The axis value for such an epoch is unchanged; what it now
+  records is that an epoch begins here. Measured on the same arm, the landing goes from `rendered=4.67
+  target=3.00` to `rendered=3.00 target=3.00`, within one frame from the first tick.
+
+- **A display-criteria write for a rate the panel already runs no longer spends the full 2 s cap holding
+  `play()` (AE#449).** The gate had no way to tell "the handshake is still in flight" from "there was
+  never anything to hand over". A rate-only write of 50.000 to a display already running 50.002 Hz posts
+  a mode-switch start, never posts an end, and held `isDisplayModeSwitchInProgress` for the whole cap:
+  eight of nine gates in an 18 minute session spent the full 2000 ms, with `play()` released in the same
+  millisecond the cap expired every time. A display link armed at gate entry now reports the mode the
+  panel is running per tick, and a rate-only write whose requested rate the panel already runs has nothing
+  left to settle. Deliberately narrow: engine rate-only writes, exact match only (a 50.002 Hz panel
+  satisfies a 25.000 request, but so would a switch to 25 still in flight, so a multiple is measured and
+  logged rather than acted on), and a stale display link keeps the gate waiting, because a panel not
+  putting frames on screen is what a blanked HDMI re-sync looks like from in here.
+
+### Changed
+
+- **The live `TARGETDURATION` seal separates a floor that has no meter from one with no measurement yet
+  (AE#447).** The cadence meter is built only for live INGEST sources, where an upstream hands over
+  finished segments whose arrival intervals can be observed; a raw MPEG-TS source is cut inside the engine
+  and has no arrival cadence at all. Both cases printed `measured floor none yet`, which reads as pending,
+  and two device runs were read that way. A source with no meter now says so, `none yet` is kept for the
+  one case it was right about, and the served value is unchanged in both.
+
+- **A refused live-join hold is now sampled while it stands (AE#440).** The guard that may cut AVPlayer's
+  stall-avoidance wait short decides on a transport-status or waiting-reason change and nothing else
+  re-reads the buffer, so a join that begins starved and fills while the reason stands still gets no
+  second look and left no line saying whether that happened. A refused hold is sampled every 250 ms for up
+  to 5 s, which outlives both holds measured in the field (1.55 to 2.81 s) and resolves inside the
+  shortest, and exactly one line reports which of three things happened: the cushion reached the floor
+  with the hold still standing, the hold ended first, or the budget ran out. All three speak, because a
+  witness silent about its own negative cannot be told from one that never ran. It observes only: starting
+  on a cushion that has just crossed and is still climbing is the bet the floor exists to refuse.
+
+## [6.56.0] - 2026-08-29
+
+### Fixed
+
+- **An outage rejoin lands where the session was held, and no longer at the live edge (AE#446).** A live
+  seek clamped its target against `LiveWindow.edgeTime`, a running maximum over publish ticks, and
+  converted it by subtracting that edge from the item's `seekableEnd` sampled now. The pair describes one
+  state only while both come from the same epoch, and a rejoin runs in the two moments where they do not:
+  during an outage the published edge freezes, because an item that has seen an ENDLIST never reloads its
+  playlist, while the playhead runs on through the runway. Measured on a device, a viewer 31 s back
+  rejoined 29 s past the place it held with its timeshift discarded. Both ends now read one sample, the
+  edge coming from the item being seeked and the conversion running through the seam-aware
+  `PresentationAxisMap` the engine already uses for scrub thumbnails, so the shift in force for that
+  position is the one applied.
+
+- **The outage hold now lasts as long as the read it depends on (AE#446).** The no-cut watchdog abandons
+  the source read 35 s after the last cut, and that read is the only thing able to observe the source
+  coming back. Measured on the harness with a 76 s outage: the read was aborted while 46 s of runway were
+  still being handed to the consumer, so the source delivering again at +76 s was never seen and the
+  session held its last frame for the rest of the run. A starvation verdict now defers while the closed
+  window still holds segments above the consumer's fetch point, bounded by the hold budget that already
+  exists, so the deferral lasts only while pictures are still being delivered. A wedged cutter is
+  untouched. Verified across three legs: a 25 s and a 76 s outage both rejoin with zero segments skipped,
+  and a 150 s outage spends the budget and hands the session to the host rather than swapping into it.
+
+- **A read that was given up no longer reads as a source delivering again (AE#446).** The no-cut exit
+  flushes a last partial segment in the same millisecond as its abort, which refreshes the finalize
+  timestamp, so the production-resumed check saw "delivering again" for one cadence and the watcher
+  swapped the item into a window whose source was dead. An abandoned read now blocks both the swap and
+  the watcher, and says so rather than polling a source nobody is reading.
+
+- **The served `TARGETDURATION` is decided at the resolution the playlist serves it in (AE#447).** A live
+  `#EXTINF` is `nextStart - startSeconds`, a difference of two accumulated item-axis doubles, and the
+  operands carry different representation error. On a reporting stack cutting a strictly 2.000 s GOP, 74
+  of 80 segments came out exactly 2.0 and six landed one to four ulp above it. The seal takes the max over
+  the window, so one is enough: `ceil` charged a whole second for an excess of 4e-16, and `3 x TD` turned
+  that into a 9 s first-manifest holdback instead of 6 s, a measured 1.07 to 1.09 s on every zap. The
+  playlist writes `#EXTINF` with `%.3f`, so a millisecond is the finest distinction any client can read,
+  and every term of the derivation is now taken at that resolution, with rounding that matches the
+  formatter so the value is never below what the playlist prints. A genuine excess is unaffected: 2.0006 s
+  still seals at 3. The same error runs the other way through the first-serve gate, where the float sum of
+  three 2.000 s segments lands a hair below 6.0 for some first-segment starts, which would have held for a
+  fourth segment nobody needs on some sessions and not others; the cushion check and the first-serve
+  account now use the same served resolution as the value they are checked against.
+
+- **The `TARGETDURATION` floor is sealed from what the source did, not from what it advertised (AE#447).**
+  Four terms pushed it up, and two of them were the engine measuring its own wait. The cadence meter was
+  seeded with the upstream's self-declared `TARGETDURATION`, which is the exact number the class exists to
+  distrust; the playlist poll ran at half that same advert, so a 2.000 s origin advertising 3 was sampled
+  every 1.5 s and its arrivals quantized upward (measured floor 3.133 s on one join of three); the floor
+  read the still-open gap from inside the gate that was holding it open, which feeds back through the
+  holdback (three consecutive joins sealed 3, then 4, then 4); and an arrival interval entered as
+  `ceil(gap)`, asking for `4.5 x gap` of startup depth that nobody chose, where the patience it answers to
+  is `1.5 x TD`. The poll now runs at half the segment duration the upstream really served, the floor
+  takes closed intervals and the longest segment actually delivered, and the whole derivation is printed
+  once per session so the term that carried a seal is nameable from a log rather than by elimination.
+
+- **A subtitle rendition serves the sealed `TARGETDURATION` (AE#447).** Its playlist rebuilt the
+  derivation by hand, so a rendition could advertise a different depth from the video it belongs to. Both
+  it and the whole-program sideload call the shared derivation now.
+
+### Changed
+
+- **The large-allocation census names the allocator family from its growth ladder (AE#445).** A footprint
+  pinned to one REALLOC-tagged block on an exact x1.25 ladder is attributable from the ratio alone:
+  Foundation's `Data` adds `newLength >> 2` above 128 KB, `av_fast_realloc` adds a sixteenth, the AVIO
+  dynamic buffer adds a half, Swift's `Array` doubles. The census prints `bigGrowth=1.2501x(Data)` beside
+  `bigExact`, with the memprobe walk and the 8 Hz trigger walk each keeping their own previous value,
+  since a shared one would report the ratio the other sampler's interval produced. An unrecognised ratio
+  is printed bare rather than rounded into the nearest family.
+
+- **`setLargeAllocationCensusEnabled` takes a `triggerCaptureCap` (0 = uncapped).** A steady mux-rate climb
+  spends one capture per threshold crossed, so the previously fixed twelve ran out 4.4 minutes before the
+  reporting session's kill and the decisive final step survived only in the 30 s grid.
+
+## [6.55.0] - 2026-08-28
+
+### Changed
+
+- **A live join no longer holds its first frame still while AVPlayer second-guesses the cushion it
+  already has: `LoadOptions.liveJoinStartsImmediately` now defaults to `true` (AE#440).** The device A/B
+  the opt-in was waiting for ran on 6.53.0: two runs of ten channel changes on the reporting stack, press
+  to moving picture fell from 6.4 / 6.5 / 7.2 s to 4.3 / 4.8 / 5.1 / 5.6 s, press to first PICTURE was
+  unchanged at 3.4 to 3.9 s in both arms, and stalls and dropped frames stayed at zero in both. What it
+  removes is exactly the frozen tail. Cold joins, where the tuner spin-up is inside the first byte, were
+  identical in both arms, the guards keeping the lever out of the starved case. Hosts that want
+  AVPlayer's own policy for the join set the option `false`.
+
+### Fixed
+
+- **A live DVR window deeper than 180 segments froze its own edge, and then killed the source behind
+  it (AE#443).** The window is sized in seconds from what a host asks for; the producer refused to hold
+  more than a fixed count of segments. The playlist does not start sliding until the window's worth of
+  segments exists, so for any deeper window the cache filled to that count first and the pump parked
+  against it for the rest of the session, at exactly 180 x the segment duration. Reproduced on the
+  loopback fixture with no seek and no remote server: park at 179 s on a 1 s cadence, the edge frozen
+  from that second, then the 503 blocking reloads, the item death and the rejoin ladder the reporter
+  had been reading as a dead origin for three campaigns. The park is also what stopped his origin: a
+  parked pump is not reading, the reader's runway fills at mux rate (measured 0 to 16 MiB across the
+  park), and then a single-connection live source backs up and dies. The window is now sized by what
+  the session can actually hold, the retention budget over the observed segment size under a playlist
+  ceiling, so it slides at its own depth and `seekableLiveRange` advertises the depth that exists. The
+  resident cap is a backstop above the window instead of a bound below it.
+
+- **`rx` survives an item swap (AE#443).** Summing the access log's entries fixed the fall inside one
+  item; an `AVPlayerItem`'s log holds only its own entries, so the #93 stage-2 recovery replaced the
+  counter along with the item (measured by the reporter: 1229.1 MB, absent, 34.3 MB). A departing
+  item's totals are folded into the session's at the swap, and the gap between two items reports the
+  total so far rather than nothing.
+
+- **The stall ladder no longer reports a pump this engine is holding as a starved source (AE#443).**
+  "No segment finalized" has two causes that point in opposite directions, and only one of them is
+  about the origin.
+
+- **A live resume clamp is measured from the bound it lands on (AE#441).** Since 6.52.0 the clamp lands
+  on the honest floor, the DVR window intersected with what the cache actually holds, but it still
+  TRIGGERED on window arithmetic. Where retention runs short of the window for a session's whole life
+  (the reporting strip: a 420 s window advertising ~405 s of depth), a resume between the real depth and
+  the window therefore got no clamp at all, for a position the cache no longer held. Both ends read the
+  same bound now. The margin applies only once the window is sliding: before it fills, the floor is the
+  session's own start rather than an eviction frontier, and a margin there would only shove a resume near
+  the start forward.
+
+- **Eviction stops at the consumer's next fetch, so a segment cannot be unlinked while it is being served
+  (AE#441).** `live window slid past the consumer` read the LAST fetch when the cost of a slide is decided
+  by the NEXT one: the consumer walks indices forward, so everything below the declared target is already
+  in AVPlayer's buffer and a viewer parked at the floor sits one segment below `firstVisible` for part of
+  every slide with nothing lost. Chasing the four benign lines in the AE#441 retest turned up why that
+  tolerance is not cosmetic. At exactly that off-by-one, eviction unlinked the segment currently being
+  served, and a serve holds a URL rather than a file handle, so the gap is a 404 for an index the playlist
+  offered when it was asked for. Eviction now stops at the fetch point, which is the bound `evictBelow`
+  already documented for itself, and never trails `firstVisible` by more than that one segment, so a
+  consumer that stopped fetching cannot pin retention behind it.
+
+- **A live window whose source has stopped delivering is served as the finite asset it is (AE#446).** A
+  live playlist whose tail stops moving stops being fetched: AVPlayer reloads it, finds it unchanged
+  (-12888), and after a handful of those it stops polling AND stops requesting segments, including ones
+  it has never downloaded that the playlist still lists and that are resident on disk. Measured with a
+  viewer 147 s inside the window and the source frozen: six more segments at playback rate, then silence
+  with 115 s of runway sitting on disk, and a self-directed rejoin at edge-minus-HOLD-BACK when the
+  playlist finally moved again (forward step 117.76 s). While the source is not delivering and the viewer
+  still has resident segments ahead, the window is now served with an ENDLIST, same numbering, every
+  segment still listed, which carries the whole runway (166.75 s of playback, no item deaths, no -12888)
+  where the sliding-window form managed 24 s. Two cheaper answers, a byte-distinct refresh tag and a
+  clock-driven MEDIA-SEQUENCE slide, were built, measured and discarded, and are documented as dead ends:
+  what AVPlayer watches is the tail. A source that comes back is picked up by an item swap, which is the
+  AE#442 one and therefore keeps the place, and `didPlayToEndTime` at the end of such a window is not
+  forwarded as `.ended`.
+
+- **A host reader's autoreleased objects no longer strand for the length of a live session (AE#445).**
+  `HLSSegmentProducer` pumps on a bare `Thread`, which has no autorelease pool of its own, and FFmpeg's
+  read callback reaches the host's `IOReader` from inside that loop. Anything Foundation hands a custom
+  reader back at +0 (an `NSData` out of `FileHandle`, for instance) was therefore held until the session
+  ended, which on a live source that never EOFs is unbounded by construction. The engine had paid for this
+  twice already and fixed it one reader down both times; the pool now sits at `CustomIOReaderBridge`, the
+  single door every custom reader comes through, around read, seek, the size and seekability probes and
+  cancel. Measured on the new `aetherctl customio --live` harness at a 0.95 MB/s mux rate: 0.95 MB/s of
+  retention before, 0.00 after. A reader that preads into the buffer the bridge hands it allocates nothing
+  per read and was never affected by this: that arm is the harness default now and measures flat (ratio
+  -0.03 over 541 s, 0.00 with a 300 s DVR window) across 900 MB of source.
+
+- **The join lever now reads how deep the buffer is, not merely that it is non-empty (AE#440).**
+  `isPlaybackBufferEmpty` is the precondition `AVPlayer.h` documents, not a measure of safety: a single
+  served fragment reads `false` exactly as a four-second cushion does. Sampling the real hold on hardware
+  found 3.7 to 4.9 s ahead of the playhead throughout, which is why cutting it short cost nothing there;
+  behind the same flag a genuinely starved join holds a fraction of a second, and starting there trades a
+  still picture for an immediate stall. The lever now also requires 1.5 s of contiguous buffer ahead of
+  the playhead, an island past a gap not counting, and says so once per load when the floor is not met.
+- **The lever is evaluated when the waiting REASON changes, not only when the transport status does
+  (AE#440).** A live join runs `waitingToPlay(EvaluatingBufferingRate)` -> `waitingToPlay(ToMinimizeStalls)`
+  -> `playing`, and only the middle stretch is the hold that may be cut short. Since both waiting states
+  are the same `timeControlStatus`, whether the lever ever saw its own case rested on AVFoundation
+  happening to republish an unchanged status. `reasonForWaitingToPlay` is now observed in its own right.
+- **The readings behind that decision are taken off the main actor (AE#422 applied to AE#440).** The
+  guard runs while AVPlayer holds a presented frame, which on the starved half of the two mechanisms is
+  exactly the state where the media server is least likely to answer, and it was reading
+  `isPlaybackBufferEmpty` synchronously on the main actor. All three figures are now one batched
+  off-main read, and the decision is re-checked against the state that exists after it returns.
+
+## [6.54.0] - 2026-08-28
+
+### Fixed
+
+- **A live recovery that swaps the item in place keeps the place it held.** The stage-2 / `#65`
+  recovery reload replaces the `AVPlayerItem` under a session that stays whole: same
+  `HLSVideoEngine`, same segment cache, same served playlist. It nevertheless rejoined at the live
+  edge, because `LiveReloadPolicy` applied one rule to every live reload. That rule was written for
+  the pipeline rebuild, where `stopInternal` takes the cache with it and the pre-reload position does
+  not merely go stale, it stops existing. On this path the position is still resident content, and
+  since 6.52.0 the session can prove it. The recovery now rejoins at the playhead clamped into
+  `seekableLiveRange`, and keeps the edge rejoin wherever nothing can vouch for the position:
+  remote-HLS live, the software live path, and a viewer who was at the edge anyway. The distance that
+  decides is the last one sampled while the clock was actually moving, because a stall inflates
+  `behindLiveSeconds` by its own duration and would otherwise drag an edge viewer backwards by
+  however long their picture was frozen. Measured on the harness, a viewer 102 s inside an 1800 s
+  window when the source froze: the forward step drops from 100.99 s to 1.10 s, and the session no
+  longer dies a second time, because a rejoin at the edge of a source that has stopped delivering
+  starves straight back into the ladder it came from.
+- **A poll a dead source can never answer is no longer held.** A viewer parked inside the DVR window
+  stalled when the upstream froze, with every segment ahead of them already in the cache. AVPlayer
+  refreshes the playlist with a blocking reload and issues no segment requests while one is
+  outstanding, and an unsatisfiable hold runs 3 x TARGETDURATION before RFC 8216bis allows the 503.
+  The session now withdraws `CAN-BLOCK-RELOAD` as soon as the source misses its own cadence by more
+  than 1.5 x TARGETDURATION, which is AVPlayer's own patience for an unchanged live playlist, rather
+  than waiting for the no-cut watchdog at 35 s. This is the 5.x `liveProductionHalted` policy applied
+  one watchdog earlier, and it is latched for the same reason. A poll already in flight when the
+  source died wakes in one-second slices instead of riding out the whole bound. Measured: first
+  segment fetch back 9 s sooner, `playbackStalled` across the run 3 to 1, and the `-15410` that used
+  to end the starvation by accident does not occur at all.
+
+## [6.53.0] - 2026-08-28
+
+### Fixed
+
+- **A session counter describes the session now, not the object the session replaced.** Every
+  "lifetime" number in `LiveTelemetry` was read straight off the live instance that holds it, so it
+  fell back to a fresh instance's partial total in the middle of a healthy session, with nothing in
+  the line to say it had. `networkTransferredBytes` and `droppedFrameCount` read the newest
+  `AVPlayerItemAccessLogEvent`, whose counters are totals per entry, and AVFoundation opens a new
+  entry whenever the playback session changes under it. Measured on the live loopback harness, one
+  origin connection and no producer restart in the whole run: `rx` went 3.4 to 2.2 to 0.6 MB and
+  `drop` 44 to 0 while the session played on. Summed across entries, both stay monotonic over the
+  same run. `demuxerBytesFetched`, `muxedBytesLifetime` and `producerRestartCount` had the same
+  defect one layer down: a live reopen rebuilds the demuxer and the producer, and a muxer rotation
+  rebuilds the muxer, so each replacement now folds the outgoing instance's totals into the
+  session's. A reporter spent two rounds attributing one of these falls to an origin socket event
+  that never happened (AE#443).
+- **`producerRestartCount` no longer claims more than it can see.** A producer restarts at most once,
+  so the field was a 0/1 flag on the current instance rather than a count for the session, and on a
+  live session it is 0 by construction: the live recoveries replace the producer instead of
+  restarting one, and say so in the log (`live reopen attempt`, `live producer rebuilt in place`).
+  It counts across producers now, and its documentation states the live case.
+
+### Changed
+
+- **`aetherctl` shows the origin link next to the consumer link.** The two are not the same and on
+  the native path they cannot be: `rx` is what AVPlayer pulled from the engine's own loopback server,
+  while an origin question is about the source. `play` prints `origin=` beside `rx=`, and `live`
+  prints `origin=` and `restarts=` per tick, which is where a `--drop-after` recovery is driven.
+
+## [6.52.0] - 2026-08-28
+
+### Added
+
+- **`LoadOptions.liveJoinStartsImmediately` cuts AVPlayer's stall-avoidance hold short at a live join.**
+  Past the first serve AVPlayer can present the first frame and then hold it perfectly still while it
+  decides whether its cushion will sustain playback (`AVPlayerWaitingToMinimizeStallsReason`). Against a
+  source delivered at 1x that cushion is bought in wall-clock time, and nothing on the item shortens it:
+  a host measured 1.5 to 2.8 s of bit-static picture on 9 of 11 consecutive tunes on an Apple TV 4K, HDMI
+  capture confirming the freeze, with `preferredForwardBufferDuration` measured inert. Set, the first such
+  hold of a live session is cut short with `playImmediately(atRate:)`, once per load and only over a
+  buffer AVPlayer reports as non-empty; every later hold keeps AVPlayer's own policy, so a mid-stream
+  rebuffer is untouched. Off by default: the trade is the one `.fastZap` already prices, playback starting
+  on a thinner cushion (AE#440).
+- **`LoadOptions.clampsLiveResumeToWindow` hands live resume policy to the host.** `play()` moves a
+  behind-live playhead by itself (edge snap on a live-only source more than 45 s back, a landing above the
+  retained floor when a DVR window has slid past it). Both are recoveries from a position that no longer
+  exists, but they run inside `play()` and land before a host with its own live-pause semantics can
+  decide. Set `false` and `play()` moves nothing; the engine keeps publishing `behindLiveSeconds` and
+  `seekableLiveRange`, and `seekToLiveEdge()` performs the same recovery on request. Defaults to `true`,
+  today's behaviour, and the decision is now one pure function rather than two inline branches (AE#444).
+- **`aetherctl play` prints a `PHASE` line on every `playbackPhase` edge**, and takes
+  `--live-start-immediately`. The 1 Hz telemetry samples the phase, which cannot tell a start signal apart
+  from the roll. Its live telemetry also carries `edge=`, `behind=` and `range=` now, which previously
+  needed a patched copy of the CLI to sample at all.
+
+### Fixed
+
+- **`seekableLiveRange` advertised a rewind depth the session had never written.** The lower bound was
+  `max(0, edgeTime - dvrWindowSeconds)`, pure window arithmetic that never consulted the segment cache, so
+  it over-promised by the session's join offset (measured: a session joined 181 s into a source advertised
+  a floor of 0.00, while a seek to 0.20 landed at 181.66) and again whenever retention kept less than the
+  window (measured: 24 s kept against a 30 s window). The bound is now the intersection of the window and
+  what the cache actually holds and can play forward from, and `seek(to:)` clamps to the same floor, so
+  the engine's own live resume clamp can no longer aim at a position that was never retained either. The
+  floor is a backward-contiguous walk from the newest resident segment, not the cache's lowest index: a
+  minimum is not proof of coverage. Software live sessions have no such cache and are unchanged (AE#441).
+- **`playbackPhase` reported `.playing` before anything moved.** `state` is transport intent and every
+  autostart writes it the moment `play()` has been called; on a live join the rate can roll seconds later.
+  The phase followed it, so the one observable documented as the single source of truth for what playback
+  is doing published `.playing` (and, from AVPlayer's pre-play status arriving afterwards, a millisecond
+  of `.paused`) over a picture that was standing still. It now reports `.loading` until the transport has
+  rolled once in the load, and turns `.playing` on the roll itself. `state` is unchanged; a host that
+  needs motion rather than intent should observe `$playbackPhase` (AE#440).
+
+## [6.51.0] - 2026-08-28
+
+### Added
+
+- **The 1 Hz `[SWDiag]` line describes cadence, not only a frame count.** A capture of a visibly
+  juddering software-path session read healthy on every field it had: the panel was on the content
+  rate, `enq` held at 24, the parked FIFO was steady, and the display layer dropped nothing and
+  accumulated no delay. `enq` is a count per wall second taken in the DECODER callback, so an even
+  timeline, one with a doubled interval or a duplicate timestamp, and one where a frame never
+  reached the layer all read the same. Four fields separate them: `disp` counts frames actually
+  handed to the queue target, `lost` counts the ones that never got there (unschedulable timestamps,
+  sample buffers that would not build), `dpts` reports the shortest and longest gap between the
+  timestamps handed over, and `vLead` reports the video cushion at its lowest over the interval,
+  next to the audio cushion `aLead` has always carried. `parked` is now `parkedPkts`, because it
+  counts undecoded PACKETS and was read as a video queue depth.
+
+### Changed
+
+- **Software-path frames carry their duration.** The reorder buffer already holds the successor
+  when a frame goes out, so `CMSampleTimingInfo.duration` is exact and costs no extra latency. The
+  last frame of a stream keeps an invalid duration on purpose: at end of media that is the frame
+  that stays on screen.
+- **The `[applySubtitleEvent]` line names the open-ended PGS placeholder** instead of printing it as
+  a cue that ends 4294967.3 s after it starts. A PGS composition carries no end of its own; the
+  successor's trim closes it.
+
+## [6.50.1] - 2026-08-27
+
+### Fixed
+
+- **The H.264 `CODECS` attribute misspelled any profile that carries a constraint flag.** The
+  master's entry was formatted straight from `AVCodecParameters.profile`, and that field is not a
+  bare `profile_idc`: libavcodec ORs the constraint flags into the high bits, so Constrained Baseline
+  arrives as `66|AV_PROFILE_H264_CONSTRAINED` = 578. `%02X` is a minimum width rather than a maximum,
+  so it printed as three digits and the attribute came out `avc1.2420028`, seven hex digits where RFC
+  6381 defines exactly six. Constrained High and the High 10 / 4:2:2 / 4:4:4 Intra profiles overflow
+  the same way; Main and High carry no flags, which is why remuxed sources never showed it. The
+  hardcoded middle byte was the other half of it: `profile_compatibility` carries those same
+  constraint flags, and declaring zero for every source contradicted the sample entry the muxer
+  writes from the same extradata.
+
+  All three bytes now come from the source in whatever form it carries them, the way the HEVC branch
+  already worked: the avcC states them outright, an MPEG-TS stream states them in the first three
+  bytes of its SPS, and only a source with neither falls back to the codecpar fields, masked, with
+  the two flags libavcodec preserved mapped back into the compatibility byte. Deriving the attribute
+  from the same extradata the muxer stream-copies into the sample entry is what keeps the manifest
+  and the init segment from disagreeing by construction. Only the manifest attribute changes, no
+  segment or init byte moves, and only the master route is affected: a media-direct session declares
+  no `CODECS` at all. Sources whose profile carries no constraint flags are byte-identical before and
+  after, verified side by side on the same fixtures.
+
+  Not claimed: that the malformed string broke playback. macOS AVFoundation accepted both spellings
+  in an A/B on identical media, so this is a specification violation whose consequence on tvOS is
+  untested.
+
+## [6.50.0] - 2026-08-27
+
+### Fixed
+
+- **The local HLS origin answered anyone on the same network, not only this session.** The listener
+  binds `0.0.0.0` so an AirPlay receiver can reach it over the LAN (#86), which also puts it in front
+  of every other host on that network, and there was no access control at all: the endpoint names are
+  fixed (`/master.m3u8`, `/media.m3u8`, `/init.mp4`, `/segN.mp4`) and the peer address was read for a
+  diagnostic line rather than to filter, so the ephemeral port was the only thing a scan on the same
+  WiFi had to find before it could pull the stream that was playing. Every path now carries a 128-bit
+  per-session token as its first component, and a request without it is refused before it reaches the
+  router. Nothing else had to change: playlist URIs are relative, so segments, the init segment and
+  the subtitle renditions resolve under the prefix on their own, and only the three entry-point
+  accessors name it. `AirPlayPlaylistDecision.receiverURL` used to overwrite the whole path when it
+  swapped in `media.m3u8`, which would have handed the receiver an address the server now refuses; it
+  replaces the last component and keeps what precedes it.
+
+  Worth stating plainly, so this is not read as more than it was: no path traversal existed and none
+  is added (subtitle paths parse as integers, segments come from memory, no request maps to the file
+  system), and no credential was ever reachable there. What was reachable was the stream itself.
+
+### Changed
+
+- **FFmpegBuild 2.5.0, for a libzvbi security update.** libzvbi 0.2.45 fixes an out-of-bounds read,
+  an out-of-bounds write and an integer underflow (GHSA-86rm-g7qf-j2fh, moderate, no CVE assigned).
+  The `libzvbi_teletext` decoder is built and the teletext path is wired end to end, so a DVB
+  teletext stream reaches that code. The same release drops the `concat` demuxer, a script demuxer
+  selectable by probing alone, which made any stream handed to `avformat_open_input` a potential
+  file-open primitive; nothing here ever asked for it by name. It also carries dav1d 1.5.4 and zimg
+  3.0.6, neither under an advisory. FFmpeg stays on `n8.1.2`.
+
+- **LibDovi 2.1.0 (`dolby_vision` 3.4.0).** No advisory. The header change is additive only: two new
+  CMv4.0 metadata entry points, nothing removed, so the Profile 7 to 8.1 conversion path is
+  untouched.
+
+## [6.49.0] - 2026-08-27
+
+### Fixed
+
+- **A resume came back at 1.0 and discarded the playback speed, and no client could hold it from
+  outside (AE#436).** `AVPlayer.play()` is rate 1.0 by definition, and the native video host latched
+  a boolean play intent rather than a rate, so every pause dropped the speed. Re-applying it from the
+  outside did not work either, as the report measured: the engine re-issues play() from paths a
+  client cannot observe (the readyToPlay re-assert after an item swap, interruption and background
+  resume, the #287 premature-end recovery), and AVKit and the remote command centre call play()
+  straight on the player, so one client write was overwritten 45 ms later and again three seconds
+  after that, with the playback phase never changing to key a backstop on.
+
+  The rate a resume comes back at is `AVPlayer.defaultRate`, the platform's own "rate at which to
+  start playback when play is called", so both AVPlayer-backed hosts record the speed there and every
+  one of those paths resumes at it, with nobody writing rate inside a resume window. Zero is treated
+  as a pause rather than a speed at all four hosts: recorded as one it became the rate the next
+  resume, the software clock arming, and a rebuffer recovery all came back at, which brought a
+  session back frozen while it reported itself playing. The engine also remembers the requested speed
+  (`desiredRate`, the neighbour of `desiredVolume` the report asked for) and seeds it into each host
+  it builds, re-clamped to that host's ceiling, so the rebuilds a session makes on its own keep it.
+  The speed belongs to the item: a load of a different source, or `stop()`, returns to 1.0.
+
+  `aetherctl play --host-calls ratehold` is the measurement: it sets 1.5, pauses, resumes without the
+  client writing a rate, and reads the rate back off the transport itself. It reproduces the report
+  on the previous code and passes on this one, on the native and the software path.
+
+  Thanks to @rrgomes for measuring the client-side workaround as well as the defect, which is what
+  showed the re-issues were unreachable from outside.
+
+- **A 3D Blu-ray MVC remux played black on the native path (AE#435).** These files carry both eyes
+  inside one H.264 track, which Matroska declares as StereoMode 13 / 14 (`block_lr` / `block_rl`,
+  both eyes in one block) and libavformat reports as stream-level `AV_STEREO3D_FRAMESEQUENCE`. The
+  dependent view's slices reference a subset SPS the base decoder never receives, so a plain H.264
+  decoder can only skip them. libavcodec does exactly that and decodes the base view, which is the
+  left eye and the 2D fallback every non-3D player shows; VideoToolbox is handed whole samples with
+  both views' NALs inside and renders nothing, so the session played its audio over a black screen.
+  Nothing in the engine had ever read the stereo declaration, so these files took the native path on
+  the strength of being progressive H.264.
+
+  The container says it before a packet is decoded, so routing reads it at load: H.264 declaring
+  either both-eyes-in-one-block carriage now takes the software path, the one decoder that produces
+  a picture from it. Same shape as the rules already there for interlaced H.264 and High 4:2:2,
+  where the format looks native on paper and comes out wrong in practice. The frame-packed modes
+  (side by side, top / bottom, checkerboard, row or column interleaved, anaglyph) are single
+  self-contained pictures and keep the native path with hardware decode; cropping an eye out of one
+  of those stays the host's call. MV-HEVC keeps the native path too, being Apple's own format with a
+  base layer AVPlayer plays. Real MVC 3D output is not offered on any path, and the dispatch now
+  logs the decision, so a session that took this route says so.
+
+  Thanks to @TheyCallMeSpy for the report, which came with the packet cadence, the container tag and
+  the ffmpeg decode that narrows it to routing rather than decode.
+
+- **`setRate` documented the software path as playing speed without pitch correction, and it never
+  did (AE#434).** Both transport surfaces were running AVFoundation's TimeDomain algorithm, the
+  default an app linked on or after iOS 15 / macOS 12 gets, and the engine set the property nowhere,
+  so the sentence read perfectly while describing nothing in the build. The report measured it the
+  other way round on a VP9 / Opus MKV that routes to software decode: 1.25, 1.5 and 1.75 with no
+  pitch shift, on a route confirmed in the log rather than assumed. A wrong capability claim costs
+  more than a missing one, and this one came within a step of a per-peer capability bit in a
+  group-playback protocol, recomputed per title because routing depends on codec, resolution, frame
+  rate and hardware, to avoid offering speed to whoever landed in software.
+
+  `audioTimePitchAlgorithm` is now pinned to TimeDomain at all four hosts through one
+  `AudioRatePolicy`: on the native `AVPlayerItem`, on the audio-only item, and on the software
+  path's `AVSampleBufferAudioRenderer`, whose algorithm is what the synchronizer's timebase rate
+  runs through. The guarantee stops depending on the host app's link age (the default has moved
+  once already and differs per platform below those versions), and it is the same on every route.
+  Pitch behaviour is unchanged on any current build; what changes is that the documentation, in
+  `setRate`'s docstring and in docs/api.md, now says what the code does, with a test holding the
+  three statements to the configured value.
+
+  Thanks to @rrgomes for measuring the documented claim instead of budgeting against it.
+
+## [6.48.0] - 2026-08-26
+
+### Fixed
+
+- **A producer restart that replaced the reader left `playbackPhase` on `.stalled(reconnecting:)`
+  for the rest of the session (AE#433).** The axis a host reads for "the source is delivering" is
+  per session, the dedupe gate that feeds it is per reader instance, and the handover let the two
+  drift apart. The restart opens its replacement demuxer first and wires the phase sink one step
+  later, so everything `find_stream_info` read went through the gate into a nil sink and latched it
+  on `.flowing`. By the time the sink existed, the reader now serving the session had nothing left
+  to say, and the phase kept describing the reader that had just been aborted: reported as 454.8 s
+  of `.stalled(reconnecting: true)`, 298 s of it over normally playing video. Two adjacent holes
+  came out of the same reading: the replaced demuxer kept its sink, so an aborted pump outliving the
+  swap could still move the axis for a session it no longer feeds, and the live reopen never wired
+  the sink onto its fresh demuxer at all, which left that path unable to recover the axis for the
+  rest of the session.
+
+  The gate now deduplicates for a LISTENER rather than for a reader instance: attaching a sink
+  clears its history, because a listener that just arrived has heard nothing regardless of what the
+  reader said into the void beforehand. Sink and gate moved under one leaf lock, since the handover
+  thread installs while the demux thread emits. At the swap the outgoing demuxer is unwired and the
+  incoming one takes the sink on both the restart and the live-reopen paths, so the fresh reader
+  publishes a non-stalled phase off its own first measured delivery instead of anyone asserting
+  health at the swap. `setReaderNetworkPhase` also logs its transitions now
+  (`source network axis reconnecting -> flowing`); the axis moves a handful of times per session and
+  was named nowhere in the log, which forced the report to reconstruct it from reader generation
+  counters.
+
+  Measured against an origin that stops delivering on established sockets without closing them, so
+  the reader parks in a blocking read and the recovery takes the wedged-producer restart. Three runs
+  per arm, identical every time: before, 24 telemetry ticks reading `.stalled(reconnecting: true)`
+  with the clock advancing at 1.0x and zero drops through 21 of them; after, 3 ticks covering the
+  outage itself and `playing` from the first tick after the restart.
+
+- **A live source that stopped carrying timestamps wedged the segment cutter (AE#432).** A live
+  MPEG-TS whose video PES headers stopped carrying PTS/DTS put 1792 packets and 30 keyframes into
+  one 85 MB segment advertised as 0.5 s, and produced nothing afterwards. The repair for a packet
+  arriving with neither dts nor pts was `lastValidDts + 1`, one tick of the source time base, which
+  satisfies the muxer's monotonic invariant and nothing else: on the 90 kHz MPEG-TS axis it claims
+  11 microseconds of presentation time for a 20 ms frame. The live cutter's clock IS that timestamp,
+  so a run of timestamp-less packets froze it and no keyframe in the window could cut.
+
+  Such a packet now advances by a plausible frame interval: the demuxer's own duration for the
+  packet, else the last genuine inter-packet delta the stream showed (learned from genuine
+  timestamps only, never from a repaired one, and never across a delta past a second, which is a
+  program boundary rather than a cadence), else the frame duration the producer already carries,
+  else the historical single tick for a stream that never carried a usable timestamp at all. The
+  dts-only case (matroska B-frames) keeps its minimal bump, where pts is real and must not be
+  crossed. The repair states once per pump that the source stopped carrying timestamps and what
+  replaced them, and the no-cut stall line reports how many packets in its window carried a
+  synthesized timestamp, so `videoPtsAdvance` reads as a statement about the source rather than
+  about the engine's own repair. Measured on a 50 fps HEVC MPEG-TS losing its timestamps at t=20 s:
+  5 segments and a cutter wedge before, 12 segments through 52.8 s and uninterrupted playback after.
+
 ## [6.47.0] - 2026-08-26
 
 ### Fixed

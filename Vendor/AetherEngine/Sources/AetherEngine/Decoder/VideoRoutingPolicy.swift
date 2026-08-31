@@ -1,4 +1,5 @@
 import AetherLibavcodec
+import AetherLibavutil
 
 /// Pure codec-and-field-order routing decision extracted from AetherEngine.load's dispatch so it is
 /// unit-testable. Native carries HEVC, H.264 and HW-decodable AV1; every other video codec is
@@ -30,7 +31,8 @@ enum VideoRoutingPolicy {
         codecID: AVCodecID,
         fieldOrder: AVFieldOrder,
         av1Available: Bool,
-        spsIndicatesInterlaced: Bool = false
+        spsIndicatesInterlaced: Bool = false,
+        stereo3DType: AVStereo3DType? = nil
     ) -> Bool {
         switch codecID {
         case AV_CODEC_ID_NONE, AV_CODEC_ID_HEVC:
@@ -38,12 +40,38 @@ enum VideoRoutingPolicy {
         case AV_CODEC_ID_AV1:
             return !av1Available
         case AV_CODEC_ID_H264:
+            if routesSoftwareForMultiviewCarriage(codecID: codecID, stereo3DType: stereo3DType) {
+                return true
+            }
             return routesSoftwareForDeclaredInterlace(
                 codecID: codecID, fieldOrder: fieldOrder,
                 spsIndicatesInterlaced: spsIndicatesInterlaced)
         default:
             return true
         }
+    }
+
+    /// #435: H.264 that carries both stereo views inside one track, which is how a 3D Blu-ray MVC remux
+    /// is muxed: Matroska StereoMode 13 / 14 (`block_lr` / `block_rl`, both eyes in one block), reported
+    /// by libavformat as stream-level `AV_PKT_DATA_STEREO3D` of type `AV_STEREO3D_FRAMESEQUENCE`. The
+    /// dependent view's slices reference a subset SPS the base decoder does not have, so a decoder that
+    /// only knows plain H.264 has to skip them, and VideoToolbox gets no say in that: it is handed whole
+    /// samples with both views' NALs inside and renders nothing (reported as black video with audio
+    /// playing). libavcodec skips the extension NALs and decodes the base view, which is the left eye and
+    /// exactly the 2D fallback every non-3D player shows, so the software path is the one that produces a
+    /// picture. Same shape as the interlaced and High 4:2:2 rules: native on paper, no picture in practice.
+    ///
+    /// Only these two carriages qualify. The frame-packed modes (side by side, top / bottom, checkerboard,
+    /// row or column interleaved, anaglyph) are single self-contained pictures that decode natively and
+    /// keep the native route; the host, not the engine, decides whether to crop an eye out of them.
+    /// HEVC is excluded on purpose: MV-HEVC is Apple's own spatial-video format, and the native path
+    /// plays its base layer.
+    static func routesSoftwareForMultiviewCarriage(
+        codecID: AVCodecID,
+        stereo3DType: AVStereo3DType?
+    ) -> Bool {
+        guard codecID == AV_CODEC_ID_H264 else { return false }
+        return stereo3DType == AV_STEREO3D_FRAMESEQUENCE
     }
 
     /// #232: true when the declared-interlace rule, and only that rule, is what sends this stream to

@@ -890,6 +890,13 @@ final class SoftwarePlaybackHost {
     }
 
     func setRate(_ newRate: Float) {
+        // #436: zero is a pause, not a speed. `lastRate` is what the clock arms at and what a
+        // rebuffer resumes at, so storing a zero there brings the session back frozen while it
+        // reports itself playing. Park it the way pause() does and keep the last real speed.
+        if newRate == 0 {
+            pause()
+            return
+        }
         lastRate = newRate
         rate = newRate
         // Same rule as play(): never rate-change the un-anchored synchronizer. A host setRate
@@ -899,6 +906,11 @@ final class SoftwarePlaybackHost {
         if clockArmed {
             audioOutput?.setRate(newRate)
         }
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        lastRate = rate
     }
 
     /// #254: the demuxer reposition is awaited off the main actor. It used to run inline here, and
@@ -2318,17 +2330,37 @@ final class SoftwarePlaybackHost {
     private var diagPrevDropped = 0
     private var diagPrevEnqueued = 0
     private var diagPrevDelay: TimeInterval = 0
+    /// #407: the layer's side of the frame count. `framesEnqueued` is bumped in the decoder callback,
+    /// so it counts frames PRODUCED; anything lost between there and the layer is invisible in it and
+    /// invisible in the layer's own drop counter too, which only sees frames it received.
+    private var diagPrevHandedOver = 0
+    private var diagPrevLost = 0
+    /// #407: smallest video cushion seen since the last emitted line. The tick runs at 4 Hz and the
+    /// line at 1 Hz, so an instantaneous read would miss three quarters of the interval, and a
+    /// cushion that dips is exactly what a report of a picture that hitches while the per-second
+    /// frame count stays at rate would look like.
+    private var diagMinVideoLead = Double.infinity
     /// AE#374: the post-end line reporting the parked clock has been emitted; the session is over and
     /// the line stops rather than repeating itself at 1 Hz for as long as the host holds the engine.
     private var didEmitParkedDiag = false
 
-    /// 1 Hz [SWDiag] line: clock + clock delta, decoded-audio lead over the clock, parked
-    /// video FIFO depth, rebuffer state, and the display layer's OWN drop counter with its
+    /// 1 Hz [SWDiag] line: clock + clock delta, decoded-audio and video lead over the clock, parked
+    /// video PACKET FIFO depth, rebuffer state, frames produced vs frames handed to the layer with
+    /// the spacing of the timestamps they carried, and the display layer's OWN drop counter with its
     /// per-second delta. The layer counter is the one place render-deadline misses are
     /// visible - swDropped in the memprobe only counts pre-enqueue drops, so a session can
     /// stutter visibly while every 30 s probe reads clean.
+    ///
+    /// #407: `enq` alone cannot describe cadence. It is a count per wall second taken on the
+    /// decoder's side of the layer, so an even 24 fps timeline and one carrying a doubled interval,
+    /// a duplicate timestamp or a frame that never reached the layer all read `+24`. `disp`, `lost`
+    /// and `dpts` are the three that separate them, and `vLead` says whether the frames were queued
+    /// ahead of their presentation time or handed over at their deadline.
     private func emitDiagIfDue(clock: Double) {
         diagTickCounter += 1
+        if let frontier = renderer.newestEnqueuedPtsSeconds, clock.isFinite {
+            diagMinVideoLead = min(diagMinVideoLead, frontier - clock)
+        }
         guard diagTickCounter % 4 == 0 else { return }
         let prevClock = diagPrevClock
         let d = demuxDiag.snapshot
@@ -2345,6 +2377,22 @@ final class SoftwarePlaybackHost {
         let enqueued = framesEnqueued
         let dEnq = enqueued - diagPrevEnqueued
         diagPrevEnqueued = enqueued
+        let cadence = renderer.takeCadence()
+        let dHanded = cadence.handedOver - diagPrevHandedOver
+        diagPrevHandedOver = cadence.handedOver
+        let dLost = cadence.lostBeforeLayer - diagPrevLost
+        diagPrevLost = cadence.lostBeforeLayer
+        // #407: how far ahead of the clock the newest admitted frame sat, at its LOWEST over the
+        // interval. `parkedPkts` counts undecoded PACKETS, so it says nothing about the video
+        // pipeline's depth in TIME, which is what a report of frames arriving late needs.
+        let videoLead = diagMinVideoLead.isFinite ? diagMinVideoLead : nil
+        diagMinVideoLead = .infinity
+        let spacing: String
+        if let lo = cadence.minDeltaSeconds, let hi = cadence.maxDeltaSeconds {
+            spacing = String(format: "%.1f/%.1f", lo * 1000, hi * 1000)
+        } else {
+            spacing = "-"
+        }
         Task { @MainActor [weak self] in
             guard let self else { return }
             let m = await self.loadRenderMetrics()
@@ -2373,9 +2421,12 @@ final class SoftwarePlaybackHost {
                 "[SWDiag] clk=\(String(format: "%.2f", clock)) "
                 + "dclk=\(dclk.isFinite ? String(format: "%.2f", dclk) : "-") "
                 + "aLead=\(lead.isFinite ? String(format: "%.2f", lead) : "-") "
-                + "parked=\(d.parked) rebuf=\(d.rebuffering ? "y" : "n") "
+                + "vLead=\(videoLead.map { String(format: "%.2f", $0) } ?? "-") "
+                + "parkedPkts=\(d.parked) rebuf=\(d.rebuffering ? "y" : "n") "
                 + (d.sourceExhausted ? "eof=y " : "")
-                + "enq=+\(dEnq) layerDrop=\(dropped)(\(dDrop >= 0 ? "+" : "")\(dDrop)) "
+                + "enq=+\(dEnq) disp=+\(dHanded) "
+                + "lost=\(cadence.lostBeforeLayer)(\(dLost >= 0 ? "+" : "")\(dLost)) "
+                + "dpts=\(spacing) layerDrop=\(dropped)(\(dDrop >= 0 ? "+" : "")\(dDrop)) "
                 + "delay=\(delay >= 0 ? String(format: "%.2f", delay) : "-")"
                 + "(\(dDelay >= 0 ? "+" : "")\(String(format: "%.2f", dDelay))) "
                 + "corr=\(m?.corrupted ?? -1) "

@@ -58,6 +58,79 @@ final class LiveReloadPolicyTests: XCTestCase {
         XCTAssertFalse(LiveReloadPolicy.skipInitialSeek(isLive: false, isRejoin: true))
     }
 
+    // MARK: - recoveryRejoinPosition (AE#442)
+
+    /// The reported case: a viewer 540 s inside an 1800 s window when the consumer dies. The in-place
+    /// recovery reload leaves the cache standing, so the position is still resident content.
+    func testParkedViewerKeepsItsPlaceAcrossAnInPlaceRecovery() {
+        XCTAssertEqual(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 1572, behindWhenLastAdvancing: 540,
+                residentRange: 400...2134.8, targetDurationSeconds: 6),
+            1572
+        )
+    }
+
+    /// The distance that decides is the last one measured while the picture moved. A live
+    /// `behindLiveSeconds` at the moment of a recovery carries the stall's own duration, which would
+    /// drag an edge viewer backwards by however long they stared at a frozen frame.
+    func testEdgeViewerWhoJustStalledStillRejoinsAtTheEdge() {
+        XCTAssertNil(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 2094.8, behindWhenLastAdvancing: 1.2,
+                residentRange: 400...2134.8, targetDurationSeconds: 6),
+            "a 40 s stall must not turn an edge viewer into a viewer parked 40 s back"
+        )
+    }
+
+    /// One TARGETDURATION is the oscillation the edge itself imposes: it advances a segment at a time.
+    func testDistanceWithinOneTargetDurationCountsAsTheEdge() {
+        for behind in [0.0, 3.2, 5.9] {
+            XCTAssertNil(
+                LiveReloadPolicy.recoveryRejoinPosition(
+                    isLive: true, playhead: 100, behindWhenLastAdvancing: behind,
+                    residentRange: 0...200, targetDurationSeconds: 6))
+        }
+        XCTAssertEqual(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 100, behindWhenLastAdvancing: 6.1,
+                residentRange: 0...200, targetDurationSeconds: 6),
+            100)
+    }
+
+    /// No cache to ask (remote-HLS live, the software live path) is exactly the shape the edge-rejoin
+    /// rule was written for: nothing can vouch for the position, so nothing changes.
+    func testNoResidentRangeKeepsTheEdgeRejoin() {
+        XCTAssertNil(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 1572, behindWhenLastAdvancing: 540,
+                residentRange: nil, targetDurationSeconds: 6))
+    }
+
+    /// Before the first playlist build there is no served TARGETDURATION, and nothing can be parked.
+    func testNoServedTargetDurationKeepsTheEdgeRejoin() {
+        XCTAssertNil(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 1572, behindWhenLastAdvancing: 540,
+                residentRange: 400...2134.8, targetDurationSeconds: nil))
+    }
+
+    /// A position that slid out from under the stall is gone; the oldest surviving second beats the edge.
+    func testPositionBelowTheResidentFloorClampsToTheFloor() {
+        XCTAssertEqual(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: true, playhead: 320, behindWhenLastAdvancing: 540,
+                residentRange: 400...2134.8, targetDurationSeconds: 6),
+            400)
+    }
+
+    func testVODRecoveryIsUntouched() {
+        XCTAssertNil(
+            LiveReloadPolicy.recoveryRejoinPosition(
+                isLive: false, playhead: 1572, behindWhenLastAdvancing: 540,
+                residentRange: 0...2000, targetDurationSeconds: 6))
+    }
+
     // MARK: - LoadOptions plumbing
 
     func testHostsCannotSetLiveRejoin() {

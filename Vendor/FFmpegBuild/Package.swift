@@ -1,11 +1,17 @@
 // swift-tools-version: 6.0
-// Nuvio fork of FFmpegBuild 2.4.3: frameworks/modules namespaced as AetherLib*
-// so they coexist in the same app binary with MPVKit's Libav* stack.
-// Upstream: https://github.com/superuser404notfound/FFmpegBuild/tree/2.4.3
-// Rebuild: re-run Vendor/namespace_ffmpegbuild.py after refreshing upstream xcframeworks.
+// Nuvio local pin of upstream FFmpegBuild 3.0.0. Frameworks/modules are
+// already namespaced as AetherLib* for coexistence with MPVKit.
 
 import PackageDescription
 
+// The frameworks ship under an `Aether` prefix. SwiftPM target names and
+// product names are unique across the whole dependency graph, and every other
+// FFmpeg packaged for Apple platforms (FFmpegKit and its forks, MobileVLCKit,
+// the mpv builds) declares targets named Libavcodec, Libavformat and friends.
+// Sharing those names made this package unresolvable next to any of them, and
+// the frameworks then collided a second time on one install name inside
+// App.app/Frameworks/. The prefix settles both, and `otool -L` says which
+// FFmpeg answered without anyone having to guess.
 let package = Package(
     name: "FFmpegBuild",
     platforms: [
@@ -16,8 +22,8 @@ let package = Package(
     ],
     products: [
         .library(
-            name: "FFmpegBuild",
-            targets: ["FFmpegBuild"]
+            name: "AetherFFmpegBuild",
+            targets: ["AetherFFmpegBuild"]
         ),
         // Individual libraries for consumers that want fine-grained control
         .library(name: "AetherLibavcodec", targets: ["AetherLibavcodec"]),
@@ -33,7 +39,7 @@ let package = Package(
     targets: [
         // Umbrella target that links all FFmpeg libraries + dav1d + system frameworks
         .target(
-            name: "FFmpegBuild",
+            name: "AetherFFmpegBuild",
             dependencies: [
                 "AetherLibavcodec",
                 "AetherLibavformat",
@@ -45,7 +51,7 @@ let package = Package(
                 "AetherLibzimg",
                 "AetherLibzvbi",
             ],
-            path: "Sources/FFmpegBuild",
+            path: "Sources/AetherFFmpegBuild",
             linkerSettings: [
                 .linkedFramework("AudioToolbox"),
                 .linkedFramework("CoreMedia"),
@@ -69,7 +75,7 @@ let package = Package(
         .binaryTarget(name: "AetherLibzvbi", path: "Sources/AetherLibzvbi.xcframework"),
         .testTarget(
             name: "FFmpegBuildTests",
-            dependencies: ["FFmpegBuild", "AetherLibavfilter", "AetherLibavutil"],
+            dependencies: ["AetherFFmpegBuild", "AetherLibavfilter", "AetherLibavutil"],
             path: "Tests/FFmpegBuildTests"
         ),
     ]

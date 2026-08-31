@@ -629,6 +629,22 @@ extension AetherEngine {
         return nil
     }
 
+    /// Container-declared stereo layout from stream-level `AV_PKT_DATA_STEREO3D` side data; nil when the
+    /// stream declares none. Matroska StereoMode is the source in practice (`stereo_mode` in the stream
+    /// metadata is the same value spelled as a string). Read for routing: `AV_STEREO3D_FRAMESEQUENCE` on
+    /// H.264 means both views ride in one track (#435).
+    nonisolated static func stereo3DType(stream: UnsafeMutablePointer<AVStream>) -> AVStereo3DType? {
+        let nb = Int(stream.pointee.codecpar.pointee.nb_coded_side_data)
+        guard nb > 0, let sideData = stream.pointee.codecpar.pointee.coded_side_data else { return nil }
+        for i in 0..<nb {
+            let item = sideData[i]
+            guard item.type == AV_PKT_DATA_STEREO3D, let raw = item.data,
+                  item.size >= MemoryLayout<AVStereo3D>.size else { continue }
+            return raw.withMemoryRebound(to: AVStereo3D.self, capacity: 1) { $0.pointee.type }
+        }
+        return nil
+    }
+
     nonisolated static func detectFrameRate(stream: UnsafeMutablePointer<AVStream>) -> Double? {
         let avg = stream.pointee.avg_frame_rate
         if avg.den > 0 && avg.num > 0 {

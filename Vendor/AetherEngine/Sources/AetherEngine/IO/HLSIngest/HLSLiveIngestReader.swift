@@ -32,6 +32,9 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     /// Tracks observed segment-arrival cadence for LL-HLS shaping (AetherEngine#167). Updated whenever new
     /// upstream segments appear; read via `observedLiveCadenceSeconds`.
     private var _cadenceMeter = LiveArrivalCadenceMeter()
+    /// AE#447: longest EXTINF the upstream has actually served, the measured counterpart to
+    /// `_upstreamTargetDuration`. Monotonic; read via `upstreamSegmentDurationSeconds`.
+    private var _upstreamSegmentDurationSeconds: Double?
     /// Installed by the resolver before the first FIFO byte; nil = muxed audio.
     private var _companionAudioReader: HLSLiveIngestReader?
     /// AE#359: SUBTITLES renditions of the picked variant, resolved to absolute URLs. Metadata only.
@@ -70,6 +73,14 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
     public var observedLiveCadenceSeconds: Double? {
         let now = Self.monotonicNow()
         return startLock.withLock { _cadenceMeter.observedCadence(at: now) }
+    }
+
+    public var upstreamSegmentDurationSeconds: Double? {
+        startLock.withLock { _upstreamSegmentDurationSeconds }
+    }
+
+    public var closedLiveCadenceSeconds: Double? {
+        startLock.withLock { _cadenceMeter.closedCadence }
     }
 
     /// Monotonic seconds (uptime); immune to wall-clock jumps that would corrupt interval measurement.
@@ -236,16 +247,31 @@ public final class HLSLiveIngestReader: IOReader, LiveIngestSourceInfo, @uncheck
                     )
                 }
                 if media.hasMap { throw HLSIngestError.unsupportedSegmentFormat }
-                refreshInterval = min(6, max(1, media.targetDuration / 2))
+                // AE#447: sample at half the SERVED segment duration, not half the advertised target.
+                // A padded advert (`segment + 1`, which the RFC allows and packagers habitually serve)
+                // makes the poll coarser than the source's real cadence, and arrivals then quantize
+                // upward: a 2.000 s source polled every 1.5 s shows 3 s inter-arrival gaps, and that is
+                // what the served TARGETDURATION gets sealed from. Never above the advert, which stays
+                // the upper bound a conforming origin promises.
+                let servedSegment = media.segments.last?.duration ?? media.targetDuration
+                refreshInterval = min(6, max(1, min(servedSegment, media.targetDuration) / 2))
 
                 let isJoin = !sniffedFirstSegment
                 let fresh = tracker.newSegments(in: media)
                 if tracker.stallCount > 6 { throw HLSIngestError.ingestStalled }
                 if !fresh.isEmpty {
                     // Real arrival of new content: the interval since the previous arrival is the observed
-                    // cadence the engine shapes the local playlist around (AetherEngine#167).
+                    // cadence the engine shapes the local playlist around (AetherEngine#167). The longest
+                    // segment served rides along, because it bounds that cadence from below before any
+                    // interval has closed, which is when the served TARGETDURATION is sealed (AE#447).
                     let now = Self.monotonicNow()
-                    startLock.withLock { _cadenceMeter.recordArrival(at: now) }
+                    let longest = fresh.reduce(0.0) { max($0, $1.duration) }
+                    startLock.withLock {
+                        _cadenceMeter.recordArrival(at: now)
+                        if longest > 0 {
+                            _upstreamSegmentDurationSeconds = max(_upstreamSegmentDurationSeconds ?? 0, longest)
+                        }
+                    }
                 }
                 if isJoin, !fresh.isEmpty {
                     // AE#359: the wall time the engine's timeline begins at. Sibling renditions carry the

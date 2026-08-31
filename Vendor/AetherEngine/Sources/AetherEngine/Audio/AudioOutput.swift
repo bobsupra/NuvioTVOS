@@ -18,6 +18,10 @@ final class AudioOutput: @unchecked Sendable {
 
         // Spatial audio for AirPods Pro/Max and HomePod: renderer spatializes multichannel when system-enabled.
         renderer.allowedAudioSpatializationFormats = .multichannel
+
+        // Rate changes ride the synchronizer timebase, and this renderer's algorithm is what decides
+        // whether they keep pitch (#434). Pinned here, while the timebase is still stopped.
+        AudioRatePolicy.apply(to: renderer)
     }
 
     /// Add the video queue target to the synchronizer for automatic A/V sync + frame pacing. The

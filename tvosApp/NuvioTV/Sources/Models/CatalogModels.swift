@@ -94,13 +94,45 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     /// library/watch-state snapshots.
     let externalRatings: [NuvioExternalRating]?
 
-    var isSeries: Bool { ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()) }
+    var isSeries: Bool {
+        ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+            || videos?.isEmpty == false
+    }
+
+    /// Canonical type used for persisted and watched-state identity. Providers
+    /// can label a video-bearing series as a movie, but episode identity must
+    /// still use the series namespace.
+    var canonicalType: String {
+        isSeries ? "series" : type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    }
+
+    /// Returns a canonical IMDb id from a direct id or the AIO/RPDB wrapper.
+    /// Do not infer ids from arbitrary embedded text: only the complete value
+    /// may be an IMDb id (optionally prefixed by `rpdb:`).
+    static func canonicalImdbID(from value: String) -> String? {
+        var candidate = value.trimmingCharacters(in: .whitespacesAndNewlines)
+        if candidate.prefix(5).caseInsensitiveCompare("rpdb:") == .orderedSame {
+            candidate = String(candidate.dropFirst(5)).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+
+        guard candidate.count > 2,
+              candidate.prefix(2).caseInsensitiveCompare("tt") == .orderedSame,
+              candidate.dropFirst(2).allSatisfy({ $0 >= "0" && $0 <= "9" }) else {
+            return nil
+        }
+        return "tt\(candidate.dropFirst(2))"
+    }
 
     /// Canonical stream lookup id: the additive-imdb id when known (what stream
     /// add-ons declare in their `idPrefixes`), otherwise the meta id. Items can
     /// carry non-canonical ids ("tmdb:123", "simkl:42") which stream add-ons do
     /// not claim, causing "No compatible add-ons".
-    var streamId: String { imdbId ?? id }
+    var streamId: String {
+        if let canonical = imdbId.flatMap(Self.canonicalImdbID(from:)) {
+            return canonical
+        }
+        return Self.canonicalImdbID(from: id) ?? imdbId ?? id
+    }
 
     /// Compact copy for watched / library-style persistence.
     /// Drops the full episode guide (can be huge) and non-finite ratings so a
@@ -116,7 +148,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             logoUrl: logoUrl,
             imdbId: imdbId,
             tmdbId: tmdbId,
-            type: type,
+            type: canonicalType,
             year: year,
             genres: genres,
             rating: rating.flatMap { $0.isFinite ? $0 : nil },
@@ -434,7 +466,7 @@ enum EpisodeReleasePolicy {
     static func airDateText(for released: String?) -> String? {
         guard let released, !hasAired(released) else { return nil }
         if isAiringToday(released) {
-            return "Today"
+            return L10n.string("date_today", fallback: "Today")
         }
         return NuvioDateDisplay.formattedDate(released) ?? released.prefix(10).description
     }
@@ -950,11 +982,11 @@ struct ContinueWatchingItem: Identifiable, Codable {
     var upNextBadgeText: String {
         guard isUpNextEntry else { return remainingText }
         if hasAired {
-            if isNewSeasonDrop { return "NEW SEASON" }
-            return isNewEpisodeDrop ? "NEW EPISODE" : "NEXT UP"
+            if isNewSeasonDrop { return L10n.string("cw_badge_new_season", fallback: "NEW SEASON") }
+            return isNewEpisodeDrop ? L10n.string("cw_badge_new_episode", fallback: "NEW EPISODE") : L10n.string("cw_badge_next_up", fallback: "NEXT UP")
         }
-        if let airDateText { return "AIRS \(airDateText.uppercased())" }
-        return "UPCOMING"
+        if let airDateText { return L10n.format("cw_badge_airs_date", fallback: "AIRS %@", airDateText.uppercased()) }
+        return L10n.string("cw_badge_upcoming", fallback: "UPCOMING")
     }
 
     /// An aired up-next episode reads as a "New Episode" drop only while it is
@@ -1197,16 +1229,16 @@ struct ContinueWatchingItem: Identifiable, Codable {
     var remainingText: String {
         // Synced rows can arrive without a runtime; there is no honest number to
         // show for those, so offer the action instead.
-        guard duration > 0 else { return "RESUME" }
+        guard duration > 0 else { return L10n.string("action_resume", fallback: "Resume").uppercased() }
         let remaining = max(0, duration - position)
         let minutes = Int(remaining / 60)
         let hours = minutes / 60
         let remainder = minutes % 60
 
         if hours > 0 {
-            return "\(hours)h \(remainder)m left"
+            return L10n.format("cw_hours_minutes_left", fallback: "%1$dh %2$dm left", hours, remainder)
         }
-        return "\(max(minutes, 1))m left"
+        return L10n.format("cw_minutes_left", fallback: "%dm left", max(minutes, 1))
     }
 }
 
@@ -1813,17 +1845,17 @@ enum ContinueWatchingStore {
                 guard let entry = iterator.next() else { return }
                 inFlight += 1
                 group.addTask {
-                    guard let latest = try? await repository.refreshMetadata(
+                    guard let raw = try? await repository.refreshMetadata(
                         id: entry.item.meta.id,
                         type: entry.item.meta.type
-                    ),
-                    let numbers = entry.item.episodeNumbers,
-                    let latestEpisode = latest.videos?.first(where: {
-                        $0.season == numbers.season && $0.episode == numbers.episode
-                    }),
-                    !episodeText(latestEpisode.overview).isEmpty else {
+                    ) else {
                         return (entry.index, nil)
                     }
+                    let latest = await TmdbDetailsService.localizedMetadata(for: raw)
+                    let numbers = entry.item.episodeNumbers
+                    let latestEpisode = latest.videos?.first(where: {
+                        $0.season == numbers?.season && $0.episode == numbers?.episode
+                    })
 
                     let refreshed = ContinueWatchingItem(
                         meta: latest,
@@ -1833,7 +1865,7 @@ enum ContinueWatchingStore {
                         lastWatchedAt: entry.item.lastWatchedAt,
                         season: entry.item.season,
                         episode: entry.item.episode,
-                        released: latestEpisode.released ?? entry.item.released,
+                        released: latestEpisode?.released ?? entry.item.released,
                         episodeTitleOverride: entry.item.episodeTitleOverride,
                         episodeOverviewOverride: entry.item.episodeOverviewOverride,
                         episodeThumbnailOverride: entry.item.episodeThumbnailOverride,
@@ -1952,7 +1984,7 @@ enum ContinueWatchingStore {
                 metaId: progress.meta.id,
                 imdbId: progress.meta.imdbId,
                 tmdbId: progress.meta.tmdbId,
-                contentType: progress.meta.type,
+                contentType: progress.meta.canonicalType,
                 season: season,
                 episode: episode
             )
@@ -3863,9 +3895,9 @@ enum CollectionsStore {
 struct WatchedStoreItem: Identifiable, Codable, Equatable {
     var id: String {
         if let season, let episode {
-            return "\(meta.type):\(meta.id):s\(season)e\(episode)"
+            return "\(meta.canonicalType):\(meta.id):s\(season)e\(episode)"
         }
-        return "\(meta.type):\(meta.id)"
+        return "\(meta.canonicalType):\(meta.id)"
     }
     let meta: NuvioMeta
     let watchedAt: Date
@@ -4066,8 +4098,8 @@ struct WatchedSnapshot {
         var epBySeriesTitle: [String: [(year: Int?, keys: Set<String>)]] = [:]
 
         for item in visible {
-            let type = WatchedStore.normalizedType(item.meta.type)
             let isEpisode = item.season != nil && item.episode != nil
+            let type = isEpisode ? "series" : WatchedStore.normalizedType(item.meta.canonicalType)
 
             if !isEpisode {
                 let contentKeys = WatchedStore.contentIdentityKeys(for: item.meta)
@@ -4136,7 +4168,7 @@ struct WatchedSnapshot {
     }
 
     func contains(meta: NuvioMeta) -> Bool {
-        let type = WatchedStore.normalizedType(meta.type)
+        let type = WatchedStore.normalizedType(meta.canonicalType)
         guard let storedKeys = wholeTitleIdentityKeysByType[type], !storedKeys.isEmpty else {
             return false
         }
@@ -4146,7 +4178,7 @@ struct WatchedSnapshot {
 
     func containsCatalogTitle(meta: NuvioMeta) -> Bool {
         if contains(meta: meta) { return true }
-        guard WatchedStore.normalizedType(meta.type) == "series" else { return false }
+        guard WatchedStore.normalizedType(meta.canonicalType) == "series" else { return false }
         let normTitle = WatchedStore.normalizedCatalogTitle(meta.name)
         guard !normTitle.isEmpty, let years = wholeTitleSeriesByNormalizedTitle[normTitle] else {
             return false
@@ -4163,7 +4195,7 @@ struct WatchedSnapshot {
     }
 
     func containsEpisode(meta: NuvioMeta, season: Int, episode: Int) -> Bool {
-        let type = WatchedStore.normalizedType(meta.type)
+        let type = WatchedStore.normalizedType(meta.canonicalType)
         let targetEpKey = "\(season):\(episode)"
         let contentKeys = WatchedStore.contentIdentityKeys(for: meta)
         return contentKeys.contains { key in
@@ -4177,7 +4209,7 @@ struct WatchedSnapshot {
     }
 
     func watchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
-        let type = WatchedStore.normalizedType(meta.type)
+        let type = WatchedStore.normalizedType(meta.canonicalType)
         let contentKeys = WatchedStore.contentIdentityKeys(for: meta)
         var result = Set<String>()
         for key in contentKeys {
@@ -4190,7 +4222,7 @@ struct WatchedSnapshot {
 
     func catalogWatchedEpisodeKeys(meta: NuvioMeta) -> Set<String> {
         var result = watchedEpisodeKeys(meta: meta)
-        guard WatchedStore.normalizedType(meta.type) == "series" else { return result }
+        guard WatchedStore.normalizedType(meta.canonicalType) == "series" else { return result }
         let normTitle = WatchedStore.normalizedCatalogTitle(meta.name)
         guard !normTitle.isEmpty, let seriesEntries = episodeKeysBySeriesTitle[normTitle] else {
             return result
@@ -4448,7 +4480,7 @@ enum WatchedStore {
     }
 
     static func catalogTitleIdentityKeys(for meta: NuvioMeta) -> Set<String> {
-        let type = normalizedType(meta.type)
+        let type = normalizedType(meta.canonicalType)
         return Set(contentIdentityKeys(for: meta).map { "\(type)\u{1f}\($0)" })
     }
 
@@ -4780,7 +4812,7 @@ enum WatchedStore {
     /// The marker is only a local UI/indexing aid; remote history remains
     /// episode-based so specials and unaired episodes are never implied.
     private static func reconcileWholeSeriesMarker(for meta: NuvioMeta) {
-        guard normalizedType(meta.type) == "series",
+        guard normalizedType(meta.canonicalType) == "series",
               let videos = meta.videos,
               !videos.isEmpty else { return }
 
@@ -5095,13 +5127,13 @@ enum WatchedStore {
     }
 
     static func sameContent(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
-        guard normalizedType(lhs.type) == normalizedType(rhs.type) else { return false }
+        guard normalizedType(lhs.canonicalType) == normalizedType(rhs.canonicalType) else { return false }
         return !contentIdentityKeys(for: lhs).isDisjoint(with: contentIdentityKeys(for: rhs))
     }
 
     static func sameCatalogSeriesTitle(_ lhs: NuvioMeta, _ rhs: NuvioMeta) -> Bool {
-        guard normalizedType(lhs.type) == "series",
-              normalizedType(rhs.type) == "series",
+        guard normalizedType(lhs.canonicalType) == "series",
+              normalizedType(rhs.canonicalType) == "series",
               normalizedCatalogTitle(lhs.name) == normalizedCatalogTitle(rhs.name),
               !normalizedCatalogTitle(lhs.name).isEmpty else {
             return false
@@ -5121,7 +5153,7 @@ enum WatchedStore {
         // Trakt represents a watched show as episode rows, not as a distinct
         // whole-series row. Keep the local title-level marker while reconciling
         // the episode history that Trakt can actually describe.
-        if normalizedType(item.meta.type) == "series",
+        if normalizedType(item.meta.canonicalType) == "series",
            item.season == nil,
            item.episode == nil { return false }
         return !traktIdentityKeys(item).isEmpty
@@ -5185,7 +5217,7 @@ enum WatchedStore {
             metaId: item.meta.id,
             imdbId: item.meta.imdbId,
             tmdbId: item.meta.tmdbId,
-            contentType: item.meta.type,
+            contentType: item.meta.canonicalType,
             season: item.season,
             episode: item.episode
         )
@@ -5199,7 +5231,7 @@ enum WatchedStore {
         season: Int?,
         episode: Int?
     ) -> Set<String> {
-        let type = normalizedType(contentType)
+        let type = season != nil && episode != nil ? "series" : normalizedType(contentType)
         let season = season.map(String.init) ?? "-"
         let episode = episode.map(String.init) ?? "-"
         return Set(contentIdentityKeys(metaId: metaId, imdbId: imdbId, tmdbId: tmdbId).map {
@@ -5292,7 +5324,8 @@ enum WatchedStore {
             changedAt: Date()
         )
         let updated = pendingTraktMutations(profileId: profileId).filter {
-            !(sameContent($0.meta, meta) && $0.season == season && $0.episode == episode)
+            !samePendingContent($0.meta, season: $0.season, episode: $0.episode,
+                                and: meta, season: season, episode: episode)
         } + [entry]
         return persistPendingTraktMutations(updated, profileId: profileId)
     }
@@ -5312,13 +5345,40 @@ enum WatchedStore {
         _ pending: PendingTraktMutation,
         item: WatchedStoreItem
     ) -> Bool {
+        // Episode mutations require exact season/episode identity. This also
+        // handles legacy movie-typed, video-less episode snapshots by ignoring
+        // their stale type namespace.
+        if pending.season != nil, pending.episode != nil {
+            return samePendingContent(
+                pending.meta, season: pending.season, episode: pending.episode,
+                and: item.meta, season: item.season, episode: item.episode
+            )
+        }
+
+        // A whole-series mutation intentionally matches any episode row for
+        // the same title, preserving the prior wildcard behavior.
         guard sameContent(pending.meta, item.meta) else { return false }
-        if normalizedType(pending.meta.type) == "series",
+        if normalizedType(pending.meta.canonicalType) == "series",
            pending.season == nil,
            pending.episode == nil {
             return true
         }
         return pending.season == item.season && pending.episode == item.episode
+    }
+
+    private static func samePendingContent(
+        _ lhs: NuvioMeta,
+        season lhsSeason: Int?,
+        episode lhsEpisode: Int?,
+        and rhs: NuvioMeta,
+        season rhsSeason: Int?,
+        episode rhsEpisode: Int?
+    ) -> Bool {
+        guard lhsSeason == rhsSeason, lhsEpisode == rhsEpisode else { return false }
+        if lhsSeason != nil, lhsEpisode != nil {
+            return !contentIdentityKeys(for: lhs).isDisjoint(with: contentIdentityKeys(for: rhs))
+        }
+        return sameContent(lhs, rhs)
     }
 
     @discardableResult
@@ -5368,7 +5428,7 @@ enum WatchedStore {
     private static func addTombstone(meta: NuvioMeta, season: Int?, episode: Int?) {
         let entry = Tombstone(
             metaId: meta.id,
-            contentType: meta.type,
+            contentType: meta.canonicalType,
             imdbId: meta.imdbId,
             tmdbId: meta.tmdbId,
             season: season,
@@ -5391,7 +5451,7 @@ enum WatchedStore {
 
     private static func tombstoneMatches(_ tombstone: Tombstone, item: WatchedStoreItem) -> Bool {
         guard tombstoneContentMatches(tombstone, meta: item.meta) else { return false }
-        if normalizedType(tombstone.contentType ?? item.meta.type) == "series",
+        if normalizedType(tombstone.contentType ?? item.meta.canonicalType) == "series",
            tombstone.season == nil,
            tombstone.episode == nil {
             return true
@@ -5400,8 +5460,11 @@ enum WatchedStore {
     }
 
     private static func tombstoneContentMatches(_ tombstone: Tombstone, meta: NuvioMeta) -> Bool {
-        if let contentType = tombstone.contentType,
-           normalizedType(contentType) != normalizedType(meta.type) {
+        let tombstoneType = tombstone.season != nil && tombstone.episode != nil
+            ? "series"
+            : tombstone.contentType.map(normalizedType)
+        if let tombstoneType,
+           tombstoneType != normalizedType(meta.canonicalType) {
             return false
         }
         let tombstoneKeys = contentIdentityKeys(

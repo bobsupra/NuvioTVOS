@@ -133,7 +133,10 @@ final class ThrottledOriginServer: @unchecked Sendable {
                 bind(fd, $0, socklen_t(MemoryLayout<sockaddr_in>.size))
             }
         }
-        guard bindResult == 0, listen(fd, 4) == 0 else {
+        // #450: a backlog of 4 is a ceiling of this harness's own, and the suite that reads
+        // this origin's request log is measuring how many concurrent readers get on the link.
+        // A harness that brings its own version of the cause cannot measure it.
+        guard bindResult == 0, listen(fd, 32) == 0 else {
             close(fd)
             return nil
         }

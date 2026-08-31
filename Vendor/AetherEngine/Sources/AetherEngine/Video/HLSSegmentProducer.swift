@@ -196,6 +196,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Fires synchronously on the pump thread per finalized live segment (index, duration, startSeconds, discontinuous).
     var onLiveSegmentFinalized: (@Sendable (Int, Double, Double, Bool) -> Void)?
 
+    /// AE#443: the resident segment count the live runaway park may use, from the session that owns the
+    /// window (`VideoSegmentProvider.liveResidentParkCap`). Unset leaves the static floor, which is the
+    /// pre-#443 behaviour.
+    var liveResidentCapProvider: (@Sendable () -> Int)?
+
     /// Sequential-VOD twin of `onLiveSegmentFinalized` (index, real duration in seconds): feeds
     /// the append playlist whose EXTINF must match the media actually muxed. Set only for
     /// sequential-origin sessions; nil keeps the historical VOD behavior byte-identical.
@@ -382,6 +387,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `audioMoovPrimeUnobtainable`.
     var audioBridgeFeedStats: AudioBridge.FeedStats? { audioConfig?.bridge?.feedStats }
     private var currentMuxer: MP4SegmentMuxer?
+    /// AE#443: totals folded off muxers this producer has ROTATED away. A rotation (program switch, ad
+    /// pod, a rebuilt muxer after a failure) hands the session a fresh `ByteCounter`, so a read of the
+    /// current muxer alone drops everything the previous ones emitted, and the "lifetime" it is read as
+    /// silently means "since the last rotation". Guarded by `stateLock` with `currentMuxer` itself.
+    private var retiredMuxerBytes: Int = 0
+    private var retiredMuxerFragmentCuts: Int = 0
     private var currentMuxerSegmentIndex: Int = .min
 
     /// Latched once first muxer emits ftyp+moov bytes; subsequent muxers' init bytes are discarded.
@@ -390,6 +401,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// Last valid dts per stream (source TB); used to repair NOPTS dts via lastValidDts+1.
     private var lastVideoSourceDts: Int64 = Int64.min
     private var lastAudioSourceDts: Int64 = Int64.min
+
+    /// AE#432: last GENUINE source dts per stream and the frame stride learned from it. A repaired
+    /// timestamp says nothing about the source's cadence, so it is deliberately not fed back here.
+    private var lastGenuineVideoSourceDts: Int64 = Int64.min
+    private var lastGenuineAudioSourceDts: Int64 = Int64.min
+    private var videoSourceStrideTicks: Int64 = 0
+    private var audioSourceStrideTicks: Int64 = 0
+    private var loggedFirstSynthesizedTimestamp = false
 
     /// First dts ever seen per stream; replay detection: backward rebase landing near this + recent reconnect = server replay.
     private var firstSeenVideoSourceDts: Int64 = Int64.min
@@ -528,6 +547,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// properties; the watchdog object itself is the only thing the timer touches.
     private var noCutWatchdog: NoCutStallWatchdog?
     private var noCutWatchdogTimer: DispatchSourceTimer?
+
+    /// AE#443: is the live pump inside the runaway headroom park right now?
+    ///
+    /// The park looks exactly like a dead source from every consumer-side vantage point, and two
+    /// separate diagnostics said so for three rounds of #443 ("the producer is starved, not the
+    /// consumer", "source stopped delivering"). A held pump is not a starved one, and the difference
+    /// is only knowable here. Its own lock: written on the pump thread, read from the stall ladder.
+    private let parkStateLock = NSLock()
+    private var _liveHeadroomParked = false
+    var isLiveHeadroomParked: Bool {
+        parkStateLock.lock()
+        defer { parkStateLock.unlock() }
+        return _liveHeadroomParked
+    }
+    private func setLiveHeadroomParked(_ parked: Bool) {
+        parkStateLock.lock()
+        _liveHeadroomParked = parked
+        parkStateLock.unlock()
+    }
     private let noCutWatchdogQueue = DispatchQueue(label: "aether.nocut.watchdog", qos: .userInitiated)
     /// Tick of the lifted watchdog: fine against both windows (10 s wedge, 35 s starvation) and
     /// cheap, one lock and a subtraction unless it has something to say. A private queue rather
@@ -561,11 +599,21 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// and loops. Hold and re-arm instead, bounded by `liveSlowDeliveryMaxHolds`. A genuine SSAI wedge
     /// reads at full rate with frozen video PTS and still exits immediately; the source-starvation
     /// classification is untouched (its 35 s window with barely-advancing PTS is a dead source).
+    ///
+    /// AE#446 round 3: `servingOutageRunway` is the one case where a dead source must not be given up
+    /// on. The session has already diagnosed the outage, closed its window with ENDLIST, and is
+    /// feeding the consumer segments it holds; the exit tears down the read that is the only thing
+    /// able to notice the source coming back, and takes a playing session with it. Measured on the
+    /// harness with a 76 s outage: the read was aborted 35 s in while 46 s of runway were still
+    /// playing, so the source delivering again at +76 s was never seen and the session held its last
+    /// frame for the rest of the run. Bounded by the same hold budget, so a consumer that stops
+    /// fetching with runway still listed cannot keep a dead source open for the whole session.
     static func noCutStallAction(
         stalledFor: TimeInterval,
         readRate: Double,
         videoPtsAdvanceSeconds: Double,
-        consecutiveHolds: Int
+        consecutiveHolds: Int,
+        servingOutageRunway: Bool = false
     ) -> NoCutStallAction {
         let isWedge = readRate >= liveWedgeProgressRateThreshold
         let timeout = isWedge ? liveSegmentStallTimeoutSeconds : liveSourceStarvationTimeoutSeconds
@@ -575,8 +623,63 @@ final class HLSSegmentProducer: @unchecked Sendable {
            consecutiveHolds < liveSlowDeliveryMaxHolds {
             return .holdForSlowDelivery
         }
+        // A wedge is a cutter that cannot cut what it is being given, which waiting does not fix; the
+        // runway deferral is for a source that is not giving it anything.
+        if !isWedge, servingOutageRunway, consecutiveHolds < liveSlowDeliveryMaxHolds {
+            return .holdForSlowDelivery
+        }
         return .exitForRetune
     }
+
+    // MARK: - AE#432: a source that stops carrying timestamps
+
+    /// Widest inter-packet delta still read as a frame interval. Anything past a second is a
+    /// program boundary or a renumbered clock, not a cadence.
+    static let maxSynthesizedStrideSeconds: Double = 1.0
+
+    /// How far a repaired timestamp advances when the source carried neither dts nor pts.
+    ///
+    /// It used to advance one tick, which satisfies the muxer's monotonic invariant and nothing
+    /// else: on the 90 kHz MPEG-TS axis that is 11 microseconds for a whole 20 ms frame. The live
+    /// cutter's clock IS this timestamp (`liveShouldCut` below reads the pts a keyframe carries),
+    /// so a run of timestamp-less packets froze the clock and the cutter could not cut again for as
+    /// long as the run lasted: 1792 packets and 30 keyframes went into one 85 MB segment advertised
+    /// as 0.5 s (AE#432).
+    ///
+    /// Cascade, most specific first: the demuxer's own claim for this packet, then the last genuine
+    /// delta this stream showed, then the frame duration the producer already carries for the last
+    /// trun sample, then the historical single tick for a stream that has never carried a usable
+    /// timestamp at all.
+    static func repairStrideTicks(packetDuration: Int64, observedStride: Int64,
+                                  fallbackDuration: Int64) -> Int64 {
+        if packetDuration > 0 { return packetDuration }
+        if observedStride > 0 { return observedStride }
+        if fallbackDuration > 0 { return fallbackDuration }
+        return 1
+    }
+
+    /// Adopts `dts - previousDts` as the stream's stride when it is forward and inside
+    /// `maxStrideTicks`. A backward, standing or multi-second delta is a boundary or a replay, so
+    /// the stride learned before it survives.
+    static func updatedStrideTicks(current: Int64, previousDts: Int64, dts: Int64,
+                                   maxStrideTicks: Int64) -> Int64 {
+        guard previousDts != Int64.min, dts != Int64.min, maxStrideTicks > 0 else { return current }
+        let delta = dts &- previousDts
+        guard delta > 0, delta <= maxStrideTicks else { return current }
+        return delta
+    }
+
+    /// The live cut rule, pure: a keyframe opens a new segment once its presentation time has moved
+    /// `targetSeconds` past the open segment's start, or immediately when a program boundary forced
+    /// a cut. Extracted so AE#432's wedge is testable against the rule the pump actually runs.
+    static func liveShouldCut(ptsSeconds: Double, segmentStartSeconds: Double,
+                              targetSeconds: Double, isKeyframe: Bool, forceCut: Bool) -> Bool {
+        guard isKeyframe else { return false }
+        return forceCut || ptsSeconds - segmentStartSeconds >= targetSeconds
+    }
+
+    // MARK: -
+
     private var lastPregateVideoLog: Int = 0
     private var lastPregateAudioLog: Int = 0
     private static let pregateLogInterval = 200
@@ -631,11 +734,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// safe (see BackpressureWedgeDetector.fastBreakThresholdSeconds).
     private static let backpressureWedgeFastBreakThresholdSeconds = 5
 
-    /// Live disk runaway cap for awaitLiveWindowHeadroom. In healthy play resident count tracks the
-    /// sliding window (~windowSegmentCount plus a few in flight) because every playlist build slides
-    /// evictBelow. It can only approach this cap when the consumer stopped polling entirely (dead
-    /// item), at which point the engine's stall watchdogs reload the item within ~12 s, so a park
-    /// here is diagnostic, never steady state. ~6 min of 2 s GOP segments.
+    /// Live disk runaway FLOOR for awaitLiveWindowHeadroom, for a session that cannot state its own
+    /// window (`liveResidentCapProvider` unset). The live cap is `max(this, provider())`, and the
+    /// provider's value is the sliding window plus slack, so the park always sits ABOVE the window.
+    ///
+    /// AE#443: this used to be the cap itself, and the claim above it was that a session could only
+    /// approach it with a dead consumer. That was false for any window deeper than 180 segments: the
+    /// playlist does not start sliding until `windowSegmentCount` segments exist, so the cache fills to
+    /// the cap first and the pump parks there for the rest of the session. Measured on the loopback
+    /// fixture at an 1800 s window and a 1 s cadence, an edge session with no seek at all: park at
+    /// resident=180 after 179 s, never released, the edge frozen from that second on. The reporter of
+    /// #443 measured the same shape against Jellyfin at a 3.9 s cadence, and 180 x 3.9 s is where his
+    /// session froze, three campaigns running.
     private static let liveResidentSegmentCap = 180
 
     static func qosName(_ c: qos_class_t) -> String {
@@ -856,9 +966,32 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// (late) gate the pin makes the two identical, which is why publishing the mux shift held until
     /// the early-opening gate of AE#408 landed; on a re-aimed gate they differ by the whole re-aim,
     /// and the clock then ran that far ahead of the picture (captions early by the same amount).
-    static func presentedShiftPts(actualFirstDts: Int64, desiredTfdtPts: Int64) -> Int64 {
-        guard actualFirstDts != Int64.min, desiredTfdtPts != Int64.min else { return 0 }
-        return actualFirstDts &- desiredTfdtPts
+    ///
+    /// AE#418 round 4: taken on the first PTS, not the first DTS. A segment opens on a random-access
+    /// point in DECODE order, and with B-frames that sample is presented `video_delay` frames later
+    /// than it is decoded, so the two differ by exactly the composition offset the segment carries for
+    /// it. This is an offset about what AVPlayer SHOWS, so it is measured where the picture is: the
+    /// gate's own line already carried both numbers (`actual=42917 anchorPts=43000` on a 24 fps h264
+    /// fixture with `has_b_frames=2`), and the axis was published from the decode one. Measured with
+    /// `play --picture-probe`, that put the published axis 0.083 s under the truth on every epoch of
+    /// a B-frame source and 0.000 s under it on the same fixture encoded without them.
+    static func presentedShiftPts(actualFirstPts: Int64, desiredTfdtPts: Int64) -> Int64 {
+        guard actualFirstPts != Int64.min, desiredTfdtPts != Int64.min else { return 0 }
+        return actualFirstPts &- desiredTfdtPts
+    }
+
+    /// AE#418 round 5: how far after its own decode time the gating sample is PRESENTED.
+    ///
+    /// Measured with `play --picture-probe` on the fixture pair (`tc-bframes.mkv` against
+    /// `tc-drought.mkv`, identical but for `-bf 3`): the FIRST placement into an item's timeline puts
+    /// the segment's first presented sample at its advertised start, and every later placement puts
+    /// its first DECODED sample there instead, so the picture arrives this much later than the
+    /// advertised start read through the axis. Without B-frames the two are one number and no
+    /// composition moves; with them, a second placement of a segment worth -9.000 s read -18.083 s
+    /// off the picture where the composition predicted -18.000 s, on every run.
+    static func presentationLeadPts(actualFirstPts: Int64, actualFirstDts: Int64) -> Int64 {
+        guard actualFirstPts != Int64.min, actualFirstDts != Int64.min else { return 0 }
+        return Swift.max(0, actualFirstPts &- actualFirstDts)
     }
 
     /// AE#408: aim the gate below a boundary that cannot be opened on, so the segment covers its own
@@ -936,13 +1069,25 @@ final class HLSSegmentProducer: @unchecked Sendable {
     var muxerLifetimeFragmentBytes: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentMuxer?.lifetimeFragmentBytesEmitted ?? 0
+        return retiredMuxerBytes + (currentMuxer?.lifetimeFragmentBytesEmitted ?? 0)
     }
 
     var muxerFragmentCuts: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return currentMuxer?.fragmentCutCount ?? 0
+        return retiredMuxerFragmentCuts + (currentMuxer?.fragmentCutCount ?? 0)
+    }
+
+    /// The only way `currentMuxer` changes. Folds the outgoing muxer's totals in first, so every
+    /// rotation site inherits the accounting instead of having to remember it (AE#443).
+    private func installMuxer(_ new: MP4SegmentMuxer?) {
+        stateLock.lock()
+        if let outgoing = currentMuxer {
+            retiredMuxerBytes &+= outgoing.lifetimeFragmentBytesEmitted
+            retiredMuxerFragmentCuts &+= outgoing.fragmentCutCount
+        }
+        currentMuxer = new
+        stateLock.unlock()
     }
 
     private let finishCondition = NSCondition()
@@ -969,7 +1114,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
     /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
     /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
-    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64) -> Void)?
+    /// AE#418 round 5: `presentationLeadPts` is what the gating sample is presented AFTER it is
+    /// decoded (its composition offset). A placement composed onto a run that is already in the
+    /// timeline lands exactly that much later than the advertised start read through the axis, so the
+    /// consumer needs it alongside the shift; on a source without reordering it is zero and nothing
+    /// about the composition changes.
+    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64, _ presentationLeadPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
     /// Distinct from onVideoShiftKnown: the new shift is at the producer edge, AVPlayer renders it buffer+holdback later.
@@ -1038,6 +1188,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// backpressure wedge detector's fast path (park + flat clock + frozen fetch target -> single-digit
     /// detection instead of the 24 s counter). nil (tests, live) keeps the fast path inert.
     var playbackPositionProvider: (@Sendable () -> Double?)?
+
+    /// AE#446 round 3: reads whether the session is serving a window it closed with ENDLIST because
+    /// the source stopped delivering, with segments the consumer has not reached yet. While that is
+    /// true the no-cut watchdog's starvation exit would tear down a session that is still handing out
+    /// pictures, and with it the only read able to notice the source coming back. nil = false, which
+    /// is the historical behaviour for tests and every non-live path.
+    var outageRunwayProvider: (@Sendable () -> Bool)?
 
     /// #35/#93 startup guard: reads whether AVPlayer has ever presented a frame this item (its
     /// `timeControlStatus` reached `.playing` at least once), off the main actor. nil = assume started
@@ -1341,9 +1498,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
         }
         // pendingForceCutFlag cuts at the next keyframe regardless of the 4 s minimum,
         // so #EXT-X-DISCONTINUITY lands on the first IRAP of the new program (not one segment late).
-        if isKeyframe,
-           pendingForceCutFlag
-            || ptsSeconds - liveSegmentStartPtsSeconds >= targetSegmentDurationSeconds {
+        if Self.liveShouldCut(ptsSeconds: ptsSeconds,
+                              segmentStartSeconds: liveSegmentStartPtsSeconds,
+                              targetSeconds: targetSegmentDurationSeconds,
+                              isKeyframe: isKeyframe,
+                              forceCut: pendingForceCutFlag) {
             liveCurrentSegmentIndex += 1
             liveSegmentStartPtsSeconds = ptsSeconds
             liveSegmentStartByIndex[liveCurrentSegmentIndex] = ptsSeconds
@@ -1365,6 +1524,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
     private var sourceVideoTbSeconds: Double {
         guard sourceVideoTimeBase.num > 0, sourceVideoTimeBase.den > 0 else { return 0 }
         return Double(sourceVideoTimeBase.num) / Double(sourceVideoTimeBase.den)
+    }
+
+    /// Source audio time base in seconds; 0 when there is no audio or it is degenerate.
+    private var audioSourceTbSeconds: Double {
+        guard let tb = audioConfig?.sourceTimeBase, tb.num > 0, tb.den > 0 else { return 0 }
+        return Double(tb.num) / Double(tb.den)
+    }
+
+    /// AE#432: says once per pump that the source stopped carrying timestamps and what the engine
+    /// put in their place. Silent before this, which is why the field trace could only show the
+    /// consequence (a frozen cut clock) and not the cause.
+    private func noteSynthesizedTimestamp(strideTicks: Int64, isVideo: Bool) {
+        guard !loggedFirstSynthesizedTimestamp else { return }
+        loggedFirstSynthesizedTimestamp = true
+        let tb = isVideo ? sourceVideoTbSeconds : audioSourceTbSeconds
+        EngineLog.emit(
+            "[HLSSegmentProducer] source stopped carrying timestamps on the "
+            + "\(isVideo ? "video" : "audio") stream; synthesizing at \(strideTicks) ticks/packet"
+            + (tb > 0 ? " (\(String(format: "%.4f", Double(strideTicks) * tb))s)" : "")
+            + ". The live cutter reads this timestamp, so its segments are paced by it from here on",
+            category: .session
+        )
     }
 
     /// Map post-shift (item-axis) pts to absolute segment index.
@@ -1597,8 +1778,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// reach only because reaching `liveResidentSegmentCap` takes a consumer that is already dead, and
     /// the engine's 12 s stall watchdogs reload the item (and thus issue a fresh GET) long before then.
     /// Lowering the cap toward the steady-state window would put that deadlock back within reach.
+    /// AE#443: the resident count this pump refuses to pass. The session states it (window plus
+    /// slack); the static floor only covers a session that cannot.
+    private func liveResidentCap() -> Int {
+        max(Self.liveResidentSegmentCap, liveResidentCapProvider?() ?? 0)
+    }
+
     private func awaitLiveWindowHeadroom(head: Int) -> Bool {
-        if cache.count < Self.liveResidentSegmentCap { return true }
+        if cache.count < liveResidentCap() { return true }
         // #240: a parked pump is not using the link.
         sideReaderLinkGate?.videoFetchEnded()
         defer { sideReaderLinkGate?.videoFetchBegan() }
@@ -1607,9 +1794,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // as a source that stopped delivering. The window re-anchors when the park releases.
         noCutWatchdog?.setReading(false, at: Date())
         defer { noCutWatchdog?.setReading(true, at: Date()) }
+        // AE#443: so the stall ladder can name the pump instead of the source.
+        setLiveHeadroomParked(true)
+        defer { setLiveHeadroomParked(false) }
         var parked = 0
         while !checkShouldStop() {
-            if cache.count < Self.liveResidentSegmentCap {
+            // AE#443: re-read per second rather than latching the entry value. The window is sized
+            // from the observed cadence and segment size, so it moves while a park holds, and a park
+            // that outlived its own reason would keep the origin undrained for nothing.
+            let cap = liveResidentCap()
+            if cache.count < cap {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom released head=\(head) after=\(parked)s "
                     + "resident=\(cache.count)",
@@ -1620,7 +1814,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             if parked % 10 == 0 {
                 EngineLog.emit(
                     "[HLSSegmentProducer] live headroom PARK head=\(head) resident=\(cache.count) "
-                    + "cap=\(Self.liveResidentSegmentCap) parked=\(parked)s (playlist polls stopped?)",
+                    + "cap=\(cap) parked=\(parked)s (playlist polls stopped?). AE#443: this pump is "
+                    + "not reading while it is parked, so the origin is not being drained either; a "
+                    + "single-connection live source dies behind a long park",
                     category: .session
                 )
             }
@@ -1816,10 +2012,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                     }
                 }
             )
-            // Write under stateLock: telemetry getters read currentMuxer under the same lock.
-            stateLock.lock()
-            self.currentMuxer = muxer
-            stateLock.unlock()
+            // Write through installMuxer: telemetry getters read currentMuxer under stateLock, and the
+            // outgoing muxer's totals have to be folded before the reference goes.
+            self.installMuxer(muxer)
             self.currentMuxerSegmentIndex = initialSegmentIndex
             return muxer
         } catch {
@@ -2264,9 +2459,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session
             )
         }
-        stateLock.lock()
-        currentMuxer = nil
-        stateLock.unlock()
+        installMuxer(nil)
         currentMuxerSegmentIndex = .min
     }
 
@@ -2282,9 +2475,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 category: .session
             )
         }
-        stateLock.lock()
-        currentMuxer = nil
-        stateLock.unlock()
+        installMuxer(nil)
         currentMuxerSegmentIndex = .min
     }
 
@@ -2512,8 +2703,18 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// The abort costs nothing this exit was going to keep: `.segmentStall` delegates to a host
     /// retune, which tears the demuxer down.
     private func tickNoCutWatchdog(_ watchdog: NoCutStallWatchdog) {
-        guard let decision = watchdog.evaluate(now: Date()) else { return }
+        guard let decision = watchdog.evaluate(
+            now: Date(), servingOutageRunway: outageRunwayProvider?() ?? false) else { return }
         switch decision {
+        case .holdForOutageRunway(let w):
+            EngineLog.emit(
+                "[HLSSegmentProducer] #446 outage hold "
+                + "\(w.consecutiveHolds)/\(Self.liveSlowDeliveryMaxHolds): nothing cut for "
+                + "\(Int(w.stalledFor))s (rate=\(String(format: "%.1f", w.readRate))pkt/s), and the "
+                + "closed window is still feeding the consumer; keeping the source read so the source "
+                + "coming back can still be seen",
+                category: .session
+            )
         case .holdForSlowDelivery(let w):
             EngineLog.emit(
                 "[HLSSegmentProducer] slow live delivery hold "
@@ -2532,6 +2733,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 + "\(w.isWedge ? "cutter wedge" : "source starvation")); "
                 + "window video=\(w.videoPackets) key=\(w.videoKeyframes) "
                 + "audio=\(w.audioPackets) foreign=\(w.foreignPackets)"
+                + (w.synthesizedVideoPackets > 0
+                    ? " synthesizedTs=\(w.synthesizedVideoPackets)" : "")
                 + (w.lastForeignStreamIndex >= 0
                     ? " lastForeignIdx=\(w.lastForeignStreamIndex)" : "")
                 + (w.videoPtsAdvanceSeconds >= 0
@@ -2715,6 +2918,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
                          subtitleTapTimeBases[pktStreamIdx] ?? AVRational(num: 1, den: 1000))
                 }
 
+                // AE#432: learn each stream's frame stride from its GENUINE timestamps, so a run
+                // that arrives without any can be advanced by a plausible interval instead of a
+                // single tick. Recorded before the repair below, and never from a repaired value.
+                if packet.pointee.dts != Int64.min, isVideoPkt || isAudioPkt {
+                    let tb = isVideoPkt ? sourceVideoTbSeconds : audioSourceTbSeconds
+                    let cap = tb > 0 ? Int64(Self.maxSynthesizedStrideSeconds / tb) : 0
+                    if isVideoPkt {
+                        videoSourceStrideTicks = Self.updatedStrideTicks(
+                            current: videoSourceStrideTicks, previousDts: lastGenuineVideoSourceDts,
+                            dts: packet.pointee.dts, maxStrideTicks: cap)
+                        lastGenuineVideoSourceDts = packet.pointee.dts
+                    } else {
+                        audioSourceStrideTicks = Self.updatedStrideTicks(
+                            current: audioSourceStrideTicks, previousDts: lastGenuineAudioSourceDts,
+                            dts: packet.pointee.dts, maxStrideTicks: cap)
+                        lastGenuineAudioSourceDts = packet.pointee.dts
+                    }
+                }
+
+                // AE#432: true when this packet reached the loop with no timestamp of its own, so
+                // everything downstream that measures time is reading a value the engine invented.
+                var timestampsSynthesized = false
                 if packet.pointee.dts == Int64.min {
                     let anchor: Int64 = isVideoPkt ? lastVideoSourceDts
                                       : isAudioPkt ? lastAudioSourceDts
@@ -2728,11 +2953,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             continue
                         }
                         packet.pointee.dts = packet.pointee.pts
+                    } else if packet.pointee.pts != Int64.min {
+                        // dts alone is missing (matroska reconstructs it from ReferenceBlock relations
+                        // and fails on some B-frames). pts is the real presentation time and must not
+                        // be crossed, so the bump stays minimal.
+                        packet.pointee.dts = anchor &+ 1
                     } else {
-                        packet.pointee.dts = anchor + 1
-                        if packet.pointee.pts == Int64.min {
-                            packet.pointee.pts = packet.pointee.dts
-                        }
+                        // Neither timestamp survived. One tick per packet is not a presentation time,
+                        // it is a frozen clock; advance by this stream's frame interval instead.
+                        let stride = Self.repairStrideTicks(
+                            packetDuration: packet.pointee.duration,
+                            observedStride: isVideoPkt ? videoSourceStrideTicks : audioSourceStrideTicks,
+                            fallbackDuration: isVideoPkt ? videoFallbackDurationPts : audioFallbackDurationPts)
+                        packet.pointee.dts = anchor &+ stride
+                        packet.pointee.pts = packet.pointee.dts
+                        timestampsSynthesized = true
+                        noteSynthesizedTimestamp(strideTicks: stride, isVideo: isVideoPkt)
                     }
                 }
 
@@ -3055,7 +3291,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 if isVideoPkt {
                     noCutWatchdog?.noteVideoPacket(
                         pts: packet.pointee.pts,
-                        isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
+                        isKeyframe: (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0,
+                        synthesizedTimestamp: timestampsSynthesized
                     )
                     if firstSeenVideoSourceDts == Int64.min {
                         firstSeenVideoSourceDts = packet.pointee.dts
@@ -3225,9 +3462,14 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             + (pinnedTfdtPts != desiredFirstVideoTfdtPts
                                 ? "pinnedTo=\(pinnedTfdtPts) " : "")
                             + "shift=\(videoShiftPts) "
-                            + (Self.presentedShiftPts(actualFirstDts: firstActualVideoDts,
+                            + (Self.presentedShiftPts(actualFirstPts: firstActualVideoPts,
                                                       desiredTfdtPts: desiredFirstVideoTfdtPts) != videoShiftPts
-                                ? "presentedShift=\(Self.presentedShiftPts(actualFirstDts: firstActualVideoDts, desiredTfdtPts: desiredFirstVideoTfdtPts)) " : "")
+                                ? "presentedShift=\(Self.presentedShiftPts(actualFirstPts: firstActualVideoPts, desiredTfdtPts: desiredFirstVideoTfdtPts)) " : "")
+                            // AE#418 round 5: the composition needs this, so the line that publishes
+                            // the shift names it too. Zero on a source without frame reordering.
+                            + (Self.presentationLeadPts(actualFirstPts: firstActualVideoPts,
+                                                        actualFirstDts: firstActualVideoDts) != 0
+                                ? "lead=\(Self.presentationLeadPts(actualFirstPts: firstActualVideoPts, actualFirstDts: firstActualVideoDts)) " : "")
                             // #133 follow-up diag: PID + reconstruct state per epoch, so retest logs separate a
                             // same-PID mid-stream parameter-set change from a reopen storm (each reopen is a fresh
                             // gate-open here; a same-PID change is NOT, it stays in one epoch and rotates in place).
@@ -3247,9 +3489,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         // start: the stretch below it still belongs to the previous epoch on screen.
                         onVideoShiftKnown?(
                             Self.presentedShiftPts(
-                                actualFirstDts: firstActualVideoDts,
+                                actualFirstPts: firstActualVideoPts,
                                 desiredTfdtPts: desiredFirstVideoTfdtPts),
-                            desiredFirstVideoTfdtPts)
+                            desiredFirstVideoTfdtPts,
+                            Self.presentationLeadPts(
+                                actualFirstPts: firstActualVideoPts,
+                                actualFirstDts: firstActualVideoDts))
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.

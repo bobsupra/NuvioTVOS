@@ -22,45 +22,51 @@ struct ActionButtons: View {
                 HStack(spacing: 8) {
                     Image(systemName: "play.fill")
                         .accessibilityHidden(true)
-                    Text("Watch Now")
+                    Text(L10n.string("details_watch_now", fallback: "Watch Now"))
                 }
                 .frame(height: 56)
                 .padding(.horizontal, 24)
             }
             .buttonStyle(.borderedProminent)
-            .accessibilityLabel("Watch Now")
-            .accessibilityHint("Starts playback")
+            .accessibilityLabel(L10n.string("details_watch_now", fallback: "Watch Now"))
+            .accessibilityHint(L10n.string("details_play_hint", fallback: "Starts playback"))
 
             Button(action: onWatchlistClick) {
                 HStack(spacing: 8) {
                     Image(systemName: isInWatchlist ? "checkmark" : "plus")
                         .accessibilityHidden(true)
-                    Text(isInWatchlist ? "In Library" : "Library")
+                    Text(isInWatchlist
+                        ? L10n.string("details_in_library", fallback: "In Library")
+                        : L10n.string("details_library", fallback: "Library"))
                 }
                 .frame(height: 56)
                 .padding(.horizontal, 20)
             }
             .buttonStyle(.bordered)
-            .accessibilityLabel(isInWatchlist ? "In library" : "Add to library")
+            .accessibilityLabel(isInWatchlist
+                ? L10n.string("details_in_library", fallback: "In library")
+                : L10n.string("details_add_to_library", fallback: "Add to library"))
             .accessibilityHint(isInWatchlist
-                ? "Removes this title from your library"
-                : "Adds this title to your library")
+                ? L10n.string("details_remove_from_library_hint", fallback: "Removes this title from your library")
+                : L10n.string("details_add_to_library_hint", fallback: "Adds this title to your library"))
 
             Button(action: onWatchedClick) {
                 Image(systemName: isWatched ? "eye.fill" : "eye.slash.fill")
             }
             .buttonStyle(.plain)
-            .accessibilityLabel(isWatched ? "Watched" : "Not watched")
+            .accessibilityLabel(isWatched
+                ? L10n.string("details_watched", fallback: "Watched")
+                : L10n.string("details_not_watched", fallback: "Not watched"))
             .accessibilityHint(isWatched
-                ? "Marks this title as unwatched"
-                : "Marks this title as watched")
+                ? L10n.string("details_mark_unwatched_hint", fallback: "Marks this title as unwatched")
+                : L10n.string("details_mark_watched_hint", fallback: "Marks this title as watched"))
 
             Button(action: onShareClick) {
                 Image(systemName: "square.and.arrow.up")
             }
             .buttonStyle(.plain)
-            .accessibilityLabel("Share")
-            .accessibilityHint("Shares this title")
+            .accessibilityLabel(L10n.string("action_share", fallback: "Share"))
+            .accessibilityHint(L10n.string("details_share_hint", fallback: "Shares this title"))
         }
     }
 }
@@ -80,39 +86,45 @@ struct TvActionButtons: View {
                     Image(systemName: "play.fill")
                         .font(.system(size: 24))
                         .accessibilityHidden(true)
-                    Text("Watch Now")
+                    Text(L10n.string("details_watch_now", fallback: "Watch Now"))
                         .font(.title3)
                 }
                 .frame(height: 64)
                 .padding(.horizontal, 32)
             }
             .buttonStyle(.borderedProminent)
-            .accessibilityLabel("Watch Now")
-            .accessibilityHint("Starts playback")
+            .accessibilityLabel(L10n.string("details_watch_now", fallback: "Watch Now"))
+            .accessibilityHint(L10n.string("details_play_hint", fallback: "Starts playback"))
 
             Button(action: onWatchlistClick) {
                 HStack(spacing: 12) {
                     Image(systemName: isInWatchlist ? "checkmark" : "plus")
                         .font(.system(size: 20))
                         .accessibilityHidden(true)
-                    Text(isInWatchlist ? "In Library" : "Library")
+                    Text(isInWatchlist
+                        ? L10n.string("details_in_library", fallback: "In Library")
+                        : L10n.string("details_library", fallback: "Library"))
                         .font(.title3)
                 }
                 .frame(height: 64)
                 .padding(.horizontal, 28)
             }
             .buttonStyle(.bordered)
-            .accessibilityLabel(isInWatchlist ? "In library" : "Add to library")
+            .accessibilityLabel(isInWatchlist
+                ? L10n.string("details_in_library", fallback: "In library")
+                : L10n.string("details_add_to_library", fallback: "Add to library"))
             .accessibilityHint(isInWatchlist
-                ? "Removes this title from your library"
-                : "Adds this title to your library")
+                ? L10n.string("details_remove_from_library_hint", fallback: "Removes this title from your library")
+                : L10n.string("details_add_to_library_hint", fallback: "Adds this title to your library"))
 
             Button(action: onWatchedClick) {
                 HStack(spacing: 12) {
                     Image(systemName: isWatched ? "eye.fill" : "eye.slash.fill")
                         .font(.system(size: 20))
                         .accessibilityHidden(true)
-                    Text(isWatched ? "Watched" : "Unwatched")
+                    Text(isWatched
+                        ? L10n.string("details_watched", fallback: "Watched")
+                        : L10n.string("details_unwatched", fallback: "Unwatched"))
                         .font(.title3)
                         .accessibilityHidden(true)
                 }
@@ -120,17 +132,19 @@ struct TvActionButtons: View {
                 .padding(.horizontal, 28)
             }
             .buttonStyle(.bordered)
-            .accessibilityLabel(isWatched ? "Watched" : "Not watched")
+            .accessibilityLabel(isWatched
+                ? L10n.string("details_watched", fallback: "Watched")
+                : L10n.string("details_not_watched", fallback: "Not watched"))
             .accessibilityHint(isWatched
-                ? "Marks this title as unwatched"
-                : "Marks this title as watched")
+                ? L10n.string("details_mark_unwatched_hint", fallback: "Marks this title as unwatched")
+                : L10n.string("details_mark_watched_hint", fallback: "Marks this title as watched"))
 
             Button(action: onShareClick) {
                 HStack(spacing: 12) {
                     Image(systemName: "square.and.arrow.up")
                         .font(.system(size: 20))
                         .accessibilityHidden(true)
-                    Text("Share")
+                    Text(L10n.string("action_share", fallback: "Share"))
                         .font(.title3)
                         .accessibilityHidden(true)
                 }
@@ -138,8 +152,8 @@ struct TvActionButtons: View {
                 .padding(.horizontal, 28)
             }
             .buttonStyle(.bordered)
-            .accessibilityLabel("Share")
-            .accessibilityHint("Shares this title")
+            .accessibilityLabel(L10n.string("action_share", fallback: "Share"))
+            .accessibilityHint(L10n.string("details_share_hint", fallback: "Shares this title"))
         }
     }
 }

@@ -22,4 +22,41 @@ enum LiveReloadPolicy {
     static func skipInitialSeek(isLive: Bool, isRejoin: Bool) -> Bool {
         isLive && isRejoin
     }
+
+    /// AE#442: where a live REJOIN that swapped the item IN PLACE should come back.
+    ///
+    /// The rules above describe a reload that rebuilt the pipeline: `HLSVideoEngine` and its segment
+    /// cache went with `stopInternal`, so the pre-reload position is not discarded, it stops existing.
+    /// The stage-2 / #65 recovery reload is a different animal. It calls `host.load(inPlaceSwap: true)`
+    /// under a session that stays whole: same producer, same cache, same served playlist. A playhead
+    /// parked minutes inside the DVR window is still resident content at the moment that reload picks
+    /// its join point, and rejoining at the edge throws away something that is provably still there.
+    ///
+    /// `behindWhenLastAdvancing` is deliberately NOT the live `behindLiveSeconds`. A stall inflates
+    /// that by its own duration (the edge runs on while the playhead does not), so at the moment of a
+    /// recovery it cannot tell a viewer parked in the window from an edge viewer whose picture just
+    /// froze. The last sample where the clock actually moved can.
+    ///
+    /// `targetDurationSeconds` is the threshold rather than an invented constant: the edge advances one
+    /// segment at a time, so a healthy playhead's distance from it oscillates within exactly one
+    /// TARGETDURATION by construction. Beyond that the distance is a position, not the oscillation.
+    ///
+    /// Returns nil for every case that must keep today's edge rejoin: not live, no cache that can vouch
+    /// for the position (remote-HLS live and the software live path both pass `residentRange: nil`), or
+    /// a viewer who was at the edge anyway.
+    static func recoveryRejoinPosition(
+        isLive: Bool,
+        playhead: Double,
+        behindWhenLastAdvancing: Double,
+        residentRange: ClosedRange<Double>?,
+        targetDurationSeconds: Double?
+    ) -> Double? {
+        guard isLive, let range = residentRange else { return nil }
+        // No served TARGETDURATION means no live playlist of ours to reason about; keep the edge rejoin.
+        guard let targetDuration = targetDurationSeconds,
+              behindWhenLastAdvancing > targetDuration else { return nil }
+        // Clamped rather than refused: a position that slid out from under the stall is gone, and the
+        // oldest surviving second is a far better answer for a viewer who was minutes back than the edge.
+        return Swift.min(Swift.max(playhead, range.lowerBound), range.upperBound)
+    }
 }

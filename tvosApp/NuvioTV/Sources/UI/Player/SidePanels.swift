@@ -228,7 +228,7 @@ struct PlayerEpisodesPanel: View {
                     .lineLimit(3)
                     .fixedSize(horizontal: false, vertical: true)
                 if isCurrent {
-                    Text("Now Playing")
+                    Text(L10n.string("player_now_playing", fallback: "Now Playing"))
                         .font(.system(size: 16, weight: .bold))
                         .foregroundStyle(isFocused ? .black.opacity(0.65) : .white.opacity(0.75))
                 }
@@ -278,7 +278,7 @@ struct PlayerSourcesPanel: View {
                                 ProgressView()
                                     .progressViewStyle(.circular)
                                     .tint(.white)
-                                Text("Searching sources…")
+                                Text(L10n.string("player_searching_sources", fallback: "Searching sources…"))
                                     .font(.system(size: 22, weight: .medium))
                                     .foregroundStyle(.white.opacity(0.8))
                             }
@@ -287,8 +287,8 @@ struct PlayerSourcesPanel: View {
                         } else if viewModel.availableSources.isEmpty {
                             Button {} label: {
                                 PlayerPanelRow(
-                                    title: "No sources found",
-                                    subtitle: "None of your stream add-ons returned a link.",
+                                    title: L10n.string("player_no_sources_found", fallback: "No sources found"),
+                                    subtitle: L10n.string("player_no_sources_found_subtitle", fallback: "None of your stream add-ons returned a link."),
                                     isFocused: focusedID == "empty"
                                 )
                             }

@@ -379,6 +379,16 @@ enum L10n {
             return string("type_series", fallback: "TV")
         case "Built-in":
             return string("tvos_settings_option_built_in", fallback: "Built-in")
+        case "Top":
+            return string("tvos_settings_option_top", fallback: "Top")
+        case "Bottom":
+            return string("tvos_settings_option_bottom", fallback: "Bottom")
+        case "Quality":
+            return string("tvos_settings_option_quality", fallback: "Quality")
+        case "Size":
+            return string("tvos_settings_option_size", fallback: "Size")
+        case "Name":
+            return string("tvos_settings_option_name", fallback: "Name")
         default:
             return stored
         }

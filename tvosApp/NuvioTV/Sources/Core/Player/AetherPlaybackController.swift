@@ -1,6 +1,7 @@
 import Foundation
 import UIKit
 import AVFoundation
+import MediaPlayer
 import Combine
 import AetherEngine
 import AetherEngineSMB
@@ -1800,6 +1801,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
         }
         super.init(nibName: nil, bundle: nil)
+        #if os(tvOS) || os(iOS)
+        self.engine.ownsVideoNowPlayingSession = true
+        #endif
         subtitleTranslationState.onCueTranslationResolved = { [weak self] cueID in
             self?.releaseAISubtitleStartupHold(for: cueID)
         }
@@ -2197,6 +2201,18 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             subtitles: request.externalSubtitles,
             httpHeaders: request.httpHeaders
         )
+        #if os(tvOS) || os(iOS)
+        var nowPlaying: [String: Any] = [:]
+        if let title = request.streamName, !title.isEmpty {
+            nowPlaying[MPMediaItemPropertyTitle] = title
+        }
+        if let subtitle = request.streamDescription, !subtitle.isEmpty {
+            nowPlaying[MPMediaItemPropertyArtist] = subtitle
+        }
+        if !nowPlaying.isEmpty {
+            engine.setVideoNowPlayingInfo(nowPlaying)
+        }
+        #endif
         externalSubtitleURLsByTrackID = externalRegistration.urlsByTrackID
         currentHTTPHeaders = request.httpHeaders
         lastKnownPositionMs = 0
@@ -2266,6 +2282,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 self.sourceProbe = probe
                 self.isPlayerLoading = false
                 self.setSpeed(request.playbackRate)
+                #if os(tvOS) || os(iOS)
+                self.configureRemoteCommandsIfNeeded()
+                #endif
             } catch {
                 guard self.loadGeneration == gen else { return }
                 let message = error.localizedDescription
@@ -2465,7 +2484,66 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         mapAudioTracks(engine.audioTracks)
         mapSubtitleTracks(engine.subtitleTracks)
         applyPhase(engine.playbackPhase)
+        #if os(tvOS) || os(iOS)
+        configureRemoteCommandsIfNeeded()
+        #endif
     }
+
+    #if os(tvOS) || os(iOS)
+    private var didConfigureRemoteCommands = false
+
+    private func configureRemoteCommandsIfNeeded() {
+        guard !didConfigureRemoteCommands,
+              let center = engine.videoNowPlayingSession?.remoteCommandCenter else { return }
+        didConfigureRemoteCommands = true
+
+        center.playCommand.isEnabled = true
+        center.playCommand.addTarget { [weak self] _ in
+            self?.playPlayback()
+            return .success
+        }
+
+        center.pauseCommand.isEnabled = true
+        center.pauseCommand.addTarget { [weak self] _ in
+            self?.pausePlayback()
+            return .success
+        }
+
+        center.togglePlayPauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            if self.isPlayerPlaying {
+                self.pausePlayback()
+            } else {
+                self.playPlayback()
+            }
+            return .success
+        }
+
+        center.changePlaybackPositionCommand.isEnabled = true
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            self?.seekToMs(Int64((event.positionTime * 1000).rounded()))
+            return .success
+        }
+
+        center.skipForwardCommand.isEnabled = true
+        center.skipForwardCommand.preferredIntervals = [10]
+        center.skipForwardCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            self.seekToMs(self.positionMs + 10_000)
+            return .success
+        }
+
+        center.skipBackwardCommand.isEnabled = true
+        center.skipBackwardCommand.preferredIntervals = [10]
+        center.skipBackwardCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            self.seekToMs(max(0, self.positionMs - 10_000))
+            return .success
+        }
+    }
+    #endif
 
     /// Snapshot for coordinator handoff.
     func coherentSourceTimeSeconds() -> Double {

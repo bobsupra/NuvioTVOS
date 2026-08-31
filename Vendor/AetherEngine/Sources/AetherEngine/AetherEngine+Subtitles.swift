@@ -921,10 +921,15 @@ extension AetherEngine {
         // shift, and reading the two as one clock has cost a round of diagnosis before.
         if channel == .primary, let firstCue = event.cues.first,
            subtitleCueDiagnosticBudget.claim(generation: currentSeekGeneration) {
+            // #407: a PGS composition carries no end of its own, so the decoder stamps it with
+            // `end_display_time = UINT32_MAX` and the successor's `pgsTrimAt` closes it. Printed
+            // raw, that placeholder reads as a 49.7-day cue and has already been reported as an
+            // unsigned-32-bit overflow. Name it for what it is.
+            let openEnded = firstCue.endTime - firstCue.startTime >= Self.subtitleOpenEndedWindowSeconds
             EngineLog.emit(
                 "[applySubtitleEvent] " +
                 "cueStart=\(String(format: "%.3f", firstCue.startTime))s " +
-                "cueEnd=\(String(format: "%.3f", firstCue.endTime))s " +
+                "cueEnd=\(openEnded ? "open-ended (closed by the successor)" : String(format: "%.3fs", firstCue.endTime)) " +
                 "sourceTime=\(String(format: "%.3f", sourceTime))s " +
                 "engine.currentTime=\(String(format: "%.3f", currentTime))s " +
                 "seekGen=\(currentSeekGeneration)",

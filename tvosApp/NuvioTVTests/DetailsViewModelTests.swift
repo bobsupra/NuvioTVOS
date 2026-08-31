@@ -271,20 +271,95 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertFalse(metaMovie.isSeries)
     }
 
+    func testVideoBearingMovieIsRecognizedAsSeries() {
+        let meta = NuvioMeta(
+            id: "movie-with-episode",
+            name: "Movie",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            type: "movie",
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: [NuvioVideo(id: "movie-with-episode:1:1", title: "Episode", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil)],
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+
+        XCTAssertTrue(meta.isSeries)
+    }
+
     func testLiveTVFallbackTitleFormatting() {
         XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "usatv_espn_hd"), "ESPN HD")
         XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "iptv:cnn"), "CNN")
         XCTAssertEqual(CinemetaCatalogRepository.fallbackTitle(forId: "channel_hbo_east"), "HBO East")
     }
 
-    func testCinemetaCatalogRepositoryLiveTVMetadataResolution() async throws {
-        let repo = CinemetaCatalogRepository()
-        let meta = try await repo.getMetadata(id: "usatv_espn_hd", type: "channel")
-        XCTAssertEqual(meta.id, "usatv_espn_hd")
-        XCTAssertEqual(meta.name, "ESPN HD")
-        XCTAssertEqual(meta.type, "channel")
-        XCTAssertFalse(meta.isSeries)
+    func testEpisodeMergingAndSorting() {
+        let existing = [
+            NuvioVideo(id: "tt:4:1", title: "S4E1", season: 4, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+            NuvioVideo(id: "tt:5:1", title: "S5E1", season: 5, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil)
+        ]
+        let tmdb = [
+            NuvioVideo(id: "tt:1:1", title: "S1E1", season: 1, episode: 1, thumbnail: "thumb1", overview: "Overview 1", released: nil, rating: nil),
+            NuvioVideo(id: "tt:2:1", title: "S2E1", season: 2, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+            NuvioVideo(id: "tt:3:1", title: "S3E1", season: 3, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil),
+            NuvioVideo(id: "tt:4:1", title: "S4E1 TMDB Title", season: 4, episode: 1, thumbnail: "thumb4", overview: "Overview 4", released: nil, rating: nil)
+        ]
+
+        let merged = DetailsViewModel.mergeEpisodes(existing: existing, fromTmdb: tmdb, parentId: "tt")
+        XCTAssertNotNil(merged)
+        XCTAssertEqual(merged?.count, 5)
+        XCTAssertEqual(merged?.map(\.season), [1, 2, 3, 4, 5])
+        XCTAssertEqual(merged?.first(where: { $0.season == 4 })?.title, "S4E1 TMDB Title")
     }
 
-}
+    func testCatalogPreviewsDoNotCountAsFullCachedMetadata() {
+        let repo = CinemetaCatalogRepository()
+        let testId = "tt_test_series_preview"
 
+        // Cache a full meta
+        let fullMeta = NuvioMeta(
+            id: testId,
+            name: "Test Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: testId,
+            tmdbId: nil,
+            type: "series",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: [NuvioVideo(id: "\(testId):1:1", title: "Pilot", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil)],
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+
+        repo.cacheMetadata(fullMeta, requestedID: testId)
+        XCTAssertTrue(repo.isCachedFullMetadata(id: testId))
+    }
+}

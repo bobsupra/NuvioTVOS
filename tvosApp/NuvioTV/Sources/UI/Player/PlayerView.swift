@@ -39,50 +39,128 @@ struct PlayerView: View {
     ) async -> PreparedNextStream?)? = nil
     var onFinished: (() -> Void)? = nil
     var onPlaybackStarted: (() -> Void)? = nil
+    var onPlayRecommendation: ((_ meta: NuvioMeta, _ playManually: Bool) -> Void)? = nil
+    var onOpenRecommendationDetails: ((_ meta: NuvioMeta) -> Void)? = nil
     var onBack: () -> Void
 
     @State private var didHandleFinished = false
     @State private var didReportPlaybackStarted = false
     @FocusState private var remoteInputFocused: Bool
     @FocusState private var nextEpisodeFocused: Bool
+    @FocusState private var cancelAutoPlayFocused: Bool
     @FocusState private var skipSegmentFocused: Bool
+    @FocusState private var postPlayFocus: PostPlayFocusItem?
 
     var body: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
-            // Aether is primary; MPV owns the one-way compatibility fallback.
-            Group {
-                switch viewModel.activeEngineKind {
-                case .aether:
-                    AetherPlayerSurface(controller: viewModel.aetherController)
-                case .mpv:
-                    MPVVideoSurface(controller: viewModel.playerController)
-                }
-            }
-            .ignoresSafeArea()
+            // Main video surface (or top-right mini window during post-play recommendations)
+            if !viewModel.postPlayState.isTrailerPlaying &&
+                (!viewModel.postPlayState.isVisible || viewModel.postPlayState.canReturnToPlayer) {
+                ZStack {
+                    Group {
+                        switch viewModel.activeEngineKind {
+                        case .aether:
+                            AetherPlayerSurface(controller: viewModel.aetherController)
+                        case .mpv:
+                            MPVVideoSurface(controller: viewModel.playerController)
+                        }
+                    }
 
-            // Aether exposes timed cues directly. MPV exposes its current text
-            // cue; its native renderer is hidden only while that cue is being
-            // replaced by the AI subtitle overlay.
-            if viewModel.activeEngineKind == .aether {
-                PlayerSubtitleOverlay(
-                    playback: viewModel.aetherController.subtitleOverlayState,
-                    translation: viewModel.aetherController.subtitleTranslationState,
-                    subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
-                    videoNaturalSize: viewModel.videoNaturalSize,
-                    aspectMode: viewModel.aspectMode,
-                    style: viewModel.subtitleStyle
+                    if viewModel.activeEngineKind == .aether {
+                        PlayerSubtitleOverlay(
+                            playback: viewModel.aetherController.subtitleOverlayState,
+                            translation: viewModel.aetherController.subtitleTranslationState,
+                            subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
+                            videoNaturalSize: viewModel.videoNaturalSize,
+                            aspectMode: viewModel.aspectMode,
+                            style: viewModel.subtitleStyle
+                        )
+                        .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+                    } else {
+                        MPVSubtitleOverlay(
+                            translation: viewModel.playerController.subtitleTranslationState,
+                            videoNaturalSize: viewModel.videoNaturalSize,
+                            aspectMode: viewModel.aspectMode,
+                            style: viewModel.subtitleStyle
+                        )
+                        .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+                    }
+
+                    if viewModel.postPlayState.isVisible && viewModel.postPlayState.canReturnToPlayer {
+                        miniPlayerReturnButton
+                    }
+                }
+                .frame(
+                    width: viewModel.postPlayState.isVisible ? 580 : nil,
+                    height: viewModel.postPlayState.isVisible ? 326 : nil
                 )
-                .ignoresSafeArea()
-            } else {
-                MPVSubtitleOverlay(
-                    translation: viewModel.playerController.subtitleTranslationState,
-                    videoNaturalSize: viewModel.videoNaturalSize,
-                    aspectMode: viewModel.aspectMode,
-                    style: viewModel.subtitleStyle
+                .clipShape(RoundedRectangle(cornerRadius: viewModel.postPlayState.isVisible ? 16 : 0))
+                .scaleEffect(viewModel.postPlayState.isVisible && postPlayFocus == .miniPlayer ? 1.05 : 1.0)
+                .animation(.easeOut(duration: 0.16), value: postPlayFocus)
+                .overlay {
+                    if viewModel.postPlayState.isVisible {
+                        RoundedRectangle(cornerRadius: 16)
+                            .stroke(
+                                postPlayFocus == .miniPlayer ? Color.white : Color.white.opacity(0.35),
+                                lineWidth: postPlayFocus == .miniPlayer ? 4 : 2
+                            )
+                            .shadow(
+                                color: postPlayFocus == .miniPlayer ? Color.white.opacity(0.6) : Color.clear,
+                                radius: 12
+                            )
+                    }
+                }
+                .shadow(color: Color.black.opacity(viewModel.postPlayState.isVisible ? 0.6 : 0), radius: 16)
+                .frame(
+                    maxWidth: .infinity,
+                    maxHeight: .infinity,
+                    alignment: viewModel.postPlayState.isVisible ? .topTrailing : .center
                 )
-                .ignoresSafeArea()
+                .padding(.top, viewModel.postPlayState.isVisible ? 50 : 0)
+                .padding(.trailing, viewModel.postPlayState.isVisible ? 60 : 0)
+                .zIndex(viewModel.postPlayState.isVisible ? 5 : 0)
+                .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
+            }
+
+            // Post-Play Recommendation Overlay
+            if viewModel.postPlayState.isVisible {
+                PostPlayRecommendationOverlay(
+                    state: viewModel.postPlayState,
+                    currentTitle: meta.name,
+                    showManualPlayOption: autoPlayNextEnabled,
+                    focus: $postPlayFocus,
+                    onPlay: { rec, manual in
+                        onPlayRecommendation?(rec.asMeta, manual)
+                    },
+                    onOpenDetails: { rec in
+                        onOpenRecommendationDetails?(rec.asMeta)
+                    },
+                    onPlayTrailer: {
+                        viewModel.playPostPlayTrailer()
+                    },
+                    onStopTrailer: {
+                        viewModel.stopPostPlayTrailer()
+                    },
+                    onPreviousRecommendation: {
+                        viewModel.showPreviousRecommendation()
+                    },
+                    onNextRecommendation: {
+                        viewModel.showNextRecommendation()
+                    },
+                    onBack: {
+                        if viewModel.postPlayState.isTrailerPlaying {
+                            viewModel.stopPostPlayTrailer()
+                        } else if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
+                            viewModel.returnToPlayerFromPostPlay()
+                        } else {
+                            onBack()
+                        }
+                    }
+                )
+                .zIndex(2)
+                .transition(.opacity)
             }
 
             // Window-level trackpad capture for Infuse-style scrubbing / peek.
@@ -90,6 +168,7 @@ struct PlayerView: View {
                 isActive: {
                     !viewModel.showSettingsPanel
                         && viewModel.sidePanel == nil
+                        && !viewModel.postPlayState.isVisible
                         && (viewModel.isScrubbing
                             || (!viewModel.showControls && !viewModel.showNextEpisodeCard))
                 },
@@ -108,6 +187,7 @@ struct PlayerView: View {
                 isActive: !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.isScrubbing
+                    && !viewModel.postPlayState.isVisible
                     && (!viewModel.showControls || viewModel.isTimelineFocused),
                 onBeginBackward: { viewModel.beginRepeatingSkipBackward() },
                 onBeginForward: { viewModel.beginRepeatingSkipForward() },
@@ -116,49 +196,7 @@ struct PlayerView: View {
             .frame(width: 1, height: 1)
             .accessibilityHidden(true)
 
-            switch viewModel.status {
-            case .buffering, .idle:
-                // A switch keeps this up for the whole round trip (resolve, then
-                // the new stream opening), labelled with what it's waiting on.
-                if viewModel.isSwitchingSource {
-                    VStack(spacing: 14) {
-                        ProgressView()
-                            .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                            .scaleEffect(1.3)
-                        Text(viewModel.switchingSourceMessage)
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.9))
-                    }
-                    .padding(.horizontal, 36)
-                    .padding(.vertical, 28)
-                    .glassRoundedRect(cornerRadius: 24)
-                    .transition(.opacity)
-                } else {
-                    ProgressView()
-                        .progressViewStyle(CircularProgressViewStyle(tint: .white))
-                        .scaleEffect(2)
-                        .padding(48)
-                        .glassCircle()
-                }
-            case .error(let message):
-                VStack(spacing: 16) {
-                    Image(systemName: "exclamationmark.triangle")
-                        .font(.system(size: 48))
-                        .foregroundColor(.yellow)
-                    Text("Playback failed")
-                        .font(.title2.weight(.semibold))
-                        .foregroundColor(.white)
-                    Text(message)
-                        .font(.body)
-                        .foregroundColor(.white.opacity(0.7))
-                        .multilineTextAlignment(.center)
-                        .frame(maxWidth: 900)
-                }
-                .padding(48)
-                .glassRoundedRect(cornerRadius: 32)
-            default:
-                EmptyView()
-            }
+            playerStatusOverlay
 
             if let toast = viewModel.playerToast {
                 VStack {
@@ -195,10 +233,11 @@ struct PlayerView: View {
                 .ignoresSafeArea()
                 .contentShape(Rectangle())
                 .focusable(
-                    (!viewModel.showControls || viewModel.isScrubbing || viewModel.showPauseOverlay)
+                    (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.isScrubbing || viewModel.showPauseOverlay)
                         && !viewModel.showNextEpisodeCard
                         && !viewModel.showSkipSegmentCard
                         && !viewModel.showSettingsPanel
+                        && !viewModel.postPlayState.isVisible
                         && viewModel.sidePanel == nil
                 )
                 .focused($remoteInputFocused)
@@ -273,20 +312,28 @@ struct PlayerView: View {
                 .zIndex(3)
             }
 
-            // Next-episode prompt, shown near the end. It auto-hides after five
-            // seconds like the skip card; Auto-Play can still advance afterward.
+            // Next-episode prompt, shown near the end. Auto-play occurs only
+            // after the current episode reaches genuine end-of-media.
             if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
-                Button(action: { viewModel.playNextEpisode() }) {
-                    NextEpisodeOverlay(
-                        episode: next,
-                        countdown: viewModel.nextEpisodeCountdown,
-                        isAdvancing: viewModel.isAdvancingEpisode,
-                        isFocused: nextEpisodeFocused
-                    )
+                VStack(spacing: 8) {
+                    Button(action: { viewModel.playNextEpisode() }) {
+                        NextEpisodeOverlay(episode: next, isAdvancing: viewModel.isAdvancingEpisode, isFocused: nextEpisodeFocused, isAutoPlayCancelled: viewModel.isAutoPlayCancelled)
+                    }
+                    .buttonStyle(PosterCardButtonStyle())
+                    .focusEffectDisabledIfAvailable()
+                    .focused($nextEpisodeFocused)
+                    if autoPlayNextEnabled && !viewModel.isAutoPlayCancelled && !viewModel.isAdvancingEpisode {
+                        Button(action: { viewModel.cancelAutoPlay() }) {
+                            Text(L10n.string("player_cancel_autoplay", fallback: "Cancel Auto-Play"))
+                                .font(.system(size: 17, weight: .semibold))
+                                .foregroundColor(cancelAutoPlayFocused ? .black : .white.opacity(0.85))
+                                .padding(.horizontal, 18).padding(.vertical, 8)
+                                .background(cancelAutoPlayFocused ? Color.white : Color.white.opacity(0.14), in: Capsule())
+                        }
+                        .buttonStyle(.plain)
+                        .focused($cancelAutoPlayFocused)
+                    }
                 }
-                .buttonStyle(PosterCardButtonStyle())
-                .focusEffectDisabledIfAvailable()
-                .focused($nextEpisodeFocused)
                 .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomTrailing)
                 .padding(.trailing, 60)
                 .padding(.bottom, viewModel.showControls ? 200 : 54)
@@ -303,14 +350,38 @@ struct PlayerView: View {
             PlayerControls(
                 viewModel: viewModel,
                 isSkipSegmentFocused: skipSegmentFocused,
-                isNextEpisodeFocused: nextEpisodeFocused,
+                isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 onFocusSkipSegment: { focusSkipSegment() },
                 onFocusNextEpisode: { focusNextEpisode() }
             )
-                .opacity(viewModel.showControls && !viewModel.showSettingsPanel && !viewModel.isScrubbing && !viewModel.showPauseOverlay ? 1 : 0)
-                .scaleEffect(viewModel.showControls && !viewModel.isScrubbing && !viewModel.showPauseOverlay ? 1 : 0.95)
-                .allowsHitTesting(viewModel.showControls && !viewModel.showSettingsPanel && !viewModel.isScrubbing && !viewModel.showPauseOverlay)
+                .opacity(
+                    viewModel.showControls
+                        && didReportPlaybackStarted
+                        && !viewModel.isSwitchingSource
+                        && !viewModel.showSettingsPanel
+                        && !viewModel.isScrubbing
+                        && !viewModel.showPauseOverlay
+                    ? 1 : 0
+                )
+                .scaleEffect(
+                    viewModel.showControls
+                        && didReportPlaybackStarted
+                        && !viewModel.isSwitchingSource
+                        && !viewModel.isScrubbing
+                        && !viewModel.showPauseOverlay
+                    ? 1 : 0.95
+                )
+                .allowsHitTesting(
+                    viewModel.showControls
+                        && didReportPlaybackStarted
+                        && !viewModel.isSwitchingSource
+                        && !viewModel.showSettingsPanel
+                        && !viewModel.isScrubbing
+                        && !viewModel.showPauseOverlay
+                )
                 .animation(.playerControls, value: viewModel.showControls)
+                .animation(.playerControls, value: didReportPlaybackStarted)
+                .animation(.playerControls, value: viewModel.isSwitchingSource)
                 .animation(.playerControls, value: viewModel.showSettingsPanel)
                 .animation(.playerControls, value: viewModel.isScrubbing)
                 .animation(.playerControls, value: viewModel.showPauseOverlay)
@@ -396,17 +467,32 @@ struct PlayerView: View {
             // Keep reasserting while the player is up — never re-enable sleep
             // based on transient status (pause/buffer/error) mid-session.
             PlaybackWakeLock.reassert()
-            if status == .playing, !didReportPlaybackStarted {
+            if status == .playing,
+               !viewModel.isSwitchingSource,
+               !viewModel.isReloadingStream,
+               !viewModel.didDetectReplacementStream,
+               !didReportPlaybackStarted {
                 didReportPlaybackStarted = true
                 onPlaybackStarted?()
             }
             guard status == .ended,
                   !didHandleFinished,
+                  !viewModel.postPlayState.blocksNaturalCompletion,
                   let onFinished else {
                 return
             }
             didHandleFinished = true
             onFinished()
+        }
+        .onChange(of: viewModel.isSwitchingSource) { _, isSwitching in
+            if isSwitching {
+                didReportPlaybackStarted = false
+            }
+        }
+        .onChange(of: viewModel.didDetectReplacementStream) { _, isReplacement in
+            if isReplacement {
+                didReportPlaybackStarted = false
+            }
         }
         .onChange(of: scenePhase) { _, phase in
             if phase == .active {
@@ -414,15 +500,17 @@ struct PlayerView: View {
             }
         }
         .onChange(of: viewModel.showControls) { _, isVisible in
-            if viewModel.sidePanel != nil {
+            if viewModel.sidePanel != nil || viewModel.postPlayState.isVisible {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 skipSegmentFocused = false
                 return
             }
             if isVisible, !viewModel.isScrubbing, !viewModel.showPauseOverlay {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 skipSegmentFocused = false
             } else if viewModel.isScrubbing || viewModel.showPauseOverlay {
                 focusRemoteInput()
@@ -434,16 +522,31 @@ struct PlayerView: View {
                 focusRemoteInput()
             }
         }
+        .onChange(of: viewModel.postPlayState.isVisible) { _, isVisible in
+            if isVisible {
+                remoteInputFocused = false
+                nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
+                skipSegmentFocused = false
+                DispatchQueue.main.async {
+                    postPlayFocus = .primaryAction
+                }
+            } else {
+                postPlayFocus = nil
+            }
+        }
         .onChange(of: viewModel.sidePanel) { _, panel in
             if panel != nil {
                 remoteInputFocused = false
                 nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 skipSegmentFocused = false
             }
         }
         .onChange(of: viewModel.showPauseOverlay) { _, visible in
             if visible {
                 nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 skipSegmentFocused = false
                 focusRemoteInput()
             }
@@ -451,6 +554,7 @@ struct PlayerView: View {
         .onChange(of: viewModel.isScrubbing) { _, scrubbing in
             if scrubbing {
                 nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 skipSegmentFocused = false
                 focusRemoteInput()
             } else if viewModel.showControls {
@@ -464,9 +568,19 @@ struct PlayerView: View {
             if visible {
                 focusNextEpisode()
             } else if viewModel.showSkipSegmentCard {
+                nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 focusSkipSegment()
             } else {
+                nextEpisodeFocused = false
+                cancelAutoPlayFocused = false
                 focusRemoteInput()
+            }
+        }
+        .onChange(of: viewModel.isAutoPlayCancelled) { _, cancelled in
+            if cancelled {
+                cancelAutoPlayFocused = false
+                focusNextEpisode()
             }
         }
         .onChange(of: viewModel.showSkipSegmentCard) { _, visible in
@@ -548,6 +662,18 @@ struct PlayerView: View {
                 viewModel.hidePeek()
                 return
             }
+            if viewModel.postPlayState.isTrailerPlaying {
+                viewModel.stopPostPlayTrailer()
+                return
+            }
+            if viewModel.postPlayState.isVisible {
+                if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
+                    viewModel.returnToPlayerFromPostPlay()
+                } else {
+                    onBack()
+                }
+                return
+            }
             if viewModel.showControls {
                 viewModel.hideControls()
                 return
@@ -565,6 +691,7 @@ struct PlayerView: View {
     }
 
     private func focusRemoteInput() {
+        guard !viewModel.postPlayState.isVisible else { return }
         DispatchQueue.main.async {
             remoteInputFocused = true
         }
@@ -579,6 +706,102 @@ struct PlayerView: View {
     private func focusSkipSegment() {
         DispatchQueue.main.async {
             skipSegmentFocused = true
+        }
+    }
+
+    @ViewBuilder
+    private var miniPlayerReturnButton: some View {
+        Button {
+            viewModel.returnToPlayerFromPostPlay()
+        } label: {
+            ZStack {
+                Color.clear
+                if postPlayFocus == .miniPlayer {
+                    VStack {
+                        Spacer()
+                        HStack(spacing: 8) {
+                            Image(systemName: "arrow.up.left.and.arrow.down.right")
+                                .font(.system(size: 16, weight: .bold))
+                            Text(L10n.string("player_return_to_video", fallback: "Return to Video"))
+                                .font(.system(size: 16, weight: .semibold))
+                        }
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 16)
+                        .padding(.vertical, 8)
+                        .background(Color.white.opacity(0.95), in: Capsule())
+                        .shadow(color: .black.opacity(0.3), radius: 8, y: 4)
+                        .padding(.bottom, 14)
+                    }
+                    .transition(.opacity)
+                }
+            }
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .focused($postPlayFocus, equals: .miniPlayer)
+        .onMoveCommand { direction in
+            if direction == .down {
+                postPlayFocus = .primaryAction
+            }
+        }
+        .accessibilityLabel("Return to video")
+    }
+
+    @ViewBuilder
+    private var playerStatusOverlay: some View {
+        switch viewModel.status {
+        case .buffering, .idle:
+            if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream {
+                PlayerLoadingOverlay(
+                    backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                    logoUrl: meta.logoUrl,
+                    title: meta.name,
+                    message: L10n.string("player_status_starting_stream", fallback: "Starting stream")
+                )
+                .transition(.opacity)
+            } else if !didReportPlaybackStarted {
+                PlayerLoadingOverlay(
+                    backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                    logoUrl: meta.logoUrl,
+                    title: meta.name,
+                    message: L10n.string("player_status_starting_stream", fallback: "Starting stream")
+                )
+                .transition(.opacity)
+            } else {
+                ProgressView()
+                    .progressViewStyle(CircularProgressViewStyle(tint: .white))
+                    .scaleEffect(2)
+                    .padding(48)
+                    .glassCircle()
+            }
+        case .playing, .paused:
+            if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream || !didReportPlaybackStarted {
+                PlayerLoadingOverlay(
+                    backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                    logoUrl: meta.logoUrl,
+                    title: meta.name,
+                    message: L10n.string("player_status_starting_stream", fallback: "Starting stream")
+                )
+                .transition(.opacity)
+            }
+        case .error(let message):
+            VStack(spacing: 16) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 48))
+                    .foregroundColor(.yellow)
+                Text(L10n.string("player_status_playback_failed", fallback: "Playback failed"))
+                    .font(.title2.weight(.semibold))
+                    .foregroundColor(.white)
+                Text(message)
+                    .font(.body)
+                    .foregroundColor(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                    .frame(maxWidth: 900)
+            }
+            .padding(48)
+            .glassRoundedRect(cornerRadius: 32)
+        default:
+            EmptyView()
         }
     }
 

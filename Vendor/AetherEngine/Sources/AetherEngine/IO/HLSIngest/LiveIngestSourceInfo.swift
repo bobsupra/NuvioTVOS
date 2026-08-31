@@ -16,8 +16,21 @@ protocol LiveIngestSourceInfo: AnyObject, Sendable {
     /// EXT-X-TARGETDURATION in seconds, nil until the resolver has fetched the first media playlist. This
     /// is the upstream's *self-declared* value: a valid lower bound on segment duration, but NOT evidence
     /// of real delivery cadence. Use `observedLiveCadenceSeconds` for blocking-reload / TARGETDURATION
-    /// shaping (AetherEngine#167).
+    /// shaping (AetherEngine#167). Nothing derives from it: since AE#447 it is reported in the seal log
+    /// and nowhere else, because a packager's habitual `segment + 1` padding used to become the session's
+    /// served TARGETDURATION and cost `3 x` itself in first-serve holdback.
     var upstreamTargetDuration: Double? { get }
+
+    /// Longest CLOSED inter-arrival interval observed, nil until one has closed. Unlike
+    /// `observedLiveCadenceSeconds` this excludes the currently-open gap, which inside the first-serve
+    /// gate measures the engine's own wait rather than the source's cadence (AE#447).
+    var closedLiveCadenceSeconds: Double? { get }
+
+    /// Longest segment duration (EXTINF) the upstream has actually SERVED, nil until the first arrival.
+    /// The measured counterpart to `upstreamTargetDuration`, and the term that keeps the served
+    /// TARGETDURATION honest when a join burst makes the arrival intervals look shorter than the steady
+    /// state ever will be: an upstream cutting 4 s segments cannot sustain a 0.5 s cadence (AE#447).
+    var upstreamSegmentDurationSeconds: Double? { get }
 
     /// OBSERVED upstream segment-arrival cadence in seconds (recent max inter-arrival interval, widened by
     /// the currently-open gap), nil until the first arrival. Unlike `upstreamTargetDuration` this reflects

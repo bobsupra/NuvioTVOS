@@ -329,4 +329,27 @@ enum PlaybackSystemMonitor {
         }
         return "HDMI · 0 changes"
     }
+
+    /// Clean, user-facing active audio route title (e.g. "HomePod", "TV Speakers", "AirPods").
+    static func currentAudioOutputTitle() -> String {
+        let route = AVAudioSession.sharedInstance().currentRoute
+        if let output = route.outputs.first {
+            let portType = output.portType
+            let portName = output.portName.trimmingCharacters(in: .whitespacesAndNewlines)
+            if portType == .airPlay {
+                return portName.isEmpty ? "HomePod / AirPlay" : portName
+            } else if portType == .bluetoothA2DP || portType == .bluetoothLE || portType == .bluetoothHFP {
+                return portName.isEmpty ? "Bluetooth Audio" : portName
+            } else if portType == .headphones {
+                return portName.isEmpty ? "Headphones" : portName
+            } else if portType == .builtInSpeaker || portName.lowercased() == "stua" || portName.lowercased().contains("speaker") {
+                return "TV Speakers"
+            } else if portName.lowercased().contains("hdmi") || portName.lowercased().contains("receiver") || portName.lowercased().contains("earc") {
+                return portName
+            } else if !portName.isEmpty {
+                return portName == "stua" ? "TV Speakers" : portName
+            }
+        }
+        return "TV Speakers / HDMI"
+    }
 }

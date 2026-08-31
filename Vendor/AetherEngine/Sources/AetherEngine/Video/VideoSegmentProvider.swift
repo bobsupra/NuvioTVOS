@@ -25,8 +25,17 @@ struct LiveWindowSizing {
     /// Smaller windows caused the 81 s spike stall (AVPlayer fell below MEDIA-SEQUENCE).
     static let minSafeSegments = 8
 
+    /// AE#443: the most segments a live playlist will ever list, however deep the window and however
+    /// cheap the segments. A PLAYLIST bound rather than a disk one (the retention budget below is the
+    /// disk bound): the whole visible window is rebuilt and re-served on every poll, and a live client
+    /// polls about once per target duration.
+    static let maxWindowSegments = 900
+
     let targetSegmentDurationSeconds: Double
     let dvrWindowSeconds: Double?
+    /// AE#443: the session's disk allowance (`HLSVideoEngine.sessionRetentionBudgetBytes`). 0 means
+    /// "not stated", which leaves the sizing purely time-based, as it was.
+    var retentionBudgetBytes: Int = 0
 
     /// Number of segments the playlist keeps visible (and the cache keeps
     /// resident). Clamped up to `minSafeSegments`.
@@ -37,11 +46,38 @@ struct LiveWindowSizing {
     /// and deferring evictBelow (the "sliding" window never slid). Callers that know the observed
     /// cadence (mean EXTINF of recent finalized segments) pass it so the window really holds
     /// `effectiveWindowSeconds` of content.
-    func windowSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
+    func windowSegmentCount(observedSegmentDurationSeconds: Double?,
+                            observedSegmentBytes: Int? = nil) -> Int {
+        let asked = requestedSegmentCount(observedSegmentDurationSeconds: observedSegmentDurationSeconds)
+        let affordable = Self.affordableSegments(retentionBudgetBytes: retentionBudgetBytes,
+                                                 observedSegmentBytes: observedSegmentBytes)
+        return max(Self.minSafeSegments, min(asked, affordable, Self.maxWindowSegments))
+    }
+
+    /// AE#443: the window in segments as ASKED for, before either bound. Only the log reads it, and it
+    /// has to: comparing the served count against a value that already carries the clamps would report
+    /// every clamped window as unclamped.
+    func requestedSegmentCount(observedSegmentDurationSeconds: Double?) -> Int {
         let effective = dvrWindowSeconds ?? Self.liveOnlyFloorSeconds
         let divisor = max(max(0.5, targetSegmentDurationSeconds), observedSegmentDurationSeconds ?? 0)
-        let raw = Int(ceil(effective / divisor))
-        return max(Self.minSafeSegments, raw)
+        return Int(ceil(effective / divisor))
+    }
+
+    /// AE#443: how many segments of the observed size the session's disk allowance holds.
+    ///
+    /// The window a host asks for is a promise in SECONDS and the disk is a fact in BYTES, and until
+    /// this clamp existed nothing made them meet: a 1800 s window at a 1 s cadence sized a 1800-segment
+    /// window that the producer's resident cap refused to hold, so the cache filled to the cap before
+    /// the window had slid once, and the pump parked against it for the rest of the session. A parked
+    /// live pump stops draining the origin, which on a single-connection source is not backpressure but
+    /// a slow kill. Sizing the window by what can actually be held means the window slides instead, at
+    /// the depth the disk really supports, and `seekableLiveRange` (AE#441 reads the cache) then
+    /// advertises that depth rather than the one that was asked for.
+    ///
+    /// `.max` when either side is unknown: an unmeasured segment size must not shrink a window.
+    static func affordableSegments(retentionBudgetBytes: Int, observedSegmentBytes: Int?) -> Int {
+        guard retentionBudgetBytes > 0, let bytes = observedSegmentBytes, bytes > 0 else { return .max }
+        return retentionBudgetBytes / bytes
     }
 
     var windowSegmentCount: Int { windowSegmentCount(observedSegmentDurationSeconds: nil) }
@@ -62,15 +98,87 @@ enum LiveEdgePolicy {
     /// Never serve an empty or single-segment live playlist (a 1-segment window is an instant -12888).
     static let minStartupSegments = 2
 
+    /// AVPlayer's unchanged-playlist patience: it tolerates a playlist that has not changed for this
+    /// multiple of the served TARGETDURATION before drawing `-12888`. The one number the cadence floor
+    /// is answerable to.
+    static let unchangedPlaylistPatienceMultiplier: Double = 1.5
+
+    /// The TARGETDURATION a measured arrival cadence requires: enough that `1.5 x TD` of patience covers
+    /// the gap. AE#447: the floor used to enter as `ceil(gap)`, which demands `1.5 x` the gap in patience
+    /// and, through the `3 x TD` holdback, `4.5 x` it in startup depth. Nobody chose that margin; it came
+    /// from treating an arrival interval as if it were a segment duration. The conservatism belongs where
+    /// it is already paid for: the meter reports the MAX over a trailing window, not the mean, so the gap
+    /// handed in here is a worst case already. Multiplying a worst case by 1.5 counts it twice, and at a
+    /// 2.000 s cadence the ordinary jitter that makes it 2.05 then buys a whole extra second of TD and
+    /// three of holdback (measured: 1.07-1.09 s of wall clock per zap).
+    static func targetDurationForCadence(_ cadenceSeconds: Double) -> Int {
+        wholeSecondsCovering(cadenceSeconds / unchangedPlaylistPatienceMultiplier)
+    }
+
+    /// A duration as the playlist actually serves it: `#EXTINF` is written with `%.3f`, so a millisecond
+    /// is the finest distinction any client can ever read, and nothing below it may decide anything.
+    ///
+    /// AE#447 round 2: the live durations are differences of accumulated item-axis doubles
+    /// (`nextStart - startSeconds` in `reportLiveSegmentFinalized`), and the two operands carry different
+    /// representation error, so a strictly 2.000 s GOP produces the odd `2.0000000000000004`. Measured on
+    /// the reporter's device: 74 of 80 segments exactly `2.0`, 6 one to four ulp above. `ceil` weighs that
+    /// invisible excess as a whole second, the seal takes the MAX over the window so one segment is enough,
+    /// and `3 x TD` turns it into a 9 s holdback: the same 1.1 s per zap the first four fixes removed,
+    /// arriving through a term nobody could see (his log read `max EXTINF 2.000s` and sealed at 3).
+    /// The rounding matches `String(format: "%.3f")`, ties away from zero, so this is never BELOW what the
+    /// playlist prints and the promise always covers the segment the client was handed. `seconds(_:)`
+    /// below is the same quantization as text, so a term printed in the seal line is the term that
+    /// decided it.
+    static func servedSeconds(_ seconds: Double) -> Double {
+        (seconds * 1000).rounded(.toNearestOrAwayFromZero) / 1000
+    }
+
+    /// Whole seconds of promise covering a measured duration, taken at the served resolution.
+    static func wholeSecondsCovering(_ seconds: Double) -> Int {
+        Int(servedSeconds(seconds).rounded(.up))
+    }
+
+    /// AE#454: the served `EXT-X-START:TIME-OFFSET` for a rejoin, or nil when this playlist cannot
+    /// carry the placement.
+    ///
+    /// The item's own timeline is the SUM OF THE PRINTED EXTINFs, not the producer's accumulated
+    /// output axis, so every term here is taken at the resolution the playlist serves. A target the
+    /// window has already evicted returns nil, and so does one within `3 x TARGETDURATION` of the end:
+    /// RFC 8216 4.3.5.2 says a positive offset should not sit inside the holdback, and a viewer that
+    /// close to the edge is one the ordinary edge join answers correctly anyway.
+    static func rejoinStartTimeOffset(
+        segmentIndex: Int,
+        secondsIntoSegment: Double,
+        firstVisible: Int,
+        visibleCount: Int,
+        targetDuration: Int,
+        segmentDuration: (Int) -> Double
+    ) -> Double? {
+        guard segmentIndex >= firstVisible, segmentIndex < visibleCount, firstVisible < visibleCount else {
+            return nil
+        }
+        var offset: Double = 0
+        for k in firstVisible..<segmentIndex { offset += servedSeconds(segmentDuration(k)) }
+        offset += servedSeconds(Swift.max(0, secondsIntoSegment))
+        var total: Double = 0
+        for k in firstVisible..<visibleCount { total += servedSeconds(segmentDuration(k)) }
+        let served = servedSeconds(offset)
+        guard served >= 0, served <= servedSeconds(total - 3.0 * Double(targetDuration)) else { return nil }
+        return served
+    }
+
     /// Served `#EXT-X-TARGETDURATION`, in whole seconds: `>= ceil(max EXTINF)` (HLS requirement), floored
-    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888) and the
-    /// observed-cadence floor. `cutTargetSeconds` / `cadenceFloorSeconds` are nil for VOD/EVENT.
+    /// by `ceil(1.5 x cut target)` (widens AVPlayer's unchanged-playlist patience, anti -12888) and by
+    /// what the observed cadence needs to stay inside that patience. `cutTargetSeconds` /
+    /// `cadenceFloorSeconds` are nil for VOD/EVENT. Every term is taken at the resolution the playlist
+    /// serves (`servedSeconds`), so the value covers the EXTINFs the client is actually handed and no
+    /// sub-millisecond noise can buy a whole second of holdback.
     static func targetDurationSeconds(maxSegmentDuration: Double,
                                       cutTargetSeconds: Double?,
                                       cadenceFloorSeconds: Double?) -> Int {
-        var td = Int(ceil(max(1.0, maxSegmentDuration)))
-        if let cut = cutTargetSeconds { td = max(td, Int(ceil(cut * 1.5))) }
-        if let floor = cadenceFloorSeconds { td = max(td, Int(ceil(floor))) }
+        var td = wholeSecondsCovering(max(1.0, maxSegmentDuration))
+        if let cut = cutTargetSeconds { td = max(td, wholeSecondsCovering(cut * 1.5)) }
+        if let floor = cadenceFloorSeconds { td = max(td, targetDurationForCadence(floor)) }
         return td
     }
 
@@ -117,7 +225,12 @@ enum LiveEdgePolicy {
                                         windowSegmentCount: Int) -> Bool {
         guard segmentCount >= minStartupSegments else { return false }
         if segmentCount >= windowSegmentCount { return true }
-        return summedDurationSeconds >= holdBackSeconds(targetDuration: targetDuration)
+        // Judged at the served resolution too, or the depth check disagrees with the value it is checking
+        // against. Same accumulated-double error, other direction: three 2.000 s segments sum to exactly
+        // 6.0 for some first-segment starts and to a hair under it for others (a first start of 0.030 s
+        // lands short, the reporter's 0.060 s does not), and the gate would then hold for a fourth
+        // segment it does not need, a full extra segment duration, on some sessions and not others.
+        return servedSeconds(summedDurationSeconds) >= holdBackSeconds(targetDuration: targetDuration)
     }
 
     /// AE#374: the first live manifest's own account of what it cost, for the log.
@@ -132,7 +245,7 @@ enum LiveEdgePolicy {
                                   summedDurationSeconds: Double,
                                   targetDuration: Int) -> String {
         let holdBack = holdBackSeconds(targetDuration: targetDuration)
-        let reached = summedDurationSeconds >= holdBack ? ">=" : "<"
+        let reached = servedSeconds(summedDurationSeconds) >= holdBack ? ">=" : "<"
         return "first live manifest served after \(seconds(waitedSeconds))s: "
             + "\(segmentCount) segments / \(seconds(summedDurationSeconds))s "
             + "\(reached) \(seconds(holdBack))s holdback (TARGETDURATION \(targetDuration)s)"
@@ -146,20 +259,80 @@ enum LiveEdgePolicy {
     }
 }
 
+/// AE#447 round 3: an absent cadence floor is two different facts, and the seal printed one word for
+/// both. A meter exists only where the upstream hands over finished segments (live ingest); a source the
+/// engine cuts itself has no arrival cadence at all, so its floor is not pending, it does not exist. The
+/// reporter's raw-TS session read `measured floor none yet` on every tune of two runs and reasonably took
+/// it for a meter that had not measured anything YET, which credited four fixes on a path none of them
+/// could reach. A term that cannot be measured has to say so.
+enum CadenceFloorTerm {
+    /// The meter has a measurement, in seconds.
+    case measured(Double)
+    /// A meter is running and has nothing yet: an ingest session before its first closed interval.
+    case pending
+    /// No meter on this path: the engine cuts these segments itself, so no arrival cadence exists.
+    case unmeasurable
+
+    /// The value that feeds the max, which only a real measurement ever does.
+    var seconds: Double? {
+        if case .measured(let value) = self { return value }
+        return nil
+    }
+
+    /// The term as the seal line states it, in the list the other terms are joined into.
+    var account: String {
+        switch self {
+        case .measured(let value):
+            return "measured floor \(LiveEdgePolicy.seconds(value))s needs "
+                + "\(LiveEdgePolicy.targetDurationForCadence(value))s of patience"
+        case .pending:
+            return "measured floor none yet"
+        case .unmeasurable:
+            return "no measured floor (segments are cut here, not ingested)"
+        }
+    }
+}
+
+/// AE#447: the served TARGETDURATION with the terms it was derived from, so the seal can say in one
+/// line why the session will hold this value for its whole life. Every term but `selfReported` feeds
+/// the max; `selfReported` is what the upstream CLAIMED, printed beside what was measured.
+struct LiveTargetDurationDerivation {
+    let value: Int
+    let maxSegmentDuration: Double
+    let cutTargetFloor: Double?
+    let cadenceFloor: CadenceFloorTerm
+    let selfReported: Double?
+
+    /// One line, in the order the terms are maxed. Reads as an argument for the number it reports.
+    var account: String {
+        var terms = ["max EXTINF \(LiveEdgePolicy.seconds(maxSegmentDuration))s"]
+        if let cutTargetFloor {
+            terms.append("1.5 x cut target \(LiveEdgePolicy.seconds(cutTargetFloor * 1.5))s")
+        }
+        terms.append(cadenceFloor.account)
+        let claim = selfReported.map {
+            "; upstream advertises \(LiveEdgePolicy.seconds($0))s (reported, not used)"
+        } ?? ""
+        return "live TARGETDURATION sealed at \(value)s "
+            + "(holdback \(LiveEdgePolicy.seconds(LiveEdgePolicy.holdBackSeconds(targetDuration: value)))s): "
+            + terms.joined(separator: ", ") + claim
+    }
+}
+
 struct LiveTargetDurationSeal {
     private(set) var value: Int?
     private var didLogUpwardDrift = false
 
-    mutating func resolve(candidate: Int) -> (value: Int, shouldLogDrift: Bool) {
+    mutating func resolve(candidate: Int) -> (value: Int, shouldLogDrift: Bool, didSeal: Bool) {
         guard let sealed = value else {
             value = candidate
-            return (candidate, false)
+            return (candidate, false, true)
         }
         guard candidate > sealed, !didLogUpwardDrift else {
-            return (sealed, false)
+            return (sealed, false, false)
         }
         didLogUpwardDrift = true
-        return (sealed, true)
+        return (sealed, true, false)
     }
 }
 
@@ -291,6 +464,18 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// RFC 8216 requires TARGETDURATION to stay constant for the lifetime of a media playlist.
     /// Guarded by stateLock and preserved across in-provider producer reopens.
     private var liveTargetDurationSeal = LiveTargetDurationSeal()
+    /// AE#446: wall time of the newest finalized live segment, and the latch that says the source
+    /// stopped delivering. See `liveDeliveryStalled`.
+    private var _lastLiveSegmentFinalizedAt: Date?
+    private var _liveDeliveryStalledLatched = false
+    /// AE#446 round 2: once ENDLIST has been served it can never be withdrawn to the item that saw it,
+    /// so the decision latches. See `liveOutageEndlist`.
+    private var _liveOutageEndlistLatched = false
+    /// AE#454: where a rejoin wants the NEXT item to begin, addressed by CONTENT (which segment, how
+    /// far into it) rather than by a clock. The window slides between arming this and the fresh item
+    /// fetching the playlist that carries it, so a seconds value would name a different place by the
+    /// time it was served; a segment index does not renumber.
+    private var _liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)?
     private var refreshCounter: Int = 0
     /// EXT-X-MEDIA-SEQUENCE first index; monotonically advancing, stays 0 for VOD.
     private var _liveFirstVisible: Int = 0
@@ -300,6 +485,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// divisor of `LiveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds:)`.
     /// Guarded by stateLock.
     private var _liveRecentDurations: [Double] = []
+    /// AE#443: the window-clamp line is a statement about the session, so it is made once.
+    private var _loggedLiveWindowClamp = false
     private static let liveRecentDurationSampleCount = 20
     /// One-shot latch for `noteWindowSlideRelativeToConsumer`. Guarded by stateLock.
     private var _liveConsumerOutsideWindowLatched = false
@@ -428,6 +615,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             durationSeconds: durationSeconds,
             discontinuous: discontinuous
         ))
+        _lastLiveSegmentFinalizedAt = Date()
         _liveRecentDurations.append(durationSeconds)
         if _liveRecentDurations.count > Self.liveRecentDurationSampleCount {
             _liveRecentDurations.removeFirst(_liveRecentDurations.count - Self.liveRecentDurationSampleCount)
@@ -511,6 +699,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// VOD: returns full count so AVPlayer sees a complete asset (EVENT experiment that reported
     /// visibleHighWater+1 made AVPlayer think the asset was 2:13 and stop there).
     func notePlaylistBuild() -> (visibleCount: Int, firstVisible: Int, refreshCounter: Int, endlistAdded: Bool, discontinuitySequence: Int) {
+        // AE#443: read the cache's own measure of a segment BEFORE taking stateLock. The cache has its
+        // own lock, and nesting it inside this one would invert the ordering `evictBelow`'s async hop
+        // below exists to avoid.
+        let observedBytes = cache.meanEntryBytes
         stateLock.lock()
         defer { stateLock.unlock() }
         refreshCounter += 1
@@ -518,7 +710,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let total = segments.count
             let observedMean = _liveRecentDurations.isEmpty
                 ? nil : _liveRecentDurations.reduce(0, +) / Double(_liveRecentDurations.count)
-            let window = liveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds: observedMean)
+            let window = liveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds: observedMean,
+                                                             observedSegmentBytes: observedBytes)
+            noteLiveWindowClampLocked(window: window, observedSegmentBytes: observedBytes,
+                                      observedSegmentDurationSeconds: observedMean)
             // highWater is the last produced index (total - 1). Keep the
             // last `window` segments visible: firstVisible = highWater -
             // window + 1 = total - window. Until at least `window`
@@ -540,7 +735,8 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                     // its own lock; nesting the two here would invert the ordering evictBelow's async
                     // hop exists to avoid).
                     let consumerTarget = cacheRef.targetIndex
-                    cacheRef.evictBelow(cutoff)
+                    cacheRef.evictBelow(Self.liveEvictionFloor(firstVisible: cutoff,
+                                                               consumerTarget: consumerTarget))
                     self?.noteWindowSlideRelativeToConsumer(cutoff: cutoff, consumerTarget: consumerTarget)
                 }
             }
@@ -556,6 +752,36 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         return (segments.count, 0, refreshCounter, false, 0)
     }
 
+    /// AE#441 round 3: what a window slide costs is decided by the consumer's NEXT fetch, not its last.
+    ///
+    /// `declareTarget` is called as a segment is served and the consumer walks indices forward one at a
+    /// time, so everything strictly below `consumerTarget` is already in AVPlayer's own buffer and the
+    /// index it will ask for next is `consumerTarget + 1`. A viewer parked at the floor therefore sits
+    /// at `firstVisible - 1` for part of every segment, by the same one-segment sawtooth
+    /// `residentFloorOutputSeconds()` has against the rendered playhead: the slide moves in whole
+    /// segments while the consumer moves continuously. Its next fetch is `firstVisible` itself, which is
+    /// resident, so nothing is missed. From `firstVisible - 2` down the index it is about to ask for has
+    /// been deleted, and that is the cache miss this line exists to name.
+    static func windowSlidPastConsumer(firstVisible: Int, consumerTarget: Int) -> Bool {
+        return consumerTarget + 1 < firstVisible
+    }
+
+    /// The lowest index a window slide may unlink, which is not always the playlist's new first visible.
+    ///
+    /// A serve holds a URL, not a file handle: `mediaSegmentURL` hands `peekURL`'s result to a response
+    /// that stats and opens the file afterwards, so unlinking the segment currently being served turns
+    /// into a 404 for an index the playlist offered when it was asked for. And a viewer riding the floor
+    /// puts the slide exactly one segment above the fetch point routinely, not rarely (measured: every
+    /// latched line of a 220 s parked run had `firstVisible == consumerTarget + 1`). So eviction stops at
+    /// the fetch point, which is the bound `evictBelow` already documents for itself.
+    ///
+    /// Bounded on the other side too: the floor never trails `firstVisible` by more than one segment, so
+    /// a consumer that has stopped fetching entirely cannot pin retention behind it.
+    static func liveEvictionFloor(firstVisible: Int, consumerTarget: Int) -> Int {
+        guard consumerTarget >= 0 else { return firstVisible }
+        return max(firstVisible - 1, min(firstVisible, consumerTarget))
+    }
+
     /// The sliding window overtaking the consumer's fetch point is the failure mode the removed advance
     /// park used to make impossible (it capped the producer 10 segments ahead of that point). Live is
     /// source-paced, so a real-time origin cannot get there; an origin that hands over more than one
@@ -566,7 +792,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private func noteWindowSlideRelativeToConsumer(cutoff: Int, consumerTarget: Int) {
         guard consumerTarget >= 0 else { return }
         stateLock.lock()
-        let outside = consumerTarget < cutoff
+        let outside = Self.windowSlidPastConsumer(firstVisible: cutoff, consumerTarget: consumerTarget)
         let shouldLog = outside && !_liveConsumerOutsideWindowLatched
         _liveConsumerOutsideWindowLatched = outside
         stateLock.unlock()
@@ -578,6 +804,59 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             category: .session
         )
     }
+
+    /// AE#443: says once that the window a host asked for is deeper than the disk can hold.
+    ///
+    /// Silent otherwise. The clamp is not a failure, it is the window becoming a fact, and a host that
+    /// wants to know what it really got reads `seekableLiveRange` (AE#441), which measures the same
+    /// cache. Must be called with stateLock held.
+    private func noteLiveWindowClampLocked(window: Int, observedSegmentBytes: Int?,
+                                           observedSegmentDurationSeconds: Double?) {
+        guard !_loggedLiveWindowClamp else { return }
+        let asked = liveWindowSizing.requestedSegmentCount(
+            observedSegmentDurationSeconds: observedSegmentDurationSeconds)
+        guard window < asked else { return }
+        _loggedLiveWindowClamp = true
+        let cadence = max(max(0.5, liveWindowSizing.targetSegmentDurationSeconds),
+                          observedSegmentDurationSeconds ?? 0)
+        let affordable = LiveWindowSizing.affordableSegments(
+            retentionBudgetBytes: liveWindowSizing.retentionBudgetBytes,
+            observedSegmentBytes: observedSegmentBytes)
+        let bound = affordable <= LiveWindowSizing.maxWindowSegments
+            ? "\(liveWindowSizing.retentionBudgetBytes / (1 << 20)) MiB of retention holds "
+              + "\(affordable) segments of \((observedSegmentBytes ?? 0) / 1024) KiB"
+            : "a live playlist is rebuilt and re-served on every poll, so it is capped at "
+              + "\(LiveWindowSizing.maxWindowSegments) entries"
+        EngineLog.emit(
+            "[HLSVideoEngine] #443 live window served at \(window) segments "
+            + "(~\(Int(Double(window) * cadence))s) of the \(asked) asked for "
+            + "(~\(Int(Double(asked) * cadence))s): \(bound). The window slides here instead of the "
+            + "producer parking against a resident cap it cannot pass",
+            category: .session
+        )
+    }
+
+    /// AE#443: the resident segment count the producer's runaway park must stay ABOVE.
+    ///
+    /// The park exists for a consumer that stopped polling entirely: with no playlist build there is no
+    /// `evictBelow`, so nothing bounds the cache. It must never be the thing that bounds a LIVE window,
+    /// because its enforcement is a sleeping read thread, and a live pump that stops reading stops
+    /// draining the origin. Measured before this fix on the loopback fixture, an edge session with no
+    /// seek at all: a 1800 s window at a 1 s cadence parked at resident=180 after 180 s and never
+    /// released, the edge froze, and the ladder then reported the SOURCE as starved.
+    func liveResidentParkCap() -> Int {
+        stateLock.lock()
+        let observedMean = _liveRecentDurations.isEmpty
+            ? nil : _liveRecentDurations.reduce(0, +) / Double(_liveRecentDurations.count)
+        stateLock.unlock()
+        let window = liveWindowSizing.windowSegmentCount(observedSegmentDurationSeconds: observedMean,
+                                                         observedSegmentBytes: cache.meanEntryBytes)
+        return window + Self.liveResidentParkSlackSegments
+    }
+
+    /// Segments that can sit between the pump and the playlist build that would evict them, so the park
+    /// is reached by a consumer that stopped polling and never by one that is merely a poll behind.
+    static let liveResidentParkSlackSegments = 24
 
     var firstVisibleSegmentIndex: Int {
         guard isLive else { return 0 }
@@ -610,6 +889,45 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
         guard let url = cache.peekURL(index: idx) else { return nil }
         return (idx, segs[idx].startSeconds, url)
+    }
+
+    /// AE#441: the oldest position a rewind can actually land on and still play forward, in output
+    /// seconds, or nil when nothing is resident yet.
+    ///
+    /// The DVR window is a POLICY (how much the session is willing to keep); this is the FACT (how much
+    /// it currently holds). They diverge for the whole first `window` seconds of every session, and
+    /// again whenever the retention budget evicts faster than the window slides, so a rewind strip
+    /// scaled on the policy alone promises depth that was never written.
+    ///
+    /// Walks back from the newest resident segment rather than reading `indexRange().0`, because a
+    /// minimum index is not proof of contiguity: an interior hole would make everything below it
+    /// unplayable, and a stale band left by a previous producer sits below one.
+    func residentFloorOutputSeconds() -> Double? {
+        guard let top = cache.highestResidentIndex else { return nil }
+        let floor = cache.contiguousBackwardFloor(from: top)
+        stateLock.lock()
+        let segs = segments
+        stateLock.unlock()
+        guard floor >= 0, floor < segs.count else { return nil }
+        return segs[floor].startSeconds
+    }
+
+    /// AE#446 round 4: the newest position the cache holds, in output seconds, i.e. the END of the
+    /// newest resident segment.
+    ///
+    /// The floor above exists because the advertised window over-promises depth. This exists because
+    /// at the one moment a rejoin runs, neither clock the engine publishes can be trusted for the
+    /// other end: the session's edge is a running maximum that an outage freezes below the playhead,
+    /// and a freshly swapped item's own `seekableEnd` is a range it has not finished reporting. The
+    /// producer is the only party that knows what is actually there, and it knows it now rather than
+    /// at the next publish tick.
+    func residentCeilingOutputSeconds() -> Double? {
+        guard let top = cache.highestResidentIndex else { return nil }
+        stateLock.lock()
+        let segs = segments
+        stateLock.unlock()
+        guard top >= 0, top < segs.count else { return nil }
+        return segs[top].startSeconds + segs[top].durationSeconds
     }
 
     /// Non-blocking init.mp4 peek; the 30s blocking initSegment() is only for the HTTP server path.
@@ -1169,8 +1487,197 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     }
     var liveBlockingReloadEnabled: Bool {
         Self.resolveLiveBlockingReload(halted: liveProductionHalted,
+                                       deliveryStalled: liveDeliveryStalled,
                                        override: blockingReloadOverride,
                                        policy: liveCadencePolicy)
+    }
+
+    /// AE#446: has the source stopped delivering on its own cadence?
+    ///
+    /// A blocking reload that can never be satisfied is worse than no blocking reload at all. AVPlayer
+    /// issues no segment requests while one is outstanding (measured: a separate, idle connection sat
+    /// there the whole time), so the hold starves a client whose cache already holds every second in
+    /// front of it. `liveProductionHalted` catches this eventually, but only once the no-cut watchdog
+    /// has run, and the stall starts long before that.
+    ///
+    /// The threshold is 1.5 x TARGETDURATION because that is AVPlayer's own patience for an unchanged
+    /// live playlist (-12888): past it the client already considers the source late, so holding its
+    /// next poll can only cost it something. Latched, because a source that has missed its cadence once
+    /// is exactly the "cannot honor the contract" category the static switch exists for (#167), and
+    /// letting the advertisement return would flap CAN-BLOCK-RELOAD across every recovery.
+    var liveDeliveryStalled: Bool {
+        stateLock.lock()
+        if _liveDeliveryStalledLatched {
+            stateLock.unlock()
+            return true
+        }
+        guard isLive, let last = _lastLiveSegmentFinalizedAt,
+              let targetDuration = liveTargetDurationSeal.value else {
+            stateLock.unlock()
+            return false
+        }
+        let since = Date().timeIntervalSince(last)
+        guard since > 1.5 * Double(targetDuration) else {
+            stateLock.unlock()
+            return false
+        }
+        _liveDeliveryStalledLatched = true
+        stateLock.unlock()
+        EngineLog.emit(
+            "[HLSVideoEngine] #446 source stopped delivering (no segment finalized for "
+            + "\(String(format: "%.1f", since))s, TARGETDURATION \(targetDuration)s); withdrawing "
+            + "CAN-BLOCK-RELOAD so a held poll cannot starve a client the cache could still feed",
+            category: .session
+        )
+        return true
+    }
+
+    /// AE#446 round 2: serve the remaining window as a finished asset while the source is not delivering.
+    ///
+    /// A live playlist whose tail stops moving stops being fetched, and the segments it still lists go
+    /// with it. Measured on the harness, a viewer 147 s inside the window with the source frozen: six
+    /// more segments arrive at playback rate, AVPlayer draws `-12888 Playlist File unchanged` on every
+    /// reload, and after the sixth it stops polling AND stops requesting, with 115 s of its own runway
+    /// resident on disk. Then, when the playlist finally moves again, it rejoins at
+    /// edge-minus-HOLD-BACK by itself and the position is gone (measured forward step 117.76 s), which
+    /// is a second way to lose a place that no reload policy of ours can cover.
+    ///
+    /// Two cheaper answers were built and measured and neither moves it, so neither is worth trying again:
+    /// - `EXT-X-SODALITE-REFRESH` makes every response byte-distinct (verified live: two polls 4 s apart
+    ///   differ in that line alone) and AVPlayer still calls the playlist unchanged. Its test reads the
+    ///   parsed playlist, so a tag it does not know cannot count.
+    /// - Sliding the window forward on the clock, so `EXT-X-MEDIA-SEQUENCE` advances one segment per
+    ///   TARGETDURATION, does not reset that clock either: same `-12888` cadence, same strike-out at the
+    ///   same second, and it spends the viewer's rewind depth to buy nothing. What AVPlayer watches is
+    ///   the TAIL of the playlist, not its identity.
+    ///
+    /// So the window is served as what it actually is while the source is down: a finite asset. Latched,
+    /// because a playlist that has carried ENDLIST can never take it back.
+    ///
+    /// Not for a viewer at the edge: with nothing resident ahead, ENDLIST would only convert a stall into
+    /// an end. The gate is the consumer's own fetch point.
+    var liveOutageEndlist: Bool {
+        let consumerTarget = cache.targetIndex
+        stateLock.lock()
+        if _liveOutageEndlistLatched {
+            stateLock.unlock()
+            return true
+        }
+        let total = segments.count
+        let stale = sourceIsLateLocked()
+        stateLock.unlock()
+        guard isLive, consumerTarget >= 0, consumerTarget + 1 < total, stale else { return false }
+        stateLock.lock()
+        _liveOutageEndlistLatched = true
+        stateLock.unlock()
+        EngineLog.emit(
+            "[VideoSegmentProvider] #446 the source stopped delivering with the consumer at "
+            + "\(consumerTarget) of \(total); serving the rest of the window as a finished asset "
+            + "(ENDLIST) so AVPlayer keeps fetching the runway it already holds instead of striking "
+            + "out on an unchanged playlist",
+            category: .session
+        )
+        return true
+    }
+
+    /// AE#446 round 2: has the window already been closed? A pure read, unlike `liveOutageEndlist`,
+    /// which decides and latches. Anything outside the playlist build wants this one.
+    var liveOutageEndlistLatched: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveOutageEndlistLatched
+    }
+
+    /// AE#446 round 3: is a window closed by an outage still feeding its consumer?
+    ///
+    /// The consumer's own fetch point is the measure, the same one that decided to close the window:
+    /// while segments remain above it, the session is still handing out pictures and the source read
+    /// must not be abandoned under it. Once the consumer has walked to the end of what the window
+    /// holds, nothing is being delivered any more and the starvation exit is the honest answer again.
+    var outageRunwayAheadOfConsumer: Bool {
+        let consumerTarget = cache.targetIndex
+        stateLock.lock()
+        let latched = _liveOutageEndlistLatched
+        let total = segments.count
+        stateLock.unlock()
+        return latched && consumerTarget >= 0 && consumerTarget + 1 < total
+    }
+
+    /// AE#446 round 2: is the source late by its own advertised cadence? Read FRESH rather than through
+    /// `liveDeliveryStalled`, which latches for the lifetime of the session on purpose (#167: a
+    /// returning CAN-BLOCK-RELOAD would flap). A window closed by an outage has to be able to re-open,
+    /// so the condition that closes it has to be able to become false again. Call under stateLock.
+    private func sourceIsLateLocked() -> Bool {
+        guard let last = _lastLiveSegmentFinalizedAt, let td = liveTargetDurationSeal.value,
+              td > 0 else { return false }
+        return Date().timeIntervalSince(last) > 1.5 * Double(td)
+    }
+
+    /// AE#446 round 2: the source is delivering again, so the session can go back to being live. Only
+    /// an item swap can act on it: an item that has seen ENDLIST never reloads its playlist again,
+    /// which is exactly why the swap is required.
+    ///
+    /// Deliberately the exact complement of what closed the window, rather than "one more segment than
+    /// there was". A dying source cuts a last partial segment on its way out (the no-cut watchdog's
+    /// final flush is one), and counting that as a recovery swaps the item into a window that is still
+    /// closed, where a live rejoin has no edge to aim at and starts the viewer at the beginning of it.
+    /// Measured doing exactly that: a rejoin 180 s below the place it was supposed to hold.
+    var liveOutageProductionResumed: Bool {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveOutageEndlistLatched && !sourceIsLateLocked()
+    }
+
+    /// AE#446 round 2: re-open the window as live, for a FRESH item only. Safe because the item that
+    /// saw the ENDLIST has stopped polling, so it cannot observe the tag being withdrawn.
+    func clearLiveOutageEndlist() {
+        stateLock.lock()
+        let wasLatched = _liveOutageEndlistLatched
+        _liveOutageEndlistLatched = false
+        stateLock.unlock()
+        guard wasLatched else { return }
+        EngineLog.emit(
+            "[VideoSegmentProvider] #446 the source is cutting again; the window is live once more "
+            + "for the next item",
+            category: .session
+        )
+    }
+
+    /// AE#454: tell the next item where to start, in the playlist it will load.
+    ///
+    /// A rejoin is two operations, attaching an item and placing it, and only the first used to be
+    /// expressed to AVPlayer at the swap. So the fresh item did what a live playlist tells any client
+    /// to do, joined at the edge, started playing there, and got the place it held ~150 ms later as a
+    /// seek. The playlist is ours, and HLS has a tag for this question, so the placement belongs in
+    /// the manifest rather than in a correction after the fact.
+    ///
+    /// Returns the resolved position, or nil when `seconds` names nothing this producer holds (an
+    /// evicted target), in which case the caller keeps the edge join it would have had.
+    @discardableResult
+    func armLiveRejoinStart(atOutputSeconds seconds: Double) -> (segmentIndex: Int, secondsIntoSegment: Double)? {
+        stateLock.lock()
+        let segs = segments
+        stateLock.unlock()
+        guard let idx = Self.thumbnailSegmentIndex(atSeconds: seconds, segments: segs) else { return nil }
+        let into = Swift.max(0, seconds - segs[idx].startSeconds)
+        stateLock.lock()
+        _liveRejoinStart = (idx, into)
+        stateLock.unlock()
+        return (idx, into)
+    }
+
+    /// AE#454: the placement is spent once the item that asked for it is running. Left armed, the next
+    /// item to load for any other reason would inherit a position it never asked about.
+    func clearLiveRejoinStart() {
+        stateLock.lock()
+        _liveRejoinStart = nil
+        stateLock.unlock()
+    }
+
+    var liveRejoinStart: (segmentIndex: Int, secondsIntoSegment: Double)? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return _liveRejoinStart
     }
 
     /// Blocking-reload hold bound: 3 x sealed TARGETDURATION (= the advertised HOLD-BACK depth).
@@ -1183,6 +1690,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         let sealed = liveTargetDurationSeal.value
         stateLock.unlock()
         return Double(3 * (sealed ?? 6))
+    }
+
+    /// AE#442: the TARGETDURATION the live playlist is actually serving, once sealed. nil before the
+    /// first playlist build, which is also the only window in which nothing can be parked behind live.
+    var sealedLiveTargetDurationSeconds: Int? {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return liveTargetDurationSeal.value
     }
 
     var liveProductionHalted: Bool {
@@ -1209,23 +1724,38 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
 
     func currentLiveTargetDuration(
         maxSegmentDuration: Double
-    ) -> (value: Int, cadenceFloor: Double?) {
-        let floor = liveCadencePolicy?.targetDurationFloorSeconds
-        return (
-            LiveEdgePolicy.targetDurationSeconds(
+    ) -> LiveTargetDurationDerivation {
+        let cutTarget = liveWindowSizing.targetSegmentDurationSeconds
+        // Which of the two absences this is decides what the seal line may claim: no policy means no
+        // meter for the life of the session, not a measurement still to come (AE#447 round 3).
+        let floor: CadenceFloorTerm = liveCadencePolicy.map { policy in
+            policy.targetDurationFloorSeconds.map { CadenceFloorTerm.measured($0) } ?? .pending
+        } ?? .unmeasurable
+        return LiveTargetDurationDerivation(
+            value: LiveEdgePolicy.targetDurationSeconds(
                 maxSegmentDuration: maxSegmentDuration,
-                cutTargetSeconds: liveWindowSizing.targetSegmentDurationSeconds,
-                cadenceFloorSeconds: floor
+                cutTargetSeconds: cutTarget,
+                cadenceFloorSeconds: floor.seconds
             ),
-            floor
+            maxSegmentDuration: maxSegmentDuration,
+            cutTargetFloor: cutTarget,
+            cadenceFloor: floor,
+            selfReported: liveCadencePolicy?.selfReportedTargetDurationSeconds
         )
     }
 
-    private func sealLiveTargetDuration(candidate: Int) -> Int {
+    /// Takes the seal and, on the call that actually takes it, publishes the derivation. The value is
+    /// frozen for the session (RFC 8216 forbids a changing TARGETDURATION, AE#209), so the one line that
+    /// explains it has to be emitted here or nowhere: a host reading a 9 s holdback later has no way to
+    /// tell a measured cadence from an inherited advert (AE#447).
+    private func sealLiveTargetDuration(_ derivation: LiveTargetDurationDerivation) -> Int {
         stateLock.lock()
-        let resolved = liveTargetDurationSeal.resolve(candidate: candidate).value
+        let resolved = liveTargetDurationSeal.resolve(candidate: derivation.value)
         stateLock.unlock()
-        return resolved
+        if resolved.didSeal {
+            EngineLog.emit("[HLSVideoEngine] \(derivation.account)", category: .session)
+        }
+        return resolved.value
     }
 
     func liveTargetDurationSeconds(maxSegmentDuration: Double) -> Int {
@@ -1233,14 +1763,16 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.lock()
         let resolved = liveTargetDurationSeal.resolve(candidate: candidate.value)
         stateLock.unlock()
+        if resolved.didSeal {
+            EngineLog.emit("[HLSVideoEngine] \(candidate.account)", category: .session)
+        }
 
         if resolved.shouldLogDrift {
             EngineLog.emit(
                 "[HLSVideoEngine] live TARGETDURATION remains sealed at "
                 + "\(resolved.value)s, later candidate \(candidate.value)s "
                 + "(max segment \(String(format: "%.3f", maxSegmentDuration))s, "
-                + "cadence floor "
-                + (candidate.cadenceFloor.map { String(format: "%.3f", $0) } ?? "nil")
+                + candidate.cadenceFloor.account
                 + ")",
                 category: .session
             )
@@ -1253,8 +1785,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     /// the observed-cadence policy decides for ingest sources; signal-less live (plain-url Jellyfin
     /// transcode) keeps the low-latency default. Pure so the precedence is unit-testable without a full
     /// provider (#167).
-    static func resolveLiveBlockingReload(halted: Bool = false, override: Bool?, policy: LiveCadencePolicy?) -> Bool {
-        if halted { return false }
+    static func resolveLiveBlockingReload(halted: Bool = false, deliveryStalled: Bool = false,
+                                          override: Bool?, policy: LiveCadencePolicy?) -> Bool {
+        // Both outrank an explicit override: a source that is not delivering cannot honor the contract
+        // however loudly the host asks for it.
+        if halted || deliveryStalled { return false }
         if let override { return override }
         if let policy { return policy.blockingReloadEnabled }
         return true
@@ -1298,7 +1833,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                                        summedDurationSeconds: snap.summed,
                                                        targetDuration: target.value,
                                                        windowSegmentCount: window) {
-                let sealed = sealLiveTargetDuration(candidate: target.value)
+                let sealed = sealLiveTargetDuration(target)
                 accountForFirstServe(since: enteredAt, snapshot: snap, targetDuration: sealed)
                 return true
             }
@@ -1321,14 +1856,14 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                                                           summedDurationSeconds: after.summed,
                                                           targetDuration: afterTarget.value,
                                                           windowSegmentCount: window) {
-                    let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                    let sealed = sealLiveTargetDuration(afterTarget)
                     accountForFirstServe(since: enteredAt, snapshot: after, targetDuration: sealed)
                     return true
                 }
                 if let degradedDeadline,
                    Date() >= degradedDeadline,
                    after.count >= LiveEdgePolicy.minStartupSegments {
-                    let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                    let sealed = sealLiveTargetDuration(afterTarget)
                     // AE#374: the grace is the last leg of this wait, not the wait. Reporting it alone
                     // left a bounded start reading as a half-second one when it had held for twelve.
                     accountForFirstServe(
@@ -1351,7 +1886,7 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
                 }
                 // The satisfied re-read above has already returned, so reaching the deadline here means the
                 // cushion is undersized by definition.
-                let sealed = sealLiveTargetDuration(candidate: afterTarget.value)
+                let sealed = sealLiveTargetDuration(afterTarget)
                 accountForFirstServe(
                     since: enteredAt, snapshot: after, targetDuration: sealed, warning: true,
                     note: "\(Int(timeout))s timeout (undersized startup cushion)"
@@ -1432,14 +1967,24 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
             let count = segments.count
             stateLock.unlock()
             if count > index { return true }
-            if !firstSegmentCondition.wait(until: deadline) {
-                stateLock.lock()
-                let final = segments.count
-                stateLock.unlock()
-                return final > index
+            // AE#446: wake in slices rather than parking for the whole bound. A source that stops
+            // delivering mid-hold has to be noticed here too, or the poll that was already in flight
+            // when it died still costs the client a full 3 x TARGETDURATION of not fetching anything.
+            let slice = min(deadline, Date().addingTimeInterval(Self.liveHoldRecheckSeconds))
+            if !firstSegmentCondition.wait(until: slice) {
+                if Date() >= deadline {
+                    stateLock.lock()
+                    let final = segments.count
+                    stateLock.unlock()
+                    return final > index
+                }
+                if liveDeliveryStalled { return false }
             }
         }
     }
+
+    /// AE#446: how often a blocking-reload hold re-asks whether the source is still alive.
+    static let liveHoldRecheckSeconds: TimeInterval = 1.0
     var masterCodecs: String? { codecsString }
     var masterSupplementalCodecs: String? { supplementalCodecsString }
     var masterResolution: (width: Int, height: Int)? {

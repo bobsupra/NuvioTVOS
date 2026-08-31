@@ -11,7 +11,11 @@ enum PlaybackAudioSession {
         queue.async {
             let session = AVAudioSession.sharedInstance()
             do {
+                #if os(tvOS)
+                try session.setCategory(.playback, mode: .moviePlayback, policy: .longFormAudio)
+                #else
                 try session.setCategory(.playback, mode: .moviePlayback)
+                #endif
                 try session.setActive(true)
             } catch {
                 print("[PlaybackAudioSession] activate failed: \(error.localizedDescription)")

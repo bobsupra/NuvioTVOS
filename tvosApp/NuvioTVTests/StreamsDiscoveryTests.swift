@@ -9,7 +9,18 @@
 import XCTest
 @testable import NuvioTV
 
+private enum TestStreamError: Error { case failed }
+
 final class StreamsDiscoveryTests: XCTestCase {
+
+    func testStreamRequestRetryPolicyRetriesTransientErrorsOnly() {
+        XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.timedOut)))
+        XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.networkConnectionLost)))
+        XCTAssertTrue(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.cannotConnectToHost)))
+        XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.cancelled)))
+        XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(URLError(.badServerResponse)))
+        XCTAssertFalse(StreamsRepository.StreamRequestRetryPolicy.shouldRetry(TestStreamError.failed))
+    }
 
     func testMergingExternalSubtitlesPreservesTorrentMetadata() {
         let torrent = NuvioStream(
@@ -125,6 +136,97 @@ final class StreamsDiscoveryTests: XCTestCase {
         let cached = await cache.success(for: url)
         XCTAssertEqual(cached?.id, "com.example.addon")
         XCTAssertEqual(cached?.name, "Example")
+    }
+
+    func testTMDBMetadataUsesImdbIDForCanonicalStreamIdentity() throws {
+        let data = Data(
+            #"{"id":"tmdb:687163","name":"Example","type":"movie","imdb_id":" tt12042730 "}"#.utf8
+        )
+        let decoded = try JSONDecoder().decode(CinemetaMeta.self, from: data)
+        let meta = decoded.toMeta(fallbackType: "movie")
+
+        XCTAssertEqual(meta.imdbId, "tt12042730")
+        XCTAssertEqual(meta.streamId, "tt12042730")
+    }
+
+    func testFullMetadataRequiresCanonicalImdbIdentityForMovies() {
+        let tmdbOnly = makeMeta(id: "tmdb:687163", imdbId: nil)
+        let canonical = makeMeta(id: "tmdb:687163", imdbId: "tt12042730")
+        let canonicalId = makeMeta(id: "tt12042730", imdbId: nil)
+
+        XCTAssertFalse(CinemetaCatalogRepository.isFullMetadata(tmdbOnly))
+        XCTAssertTrue(CinemetaCatalogRepository.isFullMetadata(canonical))
+        XCTAssertTrue(CinemetaCatalogRepository.isFullMetadata(canonicalId))
+    }
+
+    func testSeriesWithEmptyVideosIsNotFullMetadata() {
+        let meta = makeMeta(id: "tt12042730", imdbId: "tt12042730", type: "series", videos: [])
+
+        XCTAssertFalse(CinemetaCatalogRepository.isFullMetadata(meta))
+    }
+
+    func testVideoInferredMovieWithCanonicalIdentityIsFullMetadata() {
+        let meta = NuvioMeta(
+            id: "tt12042730",
+            name: "Example",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt12042730",
+            tmdbId: nil,
+            type: "movie",
+            year: nil,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: [NuvioVideo(id: "tt12042730:1:1", title: "Episode", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil)],
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+
+        XCTAssertTrue(meta.isSeries)
+        XCTAssertTrue(CinemetaCatalogRepository.isFullMetadata(meta))
+    }
+
+    func testUnicodeDigitIMDbIDIsRejected() {
+        XCTAssertNil(NuvioMeta.canonicalImdbID(from: "tt१२३४५६७"))
+    }
+
+    func testCanonicalIMDbMetadataUsesSeriesFirstFallbackOrdering() {
+        XCTAssertEqual(
+            CinemetaCatalogRepository.cinemetaMetadataTypesToTry(
+                primaryType: "series",
+                canonicalImdbID: NuvioMeta.canonicalImdbID(from: " rpdb:TT12042730 ")
+            ),
+            ["series", "movie"]
+        )
+        XCTAssertEqual(
+            CinemetaCatalogRepository.cinemetaMetadataTypesToTry(
+                primaryType: "series",
+                canonicalImdbID: "tmdb:123"
+            ),
+            ["series"]
+        )
+    }
+
+    func testRPDBWrappedMetadataUsesCanonicalImdbIdentity() throws {
+        let data = Data(
+            #"{"id":" rpdb:TT1234567 ","name":"Example","type":"movie"}"#.utf8
+        )
+        let decoded = try JSONDecoder().decode(CinemetaMeta.self, from: data)
+        let meta = decoded.toMeta(fallbackType: "movie")
+
+        XCTAssertEqual(meta.imdbId, "tt1234567")
+        XCTAssertEqual(meta.streamId, "tt1234567")
     }
 
     func testProxyRequestHeadersAreRetainedForPlayback() throws {
@@ -353,6 +455,40 @@ final class StreamsDiscoveryTests: XCTestCase {
             description: nil,
             addonName: addon,
             subtitles: subtitles
+        )
+    }
+
+    private func makeMeta(
+        id: String,
+        imdbId: String?,
+        type: String = "movie",
+        videos: [NuvioVideo]? = nil
+    ) -> NuvioMeta {
+        NuvioMeta(
+            id: id,
+            name: "Example",
+            description: "Description",
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: imdbId,
+            tmdbId: 687163,
+            type: type,
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: ["Director"],
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            status: nil,
+            videos: videos,
+            trailerYtIds: nil,
+            externalRatings: nil
         )
     }
 }

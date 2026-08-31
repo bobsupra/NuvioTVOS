@@ -186,6 +186,64 @@ extension HLSVideoEngine {
         return s
     }
 
+    /// RFC 6381 `avc1.PPCCLL` read straight off the avcC configuration record, which states all three
+    /// bytes outright: AVCProfileIndication, profile_compatibility (the constraint_set flags) and
+    /// AVCLevelIndication are bytes 1..3. Same reasoning as `hevcCodecsString`: the record is what the
+    /// muxer writes into the sample entry, so deriving the attribute from anything else invites the
+    /// two to disagree. nil for Annex-B extradata (MPEG-TS carries no record; byte 0 is a start code,
+    /// not configurationVersion 1) and for a record too short to hold the three bytes.
+    static func avcCodecsString(fromConfigRecord avcC: [UInt8]) -> String? {
+        guard avcC.count >= 4, avcC[0] == 1 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", avcC[1], avcC[2], avcC[3])
+    }
+
+    /// Same three bytes read off the SPS instead, which is what MPEG-TS carries in place of a record:
+    /// profile_idc, the constraint_set flags byte and level_idc are the first three bytes of the RBSP,
+    /// right behind the NAL header. This keeps the live path exact rather than reconstructing the
+    /// compatibility byte from the two flags libavcodec preserved. nil unless the NAL really is an SPS
+    /// (type 7) and long enough to hold them.
+    static func avcCodecsString(fromSPSNAL sps: [UInt8]) -> String? {
+        guard sps.count >= 4, (sps[0] & 0x1F) == 7 else { return nil }
+        return String(format: "avc1.%02X%02X%02X", sps[1], sps[2], sps[3])
+    }
+
+    /// Fallback for sources with no avcC. `AVCodecParameters.profile` is NOT a bare profile_idc:
+    /// libavcodec ORs the constraint flags into the high bits, so Constrained Baseline arrives as
+    /// `66|AV_PROFILE_H264_CONSTRAINED` = 578 and the Intra profiles as `idc|AV_PROFILE_H264_INTRA`.
+    /// Formatting that raw overflowed `%02X` to three digits and produced `avc1.2420028`, seven hex
+    /// digits where the grammar defines six. Masking recovers profile_idc, and the two flags map back
+    /// into the compatibility byte they came from (constraint_set1 is bit 6, constraint_set3 is bit 4),
+    /// so the fallback states them instead of the hardcoded zero the branch used to emit.
+    static func avcCodecsString(profile: Int32, level: Int32) -> String {
+        let raw = profile > 0 ? Int(profile) : 100   // High
+        let safeLevel = level > 0 ? Int(level) : 40  // 4.0
+        var compatibility = 0
+        if raw & 0x200 != 0 { compatibility |= 0x40 }   // AV_PROFILE_H264_CONSTRAINED -> constraint_set1
+        if raw & 0x800 != 0 { compatibility |= 0x10 }   // AV_PROFILE_H264_INTRA       -> constraint_set3
+        return String(format: "avc1.%02X%02X%02X", raw & 0xFF, compatibility, safeLevel)
+    }
+
+    /// The source states these bytes; prefer whichever form it carries them in (avcC, then the SPS a
+    /// TS stream carries instead), and only reconstruct from the codecpar fields when it carries
+    /// neither. Mirrors `plainHEVCCodecs`. Deriving the attribute from the same extradata the muxer
+    /// stream-copies into the sample entry is what keeps the manifest and the init from disagreeing.
+    private func avcCodecs(codecpar: UnsafePointer<AVCodecParameters>) -> String {
+        if let ed = codecpar.pointee.extradata, codecpar.pointee.extradata_size > 0 {
+            let bytes = Array(UnsafeBufferPointer(
+                start: ed, count: Int(codecpar.pointee.extradata_size)))
+            if let derived = Self.avcCodecsString(fromConfigRecord: bytes) {
+                return derived
+            }
+            // Annex-B (MPEG-TS): no record, but the SPS states the same three bytes.
+            if let sps = H264SPS.spsNAL(fromExtradata: bytes),
+               let derived = Self.avcCodecsString(fromSPSNAL: sps) {
+                return derived
+            }
+        }
+        return Self.avcCodecsString(
+            profile: codecpar.pointee.profile, level: codecpar.pointee.level)
+    }
+
     /// Derive the plain-HEVC CODECS string from the source hvcC when parseable, else fall back to the
     /// legacy Main10 form. Used only by the non-DV `.none` / `.profile82` branch; DV variants keep their
     /// deliberate `hvc1.2.4` (Main10 PQ base) declaration.
@@ -209,10 +267,6 @@ extension HLSVideoEngine {
         let codecID = codecpar.pointee.codec_id
 
         if codecID == AV_CODEC_ID_H264 {
-            let profileIDC = Int(codecpar.pointee.profile)
-            let levelIDC = Int(codecpar.pointee.level)
-            let safeProfile = profileIDC > 0 ? profileIDC : 100  // High
-            let safeLevel = levelIDC > 0 ? levelIDC : 40         // 4.0
             // AVC+DV P9: no Apple AVC+DV decoder; strip dvcC so muxer writes clean avc1 (dvvC trips -11868).
             let hasDV = doviConfigRecord(from: codecpar) != nil
             if hasDV {
@@ -226,7 +280,7 @@ extension HLSVideoEngine {
             return CodecRoute(
                 codecTagOverride: "avc1",
                 videoRange: manifestVideoRange(codecpar),
-                primaryCodecs: String(format: "avc1.%02X%02X%02X", safeProfile, 0, safeLevel),
+                primaryCodecs: avcCodecs(codecpar: codecpar),
                 supplementalCodecs: nil,
                 stripDolbyVisionMetadata: hasDV,
                 convertP7ToProfile81: false,

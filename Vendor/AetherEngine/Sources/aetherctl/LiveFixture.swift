@@ -32,9 +32,10 @@
 // `HLSLocalServer` deliberately: Darwin BSD sockets, not
 // Network.framework. See that file's header for the rationale.
 //
-// YAGNI: a single initializer, no drop / discontinuity injection. Later
-// tasks add `--drop-after` / `--discontinuity-at`; this fixture is the
-// clean baseline.
+// Fault injection, one shot each and all off by default: `--drop-after`
+// (RST, the reader reconnects), `--discontinuity-at` (PTS/PCR jump, a
+// program boundary), and `--freeze-after` (connection stays open and
+// simply stops delivering, which is how a dead upstream usually looks).
 
 import Darwin
 import Foundation
@@ -89,6 +90,20 @@ final class LiveFixture: @unchecked Sendable {
     /// Close the first accepted connection after N seconds to simulate a recoverable mid-stream drop. Subsequent connections are served normally.
     var dropAfterSeconds: Double? = nil
     private var didFireDrop = false // latched after the one-shot drop fires
+
+    /// AE#442: one-shot upstream FREEZE after N seconds. The connection stays open and writable,
+    /// the fixture simply stops emitting. This is a different failure from `dropAfterSeconds`: an RST
+    /// ends the connection and drives the reader's reopen ladder, a freeze leaves every layer
+    /// believing it is still connected while the edge stops advancing, the playlist server's blocking
+    /// reloads go unsatisfiable, and AVPlayer starves at the edge into item death. The reporter's
+    /// source failed this way, and the segment cache keeps everything behind the playhead throughout.
+    var freezeAfterSeconds: Double? = nil
+    /// AE#446 round 2: seconds of freeze before the upstream starts delivering again. nil = never,
+    /// which is the only regime `--freeze-after` alone can drive and therefore the only one the
+    /// recovery-after-an-outage path was never exercised in.
+    var unfreezeAfterSeconds: Double? = nil
+    private var frozen = false
+    private var didFireFreeze = false
 
     /// One-shot PTS/DTS/PCR forward jump after N seconds of serving, simulating a broadcast program boundary. Engine must survive it.
     var discontinuityAfterSeconds: Double? = nil
@@ -328,6 +343,17 @@ final class LiveFixture: @unchecked Sendable {
         let startLoopIndex = max(wallDerived, highWaterLoopIndex + 1)
         stateLock.unlock()
         var loopIndex: Int64 = startLoopIndex
+        // AE#446 round 3: say this out loud, because it reaches the engine as a real source jump and
+        // costs a reader an hour otherwise. A connection always starts at PACKET 0 of a loop, so a
+        // client that reconnects while the previous connection was parked mid-loop (which is what
+        // --freeze-after arranges) skips the rest of that loop. Measured: 28.8 s on the bundled seed,
+        // 49.1 s reported on a 93 s capture, both landing in the engine's live timeline rebase.
+        if startLoopIndex > 0, loopPeriodTicks > 0 {
+            print("[LiveFixture] serving from loop \(startLoopIndex) of a "
+                  + String(format: "%.2f", Double(loopPeriodTicks) / 90_000.0)
+                  + "s seed; a connection starts at a loop boundary, so a reconnect mid-loop skips "
+                  + "the remainder and the engine sees a source discontinuity")
+        }
 
         // One-shot discontinuity: armed by a timer so it fires on schedule even while serve() is blocked in send().
         stateLock.lock()
@@ -348,6 +374,34 @@ final class LiveFixture: @unchecked Sendable {
                 self.stateLock.unlock()
             }
         }
+        // AE#442: timer-armed like the discontinuity, so the freeze fires on schedule even while
+        // serve() is parked in a back-pressured send().
+        stateLock.lock()
+        let freezeAfter = freezeAfterSeconds
+        let scheduleFreeze = (freezeAfter != nil && !didFireFreeze)
+        stateLock.unlock()
+        if let after = freezeAfter, scheduleFreeze {
+            workQueue.asyncAfter(deadline: .now() + after) { [weak self] in
+                guard let self else { return }
+                self.stateLock.lock()
+                if !self.didFireFreeze {
+                    self.didFireFreeze = true
+                    self.frozen = true
+                    print("[LiveFixture] Freezing upstream after ~\(Int(after))s "
+                          + "(connection stays open, no further bytes, fd=\(fd))")
+                }
+                self.stateLock.unlock()
+                guard let thaw = self.unfreezeAfterSeconds else { return }
+                self.workQueue.asyncAfter(deadline: .now() + thaw) { [weak self] in
+                    guard let self else { return }
+                    self.stateLock.lock()
+                    self.frozen = false
+                    self.stateLock.unlock()
+                    print("[LiveFixture] Upstream delivering again after ~\(Int(thaw))s of freeze")
+                }
+            }
+        }
+
         var discontinuityOffset: Int64 = 0
 
         var scratch = [UInt8](repeating: 0, count: LiveFixture.tsPacketSize) // reused per-packet; no steady-state alloc
@@ -363,6 +417,17 @@ final class LiveFixture: @unchecked Sendable {
             if stopping { return }
 
             for (packetIndex, packet) in seedPackets.enumerated() {
+                // AE#442: park while frozen. No write, no close: the peer keeps a healthy socket
+                // that never delivers again.
+                while true {
+                    stateLock.lock()
+                    let isFrozen = frozen
+                    let stopNow = shouldStop
+                    stateLock.unlock()
+                    if stopNow { return }
+                    if !isFrozen { break }
+                    usleep(100_000)
+                }
                 // Real-time gate: hold the average emit rate at ~1x. Sleep in
                 // coarse slices whenever the emitted media-time runs more than
                 // `pacingLeadSeconds` ahead of wall-clock elapsed. Coarse on

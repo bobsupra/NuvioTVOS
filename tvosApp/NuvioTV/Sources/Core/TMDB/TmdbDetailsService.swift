@@ -469,7 +469,8 @@ enum TmdbDetailsService {
         )!
         components.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
-            URLQueryItem(name: "language", value: preferredLanguage)
+            URLQueryItem(name: "language", value: preferredLanguage),
+            URLQueryItem(name: "append_to_response", value: "translations")
         ]
         guard let url = components.url,
               let (data, response) = try? await URLSession.shared.data(from: url),
@@ -479,18 +480,28 @@ enum TmdbDetailsService {
             return []
         }
 
+        let requestedCode = preferredLanguage.split(separator: "-").first.map(String.init) ?? "en"
         let baseParentId = parentId.hasPrefix("tt") ? parentId : "tmdb:\(tmdbId)"
         return (seasonDetails.episodes ?? []).compactMap { ep -> NuvioVideo? in
             guard let epNum = ep.episodeNumber else { return nil }
             let epSeason = ep.seasonNumber ?? seasonNumber
             let ratingStr = ep.voteAverage.flatMap { $0 > 0 ? String(format: "%.1f", $0) : nil }
+
+            let matchingTrans = ep.translations?.translations?.first(where: {
+                $0.iso6391?.caseInsensitiveCompare(requestedCode) == .orderedSame
+                    && (!($0.data?.name?.isEmpty ?? true) || !($0.data?.overview?.isEmpty ?? true))
+            })
+
+            let epName = nonEmpty(matchingTrans?.data?.name) ?? nonEmpty(ep.name) ?? "Episode \(epNum)"
+            let epOverview = nonEmpty(matchingTrans?.data?.overview) ?? nonEmpty(ep.overview)
+
             return NuvioVideo(
                 id: "\(baseParentId):\(epSeason):\(epNum)",
-                title: nonEmpty(ep.name) ?? "Episode \(epNum)",
+                title: epName,
                 season: epSeason,
                 episode: epNum,
                 thumbnail: imageURL(ep.stillPath, size: "w500"),
-                overview: nonEmpty(ep.overview),
+                overview: epOverview,
                 released: nonEmpty(ep.airDate),
                 rating: ratingStr
             )
@@ -509,18 +520,32 @@ enum TmdbDetailsService {
             return meta
         }
 
+        let requestedCode = preferredLanguage.split(separator: "-").first.map(String.init) ?? "en"
+
+        let matchingTranslation = details.translations?.translations?.first(where: {
+            $0.iso6391?.caseInsensitiveCompare(requestedCode) == .orderedSame
+                && (!($0.data?.title?.isEmpty ?? true) || !($0.data?.name?.isEmpty ?? true) || !($0.data?.overview?.isEmpty ?? true))
+        })
+
+        let translatedTitle = nonEmpty(matchingTranslation?.data?.title ?? matchingTranslation?.data?.name)
+        let translatedOverview = nonEmpty(matchingTranslation?.data?.overview)
+
         let rawTitle = nonEmpty(details.title ?? details.name)
         let originalTitle = nonEmpty(details.originalTitle ?? details.originalName)
-        let requestedCode = preferredLanguage.split(separator: "-").first.map(String.init) ?? "en"
+
         let localizedTitle: String?
-        if requestedCode != "en",
-           rawTitle == originalTitle,
-           let originalLanguage = nonEmpty(details.originalLanguage),
-           originalLanguage.caseInsensitiveCompare(requestedCode) != .orderedSame {
+        if let translatedTitle {
+            localizedTitle = translatedTitle
+        } else if requestedCode != "en",
+                  rawTitle == originalTitle,
+                  let originalLanguage = nonEmpty(details.originalLanguage),
+                  originalLanguage.caseInsensitiveCompare(requestedCode) != .orderedSame {
             localizedTitle = nil
         } else {
             localizedTitle = rawTitle
         }
+
+        let localizedOverview = translatedOverview ?? nonEmpty(details.overview)
 
         let localizedGenres = details.genres?
             .compactMap { nonEmpty($0.name) }
@@ -535,7 +560,7 @@ enum TmdbDetailsService {
         return NuvioMeta(
             id: meta.id,
             name: localizedTitle ?? meta.name,
-            description: nonEmpty(details.overview) ?? meta.description,
+            description: localizedOverview ?? meta.description,
             posterUrl: tmdbPosterURL ?? meta.posterUrl,
             backgroundUrl: tmdbBackgroundURL ?? meta.backgroundUrl,
             logoUrl: tmdbLogoURL ?? meta.logoUrl,
@@ -990,7 +1015,7 @@ enum TmdbDetailsService {
         components.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
             URLQueryItem(name: "language", value: preferredLanguage),
-            URLQueryItem(name: "append_to_response", value: "images"),
+            URLQueryItem(name: "append_to_response", value: "images,translations"),
             URLQueryItem(
                 name: "include_image_language",
                 value: "\(preferredLanguage),en,null"
@@ -1118,15 +1143,37 @@ private struct TmdbEpisodeDTO: Decodable {
     let seasonNumber: Int?
     let stillPath: String?
     let voteAverage: Double?
+    let translations: TmdbEpisodeTranslationsContainer?
 
     enum CodingKeys: String, CodingKey {
-        case id, name, overview
+        case id, name, overview, translations
         case airDate = "air_date"
         case episodeNumber = "episode_number"
         case seasonNumber = "season_number"
         case stillPath = "still_path"
         case voteAverage = "vote_average"
     }
+}
+
+private struct TmdbEpisodeTranslationsContainer: Decodable {
+    let translations: [TmdbEpisodeTranslationItemDTO]?
+}
+
+private struct TmdbEpisodeTranslationItemDTO: Decodable {
+    let iso6391: String?
+    let iso31661: String?
+    let data: TmdbEpisodeTranslationDataDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case iso6391 = "iso_639_1"
+        case iso31661 = "iso_3166_1"
+        case data
+    }
+}
+
+private struct TmdbEpisodeTranslationDataDTO: Decodable {
+    let name: String?
+    let overview: String?
 }
 
 private struct TmdbNetworkDetailsResponse: Decodable {
@@ -1224,10 +1271,11 @@ private struct TmdbLocalizedDetailsResponse: Decodable {
     let posterPath: String?
     let backdropPath: String?
     let images: TmdbImageCollection?
+    let translations: TmdbTranslationsContainer?
     let genres: [TmdbGenreDTO]?
 
     enum CodingKeys: String, CodingKey {
-        case title, name, overview, genres
+        case title, name, overview, genres, translations
         case originalTitle = "original_title"
         case originalName = "original_name"
         case originalLanguage = "original_language"
@@ -1235,6 +1283,28 @@ private struct TmdbLocalizedDetailsResponse: Decodable {
         case backdropPath = "backdrop_path"
         case images
     }
+}
+
+private struct TmdbTranslationsContainer: Decodable {
+    let translations: [TmdbTranslationItemDTO]?
+}
+
+private struct TmdbTranslationItemDTO: Decodable {
+    let iso6391: String?
+    let iso31661: String?
+    let data: TmdbTranslationDataDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case iso6391 = "iso_639_1"
+        case iso31661 = "iso_3166_1"
+        case data
+    }
+}
+
+private struct TmdbTranslationDataDTO: Decodable {
+    let title: String?
+    let name: String?
+    let overview: String?
 }
 
 private struct TmdbImageCollection: Decodable {

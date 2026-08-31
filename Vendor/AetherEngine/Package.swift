@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 6.47.0 — imports AetherLib* FFmpeg modules (namespaced for MPVKit coexistence).
+// Nuvio pin of AetherEngine 6.57.0 with local FFmpegBuild and AV1 Metal conversion.
 
 import PackageDescription
 
@@ -30,7 +30,8 @@ let package = Package(
     dependencies: [
         // Minimal FFmpeg build (avcodec, avformat, avutil, swresample only).
         // No network stack, we use custom AVIO + URLSession for HTTP streams.
-        // Nuvio: local namespaced FFmpegBuild (AetherLib*) for MPVKit coexistence.
+        // Nuvio vendors the exact FFmpegBuild release beside this package so
+        // its namespaced dynamic frameworks stay coherent with MPVKit.
         .package(path: "../FFmpegBuild"),
         // Pure-Swift SMB2 client (MIT) that speaks the protocol over
         // NWConnection. Replaces AMSMB2/libsmb2, which EPERMs on tvOS/iOS.
@@ -44,13 +45,13 @@ let package = Package(
         // worked example: 1.1.0 shipped a tvOS floor raise as a minor, SwiftPM
         // floated every `from: "1.0.x"` consumer onto it and then failed on the
         // floor instead of backing off, so all of 5.x stopped resolving.
-        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.0.0")),  // 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
+        .package(url: "https://github.com/superuser404notfound/LibDovi", .upToNextMinor(from: "2.1.0")),  // 2.1.0: dolby_vision 3.4.0, header additive only (two new CMv4.0 metadata entry points, nothing removed); 2.0.0: visionOS (xros) device + simulator slices, declared tvOS floor corrected to 17.0 (was published as 1.1.0, withdrawn: a floor raise is breaking and broke every 5.x pin that floated onto it); 1.0.2: iOS slices + x86_64 (Intel Macs)
     ],
     targets: [
         .target(
             name: "AetherEngine",
             dependencies: [
-                .product(name: "FFmpegBuild", package: "FFmpegBuild"),
+                .product(name: "AetherFFmpegBuild", package: "FFmpegBuild"),
                 .product(name: "Dovi", package: "LibDovi"),
             ],
             linkerSettings: [
@@ -60,6 +61,7 @@ let package = Package(
                 .linkedFramework("CoreVideo"),
                 .linkedFramework("VideoToolbox"),
                 .linkedFramework("AudioToolbox"),
+                .linkedFramework("Metal"),
             ]
         ),
         .target(

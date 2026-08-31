@@ -83,7 +83,7 @@ struct RemoteHLSSubtitleProxyTests {
         try server.start()
         defer { server.stop() }
 
-        let (status, body) = try await Self.get("/master.m3u8", port: server.port)
+        let (status, body) = try await Self.get("/\(server.pathToken)/master.m3u8", port: server.port)
         #expect(status == 200)
         #expect(body == Self.master)
     }
@@ -97,7 +97,7 @@ struct RemoteHLSSubtitleProxyTests {
         let server = HLSLocalServer(provider: provider)
         try server.start()
         defer { server.stop() }
-        #expect(server.playlistURL?.path == "/master.m3u8")
+        #expect(server.playlistURL?.lastPathComponent == "master.m3u8")
     }
 
     @Test("The rendition playlist is a finished whole-program VOD playlist")
@@ -109,7 +109,7 @@ struct RemoteHLSSubtitleProxyTests {
         try server.start()
         defer { server.stop() }
 
-        let (status, body) = try await Self.get("/subs_0.m3u8", port: server.port)
+        let (status, body) = try await Self.get("/\(server.pathToken)/subs_0.m3u8", port: server.port)
         #expect(status == 200)
         #expect(body.contains("#EXT-X-PLAYLIST-TYPE:VOD"))
         #expect(body.contains("#EXT-X-TARGETDURATION:1235"))
@@ -127,8 +127,8 @@ struct RemoteHLSSubtitleProxyTests {
         try server.start()
         defer { server.stop() }
 
-        #expect(try await Self.get("/seg0.mp4", port: server.port).status == 404)
-        #expect(try await Self.get("/init.mp4", port: server.port).status == 404)
+        #expect(try await Self.get("/\(server.pathToken)/seg0.mp4", port: server.port).status == 404)
+        #expect(try await Self.get("/\(server.pathToken)/init.mp4", port: server.port).status == 404)
     }
 
     @Test("A decoded sidecar is served as whole-program WebVTT", .timeLimit(.minutes(2)))
@@ -161,7 +161,7 @@ struct RemoteHLSSubtitleProxyTests {
         provider.startFill()
         await provider.awaitFill()
 
-        let (status, body) = try await Self.get("/subs_0_0.vtt", port: server.port)
+        let (status, body) = try await Self.get("/\(server.pathToken)/subs_0_0.vtt", port: server.port)
         #expect(status == 200)
         #expect(body.hasPrefix("WEBVTT"))
         #expect(body.contains("Erste Zeile"))

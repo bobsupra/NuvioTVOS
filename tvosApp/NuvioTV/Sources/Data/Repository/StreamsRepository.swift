@@ -375,11 +375,17 @@ final class StreamsRepository: ObservableObject {
             .appendingPathComponent("\(videoId).json")
 
         do {
-            let streams = try await fetchStreams(
-                from: streamURL,
-                addonName: target.displayName,
-                logo: target.logo
-            )
+            var attempt = 0
+            var streams: [NuvioStream] = []
+            while true {
+                do {
+                    streams = try await fetchStreams(from: streamURL, addonName: target.displayName, logo: target.logo)
+                    break
+                } catch {
+                    guard attempt == 0, StreamRequestRetryPolicy.shouldRetry(error) else { throw error }
+                    attempt += 1
+                }
+            }
             return GroupUpdate(
                 addonId: target.addonId,
                 group: AddonStreamGroup(
@@ -405,6 +411,13 @@ final class StreamsRepository: ObservableObject {
                     error: message
                 )
             )
+        }
+    }
+
+    enum StreamRequestRetryPolicy {
+        static func shouldRetry(_ error: Error) -> Bool {
+            guard let urlError = error as? URLError else { return false }
+            return [.timedOut, .networkConnectionLost, .cannotConnectToHost].contains(urlError.code)
         }
     }
 

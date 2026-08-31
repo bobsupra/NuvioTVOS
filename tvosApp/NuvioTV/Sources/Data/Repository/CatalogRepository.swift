@@ -233,11 +233,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
             .sorted { $0.key < $1.key }
             .map { "\($0.key)=\($0.value)" }
             .joined(separator: ",")
-        return "cinemeta:\(cinemetaEnabled) urls:[\(urls)] disabled:[\(disabled)] order:[\(order)]"
+        let showType = ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true
+        return "cinemeta:\(cinemetaEnabled) urls:[\(urls)] disabled:[\(disabled)] order:[\(order)] showType:\(showType)"
     }
     private let baseURL = URL(string: "https://v3-cinemeta.strem.io")!
-    private static let metadataCacheQueue = DispatchQueue(label: "com.nuvio.tv.metadata-cache")
     private static var cachedMetaById: [String: NuvioMeta] = [:]
+    private static var cachedFullMetaIds: Set<String> = []
+    private static let metadataCacheQueue = DispatchQueue(label: "nuvio.catalog.metadata-cache", attributes: .concurrent)
     private let builtInSubtitleAddons = [
         StremioSubtitleAddon(
             name: "OpenSubtitles v3",
@@ -256,32 +258,55 @@ final class CinemetaCatalogRepository: CatalogRepository {
         Self.metadataCacheQueue.sync { Self.cachedMetaById[id] }
     }
 
-    func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
+    func isCachedFullMetadata(id: String) -> Bool {
         Self.metadataCacheQueue.sync {
+            Self.cachedFullMetaIds.contains(id) && Self.cachedMetaById[id] != nil
+        }
+    }
+
+    func cacheMetadata(_ meta: NuvioMeta, requestedID: String? = nil) {
+        Self.metadataCacheQueue.sync(flags: .barrier) {
             if let requestedID {
                 Self.cachedMetaById[requestedID] = meta
+                Self.cachedFullMetaIds.insert(requestedID)
             }
             Self.cachedMetaById[meta.id] = meta
+            Self.cachedFullMetaIds.insert(meta.id)
         }
     }
 
     static func isFullMetadata(_ meta: NuvioMeta) -> Bool {
+        let isMovieOrSeries = meta.isSeries || meta.type
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased() == "movie"
+        if isMovieOrSeries && !hasCanonicalIMDbStreamIdentity(meta) {
+            return false
+        }
         if meta.isSeries {
-            return meta.videos != nil
+            return meta.videos?.isEmpty == false
         } else {
             return (meta.tmdbId != nil && meta.tmdbId! > 0) || (meta.director != nil && !meta.director!.isEmpty) || (meta.trailerYtIds != nil && !meta.trailerYtIds!.isEmpty)
         }
     }
 
+    private static func hasCanonicalIMDbStreamIdentity(_ meta: NuvioMeta) -> Bool {
+        NuvioMeta.canonicalImdbID(from: meta.streamId) != nil
+    }
+
+    private func cacheCatalogMetadata(_ meta: NuvioMeta) {
+        Self.metadataCacheQueue.sync(flags: .barrier) {
+            if Self.cachedFullMetaIds.contains(meta.id) {
+                return
+            }
+            Self.cachedMetaById[meta.id] = meta
+        }
+    }
+
     private func cacheMetadata(_ items: [NuvioMeta]) {
-        Self.metadataCacheQueue.sync {
+        Self.metadataCacheQueue.sync(flags: .barrier) {
             for item in items {
-                if let existing = Self.cachedMetaById[item.id] {
-                    let existingIsFull = Self.isFullMetadata(existing)
-                    let newIsFull = Self.isFullMetadata(item)
-                    if existingIsFull && !newIsFull {
-                        continue
-                    }
+                if Self.cachedFullMetaIds.contains(item.id) {
+                    continue
                 }
                 Self.cachedMetaById[item.id] = item
             }
@@ -289,8 +314,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
     }
 
     private func removeCachedMetadata(for id: String) {
-        Self.metadataCacheQueue.sync {
+        Self.metadataCacheQueue.sync(flags: .barrier) {
             _ = Self.cachedMetaById.removeValue(forKey: id)
+            Self.cachedFullMetaIds.remove(id)
         }
     }
 
@@ -464,6 +490,15 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // Catalogs the user hid from Home on another device (synced from the
         // account). Their key format matches the tvOS catalog id sans `addon_`.
         let disabledCatalogKeys = TVHomeCatalogOrder.disabledCatalogKeys()
+        let syncedHomeKeys = Set(TVHomeCatalogOrder.syncedCatalogOrderIndex().keys)
+        let collectionSources: [CatalogHomeVisibilityResolver.Source] = CollectionsStore.collections().flatMap { collection in
+            collection.folders.flatMap { $0.resolvedSources }
+                .filter { $0.normalizedProvider == "addon" }
+                .compactMap { source in
+                    guard let addonId = source.addonId, let type = source.type, let catalogId = source.catalogId else { return nil }
+                    return CatalogHomeVisibilityResolver.Source(addonIdentifier: addonId, contentType: type, catalogID: catalogId, collectionID: collection.id)
+                }
+        }
         var catalogs: [NuvioCatalog] = []
         var reports: [String] = []
         var hadFailures = false
@@ -482,7 +517,16 @@ final class CinemetaCatalogRepository: CatalogRepository {
             let base = manifestURL.deletingLastPathComponent()
             let eligible = (manifest.catalogs ?? []).filter { catalog in
                 guard catalog.eligibleForHome else { return false }
-                guard !disabledCatalogKeys.contains("\(manifest.id)_\(catalog.type)_\(catalog.id)") else {
+                let key = "\(manifest.id)_\(catalog.type)_\(catalog.id)"
+                guard CatalogHomeVisibilityResolver.shouldInclude(
+                    addonID: manifest.id,
+                    contentType: catalog.type,
+                    catalogID: catalog.id,
+                    collectionSources: collectionSources,
+                    manifestURL: manifestURL,
+                    explicitHomeKeys: syncedHomeKeys
+                ) else { return false }
+                guard !disabledCatalogKeys.contains(key) else {
                     return false
                 }
                 return !catalog.requiresGenre || catalog.firstGenreOption != nil
@@ -503,7 +547,11 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     let items = response.metas.map { $0.toMeta(fallbackType: catalog.type) }
                     guard !items.isEmpty else { return nil }
                     cacheMetadata(items)
-                    let catalogName = catalog.name ?? catalog.id
+                    let catalogName = TVHomeCatalogOrder.catalogDisplayTitle(
+                        catalog.name ?? catalog.id,
+                        contentType: catalog.type,
+                        showType: ProfileSettings.current.object(forKey: SettingsKey.homeCatalogShowType) as? Bool ?? true
+                    )
                     return NuvioCatalog(
                         id: "addon_\(manifest.id)_\(catalog.type)_\(catalog.id)",
                         name: catalogName,
@@ -594,33 +642,35 @@ final class CinemetaCatalogRepository: CatalogRepository {
         if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
             return jellyfinMeta
         }
-        if let cached = cachedMetadata(for: id) {
-            let isFull = Self.isFullMetadata(cached)
-            if isFull {
-                return await TmdbDetailsService.localizedMetadata(for: cached)
-            }
+        let cached = cachedMetadata(for: id)
+        if let cached, isCachedFullMetadata(id: id) {
+            return await TmdbDetailsService.localizedMetadata(for: cached)
         }
 
-        return try await loadMetadata(id: id, type: type)
+        return try await loadMetadata(id: id, type: type, cachedIsSeriesHint: cached?.isSeries)
     }
 
     func refreshMetadata(id: String, type: String) async throws -> NuvioMeta {
         if let jellyfinMeta = await JellyfinLibraryIndex.shared.meta(forContentId: id) {
             return jellyfinMeta
         }
+        // A catalog can report `type: movie` while its nonempty videos prove
+        // that it is a series. Keep that inference while replacing the cache,
+        // otherwise refresh falls back to the wrong Cinemeta endpoint.
+        let cachedIsSeriesHint = cachedMetadata(for: id)?.isSeries
         removeCachedMetadata(for: id)
-        return try await loadMetadata(id: id, type: type)
+        return try await loadMetadata(id: id, type: type, cachedIsSeriesHint: cachedIsSeriesHint)
     }
 
-    private func loadMetadata(id: String, type: String) async throws -> NuvioMeta {
+    private func loadMetadata(id: String, type: String, cachedIsSeriesHint: Bool? = nil) async throws -> NuvioMeta {
         // Query the correct endpoint based on the caller-provided type. The
         // Details screen uses a fresh repository (empty cache) so this always
         // fetches the full /meta payload — real episodes and per-episode ratings.
-        let isSeries = Self.isSeriesType(type)
+        let isSeries = Self.isSeriesType(type) || cachedIsSeriesHint == true
         let isLive = Self.isLiveContentType(type)
         let metaType = isSeries ? "series" : "movie"
         var lastError: Error?
-        var resolvedId = id
+        var resolvedId = NuvioMeta.canonicalImdbID(from: id) ?? id
 
         // Map tmdb:123 → imdb when TMDB is configured so Cinemeta can resolve.
         if id.hasPrefix("tmdb:"),
@@ -640,22 +690,29 @@ final class CinemetaCatalogRepository: CatalogRepository {
             resolvedId = imdb
         }
 
+        let resolvedCanonicalImdbID = NuvioMeta.canonicalImdbID(from: resolvedId)
+
         // Cinemeta only resolves IMDb ids; other id spaces synced from the
         // phone app (tmdb:, kitsu:, ...) must come from the configured add-ons.
-        if resolvedId.hasPrefix("tt") {
-            do {
-                let url = baseURL
-                    .appendingPathComponent("meta")
-                    .appendingPathComponent(metaType)
-                    .appendingPathComponent("\(resolvedId).json")
-                let response: CinemetaMetaResponse = try await fetch(url)
-                let meta = await TmdbDetailsService.localizedMetadata(
-                    for: response.meta.toMeta(fallbackType: metaType)
-                )
-                cacheMetadata(meta, requestedID: id)
-                return meta
-            } catch {
-                lastError = error
+        if !isLive, let resolvedCanonicalImdbID {
+            for candidateType in Self.cinemetaMetadataTypesToTry(
+                primaryType: metaType,
+                canonicalImdbID: resolvedCanonicalImdbID
+            ) {
+                do {
+                    let url = baseURL
+                        .appendingPathComponent("meta")
+                        .appendingPathComponent(candidateType)
+                        .appendingPathComponent("\(resolvedId).json")
+                    let response: CinemetaMetaResponse = try await fetch(url)
+                    let meta = await TmdbDetailsService.localizedMetadata(
+                        for: response.meta.toMeta(fallbackType: candidateType)
+                    )
+                    cacheMetadata(meta, requestedID: id)
+                    return meta
+                } catch {
+                    lastError = error
+                }
             }
         }
 
@@ -724,6 +781,20 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         throw lastError ?? URLError(.badServerResponse)
+    }
+
+    static func cinemetaMetadataTypesToTry(primaryType: String, canonicalImdbID: String?) -> [String] {
+        guard let canonicalImdbID,
+              NuvioMeta.canonicalImdbID(from: canonicalImdbID) != nil else {
+            return [primaryType]
+        }
+
+        let normalizedType = primaryType.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        switch normalizedType {
+        case "series": return ["series", "movie"]
+        case "movie": return ["movie", "series"]
+        default: return [primaryType]
+        }
     }
 
     /// Best-effort TMDB external_ids lookup so More Like This / production
@@ -1262,7 +1333,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                 for meta in response.metas.map({ $0.toMeta(fallbackType: source.type) }) {
                     guard items.count < limit else { break }
                     guard seen.insert(meta.id).inserted else { continue }
-                    cacheMetadata(meta)
+                    cacheCatalogMetadata(meta)
                     items.append(meta)
                 }
             } catch {
@@ -1614,7 +1685,7 @@ struct CinemetaMeta: Decodable {
     let poster: String?
     let background: String?
     let logo: String?
-    let imdbRating: String?
+    let imdbRating: FlexibleString?
     let genres: [String]?
     let genre: [String]?
     let releaseInfo: String?
@@ -1630,12 +1701,14 @@ struct CinemetaMeta: Decodable {
     let videos: [CinemetaVideo]?
     let trailers: [CinemetaTrailer]?
     let trailerStreams: [CinemetaTrailerStream]?
+    let imdbId: String?
 
     enum CodingKeys: String, CodingKey {
         case id, name, type, description, poster, background, logo, imdbRating
         case genres, genre, releaseInfo, year, runtime, cast, director, writer, country, released
         case status, videos, trailers, trailerStreams
         case moviedbId = "moviedb_id"
+        case imdbId = "imdb_id"
     }
 
     func toMeta(fallbackType: String) -> NuvioMeta {
@@ -1646,7 +1719,7 @@ struct CinemetaMeta: Decodable {
             posterUrl: poster,
             backgroundUrl: background,
             logoUrl: logo,
-            imdbId: id.hasPrefix("tt") ? id : nil,
+            imdbId: canonicalImdbId,
             tmdbId: moviedbId,
             type: type ?? fallbackType,
             year: parsedYear,
@@ -1666,8 +1739,13 @@ struct CinemetaMeta: Decodable {
         )
     }
 
+    private var canonicalImdbId: String? {
+        NuvioMeta.canonicalImdbID(from: imdbId ?? "")
+            ?? NuvioMeta.canonicalImdbID(from: id)
+    }
+
     private var parsedImdbRating: Double? {
-        guard let value = imdbRating.flatMap(Double.init), value.isFinite else { return nil }
+        guard let value = imdbRating.flatMap({ Double($0.value) }), value.isFinite, value > 0 else { return nil }
         return value
     }
 

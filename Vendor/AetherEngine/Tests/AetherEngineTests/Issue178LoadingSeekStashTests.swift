@@ -5,7 +5,7 @@ import Testing
 /// #178 mechanism 1 (YangHanqing): `seek(to:)` unconditionally no-oped while `state == .loading`,
 /// silently discarding any seek issued in the multi-second initial-load window. Hosts that render
 /// the target optimistically then watch playback snap back to the pre-seek position. The fix
-/// stashes the latest loading-window seek in `pendingPreReadySeekSeconds` (the #127 slot) and
+/// stashes the latest loading-window seek in `pendingPreReadySeek` (the #127 slot) and
 /// resolves it on the transition out of `.loading`: replay into a playable state, discard into a
 /// terminal one. The `.loading` state itself is never left early (spinner hold, see #127 notes).
 struct Issue178LoadingSeekStashTests {
@@ -16,7 +16,9 @@ struct Issue178LoadingSeekStashTests {
         let engine = try AetherEngine()
         engine.state = .loading
         await engine.seek(to: 42)
-        #expect(engine.pendingPreReadySeekSeconds == 42)
+        #expect(engine.pendingPreReadySeek?.seconds == 42)
+        // AE#446 round 4: a host seek stays a host seek across the stash.
+        #expect(engine.pendingPreReadySeek?.origin == .host)
         #expect(engine.state == .loading)          // spinner hold intact
         #expect(engine.clock.currentTime == 42)    // optimistic scrub clock follows the target
     }
@@ -28,7 +30,7 @@ struct Issue178LoadingSeekStashTests {
         engine.state = .loading
         await engine.seek(to: 42)
         await engine.seek(to: 97)
-        #expect(engine.pendingPreReadySeekSeconds == 97)
+        #expect(engine.pendingPreReadySeek?.seconds == 97)
     }
 
     @MainActor
@@ -39,10 +41,10 @@ struct Issue178LoadingSeekStashTests {
         await engine.seek(to: 42)
         engine.state = .playing   // autostart path: timeControlStatus sink flips .loading -> .playing
         for _ in 0..<50 {
-            if engine.pendingPreReadySeekSeconds == nil { break }
+            if engine.pendingPreReadySeek == nil { break }
             await Task.yield()
         }
-        #expect(engine.pendingPreReadySeekSeconds == nil)
+        #expect(engine.pendingPreReadySeek == nil)
         #expect(engine.clock.currentTime == 42)
     }
 
@@ -53,7 +55,7 @@ struct Issue178LoadingSeekStashTests {
         engine.state = .loading
         await engine.seek(to: 42)
         engine.state = .error("load failed")
-        #expect(engine.pendingPreReadySeekSeconds == nil)
+        #expect(engine.pendingPreReadySeek == nil)
     }
 
     @Test("stash resolution: replay into playable, discard into terminal, hold otherwise")

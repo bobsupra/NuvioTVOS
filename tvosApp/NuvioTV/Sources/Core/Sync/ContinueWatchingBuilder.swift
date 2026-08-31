@@ -295,6 +295,11 @@ enum ContinueWatchingBuilder {
 
             let sameEpisode = existing?.season == record.season && existing?.episode == record.episode
             let video = episode(in: meta, season: record.season, episode: record.episode)
+            let tmdbEpisode = await EpisodeMetadataEnrichment.fetch(
+                meta: meta,
+                season: record.season,
+                episode: record.episode
+            )
             page.append(
                 ContinueWatchingItem(
                     meta: meta,
@@ -304,12 +309,15 @@ enum ContinueWatchingBuilder {
                     lastWatchedAt: record.lastWatchedAt,
                     season: record.season,
                     episode: record.episode,
-                    released: video?.released ?? (sameEpisode ? existing?.released : nil),
-                    episodeTitleOverride: nonPlaceholder(video?.title)
+                    released: tmdbEpisode?.released ?? video?.released ?? (sameEpisode ? existing?.released : nil),
+                    episodeTitleOverride: tmdbEpisode?.title
+                        ?? nonPlaceholder(video?.title)
                         ?? (sameEpisode ? existing?.episodeTitleOverride : nil),
-                    episodeOverviewOverride: nonEmpty(video?.overview)
+                    episodeOverviewOverride: tmdbEpisode?.overview
+                        ?? nonEmpty(video?.overview)
                         ?? (sameEpisode ? existing?.episodeOverviewOverride : nil),
-                    episodeThumbnailOverride: video?.thumbnail
+                    episodeThumbnailOverride: tmdbEpisode?.thumbnail
+                        ?? video?.thumbnail
                         ?? (sameEpisode ? existing?.episodeThumbnailOverride : nil)
                 )
             )
@@ -344,10 +352,14 @@ enum ContinueWatchingBuilder {
                 group.addTask {
                     // A seed needs a real episode guide, so bypass the cache for
                     // those; a plain resume row is happy with whatever is cached.
-                    let meta = request.needsVideos
+                    let rawMeta = request.needsVideos
                         ? try? await repository.refreshMetadata(id: request.id, type: request.type)
                         : try? await repository.getMetadata(id: request.id, type: request.type)
-                    return (request.id, meta)
+                    if let rawMeta {
+                        let localized = await TmdbDetailsService.localizedMetadata(for: rawMeta)
+                        return (request.id, localized)
+                    }
+                    return (request.id, nil)
                 }
             }
 

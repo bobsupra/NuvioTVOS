@@ -1828,6 +1828,22 @@ enum ContinueWatchingSyncMapper {
 enum PlayerSettingsSyncMapper {
     static let featureKey = "player_settings"
 
+    /// Mobile owns the complete shared player feature. Preserve any tv-only
+    /// fields only when mobile does not already define the same key.
+    static func mergeRemoteSettings(mobile: [String: Any]?, tv: [String: Any]?) -> [String: Any] {
+        var merged = mobile ?? [:]
+        for (key, value) in tv ?? [:] where merged[key] == nil { merged[key] = value }
+        return merged
+    }
+
+    /// tvOS owns only the mapped values it exports; those values overlay the
+    /// preserved shared feature without removing mobile-only settings.
+    static func overlayOwnedSettings(_ existing: [String: Any], with owned: [String: Any]) -> [String: Any] {
+        var merged = existing
+        for (key, value) in owned { merged[key] = value }
+        return merged
+    }
+
     static let remoteToLocalKeyMappings: [(remote: String, local: String)] = [
         ("preferred_audio_language", SettingsKey.audioLanguage),
         ("preferred_subtitle_language", SettingsKey.subtitleLanguage),
@@ -2317,19 +2333,23 @@ fileprivate final class NuvioAPIClient {
         let currentOrderData = defaults.data(forKey: SettingsKey.homeCatalogSyncedOrder)
         let currentDisabledData = defaults.data(forKey: SettingsKey.homeCatalogDisabled)
         let currentDisabledColData = defaults.data(forKey: SettingsKey.homeCollectionDisabled)
+        let currentShowType = defaults.object(forKey: SettingsKey.homeCatalogShowType) as? Bool
 
         let newOrderData = try? JSONEncoder().encode(orderKeys)
         let newDisabledData = try? JSONEncoder().encode(disabledKeys)
         let newDisabledColData = try? JSONEncoder().encode(disabledCollectionIds)
+        let newShowType = payload.showCatalogType
 
         let didChange = (currentOrderData != newOrderData)
             || (currentDisabledData != newDisabledData)
             || (currentDisabledColData != newDisabledColData)
+            || (currentShowType ?? true) != newShowType
 
         if didChange {
             if let newOrderData { defaults.set(newOrderData, forKey: SettingsKey.homeCatalogSyncedOrder) }
             if let newDisabledData { defaults.set(newDisabledData, forKey: SettingsKey.homeCatalogDisabled) }
             if let newDisabledColData { defaults.set(newDisabledColData, forKey: SettingsKey.homeCollectionDisabled) }
+            defaults.set(newShowType, forKey: SettingsKey.homeCatalogShowType)
         }
         return didChange
     }
@@ -2475,6 +2495,16 @@ fileprivate final class NuvioAPIClient {
         remoteProfileId: Int,
         localProfileId: String
     ) async throws {
+        // Refresh mobile immediately so player_settings uses the freshest
+        // mobile-authoritative blob (the user may have changed it since pull).
+        var latestMobileSettingsJSON = lastPulledMobileProfileSettingsJSON ?? [:]
+        if let fetched = try? await pullProfileSettingsJSON(
+            session: session, remoteProfileId: remoteProfileId,
+            platform: Self.mobileSettingsPlatform
+        ) {
+            latestMobileSettingsJSON = fetched
+            lastPulledMobileProfileSettingsJSON = latestMobileSettingsJSON
+        }
         // This RPC atomically replaces the complete (user, profile, platform)
         // blob. Merge our namespaced feature into the row we just pulled so
         // Android/other TV feature keys survive a tvOS settings update.
@@ -2501,8 +2531,9 @@ fileprivate final class NuvioAPIClient {
         )
         features[Self.posterCardStyleSettingsFeature] = posterStylePayload
 
-        let existingPlayer = (features[Self.playerSettingsFeature] as? [String: Any])
-            ?? (lastPulledMobileProfileSettingsJSON?["features"] as? [String: Any])?[Self.playerSettingsFeature] as? [String: Any]
+        let tvPlayer = features[Self.playerSettingsFeature] as? [String: Any]
+        let mobilePlayer = (latestMobileSettingsJSON["features"] as? [String: Any])?[Self.playerSettingsFeature] as? [String: Any]
+        let existingPlayer = PlayerSettingsSyncMapper.mergeRemoteSettings(mobile: mobilePlayer, tv: tvPlayer)
         let playerPayload = exportPlayerSettings(
             localProfileId: localProfileId,
             existing: existingPlayer
@@ -2550,11 +2581,7 @@ fileprivate final class NuvioAPIClient {
         // document before replacing stream_badge_settings, poster_card_style_settings_payload,
         // player_settings, continue_watching_settings_payload, mdblist_settings, and theme_settings.
         do {
-            var mobileSettingsJSON = try await pullProfileSettingsJSON(
-                session: session,
-                remoteProfileId: remoteProfileId,
-                platform: Self.mobileSettingsPlatform
-            ) ?? lastPulledMobileProfileSettingsJSON ?? [:]
+            var mobileSettingsJSON = latestMobileSettingsJSON
             var mobileFeatures = mobileSettingsJSON["features"] as? [String: Any] ?? [:]
             mobileFeatures[Self.streamBadgeSettingsFeature] = exportStreamBadgeSettings(localProfileId: localProfileId)
             mobileFeatures[Self.posterCardStyleSettingsFeature] = posterStylePayload
@@ -3260,16 +3287,16 @@ fileprivate final class NuvioAPIClient {
         existing: [String: Any]?
     ) -> [String: Any] {
         let defaults = ProfileSettings.store(for: localProfileId)
-        var feature = existing ?? [:]
-
+        let feature = existing ?? [:]
+        var owned: [String: Any] = [:]
         for (localKey, remoteKey) in PlayerSettingsSyncMapper.localToRemoteKeyMappings {
             guard let value = defaults.object(forKey: localKey),
                   let encoded = Self.encodeSettingValue(value) else {
                 continue
             }
-            feature[remoteKey] = encoded
+            owned[remoteKey] = encoded
         }
-        return feature
+        return PlayerSettingsSyncMapper.overlayOwnedSettings(feature, with: owned)
     }
 
     private func importPlayerSettings(_ remote: [String: Any]?, localProfileId: String) {
@@ -3460,7 +3487,6 @@ enum EpisodeMetadataEnrichment {
 
     static func fetch(meta: NuvioMeta, season: Int?, episode: Int?) async -> Episode? {
         guard meta.isSeries,
-              let tmdbId = meta.tmdbId,
               let season,
               let episode,
               TmdbDetailsService.useEpisodes,
@@ -3468,16 +3494,27 @@ enum EpisodeMetadataEnrichment {
             return nil
         }
 
+        let tmdbId: Int
+        if let id = meta.tmdbId, id > 0 {
+            tmdbId = id
+        } else if let resolved = await TmdbDetailsService.resolveTmdbId(for: meta) {
+            tmdbId = resolved.id
+        } else {
+            return nil
+        }
+
         let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         guard !apiKey.isEmpty else { return nil }
 
+        let preferredLang = TmdbDetailsService.preferredLanguage
         var components = URLComponents(
             string: "https://api.themoviedb.org/3/tv/\(tmdbId)/season/\(season)/episode/\(episode)"
         )
         components?.queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
-            URLQueryItem(name: "language", value: TmdbDetailsService.preferredLanguage)
+            URLQueryItem(name: "language", value: preferredLang),
+            URLQueryItem(name: "append_to_response", value: "translations")
         ]
         guard let url = components?.url else { return nil }
 
@@ -3487,9 +3524,19 @@ enum EpisodeMetadataEnrichment {
                 return nil
             }
             let decoded = try JSONDecoder().decode(TmdbEpisodeResponse.self, from: data)
+            let requestedCode = preferredLang.split(separator: "-").first.map(String.init) ?? "en"
+
+            let matchingTrans = decoded.translations?.translations?.first(where: {
+                $0.iso6391?.caseInsensitiveCompare(requestedCode) == .orderedSame
+                    && (!($0.data?.name?.isEmpty ?? true) || !($0.data?.overview?.isEmpty ?? true))
+            })
+
+            let title = nonEmpty(matchingTrans?.data?.name) ?? nonEmpty(decoded.name)
+            let overview = nonEmpty(matchingTrans?.data?.overview) ?? nonEmpty(decoded.overview)
+
             return Episode(
-                title: nonEmpty(decoded.name),
-                overview: nonEmpty(decoded.overview),
+                title: title,
+                overview: overview,
                 thumbnail: decoded.stillPath.map { "https://image.tmdb.org/t/p/w780\($0)" },
                 released: nonEmpty(decoded.airDate)
             )
@@ -3511,12 +3558,34 @@ private struct TmdbEpisodeResponse: Decodable {
     let overview: String?
     let stillPath: String?
     let airDate: String?
+    let translations: TmdbEpisodeTranslationsContainer?
 
     enum CodingKeys: String, CodingKey {
-        case name, overview
+        case name, overview, translations
         case stillPath = "still_path"
         case airDate = "air_date"
     }
+}
+
+private struct TmdbEpisodeTranslationsContainer: Decodable {
+    let translations: [TmdbEpisodeTranslationItemDTO]?
+}
+
+private struct TmdbEpisodeTranslationItemDTO: Decodable {
+    let iso6391: String?
+    let iso31661: String?
+    let data: TmdbEpisodeTranslationDataDTO?
+
+    enum CodingKeys: String, CodingKey {
+        case iso6391 = "iso_639_1"
+        case iso31661 = "iso_3166_1"
+        case data
+    }
+}
+
+private struct TmdbEpisodeTranslationDataDTO: Decodable {
+    let name: String?
+    let overview: String?
 }
 
 /// Decodes every row it can and keeps the server's raw row count, so a single
@@ -3615,10 +3684,14 @@ private struct RemoteProfilePinVerification: Decodable {
 /// drift can't abort the pull.
 struct HomeCatalogSyncPayload {
     let items: [HomeCatalogSyncItem]
+    let showCatalogType: Bool
 
     init(dictionary: [String: Any]) {
         let rawItems = dictionary["items"] as? [[String: Any]] ?? []
         self.items = rawItems.compactMap(HomeCatalogSyncItem.init(dictionary:))
+        self.showCatalogType = (dictionary["show_catalog_type"] as? Bool)
+            ?? (dictionary["show_catalog_type"] as? NSNumber)?.boolValue
+            ?? true
     }
 }
 

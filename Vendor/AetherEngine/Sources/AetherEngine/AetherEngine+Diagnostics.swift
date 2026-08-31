@@ -17,14 +17,27 @@ extension AetherEngine {
     /// #220 turned out to be, so the counter is polled at `triggerPollHz` and the zone walk runs once
     /// it climbs `triggerThresholdMB` above its running high-water. Pass `triggerPollHz: 0` for the
     /// plain 30 s census with no watcher.
+    ///
+    /// `triggerCaptureCap` bounds how many of those walks are logged (`0` = uncapped). The default of
+    /// twelve keeps a runaway from turning the log into a slideshow, but a session that climbs at a
+    /// steady mux rate spends one capture per threshold climbed and reaches the cap minutes before
+    /// the kill (AE#445, where the decisive final step survived only in the 30 s grid). Lift it when
+    /// the shape being hunted is a steady climb rather than a single step.
     public nonisolated static func setLargeAllocationCensusEnabled(
         _ enabled: Bool,
         triggerThresholdMB: Int = 64,
-        triggerPollHz: Double = 8
+        triggerPollHz: Double = 8,
+        triggerCaptureCap: Int = 12   // MallocBlockCensus.defaultTriggerCaptureCap, spelled out because that type is internal
     ) {
         MallocBlockCensus.isEnabled = enabled
+        // AE#445: the same switch, because they answer halves of one question. The malloc census
+        // covers the heap; the region census covers everything phys_footprint counts that malloc
+        // never sees, which is where three rounds of that issue ran out of instrument.
+        VMRegionCensus.isEnabled = enabled
+        if !enabled { VMRegionCensus.clearBaseline() }
         if enabled {
-            MallocBlockCensus.startTriggerWatch(thresholdMB: triggerThresholdMB, pollHz: triggerPollHz)
+            MallocBlockCensus.startTriggerWatch(thresholdMB: triggerThresholdMB, pollHz: triggerPollHz,
+                                                captureCap: triggerCaptureCap)
         } else {
             MallocBlockCensus.stopTriggerWatch()
         }
@@ -50,6 +63,57 @@ extension AetherEngine {
                 if end > now { ahead += end - max(start, now) }
             }
             return ahead
+        }
+    }
+
+    /// AE#418: the item's loaded ranges on the item axis. Where AVPlayer HOLDS what it fetched is the
+    /// only on-device account of where it placed a segment, and the axis is a statement about exactly
+    /// that. Off-main for the same reason as the buffer probe (AE#422).
+    func avPlayerLoadedRanges() async -> [(Double, Double)] {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return [] }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            item.loadedTimeRanges.map { value in
+                let r = value.timeRangeValue
+                return (r.start.seconds, (r.start + r.duration).seconds)
+            }
+        }
+    }
+
+    /// AE#418 round 3: check a just-published VOD axis against AVPlayer's own account of the placement
+    /// it describes, and let the session correct it when the base it composed onto was never carried.
+    ///
+    /// Polled rather than awaited on an edge, because the publish happens when the segment is FETCHED
+    /// and the ranges only move once AVPlayer has taken the bytes.
+    ///
+    /// Round 4: the first sample is the BASELINE, taken before AVPlayer can have the bytes, and every
+    /// later sample is read against it. Only a run that overlaps nothing in the baseline is this
+    /// placement's; the run that was already there answers a different question, and its own start
+    /// moves while it is asked, because AVPlayer backfills below a run after it opens. Reading the
+    /// first range that happened to hold the playhead is what let a stale run be reported as a
+    /// confirmation, one to two frames at a time, until the accumulated difference exceeded the check
+    /// itself.
+    static let placementVerificationAttempts = 6
+    static let placementVerificationIntervalMS = 250
+
+    func verifyPlacementAgainstLoadedRanges(session: HLSVideoEngine) {
+        placementVerificationTask?.cancel()
+        guard session.hasPlacementAwaitingMeasurement else { return }
+        placementVerificationTask = Task { @MainActor [weak self, weak session] in
+            guard let baseline = await self?.avPlayerLoadedRanges() else { return }
+            for _ in 0..<Self.placementVerificationAttempts {
+                try? await Task.sleep(for: .milliseconds(Self.placementVerificationIntervalMS))
+                guard !Task.isCancelled, let self, let session else { return }
+                let ranges = await self.avPlayerLoadedRanges()
+                guard !Task.isCancelled else { return }
+                let clock = self.nativeClockSeconds
+                guard let start = HLSVideoEngine.freshRunStart(
+                    ranges: ranges, baseline: baseline, itemClock: clock)
+                else { continue }
+                session.reconcileAxisWithObservedPlacement(observedItemStart: start, itemClock: clock)
+                return
+            }
+            guard !Task.isCancelled else { return }
+            session?.reportPlacementUnreadable()
         }
     }
 
@@ -171,6 +235,11 @@ extension AetherEngine {
                     // 30 s cadence never sampled.
                     + MallocBlockCensus.probeFragment()
                     + (MallocBlockCensus.isEnabled ? "peakMB=\(MallocBlockCensus.peakSizeInUseMB) " : "")
+                    // AE#445: which VM region the footprint grew in, by tag and by delta against
+                    // the first tick. `physFP` rising while every bucket above it is flat is the
+                    // state this issue kept ending in, and it means the growth is somewhere none of
+                    // them look, not that there is nothing to find.
+                    + VMRegionCensus.probeFragment()
                     + "avioFetchedMB=\(avioMB) "
                     // #243: only the disc pull path fills this, and only then is it printed. On a
                     // remote ISO every reader fork pulls through HTTPDiscIOReader, which

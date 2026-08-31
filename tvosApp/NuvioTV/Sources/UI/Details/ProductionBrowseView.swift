@@ -40,13 +40,13 @@ struct ProductionBrowseView: View {
         let movies = titles.filter { $0.type == "movie" }
         var rails: [TmdbNetworkBrowseRail] = []
         if !series.isEmpty {
-            rails.append(TmdbNetworkBrowseRail(id: "series", title: "Series • Popular", items: series))
+            rails.append(TmdbNetworkBrowseRail(id: "series", title: L10n.string("details_series_popular", fallback: "Series • Popular"), items: series))
         }
         if !movies.isEmpty {
-            rails.append(TmdbNetworkBrowseRail(id: "movies", title: "Movies • Popular", items: movies))
+            rails.append(TmdbNetworkBrowseRail(id: "movies", title: L10n.string("details_movies_popular", fallback: "Movies • Popular"), items: movies))
         }
         if rails.isEmpty && !titles.isEmpty {
-            rails.append(TmdbNetworkBrowseRail(id: "titles", title: "Titles • Popular", items: titles))
+            rails.append(TmdbNetworkBrowseRail(id: "titles", title: L10n.string("details_titles_popular", fallback: "Titles • Popular"), items: titles))
         }
         return rails
     }
@@ -99,7 +99,9 @@ private struct CompanyBrowseContent: View {
         guard !fallbackTitles.isEmpty else { return [] }
         return [TmdbNetworkBrowseRail(
             id: "popular",
-            title: company.kind == .network ? "Series • Popular" : "Titles • Popular",
+            title: company.kind == .network
+                ? L10n.string("details_series_popular", fallback: "Series • Popular")
+                : L10n.string("details_titles_popular", fallback: "Titles • Popular"),
             items: fallbackTitles
         )]
     }
@@ -146,7 +148,7 @@ private struct CompanyBrowseContent: View {
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity, minHeight: 260)
                     } else if rails.isEmpty {
-                        Text("No titles found for \(displayName)")
+                        Text(L10n.format("details_no_titles_found_for", fallback: "No titles found for %@", displayName))
                             .font(.system(size: 30, weight: .medium))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity, minHeight: 260)
@@ -405,7 +407,7 @@ struct PersonBrowseView: View {
                                 .foregroundColor(.white.opacity(0.55))
                         }
                         if !isLoading {
-                            Text("\(titles.count) titles")
+                            Text(L10n.format("details_titles_count", fallback: "%d titles", titles.count))
                                 .font(.system(size: 24, weight: .regular))
                                 .foregroundColor(.white.opacity(0.4))
                         }
@@ -422,7 +424,7 @@ struct PersonBrowseView: View {
                     Spacer()
                 } else if titles.isEmpty {
                     Spacer()
-                    Text("No movies or series found for \(person.name)")
+                    Text(L10n.format("details_no_titles_found_for_person", fallback: "No movies or series found for %@", person.name))
                         .font(.system(size: 30, weight: .medium))
                         .foregroundColor(.white.opacity(0.7))
                         .frame(maxWidth: .infinity)

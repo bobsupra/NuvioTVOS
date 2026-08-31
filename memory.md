@@ -546,8 +546,8 @@ Navigating vertically between catalog rows on Home (e.g. between "Popular - Seri
 
 ## AetherEngine and FFmpegBuild vendor upgrade runbook
 
-Last verified: 2026-08-26 while upgrading AetherEngine 6.34.0 to 6.47.0 and
-FFmpegBuild 2.4.3.
+Last verified: 2026-08-31 while upgrading AetherEngine 6.47.0 to 6.57.0,
+FFmpegBuild 2.4.3 to 3.0.0, and LibDovi 2.0.0 to 2.1.0.
 
 This repository does **not** consume stock AetherEngine and FFmpegBuild. It
 ships locally patched copies under `Vendor/` so AetherEngine's FFmpeg dynamic
@@ -571,6 +571,8 @@ edit or wholesale replacement of either directory is therefore incorrect.
   migrated to an upstream replacement in the same change.
 - Preserve the AI subtitle translation flow, subtitle cue identity/timing,
   SMB playback, MPV fallback, and Nuvio's external-subtitle registration.
+- Preserve Nuvio's AV1 Metal YUV conversion fast path, its CPU fallback, and
+  its exact-output tests unless upstream contains a verified equivalent.
 - Preserve `Vendor/namespace_ffmpegbuild.py` and
   `tvosApp/Scripts/thin_aether_simulator_frameworks.sh`. The first rewrites
   framework/module identities and removes stale upstream signatures; the
@@ -664,6 +666,40 @@ contains equivalent behavior and tests:
 Do not “fix” an ambiguity by merely trying Annex-B first or length-prefixed
 first; either ordering corrupts the opposite valid case.
 
+### 3a. AV1 software-conversion safeguard
+
+Apple TV routes AV1 through dav1d software decode. Nuvio previously followed
+every decoded 4K frame with a CPU `sws_scale` conversion from planar YUV into
+NV12/P010; the extra full-frame conversion saturated the device while the same
+file remained playable in a native-Metal player. The local fast path moves that
+planar-to-bi-planar conversion onto Metal without replacing Aether's existing
+CVPixelBuffer/sample-buffer renderer.
+
+Future rebases must preserve all of the following unless upstream ships and
+tests an equivalent path:
+
+- `Sources/AetherEngine/Decoder/MetalYUVConverter.swift` owns the session-scoped
+  Metal command queue, texture cache, shaders, and reusable source textures.
+- `SoftwareVideoDecoder.swift` enables it only for AV1 `YUV420P`, `YUVJ420P`,
+  and `YUV420P10LE`, producing NV12/P010 from the decoder's existing pool.
+- Color and pixel-aspect attachments, subtitles, seeking, frame pacing, and PiP
+  continue through `SampleBufferRenderer`; this is not a second renderer.
+- Unsupported formats, missing Metal, invalid/negative strides, texture/shader
+  failures, or GPU command failures fall back to the existing `sws_scale` path.
+  A failed Metal path is disabled for that session and logged once rather than
+  retried on every frame.
+- FFmpeg's 10-bit planar samples are low-aligned; the P010 output is high-aligned
+  and preserves video/full-range mapping. Do not remove that packing logic.
+- `Package.swift` must keep the `Metal` framework link.
+- Keep `MetalYUVConversionPolicyTests.swift`: it runs the real shader on a Metal
+  device, reads back exact NV12/P010 bytes, verifies P010 alignment/range, and
+  checks negative-stride fallback.
+
+After an upgrade, run the Metal conversion suite and test the affected 4K AV1
+file on a physical Apple TV. The release log should contain
+`AV1 Metal YUV conversion enabled (GPU-complete)`; a fallback log means the
+performance fix was not active.
+
 ### 4. Refresh FFmpegBuild without losing the fork
 
 1. Inspect the upstream old-tag to target-tag diff for all text, tests, build
@@ -673,15 +709,16 @@ first; either ordering corrupts the opposite valid case.
    dynamic-framework packaging/signing behavior, GPL exclusions, and any
    prior decoder/subtitle fixes while incorporating the target release's new
    flags.
-3. Preserve the local `Package.swift` products and binary targets named
-   `AetherLib*`.
-4. Stage the target FFmpegBuild tag's original `Sources/Lib*.xcframework`
-   directories in `Vendor/FFmpegBuild/Sources`.
-5. Run `python3 Vendor/namespace_ffmpegbuild.py` once the original framework
-   names are present. It creates `AetherLib*.xcframework`, rewrites Mach-O IDs
-   and dependencies, bundle identifiers, module maps, and cross-framework
-   header imports, removes stale signatures, and removes the original `Lib*`
-   directories.
+3. FFmpegBuild 3.0.0 and later already ship the `AetherFFmpegBuild` product and
+   `AetherLib*` binary targets/frameworks. Copy those coherent prefixed trees
+   directly and do **not** run `namespace_ffmpegbuild.py` on them.
+4. For an older target that still ships `Sources/Lib*.xcframework`, stage those
+   original trees in `Vendor/FFmpegBuild/Sources`, then run
+   `python3 Vendor/namespace_ffmpegbuild.py`. It creates `AetherLib*`, rewrites
+   Mach-O IDs/dependencies, bundle identifiers, module maps, and cross-framework
+   header imports, removes stale signatures, and removes the originals.
+5. In either path, remove upstream framework signatures after the final binary
+   shape is settled; the consuming app supplies the platform signature.
 6. If upstream adds or removes a framework, update the script's `LIBS` list,
    FFmpegBuild products/targets, embed/thinning logic, and coexistence docs as
    one change. Do not assume the historic nine-library list is permanent.

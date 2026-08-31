@@ -2,7 +2,11 @@
 // Pins live-playlist invariants across refresh-generation bumps (reproduction of the live-reload stall:
 // playlist regenerated from seg0 while producer raced through a backlog). Guards: no ENDLIST/PLAYLIST-TYPE,
 // CAN-BLOCK-RELOAD=YES, MEDIA-SEQUENCE==firstVisible, one EXTINF+URI per segment, refresh counter
-// makes consecutive builds byte-distinct (anti -12888).
+// makes consecutive builds byte-distinct. That last one is NOT an anti -12888 measure, whatever it
+// was written as: measured on the harness, two polls 4 s apart differing in that line alone still
+// drew `-12888 Playlist File unchanged`, because AVPlayer's unchanged test reads the parsed playlist
+// and skips the tag it does not know. What keeps a stalled live session fetching is the window
+// itself (AE#446, `VideoSegmentProvider.stalledWindowFirstVisible`).
 import XCTest
 @testable import AetherEngine
 
@@ -53,7 +57,9 @@ final class LivePlaylistRefreshTests: XCTestCase {
         XCTAssertTrue(ls.contains("seg19.mp4"))
     }
 
-    /// Consecutive builds with no new segment must differ byte-for-byte via the refresh counter, preventing AVPlayer -12888 during quiet windows.
+    /// Consecutive builds with no new segment must differ byte-for-byte via the refresh counter. Pinned
+    /// because a cache anywhere in the path may key on the body, NOT because it moves AVPlayer: measured,
+    /// it does not (see the file header).
     func testConsecutiveBuildsDifferViaRefreshCounter() {
         let provider = ScriptedLiveProvider(count: 3)
         let first = HLSLocalServer.buildMediaPlaylistText(provider: provider)

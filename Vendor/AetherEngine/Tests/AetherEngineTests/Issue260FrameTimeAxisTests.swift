@@ -60,10 +60,15 @@ struct Issue260FrameTimeAxisTests {
         let frames = collector.snapshot()
         try #require(!frames.isEmpty, "no frame times emitted")
 
-        // Vacuum guard: with a zero shift the two axes coincide and the witness proves nothing.
-        let shift = engine.playlistShiftSeconds
+        // Vacuum guard: with a zero separation the two axes coincide and the witness proves nothing.
+        // AE#418 round 5: read it off the PAIR, not off `playlistShiftSeconds`. Since 6.56.6 the
+        // published axis states where AVPlayer PLACES the segment (the presented offset), while the
+        // pair here is what the muxer wrote; on a pinned gate those were one number and this guard
+        // read the wrong one the moment they parted.
+        let deltas = frames.map { CMTimeGetSeconds($0.source) - CMTimeGetSeconds($0.item) }
+        let shift = try #require(deltas.first)
         try #require(abs(shift) > 0.001,
-                     "producer shift is 0 on this clip; the axis witness would be vacuous")
+                     "source and item coincide on this clip; the axis witness would be vacuous")
 
         for frame in frames {
             let delta = CMTimeGetSeconds(frame.source) - CMTimeGetSeconds(frame.item)

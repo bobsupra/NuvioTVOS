@@ -25,7 +25,14 @@ extension MallocBlockCensus {
     /// Emitted lines are capped: the escalation itself is informative (a step, then a bigger step),
     /// but a sustained explosion must not turn the log into a slideshow of zone walks while the
     /// device is already under pressure.
-    static let maxTriggerCaptures = 12
+    ///
+    /// AE#445 bought the exception the cap needed. A session that climbs at a steady mux rate spends
+    /// one capture per threshold climbed, so twelve of them are gone long before the kill: the
+    /// reporter's run hit the cap 4.4 minutes early and the decisive final step survived only in the
+    /// 30 s grid. The cap is therefore configurable through `setLargeAllocationCensusEnabled`, and
+    /// `0` means uncapped for exactly that shape.
+    static let defaultTriggerCaptureCap = 12
+    nonisolated(unsafe) private(set) static var triggerCaptureCap = defaultTriggerCaptureCap
 
     nonisolated(unsafe) private static var watchQueue: DispatchQueue?
     nonisolated(unsafe) private static var watchTimer: DispatchSourceTimer?
@@ -53,10 +60,12 @@ extension MallocBlockCensus {
     /// HIGH-WATER to arm a capture, so a session that climbs gently spends one capture per threshold
     /// climbed while ordinary oscillation spends none. It should sit well above that gentle climb and
     /// far below the steps being hunted, which run from hundreds of MB to gigabytes.
-    static func startTriggerWatch(thresholdMB: Int, pollHz: Double) {
+    static func startTriggerWatch(thresholdMB: Int, pollHz: Double,
+                                  captureCap: Int = defaultTriggerCaptureCap) {
         stopTriggerWatch()
         guard isEnabled, thresholdMB > 0, pollHz > 0 else { return }
         thresholdBytes = thresholdMB << 20
+        triggerCaptureCap = max(0, captureCap)
         highWater = sizeInUse()
         triggerCaptures = 0
 
@@ -71,7 +80,8 @@ extension MallocBlockCensus {
 
         EngineLog.emit(
             "[AetherEngine] census trigger armed: threshold=\(thresholdMB)MB/poll "
-            + "poll=\(String(format: "%.1f", pollHz))Hz baseline=\(highWater >> 20)MB",
+            + "poll=\(String(format: "%.1f", pollHz))Hz baseline=\(highWater >> 20)MB "
+            + "cap=\(triggerCaptureCap == 0 ? "none" : String(triggerCaptureCap))",
             category: .engine
         )
     }
@@ -95,7 +105,7 @@ extension MallocBlockCensus {
         let previousHighWater = highWater
         defer { if now > highWater { highWater = now } }
         guard now >= previousHighWater + thresholdBytes,
-              triggerCaptures < maxTriggerCaptures
+              triggerCaptureCap == 0 || triggerCaptures < triggerCaptureCap
         else { return }
         triggerCaptures += 1
         let delta = now - previousHighWater
@@ -113,14 +123,15 @@ extension MallocBlockCensus {
             let exact = result.largest.map(String.init).joined(separator: ",")
             line += "bigBlocks=\(result.count) bigMB=\(result.bytes >> 20) "
                 + "bigTop=\(top.isEmpty ? "none" : top) "
-                + "bigExact=\(exact.isEmpty ? "none" : exact)"
+                + "bigExact=\(exact.isEmpty ? "none" : exact) "
+                + triggerGrowth.fragment(largest: result.largest.first ?? 0)
         } else {
             line += "census=unavailable"
         }
         EngineLog.emit(line, category: .engine)
-        if triggerCaptures == maxTriggerCaptures {
+        if triggerCaptureCap > 0, triggerCaptures == triggerCaptureCap {
             EngineLog.emit(
-                "[AetherEngine] census trigger cap reached (\(maxTriggerCaptures)); "
+                "[AetherEngine] census trigger cap reached (\(triggerCaptureCap)); "
                 + "further jumps are not captured, peak keeps updating",
                 category: .engine
             )

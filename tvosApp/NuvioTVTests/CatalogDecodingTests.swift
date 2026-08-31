@@ -7,6 +7,131 @@ import XCTest
 final class CatalogDecodingTests: XCTestCase {
     private let decoder = JSONDecoder()
 
+    func testCatalogDisplayTitleTypeSuffixes() {
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "movie", showType: true), "Popular - Movies")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "series", showType: true), "Popular - TV Shows")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "show", showType: true), "Popular - TV Shows")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "anime", showType: true), "Popular - Anime")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Live", contentType: "channel", showType: true), "Live - Channels")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "podcast", showType: true), "Popular - Podcast")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular - Movies", contentType: "movie", showType: true), "Popular - Movies")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "movie", showType: false), "Popular")
+    }
+
+    func testHomeCatalogSyncPayloadShowCatalogTypeDefaultsAndParses() {
+        let item: [String: Any] = ["addon_id": "a", "type": "movie", "catalog_id": "c"]
+        XCTAssertTrue(HomeCatalogSyncPayload(dictionary: ["items": [item], "show_catalog_type": true]).showCatalogType)
+        XCTAssertFalse(HomeCatalogSyncPayload(dictionary: ["items": [item], "show_catalog_type": false]).showCatalogType)
+        XCTAssertTrue(HomeCatalogSyncPayload(dictionary: ["items": [item]]).showCatalogType)
+    }
+
+    func testCinemetaRatingAcceptsMixedNumericAndStringValues() throws {
+        let json = #"{"metas":[{"id":"tt1","name":"One","type":"movie","imdbRating":7.8},{"id":"tt2","name":"Two","type":"movie","imdbRating":"8.1"}]}"#
+        let page = try decoder.decode(CinemetaCatalogResponse.self, from: Data(json.utf8))
+        let metas = page.metas.map { $0.toMeta(fallbackType: "movie") }
+        XCTAssertEqual(metas.map(\.rating), [7.8, 8.1])
+    }
+
+    func testCatalogHomeVisibilityResolverHidesCollectionOnlySources() throws {
+        let manifestURL = try XCTUnwrap(URL(string: "https://example.com/manifest.json"))
+        let source = CatalogHomeVisibilityResolver.Source(
+            addonIdentifier: "https://example.com",
+            contentType: "movie",
+            catalogID: "popular"
+        )
+        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "popular",
+            collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "popular",
+            collectionSources: [source], manifestURL: manifestURL,
+            explicitHomeKeys: ["example.addon_movie_popular"]
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "series", catalogID: "popular",
+            collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+        ))
+    }
+
+    func testCollectionBackedAddonRequiresSyncedGenericCatalogKeys() throws {
+        let manifestURL = try XCTUnwrap(URL(string: "https://example.com/manifest.json"))
+        let source = CatalogHomeVisibilityResolver.Source(
+            addonIdentifier: "example.addon", contentType: "movie", catalogID: "collection", collectionID: "xperience"
+        )
+        let collectionOnlyKey = "collection_xperience"
+        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "generic",
+            collectionSources: [source], manifestURL: manifestURL,
+            explicitHomeKeys: [collectionOnlyKey]
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "generic",
+            collectionSources: [source], manifestURL: manifestURL,
+            explicitHomeKeys: [collectionOnlyKey, "example.addon_movie_generic"]
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "generic",
+            collectionSources: [source], manifestURL: manifestURL,
+            explicitHomeKeys: ["other.addon_movie_other", "collection_other"]
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "generic",
+            collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+        ))
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "unrelated.addon", contentType: "movie", catalogID: "generic",
+            collectionSources: [source], manifestURL: manifestURL,
+            explicitHomeKeys: [collectionOnlyKey]
+        ))
+        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "collection",
+            collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+        ))
+    }
+
+    func testCatalogHomeVisibilityResolverMatchesCompositeIdentifier() throws {
+        let manifestURL = try XCTUnwrap(URL(string: "https://example.com/path/manifest.json"))
+        let source = CatalogHomeVisibilityResolver.Source(
+            addonIdentifier: "addon:example.addon:https://example.com/path",
+            contentType: "movie", catalogID: "popular"
+        )
+        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "example.addon", contentType: "movie", catalogID: "popular",
+            collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+        ))
+    }
+
+    func testCatalogHomeVisibilityResolverPreservesURLPathAndQueryCase() throws {
+        let manifestURL = try XCTUnwrap(URL(string: "https://example.com/path/manifest.json?token=AbC"))
+        for identifier in [
+            "https://example.com/Path/manifest.json?token=AbC",
+            "https://example.com/path/manifest.json?token=abc"
+        ] {
+            let source = CatalogHomeVisibilityResolver.Source(
+                addonIdentifier: identifier, contentType: "movie", catalogID: "popular"
+            )
+            XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+                addonID: "example.addon", contentType: "movie", catalogID: "popular",
+                collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
+            ))
+        }
+    }
+
+    func testPosterCacheFreshnessBoundaries() {
+        let now = Date(timeIntervalSince1970: 1_000_000)
+        XCTAssertTrue(PosterDiskCacheFreshness.isFresh(modified: now.addingTimeInterval(-86400), now: now, ttl: 86400))
+        XCTAssertFalse(PosterDiskCacheFreshness.isFresh(modified: now.addingTimeInterval(-86400.1), now: now, ttl: 86400))
+    }
+
+    func testPosterArtworkCachePolicyVolatileHosts() {
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://xperience-app.com/a.jpg")!))
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://cdn.xperience-app.com/a.jpg")!))
+        XCTAssertTrue(PosterArtworkCachePolicy.isVolatile(URL(string: "https://btttr.cc/a.jpg")!))
+        XCTAssertFalse(PosterArtworkCachePolicy.isVolatile(URL(string: "https://xperience-app.com.evil.test/a.jpg")!))
+        XCTAssertFalse(PosterArtworkCachePolicy.isVolatile(URL(string: "https://example.com/a.jpg")!))
+    }
+
     func testCollectionFolderPreservesTmdbAndTraktSources() throws {
         let json = """
         {
@@ -329,6 +454,60 @@ final class CatalogDecodingTests: XCTestCase {
 
         let metaEpisodeKeys = snapshot.watchedEpisodeKeys(meta: seriesMeta)
         XCTAssertEqual(metaEpisodeKeys, ["1:1", "1:2", "2:1"])
+
+        let movieTypedSeriesMeta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0903747",
+            tmdbId: 1396,
+            type: "movie",
+            year: 2008,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: [NuvioVideo(
+                id: "tt0903747:1:1", title: "Pilot", season: 1, episode: 1,
+                thumbnail: nil, overview: nil, released: nil, rating: nil
+            )]
+        )
+        XCTAssertEqual(movieTypedSeriesMeta.persistenceSnapshot.type, "series")
+        XCTAssertTrue(snapshot.containsEpisode(meta: movieTypedSeriesMeta, season: 1, episode: 1))
+        XCTAssertEqual(snapshot.watchedEpisodeKeys(meta: movieTypedSeriesMeta), ["1:1", "1:2", "2:1"])
+
+        let legacyEpisodeMeta = NuvioMeta(
+            id: "tt-legacy-series", name: "Legacy Series", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil,
+            tmdbId: nil, type: "movie", year: 2020, genres: nil, rating: nil,
+            releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil,
+            certification: nil, country: nil, released: nil
+        )
+        let currentSeriesMeta = NuvioMeta(
+            id: "tt-legacy-series", name: "Legacy Series", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil,
+            tmdbId: nil, type: "movie", year: 2020, genres: nil, rating: nil,
+            releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil,
+            certification: nil, country: nil, released: nil,
+            videos: [NuvioVideo(id: "tt-legacy-series:1:1", title: "Pilot",
+                                season: 1, episode: 1, thumbnail: nil,
+                                overview: nil, released: nil, rating: nil)]
+        )
+        let legacySnapshot = WatchedSnapshot(
+            items: [WatchedStoreItem(meta: legacyEpisodeMeta, watchedAt: Date(), season: 1, episode: 1)],
+            source: .nuvioSync
+        )
+        XCTAssertTrue(legacySnapshot.containsEpisode(meta: currentSeriesMeta, season: 1, episode: 1))
+        XCTAssertEqual(legacySnapshot.watchedEpisodeKeys(meta: currentSeriesMeta), ["1:1"])
 
         // Catalog series title fallback match
         let localSeriesMeta = NuvioMeta(

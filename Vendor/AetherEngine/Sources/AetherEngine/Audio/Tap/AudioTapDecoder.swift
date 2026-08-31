@@ -30,6 +30,10 @@ final class AudioTapDecoder: @unchecked Sendable {
     private var pending: [Float] = []
     private var pendingStartPTS: Double = 0
 
+    /// What the current `swrContext` reads (#452). The tap outlives a live splice the same way the
+    /// SW path does, and its output side is pinned to mono 48 kHz, so only the input can move.
+    private var configuredInput = ResamplerInputParameters()
+
     enum TapDecoderError: Error, CustomStringConvertible, LocalizedError {
         case noCodecParameters, unsupportedCodec, allocFailed, openFailed
 
@@ -84,6 +88,7 @@ final class AudioTapDecoder: @unchecked Sendable {
         defer { stateLock.unlock() }
         if codecContext != nil { avcodec_free_context(&codecContext) }
         if swrContext != nil { swr_free(&swrContext) }
+        configuredInput.release()
         pending.removeAll()
         anchorPTS = nil
         samplesSinceAnchor = 0
@@ -100,6 +105,20 @@ final class AudioTapDecoder: @unchecked Sendable {
         guard let f = frame else { return [] }
         while avcodec_receive_frame(ctx, f) >= 0 {
             if swrContext == nil, !initResampler(from: f) { continue }
+            // A mid-stream input change (5.1 to stereo at a live program boundary) leaves the context
+            // reading planes the frame no longer carries, which faults inside swr_convert (#452).
+            // The chunk accumulator is already in the fixed output format, so nothing has to be
+            // flushed first and the running clock counts output samples either way.
+            if configuredInput.differ(from: f) {
+                EngineLog.emit(
+                    "[AudioTap] input format changed mid-stream ("
+                    + "\(configuredInput.rate)Hz/\(configuredInput.layout.nb_channels)ch/fmt=\(configuredInput.format.rawValue)"
+                    + " -> \(f.pointee.sample_rate)Hz/\(f.pointee.ch_layout.nb_channels)ch/fmt=\(f.pointee.format)"
+                    + "); rebuilding resampler",
+                    category: .engine)
+                swr_free(&swrContext)
+                if !initResampler(from: f) { continue }
+            }
             ingest(frame: f)
             if pending.count >= AudioTapDefaults.minSamplesPerChunk,
                let chunk = emitPending(force: false) {
@@ -133,11 +152,20 @@ final class AudioTapDecoder: @unchecked Sendable {
             if swrContext != nil { swr_free(&swrContext) }
             return false
         }
+        // What this context reads; every later frame is compared against it (#452).
+        configuredInput.adopt(
+            layout: &inLayout,
+            format: AVSampleFormat(rawValue: frame.pointee.format),
+            rate: frame.pointee.sample_rate
+        )
         return true
     }
 
     private func ingest(frame f: UnsafeMutablePointer<AVFrame>) {
         guard let swr = swrContext, f.pointee.nb_samples > 0 else { return }
+        // Corrupt live MPEG-TS decodes to a frame with samples but a NULL plane and declares no
+        // change; swr_convert dereferences it (#452).
+        guard configuredInput.framePlanesArePresent(f) else { return }
 
         let framePTS: Double? = f.pointee.pts != Int64.min && timeBase.den > 0
             ? Double(f.pointee.pts) * Double(timeBase.num) / Double(timeBase.den)

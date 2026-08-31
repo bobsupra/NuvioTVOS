@@ -74,9 +74,14 @@ final class Issue195FastLiveJoinTests: XCTestCase {
     func testFastZapObservedCadenceFloorStillDominates() {
         // A bursty ingest origin (AE#167) keeps its observed-cadence TD floor under fastZap: fast join
         // never trades away the raised patience that bursty delivery requires.
-        XCTAssertEqual(LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 0.96,
-                                                            cutTargetSeconds: HLSVideoEngine.liveCutTargetSeconds(for: .fastZap),
-                                                            cadenceFloorSeconds: 4.2), 5)
+        let td = LiveEdgePolicy.targetDurationSeconds(maxSegmentDuration: 0.96,
+                                                      cutTargetSeconds: HLSVideoEngine.liveCutTargetSeconds(for: .fastZap),
+                                                      cadenceFloorSeconds: 4.2)
+        XCTAssertEqual(td, 3)
+        // AE#447: what "dominates" has to mean is that the patience covers the gap. It does, at 4.5s
+        // over 4.2s, and it no longer buys that with 15s of startup depth instead of 9s.
+        XCTAssertGreaterThanOrEqual(Double(td) * LiveEdgePolicy.unchangedPlaylistPatienceMultiplier, 4.2)
+        XCTAssertGreaterThan(td, Int(ceil(0.96)))
     }
 
     // MARK: - Startup cushion under fastZap

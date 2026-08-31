@@ -247,22 +247,31 @@ final class LiveTelemetrySampler {
             accumulatedFrameDelaySeconds = nil
             avSyncGapMs = engine.lastAVGapMs  // HLSSegmentProducer audio-gate-open vs video-gate-open (native path only)
             if let player = engine.currentAVPlayer, let item = player.currentItem {
-                let readings = await readNativeOffMain(player: player, item: item)
+                var readings = await readNativeOffMain(player: player, item: item)
                 // stop() may have cancelled this tick, or a reload seam may have swapped the
                 // player/item, while the read was in flight; publishing now would leak a stale
                 // snapshot and yield-gate tick into the current session.
                 guard !Task.isCancelled,
                       engine.currentAVPlayer === player,
                       player.currentItem === item else { return }
+                // AE#443: the read above covers this item; the host carries what the items before it
+                // transferred. Read after the guard, so the two halves describe the same swap state.
+                readings.networkTransferredBytes = Self.foldRetired(
+                    readings.networkTransferredBytes, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
+                readings.droppedFrameCount = Self.foldRetired(
+                    readings.droppedFrameCount, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
+                readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
                 nativeReadings = readings
                 droppedFrameCount = readings.droppedFrameCount
                 networkThroughputMbps = readings.networkThroughputMbps
                 networkTransferredBytes = readings.networkTransferredBytes
                 forwardBufferSeconds = readings.forwardBufferSeconds
             } else {
-                droppedFrameCount = nil
+                // AE#443: an item swap has a gap where the host holds no current item, and reporting
+                // nothing through it reads as "the counter is gone" rather than "nothing new since".
+                droppedFrameCount = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemDroppedFrames ?? 0)
                 networkThroughputMbps = nil
-                networkTransferredBytes = nil
+                networkTransferredBytes = Self.foldRetired(nil, retired: engine.nativeHost?.retiredItemTransferredBytes ?? 0)
                 forwardBufferSeconds = nil
             }
 
@@ -443,22 +452,51 @@ final class LiveTelemetrySampler {
         }
     }
 
+    /// AE#443: fold a per-entry access-log counter into the session total a reader takes it for.
+    ///
+    /// `AVPlayerItemAccessLogEvent` counts within its own entry, and AVFoundation opens a new one every
+    /// time the playback session changes under it. Measured on the live loopback harness across a rewind
+    /// and a return to the edge, one origin connection for the whole run and no producer restart at all:
+    /// `rx` went 3.4 MB -> 2.2 MB and `drop` 44 -> 0 while the session played on. A number that falls in
+    /// the middle of a healthy session invites exactly one reading, that something under it was replaced,
+    /// and the reporter of #443 spent two rounds on that reading before the logs refused it.
+    ///
+    /// Entries that report the field as unavailable (negative) are skipped rather than clamped, and the
+    /// result is nil when none of them carried it, so "not measurable" stays distinguishable from zero.
+    nonisolated static func sessionTotal<T: BinaryInteger>(perEntry values: [T]) -> T? {
+        let known = values.filter { $0 >= 0 }
+        return known.isEmpty ? nil : known.reduce(0, +)
+    }
+
+    /// AE#443: adds what the session's retired items carried to what the current one reports.
+    ///
+    /// nil + nothing retired stays nil, because "this path cannot report it" is not zero. nil with a
+    /// retired total is the swap gap, and the honest reading there is the total so far, not silence.
+    nonisolated static func foldRetired<T: BinaryInteger>(_ current: T?, retired: T) -> T? {
+        guard let current else { return retired > 0 ? retired : nil }
+        return current + retired
+    }
+
     /// The real batch, run on `readQueue`: one accessLog() shared by the snapshot fields and the
     /// LagDiag lifetime drop sum, one currentTime() shared by the forward-buffer math and the
     /// LagDiag clock (previously two of each per tick, all on the main actor).
     private nonisolated static func batchReadNativeAVF(player: AVPlayer, item: AVPlayerItem) -> NativeAVFReadings {
         var readings = NativeAVFReadings()
         let events = item.accessLog()?.events
+        // The rate is a `.last` read on purpose: it describes the link right now.
         if let event = events?.last {
-            readings.droppedFrameCount = event.numberOfDroppedVideoFrames >= 0
-                ? event.numberOfDroppedVideoFrames : nil
             let observed = event.observedBitrate
             readings.networkThroughputMbps = observed.isFinite && observed > 0
                 ? observed / 1_000_000.0 : nil
-            readings.networkTransferredBytes = event.numberOfBytesTransferred >= 0
-                ? Int64(event.numberOfBytesTransferred) : nil
         }
-        readings.droppedFramesLifetimeSum = events?.reduce(0) { $0 + max(0, $1.numberOfDroppedVideoFrames) } ?? 0
+        // AE#443: the counters are not. They are totals PER ENTRY, and AVFoundation opens a new entry
+        // whenever the playback session changes under it, so reading `.last` publishes a number that
+        // falls BACK mid-session, with nothing in the line to say it did.
+        if let events {
+            readings.networkTransferredBytes = Self.sessionTotal(perEntry: events.map(\.numberOfBytesTransferred))
+            readings.droppedFrameCount = Self.sessionTotal(perEntry: events.map(\.numberOfDroppedVideoFrames))
+        }
+        readings.droppedFramesLifetimeSum = readings.droppedFrameCount ?? 0
 
         let now = player.currentTime().seconds
         readings.currentTimeSeconds = now

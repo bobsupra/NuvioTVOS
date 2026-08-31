@@ -2,6 +2,7 @@ import Foundation
 import UIKit
 import AVFoundation
 import AVKit
+import MediaPlayer
 import CoreGraphics
 import Libmpv
 import Metal
@@ -385,6 +386,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var pendingAudioURL: String?
     private var pendingHTTPHeaders: [String: String] = [:]
     private var pendingLoadConfiguration: MPVLoadConfiguration?
+    private var currentMediaTitle: String?
+    private var currentMediaArtist: String?
+    private var didConfigureMPVRemoteCommands = false
     /// Physical Apple TV can blank HDMI while matching frame rate / dynamic
     /// range. Keep the file paused until that switch finishes so playback time
     /// cannot advance behind the black screen.
@@ -708,6 +712,12 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         pendingAudioURL = request.audioURL?.absoluteString
         pendingHTTPHeaders = request.httpHeaders
         pendingURL = request.videoURL.absoluteString
+        currentMediaTitle = request.streamName
+        currentMediaArtist = request.streamDescription
+        PlaybackAudioSession.activateMoviePlayback()
+        #if os(tvOS) || os(iOS)
+        setupMPVRemoteCommandsIfNeeded()
+        #endif
         if Thread.isMainThread {
             attemptStartPendingLoad()
         } else {
@@ -784,6 +794,92 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             lastVerifiedDurationMs = durationMs
         }
     }
+
+    func coherentSourceTimeSeconds() -> Double {
+        let sampled = max(positionMs, 0)
+        return Double(sampled) / 1000.0
+    }
+
+    #if os(tvOS) || os(iOS)
+    private func updateMPVNowPlayingInfo() {
+        guard durationMs > 0 else { return }
+        var info = [String: Any]()
+        if let title = currentMediaTitle, !title.isEmpty {
+            info[MPMediaItemPropertyTitle] = title
+        }
+        if let artist = currentMediaArtist, !artist.isEmpty {
+            info[MPMediaItemPropertyArtist] = artist
+        }
+        info[MPNowPlayingInfoPropertyElapsedPlaybackTime] = Double(positionMs) / 1000.0
+        info[MPMediaItemPropertyPlaybackDuration] = Double(durationMs) / 1000.0
+        info[MPNowPlayingInfoPropertyPlaybackRate] = isPlayerPlaying ? Double(currentSpeed) : 0.0
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = info
+    }
+
+    private func setupMPVRemoteCommandsIfNeeded() {
+        guard !didConfigureMPVRemoteCommands else { return }
+        didConfigureMPVRemoteCommands = true
+        let center = MPRemoteCommandCenter.shared()
+
+        center.playCommand.isEnabled = true
+        center.playCommand.addTarget { [weak self] _ in
+            self?.playPlayback()
+            return .success
+        }
+
+        center.pauseCommand.isEnabled = true
+        center.pauseCommand.addTarget { [weak self] _ in
+            self?.pausePlayback()
+            return .success
+        }
+
+        center.togglePlayPauseCommand.isEnabled = true
+        center.togglePlayPauseCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            if self.isPlayerPlaying {
+                self.pausePlayback()
+            } else {
+                self.playPlayback()
+            }
+            return .success
+        }
+
+        center.changePlaybackPositionCommand.isEnabled = true
+        center.changePlaybackPositionCommand.addTarget { [weak self] event in
+            guard let event = event as? MPChangePlaybackPositionCommandEvent else { return .commandFailed }
+            self?.seekToMs(Int64((event.positionTime * 1000).rounded()))
+            return .success
+        }
+
+        center.skipForwardCommand.isEnabled = true
+        center.skipForwardCommand.preferredIntervals = [10]
+        center.skipForwardCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            self.seekToMs(self.positionMs + 10_000)
+            return .success
+        }
+
+        center.skipBackwardCommand.isEnabled = true
+        center.skipBackwardCommand.preferredIntervals = [10]
+        center.skipBackwardCommand.addTarget { [weak self] _ in
+            guard let self else { return .commandFailed }
+            self.seekToMs(max(0, self.positionMs - 10_000))
+            return .success
+        }
+    }
+
+    private func teardownMPVRemoteCommands() {
+        guard didConfigureMPVRemoteCommands else { return }
+        didConfigureMPVRemoteCommands = false
+        let center = MPRemoteCommandCenter.shared()
+        center.playCommand.removeTarget(nil)
+        center.pauseCommand.removeTarget(nil)
+        center.togglePlayPauseCommand.removeTarget(nil)
+        center.changePlaybackPositionCommand.removeTarget(nil)
+        center.skipForwardCommand.removeTarget(nil)
+        center.skipBackwardCommand.removeTarget(nil)
+    }
+    #endif
 
     func setSpeed(_ speed: Float) {
         guard mpv != nil else { return }
@@ -1113,6 +1209,10 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         pendingAutoplayAfterDisplayGate = false
         clearDisplayCriteria()
         clearPlaybackError()
+        #if os(tvOS) || os(iOS)
+        MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
+        teardownMPVRemoteCommands()
+        #endif
         guard let ctx = mpv else { return }
         mpv = nil  // nil first so the event loop stops reading
 
@@ -1226,6 +1326,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             self.bufferedMs = max(positionMs + cachedMs, 0)
         }
         currentSpeed = Float(speed > 0 ? speed : 1.0)
+        #if os(tvOS) || os(iOS)
+        updateMPVNowPlayingInfo()
+        #endif
         refreshSubtitleTranslation()
     }
 

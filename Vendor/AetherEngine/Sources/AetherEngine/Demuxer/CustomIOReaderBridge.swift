@@ -41,8 +41,25 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
     /// #112 round 9: the byte axis libavformat sees through this bridge (for a disc adapter, the
     /// virtual concat stream length via AVSEEK_SIZE), backing the byte-estimate seek fallback.
     var resolvedByteSize: Int64? {
-        let size = reader.seek(offset: 0, whence: 65536)  // AVSEEK_SIZE: report length, don't move
+        let size = callingHost { reader.seek(offset: 0, whence: 65536) }  // AVSEEK_SIZE: report length, don't move
         return size > 0 ? size : nil
+    }
+
+    /// AE#445: every call into the host's reader goes through here.
+    ///
+    /// The pump is a bare `Thread` (`HLSSegmentProducer.start`) and FFmpeg's read callback reaches the
+    /// host from inside its loop, so nothing on that thread ever drains an autorelease pool. A host
+    /// reader built on Foundation (`FileHandle.readData`, anything handed back +0) therefore strands
+    /// one object per call for the life of the session, which on a live source that never EOFs is one
+    /// leaked byte per byte played: the reporter's `phys_footprint` tracked his 1.7 MB/s mux rate to
+    /// jetsam at ~11.5 min while every itemized bucket on the memprobe stayed flat.
+    ///
+    /// The engine had already learned this twice and both times fixed it one reader down, in
+    /// `FileIOReader.read` (#243) and `HTTPDiscIOReader.rangeGet`. Those pools cover the engine's own
+    /// readers and can never cover a reader the HOST wrote, and a host cannot be asked to know which
+    /// of the engine's threads its callback lands on. The seam is the engine's, so the pool is too.
+    private func callingHost<T>(_ body: () -> T) -> T {
+        autoreleasepool { body() }
     }
 
     init(reader: IOReader) {
@@ -73,12 +90,12 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
 
         // SEEK_SET to 0 is a no-op for seekable, refused by forward-only (returns negative).
         isSeekable = timeSeekableReader != nil
-            || reader.seek(offset: 0, whence: 0) >= 0
+            || callingHost { reader.seek(offset: 0, whence: 0) } >= 0
     }
 
     func markClosed() {
         isClosed = true
-        reader.cancel()
+        callingHost { reader.cancel() }
     }
 
     func close() {
@@ -101,14 +118,14 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         // -1 = forced abort (not EOF); mirrors AVIOReader.read so FFmpeg doesn't run EOS handling.
         guard !isClosed else { return -1 }
         if isPastReadDeadline { readDeadlineFired = true; return -1 }
-        let n = reader.read(buf, size: size)
+        let n = callingHost { reader.read(buf, size: size) }
         if n == 0 { return FFmpegErr.eof }  // IOReader uses 0 for EOF; avio expects AVERROR_EOF.
         return n
     }
 
-    fileprivate func performSeek(offset: Int64, whence: Int32) -> Int64 {
+    func performSeek(offset: Int64, whence: Int32) -> Int64 {
         guard !isClosed else { return -1 }
-        return reader.seek(offset: offset, whence: whence)
+        return callingHost { reader.seek(offset: offset, whence: whence) }
     }
 }
 

@@ -1,26 +1,13 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-	<key>CFBundleExecutable</key>
-	<string>AetherLibswscale</string>
-	<key>CFBundleIdentifier</key>
-	<string>com.aetherengine.AetherLibswscale</string>
-	<key>CFBundleInfoDictionaryVersion</key>
-	<string>6.0</string>
-	<key>CFBundleName</key>
-	<string>AetherLibswscale</string>
-	<key>CFBundlePackageType</key>
-	<string>FMWK</string>
-	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
-	<key>CFBundleSupportedPlatforms</key>
-	<array>
-		<string>AppleTVOS</string>
-	</array>
-	<key>CFBundleVersion</key>
-	<string>1.0</string>
-	<key>MinimumOSVersion</key>
-	<string>26.0</string>
-</dict>
-</plist>
+<plist version="1.0"><dict>
+<key>CFBundleExecutable</key><string>AetherLibswscale</string>
+<key>CFBundleIdentifier</key><string>com.aetherengine.AetherLibswscale</string>
+<key>CFBundleName</key><string>AetherLibswscale</string>
+<key>CFBundleVersion</key><string>1.0</string>
+<key>CFBundleShortVersionString</key><string>1.0</string>
+<key>CFBundlePackageType</key><string>FMWK</string>
+<key>CFBundleInfoDictionaryVersion</key><string>6.0</string>
+<key>CFBundleSupportedPlatforms</key><array><string>AppleTVOS</string></array>
+<key>MinimumOSVersion</key><string>26.0</string>
+</dict></plist>

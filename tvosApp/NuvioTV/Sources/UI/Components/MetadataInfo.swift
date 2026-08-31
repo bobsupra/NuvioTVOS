@@ -63,15 +63,15 @@ struct MetadataInfo: View {
             // Additional info
             VStack(alignment: .leading, spacing: 8) {
                 if let country = meta.country {
-                    InfoRow(label: "Country", value: country)
+                    InfoRow(label: L10n.string("details_country", fallback: "Country"), value: country)
                 }
 
                 if let releaseInfo = meta.releaseInfo {
-                    InfoRow(label: "Release", value: NuvioDateDisplay.formattedDate(releaseInfo) ?? releaseInfo)
+                    InfoRow(label: L10n.string("details_release", fallback: "Release"), value: NuvioDateDisplay.formattedDate(releaseInfo) ?? releaseInfo)
                 }
 
                 if let released = meta.released {
-                    InfoRow(label: "Released", value: NuvioDateDisplay.formattedDate(released) ?? released)
+                    InfoRow(label: L10n.string("details_released", fallback: "Released"), value: NuvioDateDisplay.formattedDate(released) ?? released)
                 }
             }
         }
@@ -133,15 +133,15 @@ struct TvMetadataInfo: View {
             // Additional info
             VStack(alignment: .leading, spacing: 12) {
                 if let country = meta.country {
-                    TvInfoRow(label: "Country", value: country)
+                    TvInfoRow(label: L10n.string("details_country", fallback: "Country"), value: country)
                 }
 
                 if let releaseInfo = meta.releaseInfo {
-                    TvInfoRow(label: "Release", value: NuvioDateDisplay.formattedDate(releaseInfo) ?? releaseInfo)
+                    TvInfoRow(label: L10n.string("details_release", fallback: "Release"), value: NuvioDateDisplay.formattedDate(releaseInfo) ?? releaseInfo)
                 }
 
                 if let released = meta.released {
-                    TvInfoRow(label: "Released", value: NuvioDateDisplay.formattedDate(released) ?? released)
+                    TvInfoRow(label: L10n.string("details_released", fallback: "Released"), value: NuvioDateDisplay.formattedDate(released) ?? released)
                 }
             }
         }

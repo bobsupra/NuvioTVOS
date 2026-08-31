@@ -95,6 +95,25 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
 
     // MARK: - Player Settings Sync Tests
 
+    func testPlayerSettingsMergeIsMobileFirstAndPreservesUnknownKeys() {
+        let merged = PlayerSettingsSyncMapper.mergeRemoteSettings(
+            mobile: ["stream_auto_play_mode": "FIRST_STREAM", "shared": "mobile"],
+            tv: ["stream_auto_play_mode": "AUTO", "tv_only": true, "shared": "tv"]
+        )
+        XCTAssertEqual(merged["stream_auto_play_mode"] as? String, "FIRST_STREAM")
+        XCTAssertEqual(merged["tv_only"] as? Bool, true)
+        XCTAssertEqual(merged["shared"] as? String, "mobile")
+
+        let overlaid = PlayerSettingsSyncMapper.overlayOwnedSettings(
+            merged,
+            with: ["smart_stream_selection": true, "shared": "tvos-owned"]
+        )
+        XCTAssertEqual(overlaid["stream_auto_play_mode"] as? String, "FIRST_STREAM")
+        XCTAssertEqual(overlaid["tv_only"] as? Bool, true)
+        XCTAssertEqual(overlaid["smart_stream_selection"] as? Bool, true)
+        XCTAssertEqual(overlaid["shared"] as? String, "tvos-owned")
+    }
+
     func testPlayerSettingsKeyMappingsCoverage() {
         let localKeys = PlayerSettingsSyncMapper.localToRemoteKeyMappings.map(\.local)
         XCTAssertTrue(localKeys.contains(SettingsKey.audioLanguage))
@@ -187,5 +206,3 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertEqual(ThemeSettingsSyncMapper.wireToTheme("WHITE"), "White")
     }
 }
-
-

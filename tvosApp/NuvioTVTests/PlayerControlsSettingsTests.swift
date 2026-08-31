@@ -46,4 +46,17 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowEpisodes))
         XCTAssertFalse(defaults.bool(forKey: SettingsKey.playerShowSources))
     }
+
+    func testAudioRouteDescriptionHelper() {
+        let title = PlaybackSystemMonitor.currentAudioOutputTitle()
+        XCTAssertFalse(title.isEmpty)
+        let route = PlaybackSystemMonitor.audioRouteInfo()
+        XCTAssertFalse(route.isEmpty)
+    }
+
+    @MainActor
+    func testAetherEngineVideoNowPlayingSessionOptIn() {
+        let controller = AetherPlaybackController()
+        XCTAssertTrue(controller.engine.ownsVideoNowPlayingSession)
+    }
 }

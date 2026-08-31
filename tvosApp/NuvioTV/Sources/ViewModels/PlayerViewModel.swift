@@ -1,6 +1,30 @@
 import Foundation
 import Combine
 import SwiftUI
+
+struct LiveStreamFailoverPolicy {
+    struct Decision: Equatable {
+        let retryCurrent: Bool
+        let exclusions: [String]
+        let retriedURLs: Set<String>
+        let failedURLs: Set<String>
+    }
+
+    static func decide(isLive: Bool, currentURL: String?, retriedURLs: Set<String>, failedURLs: Set<String>) -> Decision {
+        guard let currentURL else {
+            return Decision(retryCurrent: false, exclusions: Array(failedURLs), retriedURLs: retriedURLs, failedURLs: failedURLs)
+        }
+        if isLive && !retriedURLs.contains(currentURL) {
+            var updated = retriedURLs
+            updated.insert(currentURL)
+            return Decision(retryCurrent: true, exclusions: [], retriedURLs: updated, failedURLs: failedURLs)
+        }
+        var failed = failedURLs
+        failed.insert(currentURL)
+        return Decision(retryCurrent: false, exclusions: Array(failed), retriedURLs: retriedURLs, failedURLs: failed)
+    }
+
+}
 import UIKit
 import AVFoundation
 import AVKit
@@ -41,7 +65,7 @@ class PlayerViewModel: ObservableObject {
     @Published var seekStepSeconds: Int = PlayerSeekSettings.current
     @Published var qualities: [QualityOption] = [.auto]
     @Published var currentQuality: QualityOption = .auto
-    @Published var showControls: Bool = true
+    @Published var showControls: Bool = false
     /// True while the transport controls are up and the timeline scrubber holds
     /// focus. Lets the remote press-catcher drive continuous hold-to-seek even
     /// with the controls visible, matching the controls-hidden behaviour.
@@ -77,6 +101,8 @@ class PlayerViewModel: ObservableObject {
     @Published var audioAmplificationDb: Int = 0
     /// Full-screen settings panel (subtitles / audio / speed) visibility.
     @Published var showSettingsPanel: Bool = false
+    /// Active audio route name (e.g. HomePod, TV Speakers, AirPods).
+    @Published var currentAudioRouteDescription: String = PlaybackSystemMonitor.currentAudioOutputTitle()
     /// In-player side sheet (episodes / sources).
     @Published var sidePanel: PlayerSidePanel? = nil
     /// Alternate streams for the current title (Sources panel).
@@ -108,9 +134,11 @@ class PlayerViewModel: ObservableObject {
     /// Whether the Next Episode card is visible (near the end of an episode
     /// that has a follow-up).
     @Published var showNextEpisodeCard: Bool = false
-    /// Seconds left before Auto-Play advances, or nil while controls are shown
-    /// or Auto-Play is disabled.
+    /// Retained for compatibility with the card API; autoplay is performed
+    /// only after the backend reports genuine end-of-media.
     @Published var nextEpisodeCountdown: Int?
+    /// Cancellation applies only to the currently configured episode.
+    @Published private(set) var isAutoPlayCancelled = false
     /// True while the next episode's stream is being resolved and loaded, so the
     /// card can show a spinner instead of a Play button.
     @Published var isAdvancingEpisode: Bool = false
@@ -130,6 +158,15 @@ class PlayerViewModel: ObservableObject {
     /// Resolves a next episode into a ready-to-play stream, provided by the app
     /// layer (reuses the details screen's add-on fetch + smart selection).
     private var resolveNextStream: ((NuvioVideo) async -> PreparedNextStream?)?
+
+    // MARK: - Post-Play Recommendations
+    @Published var postPlayState = PostPlayRecommendationUiState()
+    let postPlayController = PostPlayRecommendationController()
+
+    var isNextEpisodeMetadataResolved: Bool {
+        guard let meta = activeMeta, meta.isSeries else { return true }
+        return !seriesEpisodes.isEmpty || currentEpisodeVideo != nil
+    }
     private var isAdvanceInFlight: Bool = false
     private var autoHiddenNextEpisodeCard = false
     private var nextEpisodeAutoHideDeadline: Date?
@@ -235,6 +272,8 @@ class PlayerViewModel: ObservableObject {
     private var dismissedSkipIntervalIds: Set<String> = []
     private var skipSegmentAutoHideDeadline: Date?
     private var skipIntervalLoadTask: Task<Void, Never>?
+    private var didSeedIntroDBSeasonTemplate = false
+    private var didRefreshIntroDBForKnownDuration = false
     private static let skipSegmentAutoHideSeconds = 5
     private var seekRepeatTimer: Timer?
     /// Hold-to-seek tick rate — faster than a casual tap cadence so a held
@@ -272,9 +311,9 @@ class PlayerViewModel: ObservableObject {
     private var expectedDurationSeconds: Double?
     private let trailerResolver = YouTubeTrailerResolver()
     private var trailerResolveTask: Task<Void, Never>?
-    private var didDetectReplacementStream = false
+    @Published private(set) var didDetectReplacementStream = false
     private var replacementStreamHits = 0
-    private static let replacementConfirmTicks = 4   // ~1s at the 0.25s poll cadence
+    private static let replacementConfirmTicks = 1   // Immediate detection to avoid showing expired slate frame
 
     /// Re-resolves a fresh stream for the current title/episode when a link
     /// expires or a source fails. `excludedURLs` are links already tried this
@@ -289,7 +328,7 @@ class PlayerViewModel: ObservableObject {
         _ subtitleLine: String
     ) async -> PreparedNextStream?)?
     private var reloadAttempts = 0
-    private var isReloadingStream = false
+    @Published private(set) var isReloadingStream = false
     private static let maxReloadAttempts = 5
 
     // MARK: Load watchdog + source failover
@@ -303,6 +342,7 @@ class PlayerViewModel: ObservableObject {
     /// URLs that failed to load/play this session (watchdog, mpv error, slate).
     private var failedStreamURLs: Set<String> = []
     private var currentLoadStarted = false
+    private var retriedLiveURLs: Set<String> = []
     /// True from the moment a new URL is applied until that stream actually
     /// starts. The engine reports neither "loading" nor "playing" while it tears
     /// the old pipeline down and opens the new one, which the poll would
@@ -325,6 +365,18 @@ class PlayerViewModel: ObservableObject {
         sessionCoordinator.prepareControllers()
         bindSessionCoordinatorCallbacks()
         setupPipObservers()
+        postPlayController.$uiState
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] state in
+                self?.postPlayState = state
+            }
+            .store(in: &cancellables)
+        NotificationCenter.default.addObserver(
+            self,
+            selector: #selector(handleAudioRouteChange),
+            name: AVAudioSession.routeChangeNotification,
+            object: nil
+        )
     }
 
     private func bindSessionCoordinatorCallbacks() {
@@ -353,6 +405,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     deinit {
+        NotificationCenter.default.removeObserver(self, name: AVAudioSession.routeChangeNotification, object: nil)
         let coordinator = sessionCoordinator
         let poll = pollTimer
         let hide = controlsHideTimer
@@ -470,6 +523,7 @@ class PlayerViewModel: ObservableObject {
                             ProfileSettings.current.string(forKey: SettingsKey.networkCache)
                         ),
                         assMode: .strip,
+                        streamName: title.isEmpty ? nil : title,
                         streamDescription: PlaybackMarkers.trailerSubtitle
                     )
                     self.sessionCoordinator.load(request)
@@ -483,8 +537,8 @@ class PlayerViewModel: ObservableObject {
         beginPrimaryLoad(
             for: url,
             httpHeaders: httpHeaders,
-            streamName: nil,
-            streamDescription: subtitle,
+            streamName: title.isEmpty ? nil : title,
+            streamDescription: subtitle.isEmpty ? nil : subtitle,
             filename: url.lastPathComponent
         )
         videoNaturalSize = .zero
@@ -645,6 +699,15 @@ class PlayerViewModel: ObservableObject {
         self.activeMeta = meta
         self.activeStreamURL = url.absoluteString
         self.activeHTTPHeaders = httpHeaders
+        if !isTrailerPlayback {
+            postPlayController.start(
+                contentId: meta.id,
+                contentType: meta.isSeries ? "series" : meta.type,
+                meta: meta
+            )
+        } else {
+            postPlayController.stop()
+        }
         self.activeEpisodeNumbers = isTrailerPlayback
             ? nil
             : Self.episodeNumbers(fromSubtitle: subtitle)
@@ -692,6 +755,8 @@ class PlayerViewModel: ObservableObject {
             self.audioAmplificationDb = 0
         }
         self.skipIntervals = []
+        self.didSeedIntroDBSeasonTemplate = false
+        self.didRefreshIntroDBForKnownDuration = false
         self.activeSkipInterval = nil
         self.skipSegmentCountdown = nil
         self.autoHiddenSkipIntervalId = nil
@@ -770,6 +835,7 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeCountdown = nil
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
+        isAutoPlayCancelled = false
         nextEpisode = Self.nextEpisode(after: current, in: episodes)
 
         if let meta = activeMeta, let urlString = activeStreamURL, let url = URL(string: urlString) {
@@ -834,7 +900,6 @@ class PlayerViewModel: ObservableObject {
                 if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
                 nextEpisodeAutoPlayDeadline = nil
             } else {
-                updateNextEpisodeAutoPlayState()
             }
             return
         }
@@ -860,31 +925,6 @@ class PlayerViewModel: ObservableObject {
             nextEpisodeAutoHideDeadline = nil
         }
 
-        updateNextEpisodeAutoPlayState()
-    }
-
-    private func updateNextEpisodeAutoPlayState() {
-        guard autoPlayNextEnabled else {
-            if nextEpisodeCountdown != nil { nextEpisodeCountdown = nil }
-            nextEpisodeAutoPlayDeadline = nil
-            return
-        }
-
-        if nextEpisodeAutoPlayDeadline == nil {
-            nextEpisodeAutoPlayDeadline = Date().addingTimeInterval(Double(autoPlayNextCountdownSeconds))
-            nextEpisodeCountdown = autoPlayNextCountdownSeconds
-        }
-
-        guard let deadline = nextEpisodeAutoPlayDeadline else { return }
-        let secondsLeft = deadline.timeIntervalSinceNow
-        if secondsLeft <= 0.05 {
-            nextEpisodeCountdown = nil
-            nextEpisodeAutoPlayDeadline = nil
-            advance()
-        } else {
-            let countdown = max(1, Int(secondsLeft.rounded(.up)))
-            if nextEpisodeCountdown != countdown { nextEpisodeCountdown = countdown }
-        }
     }
 
     /// Prefer IntroDB ending start so Next Episode and Skip Ending appear together.
@@ -911,36 +951,86 @@ class PlayerViewModel: ObservableObject {
     // MARK: - IntroDB skip segments
 
     private func loadSkipIntervalsIfNeeded(meta: NuvioMeta, isTrailerPlayback: Bool) {
-        guard !isTrailerPlayback,
-              meta.isSeries,
-              let episodeNumbers = activeEpisodeNumbers else {
-            return
-        }
+        guard !isTrailerPlayback else { return }
 
-        let imdbId = meta.imdbId ?? meta.id
+        let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
         let expectedMetaId = meta.id
-        let expectedEpisode = episodeNumbers
+        let episodeNumbers = activeEpisodeNumbers
+        skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = Task { [weak self] in
             let intervals = await IntroDBSkipService.shared.intervals(
                 imdbId: imdbId,
-                season: episodeNumbers.season,
-                episode: episodeNumbers.episode
+                season: episodeNumbers?.season,
+                episode: episodeNumbers?.episode,
+                duration: self?.time.duration
             )
             await MainActor.run {
                 guard let self,
                       !Task.isCancelled,
                       self.activeMeta?.id == expectedMetaId,
-                      self.activeEpisodeNumbers?.season == expectedEpisode.season,
-                      self.activeEpisodeNumbers?.episode == expectedEpisode.episode else {
+                      self.activeEpisodeNumbers?.season == episodeNumbers?.season,
+                      self.activeEpisodeNumbers?.episode == episodeNumbers?.episode else {
                     return
                 }
                 self.skipIntervals = intervals
+                if self.time.duration > 0,
+                   !intervals.isEmpty,
+                   intervals.allSatisfy({ $0.provider == "introdb" }) {
+                    IntroDBSkipService.shared.seedSeasonTemplate(
+                        imdbId: imdbId,
+                        season: episodeNumbers?.season,
+                        episode: episodeNumbers?.episode,
+                        intervals: intervals,
+                        duration: self.time.duration
+                    )
+                    self.didSeedIntroDBSeasonTemplate = true
+                }
                 self.updateSkipIntervalState()
             }
         }
     }
 
     private func updateSkipIntervalState() {
+        if !didRefreshIntroDBForKnownDuration,
+           time.duration > 0,
+           let meta = activeMeta,
+           let numbers = activeEpisodeNumbers {
+            didRefreshIntroDBForKnownDuration = true
+            let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
+            let expectedMetaId = meta.id
+            let duration = time.duration
+            skipIntervalLoadTask?.cancel()
+            skipIntervalLoadTask = Task { [weak self] in
+                let intervals = await IntroDBSkipService.shared.intervals(
+                    imdbId: imdbId, season: numbers.season, episode: numbers.episode,
+                    duration: duration
+                )
+                await MainActor.run {
+                    guard let self,
+                          !Task.isCancelled,
+                          self.activeMeta?.id == expectedMetaId,
+                          self.activeEpisodeNumbers?.season == numbers.season,
+                          self.activeEpisodeNumbers?.episode == numbers.episode else { return }
+                    self.skipIntervals = intervals
+                    self.updateSkipIntervalState()
+                }
+            }
+        }
+        if !didSeedIntroDBSeasonTemplate,
+           time.duration > 0,
+           !skipIntervals.isEmpty,
+           skipIntervals.allSatisfy({ $0.provider == "introdb" }),
+           let meta = activeMeta {
+            let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
+            IntroDBSkipService.shared.seedSeasonTemplate(
+                imdbId: imdbId,
+                season: activeEpisodeNumbers?.season,
+                episode: activeEpisodeNumbers?.episode,
+                intervals: skipIntervals,
+                duration: time.duration
+            )
+            didSeedIntroDBSeasonTemplate = true
+        }
         guard !skipIntervals.isEmpty,
               time.current > 0,
               status != .ended,
@@ -1011,6 +1101,12 @@ class PlayerViewModel: ObservableObject {
     /// Play the next episode now (the card's Play button).
     func playNextEpisode() {
         advance()
+    }
+
+    func cancelAutoPlay() {
+        isAutoPlayCancelled = true
+        nextEpisodeCountdown = nil
+        nextEpisodeAutoPlayDeadline = nil
     }
 
     private func advance() {
@@ -1085,6 +1181,7 @@ class PlayerViewModel: ObservableObject {
         if let episode {
             currentEpisodeVideo = episode
             nextEpisode = Self.nextEpisode(after: episode, in: seriesEpisodes)
+            isAutoPlayCancelled = false
         }
         autoHiddenNextEpisodeCard = false
         showNextEpisodeCard = false
@@ -1116,7 +1213,7 @@ class PlayerViewModel: ObservableObject {
         if let url = activeStreamURL { failedStreamURLs.insert(url) }
         attemptFailover(
             reason: "This stream link has expired. Go back and start it again to load a fresh stream.",
-            toast: "Link expired — trying another source"
+            toast: nil
         )
     }
 
@@ -1153,7 +1250,6 @@ class PlayerViewModel: ObservableObject {
             if let url = self.activeStreamURL {
                 self.failedStreamURLs.insert(url)
             }
-            self.showPlayerToast("Source didn't load — trying another")
             self.attemptFailover(
                 reason: "The source didn't start within \(self.loadTimeoutSeconds) seconds. Every available source was tried.",
                 toast: nil
@@ -1204,14 +1300,19 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        if let url = activeStreamURL {
-            failedStreamURLs.insert(url)
-        }
+        let decision = LiveStreamFailoverPolicy.decide(
+            isLive: isLiveStream,
+            currentURL: activeStreamURL,
+            retriedURLs: retriedLiveURLs,
+            failedURLs: failedStreamURLs
+        )
+        retriedLiveURLs = decision.retriedURLs
+        failedStreamURLs = decision.failedURLs
 
         isFailingOver = true
         isReloadingStream = true
         isSwitchingSource = true
-        switchingSourceMessage = "Trying next source…"
+        switchingSourceMessage = "Starting stream"
         isAwaitingStreamStart = true
         reloadAttempts += 1
         showNextEpisodeCard = false
@@ -1228,7 +1329,7 @@ class PlayerViewModel: ObservableObject {
             ?? (time.current > 5 ? time.current : nil)
             ?? storedResumePositionForActiveItem
 
-        let excluded = Array(failedStreamURLs)
+        let excluded = decision.exclusions
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer {
@@ -1514,19 +1615,6 @@ class PlayerViewModel: ObservableObject {
         }
 
         if c.isPlayerEnded {
-            // Outro markers can begin only a few seconds before the end. If the
-            // selected countdown cannot finish in time, still honor Auto-Play
-            // instead of dismissing the player when the episode completes.
-            if autoPlayNextEnabled,
-               time.duration >= 60,
-               time.current / time.duration >= 0.85,
-               let next = nextEpisode,
-               EpisodeReleasePolicy.hasAired(next.released),
-               resolveNextStream != nil {
-                advance()
-                return
-            }
-
             // Only a genuine watch-through counts. A stream that dies early
             // (expired link, decode error) also reports "ended", and that must
             // neither mark the title watched nor wipe the resume point.
@@ -1565,10 +1653,30 @@ class PlayerViewModel: ObservableObject {
                         )
                     }
                 }
+                if autoPlayNextEnabled && !isAutoPlayCancelled {
+                    advance()
+                    return
+                }
             }
         } else if !isLiveStream {
             saveProgressIfNeeded()
             updateNextEpisodeState()
+        }
+
+        if !isLiveStream {
+            let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
+            let hasBlockingOverlay = showSettingsPanel || sidePanel != nil || isScrubbing || showPauseOverlay
+            let endingStartTime = skipIntervals.first(where: \.isEnding)?.startTime
+            postPlayController.updateTimeline(
+                position: time.current,
+                duration: time.duration,
+                isEnded: c.isPlayerEnded || status == .ended,
+                isNextEpisodeResolved: isNextEpisodeMetadataResolved,
+                nextEpisodeHasAired: nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) },
+                endingStartTime: endingStartTime,
+                hasBlockingOverlay: hasBlockingOverlay,
+                enabled: postPlayEnabled
+            )
         }
 
         // Don't clobber an explicit error state (failover already exhausted).
@@ -1579,7 +1687,7 @@ class PlayerViewModel: ObservableObject {
             if let url = activeStreamURL { failedStreamURLs.insert(url) }
             attemptFailover(
                 reason: c.currentErrorMessage,
-                toast: "Source failed — trying another"
+                toast: nil
             )
             return
         }
@@ -1643,7 +1751,8 @@ class PlayerViewModel: ObservableObject {
         // A genuine stream is playing: reset failover budget for the next
         // independent failure later in the session.
         if status == .playing,
-           (isLiveStream || time.duration >= 60),
+           !isLiveStream,
+           time.duration >= 60,
            !didDetectReplacementStream {
             reloadAttempts = 0
             failedStreamURLs.removeAll()
@@ -1792,7 +1901,30 @@ class PlayerViewModel: ObservableObject {
         playerController.destroyPlayer()
         aetherController.destroyPlayer()
         PictureInPictureManager.shared.invalidateSession()
+        postPlayController.stop()
         status = .idle
+    }
+
+    // MARK: - Post-Play Recommendation Actions
+
+    func showPreviousRecommendation() {
+        postPlayController.showPreviousRecommendation()
+    }
+
+    func showNextRecommendation() {
+        postPlayController.showNextRecommendation()
+    }
+
+    func playPostPlayTrailer() {
+        postPlayController.startTrailer()
+    }
+
+    func stopPostPlayTrailer() {
+        postPlayController.stopTrailer()
+    }
+
+    func returnToPlayerFromPostPlay() {
+        postPlayController.returnToPlayer()
     }
 
     func togglePlayPause() {
@@ -1852,6 +1984,9 @@ class PlayerViewModel: ObservableObject {
         skipSegmentCountdown = nil
         skipSegmentAutoHideDeadline = nil
         activeSkipInterval = nil
+        if interval.isEnding {
+            postPlayController.showImmediately()
+        }
         seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
         showControls = false
         scheduleControlsHide()
@@ -3415,6 +3550,9 @@ class PlayerViewModel: ObservableObject {
         if let expected = expectedDurationSeconds, expected >= 60, loaded < expected * 0.5 {
             return true
         }
+        if subtitle != PlaybackMarkers.trailerSubtitle, !isLiveStream, loaded < 180 {
+            return true
+        }
         return false
     }
 
@@ -3553,6 +3691,12 @@ class PlayerViewModel: ObservableObject {
                 self?.isPictureInPicturePossible = possible
             }
             .store(in: &cancellables)
+    }
+
+    @objc private func handleAudioRouteChange(_ notification: Notification) {
+        Task { @MainActor [weak self] in
+            self?.currentAudioRouteDescription = PlaybackSystemMonitor.currentAudioOutputTitle()
+        }
     }
 }
 

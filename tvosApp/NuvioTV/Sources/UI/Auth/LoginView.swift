@@ -272,7 +272,7 @@ struct LoginView: View {
 
 // MARK: - Components
 
-private struct MethodTab: View {
+struct MethodTab: View {
     let title: String
     let isSelected: Bool
     let action: () -> Void
@@ -295,7 +295,7 @@ private struct MethodTab: View {
     }
 }
 
-private struct LoginButton: View {
+struct LoginButton: View {
     let title: String
     var systemImage: String? = nil
     var prominent: Bool = false
@@ -337,7 +337,7 @@ private struct LoginButton: View {
 /// Liquid Glass capsule with a hidden off-screen UITextField driving editing,
 /// because a native focused TextField/SecureField on tvOS always paints its
 /// own white pill over custom chrome.
-private struct LoginGlassField: View {
+struct LoginGlassField: View {
     let placeholder: String
     @Binding var text: String
     var isSecure: Bool = false
@@ -388,7 +388,7 @@ private struct LoginGlassField: View {
 /// Off-screen UITextField that drives editing for LoginGlassField. Mirrors the
 /// Settings tab's private helper: never focusable itself, invisible, and only
 /// used to summon the keyboard and receive text.
-private struct HiddenLoginTextField: UIViewRepresentable {
+struct HiddenLoginTextField: UIViewRepresentable {
     @Binding var text: String
     @Binding var isEditing: Bool
     var isSecure: Bool = false
@@ -459,13 +459,13 @@ private struct HiddenLoginTextField: UIViewRepresentable {
     }
 }
 
-private final class HiddenLoginUITextField: UITextField {
+final class HiddenLoginUITextField: UITextField {
     override var canBecomeFocused: Bool { false }
 }
 
 /// Small text-link button (e.g. sign-in/sign-up toggle) with the shared glass
 /// capsule focus treatment instead of the system's white platter.
-private struct LoginLinkButton: View {
+struct LoginLinkButton: View {
     let title: String
     let action: () -> Void
     @FocusState private var focused: Bool
@@ -488,7 +488,7 @@ private struct LoginLinkButton: View {
 }
 
 /// Live "Expires in mm:ss" countdown.
-private struct CountdownText: View {
+struct CountdownText: View {
     let target: Date
 
     var body: some View {

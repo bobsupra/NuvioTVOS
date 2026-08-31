@@ -20,6 +20,13 @@ extension AetherEngine {
     func applyNativeHostClockTick(_ value: Double) {
         // nativeClockSeconds preserves the raw AVPlayer clock for onPlaylistShiftChanged to re-derive against.
         nativeClockSeconds = value
+        // AE#446 round 4: before anything folds, establish which axis this item's clock is even on.
+        measureLiveItemAxisOffset()
+        // AE#454: and if it could not be established, publish nothing derived from it. The raw clock
+        // above is kept (it is a reading of the item, not of the session), but the seam lookup, the
+        // published playhead and the live window all fold an offset that belongs to the item that
+        // just left, and the window's edge is a running maximum a single wrong sample latches.
+        if liveItemPlacementPending { return }
         // Newest seam at or before the raw clock wins: activates seams on forward play, re-applies pre-seam shift on backward DVR seeks.
         if let active = presentationAxis.shiftSeconds(atItemSeconds: value) {
             playlistShiftSeconds = active
@@ -28,12 +35,13 @@ extension AetherEngine {
             // AE#105: fold the disc's clip-0 STC base back out so the published playhead sits on the same
             // 0-based axis as the MPLS duration (origin 0 for normal/live -> no-op).
             clock.currentTime = PresentationAxis.display(
-                sourcePTS: value + playlistShiftSeconds,
+                sourcePTS: value + playlistShiftSeconds + liveItemAxisOffsetSeconds,
                 origin: displayOrigin(forShift: playlistShiftSeconds))
         }
         // Live edge must fold with the same playlistShiftSeconds as the playhead; opposite sign would make behindLiveSeconds meaningless.
         if isLive {
-            publishLiveWindow(edgeSessionTime: (nativeHost?.seekableEnd ?? 0) + playlistShiftSeconds)
+            publishLiveWindow(edgeSessionTime: (nativeHost?.seekableEnd ?? 0) + playlistShiftSeconds
+                              + liveItemAxisOffsetSeconds)
         }
     }
 
@@ -205,6 +213,22 @@ extension AetherEngine {
             .sink { [weak self] ready in
                 guard let self = self else { return }
                 self.isSessionReady = ready
+                // AE#454: the item the session's published position describes. Until a fresh item says
+                // it can play, nothing it reports is a reading of where the session is; see
+                // `liveItemPlacementPending`.
+                if ready {
+                    // The placement is spent here, on every path rather than only on the one that
+                    // replays the stashed seek: a pre-ready seek can be superseded by a host scrub
+                    // (latest-wins), and an arm left standing would be inherited by whatever item the
+                    // session loads next for an unrelated reason.
+                    self.nativeVideoSession?.clearLiveRejoinStart()
+                    // An item with a rejoin placement still outstanding is not yet describing the
+                    // session: the hold runs to the PLACEMENT, not to readiness, or whether the
+                    // hand-off is reported depends on where a 100 ms tick happens to fall inside it.
+                    if self.pendingPreReadySeek?.origin != .liveRejoin {
+                        self.acceptCurrentItemForPublishing()
+                    }
+                }
                 if ready {
                     // #361: an audio session has a picture nowhere, so its ladder ends at readiness
                     // rather than stalling one checkpoint short of the end forever.
@@ -221,10 +245,39 @@ extension AetherEngine {
                 // #127: replay the latest host seek that arrived while the item was pre-ready.
                 // #178: not while still .loading (autostart paths hold .loading past readiness);
                 // replaying now would just re-stash. The state didSet resolves that case.
-                if ready, self.state != .loading, let pending = self.pendingPreReadySeekSeconds {
-                    self.pendingPreReadySeekSeconds = nil
-                    EngineLog.emit("[AetherEngine] replaying deferred pre-ready seek to \(String(format: "%.2f", pending))s (#127)", category: .engine)
-                    Task { @MainActor in await self.seek(to: pending) }
+                if ready, self.state != .loading, let pending = self.pendingPreReadySeek {
+                    self.pendingPreReadySeek = nil
+                    EngineLog.emit("[AetherEngine] replaying deferred pre-ready seek to \(String(format: "%.2f", pending.seconds))s (#127)", category: .engine)
+                    // AE#454: a placement the playlist already carried out does not need a seek to
+                    // carry it out again, and the seek is not free: a zero-tolerance seek bounces
+                    // transport and costs a rebuffer at the exact moment the picture is coming back
+                    // (measured on the harness: 250 ms of the 485 ms hand-off). Read where the item
+                    // actually came up and let the fact decide, so a client that ignored the tag, or
+                    // honoured it only to a segment boundary, still gets the correcting seek.
+                    if pending.origin == .liveRejoin, let host = self.nativeHost,
+                       let itemTarget = self.liveRejoinItemAxisTarget(pending.seconds),
+                       abs(host.currentTime - itemTarget) <= Self.liveRejoinPlacementSatisfiedSeconds {
+                        EngineLog.emit(
+                            "[AetherEngine] #454 the playlist already placed this item at its own "
+                            + "\(String(format: "%.2f", host.currentTime))s, "
+                            + "\(String(format: "%.3f", abs(host.currentTime - itemTarget)))s from the "
+                            + "\(String(format: "%.2f", itemTarget))s the rejoin asked for; no correcting seek",
+                            category: .engine)
+                        self.acceptCurrentItemForPublishing()
+                        return
+                    }
+                    if pending.origin == .liveRejoin, let host = self.nativeHost {
+                        EngineLog.emit(
+                            "[AetherEngine] #454 the fresh item came up at its own "
+                            + "\(String(format: "%.2f", host.currentTime))s of "
+                            + "\(String(format: "%.2f", host.seekableStart))..\(String(format: "%.2f", host.seekableEnd))s, "
+                            + "not where the rejoin asked for; the placement seek follows",
+                            category: .engine)
+                    }
+                    Task { @MainActor in
+                        await self.seek(to: pending.seconds, origin: pending.origin)
+                        if pending.origin == .liveRejoin { self.acceptCurrentItemForPublishing() }
+                    }
                 }
             }
             .store(in: &cancellables)
@@ -234,7 +287,15 @@ extension AetherEngine {
             .store(in: &cancellables)
         didReachEnd
             .filter { $0 }
-            .sink { [weak self] _ in self?.state = .ended }
+            .sink { [weak self] _ in
+                guard let self else { return }
+                // AE#446: a live window served as a finished asset (its source stopped delivering while
+                // the viewer still had resident runway) reaches an end that is not the end of anything.
+                // `.ended` is terminal (#63/#164), so forwarding it here would turn a source hiccup into
+                // a dead session for the rest of the tune.
+                if self.handleLiveOutageWindowExhausted() { return }
+                self.state = .ended
+            }
             .store(in: &cancellables)
     }
 
@@ -288,6 +349,7 @@ extension AetherEngine {
         // plays audio into a black view (#120). Mirrors loadNative's post-host call.
         presentCurrentLayer()
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         // No loopback producer; playhead is the raw AVPlayer clock. Shift stays 0.
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
@@ -391,11 +453,17 @@ extension AetherEngine {
                     // Hold .loading through startup (hasStartedPlaying gate on the host side).
                     if self.state != .playing { self.state = .loading }
                 case .paused:
-                    // Only an explicit user pause; ignore transient pre-roll paused at load.
-                    if self.state == .playing { self.state = .paused }
+                    // Only an explicit user pause; ignore transient pre-roll paused at load. AE#440: the
+                    // pre-play reading is delivered AFTER the autostart has written .playing, so before
+                    // the first roll a .paused is the outgoing value rather than anyone's intent.
+                    if self.hasTransportRolled, self.state == .playing { self.state = .paused }
                 @unknown default:
                     break
                 }
+                // AE#440: the rate is rolling, which is what `playbackPhase` reports as `.playing`.
+                // Last, so this load's `state` and `isBuffering` writes are already in and the phase
+                // recomputes once, onto the roll.
+                if status == .playing { self.hasTransportRolled = true }
             }
             .store(in: &nativeCancellables)
 
@@ -417,20 +485,24 @@ extension AetherEngine {
                   perFrameHDR: true,
                   // AE#154: a VOD resume anchor seeks; nil keeps the live no-initial-seek contract.
                   skipInitialSeek: startPosition == nil,
-                  forwardBufferDuration: 0,
-                  // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
-                  // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
-                  surfaceEndFailures: true,
-                  httpHeaders: options.httpHeaders,
-                  // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting it
-                  // back would ping-pong), and hosts can opt out via LoadOptions.
-                  armIngestFallback: RemoteHLSIngestFallback.shouldArm(
-                      isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback),
-                  // #334: the ceiling on silence this path never had. AVPlayer's "gave up" covers an
-                  // origin that stops answering; it does not cover one that answers everything while
-                  // AVFoundation builds no track, where nothing terminal is ever published.
-                  readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds,
-                  isLive: options.isLive)
+                  contract: .init(
+                      isLive: options.isLive,
+                      // AE#440: the same join tail exists where AVPlayer owns the buffer; the engine only
+                      // owns the moment it is told to stop waiting.
+                      liveJoinStartsImmediately: options.liveJoinStartsImmediately,
+                      forwardBufferDuration: 0,
+                      // This lean path has no live-reopen / readiness watchdog; let AVPlayer's "gave up"
+                      // signal surface a dead upstream (segment 404 / token expiry) so the host can retune.
+                      surfaceEndFailures: true,
+                      httpHeaders: options.httpHeaders,
+                      // #168 follow-up: live-only (VOD remote HLS is the AE#154 reroute target; ingesting
+                      // it back would ping-pong), and hosts can opt out via LoadOptions.
+                      armIngestFallback: RemoteHLSIngestFallback.shouldArm(
+                          isLive: options.isLive, fallbackEnabled: options.nativeRemoteHLSIngestFallback),
+                      // #334: the ceiling on silence this path never had. AVPlayer's "gave up" covers an
+                      // origin that stops answering; it does not cover one that answers everything while
+                      // AVFoundation builds no track, where nothing terminal is ever published.
+                      readinessDeadline: RemoteHLSReadinessDeadline.defaultBudgetSeconds))
 
         // AE#154: surface the item's legible AVMediaSelectionGroup as `subtitleTracks` so hosts with
         // their own picker see the external WebVTT renditions AVPlayer renders on this bypass.
@@ -577,7 +649,20 @@ extension AetherEngine {
         } else {
             liveCadenceObservation = nil
         }
-        let initialTargetDurationFloor = liveIngest?.upstreamTargetDuration
+        // AE#447: the floor is measured (arrival cadence + the longest segment the upstream really
+        // served), the advert rides along for the seal log only. Both weak, same reason as above.
+        let liveClosedCadenceObservation: (@Sendable () -> Double?)?
+        let liveUpstreamSegmentDurationObservation: (@Sendable () -> Double?)?
+        if let liveIngest {
+            liveClosedCadenceObservation = { [weak liveIngest] in liveIngest?.closedLiveCadenceSeconds }
+            liveUpstreamSegmentDurationObservation = { [weak liveIngest] in
+                liveIngest?.upstreamSegmentDurationSeconds
+            }
+        } else {
+            liveClosedCadenceObservation = nil
+            liveUpstreamSegmentDurationObservation = nil
+        }
+        let upstreamSelfReportedTargetDuration = liveIngest?.upstreamTargetDuration
         // #199: in-engine reopen transport for live ingest sessions. Only HLSLiveIngestReader main
         // readers are reconstructible blind (immutable URL + headers, hint always "mpegts"); the
         // demuxed-audio shape is excluded because a reopen would also have to rebuild the side audio
@@ -608,7 +693,9 @@ extension AetherEngine {
             liveJoinProfile: loadedOptions.liveJoinProfile,
             blockingReloadOverride: loadedOptions.liveBlockingReload,
             liveCadenceObservation: liveCadenceObservation,
-            initialTargetDurationFloor: initialTargetDurationFloor,
+            liveClosedCadenceObservation: liveClosedCadenceObservation,
+            liveUpstreamSegmentDurationObservation: liveUpstreamSegmentDurationObservation,
+            upstreamSelfReportedTargetDuration: upstreamSelfReportedTargetDuration,
             preopenedDemuxer: preopenedDemuxer,
             sourceReopenableByURL: !isCustomSource,
             customSourceReopenFactory: ingestReopenFactory,
@@ -679,6 +766,13 @@ extension AetherEngine {
                     + "avBufAhead=\(String(format: "%.2f", avBufAhead))s",
                     category: .session
                 )
+                // AE#418 round 3: a fetch is not a placement. The composition assumed AVPlayer's
+                // timeline was carrying the last axis this side published; the item's own loaded
+                // ranges say whether it was. Live rebases the whole timeline at a program boundary
+                // and nothing older comes back on screen, so it composes nothing and checks nothing.
+                if !self.isLive {
+                    self.verifyPlacementAgainstLoadedRanges(session: session)
+                }
             }
         }
         session.onSeekStateChanged = { [weak self] inFlight, playlistTime in
@@ -773,6 +867,8 @@ extension AetherEngine {
                     "[AetherEngine] onLiveSourceReset → publishing liveSourceReset to host",
                     category: .session
                 )
+                // AE#446 round 3: a #446 outage hold is waiting on this read; it has to stop saying so.
+                self.noteLiveSourceGivenUp()
                 self.liveSourceReset.send()
             }
         }
@@ -1009,6 +1105,7 @@ extension AetherEngine {
         replayVideoNowPlayingInfo(to: host)
         self.nativeHost = host
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         // Publish before wiring mirrors so subscribers see the AVPlayer before the first time update. Only emit on change: re-publishing the same instance retriggers the AVKit re-registration this reuse path avoids.
         if currentAVPlayer !== host.avPlayer {
             self.currentAVPlayer = host.avPlayer
@@ -1143,10 +1240,24 @@ extension AetherEngine {
                 // isBuffering only once playback has started (not during initial load spin-up).
                 let startedPlaying = self.state == .playing || self.state == .paused
                 self.isBuffering = startedPlaying && status == .waitingToPlayAtSpecifiedRate
+                // AE#440: the rate is rolling. The autostart wrote `state = .playing` before AVPlayer had
+                // moved anything, and on a live join AVPlayer can hold a presented first frame still for
+                // seconds past that, so `playbackPhase` reports `.loading` until this latches.
+                //
+                // After the `isBuffering` write and before the `startedPlaying` guard, and both halves of
+                // that placement are load-bearing: latching first would recompute the phase against the
+                // hold's stale `isBuffering` and publish one tick of `.rebuffering` on the way to
+                // `.playing`, and latching after the guard would strand the axis (with it the phase) on a
+                // roll that arrives while `state` is still `.loading`.
+                if status == .playing { self.hasTransportRolled = true }
                 guard startedPlaying else { return }
                 switch status {
                 case .paused:
-                    if self.state != .paused { self.state = .paused }
+                    // AE#440: AVPlayer's pre-play .paused reading reaches this sink after the autostart
+                    // has already declared .playing, so latching it before the first roll published a
+                    // millisecond of `.paused` on every native start. Before the transport has moved
+                    // once, a .paused is the status the item was mounted with, not a pause.
+                    if self.hasTransportRolled, self.state != .paused { self.state = .paused }
                 case .playing, .waitingToPlayAtSpecifiedRate:
                     if self.state != .playing { self.state = .playing }
                 @unknown default:
@@ -1243,10 +1354,19 @@ extension AetherEngine {
                                                   segmentsAtStall: segmentsAtStall,
                                                   segmentsNow: segmentsNow) {
                         let seg = segmentsNow.map(String.init) ?? "?"
+                        // AE#443: "nothing finalized" has two causes and they point in opposite
+                        // directions. A starved producer is waiting on its origin; a PARKED one is
+                        // being held by this engine and is not even reading, so naming the source
+                        // sends the reader to the wrong logs (it sent the reporter of #443 to his
+                        // server three times).
+                        let parked = self.nativeVideoSession?.liveProducerParkedSnapshot == true
                         EngineLog.emit(
                             "[AetherEngine] #65 stage-2 skipped: no segment finalized since the "
-                            + "stall (producer still at seg\(seg)); the producer is starved, not "
-                            + "the consumer; publishing liveSourceReset to host",
+                            + "stall (producer still at seg\(seg)); the producer is "
+                            + (parked ? "PARKED by this engine (live headroom cap), not starved by "
+                                      + "its origin; see the HLSSegmentProducer park line"
+                                      : "starved, not the consumer")
+                            + "; publishing liveSourceReset to host",
                             category: .engine)
                         self.liveSourceReset.send()
                         return
@@ -1349,7 +1469,7 @@ extension AetherEngine {
         // way (HLSVideoEngine drops the resume anchor for a sequential origin), so leaving the
         // item on the EVENT edge default would start it mid-archive with no way back.
         if !isLive, loadedOptions.sequentialOrigin {
-            pendingPreReadySeekSeconds = 0.0
+            pendingPreReadySeek = PendingPreReadySeek(seconds: 0.0, origin: .host)
         }
         // AE#158: consume-and-reset so only the load() that armed the handover swaps in place; audio-switch
         // and recovery reloads keep their own contracts.
@@ -1366,7 +1486,10 @@ extension AetherEngine {
                   skipInitialSeek: LiveReloadPolicy.skipInitialSeek(
                       isLive: isLive, isRejoin: liveRejoin),
                   inPlaceSwap: inPlaceHandover,
-                  isLive: isLive)
+                  contract: .init(
+                      isLive: isLive,
+                      // AE#440: the join tail, opt-in. The host itself gates this on `isLive`.
+                      liveJoinStartsImmediately: loadedOptions.liveJoinStartsImmediately))
         forceNativeLegibleDeselectedUntilHostSelects()
     }
 
@@ -1497,6 +1620,7 @@ extension AetherEngine {
             }
         }
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         // #112 rework: SW-host subtitle tap feeds a session packet store; the shared
         // playhead-paced drainer reads it exactly like the HLS session's store.
         let packetStore = SubtitlePacketStore()
@@ -1533,6 +1657,10 @@ extension AetherEngine {
                 self?.clock.sourceTime = value
             }
             .store(in: &softwareCancellables)
+        // AE#440: this path publishes no transport status to latch a roll from, and all of its
+        // transport flows through the engine's own play()/pause(), so `state` IS its motion signal.
+        // Crediting the roll here keeps `playbackPhase` on the software path exactly as it was.
+        hasTransportRolled = true
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
@@ -1591,6 +1719,7 @@ extension AetherEngine {
         let host = AudioPlaybackHost()
         self.audioHost = host
         applyDesiredVolume(to: host)
+        applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
 
@@ -1604,6 +1733,9 @@ extension AetherEngine {
                 self.clock.bufferedPosition = value
             }
             .store(in: &audioCancellables)
+        // AE#440: no AVPlayer transport status is reconciled on this path, so `state` is its motion
+        // signal. Credited with the host, which leaves `playbackPhase` here exactly as it was.
+        hasTransportRolled = true
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,
@@ -1659,6 +1791,9 @@ extension AetherEngine {
         self.audioAVPlayerHost = host
         applyDesiredVolume(to: host)
         self.audioAVPlayerActive = true
+        // After the active flag: `maxSupportedRate` is 3.0 only once this session counts as audio-only,
+        // and applyDesiredRate clamps against it (#436).
+        applyDesiredRate(to: host)
         self.playlistShiftSeconds = 0
         self.setPresentationAxis(PresentationAxisMap())
         // Reclaim Now-Playing ownership for this session on each track start,
@@ -1677,6 +1812,9 @@ extension AetherEngine {
                 self.clock.sourceTime = value
             }
             .store(in: &audioNativeCancellables)
+        // AE#440: no AVPlayer transport status is reconciled on this path, so `state` is its motion
+        // signal. Credited with the host, which leaves `playbackPhase` here exactly as it was.
+        hasTransportRolled = true
         wireCommonHostSinks(
             duration: host.$duration,
             isReady: host.$isReady,

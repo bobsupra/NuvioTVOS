@@ -81,6 +81,11 @@ struct Issue259A53CaptionAxisTests {
                 "fixture must carry A/53 cc_data on every picture, got \(expected.count)")
 
         let engine = HLSVideoEngine(url: fixtureURL("a53-captions.mp4"), dvModeAvailable: false)
+        // AE#418 round 5: the witness needs the axes to be apart, and the number that says so is the
+        // muxer's own pair. `playlistShiftSeconds` states where AVPlayer places the segment since
+        // 6.56.6, which is 0 on a clip started at its own beginning however far the output axis moved.
+        let axisSeparation = MuxedAxisSeparation()
+        engine.setNativeVideoFrameTimeObserver { axisSeparation.record($0) }
         let collector = PTSCollector()
         engine.a53CaptionObserverForSession = { _, pts, _, tb in
             collector.append(pts, timeBase: tb)
@@ -96,9 +101,9 @@ struct Issue259A53CaptionAxisTests {
         try #require(observed.count == witnessCount,
                      "producer emitted only \(observed.count)/\(witnessCount) A/53 observations")
 
-        // Without a shift the witness proves nothing: the two axes coincide.
-        let shift = engine.playlistShiftSeconds
-        #expect(shift != 0, "fixture produced a zero playlist shift, the axis witness is vacuous")
+        // Without a separation the witness proves nothing: the two axes coincide.
+        let shift = axisSeparation.value ?? 0
+        #expect(shift != 0, "fixture muxed on the source axis, the axis witness is vacuous")
 
         let tb = collector.lastTimeBase()
         #expect(tb.num == sourceTimeBase.num && tb.den == sourceTimeBase.den,
@@ -110,5 +115,21 @@ struct Issue259A53CaptionAxisTests {
             + "\(String(format: "%.3f", worst))s (playlist shift \(String(format: "%.3f", shift))s); "
             + "observed \(observed.prefix(4)) expected \(expected.prefix(4))"
         #expect(observed == expected, "\(detail)")
+    }
+}
+
+/// AE#418 round 5: the distance between the source axis and the axis the producer MUXED, read off
+/// the frame pair. One number for the whole epoch, so the first frame answers it.
+private final class MuxedAxisSeparation: @unchecked Sendable {
+    private let lock = NSLock()
+    private var first: Double?
+
+    func record(_ frame: NativeVideoFrameTime) {
+        lock.lock(); defer { lock.unlock() }
+        if first == nil { first = CMTimeGetSeconds(frame.source) - CMTimeGetSeconds(frame.item) }
+    }
+
+    var value: Double? {
+        lock.lock(); defer { lock.unlock() }; return first
     }
 }

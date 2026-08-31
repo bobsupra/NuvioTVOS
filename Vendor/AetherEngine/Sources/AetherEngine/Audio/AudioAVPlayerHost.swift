@@ -117,6 +117,7 @@ final class AudioAVPlayerHost {
             asset = AVURLAsset(url: url, options: ["AVURLAssetHTTPHeaderFieldsKey": httpHeaders])
         }
         let item = AVPlayerItem(asset: asset)
+        AudioRatePolicy.apply(to: item)
         // externalMetadata is unavailable on macOS (package builds there for tests/aetherctl).
         #if !os(macOS)
         item.externalMetadata = pendingExternalMetadata
@@ -326,11 +327,10 @@ final class AudioAVPlayerHost {
     #endif
 
     func play() {
+        // #436: the speed rides on `defaultRate`, which is the rate play() starts at, so a resume no
+        // longer needs a second rate write behind AVPlayer's back (that write also lost every play()
+        // this host does not issue itself, e.g. from the remote command centre).
         avPlayer.play()
-        // play() forces rate 1.0; restore a non-default speed.
-        if lastRate != 1.0 {
-            avPlayer.rate = lastRate
-        }
         rate = lastRate
     }
 
@@ -340,11 +340,22 @@ final class AudioAVPlayerHost {
     }
 
     func setRate(_ newRate: Float) {
-        lastRate = newRate
+        // #436: zero is a pause, not a speed. Remembered as one it becomes the rate the next play()
+        // resumes at, and the session comes back paused from its own resume.
+        if newRate != 0 {
+            lastRate = newRate
+            avPlayer.defaultRate = newRate
+        }
         if avPlayer.timeControlStatus != .paused {
             avPlayer.rate = newRate
         }
         rate = newRate
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        lastRate = rate
+        avPlayer.defaultRate = rate
     }
 
     func seek(to seconds: Double) async {

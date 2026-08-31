@@ -11,10 +11,10 @@ MPVKit and AetherEngine’s FFmpegBuild both ship frameworks/modules named `Liba
 
 | Package | Location | Change |
 |---|---|---|
-| FFmpegBuild 2.4.3 | `Vendor/FFmpegBuild` | Frameworks/modules renamed to `AetherLib*`; install names rewritten; headers rewritten to use `<AetherLib…/…>` cross-includes; Microsoft legacy video decoders enabled |
-| AetherEngine 6.47.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*` |
+| FFmpegBuild 3.0.0 | `Vendor/FFmpegBuild` | Upstream-shipped `AetherLib*` frameworks/modules and install names; headers use `<AetherLib…/…>` cross-includes; current FFmpeg/dav1d/zimg/zvbi refresh |
+| AetherEngine 6.57.0 | `Vendor/AetherEngine` | Path dep on `../FFmpegBuild`; all `import Libav*` → `import AetherLib*`; preserves Nuvio playback, diagnostics, SMB, subtitle, Dolby Vision, and AV1 Metal integrations |
 
-Refresh script: `Vendor/namespace_ffmpegbuild.py` (re-run after restoring upstream `Lib*.xcframework` trees).
+FFmpegBuild 3.0.0 is already namespaced upstream; do not run the refresh script on its `AetherLib*.xcframework` trees. For older upstream `Lib*.xcframework` trees, use `Vendor/namespace_ffmpegbuild.py` once before adopting them.
 
 ## App integration
 

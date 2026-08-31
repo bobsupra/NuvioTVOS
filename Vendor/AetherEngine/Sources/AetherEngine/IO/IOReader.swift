@@ -1,6 +1,6 @@
 import Foundation
 
-/// Custom byte source for `AetherEngine.load(source:)`. Use for memory buffers, encrypted containers, or anything not a plain URL. `read`/`seek` run on the engine's demux thread (not main); `close()` is called exactly once at teardown, never between probe and playback.
+/// Custom byte source for `AetherEngine.load(source:)`. Use for memory buffers, encrypted containers, or anything not a plain URL. `read`/`seek` run on the engine's demux thread (not main); `close()` is called exactly once at teardown, never between probe and playback. The engine wraps every call into a reader in an autorelease pool, so a reader is free to use Foundation APIs that hand back autoreleased objects (`FileHandle`, `NSData`) without stranding one per read on a pump thread that runs for the length of the session.
 public protocol IOReader: AnyObject, Sendable {
     /// Read up to `size` bytes into `buffer`. Return bytes read, `0` on EOF, or negative on error. The `buffer` optional reflects the C import convention; the engine never passes nil.
     func read(_ buffer: UnsafeMutablePointer<UInt8>?, size: Int32) -> Int32

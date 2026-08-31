@@ -194,9 +194,19 @@ final class AudioPlaybackHost {
     }
 
     func setRate(_ newRate: Float) {
+        // #436: zero is a pause, not a speed; see SoftwarePlaybackHost.setRate.
+        if newRate == 0 {
+            pause()
+            return
+        }
         lastRate = newRate
         audioOutput?.setRate(newRate)
         rate = newRate
+    }
+
+    func setResumeRate(_ rate: Float) {
+        guard rate != 0 else { return }
+        lastRate = rate
     }
 
     /// #254: the demuxer reposition is awaited off the main actor, for the reason

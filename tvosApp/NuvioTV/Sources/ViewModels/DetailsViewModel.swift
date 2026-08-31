@@ -35,8 +35,9 @@ class DetailsViewModel: ObservableObject {
         enrichmentTask?.cancel()
 
         // Check if full metadata is already in memory so we can render frame 0 instantly without showing a spinner
-        if let cached = (repository as? CinemetaCatalogRepository)?.cachedMetadata(for: id),
-           CinemetaCatalogRepository.isFullMetadata(cached) {
+        if let cinemetaRepo = repository as? CinemetaCatalogRepository,
+           let cached = cinemetaRepo.cachedMetadata(for: id),
+           cinemetaRepo.isCachedFullMetadata(id: id) {
             uiState = DetailsUiState(
                 isLoading: false,
                 meta: cached,
@@ -368,15 +369,27 @@ class DetailsViewModel: ObservableObject {
         for tmdb in tmdbVideos {
             let key = "\(tmdb.season):\(tmdb.episode)"
             if let ex = bySeasonEp.removeValue(forKey: key) {
+                let tmdbTitle = nonEmpty(tmdb.title)
+                let titleToUse: String
+                if let tmdbTitle, !tmdbTitle.hasPrefix("Episode ") {
+                    titleToUse = tmdbTitle
+                } else if !ex.title.isEmpty && !ex.title.hasPrefix("Episode ") {
+                    titleToUse = ex.title
+                } else {
+                    titleToUse = tmdbTitle ?? ex.title
+                }
+
+                let overviewToUse = nonEmpty(tmdb.overview) ?? nonEmpty(ex.overview)
+
                 result.append(NuvioVideo(
                     id: ex.id,
-                    title: (ex.title.hasPrefix("Episode ") || ex.title.isEmpty) ? tmdb.title : ex.title,
+                    title: titleToUse,
                     season: ex.season,
                     episode: ex.episode,
-                    thumbnail: ex.thumbnail ?? tmdb.thumbnail,
-                    overview: (ex.overview == nil || ex.overview?.isEmpty == true) ? tmdb.overview : ex.overview,
-                    released: ex.released ?? tmdb.released,
-                    rating: ex.rating ?? tmdb.rating
+                    thumbnail: tmdb.thumbnail ?? ex.thumbnail,
+                    overview: overviewToUse,
+                    released: tmdb.released ?? ex.released,
+                    rating: tmdb.rating ?? ex.rating
                 ))
             } else {
                 result.append(tmdb)
@@ -390,6 +403,13 @@ class DetailsViewModel: ObservableObject {
         return result.sorted {
             (seasonSortKey($0.season), $0.episode) < (seasonSortKey($1.season), $1.episode)
         }
+    }
+
+    private static func nonEmpty(_ value: String?) -> String? {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+            return nil
+        }
+        return value
     }
 
     private static func seasonSortKey(_ season: Int) -> Int {

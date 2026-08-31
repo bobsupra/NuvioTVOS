@@ -22,7 +22,7 @@ struct PauseOverlayView: View {
             VStack(alignment: .leading, spacing: 14) {
                 Spacer()
 
-                Text("YOU'RE WATCHING")
+                Text(L10n.string("player_pause_youre_watching", fallback: "YOU'RE WATCHING"))
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundStyle(.white.opacity(0.5))
                     .kerning(2)
@@ -62,7 +62,7 @@ struct PauseOverlayView: View {
                 }
 
                 if !cast.isEmpty {
-                    Text("CAST")
+                    Text(L10n.string("details_cast", fallback: "Cast").uppercased())
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundStyle(.white.opacity(0.45))
                         .kerning(2)

@@ -15,15 +15,15 @@ struct CastCrewSection: View {
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
             if let cast = cast, !cast.isEmpty {
-                CastList(title: "Cast", names: cast)
+                CastList(title: L10n.string("details_cast", fallback: "Cast"), names: cast)
             }
 
             if let director = director, !director.isEmpty {
-                CrewList(title: "Director", names: director)
+                CrewList(title: L10n.string("details_director", fallback: "Director"), names: director)
             }
 
             if let writer = writer, !writer.isEmpty {
-                CrewList(title: "Writer", names: writer)
+                CrewList(title: L10n.string("details_writer", fallback: "Writer"), names: writer)
             }
         }
     }

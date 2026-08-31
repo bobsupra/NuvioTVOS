@@ -10,7 +10,7 @@
   <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dswift-versions"></a>
   <a href="https://swiftpackageindex.com/superuser404notfound/FFmpegBuild"><img src="https://img.shields.io/endpoint?url=https%3A%2F%2Fswiftpackageindex.com%2Fapi%2Fpackages%2Fsuperuser404notfound%2FFFmpegBuild%2Fbadge%3Ftype%3Dplatforms"></a>
   <img src="https://img.shields.io/badge/FFmpeg-8.1-brightgreen">
-  <img src="https://img.shields.io/badge/dav1d-1.5.1-blue">
+  <img src="https://img.shields.io/badge/dav1d-1.5.4-blue">
   <img src="https://img.shields.io/badge/license-LGPL--2.1-lightgrey">
   <a href="https://ko-fi.com/superuser404"><img src="https://img.shields.io/badge/Ko--fi-Support-FF5E5B?logo=kofi&logoColor=white"></a>
 </p>
@@ -27,7 +27,7 @@ Full FFmpeg builds for iOS land at 40-70 MB because they bundle a TLS stack, enc
 
 | Library        | What it does                                          |
 | -------------- | ----------------------------------------------------- |
-| libavformat    | Demux MKV, MP4, WebM, MPEG-TS, MPEG-PS (VOB / DVD), DASH, AVI, OGG, FLV, plus raw elementary streams |
+| libavformat    | Demux MKV, MP4, WebM, MPEG-TS, MPEG-PS (VOB / DVD), HLS, AVI, OGG, FLV, plus raw elementary streams |
 | libavcodec     | Decode video + audio (with VideoToolbox bridge)       |
 | libavutil      | Shared primitives                                     |
 | libswresample  | Audio resampling / channel remap / format convert     |
@@ -68,16 +68,34 @@ Output lands in `Sources/` as xcframeworks, ready to consume via Swift Package M
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "1.0.0")
+    .package(url: "https://github.com/superuser404notfound/FFmpegBuild", from: "3.0.0")
 ]
 
 // Target:
-.product(name: "FFmpegBuild", package: "FFmpegBuild")
+.product(name: "AetherFFmpegBuild", package: "FFmpegBuild")
 ```
 
 Pin `branch: "main"` instead of a version if you want to track the latest rebuilds (that is how [AetherEngine](https://github.com/superuser404notfound/AetherEngine) consumes it).
 
-Then import the modules you need: `Libavformat`, `Libavcodec`, `Libavutil`, `Libswresample`, `Libswscale`, `Libavfilter`, `Libdav1d`. (`Libzimg` is a link-only backend for `zscale`, and `Libzvbi` a link-only backend for the teletext decoder; you don't import either directly.) The umbrella `FFmpegBuild` product links all of them plus the system frameworks (AudioToolbox, CoreMedia, CoreVideo, VideoToolbox) in one shot.
+Then import the modules you need: `AetherLibavformat`, `AetherLibavcodec`, `AetherLibavutil`, `AetherLibswresample`, `AetherLibswscale`, `AetherLibavfilter`, `AetherLibdav1d`. (`AetherLibzimg` is a link-only backend for `zscale`, and `AetherLibzvbi` a link-only backend for the teletext decoder; you don't import either directly.) The umbrella `AetherFFmpegBuild` product links all of them plus the system frameworks (AudioToolbox, CoreMedia, CoreVideo, VideoToolbox) in one shot.
+
+The FFmpeg API itself is unchanged: `avformat_open_input`, `avcodec_send_packet` and the rest keep their names. Only the module and framework names carry the prefix.
+
+## Sitting next to another FFmpeg
+
+Every FFmpeg packaged for Apple platforms declares the same target names, so before 3.0.0 this package could not resolve in an app that also had one. A fallback ladder with KSPlayer, mpv or MobileVLCKit in it is exactly such an app:
+
+```
+error: multiple similar targets 'Libavcodec', 'Libavfilter', 'Libavformat' and 3 others
+appear in package 'ffmpegbuild' and 'ffmpegkit'
+```
+
+`moduleAliases` does not reach this: it renames Swift source targets, not binary ones. Two things had to change, and 3.0.0 changes both:
+
+- **SwiftPM target and product names** are unique across the whole dependency graph. `AetherLibavcodec` no longer meets `Libavcodec`.
+- **Framework bundle and install names**, because two `Libavcodec.framework` bundles cannot both live at `App.app/Frameworks/` under one `@rpath/Libavcodec.framework/Libavcodec`. The shipped install name is now `@rpath/AetherLibavcodec.framework/AetherLibavcodec`.
+
+What the rename does **not** change is the C symbols: `_avcodec_open2` is still `_avcodec_open2` in every FFmpeg on earth. Distinct dynamic frameworks are enough on their own, because the two-level namespace records per reference which dylib it came from. A **static** FFmpeg in the same executable is the case that still bites: its symbols become definitions inside the executable and win for every object linked beside them. The fix there is to link the code that calls this build into its own dynamic framework, so its `_av*` bind at that framework's link. AetherEngine documents the recipe in [docs/api.md](https://github.com/superuser404notfound/AetherEngine/blob/main/docs/api.md#one-ffmpeg-and-it-has-to-be-the-engines).
 
 ## Decoder support
 
@@ -94,8 +112,8 @@ Release configuration, dynamic framework binaries as embedded in the app (all si
 
 | Target                            | FFmpeg    | dav1d    | zimg     | zvbi     | Total     |
 | --------------------------------- | --------- | -------- | -------- | -------- | --------- |
-| iOS / tvOS / visionOS arm64       | ~8.2 MB   | ~0.7 MB  | ~0.3 MB  | ~0.5 MB  | ~9.8 MB   |
-| macOS universal (arm64 + x86_64)  | ~17.3 MB  | ~2.3 MB  | ~0.9 MB  | ~1.0 MB  | ~21.5 MB  |
+| iOS / tvOS / visionOS arm64       | ~8.7 MB   | ~0.8 MB  | ~0.3 MB  | ~0.5 MB  | ~10.5 MB  |
+| macOS universal (arm64 + x86_64)  | ~18.3 MB  | ~2.5 MB  | ~0.9 MB  | ~1.0 MB  | ~22.7 MB  |
 
 Assembly-optimized paths are enabled where the Apple toolchain permits.
 
@@ -107,6 +125,18 @@ Assembly-optimized paths are enabled where the Apple toolchain permits.
 - **`patch_ffmpeg_pgssub`**: `pgssubdec.c` no longer flushes retained palettes/objects on an Epoch-Continue PCS (composition_state 3). An Epoch Continue set marks a seamless connection between two clips: a conformant set re-conveys everything it references (so skipping the flush is output-neutral), while a non-conformant bare PCS+WDS+END set relies on retained state and was dropped whole with "Invalid palette id 0" under the upstream flush (AetherEngine issue 142). Error resilience, not a spec requirement; Acquisition Point and Epoch Start keep flushing. Proposed upstream as FFmpeg PR 23851.
 - **`patch_ffmpeg_visionos`**: `videotoolbox.c` skips `kCVPixelBufferOpenGLESCompatibilityKey` on visionOS, where the key is unavailable because the platform has neither OpenGL ES nor OpenGL. Upstream selects it on `TARGET_OS_IPHONE`, which is 1 on visionOS (`TARGET_OS_IOS` is the one that is 0), so the hardware-decode path does not compile for `xros` without this. Nothing is lost: the attribute only asks CoreVideo to make the buffer bindable as a GL texture, and on visionOS every consumer is Metal, which the IOSurface properties set alongside it already cover.
 - **`patch_ffmpeg_matroska_tts`**: `matroskadec.c` logs a warning when a Matroska track carries a `TrackTimestampScale` other than 1.0. Timestamp behavior stays exactly as upstream implements it, which is what RFC 9559 specifies (block timestamps and BlockDuration are Track Ticks). The element is deprecated (maxver 3) and many readers ignore it, so a file carrying it may have been authored against such readers and mistime silently; the warning surfaces that condition (AetherEngine issue 145). Until 2.1.x this patch clamped TTS to 1.0; the clamp rested on a wrong reading of the RFC and was dropped after upstream review (FFmpeg PR 23852).
+
+## Keeping the pins current
+
+The versions this package builds are shell variables in `build.sh`, not a manifest, so no dependency bot sees them. `Scripts/check-upstream.py` compares all five (FFmpeg, dav1d, zimg, libzvbi, and `dolby_vision` over in [LibDovi](https://github.com/superuser404notfound/LibDovi)) against what upstream has published:
+
+```bash
+python3 Scripts/check-upstream.py --libdovi ../LibDovi/build.sh
+```
+
+It exits 1 when something is behind and prints why, with any published security advisory for that project attached as context. FFmpeg is compared against the newest patch on the pinned minor line rather than the newest tag overall: moving off `8.1` is a deliberate decision, not a weekly reminder.
+
+The [Upstream watch](.github/workflows/upstream-watch.yml) workflow runs it every Monday and keeps exactly one issue: opened when a pin falls behind, rewritten while it stays behind, and closed by the run that finds everything current again. Nothing is posted when there is nothing to do.
 
 ## Built with
 
