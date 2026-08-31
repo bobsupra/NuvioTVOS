@@ -603,6 +603,11 @@ final class AISubtitleTranslationState: ObservableObject {
     static func cleaned(_ text: String, stripHearingImpaired: Bool) -> String {
         var result = text
             .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(
+                of: #"\{(\\(?:an\d+|pos\([^)]*\)|fn[^{}\\\s]+|r[^{}\\\s]+|fad\([^)]*\)|fade\([^)]*\)|[1-4]?c&[Hh]?[0-9A-Fa-f]+&?|[1-4]?a&[Hh]?[0-9A-Fa-f]+&?|alpha&[Hh]?[0-9A-Fa-f]+&?|[biuso]\d+|fs\d+|fsc[xy]\d+|fsp\d+|fr[xyz]?\d+|fe\d+|k[f|o]?\d+|q\d+|p\d+|pbo\d+|bord\d+|shad\d+|blur\d+|be\d+|clip\([^)]*\)|iclip\([^)]*\)|t\([^)]*\)|move\([^)]*\)|org\([^)]*\))[^{}\\]*)+\}"#,
+                with: "",
+                options: .regularExpression
+            )
             .trimmingCharacters(in: .whitespacesAndNewlines)
         guard stripHearingImpaired else { return result }
         result = result

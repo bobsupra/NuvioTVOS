@@ -46,22 +46,24 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3.1** is the latest tvOS release.
+**Beta 3.3.2** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.1/NuvioTV-3.3.1-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.1) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.2/NuvioTV-3.3.2-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.2) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 100+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3.1
+### New in Beta 3.3.2
 
-- **Hotfix (Re-Release):** Fixes a critical issue where TV shows were missing episode details and appearing as movies on the Details screen; enhances episode merging from TMDB.
-- Updates **AetherEngine** to **6.47.0** and **FFmpegBuild** to **2.4.3** with hardened Dolby Vision RPU conversion, startup progress reporting, no-cut stall watchdogs, and MPVKit coexistence.
-- Expands the **Details screen** with trailer playback, interactive cast/crew lists, studio navigation, and high-DPI backdrop transitions.
-- Refines player controls with live subtitle timing adjustments, audio delay sliders, and audio boost controls.
-- Improves stream source selection, cached-only badges, and smart binge auto-play source retention.
+- Upgrades **AetherEngine to 6.57.0**, **FFmpegBuild to 3.0.0**, and **LibDovi to 2.1.0** with native `AetherLib*` module namespaces and full MPVKit coexistence.
+- Adds **AV1 Metal GPU hardware acceleration** for 4K AV1 (`YUV420P`/`YUV420P10LE` to NV12/P010), eliminating CPU-heavy pixel scaling and dropped frames on Apple TV 4K.
+- Introduces **Post-Play Next-Episode & Recommendations Overlay** (`PostPlayRecommendationOverlay.swift`) with auto-play countdown timers and episode details.
+- Adds full **App Localization & Multi-Language Support** with a 25,000+ line localized strings database (`AppLanguageCatalog.json`).
+- Adds modern **Player Loading Overlay** during stream discovery, buffering, and track changes.
+- Adds **ReauthSheet** to smoothly refresh expired Trakt / Debrid / Addon sessions.
+- Enhances **IntroDB Auto-Skip** accuracy and TV show episode metadata merging from TMDB.
 
 ### The new player
 
