@@ -1,0 +1,8 @@
+# Normalise line endings across the Windows edit box and the Mac build box.
+* text=auto
+# Shell scripts run on macOS; CRLF breaks them.
+*.sh text eol=lf
+# Xcode-owned files are LF on disk.
+*.pbxproj text eol=lf
+*.xcscheme text eol=lf
+*.plist text eol=lf

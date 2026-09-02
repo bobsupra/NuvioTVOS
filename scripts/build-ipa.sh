@@ -3,7 +3,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TVOS_WORKSPACE="$ROOT_DIR/tvosApp/NuvioTV.xcworkspace"
+TVOS_PROJECT="$ROOT_DIR/tvosApp/NuvioTV.xcodeproj"
 TVOS_SCHEME="NuvioTV"
 OUTPUT_DIR="$ROOT_DIR/build-ipa"
 ARCHIVE_DIR="$(mktemp -d)/NuvioTV.xcarchive"
@@ -15,7 +15,7 @@ trap cleanup EXIT
 
 echo "==> Archiving ${TVOS_SCHEME} for tvOS (Release, unsigned)..."
 xcodebuild archive \
-  -workspace "$TVOS_WORKSPACE" \
+  -project "$TVOS_PROJECT" \
   -scheme "$TVOS_SCHEME" \
   -configuration Release \
   -destination 'generic/platform=tvOS' \

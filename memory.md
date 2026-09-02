@@ -51,7 +51,7 @@ The fresh-install Guest also used to overlap with remote profile slot `1`, makin
 
 ## Regression test
 
-1. Build from `tvosApp/NuvioTV.xcworkspace`, not the standalone project.
+1. Build from `tvosApp/NuvioTV.xcodeproj` (CocoaPods was removed; there is no workspace).
 2. Boot an Apple TV simulator.
 3. Uninstall `com.nuvio.app.tv` to remove local app data.
 4. Install and launch the new `NuvioTV.app` build.
@@ -64,7 +64,7 @@ The fresh-install Guest also used to overlap with remote profile slot `1`, makin
 Build verification:
 
 ```sh
-xcodebuild -workspace tvosApp/NuvioTV.xcworkspace \
+xcodebuild -project tvosApp/NuvioTV.xcodeproj \
   -scheme NuvioTV \
   -sdk appletvsimulator \
   -configuration Debug \
@@ -181,7 +181,7 @@ Key implementation:
 Physical-target compile check:
 
 ```sh
-xcodebuild -workspace tvosApp/NuvioTV.xcworkspace \
+xcodebuild -project tvosApp/NuvioTV.xcodeproj \
   -scheme NuvioTV \
   -sdk appletvos \
   -destination 'generic/platform=tvOS' \
@@ -355,7 +355,7 @@ the release version and `BUILD` with the next integer build number.
 
 ### 6. Create the unsigned Release archive
 
-1. Archive from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`,
+1. Archive from `tvosApp/NuvioTV.xcodeproj`, scheme `NuvioTV`,
    configuration `Release`, destination `generic/platform=tvOS`.
 2. Disable signing with:
    - `CODE_SIGNING_ALLOWED=NO`
@@ -792,7 +792,7 @@ Tests and app build:
 
 ```sh
 swift test --package-path Vendor/AetherEngine
-xcodebuild build -workspace tvosApp/NuvioTV.xcworkspace \
+xcodebuild build -project tvosApp/NuvioTV.xcodeproj \
   -scheme NuvioTV \
   -destination 'generic/platform=tvOS Simulator' \
   CODE_SIGNING_ALLOWED=NO

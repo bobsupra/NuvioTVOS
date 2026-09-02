@@ -7,7 +7,6 @@
 	objects = {
 
 /* Begin PBXBuildFile section */
-		0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */ = {isa = PBXBuildFile; fileRef = 049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */; };
 		13B07FBF1A68108700A75B9A /* Images.xcassets in Resources */ = {isa = PBXBuildFile; fileRef = 13B07FB51A68108700A75B9A /* Images.xcassets */; };
 		3E461D99554A48A4959DE609 /* SplashScreen.storyboard in Resources */ = {isa = PBXBuildFile; fileRef = AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */; };
 		51A100020000000000000002 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A100010000000000000001 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift */; };
@@ -187,7 +186,6 @@
 
 /* Begin PBXFileReference section */
 		00E356EE1AD99517003FC87E /* NuvioTVTests.xctest */ = {isa = PBXFileReference; explicitFileType = wrapper.cfbundle; includeInIndex = 0; path = NuvioTVTests.xctest; sourceTree = BUILT_PRODUCTS_DIR; };
-		049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */ = {isa = PBXFileReference; explicitFileType = wrapper.framework; includeInIndex = 0; path = Pods_NuvioTV.framework; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07F961A680F5B00A75B9A /* NuvioTV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = NuvioTV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		13B07FB51A68108700A75B9A /* Images.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; name = Images.xcassets; path = NuvioTV/Images.xcassets; sourceTree = "<group>"; };
 		13B07FB61A68108700A75B9A /* Info.plist */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = text.plist.xml; name = Info.plist; path = NuvioTV/Info.plist; sourceTree = "<group>"; };
@@ -200,7 +198,6 @@
 		7E51000000000000000000A2 /* TopShelf/TopShelfContentProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelf/TopShelfContentProvider.swift; sourceTree = "<group>"; };
 		7E51000000000000000000A3 /* TopShelf/Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = TopShelf/Info.plist; sourceTree = "<group>"; };
 		7E51000000000000000000A4 /* TopShelf/TopShelf.entitlements */ = {isa = PBXFileReference; lastKnownFileType = text.plist.entitlements; path = TopShelf/TopShelf.entitlements; sourceTree = "<group>"; };
-		9ADABB9F5AC8C1969E736848 /* Pods-NuvioTV.release.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-NuvioTV.release.xcconfig"; path = "Target Support Files/Pods-NuvioTV/Pods-NuvioTV.release.xcconfig"; sourceTree = "<group>"; };
 		A1L100010000000000000001 /* NuvioTV/Sources/Core/AppLanguage.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/AppLanguage.swift; sourceTree = "<group>"; };
 		A1L100030000000000000003 /* NuvioTV/Resources/AppLanguageCatalog.json */ = {isa = PBXFileReference; lastKnownFileType = text.json; path = NuvioTV/Resources/AppLanguageCatalog.json; sourceTree = "<group>"; };
 		AA286B85B6C04FC6940260E9 /* SplashScreen.storyboard */ = {isa = PBXFileReference; fileEncoding = 4; lastKnownFileType = file.storyboard; name = SplashScreen.storyboard; path = NuvioTV/SplashScreen.storyboard; sourceTree = "<group>"; };
@@ -240,7 +237,6 @@
 		AE10F01D /* PlayerControlsSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerControlsSettingsTests.swift; sourceTree = "<group>"; };
 		AE10F01E /* AuthReauthFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthReauthFlowTests.swift; sourceTree = "<group>"; };
 		AE10F010 /* NuvioTV/Sources/Core/Player/PictureInPictureManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Player/PictureInPictureManager.swift; sourceTree = "<group>"; };
-		B7646E52916949A3A8EF6748 /* Pods-NuvioTV.debug.xcconfig */ = {isa = PBXFileReference; includeInIndex = 1; lastKnownFileType = text.xcconfig; name = "Pods-NuvioTV.debug.xcconfig"; path = "Target Support Files/Pods-NuvioTV/Pods-NuvioTV.debug.xcconfig"; sourceTree = "<group>"; };
 		C0D300010000000000000001 /* NuvioTV/Sources/NuvioTVApp.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/NuvioTVApp.swift; sourceTree = "<group>"; };
 		C0D300020000000000000002 /* NuvioTV/Sources/Models/CatalogModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Models/CatalogModels.swift; sourceTree = "<group>"; };
 		C0D300030000000000000003 /* NuvioTV/Sources/Data/Repository/CatalogRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Data/Repository/CatalogRepository.swift; sourceTree = "<group>"; };
@@ -343,7 +339,6 @@
 				7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */,
 				AE00BF010000000000000001 /* AetherEngine in Frameworks */,
 				A21100000000000000000002 /* AetherEngineSMB in Frameworks */,
-				0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -375,18 +370,8 @@
 		2D16E6871FA4F8E400B85C8A /* Frameworks */ = {
 			isa = PBXGroup;
 			children = (
-				049C9E9452E6B80AE60A799B /* Pods_NuvioTV.framework */,
 			);
 			name = Frameworks;
-			sourceTree = "<group>";
-		};
-		5DC21A6786F4F89B4FF03F9E /* Pods */ = {
-			isa = PBXGroup;
-			children = (
-				B7646E52916949A3A8EF6748 /* Pods-NuvioTV.debug.xcconfig */,
-				9ADABB9F5AC8C1969E736848 /* Pods-NuvioTV.release.xcconfig */,
-			);
-			path = Pods;
 			sourceTree = "<group>";
 		};
 		7E51000000000000000000F0 /* TopShelf */ = {
@@ -415,7 +400,6 @@
 				832341AE1AAA6A7D00B99B32 /* Libraries */,
 				83CBBA001A601CBA00E9B192 /* Products */,
 				2D16E6871FA4F8E400B85C8A /* Frameworks */,
-				5DC21A6786F4F89B4FF03F9E /* Pods */,
 			);
 			indentWidth = 2;
 			sourceTree = "<group>";
@@ -631,7 +615,6 @@
 			isa = PBXNativeTarget;
 			buildConfigurationList = 13B07F931A680F5B00A75B9A /* Build configuration list for PBXNativeTarget "NuvioTV" */;
 			buildPhases = (
-				08A4A3CD28434E44B6B9DE2E /* [CP] Check Pods Manifest.lock */,
 				13B07F871A680F5B00A75B9A /* Sources */,
 				13B07F8C1A680F5B00A75B9A /* Frameworks */,
 				AE00CP010000000000000001 /* Embed Frameworks */,
@@ -744,28 +727,6 @@
 /* End PBXResourcesBuildPhase section */
 
 /* Begin PBXShellScriptBuildPhase section */
-		08A4A3CD28434E44B6B9DE2E /* [CP] Check Pods Manifest.lock */ = {
-			isa = PBXShellScriptBuildPhase;
-			buildActionMask = 2147483647;
-			files = (
-			);
-			inputFileListPaths = (
-			);
-			inputPaths = (
-				"${PODS_PODFILE_DIR_PATH}/Podfile.lock",
-				"${PODS_ROOT}/Manifest.lock",
-			);
-			name = "[CP] Check Pods Manifest.lock";
-			outputFileListPaths = (
-			);
-			outputPaths = (
-				"$(DERIVED_FILE_DIR)/Pods-NuvioTV-checkManifestLockResult.txt",
-			);
-			runOnlyForDeploymentPostprocessing = 0;
-			shellPath = /bin/sh;
-			shellScript = "diff \"${PODS_PODFILE_DIR_PATH}/Podfile.lock\" \"${PODS_ROOT}/Manifest.lock\" > /dev/null\nif [ $? != 0 ] ; then\n    # print error to STDERR\n    echo \"error: The sandbox is not in sync with the Podfile.lock. Run 'pod install' or update your CocoaPods installation.\" >&2\n    exit 1\nfi\n# This output is used by Xcode 'outputs' to avoid re-running this script phase.\necho \"SUCCESS\" > \"${SCRIPT_OUTPUT_FILE_0}\"\n";
-			showEnvVarsInLog = 0;
-		};
 		AE00SP010000000000000001 /* Thin Aether Simulator Frameworks */ = {
 			isa = PBXShellScriptBuildPhase;
 			alwaysOutOfDate = 1;
@@ -1009,7 +970,6 @@
 		};
 		13B07F941A680F5B00A75B9A /* Debug */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = B7646E52916949A3A8EF6748 /* Pods-NuvioTV.debug.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;
@@ -1044,7 +1004,6 @@
 		};
 		13B07F951A680F5B00A75B9A /* Release */ = {
 			isa = XCBuildConfiguration;
-			baseConfigurationReference = 9ADABB9F5AC8C1969E736848 /* Pods-NuvioTV.release.xcconfig */;
 			buildSettings = {
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CLANG_ENABLE_MODULES = YES;

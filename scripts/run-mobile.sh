@@ -10,7 +10,7 @@ IOS_APP_NAME="Nuvio.app"
 IOS_BUNDLE_ID="com.nuvio.app"
 IOS_PREFERRED_DEVICE_MODEL="${IOS_PREFERRED_DEVICE_MODEL:-iPhone 14 Pro}"
 TVOS_APP_DIR="$ROOT_DIR/tvosApp"
-TVOS_WORKSPACE="$TVOS_APP_DIR/NuvioTV.xcworkspace"
+TVOS_PROJECT="$TVOS_APP_DIR/NuvioTV.xcodeproj"
 TVOS_SCHEME="NuvioTV"
 TVOS_DERIVED_DATA_BASE="$ROOT_DIR/build/tvos-derived"
 TVOS_APP_NAME="NuvioTV.app"
@@ -47,14 +47,6 @@ first_booted_tvos_simulator() {
     | sed -E 's/.*\(([A-F0-9-]+)\) \(Booted\).*/\1/'
 }
 
-ensure_tvos_pods() {
-  if [[ ! -f "$TVOS_APP_DIR/Pods/Manifest.lock" ]]; then
-    require_command pod
-
-    echo "Generating tvOS CocoaPods project..."
-    (cd "$TVOS_APP_DIR" && pod install)
-  fi
-}
 
 preferred_ios_device() {
   xcrun xcdevice list --timeout 5 2>/dev/null | python3 -c '
@@ -191,7 +183,6 @@ run_ios_physical() {
 run_tvos_simulator() {
   require_command xcodebuild
   require_command xcrun
-  ensure_tvos_pods
 
   local simulator_id
   simulator_id="$(first_booted_tvos_simulator)"
@@ -210,7 +201,7 @@ run_tvos_simulator() {
 
   echo "Building tvOS debug app for simulator $simulator_id..."
   xcodebuild \
-    -workspace "$TVOS_WORKSPACE" \
+    -project "$TVOS_PROJECT" \
     -scheme "$TVOS_SCHEME" \
     -configuration Debug \
     -destination "id=$simulator_id" \

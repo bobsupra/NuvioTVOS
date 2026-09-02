@@ -128,7 +128,6 @@ Contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for contribu
 
 - macOS with Xcode installed.
 - Apple TV simulator runtime installed in Xcode.
-- CocoaPods if `tvosApp/Pods` needs to be regenerated.
 - Network access for catalog metadata, source lookups, and Swift Package resolution.
 
 The Xcode project targets Apple TV (`SDKROOT = appletvos`) with bundle id `com.nuvio.app.tv`. The tvOS deployment target is configured in [project.pbxproj](./tvosApp/NuvioTV.xcodeproj/project.pbxproj).
@@ -140,18 +139,10 @@ git clone <your-fork-url> NuvioTVOS
 cd NuvioTVOS
 ```
 
-Install pods if the CocoaPods workspace has not been generated:
+Open the tvOS project:
 
 ```bash
-cd tvosApp
-pod install
-cd ..
-```
-
-Open the tvOS workspace:
-
-```bash
-open tvosApp/NuvioTV.xcworkspace
+open tvosApp/NuvioTV.xcodeproj
 ```
 
 Use the `NuvioTV` scheme and an Apple TV simulator.
@@ -170,7 +161,7 @@ You can also build directly with Xcode:
 
 ```bash
 xcodebuild \
-  -workspace tvosApp/NuvioTV.xcworkspace \
+  -project tvosApp/NuvioTV.xcodeproj \
   -scheme NuvioTV \
   -configuration Debug \
   -destination 'generic/platform=tvOS Simulator' \
@@ -200,7 +191,7 @@ Run tests from Xcode, or with:
 
 ```bash
 xcodebuild test \
-  -workspace tvosApp/NuvioTV.xcworkspace \
+  -project tvosApp/NuvioTV.xcodeproj \
   -scheme NuvioTV \
   -destination 'platform=tvOS Simulator,name=Apple TV'
 ```

@@ -48,3 +48,6 @@ artifacts/*-ipa/
 # Local backend credentials
 supabase/functions/**/.env
 supabase/functions/**/.env.local
+
+# Per-machine remote build settings (scripts/remote-build.sh)
+scripts/.env

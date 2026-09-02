@@ -20,7 +20,11 @@ DerivedData
 *.hmap
 *.ipa
 *.xcuserstate
-project.xcworkspace
+# Keep only the SwiftPM pins out of the project-level workspace dir.
+project.xcworkspace/*
+!project.xcworkspace/xcshareddata/
+project.xcworkspace/xcshareddata/*
+!project.xcworkspace/xcshareddata/swiftpm/
 .xcode.env.local
 
 # Bundle artifacts
