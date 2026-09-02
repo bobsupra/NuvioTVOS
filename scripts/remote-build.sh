@@ -36,7 +36,9 @@ git -C "$SCRIPT_DIR/.." push -q -u origin "$BRANCH"
 echo ">> building $BRANCH on $MAC_HOST ($TARGET)"
 # zsh -l so xcodebuild/xcrun resolve the same way they do in a Terminal window.
 # Local env values are forwarded explicitly since ssh does not pass them.
-"$SSH_BIN" -t "$MAC_HOST" "zsh -lc '
+# Allocate a TTY only when we have one (interactive run); background runs get none.
+TTY_FLAG=""; [ -t 0 ] && TTY_FLAG="-t"
+"$SSH_BIN" $TTY_FLAG "$MAC_HOST" "zsh -lc '
   set -e
   cd $MAC_REPO
   git fetch -q origin
