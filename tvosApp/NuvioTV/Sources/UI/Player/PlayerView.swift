@@ -152,7 +152,7 @@ struct PlayerView: View {
                     onBack: {
                         if viewModel.postPlayState.isTrailerPlaying {
                             viewModel.stopPostPlayTrailer()
-                        } else if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
+                        } else if canReturnToPlayerFromPostPlay {
                             viewModel.returnToPlayerFromPostPlay()
                         } else {
                             onBack()
@@ -595,49 +595,7 @@ struct PlayerView: View {
         .onPlayPauseCommand {
             viewModel.togglePlayPause()
         }
-        .onMoveCommand { direction in
-            // The Episodes/Sources sheet exclusively owns directional input.
-            // Do not let list navigation also seek or reveal player controls.
-            guard viewModel.sidePanel == nil else { return }
-
-            // Trackpad swipes also emit move commands; the pan recognizer sets
-            // moveSuppressed so a swipe does not double-fire as a skip.
-            if viewModel.moveSuppressed { return }
-
-            if viewModel.isScrubbing {
-                switch direction {
-                case .left:
-                    viewModel.scrubJump(-Double(max(viewModel.seekStepSeconds * 4, 60)))
-                case .right:
-                    viewModel.scrubJump(Double(max(viewModel.seekStepSeconds * 4, 60)))
-                default:
-                    viewModel.cancelScrub()
-                }
-                return
-            }
-
-            if viewModel.showPauseOverlay {
-                switch direction {
-                case .left:
-                    viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
-                case .right:
-                    viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
-                default:
-                    viewModel.revealControls()
-                }
-                return
-            }
-
-            guard !viewModel.showControls else { return }
-            switch direction {
-            case .left:
-                viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
-            case .right:
-                viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
-            default:
-                viewModel.revealControls()
-            }
-        }
+        .onMoveCommand(perform: handleMoveCommand)
         .onExitCommand {
             // The panel handles its own exit; this fallback covers the frame
             // where focus hasn't landed inside it yet.
@@ -667,7 +625,7 @@ struct PlayerView: View {
                 return
             }
             if viewModel.postPlayState.isVisible {
-                if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
+                if canReturnToPlayerFromPostPlay {
                     viewModel.returnToPlayerFromPostPlay()
                 } else {
                     onBack()
@@ -679,6 +637,67 @@ struct PlayerView: View {
                 return
             }
             onBack()
+        }
+    }
+
+    /// Post-play: can the user still jump back into the episode? Kept as a
+    /// property because the inline form (three `&&` terms around a generic
+    /// `max` with untyped literals) exceeds the type-checker budget.
+    private var canReturnToPlayerFromPostPlay: Bool {
+        guard viewModel.postPlayState.canReturnToPlayer, viewModel.status != .ended else { return false }
+        let cutoff = viewModel.time.duration - 3
+        return viewModel.time.current < max(0, cutoff)
+    }
+
+    /// Long-press scrub distance: four normal steps, never less than a minute.
+    private var scrubJumpSeconds: Double {
+        Double(max(viewModel.seekStepSeconds * 4, 60))
+    }
+
+    /// Remote direction handling for the player. A method rather than an
+    /// inline closure: as a closure on `body` it pushes the type-checker over
+    /// its budget ("unable to type-check this expression in reasonable time").
+    private func handleMoveCommand(_ direction: MoveCommandDirection) {
+        // The Episodes/Sources sheet exclusively owns directional input.
+        // Do not let list navigation also seek or reveal player controls.
+        guard viewModel.sidePanel == nil else { return }
+
+        // Trackpad swipes also emit move commands; the pan recognizer sets
+        // moveSuppressed so a swipe does not double-fire as a skip.
+        if viewModel.moveSuppressed { return }
+
+        if viewModel.isScrubbing {
+            switch direction {
+            case .left:
+                viewModel.scrubJump(-scrubJumpSeconds)
+            case .right:
+                viewModel.scrubJump(scrubJumpSeconds)
+            default:
+                viewModel.cancelScrub()
+            }
+            return
+        }
+
+        if viewModel.showPauseOverlay {
+            switch direction {
+            case .left:
+                viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
+            case .right:
+                viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
+            default:
+                viewModel.revealControls()
+            }
+            return
+        }
+
+        guard !viewModel.showControls else { return }
+        switch direction {
+        case .left:
+            viewModel.nudgeSeek(-Double(viewModel.seekStepSeconds))
+        case .right:
+            viewModel.nudgeSeek(Double(viewModel.seekStepSeconds))
+        default:
+            viewModel.revealControls()
         }
     }
 
