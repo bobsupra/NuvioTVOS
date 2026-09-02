@@ -27,6 +27,9 @@ if [ -x /c/Windows/System32/OpenSSH/ssh.exe ]; then
   SSH_BIN=/c/Windows/System32/OpenSSH/ssh.exe
 fi
 MAC_REPO="${MAC_REPO:-~/Projects/NuvioTVOS}"
+# If the local shell tilde-expanded MAC_REPO to the *Windows* home, undo it:
+# the path must be expanded by the Mac, not here.
+MAC_REPO="${MAC_REPO/#$HOME/~}"
 TARGET="${1:-simulator}"
 BRANCH="$(git -C "$SCRIPT_DIR/.." rev-parse --abbrev-ref HEAD)"
 
