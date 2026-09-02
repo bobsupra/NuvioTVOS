@@ -2896,6 +2896,362 @@ struct TVHomeView: View {
 
     var body: some View {
         let _ = TVHomeDebugTrace.log("home.body.render active=\(isActive) isEnabled=\(isEnabled)")
+        withFocusHandlers(withLifecycleHandlers(withSettingsHandlers(withLoadHandlers(homeContent))))
+    }
+
+    // MARK: - Body modifier groups
+    //
+    // `body` used to be one ~700-line expression (layout + 28 handler
+    // closures); Swift 6.3's type-checker refuses it. Each group below is
+    // type-checked on its own. They are methods rather than ViewModifiers so
+    // they keep access to the view's private state.
+
+    private func withLoadHandlers<Content: View>(_ content: Content) -> some View {
+        content
+        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
+            await loadWithAutomaticRetry(for: contentIdentity, forceReload: true)
+            // Add-on metadata providers are configured by the time Home has
+            // loaded, so this is the pass that recovers titles an earlier sync
+            // could not resolve. Mirrors the phone's
+            // `retryMetadataResolutionWhenAddonMetaProvidersReady`.
+            await ContinueWatchingBuilder.rebuild(reason: "home loaded")
+            await ContinueWatchingStore.refreshMissingEpisodeDetails()
+        }
+        .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
+            await refreshCollectionSections(for: contentIdentity)
+        }
+        .task(id: "\(contentIdentity.profileId):smbLocalTitles:\(smbLocalRowEnabled)") {
+            await loadLocalTitlesSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: SMBLibraryIndex.changedNotification)) { _ in
+            guard isActive else { return }
+            Task { await loadLocalTitlesSection() }
+        }
+        .task(id: "\(contentIdentity.profileId):jellyfinTitles:\(jellyfinLocalRowEnabled)") {
+            await loadJellyfinSection()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: JellyfinLibraryIndex.changedNotification)) { _ in
+            guard isActive else { return }
+            Task { await loadJellyfinSection() }
+        }
+        .onAppear {
+            // A TabView may recreate Home instead of keeping it mounted. Arm
+            // before its saved focus is restored so the first layout pass is
+            // already non-animated.
+            if isActive, store.lastFocusedCardID != nil {
+                armReturnFocusAnimationSuppression()
+            }
+            // Classic was never a distinct layout; collapse legacy values to Modern.
+            if homeLayout == "Classic" { homeLayout = "Modern" }
+            refreshContinueWatching()
+            refreshWatchedTitles()
+            scheduleContinueWatchingRefresh()
+        }
+        // Home stays mounted behind Details/Player, so `onAppear` no longer
+        // fires on return. Refresh the Continue Watching row whenever the store
+        // changes (progress saved during playback, item finished/removed).
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive else { return }
+            refreshContinueWatching()
+        }
+        // A removal has to leave the row immediately, including under Trakt/Simkl
+        // where the displayed list belongs to the provider and only changes on
+        // the next fetch.
+        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingDismissStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive else { return }
+            let all = continueWatching + upcomingItems
+            let remaining = all.filter { !ContinueWatchingDismissStore.isDismissed($0) }
+            if remaining.count != all.count {
+                setContinueWatching(remaining)
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive else { return }
+            scheduleContinueWatchingRefresh()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive else { return }
+            scheduleContinueWatchingRefresh()
+        }
+    }
+
+    private func withSettingsHandlers<Content: View>(_ content: Content) -> some View {
+        content
+        // TabView can keep Home mounted while Settings is selected, so returning
+        // to Home does not reliably produce another onAppear.
+        .onChange(of: isActive) { _, active in
+            if active {
+                // A tab switch can also toggle the environment's `isEnabled`.
+                // That is not an overlay dismissal, so discard any focus lock
+                // accidentally captured while Home was becoming inactive.
+                if overlayRestoreCardID != nil {
+                    overlayRestoreGeneration &+= 1
+                    overlayRestoreCardID = nil
+                }
+                // Usually armed while leaving Home. Re-arm here as a fallback
+                // for TabView implementations that recreate the selected tab.
+                if !suppressReturnFocusAnimations {
+                    armReturnFocusAnimationSuppression()
+                }
+                if focusedCardID != nil {
+                    releaseReturnFocusAnimationSuppression()
+                }
+                if !rawContinueWatchingItems.isEmpty {
+                    setContinueWatching(rawContinueWatchingItems)
+                }
+                if usesRemoteProgress {
+                    scheduleContinueWatchingRefresh()
+                } else {
+                    refreshContinueWatching()
+                }
+                #if DEBUG
+                logRowWindow("home became active")
+                #endif
+            } else {
+                // Details and Player leave Home selected; a real tab change
+                // must never carry their one-card restoration lock back Home.
+                overlayRestoreGeneration &+= 1
+                overlayRestoreCardID = nil
+                // Android disposes Home's composition on a tab switch, which
+                // cancels screen-scoped work. Mirror that cancellation while
+                // keeping the shared Home store warm for the next entry.
+                continueWatchingRefreshTask?.cancel()
+                continueWatchingRefreshTask = nil
+                continueWatchingRefreshGeneration &+= 1
+                // A real tab switch can destroy the conditional Home tree
+                // before LazyVStack gets another appearance callback. Keep
+                // the saved target and let the next activation seed its
+                // distant row/scroll position again.
+                pendingInitialFocusCardKey = store.lastFocusedCardID
+                didRequestInitialCardFocus = false
+                didPrepareInitialFocusViewport = false
+                // Arm before tvOS removes card focus. Waiting until Home becomes
+                // active again is too late: focus restoration has already begun.
+                armReturnFocusAnimationSuppression()
+            }
+        }
+        .onChange(of: continueWatchingSort) { _, _ in
+            if !rawContinueWatchingItems.isEmpty {
+                setContinueWatching(rawContinueWatchingItems)
+            }
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+            } else {
+                refreshContinueWatching()
+            }
+        }
+        .onChange(of: hideUnreleased) { _, _ in
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+            } else {
+                refreshContinueWatching()
+            }
+        }
+        .onChange(of: showUnairedNextUp) { _, _ in
+            // Local Next Up cards are derived from the episode guide, so the
+            // preference must rebuild that row rather than merely re-sort the
+            // already materialized cards. Remote rows need a fresh fetch because
+            // previously hidden upcoming cards are no longer in view state.
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+            } else {
+                Task { @MainActor in
+                    await ContinueWatchingBuilder.rebuild(reason: "unaired preference changed")
+                    refreshContinueWatching()
+                }
+            }
+        }
+        .onChange(of: upNextFromFurthestEpisode) { _, _ in
+            if usesRemoteProgress {
+                scheduleContinueWatchingRefresh()
+            } else {
+                Task { @MainActor in
+                    await ContinueWatchingBuilder.rebuild(reason: "up next episode preference changed")
+                    refreshContinueWatching()
+                }
+            }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
+            guard isActive else { return }
+            refreshWatchedTitles()
+            // A watched mark can be the only history left for a completed
+            // series. Rebuild the local row so a newly aired episode can seed a
+            // fresh "Airs Today" card even after the old row was retired.
+            if !usesRemoteProgress {
+                ContinueWatchingBuilder.scheduleRebuild(reason: "watched state changed")
+            }
+        }
+    }
+
+    private func withLifecycleHandlers<Content: View>(_ content: Content) -> some View {
+        content
+        // Settings → Home Catalogs reorder applies to the mounted Home live.
+        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
+            guard isActive else { return }
+            let reordered = homeOrderedSections(store.sections)
+            if reordered.map(\.id) != store.sections.map(\.id) {
+                store.sections = reordered
+            }
+        }
+        // Individual revision changes can arrive while the initial physical-
+        // device load is still in flight. Once account sync confirms that all
+        // Home inputs have landed, queue one replacement load from that final
+        // add-on and catalog-settings snapshot.
+        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
+            guard isActive && !isFullScreenOverlayPresented else { return }
+            homeReloadTask?.cancel()
+            let identity = contentIdentity
+            homeReloadTask = Task { @MainActor in
+                await reloadHomeAfterSyncedInputs(for: identity)
+            }
+        }
+        .onDisappear {
+            focusWork.cancelAll()
+            homeReloadTask?.cancel()
+            continueWatchingRefreshTask?.cancel()
+            continueWatchingRefreshTask = nil
+            finishSimklHomeLoadingDiagnostic()
+            continueWatchingRefreshGeneration &+= 1
+        }
+        .onChange(of: isLoading) { _, loading in
+            if loading {
+                requestLoadingFocus()
+            }
+        }
+        .onChange(of: focusedPosterBackdropEnabled) { _, enabled in
+            guard !enabled else { return }
+            focusWork.pendingLandscapeFocusedId = nil
+            focusWork.landscapeFocusTask?.cancel()
+            landscapeFocusedId = nil
+        }
+    }
+
+    private func withFocusHandlers<Content: View>(_ content: Content) -> some View {
+        content
+        .onChange(of: focusedCardID) { _, newValue in
+            if let newValue {
+                if let pendingInitialFocusCardKey {
+                    guard pendingInitialFocusCardKey == newValue else { return }
+                    self.pendingInitialFocusCardKey = nil
+                } else if !didPrepareInitialFocusViewport,
+                          let saved = store.lastFocusedCardID,
+                          saved != newValue
+                {
+                    pendingInitialFocusCardKey = saved
+                    return
+                }
+                store.lastFocusedCardID = newValue
+                shouldRestoreHomeFocus = false
+                if isActive {
+                    releaseReturnFocusAnimationSuppression()
+                }
+                if isEnabled,
+                   newValue == overlayRestoreCardID,
+                   focusWork.restoringOverlayCardID != newValue {
+                    overlayRestoreCardID = nil
+                }
+            } else if !focusWork.defersOverlayPreparation,
+                      store.lastFocusedCardID != nil,
+                      !isGridHeroFocused {
+                shouldRestoreHomeFocus = true
+            }
+        }
+        // Leaving the Grid hero for the sidebar has to arm the restore too — it
+        // is the only way out of Home that never passes through a card.
+        .onChange(of: isGridHeroFocused) { _, focused in
+            if focused {
+                shouldRestoreHomeFocus = false
+            } else if !focusWork.defersOverlayPreparation,
+                      focusedCardID == nil,
+                      store.lastFocusedCardID != nil {
+                shouldRestoreHomeFocus = true
+            }
+        }
+        // Visible menus still toggle Home's disabled environment. Full-screen
+        // overlays do not: their opacity-zero Home tree is already unfocusable,
+        // and handling the overlay transition directly avoids invalidating all
+        // resident shelves on Details entry.
+        .onChange(of: isEnabled) { _, enabled in
+            TVHomeDebugTrace.log(
+                "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+            )
+            // Full-screen transitions have their own handler below. This one
+            // remains for the visible card-menu path and inactive TabView tabs.
+            guard !isFullScreenOverlayPresented else { return }
+            handleHomeOverlayStateChange(isPresented: !enabled)
+        }
+        .onChange(of: isFullScreenOverlayPresented) { _, presented in
+            TVHomeDebugTrace.log(
+                "home.overlay.fullScreen changed to \(presented) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
+            )
+            handleHomeOverlayStateChange(isPresented: presented)
+        }
+        .onChange(of: detailsDidDisappearGeneration) { _, generation in
+            guard !isFullScreenOverlayPresented else { return }
+            guard let target = overlayRestoreCardID,
+                  focusWork.restoringOverlayCardID == target else { return }
+            TVHomeDebugTrace.log(
+                "home.details.disappeared generation=\(generation) restoring target=\(target)"
+            )
+            // Details is now out of the hierarchy, so this is the first focus
+            // request that tvOS can actually commit. The card's focus callback
+            // will release the one-card lock on the next run-loop turn.
+            focusedCardID = target
+        }
+        // Removing a card takes the focus capture with it: the restore target
+        // still names the card that just left, and because every other card is
+        // unfocusable while a capture stands, focus lands nowhere at all. Hand
+        // the slot to whatever moved into it instead.
+        .onChange(of: continueWatchingIDs) { _, ids in
+            let previous = continueWatchingCardIDs
+            continueWatchingCardIDs = ids
+            guard let target = overlayRestoreCardID,
+                  let removedID = continueWatchingMetaID(inCardKey: target),
+                  !ids.contains(removedID),
+                  let removedIndex = previous.firstIndex(of: removedID) else { return }
+
+            // Invalidates the in-flight restores aimed at the removed card:
+            // they only write focus while their own generation is current.
+            overlayRestoreGeneration &+= 1
+            guard !ids.isEmpty else {
+                // Row is gone entirely. Drop the capture so the engine can place
+                // focus itself rather than leaving every card disabled behind a
+                // target that will never exist.
+                overlayRestoreCardID = nil
+                return
+            }
+            // The card that shifted into the slot, or the new last card when the
+            // removed one was at the end.
+            let successorID = ids[min(removedIndex, ids.count - 1)]
+            let sectionPrefix = target.hasPrefix("\(TVHomeSection.upcomingId)\u{1}")
+                ? TVHomeSection.upcomingId
+                : TVHomeSection.continueWatchingId
+            let successorKey = "\(sectionPrefix)\u{1}\(successorID)"
+            overlayRestoreCardID = successorKey
+            store.lastFocusedCardID = successorKey
+            restoreOverlayFocus(to: successorKey, generation: overlayRestoreGeneration)
+        }
+        .fullScreenCover(item: $browsingSection) { section in
+            TVHomeCatalogBrowseView(
+                section: section,
+                repository: repository,
+                watchedTitleKeys: watchedTitleKeys,
+                onDismiss: { browsingSection = nil },
+                onSelect: { meta in
+                    browsingSection = nil
+                    DispatchQueue.main.async {
+                        navigateToDetailsFromHome(id: meta.id, type: meta.type)
+                    }
+                },
+                onLongPress: onLongPressCard
+            )
+        }
+    }
+
+    /// The Home layout tree, kept out of `body` so the layout and the
+    /// 28-handler modifier chain are not one expression: the Swift 6.3
+    /// type-checker gives up on the combined ~700-line version.
+    private var homeContent: some View {
         ZStack(alignment: .topLeading) {
             // Match Android's AppTabHost ownership: only the selected tab owns
             // a Home render tree. TVHomeStore and this view's @State preserve
@@ -3252,332 +3608,6 @@ struct TVHomeView: View {
                     .zIndex(20)
                     .allowsHitTesting(false)
             }
-        }
-        .task(id: "\(contentIdentity.profileId):\(contentIdentity.catalogRevision):\(tmdbHomeSettingsKey)") {
-            await loadWithAutomaticRetry(for: contentIdentity, forceReload: true)
-            // Add-on metadata providers are configured by the time Home has
-            // loaded, so this is the pass that recovers titles an earlier sync
-            // could not resolve. Mirrors the phone's
-            // `retryMetadataResolutionWhenAddonMetaProvidersReady`.
-            await ContinueWatchingBuilder.rebuild(reason: "home loaded")
-            await ContinueWatchingStore.refreshMissingEpisodeDetails()
-        }
-        .task(id: "\(contentIdentity.profileId):\(collectionsRevision)") {
-            await refreshCollectionSections(for: contentIdentity)
-        }
-        .task(id: "\(contentIdentity.profileId):smbLocalTitles:\(smbLocalRowEnabled)") {
-            await loadLocalTitlesSection()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: SMBLibraryIndex.changedNotification)) { _ in
-            guard isActive else { return }
-            Task { await loadLocalTitlesSection() }
-        }
-        .task(id: "\(contentIdentity.profileId):jellyfinTitles:\(jellyfinLocalRowEnabled)") {
-            await loadJellyfinSection()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: JellyfinLibraryIndex.changedNotification)) { _ in
-            guard isActive else { return }
-            Task { await loadJellyfinSection() }
-        }
-        .onAppear {
-            // A TabView may recreate Home instead of keeping it mounted. Arm
-            // before its saved focus is restored so the first layout pass is
-            // already non-animated.
-            if isActive, store.lastFocusedCardID != nil {
-                armReturnFocusAnimationSuppression()
-            }
-            // Classic was never a distinct layout; collapse legacy values to Modern.
-            if homeLayout == "Classic" { homeLayout = "Modern" }
-            refreshContinueWatching()
-            refreshWatchedTitles()
-            scheduleContinueWatchingRefresh()
-        }
-        // Home stays mounted behind Details/Player, so `onAppear` no longer
-        // fires on return. Refresh the Continue Watching row whenever the store
-        // changes (progress saved during playback, item finished/removed).
-        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
-            refreshContinueWatching()
-        }
-        // A removal has to leave the row immediately, including under Trakt/Simkl
-        // where the displayed list belongs to the provider and only changes on
-        // the next fetch.
-        .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingDismissStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
-            let all = continueWatching + upcomingItems
-            let remaining = all.filter { !ContinueWatchingDismissStore.isDismissed($0) }
-            if remaining.count != all.count {
-                setContinueWatching(remaining)
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
-            scheduleContinueWatchingRefresh()
-        }
-        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
-            scheduleContinueWatchingRefresh()
-        }
-        // TabView can keep Home mounted while Settings is selected, so returning
-        // to Home does not reliably produce another onAppear.
-        .onChange(of: isActive) { _, active in
-            if active {
-                // A tab switch can also toggle the environment's `isEnabled`.
-                // That is not an overlay dismissal, so discard any focus lock
-                // accidentally captured while Home was becoming inactive.
-                if overlayRestoreCardID != nil {
-                    overlayRestoreGeneration &+= 1
-                    overlayRestoreCardID = nil
-                }
-                // Usually armed while leaving Home. Re-arm here as a fallback
-                // for TabView implementations that recreate the selected tab.
-                if !suppressReturnFocusAnimations {
-                    armReturnFocusAnimationSuppression()
-                }
-                if focusedCardID != nil {
-                    releaseReturnFocusAnimationSuppression()
-                }
-                if !rawContinueWatchingItems.isEmpty {
-                    setContinueWatching(rawContinueWatchingItems)
-                }
-                if usesRemoteProgress {
-                    scheduleContinueWatchingRefresh()
-                } else {
-                    refreshContinueWatching()
-                }
-                #if DEBUG
-                logRowWindow("home became active")
-                #endif
-            } else {
-                // Details and Player leave Home selected; a real tab change
-                // must never carry their one-card restoration lock back Home.
-                overlayRestoreGeneration &+= 1
-                overlayRestoreCardID = nil
-                // Android disposes Home's composition on a tab switch, which
-                // cancels screen-scoped work. Mirror that cancellation while
-                // keeping the shared Home store warm for the next entry.
-                continueWatchingRefreshTask?.cancel()
-                continueWatchingRefreshTask = nil
-                continueWatchingRefreshGeneration &+= 1
-                // A real tab switch can destroy the conditional Home tree
-                // before LazyVStack gets another appearance callback. Keep
-                // the saved target and let the next activation seed its
-                // distant row/scroll position again.
-                pendingInitialFocusCardKey = store.lastFocusedCardID
-                didRequestInitialCardFocus = false
-                didPrepareInitialFocusViewport = false
-                // Arm before tvOS removes card focus. Waiting until Home becomes
-                // active again is too late: focus restoration has already begun.
-                armReturnFocusAnimationSuppression()
-            }
-        }
-        .onChange(of: continueWatchingSort) { _, _ in
-            if !rawContinueWatchingItems.isEmpty {
-                setContinueWatching(rawContinueWatchingItems)
-            }
-            if usesRemoteProgress {
-                scheduleContinueWatchingRefresh()
-            } else {
-                refreshContinueWatching()
-            }
-        }
-        .onChange(of: hideUnreleased) { _, _ in
-            if usesRemoteProgress {
-                scheduleContinueWatchingRefresh()
-            } else {
-                refreshContinueWatching()
-            }
-        }
-        .onChange(of: showUnairedNextUp) { _, _ in
-            // Local Next Up cards are derived from the episode guide, so the
-            // preference must rebuild that row rather than merely re-sort the
-            // already materialized cards. Remote rows need a fresh fetch because
-            // previously hidden upcoming cards are no longer in view state.
-            if usesRemoteProgress {
-                scheduleContinueWatchingRefresh()
-            } else {
-                Task { @MainActor in
-                    await ContinueWatchingBuilder.rebuild(reason: "unaired preference changed")
-                    refreshContinueWatching()
-                }
-            }
-        }
-        .onChange(of: upNextFromFurthestEpisode) { _, _ in
-            if usesRemoteProgress {
-                scheduleContinueWatchingRefresh()
-            } else {
-                Task { @MainActor in
-                    await ContinueWatchingBuilder.rebuild(reason: "up next episode preference changed")
-                    refreshContinueWatching()
-                }
-            }
-        }
-        .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification)) { _ in
-            guard isActive else { return }
-            refreshWatchedTitles()
-            // A watched mark can be the only history left for a completed
-            // series. Rebuild the local row so a newly aired episode can seed a
-            // fresh "Airs Today" card even after the old row was retired.
-            if !usesRemoteProgress {
-                ContinueWatchingBuilder.scheduleRebuild(reason: "watched state changed")
-            }
-        }
-        // Settings → Home Catalogs reorder applies to the mounted Home live.
-        .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification)) { _ in
-            guard isActive else { return }
-            let reordered = homeOrderedSections(store.sections)
-            if reordered.map(\.id) != store.sections.map(\.id) {
-                store.sections = reordered
-            }
-        }
-        // Individual revision changes can arrive while the initial physical-
-        // device load is still in flight. Once account sync confirms that all
-        // Home inputs have landed, queue one replacement load from that final
-        // add-on and catalog-settings snapshot.
-        .onReceive(NotificationCenter.default.publisher(for: NuvioSyncManager.homeContentSyncedNotification)) { _ in
-            guard isActive && !isFullScreenOverlayPresented else { return }
-            homeReloadTask?.cancel()
-            let identity = contentIdentity
-            homeReloadTask = Task { @MainActor in
-                await reloadHomeAfterSyncedInputs(for: identity)
-            }
-        }
-        .onDisappear {
-            focusWork.cancelAll()
-            homeReloadTask?.cancel()
-            continueWatchingRefreshTask?.cancel()
-            continueWatchingRefreshTask = nil
-            finishSimklHomeLoadingDiagnostic()
-            continueWatchingRefreshGeneration &+= 1
-        }
-        .onChange(of: isLoading) { _, loading in
-            if loading {
-                requestLoadingFocus()
-            }
-        }
-        .onChange(of: focusedPosterBackdropEnabled) { _, enabled in
-            guard !enabled else { return }
-            focusWork.pendingLandscapeFocusedId = nil
-            focusWork.landscapeFocusTask?.cancel()
-            landscapeFocusedId = nil
-        }
-        .onChange(of: focusedCardID) { _, newValue in
-            if let newValue {
-                if let pendingInitialFocusCardKey {
-                    guard pendingInitialFocusCardKey == newValue else { return }
-                    self.pendingInitialFocusCardKey = nil
-                } else if !didPrepareInitialFocusViewport,
-                          let saved = store.lastFocusedCardID,
-                          saved != newValue
-                {
-                    pendingInitialFocusCardKey = saved
-                    return
-                }
-                store.lastFocusedCardID = newValue
-                shouldRestoreHomeFocus = false
-                if isActive {
-                    releaseReturnFocusAnimationSuppression()
-                }
-                if isEnabled,
-                   newValue == overlayRestoreCardID,
-                   focusWork.restoringOverlayCardID != newValue {
-                    overlayRestoreCardID = nil
-                }
-            } else if !focusWork.defersOverlayPreparation,
-                      store.lastFocusedCardID != nil,
-                      !isGridHeroFocused {
-                shouldRestoreHomeFocus = true
-            }
-        }
-        // Leaving the Grid hero for the sidebar has to arm the restore too — it
-        // is the only way out of Home that never passes through a card.
-        .onChange(of: isGridHeroFocused) { _, focused in
-            if focused {
-                shouldRestoreHomeFocus = false
-            } else if !focusWork.defersOverlayPreparation,
-                      focusedCardID == nil,
-                      store.lastFocusedCardID != nil {
-                shouldRestoreHomeFocus = true
-            }
-        }
-        // Visible menus still toggle Home's disabled environment. Full-screen
-        // overlays do not: their opacity-zero Home tree is already unfocusable,
-        // and handling the overlay transition directly avoids invalidating all
-        // resident shelves on Details entry.
-        .onChange(of: isEnabled) { _, enabled in
-            TVHomeDebugTrace.log(
-                "home.overlay.isEnabled changed to \(enabled) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
-            )
-            // Full-screen transitions have their own handler below. This one
-            // remains for the visible card-menu path and inactive TabView tabs.
-            guard !isFullScreenOverlayPresented else { return }
-            handleHomeOverlayStateChange(isPresented: !enabled)
-        }
-        .onChange(of: isFullScreenOverlayPresented) { _, presented in
-            TVHomeDebugTrace.log(
-                "home.overlay.fullScreen changed to \(presented) active=\(isActive) defersPrep=\(focusWork.defersOverlayPreparation)"
-            )
-            handleHomeOverlayStateChange(isPresented: presented)
-        }
-        .onChange(of: detailsDidDisappearGeneration) { _, generation in
-            guard !isFullScreenOverlayPresented else { return }
-            guard let target = overlayRestoreCardID,
-                  focusWork.restoringOverlayCardID == target else { return }
-            TVHomeDebugTrace.log(
-                "home.details.disappeared generation=\(generation) restoring target=\(target)"
-            )
-            // Details is now out of the hierarchy, so this is the first focus
-            // request that tvOS can actually commit. The card's focus callback
-            // will release the one-card lock on the next run-loop turn.
-            focusedCardID = target
-        }
-        // Removing a card takes the focus capture with it: the restore target
-        // still names the card that just left, and because every other card is
-        // unfocusable while a capture stands, focus lands nowhere at all. Hand
-        // the slot to whatever moved into it instead.
-        .onChange(of: continueWatchingIDs) { _, ids in
-            let previous = continueWatchingCardIDs
-            continueWatchingCardIDs = ids
-            guard let target = overlayRestoreCardID,
-                  let removedID = continueWatchingMetaID(inCardKey: target),
-                  !ids.contains(removedID),
-                  let removedIndex = previous.firstIndex(of: removedID) else { return }
-
-            // Invalidates the in-flight restores aimed at the removed card:
-            // they only write focus while their own generation is current.
-            overlayRestoreGeneration &+= 1
-            guard !ids.isEmpty else {
-                // Row is gone entirely. Drop the capture so the engine can place
-                // focus itself rather than leaving every card disabled behind a
-                // target that will never exist.
-                overlayRestoreCardID = nil
-                return
-            }
-            // The card that shifted into the slot, or the new last card when the
-            // removed one was at the end.
-            let successorID = ids[min(removedIndex, ids.count - 1)]
-            let sectionPrefix = target.hasPrefix("\(TVHomeSection.upcomingId)\u{1}")
-                ? TVHomeSection.upcomingId
-                : TVHomeSection.continueWatchingId
-            let successorKey = "\(sectionPrefix)\u{1}\(successorID)"
-            overlayRestoreCardID = successorKey
-            store.lastFocusedCardID = successorKey
-            restoreOverlayFocus(to: successorKey, generation: overlayRestoreGeneration)
-        }
-        .fullScreenCover(item: $browsingSection) { section in
-            TVHomeCatalogBrowseView(
-                section: section,
-                repository: repository,
-                watchedTitleKeys: watchedTitleKeys,
-                onDismiss: { browsingSection = nil },
-                onSelect: { meta in
-                    browsingSection = nil
-                    DispatchQueue.main.async {
-                        navigateToDetailsFromHome(id: meta.id, type: meta.type)
-                    }
-                },
-                onLongPress: onLongPressCard
-            )
         }
     }
 
