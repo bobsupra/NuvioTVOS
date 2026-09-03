@@ -1,22 +1,13 @@
 import SwiftUI
 import UIKit
 
-/// Same poster geometry as the See All catalog and Grid Home. Seven columns fit
-/// only because of `pageInset` — the old 80pt inset left room for six.
+/// Same poster geometry as the See All catalog and Grid Home. Column count is
+/// whatever fits: the system search UI decides how much width results get.
 private enum SearchGridMetrics {
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
-    static let columnCount: CGFloat = 7
-    /// Width of the seven visible cards, from the first card's leading edge to
-    /// the last card's trailing edge. Header controls use this too so their
-    /// right edge lands directly above the last card.
-    static let cardRowWidth = posterWidth * columnCount + posterGap * (columnCount - 1)
     static let gridContentInset: CGFloat = 12
-    /// Leading/trailing inset for the whole screen. With the grid's own 12pt
-    /// (which keeps a focused card's 1.06 scale from clipping) this is the 48pt
-    /// gutter Grid Home uses, so posters line up across the two screens.
-    static let pageInset: CGFloat = 36
 }
 
 struct SearchView: View {
@@ -25,9 +16,7 @@ struct SearchView: View {
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
-    @FocusState private var searchBarFocused: Bool
     @FocusState private var focusedResultID: String?
-    @FocusState private var clearRecentFocused: Bool
     /// Last card focused in the results grid, kept so returning from details
     /// (which steals focus and nils `focusedResultID`) restores that card
     /// instead of snapping back to the first result.
@@ -41,9 +30,7 @@ struct SearchView: View {
     /// when the tab view gets disabled (overlay up), consumed on re-enable.
     @State private var overlayRestoreResultID: String?
     @State private var overlayRestoreGeneration = 0
-    @State private var discoverOverlayTransitionActive = false
     @Environment(\.isEnabled) private var isEnabled
-    @State private var searchTextInputActive = false
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
@@ -56,34 +43,26 @@ struct SearchView: View {
     }
 
     var body: some View {
+        // The system search field. Focusing it presents the tvOS keyboard with
+        // `searchContent` as the live results area underneath.
+        searchContent
+            .searchable(
+                text: $viewModel.searchText,
+                prompt: L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
+            )
+    }
+
+    private var searchContent: some View {
         ZStack(alignment: .top) {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
 
             VStack(alignment: .leading, spacing: 24) {
-                header
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .disabled(overlayRestoreResultID != nil || discoverOverlayTransitionActive)
-                    .zIndex(1)
-
                 if viewModel.hasQuery {
-                    typeFilter
-                        .frame(width: SearchGridMetrics.cardRowWidth, alignment: .leading)
-                        .padding(.horizontal, SearchGridMetrics.gridContentInset)
-                        .disabled(overlayRestoreResultID != nil)
-                        .zIndex(1)
                     resultsContainer
                         .zIndex(0)
                 } else {
-                    if !viewModel.recentSearches.isEmpty {
-                        recentRow
-                            .disabled(discoverOverlayTransitionActive)
-                    }
                     if showDiscover {
-                        DiscoverSection(
-                            onContentClick: onContentClick,
-                            onLongPress: onLongPress,
-                            parentTransitionActive: $discoverOverlayTransitionActive
-                        )
+                        SearchDiscoverGrid(onContentClick: onContentClick, onLongPress: onLongPress)
                             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
                     } else {
                         centeredState {
@@ -98,14 +77,9 @@ struct SearchView: View {
                     }
                 }
             }
-            .padding(.horizontal, SearchGridMetrics.pageInset)
-            .padding(.top, 56)
             // Let the results viewport use the space below tvOS's bottom safe
             // area instead of leaving a black bar at the screen edge.
             .ignoresSafeArea(.container, edges: .bottom)
-        }
-        .onAppear {
-            viewModel.reloadRecent()
         }
         .onChange(of: focusedResultID) { _, newValue in
             if let newValue {
@@ -140,12 +114,12 @@ struct SearchView: View {
         restoreArmTask?.cancel()
         restoreArmTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: 150_000_000)
-            guard !Task.isCancelled, focusedResultID == nil else { return }
+            guard !Task.isCancelled, focusedResultID == nil else { return }	
             shouldRestoreResultFocus = true
         }
     }
 
-    private func restoreOverlayFocus(to target: String, generation: Int) {
+	    private func restoreOverlayFocus(to target: String, generation: Int) {
         for delay in [0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
@@ -156,93 +130,6 @@ struct SearchView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
                 overlayRestoreResultID = nil
-            }
-        }
-    }
-
-    // MARK: - Header + glass search bar
-
-    private var header: some View {
-        searchBar
-    }
-
-    private var searchBar: some View {
-        ZStack(alignment: .leading) {
-            HiddenSearchTextField(
-                text: $viewModel.searchText,
-                isEditing: $searchTextInputActive,
-            )
-            .frame(width: 1, height: 1)
-            .offset(x: -4_000)
-            .allowsHitTesting(false)
-
-            Button {
-                searchBarFocused = true
-                searchTextInputActive = true
-            } label: {
-                Color.clear
-                    .frame(maxWidth: .infinity, minHeight: 72)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(PosterCardButtonStyle())
-            .focused($searchBarFocused)
-            .focusEffectDisabledIfAvailable()
-
-            // Glass overlay: magnifier + typed text / placeholder + clear.
-            HStack(spacing: 18) {
-                Image(systemName: "magnifyingglass")
-                    .font(.system(size: 30, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.7))
-
-                Text(
-                    viewModel.searchText.isEmpty
-                        ? L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
-                        : viewModel.searchText
-                )
-                    .font(.system(size: 30, weight: .regular))
-                    .foregroundColor(viewModel.searchText.isEmpty ? .white.opacity(0.45) : .white)
-                    .lineLimit(1)
-                    .allowsHitTesting(false)
-
-                Spacer(minLength: 0)
-
-                if viewModel.hasQuery {
-                    Button {
-                        viewModel.clear()
-                        searchBarFocused = true
-                        searchTextInputActive = false
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
-                            .font(.system(size: 30))
-                            .foregroundColor(.white.opacity(0.55))
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-                }
-            }
-        }
-        .padding(.horizontal, 34)
-        .frame(height: 72)
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .modifier(GlassCapsule(focused: searchBarFocused || searchTextInputActive))
-    }
-
-    // MARK: - Type filter
-
-    private var typeFilter: some View {
-        HStack(spacing: 16) {
-            ForEach(SearchContentType.allCases) { type in
-                GlassChip(title: type.title, isSelected: viewModel.selectedType == type) {
-                    viewModel.setType(type)
-                }
-            }
-
-            Spacer()
-
-            if !visibleResults.isEmpty {
-                Text(resultsCountLabel)
-                    .font(.system(size: 22, weight: .medium))
-                    .foregroundColor(.white.opacity(0.5))
             }
         }
     }
@@ -283,17 +170,9 @@ struct SearchView: View {
         }
     }
 
-    private var resultsCountLabel: String {
-        let count = visibleResults.count
-        if count == 1 {
-            return L10n.format("tvos_search_result_count_one", fallback: "%d result", count)
-        }
-        return L10n.format("tvos_search_result_count_other", fallback: "%d results", count)
-    }
-
     private var resultsGrid: some View {
         ScrollView {
-            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: SearchGridMetrics.posterGap) {
+            LazyVGrid(columns: gridColumns, alignment: .center, spacing: SearchGridMetrics.posterGap) {
                 ForEach(visibleResults) { item in
                     PosterGridCard(
                         meta: item,
@@ -331,54 +210,12 @@ struct SearchView: View {
 
     private var gridColumns: [GridItem] {
         [GridItem(
-            .adaptive(minimum: SearchGridMetrics.posterWidth, maximum: SearchGridMetrics.posterWidth),
+            .adaptive(minimum: SearchGridMetrics.posterWidth),
             spacing: SearchGridMetrics.posterGap,
             alignment: .top
         )]
     }
 
-    // MARK: Recent searches (shown above Discover when idle)
-
-    private var recentRow: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            HStack {
-                Text(L10n.string("search_recent_title", fallback: "Recent searches"))
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundColor(.white.opacity(0.8))
-            }
-
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 12) {
-                    ForEach(viewModel.recentSearches, id: \.self) { term in
-                        GlassChip(title: term, isSelected: false, leadingSystemImage: "clock.arrow.circlepath") {
-                            viewModel.applyRecent(term)
-                        }
-                    }
-
-                    Button { viewModel.clearRecent() } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "trash")
-                            Text(L10n.string("action_clear", fallback: "Clear"))
-                        }
-                        .font(.system(size: 20, weight: .semibold))
-                        .foregroundColor(clearRecentFocused ? .black : .white.opacity(0.85))
-                        .padding(.horizontal, 22)
-                        .frame(height: 50)
-                        .modifier(GlassChipBackground(filled: clearRecentFocused))
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focused($clearRecentFocused)
-                    .focusEffectDisabledIfAvailable()
-                    .scaleEffect(clearRecentFocused ? 1.06 : 1.0)
-                    .animation(.easeOut(duration: 0.14), value: clearRecentFocused)
-                }
-                .padding(.vertical, 8)
-                .padding(.horizontal, 4)
-                .padding(.trailing, 80)
-            }
-            .scrollClipDisabledIfAvailable()
-        }
-    }
 
     private func centeredState<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
         VStack {
@@ -609,4 +446,12 @@ extension View {
             self
         }
     }
+}
+	
+#Preview("Search (Classic)") {
+    SearchView(
+        viewModel: SearchViewModel(),
+        showDiscover: false,
+        onContentClick: { _, _ in }
+    )
 }
