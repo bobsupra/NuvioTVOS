@@ -46,24 +46,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3.2** is the latest tvOS release.
+**Beta 3.3.3** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.2/NuvioTV-3.3.2-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.2) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.3) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 100+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3.2
+### New in Beta 3.3.3
 
-- Upgrades **AetherEngine to 6.57.0**, **FFmpegBuild to 3.0.0**, and **LibDovi to 2.1.0** with native `AetherLib*` module namespaces and full MPVKit coexistence.
-- Adds **AV1 Metal GPU hardware acceleration** for 4K AV1 (`YUV420P`/`YUV420P10LE` to NV12/P010), eliminating CPU-heavy pixel scaling and dropped frames on Apple TV 4K.
-- Introduces **Post-Play Next-Episode & Recommendations Overlay** (`PostPlayRecommendationOverlay.swift`) with auto-play countdown timers and episode details.
-- Adds full **App Localization & Multi-Language Support** with a 25,000+ line localized strings database (`AppLanguageCatalog.json`).
-- Adds modern **Player Loading Overlay** during stream discovery, buffering, and track changes.
-- Adds **ReauthSheet** to smoothly refresh expired Trakt / Debrid / Addon sessions.
-- Enhances **IntroDB Auto-Skip** accuracy and TV show episode metadata merging from TMDB.
+- **Modular Home Screen Architecture:** Deconstructs the monolithic Home view into clean SwiftUI components (`CollectionFolderBrowseView`, `TVCatalogRow`) with smooth folder browsing and focus protection.
+- **High-Speed TMDB Metadata Caching:** Multi-tier cache and background prefetching in `TmdbDetailsService.swift` eliminates loading spinners and delay when navigating details.
+- **Comprehensive Stream Quality & Codec Detection:** Overhauled `StreamQualityTags.swift` with deep pattern matching for AV1, HEVC, Dolby Vision, Atmos, TrueHD, DTS-HD, and channel layouts (backed by 500+ unit tests).
+- **Reorganized Integration Settings:** Redesigned `SettingsView.swift` grouping debrid providers and tracking services with improved Apple TV remote focus interaction.
+- **Details Screen Polish:** Fixes episode numbering and season grouping across third-party addon catalogs with fluid poster card focus animations.
 
 ### The new player
 
