@@ -14,7 +14,7 @@ body:
 
         Vague reports such as "not working", "broken", or "same issue" may be labeled `needs-info` and closed after 1 day if the missing details are not added.
         Bug reports left open for more than 30 days may be closed as stale.
-        If the app crashes or force closes, logs are required. Crash reports without logs will be closed.
+        If the app crashes or force closes, logs or crash reports help us investigate and fix it quickly.
 
   - type: markdown
     attributes:
@@ -67,14 +67,16 @@ body:
     attributes:
       label: Platform
       options:
-        - Android (phone/tablet)
+        - Apple TV (tvOS)
+        - tvOS simulator
         - iOS (iPhone)
         - iOS (iPad)
+        - iOS simulator
         - macOS (desktop)
+        - Android (phone/tablet)
+        - Android emulator
         - Windows (desktop)
         - Linux (desktop)
-        - Android emulator
-        - iOS simulator
         - Other (please describe below)
     validations:
       required: true
@@ -212,13 +214,14 @@ body:
   - type: textarea
     id: logs
     attributes:
-      label: Logs (required for crash reports)
+      label: Logs / crash details (optional but helpful)
       description: |
-        Required if the app crashes or force closes. Crash reports without logs will be closed.
+        If the app crashes or force closes, logs or crash reports help us diagnose the issue.
         For other bug reports, logs are optional but still helpful.
 
+        **Apple TV (tvOS):** Settings → Privacy & Security → Analytics & Improvements → Analytics Data (look for files starting with Nuvio)
+        **iOS:** Crash log from Xcode Organizer, Analytics Data, or Console.app
         **Android:** `adb logcat -d | tail -n 300`
-        **iOS:** Crash log from Xcode Organizer or Console.app
         **Desktop:** Terminal/console output from around the time the issue occurred
       render: shell
       placeholder: |

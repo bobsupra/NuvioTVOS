@@ -19,6 +19,11 @@ jobs:
             const repo = context.repo.repo;
             const issue_number = context.payload.issue.number;
 
+            if (context.payload.action === "reopened") {
+              core.info("Issue was reopened; skipping automated triage.");
+              return;
+            }
+
             const issue = context.payload.issue;
             const title = (issue.title || "").trim();
             const body = issue.body || "";
@@ -143,47 +148,7 @@ jobs:
             const hasNeedsInfo = hasLabel(NEEDS_INFO);
 
             if (isCrashIssue && !hasLogs) {
-              await ensureLabel(NEEDS_INFO, NEEDS_INFO_COLOR, NEEDS_INFO_DESC);
-              if (!hasNeedsInfo) {
-                await github.rest.issues.addLabels({
-                  owner,
-                  repo,
-                  issue_number,
-                  labels: [NEEDS_INFO],
-                });
-              }
-
-              const marker = "<!-- nuvio-bot:crash-logs-required-close -->";
-              const comments = await github.paginate(github.rest.issues.listComments, {
-                owner,
-                repo,
-                issue_number,
-                per_page: 100,
-              });
-              const alreadyCommented = comments.some(c => (c.body || "").includes(marker));
-              if (!alreadyCommented) {
-                await github.rest.issues.createComment({
-                  owner,
-                  repo,
-                  issue_number,
-                  body:
-                    `${marker}\n` +
-                    `Closing this crash report because crash reports must include logs.\n\n` +
-                    `Please open a new report, or ask us to reopen this one, with a log snippet or stack trace from around the crash.\n\n` +
-                    `Useful examples:\n` +
-                    `- Android: \`adb logcat -d | tail -n 300\`\n` +
-                    `- iOS: crash log from Xcode Organizer or Console.app\n` +
-                    `- Desktop: terminal/console output from around the crash`,
-                });
-              }
-              await github.rest.issues.update({
-                owner,
-                repo,
-                issue_number,
-                state: "closed",
-                state_reason: "not_planned",
-              });
-              return;
+              problems.push("Crash logs / details (on Apple TV: Settings → Privacy & Security → Analytics & Improvements → Analytics Data; on iOS: Xcode Organizer or Console.app)");
             }
 
             if (problems.length > 0) {
@@ -206,7 +171,7 @@ jobs:
                 `\n\n` +
                 `Use a specific title, for example: \`[Bug]: Playback freezes when switching audio tracks on iOS\`.\n` +
                 `Reports that only say "not working", "broken", or "same issue" are not enough to debug.\n` +
-                `Logs are optional for most issues, but they help a lot. Crash reports without logs are closed automatically.\n`;
+                `Logs are optional for most issues, but help tremendously for crashes.\n`;
 
               const comments = await github.paginate(github.rest.issues.listComments, {
                 owner,
