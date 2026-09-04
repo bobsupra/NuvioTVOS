@@ -407,6 +407,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         items: page,
                         contentType: spec.type,
                         catalogId: spec.catalogId,
+                        addonId: Self.cinemetaAddonId,
                         addonName: Self.cinemetaDisplayName
                     )
                 )
@@ -705,9 +706,31 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         .appendingPathComponent(candidateType)
                         .appendingPathComponent("\(resolvedId).json")
                     let response: CinemetaMetaResponse = try await fetch(url)
-                    let meta = await TmdbDetailsService.localizedMetadata(
-                        for: response.meta.toMeta(fallbackType: candidateType)
-                    )
+                    let rawMeta = response.meta.toMeta(fallbackType: candidateType)
+
+                    // If Cinemeta returns a movie record with 0 videos for an IMDb ID, but it
+                    // has series markers or Cinemeta's series endpoint has episodes, adopt the
+                    // real series metadata instead of getting trapped by the hollow movie stub.
+                    let looksLikeSeries = rawMeta.isSeries
+                        || Self.isSeriesType(rawMeta.type)
+                        || isSeries
+                        || (rawMeta.releaseInfo?.contains("–") == true || rawMeta.releaseInfo?.contains("-") == true)
+                    if candidateType == "movie" && (rawMeta.videos?.isEmpty ?? true) && looksLikeSeries {
+                        let seriesURL = baseURL
+                            .appendingPathComponent("meta")
+                            .appendingPathComponent("series")
+                            .appendingPathComponent("\(resolvedId).json")
+                        if let seriesResponse: CinemetaMetaResponse = try? await fetch(seriesURL),
+                           let seriesVideos = seriesResponse.meta.videos, !seriesVideos.isEmpty {
+                            let seriesMeta = await TmdbDetailsService.localizedMetadata(
+                                for: seriesResponse.meta.toMeta(fallbackType: "series")
+                            )
+                            cacheMetadata(seriesMeta, requestedID: id)
+                            return seriesMeta
+                        }
+                    }
+
+                    let meta = await TmdbDetailsService.localizedMetadata(for: rawMeta)
                     cacheMetadata(meta, requestedID: id)
                     return meta
                 } catch {
@@ -727,8 +750,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         for candidateType in typesToTry {
             for addon in await configuredAddons(supporting: "meta", type: candidateType, id: resolvedId) {
+                guard let metaURL = addon.metaURL(type: candidateType, id: resolvedId) else { continue }
                 do {
-                    let response: CinemetaMetaResponse = try await fetch(addon.metaURL(type: candidateType, id: resolvedId))
+                    let response: CinemetaMetaResponse = try await fetch(metaURL)
                     let meta = await TmdbDetailsService.localizedMetadata(
                         for: response.meta.toMeta(fallbackType: candidateType)
                     )
@@ -805,23 +829,27 @@ final class CinemetaCatalogRepository: CatalogRepository {
         // A TMDB-backed collection is an explicit source choice, independent
         // of whether optional Details enrichment is enabled.
         guard !apiKey.isEmpty else { return nil }
-        let media = isSeriesType(type) ? "tv" : "movie"
-        var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
-        components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
-        guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
-              let http = response as? HTTPURLResponse,
-              (200...299).contains(http.statusCode),
-              let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let imdb = json["imdb_id"] as? String,
-              imdb.hasPrefix("tt") else {
-            return nil
+        let primaryMedia = isSeriesType(type) ? "tv" : "movie"
+        let fallbackMedia = primaryMedia == "tv" ? "movie" : "tv"
+        for media in [primaryMedia, fallbackMedia] {
+            var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
+            components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
+            guard let url = components.url,
+                  let (data, response) = try? await URLSession.shared.data(from: url),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let imdb = json["imdb_id"] as? String,
+                  imdb.hasPrefix("tt") else {
+                continue
+            }
+            return imdb
         }
-        return imdb
+        return nil
     }
 
     private static func isSeriesType(_ type: String) -> Bool {
-        ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
+        NuvioMeta.isSeriesType(type)
     }
 
     static func isLiveContentType(_ type: String) -> Bool {
@@ -1061,7 +1089,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
                 await withTaskGroup(of: [NuvioSubtitle].self) { group in
                     for addon in addons {
-                        let url = addon.subtitleURL(type: subtitleType, id: id)
+                        guard let url = addon.subtitleURL(type: subtitleType, id: id) else { continue }
                         let name = addon.name
                         group.addTask { await Self.fetchSubtitles(from: url, source: name) }
                     }
@@ -1122,8 +1150,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var subtitles: [NuvioSubtitle] = []
 
         for addon in addons {
+            guard let subtitleURL = addon.subtitleURL(type: subtitleType, id: id) else { continue }
             do {
-                let response: StremioSubtitleResponse = try await fetch(addon.subtitleURL(type: subtitleType, id: id))
+                let response: StremioSubtitleResponse = try await fetch(subtitleURL)
                 subtitles += response.subtitles.compactMap { $0.toNuvioSubtitle(source: addon.name) }
             } catch {
                 print("Failed to load subtitles from \(addon.name): \(error.localizedDescription)")
@@ -1382,9 +1411,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
            raw == Self.cinemetaAddonId ||
            raw.caseInsensitiveCompare("cinemeta") == .orderedSame ||
            raw.caseInsensitiveCompare("com.linvo.cinemeta") == .orderedSame {
-            if catalogId == nil {
-                return baseURL
-            }
+            return baseURL
         }
 
         // 4. Candidate manifest URLs from settings & preferences
@@ -1545,7 +1572,7 @@ private struct AddonManifestResource: Decodable {
     func supportsType(_ type: String, fallbackTypes: [String]) -> Bool {
         let supportedTypes = types.isEmpty ? fallbackTypes : types
         guard !supportedTypes.isEmpty else { return true }
-        if supportedTypes.contains(where: { $0.caseInsensitiveCompare(type) == .orderedSame }) {
+        if supportedTypes.contains(where: { AddonTransportUrls.isTypeEquivalent($0, type) }) {
             return true
         }
         if CinemetaCatalogRepository.isLiveContentType(type) {
@@ -1606,20 +1633,22 @@ private struct StremioStreamAddon {
     let name: String
     let manifestURL: URL
 
-    func streamURL(type: String, id: String) -> URL {
-        manifestURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("stream")
-            .appendingPathComponent(type)
-            .appendingPathComponent("\(id).json")
+    func streamURL(type: String, id: String) -> URL? {
+        AddonTransportUrls.buildResourceURL(
+            manifestURL: manifestURL,
+            resource: "stream",
+            type: type,
+            id: id
+        )
     }
 
-    func metaURL(type: String, id: String) -> URL {
-        manifestURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("meta")
-            .appendingPathComponent(type)
-            .appendingPathComponent("\(id).json")
+    func metaURL(type: String, id: String) -> URL? {
+        AddonTransportUrls.buildResourceURL(
+            manifestURL: manifestURL,
+            resource: "meta",
+            type: type,
+            id: id
+        )
     }
 }
 
@@ -1627,12 +1656,13 @@ private struct StremioSubtitleAddon {
     let name: String
     let manifestURL: URL
 
-    func subtitleURL(type: String, id: String) -> URL {
-        manifestURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("subtitles")
-            .appendingPathComponent(type)
-            .appendingPathComponent("\(id).json")
+    func subtitleURL(type: String, id: String) -> URL? {
+        AddonTransportUrls.buildResourceURL(
+            manifestURL: manifestURL,
+            resource: "subtitles",
+            type: type,
+            id: id
+        )
     }
 }
 
@@ -1753,7 +1783,7 @@ struct CinemetaMeta: Decodable {
         var seen: Set<String> = []
         return ((trailers?.compactMap { $0.youtubeId } ?? []) +
                 (trailerStreams?.compactMap { $0.ytId?.trimmedNonEmpty } ?? []))
-            .filter { seen.insert($0).inserted }
+            .filter { YouTubeTrailerResolver.isYouTubeVideoId($0) && seen.insert($0).inserted }
     }
 
     private var parsedYear: Int? {

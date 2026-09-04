@@ -453,6 +453,7 @@ struct PlayerView: View {
             }
         }
         .onDisappear {
+            PlaybackStartupTiming.cancel()
             if !PictureInPictureManager.shared.isPictureInPictureActive {
                 PlaybackWakeLock.release()
                 viewModel.shutdown()
@@ -473,6 +474,7 @@ struct PlayerView: View {
                !viewModel.didDetectReplacementStream,
                !didReportPlaybackStarted {
                 didReportPlaybackStarted = true
+                PlaybackStartupTiming.complete()
                 onPlaybackStarted?()
             }
             guard status == .ended,
@@ -486,11 +488,13 @@ struct PlayerView: View {
         }
         .onChange(of: viewModel.isSwitchingSource) { _, isSwitching in
             if isSwitching {
+                PlaybackStartupTiming.start()
                 didReportPlaybackStarted = false
             }
         }
         .onChange(of: viewModel.didDetectReplacementStream) { _, isReplacement in
             if isReplacement {
+                PlaybackStartupTiming.start()
                 didReportPlaybackStarted = false
             }
         }
@@ -1189,6 +1193,7 @@ struct AetherPlayerSurface: UIViewControllerRepresentable {
         PictureInPictureManager.shared.fullscreenSurfaceDidRebind()
     }
 }
+
 
 private struct RemoteSeekPressCatcher: UIViewControllerRepresentable {
     let isActive: Bool

@@ -1,7 +1,6 @@
-import SwiftUI
+import Foundation
 
-/// Add-on catalog/stream source. The management UI lives in
-/// Settings → Integrations → Add-ons (see `AddonsSettingsSection`).
+/// Add-on catalog/stream source used in Settings → Integrations → Add-ons.
 struct AddonItem: Identifiable, Equatable {
     let id: String
     let name: String

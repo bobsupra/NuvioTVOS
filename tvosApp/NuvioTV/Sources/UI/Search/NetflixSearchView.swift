@@ -204,6 +204,7 @@ struct NetflixSearchView: View {
             viewModel.reloadRecent()
             focusKeyboardOnA()
         }
+        .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
         .onChange(of: focusedItemID) { _, newValue in
             itemFocusGeneration &+= 1
             let generation = itemFocusGeneration
@@ -382,14 +383,36 @@ struct NetflixSearchView: View {
         return keyWidths + gaps
     }
 
+    private var canHandleExitCommand: Bool {
+        guard isEnabled,
+              overlayRestoreItemID == nil,
+              !discoverOverlayTransitionActive else { return false }
+        return focusedItemID != nil || focusedTypeFilterID != nil || (!keyboardVisible && (viewModel.hasQuery || showDiscover))
+    }
+
+    private func handleExitCommand() {
+        focusKeyboardOnA()
+    }
+
     /// Results hide the keyboard to make room for the grid. Once focus moves
-    /// back above its first poster, bring it back and put the cursor at the
-    /// same starting key as a fresh visit to Search.
+    /// back above its first poster, or the user presses the Back button from
+    /// a card/filter, bring it back and put the cursor at the 'A' key.
     private func focusKeyboardOnA() {
         keyboardFocusGeneration &+= 1
+        let generation = keyboardFocusGeneration
         keyboardMode = .letters
+        focusedItemID = nil
+        focusedTypeFilterID = nil
         withAnimation(.easeInOut(duration: 0.22)) {
             keyboardVisible = true
+            focusedKeyboardKeyID = "keyboard:a"
+        }
+        DispatchQueue.main.async {
+            guard keyboardFocusGeneration == generation,
+                  keyboardVisible,
+                  isEnabled else { return }
+            focusedItemID = nil
+            focusedTypeFilterID = nil
             focusedKeyboardKeyID = "keyboard:a"
         }
     }

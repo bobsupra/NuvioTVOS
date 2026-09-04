@@ -28,7 +28,7 @@ enum PlayerEngineSetting: String, Equatable {
             return .aether
         case "mpvkit", "mpv":
             return .mpv
-        case "avplayer":
+        case "ksplayer", "ks", "avplayer":
             // Retired engine preference → Auto.
             return .auto
         case "auto", "":

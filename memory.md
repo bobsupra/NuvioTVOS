@@ -571,8 +571,8 @@ edit or wholesale replacement of either directory is therefore incorrect.
   migrated to an upstream replacement in the same change.
 - Preserve the AI subtitle translation flow, subtitle cue identity/timing,
   SMB playback, MPV fallback, and Nuvio's external-subtitle registration.
-- Preserve Nuvio's AV1 Metal YUV conversion fast path, its CPU fallback, and
-  its exact-output tests unless upstream contains a verified equivalent.
+- Preserve the AV1 10-bit frame detection, bit-depth-keyed pixel-buffer pool,
+  4K VOD dav1d scheduling policy, and software performance diagnostics.
 - Preserve `Vendor/namespace_ffmpegbuild.py` and
   `tvosApp/Scripts/thin_aether_simulator_frameworks.sh`. The first rewrites
   framework/module identities and removes stale upstream signatures; the
@@ -666,39 +666,32 @@ contains equivalent behavior and tests:
 Do not “fix” an ambiguity by merely trying Annex-B first or length-prefixed
 first; either ordering corrupts the opposite valid case.
 
-### 3a. AV1 software-conversion safeguard
+### 3a. AV1 software-playback safeguards
 
-Apple TV routes AV1 through dav1d software decode. Nuvio previously followed
-every decoded 4K frame with a CPU `sws_scale` conversion from planar YUV into
-NV12/P010; the extra full-frame conversion saturated the device while the same
-file remained playable in a native-Metal player. The local fast path moves that
-planar-to-bi-planar conversion onto Metal without replacing Aether's existing
-CVPixelBuffer/sample-buffer renderer.
+Apple TV routes AV1 through dav1d software decode. A rejected experiment moved
+planar YUV to Metal and then synchronously converted it back to NV12/P010 for
+`SampleBufferRenderer`. Upstream measurement showed that path was slower than
+`sws_scale` because three `MTLTexture.replace` uploads copied/swizzled the planes
+and `waitUntilCompleted` serialized the decode loop. Do not reintroduce
+`MetalYUVConverter`; a future Metal approach must render planar frames directly
+or provide a genuinely zero-copy allocator.
 
-Future rebases must preserve all of the following unless upstream ships and
-tests an equivalent path:
+Preserve these validated local safeguards across rebases:
 
-- `Sources/AetherEngine/Decoder/MetalYUVConverter.swift` owns the session-scoped
-  Metal command queue, texture cache, shaders, and reusable source textures.
-- `SoftwareVideoDecoder.swift` enables it only for AV1 `YUV420P`, `YUVJ420P`,
-  and `YUV420P10LE`, producing NV12/P010 from the decoder's existing pool.
-- Color and pixel-aspect attachments, subtitles, seeking, frame pacing, and PiP
-  continue through `SampleBufferRenderer`; this is not a second renderer.
-- Unsupported formats, missing Metal, invalid/negative strides, texture/shader
-  failures, or GPU command failures fall back to the existing `sws_scale` path.
-  A failed Metal path is disabled for that session and logged once rather than
-  retried on every frame.
-- FFmpeg's 10-bit planar samples are low-aligned; the P010 output is high-aligned
-  and preserves video/full-range mapping. Do not remove that packing logic.
-- `Package.swift` must keep the `Metal` framework link.
-- Keep `MetalYUVConversionPolicyTests.swift`: it runs the real shader on a Metal
-  device, reads back exact NV12/P010 bytes, verifies P010 alignment/range, and
-  checks negative-stride fallback.
+- A decoded `YUV420P10LE` frame latches `use10Bit` even when codec parameters
+  omit `bits_per_raw_sample`, preventing an 8-bit pool from truncating it.
+- `poolIs10Bit` participates in pixel-buffer-pool identity so a bit-depth change
+  recreates the NV12/P010 pool correctly.
+- 4K AV1 VOD uses the device-tested dav1d thread/frame-delay policy; live,
+  lower-resolution, and 8K content keep upstream defaults.
+- `SWPerformanceSnapshot` and the on-screen `SWPERF` line retain video decode,
+  conversion, audio decode, packet/frame, and film-grain diagnostics.
+- Film-grain synthesis remains at dav1d's default. Disabling it is a fidelity
+  tradeoff and must not become a production default without explicit evidence.
 
-After an upgrade, run the Metal conversion suite and test the affected 4K AV1
-file on a physical Apple TV. The release log should contain
-`AV1 Metal YUV conversion enabled (GPU-complete)`; a fallback log means the
-performance fix was not active.
+Physical-device validation should check decoded cadence, cushion/frame lead,
+dropped-frame growth, CPU/thermal stability, and the `SWPERF` line on the same
+source/provider and playback interval.
 
 ### 4. Refresh FFmpegBuild without losing the fork
 

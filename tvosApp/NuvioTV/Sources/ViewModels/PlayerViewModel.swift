@@ -309,7 +309,7 @@ class PlayerViewModel: ObservableObject {
     /// Used to recognize an expired-link "slate" the stream host plays in place
     /// of the movie — see `loadedStreamLooksLikeReplacement()`.
     private var expectedDurationSeconds: Double?
-    private let trailerResolver = YouTubeTrailerResolver()
+    private let trailerResolver = YouTubeTrailerResolver.shared
     private var trailerResolveTask: Task<Void, Never>?
     @Published private(set) var didDetectReplacementStream = false
     private var replacementStreamHits = 0
@@ -488,11 +488,14 @@ class PlayerViewModel: ObservableObject {
 
             trailerResolveTask?.cancel()
             trailerResolveTask = Task { [weak self] in
-                let resolvedUrl = await resolver.resolve(
-                    youtubeVideoId: youtubeId,
-                    title: title,
-                    year: year
-                )
+                var resolvedUrl = await resolver.resolve(for: meta)
+                if resolvedUrl == nil {
+                    resolvedUrl = await resolver.resolve(
+                        youtubeVideoId: youtubeId,
+                        title: title,
+                        year: year
+                    )
+                }
 
                 guard !Task.isCancelled else { return }
 

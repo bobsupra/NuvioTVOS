@@ -436,8 +436,7 @@ enum WatchProgressLedger {
     // app so both platforms agree on what is still "in progress".
 
     static func isSeriesType(_ type: String) -> Bool {
-        let normalized = type.lowercased()
-        return normalized == "series" || normalized == "tv"
+        NuvioMeta.isSeriesType(type)
     }
 
     static func progressKey(contentId: String, season: Int?, episode: Int?) -> String {

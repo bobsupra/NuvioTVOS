@@ -139,6 +139,13 @@ final class StreamsRepository: ObservableObject {
         }
 
         activeRequestKey = key
+        state = StreamsDiscoveryState(
+            requestKey: key,
+            revision: state.revision &+ 1,
+            groups: [],
+            isAnyLoading: true,
+            hasResolvedTargets: false
+        )
         activeJob?.cancel()
         activeJob = Task { [weak self] in
             await self?.runDiscovery(
@@ -368,11 +375,23 @@ final class StreamsRepository: ObservableObject {
         type: String,
         videoId: String
     ) async -> GroupUpdate {
-        let streamURL = target.manifestURL
-            .deletingLastPathComponent()
-            .appendingPathComponent("stream")
-            .appendingPathComponent(type)
-            .appendingPathComponent("\(videoId).json")
+        guard let streamURL = AddonTransportUrls.buildResourceURL(
+            manifestURL: target.manifestURL,
+            resource: "stream",
+            type: type,
+            id: videoId
+        ) else {
+            return GroupUpdate(
+                addonId: target.addonId,
+                group: AddonStreamGroup(
+                    addonId: target.addonId,
+                    displayName: target.displayName,
+                    streams: [],
+                    isLoading: false,
+                    error: "Invalid stream URL"
+                )
+            )
+        }
 
         do {
             var attempt = 0
@@ -428,12 +447,13 @@ final class StreamsRepository: ObservableObject {
     ) async throws -> [NuvioStream] {
         var request = URLRequest(url: url)
         request.timeoutInterval = streamRequestTimeout
+        request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
         let (data, response) = try await URLSession.shared.data(for: request)
         guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
             throw URLError(.badServerResponse)
         }
         let decoded = try JSONDecoder().decode(StreamAddonResponse.self, from: data)
-        return decoded.streams.compactMap { raw in
+        return (decoded.streams ?? []).compactMap { raw in
             guard let stream = raw.toNuvioStream(addonName: addonName) else { return nil }
             return logo.map { stream.withAddonLogoURL($0) } ?? stream
         }
@@ -508,30 +528,30 @@ final class StreamsRepository: ObservableObject {
             )
         ]
 
-        var endpoints: [(name: String, subtitleURL: URL)] = builtIn.map { item in
-            (
-                item.name,
-                item.url
-                    .deletingLastPathComponent()
-                    .appendingPathComponent("subtitles")
-                    .appendingPathComponent(subtitleType)
-                    .appendingPathComponent("\(videoId).json")
-            )
+        var endpoints: [(name: String, subtitleURL: URL)] = builtIn.compactMap { item in
+            guard let subtitleURL = AddonTransportUrls.buildResourceURL(
+                manifestURL: item.url,
+                resource: "subtitles",
+                type: subtitleType,
+                id: videoId
+            ) else { return nil }
+            return (item.name, subtitleURL)
         }
 
         let enabledURLs = CinemetaCatalogRepository.configuredStreamAddonManifestURLs
         let manifests = await Self.loadManifestsConcurrently(urls: enabledURLs)
         for url in enabledURLs {
             guard let manifest = manifests[url],
-                  manifest.supportsResource("subtitles", type: subtitleType, id: videoId) else {
+                  manifest.supportsResource("subtitles", type: subtitleType, id: videoId),
+                  let subtitleURL = AddonTransportUrls.buildResourceURL(
+                      manifestURL: url,
+                      resource: "subtitles",
+                      type: subtitleType,
+                      id: videoId
+                  ) else {
                 continue
             }
             let name = manifest.displayName ?? CinemetaCatalogRepository.streamAddonName(for: url)
-            let subtitleURL = url
-                .deletingLastPathComponent()
-                .appendingPathComponent("subtitles")
-                .appendingPathComponent(subtitleType)
-                .appendingPathComponent("\(videoId).json")
             endpoints.append((name, subtitleURL))
         }
 
@@ -556,12 +576,13 @@ final class StreamsRepository: ObservableObject {
         do {
             var request = URLRequest(url: url)
             request.timeoutInterval = 15
+            request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
             let (data, response) = try await URLSession.shared.data(for: request)
             guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
                 return []
             }
             let decoded = try JSONDecoder().decode(StreamSubtitleResponse.self, from: data)
-            return decoded.subtitles.compactMap { $0.toNuvioSubtitle(source: source) }
+            return (decoded.subtitles ?? []).compactMap { $0.toNuvioSubtitle(source: source) }
         } catch {
             print("[StreamsRepo] subtitles failed source=\(source) error=\(error.localizedDescription)")
             return []
@@ -652,7 +673,7 @@ struct StreamAddonManifestResource: Decodable {
     func supportsType(_ type: String, fallbackTypes: [String]) -> Bool {
         let supportedTypes = types.isEmpty ? fallbackTypes : types
         guard !supportedTypes.isEmpty else { return true }
-        if supportedTypes.contains(where: { $0.caseInsensitiveCompare(type) == .orderedSame }) {
+        if supportedTypes.contains(where: { AddonTransportUrls.isTypeEquivalent($0, type) }) {
             return true
         }
         if CinemetaCatalogRepository.isLiveContentType(type) {
@@ -669,11 +690,29 @@ struct StreamAddonManifestResource: Decodable {
 }
 
 private struct StreamAddonResponse: Decodable {
-    let streams: [StreamAddonStreamDTO]
+    let streams: [StreamAddonStreamDTO]?
+
+    enum CodingKeys: String, CodingKey {
+        case streams
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.streams = try? container.decodeIfPresent([StreamAddonStreamDTO].self, forKey: .streams)
+    }
 }
 
 private struct StreamSubtitleResponse: Decodable {
-    let subtitles: [StreamAddonSubtitleDTO]
+    let subtitles: [StreamAddonSubtitleDTO]?
+
+    enum CodingKeys: String, CodingKey {
+        case subtitles
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        self.subtitles = try? container.decodeIfPresent([StreamAddonSubtitleDTO].self, forKey: .subtitles)
+    }
 }
 
 struct StreamAddonStreamDTO: Decodable {

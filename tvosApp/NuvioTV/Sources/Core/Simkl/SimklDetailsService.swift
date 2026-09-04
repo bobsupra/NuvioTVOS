@@ -54,7 +54,7 @@ enum SimklDetailsService {
         guard isConfigured, let identifier = Int(simklID), identifier > 0 else { return nil }
         // Simkl files anime under its own endpoint, and the id spaces don't
         // overlap, so fall back to it when the type-matched endpoint misses.
-        let candidates: [Kind] = isSeries(type) ? [.show, .anime] : [.movie, .anime]
+        let candidates: [Kind] = isSeries(type) ? [.show, .anime, .movie] : [.movie, .show, .anime]
         for kind in candidates {
             guard let detail: SimklDetailDTO = await get(path: "\(kind.path)/\(identifier)") else {
                 continue
@@ -131,7 +131,7 @@ enum SimklDetailsService {
     }
 
     private static func isSeries(_ type: String) -> Bool {
-        ["series", "show", "tv", "tvshow"].contains(type.lowercased())
+        NuvioMeta.isSeriesType(type)
     }
 
     // MARK: - Transport

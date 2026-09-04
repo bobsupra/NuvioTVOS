@@ -168,6 +168,12 @@ enum TmdbDetailsService {
     private static let localizedDetailsCache = TmdbLocalizedDetailsCache()
     private static let findCache = TmdbFindCache()
 
+    private static func data(for url: URL, timeout: TimeInterval = 10) async throws -> (Data, URLResponse) {
+        var request = URLRequest(url: url)
+        request.timeoutInterval = timeout
+        return try await URLSession.shared.data(for: request)
+    }
+
     private static var apiKey: String? {
         let key = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -195,12 +201,13 @@ enum TmdbDetailsService {
     static var useSeasonPosters: Bool { tmdbBoolean(SettingsKey.tmdbUseSeasonPosters) }
     static var useMoreLikeThis: Bool { tmdbBoolean(SettingsKey.tmdbUseMoreLikeThis) }
     static var useCollections: Bool { tmdbBoolean(SettingsKey.tmdbUseCollections) }
+    static var useHomeEnrichment: Bool { tmdbBoolean(SettingsKey.tmdbApplyToHome, defaultValue: false) }
 
     // MARK: - Public
 
     static func resolveTmdbId(for meta: NuvioMeta) async -> (id: Int, mediaType: String)? {
         guard isEnabled, apiKey != nil else { return nil }
-        let mediaType = isSeries(meta.type) ? "tv" : "movie"
+        let mediaType = (meta.isSeries || isSeries(meta.type)) ? "tv" : "movie"
         let imdb = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id.split(separator: ":").first.map(String.init) : nil)
 
         // 1. If an IMDb id is available, resolve via TMDB's authoritative /find/ endpoint first
@@ -263,7 +270,7 @@ enum TmdbDetailsService {
         }
         components.queryItems = queryItems
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbVideosResponse.self, from: data) else {
@@ -296,7 +303,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbCreditsResponse.self, from: data) else {
@@ -380,7 +387,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbDetailsResponse.self, from: data) else {
@@ -426,7 +433,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let showDetails = try? JSONDecoder().decode(TmdbTvShowDetailsResponse.self, from: data) else {
@@ -438,23 +445,31 @@ enum TmdbDetailsService {
             return num
         }
 
-        return await withTaskGroup(of: [NuvioVideo].self, returning: [NuvioVideo]?.self) { group in
-            for seasonNum in seasonNumbers {
-                group.addTask {
-                    await fetchSeasonEpisodes(
-                        parentId: meta.id,
-                        tmdbId: resolved.id,
-                        seasonNumber: seasonNum,
-                        apiKey: apiKey
-                    )
+        // Bounded batching (max 4 seasons at a time) to prevent memory spikes on massive series (e.g. 20-40 seasons)
+        var allVideos: [NuvioVideo] = []
+        let batchSize = 4
+        for i in stride(from: 0, to: seasonNumbers.count, by: batchSize) {
+            let chunk = Array(seasonNumbers[i..<min(i + batchSize, seasonNumbers.count)])
+            let chunkVideos = await withTaskGroup(of: [NuvioVideo].self) { group in
+                for seasonNum in chunk {
+                    group.addTask {
+                        await fetchSeasonEpisodes(
+                            parentId: meta.streamId,
+                            tmdbId: resolved.id,
+                            seasonNumber: seasonNum,
+                            apiKey: apiKey
+                        )
+                    }
                 }
+                var batchResult: [NuvioVideo] = []
+                for await seasonVideos in group {
+                    batchResult.append(contentsOf: seasonVideos)
+                }
+                return batchResult
             }
-            var allVideos: [NuvioVideo] = []
-            for await seasonVideos in group {
-                allVideos.append(contentsOf: seasonVideos)
-            }
-            return allVideos.isEmpty ? nil : allVideos
+            allVideos.append(contentsOf: chunkVideos)
         }
+        return allVideos.isEmpty ? nil : allVideos
     }
 
     private static func fetchSeasonEpisodes(
@@ -463,33 +478,41 @@ enum TmdbDetailsService {
         seasonNumber: Int,
         apiKey: String
     ) async -> [NuvioVideo] {
+        let requestedCode = preferredLanguage.split(separator: "-").first.map(String.init) ?? "en"
         var components = URLComponents(
             url: apiBase.appendingPathComponent("tv/\(tmdbId)/season/\(seasonNumber)"),
             resolvingAgainstBaseURL: false
         )!
-        components.queryItems = [
+        var queryItems = [
             URLQueryItem(name: "api_key", value: apiKey),
-            URLQueryItem(name: "language", value: preferredLanguage),
-            URLQueryItem(name: "append_to_response", value: "translations")
+            URLQueryItem(name: "language", value: preferredLanguage)
         ]
+        // Only request translations payload if non-English, avoiding massive redundant translation matrices
+        if requestedCode.caseInsensitiveCompare("en") != .orderedSame {
+            queryItems.append(URLQueryItem(name: "append_to_response", value: "translations"))
+        }
+        components.queryItems = queryItems
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let seasonDetails = try? JSONDecoder().decode(TmdbSeasonDetailsResponse.self, from: data) else {
             return []
         }
 
-        let requestedCode = preferredLanguage.split(separator: "-").first.map(String.init) ?? "en"
         let baseParentId = parentId.hasPrefix("tt") ? parentId : "tmdb:\(tmdbId)"
         return (seasonDetails.episodes ?? []).compactMap { ep -> NuvioVideo? in
             guard let epNum = ep.episodeNumber else { return nil }
             let epSeason = ep.seasonNumber ?? seasonNumber
             let ratingStr = ep.voteAverage.flatMap { $0 > 0 ? String(format: "%.1f", $0) : nil }
 
-            let matchingTrans = ep.translations?.translations?.first(where: {
-                $0.iso6391?.caseInsensitiveCompare(requestedCode) == .orderedSame
-                    && (!($0.data?.name?.isEmpty ?? true) || !($0.data?.overview?.isEmpty ?? true))
+            let matchingTrans = ep.translations?.translations?.first(where: { item in
+                guard let iso = item.iso6391, iso.caseInsensitiveCompare(requestedCode) == .orderedSame else {
+                    return false
+                }
+                let hasName = !(item.data?.name?.isEmpty ?? true)
+                let hasOverview = !(item.data?.overview?.isEmpty ?? true)
+                return hasName || hasOverview
             })
 
             let epName = nonEmpty(matchingTrans?.data?.name) ?? nonEmpty(ep.name) ?? "Episode \(epNum)"
@@ -557,16 +580,17 @@ enum TmdbDetailsService {
             : nil
         let tmdbLogoURL = imageURL(tmdbLogoPath, size: "w500")
 
+        let resolvedType = (!meta.isSeries && resolved.mediaType == "tv") ? "series" : meta.type
         return NuvioMeta(
             id: meta.id,
             name: localizedTitle ?? meta.name,
             description: localizedOverview ?? meta.description,
-            posterUrl: tmdbPosterURL ?? meta.posterUrl,
+            posterUrl: nonEmpty(meta.posterUrl) ?? tmdbPosterURL,
             backgroundUrl: tmdbBackgroundURL ?? meta.backgroundUrl,
             logoUrl: tmdbLogoURL ?? meta.logoUrl,
             imdbId: meta.imdbId,
             tmdbId: meta.tmdbId ?? resolved.id,
-            type: meta.type,
+            type: resolvedType,
             year: meta.year,
             genres: localizedGenres ?? meta.genres,
             rating: meta.rating,
@@ -588,7 +612,7 @@ enum TmdbDetailsService {
     /// catalog cards while preserving their source order. The details screen
     /// remains the only place that requests credits and episode data.
     static func localizedMetadata(for metas: [NuvioMeta]) async -> [NuvioMeta] {
-        guard isEnabled, useBasicInfo || useArtwork, !metas.isEmpty else { return metas }
+        guard isEnabled, useHomeEnrichment, useBasicInfo || useArtwork, !metas.isEmpty else { return metas }
 
         return await withTaskGroup(of: (Int, NuvioMeta).self, returning: [NuvioMeta].self) { group in
             for (index, meta) in metas.enumerated() {
@@ -731,7 +755,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbPersonCreditsResponse.self, from: data) else {
@@ -757,41 +781,36 @@ enum TmdbDetailsService {
     // MARK: - Private
 
     private static func isSeries(_ type: String) -> Bool {
-        ["series", "show", "tv", "tvshow"].contains(type.lowercased())
+        NuvioMeta.isSeriesType(type)
     }
 
     private static func findByImdb(_ imdbId: String) async -> (id: Int, mediaType: String)? {
-        if let cached = await findCache.value(for: imdbId) {
-            return cached
-        }
-        guard let apiKey else { return nil }
-        var components = URLComponents(
-            url: apiBase.appendingPathComponent("find/\(imdbId)"),
-            resolvingAgainstBaseURL: false
-        )!
-        components.queryItems = [
-            URLQueryItem(name: "api_key", value: apiKey),
-            URLQueryItem(name: "external_source", value: "imdb_id"),
-            URLQueryItem(name: "language", value: preferredLanguage)
-        ]
-        guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
-              let http = response as? HTTPURLResponse,
-              (200...299).contains(http.statusCode),
-              let decoded = try? JSONDecoder().decode(TmdbFindResponse.self, from: data) else {
+        await findCache.resolve(for: imdbId) {
+            guard let apiKey else { return nil }
+            var components = URLComponents(
+                url: apiBase.appendingPathComponent("find/\(imdbId)"),
+                resolvingAgainstBaseURL: false
+            )!
+            components.queryItems = [
+                URLQueryItem(name: "api_key", value: apiKey),
+                URLQueryItem(name: "external_source", value: "imdb_id"),
+                URLQueryItem(name: "language", value: preferredLanguage)
+            ]
+            guard let url = components.url,
+                  let (data, response) = try? await data(for: url),
+                  let http = response as? HTTPURLResponse,
+                  (200...299).contains(http.statusCode),
+                  let decoded = try? JSONDecoder().decode(TmdbFindResponse.self, from: data) else {
+                return nil
+            }
+            if let movie = decoded.movieResults?.first {
+                return (movie.id, "movie")
+            }
+            if let show = decoded.tvResults?.first {
+                return (show.id, "tv")
+            }
             return nil
         }
-        if let movie = decoded.movieResults?.first {
-            let result = (movie.id, "movie")
-            await findCache.insert(result, for: imdbId)
-            return result
-        }
-        if let show = decoded.tvResults?.first {
-            let result = (show.id, "tv")
-            await findCache.insert(result, for: imdbId)
-            return result
-        }
-        return nil
     }
 
     private static func fetchCompanies(tmdbId: Int, mediaType: String) async -> [MetaCompany] {
@@ -805,7 +824,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbDetailsResponse.self, from: data) else {
@@ -859,7 +878,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbPagedResults.self, from: data) else {
@@ -898,7 +917,7 @@ enum TmdbDetailsService {
             components.queryItems?.append(URLQueryItem(name: "vote_count.gte", value: String(voteCountFloor)))
         }
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbPagedResults.self, from: data) else {
@@ -924,7 +943,7 @@ enum TmdbDetailsService {
             URLQueryItem(name: "language", value: preferredLanguage)
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
               let decoded = try? JSONDecoder().decode(TmdbNetworkDetailsResponse.self, from: data) else {
@@ -1022,7 +1041,7 @@ enum TmdbDetailsService {
             )
         ]
         guard let url = components.url,
-              let (data, response) = try? await URLSession.shared.data(from: url),
+              let (data, response) = try? await data(for: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode) else {
             return nil
@@ -1054,13 +1073,13 @@ enum TmdbDetailsService {
         return value
     }
 
-    private static func tmdbBoolean(_ key: String) -> Bool {
+    private static func tmdbBoolean(_ key: String, defaultValue: Bool = true) -> Bool {
         guard let value = ProfileSettings.current.object(forKey: key) else {
             // All Android TV TMDB modules default to enabled. Keep that same
             // behavior for existing tvOS profiles that predate these keys.
-            return true
+            return defaultValue
         }
-        return (value as? Bool) ?? true
+        return (value as? Bool) ?? defaultValue
     }
 
     private static func dedupe(_ items: [RelatedTitle]) -> [RelatedTitle] {
@@ -1239,6 +1258,7 @@ private struct TmdbCreatorDTO: Decodable {
 
 private actor TmdbFindCache {
     private var values: [String: (id: Int, mediaType: String)] = [:]
+    private var inFlight: [String: Task<(id: Int, mediaType: String)?, Never>] = [:]
 
     func value(for key: String) -> (id: Int, mediaType: String)? {
         values[key]
@@ -1246,6 +1266,28 @@ private actor TmdbFindCache {
 
     func insert(_ value: (id: Int, mediaType: String), for key: String) {
         values[key] = value
+    }
+
+    func resolve(
+        for key: String,
+        fetcher: @Sendable @escaping () async -> (id: Int, mediaType: String)?
+    ) async -> (id: Int, mediaType: String)? {
+        if let cached = values[key] {
+            return cached
+        }
+        if let existingTask = inFlight[key] {
+            return await existingTask.value
+        }
+        let task = Task {
+            await fetcher()
+        }
+        inFlight[key] = task
+        let result = await task.value
+        inFlight.removeValue(forKey: key)
+        if let result {
+            values[key] = result
+        }
+        return result
     }
 }
 
@@ -1469,6 +1511,7 @@ enum MdbListDetailsService {
 
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
+        request.timeoutInterval = 8
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.httpBody = try? JSONEncoder().encode(
             RatingRequest(ids: [imdbID], provider: providerIMDb)

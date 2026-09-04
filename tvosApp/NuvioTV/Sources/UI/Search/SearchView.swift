@@ -196,7 +196,7 @@ struct SearchView: View {
 
                 Text(
                     viewModel.searchText.isEmpty
-                        ? L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
+                        ? L10n.string("search_placeholder", fallback: "Search movies & series")
                         : viewModel.searchText
                 )
                     .font(.system(size: 30, weight: .regular))

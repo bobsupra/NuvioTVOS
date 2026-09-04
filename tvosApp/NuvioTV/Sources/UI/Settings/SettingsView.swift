@@ -149,6 +149,7 @@ enum SettingsKey {
     /// JSON `[String]` of Home section ids selected as Grid View hero sources.
     /// Empty means all available catalog rows.
     static let heroCatalogs = "nuvio.tv.settings.layout.heroCatalogs"
+    static let fullscreenHeroBackdrop = "nuvio.tv.settings.layout.fullscreenHeroBackdrop"
     static let posterLabels = "nuvio.tv.settings.layout.posterLabels"
     static let catalogAddonNames = "nuvio.tv.settings.layout.catalogAddonNames"
     static let discoverLocation = "nuvio.tv.settings.layout.discoverLocation"
@@ -191,6 +192,7 @@ enum SettingsKey {
     static let tmdbUseSeasonPosters = "nuvio.tv.settings.integrations.tmdbUseSeasonPosters"
     static let tmdbUseMoreLikeThis = "nuvio.tv.settings.integrations.tmdbUseMoreLikeThis"
     static let tmdbUseCollections = "nuvio.tv.settings.integrations.tmdbUseCollections"
+    static let tmdbApplyToHome = "nuvio.tv.settings.integrations.tmdbApplyToHome"
     static let mdbListEnabled = "nuvio.tv.settings.integrations.mdbListEnabled"
     static let mdbListApiKey = "nuvio.tv.settings.integrations.mdbListApiKey"
     static let mdbListUseImdb = "nuvio.tv.settings.integrations.mdbListUseImdb"
@@ -232,9 +234,11 @@ enum SettingsKey {
     static let playerEngine = "nuvio.tv.settings.playback.playerEngine"
     static let externalPlayer = "nuvio.tv.settings.playback.externalPlayer"
     static let smartStreamSelection = "nuvio.tv.settings.playback.smartStreamSelection"
+    static let smartStreamUseTopResult = "nuvio.tv.settings.playback.smartStreamUseTopResult"
     static let smartStreamQuality = "nuvio.tv.settings.playback.smartStreamQuality"
     static let smartSubtitleMatching = "nuvio.tv.settings.playback.smartSubtitleMatching"
     static let cachedOnlyStreams = "nuvio.tv.settings.playback.cachedOnlyStreams"
+    static let preferHardwareDecodedStreams = "nuvio.tv.settings.playback.preferHardwareDecodedStreams"
     static let streamSortOption = "nuvio.tv.settings.playback.streamSortOption"
     static let streamBadgeRules = "nuvio.tv.settings.playback.streamBadgeRules"
     static let showFileSizeBadges = "nuvio.tv.settings.playback.showFileSizeBadges"
@@ -283,7 +287,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
+        homeLayout, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, posterLabels, catalogAddonNames, discoverLocation,
         searchStyle,
         continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
         cardCornerRadius, cardSize, liquidGlassCards,
@@ -296,7 +300,7 @@ enum SettingsKey {
         tmdbEnabled, tmdbApiKey, tmdbLanguage,
         tmdbUseTrailers, tmdbUseArtwork, tmdbUseBasicInfo, tmdbUseDetails, tmdbUseCredits,
         tmdbUseProductions, tmdbUseNetworks, tmdbUseEpisodes, tmdbUseSeasonPosters,
-        tmdbUseMoreLikeThis, tmdbUseCollections,
+        tmdbUseMoreLikeThis, tmdbUseCollections, tmdbApplyToHome,
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
@@ -306,8 +310,8 @@ enum SettingsKey {
         aiSubtitlesTargetLanguage, aiSubtitlesAutoSelect, aiSubtitlesStripHearingImpaired,
         streamAddonManifestURL, streamAddonManifestURLs,
         streamAddonManifestStates,
-        playerEngine, externalPlayer, smartStreamSelection, smartStreamQuality, smartSubtitleMatching,
-        cachedOnlyStreams, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
+        playerEngine, externalPlayer, smartStreamSelection, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
+        cachedOnlyStreams, preferHardwareDecodedStreams, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
         autoPlayNext, autoPlayNextCountdown, postPlayRecommendationsEnabled, trailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
@@ -2328,6 +2332,7 @@ private struct CardStyleLivePreview: View {
 private struct HomeLayoutLivePreview: View {
     let layout: String
     let heroEnabled: Bool
+    var fullscreenHeroBackdrop: Bool = true
     let posterLabels: Bool
     let catalogAddonNames: Bool
     let accentColor: Color
@@ -2384,37 +2389,76 @@ private struct HomeLayoutLivePreview: View {
             // Centered 16:9 Widescreen TV Mockup
             ZStack(alignment: .topLeading) {
                 // Cinematic Full-Bleed Ambient Backdrop
-                ZStack {
-                    LinearGradient(
-                        colors: [
-                            Color(red: 0.14, green: 0.18, blue: 0.24),
-                            Color(red: 0.08, green: 0.10, blue: 0.14),
-                            Color(red: 0.04, green: 0.05, blue: 0.08)
-                        ],
-                        startPoint: .topTrailing,
-                        endPoint: .bottomLeading
-                    )
+                let previewBg = Color(red: 0.04, green: 0.05, blue: 0.08)
+                ZStack(alignment: .topTrailing) {
+                    previewBg
 
-                    // Left & Bottom gradient shadow
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.95), location: 0.0),
-                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.70), location: 0.45),
-                            .init(color: .clear, location: 0.85)
-                        ],
-                        startPoint: .leading,
-                        endPoint: .trailing
-                    )
+                    if fullscreenHeroBackdrop {
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.14, green: 0.18, blue: 0.24),
+                                Color(red: 0.08, green: 0.10, blue: 0.14),
+                                previewBg
+                            ],
+                            startPoint: .topTrailing,
+                            endPoint: .bottomLeading
+                        )
 
-                    LinearGradient(
-                        stops: [
-                            .init(color: .clear, location: 0.2),
-                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08).opacity(0.85), location: 0.7),
-                            .init(color: Color(red: 0.04, green: 0.05, blue: 0.08), location: 1.0)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
+                        // Left & Bottom gradient shadow
+                        LinearGradient(
+                            stops: [
+                                .init(color: previewBg.opacity(0.95), location: 0.0),
+                                .init(color: previewBg.opacity(0.70), location: 0.45),
+                                .init(color: .clear, location: 0.85)
+                            ],
+                            startPoint: .leading,
+                            endPoint: .trailing
+                        )
+
+                        LinearGradient(
+                            stops: [
+                                .init(color: .clear, location: 0.2),
+                                .init(color: previewBg.opacity(0.85), location: 0.7),
+                                .init(color: previewBg, location: 1.0)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    } else {
+                        LinearGradient(
+                            colors: [
+                                Color(red: 0.16, green: 0.22, blue: 0.30),
+                                Color(red: 0.10, green: 0.13, blue: 0.18),
+                                previewBg
+                            ],
+                            startPoint: .topTrailing,
+                            endPoint: .bottomLeading
+                        )
+                        .frame(width: 380, height: 165)
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .clear, location: 0),
+                                    .init(color: .black.opacity(0.30), location: 0.28),
+                                    .init(color: .black, location: 0.65)
+                                ],
+                                startPoint: .leading,
+                                endPoint: .trailing
+                            )
+                        )
+                        .mask(
+                            LinearGradient(
+                                stops: [
+                                    .init(color: .black, location: 0),
+                                    .init(color: .black, location: 0.48),
+                                    .init(color: .black.opacity(0.40), location: 0.78),
+                                    .init(color: .clear, location: 1.0)
+                                ],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                    }
                 }
 
                 // Screen Layout Contents
@@ -2462,6 +2506,7 @@ private struct HomeLayoutLivePreview: View {
         )
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: layout)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: heroEnabled)
+        .animation(.spring(response: 0.32, dampingFraction: 0.80), value: fullscreenHeroBackdrop)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: posterLabels)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: catalogAddonNames)
         .animation(.spring(response: 0.32, dampingFraction: 0.80), value: cardCornerRadius)
@@ -2717,6 +2762,7 @@ private struct LayoutDiscoverySettingsView: View {
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
+    @AppStorage(SettingsKey.fullscreenHeroBackdrop) private var fullscreenHeroBackdrop = true
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.catalogAddonNames) private var catalogAddonNames = true
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
@@ -2749,6 +2795,7 @@ private struct LayoutDiscoverySettingsView: View {
                 HomeLayoutLivePreview(
                     layout: homeLayout,
                     heroEnabled: heroEnabled,
+                    fullscreenHeroBackdrop: fullscreenHeroBackdrop,
                     posterLabels: posterLabels,
                     catalogAddonNames: catalogAddonNames,
                     accentColor: accentColor
@@ -2786,6 +2833,19 @@ private struct LayoutDiscoverySettingsView: View {
                     )
                     .transition(.opacity.combined(with: .move(edge: .top)))
                 }
+
+                SettingsToggleRow(
+                    title: L10n.string(
+                        "layout_fullscreen_hero_backdrop",
+                        fallback: "Fullscreen Hero Backdrop"
+                    ),
+                    subtitle: L10n.string(
+                        "layout_fullscreen_hero_backdrop_sub",
+                        fallback: "Expand the hero backdrop to fill the entire screen."
+                    ),
+                    isOn: $fullscreenHeroBackdrop,
+                    accentColor: accentColor
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_layout_poster_labels", fallback: "Poster Labels"),
@@ -2841,7 +2901,7 @@ private struct LayoutDiscoverySettingsView: View {
                         fallback: "How long to wait before expanding focused cards"
                     ),
                     value: $focusedPosterBackdropDelay,
-                    range: 2...15,
+                    range: 0...10,
                     step: 1,
                     suffix: "s",
                     accentColor: accentColor
@@ -3183,9 +3243,27 @@ private struct IntegrationSettingsView: View {
         VStack(alignment: .leading, spacing: 22) {
             AddonsSettingsSection(accentColor: accentColor)
 
-            SMBSettingsSection(accentColor: accentColor)
+            SettingsGroup(
+                title: L10n.string("settings_simkl_title", fallback: "Simkl"),
+                subtitle: L10n.string("tvos_settings_simkl_integration_subtitle", fallback: "Connect a Simkl account with a Client ID and PIN login")
+            ) {
+                SettingsTextFieldRow(
+                    title: L10n.string("tvos_settings_simkl_client_id_title", fallback: "Simkl Client ID"),
+                    subtitle: L10n.string("tvos_settings_simkl_client_id_subtitle", fallback: "Create an API app at simkl.com/settings/developer — stored only on this Apple TV"),
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $simklClientIDDraft
+                )
 
-            JellyfinSettingsSection(accentColor: accentColor)
+                SettingsInfoRow(title: L10n.string("tvos_settings_simkl_redirect_uri", fallback: "Simkl Redirect URI"), value: SimklConfig.redirectURI)
+
+                SimklConnectionSettingsCard(
+                    viewModel: simklViewModel,
+                    accentColor: accentColor,
+                    credentialsReady: simklCredentialsReady,
+                    onStartLogin: connectSimkl,
+                    onOpenSettings: { showingSimklSettings = true }
+                )
+            }
 
             SettingsGroup(
                 title: L10n.string("mdblist_trakt_title", fallback: "Trakt"),
@@ -3224,25 +3302,17 @@ private struct IntegrationSettingsView: View {
             }
 
             SettingsGroup(
-                title: L10n.string("settings_simkl_title", fallback: "Simkl"),
-                subtitle: L10n.string("tvos_settings_simkl_integration_subtitle", fallback: "Connect a Simkl account with a Client ID and PIN login")
+                title: L10n.string("settings_ai_subtitles_title", fallback: "AI Subtitles"),
+                subtitle: L10n.string("tvos_settings_ai_subtitles_integration_subtitle", fallback: "Translate active subtitle cues live with Gemini or OpenRouter")
             ) {
-                SettingsTextFieldRow(
-                    title: L10n.string("tvos_settings_simkl_client_id_title", fallback: "Simkl Client ID"),
-                    subtitle: L10n.string("tvos_settings_simkl_client_id_subtitle", fallback: "Create an API app at simkl.com/settings/developer — stored only on this Apple TV"),
-                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $simklClientIDDraft
-                )
-
-                SettingsInfoRow(title: L10n.string("tvos_settings_simkl_redirect_uri", fallback: "Simkl Redirect URI"), value: SimklConfig.redirectURI)
-
-                SimklConnectionSettingsCard(
-                    viewModel: simklViewModel,
-                    accentColor: accentColor,
-                    credentialsReady: simklCredentialsReady,
-                    onStartLogin: connectSimkl,
-                    onOpenSettings: { showingSimklSettings = true }
-                )
+                SettingsActionRow(
+                    title: L10n.string("settings_ai_subtitles_action_title", fallback: "AI Subtitle Translation"),
+                    subtitle: L10n.string("tvos_settings_ai_subtitles_action_subtitle", fallback: "Uses your selected provider only while you watch; original subtitles stay visible until each translation is ready"),
+                    value: aiSubtitlesEnabled && aiSubtitlesHasApiKey ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
+                    accentColor: accentColor
+                ) {
+                    showingAISubtitleOptions = true
+                }
             }
 
             SettingsGroup(
@@ -3268,20 +3338,6 @@ private struct IntegrationSettingsView: View {
                     accentColor: accentColor
                 ) {
                     showingMdbListOptions = true
-                }
-            }
-
-            SettingsGroup(
-                title: L10n.string("settings_ai_subtitles_title", fallback: "AI Subtitles"),
-                subtitle: L10n.string("tvos_settings_ai_subtitles_integration_subtitle", fallback: "Translate active subtitle cues live with Gemini or OpenRouter")
-            ) {
-                SettingsActionRow(
-                    title: L10n.string("settings_ai_subtitles_action_title", fallback: "AI Subtitle Translation"),
-                    subtitle: L10n.string("tvos_settings_ai_subtitles_action_subtitle", fallback: "Uses your selected provider only while you watch; original subtitles stay visible until each translation is ready"),
-                    value: aiSubtitlesEnabled && aiSubtitlesHasApiKey ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
-                    accentColor: accentColor
-                ) {
-                    showingAISubtitleOptions = true
                 }
             }
 
@@ -3324,6 +3380,10 @@ private struct IntegrationSettingsView: View {
                     debridAccountToConnect = .premiumize
                 }
             }
+
+            SMBSettingsSection(accentColor: accentColor)
+
+            JellyfinSettingsSection(accentColor: accentColor)
         }
         .onAppear {
             traktViewModel.reload()
@@ -3469,6 +3529,7 @@ private struct TmdbOptionsSheet: View {
     @AppStorage(SettingsKey.tmdbUseSeasonPosters) private var tmdbUseSeasonPosters = true
     @AppStorage(SettingsKey.tmdbUseMoreLikeThis) private var tmdbUseMoreLikeThis = true
     @AppStorage(SettingsKey.tmdbUseCollections) private var tmdbUseCollections = true
+    @AppStorage(SettingsKey.tmdbApplyToHome) private var tmdbApplyToHome = false
 
     var body: some View {
         ZStack {
@@ -3537,6 +3598,16 @@ private struct TmdbOptionsSheet: View {
                             fallback: "Choose which TMDB features are used"
                         )
                     ) {
+                        SettingsToggleRow(
+                            title: L10n.string("settings_tmdb_module_home_enrichment", fallback: "Home Screen Enrichment"),
+                            subtitle: L10n.string(
+                                "settings_tmdb_module_home_enrichment_description",
+                                fallback: "Apply TMDB metadata translations and artwork to Home catalogs"
+                            ),
+                            isOn: $tmdbApplyToHome,
+                            accentColor: accentColor,
+                            enabled: tmdbControlsEnabled
+                        )
                         SettingsToggleRow(
                             title: L10n.string("settings_tmdb_module_trailers", fallback: "Trailers"),
                             subtitle: L10n.string(
@@ -5644,9 +5715,11 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.externalPlayer) private var externalPlayer = ExternalPlayer.builtIn.rawValue
     @AppStorage(SettingsKey.externalPlayerForwardSubtitles) private var externalPlayerForwardSubtitles = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
+    @AppStorage(SettingsKey.smartStreamUseTopResult) private var smartStreamUseTopResult = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.cachedOnlyStreams) private var cachedOnlyStreams = false
+    @AppStorage(SettingsKey.preferHardwareDecodedStreams) private var preferHardwareDecodedStreams = true
     @AppStorage(SettingsKey.streamSortOption) private var streamSortOption = StreamSortOption.quality.rawValue
     @AppStorage(SettingsKey.showFileSizeBadges) private var showFileSizeBadges = true
     @AppStorage(SettingsKey.showAddonLogo) private var showAddonLogo = false
@@ -5697,7 +5770,7 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_player_engine", fallback: "Player Engine"),
                     subtitle: L10n.string(
                         "tvos_settings_player_engine_aether",
-                        fallback: "Auto: AetherEngine (native AV or software) with one-way MPVKit fallback. Force AetherEngine or MPVKit for diagnostics."
+                        fallback: "Auto: AetherEngine with one-way MPVKit fallback. Force AetherEngine or MPVKit for playback."
                     ),
                     selection: $playerEngine,
                     options: engines,
@@ -5810,6 +5883,15 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
 
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_use_top_result", fallback: "Use Top Result"),
+                    subtitle: L10n.string("tvos_settings_use_top_result_subtitle", fallback: "Play the first available source in the list, respecting your stream sort and add-on order"),
+                    isOn: $smartStreamUseTopResult,
+                    accentColor: accentColor
+                )
+                .opacity(smartStreamSelection ? 1 : 0.46)
+                .disabled(!smartStreamSelection)
+
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_stream_quality", fallback: "Stream Quality"),
                     subtitle: L10n.string("tvos_settings_quality_target_used_when_selecting_a_lin_74ea86c2", fallback: "Quality target used when selecting a link; resume also matches last DV/HDR/Atmos"),
@@ -5833,6 +5915,13 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_cached_only", fallback: "Cached Only"),
                     subtitle: L10n.string("tvos_settings_prefer_debrid_cached_links_in_auto_selec_57c11672", fallback: "Prefer debrid-cached links in auto-select and the stream picker filter"),
                     isOn: $cachedOnlyStreams,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_prefer_hardware_codecs", fallback: "Prefer Hardware Decoded Streams"),
+                    subtitle: L10n.string("tvos_settings_prefer_hardware_codecs_subtitle", fallback: "Prioritize HEVC and H.264 streams over AV1 for 4K content to prevent high CPU load (300%+), reduce heat, and ensure native Dolby Vision and HDR support on Apple TV"),
+                    isOn: $preferHardwareDecodedStreams,
                     accentColor: accentColor
                 )
 
@@ -5923,7 +6012,7 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
                     subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
                     value: $trailerDelay,
-                    range: 2...15,
+                    range: 0...10,
                     step: 1,
                     suffix: "s",
                     accentColor: accentColor

@@ -357,12 +357,7 @@ final class PostPlayRecommendationController: ObservableObject {
         guard trailerResolutionTasks[index] == nil else { return }
         trailerResolutionTasks[index] = Task {
             let meta = recommendation.asMeta
-            if let ytId = await YouTubeTrailerResolver.preferredTrailerYouTubeId(for: meta),
-               let previewSource = await YouTubeTrailerResolver.shared.resolvePreview(
-                   youtubeVideoId: ytId,
-                   title: recommendation.title,
-                   year: recommendation.releaseInfo
-               ) {
+            if let previewSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta) {
                 guard !Task.isCancelled else { return }
                 var updated = recommendation
                 updated.trailerVideoUrl = previewSource.videoUrl

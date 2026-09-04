@@ -464,7 +464,7 @@ final class StreamsDiscoveryTests: XCTestCase {
         type: String = "movie",
         videos: [NuvioVideo]? = nil
     ) -> NuvioMeta {
-        NuvioMeta(
+        return NuvioMeta(
             id: id,
             name: "Example",
             description: "Description",
@@ -490,5 +490,74 @@ final class StreamsDiscoveryTests: XCTestCase {
             trailerYtIds: nil,
             externalRatings: nil
         )
+    }
+
+    // MARK: - Addon Transport URLs & Type Equivalence Tests
+
+    func testAddonTransportUrlsPreservesQueryAndEncodesIds() {
+        let manifestWithQuery = URL(string: "https://penguplay.com/stremio/manifest.json?token=secret123&profile=main")!
+        let streamURL = AddonTransportUrls.buildResourceURL(
+            manifestURL: manifestWithQuery,
+            resource: "stream",
+            type: "series",
+            id: "tt1234567:1:5"
+        )
+        XCTAssertEqual(
+            streamURL?.absoluteString,
+            "https://penguplay.com/stremio/stream/series/tt1234567%3A1%3A5.json?token=secret123&profile=main"
+        )
+
+        let simpleManifest = URL(string: "https://v3-cinemeta.strem.io/manifest.json")!
+        let metaURL = AddonTransportUrls.buildResourceURL(
+            manifestURL: simpleManifest,
+            resource: "meta",
+            type: "movie",
+            id: "tt9876543"
+        )
+        XCTAssertEqual(
+            metaURL?.absoluteString,
+            "https://v3-cinemeta.strem.io/meta/movie/tt9876543.json"
+        )
+
+        let pathConfiguredManifest = URL(string: "https://comet.example.com/eyJmb28iOiJiYXIifQ==/manifest.json")!
+        let cometStreamURL = AddonTransportUrls.buildResourceURL(
+            manifestURL: pathConfiguredManifest,
+            resource: "stream",
+            type: "series",
+            id: "tt1234567:2:3"
+        )
+        XCTAssertEqual(
+            cometStreamURL?.absoluteString,
+            "https://comet.example.com/eyJmb28iOiJiYXIifQ==/stream/series/tt1234567%3A2%3A3.json"
+        )
+    }
+
+    func testSupportsResourceNormalizesTvAndSeriesTypes() throws {
+        let manifestJson = """
+        {
+            "id": "org.pengu.stream",
+            "name": "PenguPlay",
+            "resources": [
+                {
+                    "name": "stream",
+                    "types": ["tv", "movie"],
+                    "idPrefixes": ["tt"]
+                }
+            ]
+        }
+        """.data(using: .utf8)!
+
+        let manifest = try JSONDecoder().decode(StreamAddonManifest.self, from: manifestJson)
+
+        // "series" should match "tv"
+        XCTAssertTrue(manifest.supportsResource("stream", type: "series", id: "tt1234567:1:1"))
+        // "tv" matches "tv"
+        XCTAssertTrue(manifest.supportsResource("stream", type: "tv", id: "tt1234567:1:1"))
+        // "movie" matches "movie"
+        XCTAssertTrue(manifest.supportsResource("stream", type: "movie", id: "tt1234567"))
+        // "movies" matches "movie"
+        XCTAssertTrue(manifest.supportsResource("stream", type: "movies", id: "tt1234567"))
+        // Non-matching id prefix should fail
+        XCTAssertFalse(manifest.supportsResource("stream", type: "series", id: "kitsu:1234"))
     }
 }

@@ -13,11 +13,11 @@ set -eo pipefail  # pipefail so `... | tail -N` doesn't swallow configure/make e
 
 FFMPEG_VERSION="n8.1.2"
 FFMPEG_REPO="https://github.com/FFmpeg/FFmpeg.git"
-DAV1D_VERSION="1.5.4"
+DAV1D_VERSION="1.5.1"
 DAV1D_REPO="https://code.videolan.org/videolan/dav1d.git"
-ZIMG_VERSION="release-3.0.6"
+ZIMG_VERSION="release-3.0.5"
 ZIMG_REPO="https://github.com/sekrit-twc/zimg.git"
-ZVBI_VERSION="v0.2.45"
+ZVBI_VERSION="v0.2.44"
 ZVBI_REPO="https://github.com/zapping-vbi/zvbi.git"
 SCRIPT_DIR="${0:a:h}"
 BUILD_DIR="${SCRIPT_DIR}/build"
@@ -53,23 +53,7 @@ fi
 
 # ─────────────────────────────────────────────────────────
 
-discard_stale_source() {
-    # The fetch functions below skip the clone when the source directory already exists, so
-    # bumping a version string alone would rebuild the OLD source and produce a release that
-    # changed nothing. Drop a tree whose checked-out tag is not the one asked for and let the
-    # caller re-clone. Verified against the shallow `--depth 1 --branch <tag>` clones these
-    # functions create: `describe --tags --exact-match` returns the tag on each of them.
-    local dir="$1" want="$2" have
-    [[ -d "${dir}" ]] || return 0
-    have="$(git -C "${dir}" describe --tags --exact-match 2>/dev/null)"
-    if [[ "${have}" != "${want}" ]]; then
-        echo "→ ${dir:t} is at '${have:-unknown}', want '${want}': discarding and re-cloning"
-        rm -rf "${dir}"
-    fi
-}
-
 fetch_ffmpeg() {
-    discard_stale_source "${FFMPEG_SRC}" "${FFMPEG_VERSION}"
     if [[ -d "${FFMPEG_SRC}" ]]; then
         echo "→ FFmpeg source already exists, skipping clone"
         return
@@ -179,7 +163,6 @@ s#        if \(track->time_scale < 0\.01\) \{\n            av_log\(matroska->ctx
 }
 
 fetch_dav1d() {
-    discard_stale_source "${DAV1D_SRC}" "${DAV1D_VERSION}"
     if [[ -d "${DAV1D_SRC}" ]]; then
         echo "→ dav1d source already exists, skipping clone"
         return
@@ -189,7 +172,6 @@ fetch_dav1d() {
 }
 
 fetch_zimg() {
-    discard_stale_source "${ZIMG_SRC}" "${ZIMG_VERSION}"
     if [[ -d "${ZIMG_SRC}" ]]; then
         echo "→ zimg source already exists, skipping clone"
         return
@@ -204,7 +186,6 @@ fetch_zimg() {
 }
 
 fetch_zvbi() {
-    discard_stale_source "${ZVBI_SRC}" "${ZVBI_VERSION}"
     if [[ -d "${ZVBI_SRC}" ]]; then
         echo "→ zvbi source already exists, skipping clone"
         return
@@ -471,23 +452,14 @@ COMMON_FLAGS=(
     --enable-videotoolbox --enable-audiotoolbox
     --enable-libdav1d
     --enable-protocol=file --enable-protocol=pipe --enable-protocol=data
-    # concat is deliberately NOT enabled. It is a script demuxer: a file beginning with
-    # "ffconcat version 1.0" makes libavformat open the paths listed inside it through the
-    # file protocol. Nothing here asks for it by name, so probing was the only way to reach
-    # it, and that made any byte stream a potential file-open primitive. hls and dash stay in:
-    # they are a documented capability of this package (README) and consumers rely on them.
     --disable-demuxers
-    # dash is NOT enabled: its demuxer needs libxml2, which this build does not link, so
-    # configure answered `Disabled dash_demuxer because not all dependencies are satisfied`
-    # and the flag silently did nothing. Asking for it again without libxml2 would only
-    # restore that false impression. DASH content still arrives through mov/mpegts segments.
-    --enable-demuxer=hls --enable-demuxer=matroska
+    --enable-demuxer=hls --enable-demuxer=dash --enable-demuxer=matroska
     --enable-demuxer=mov --enable-demuxer=mpegts --enable-demuxer=mpegps
     --enable-demuxer=avi --enable-demuxer=flv --enable-demuxer=h264
     --enable-demuxer=hevc --enable-demuxer=aac --enable-demuxer=ac3
     --enable-demuxer=eac3 --enable-demuxer=flac --enable-demuxer=ogg
     --enable-demuxer=wav --enable-demuxer=mp3 --enable-demuxer=srt
-    --enable-demuxer=ass --enable-demuxer=data
+    --enable-demuxer=ass --enable-demuxer=concat --enable-demuxer=data
     # sup: raw PGS/SUP sidecar files (Jellyfin serves external PGS tracks as raw .sup streams;
     # the pgssub DECODER was always in, but without this demuxer avformat_open_input rejects the
     # file with AVERROR_INVALIDDATA and external PGS subtitles never load. AetherEngine sidecar path.)
@@ -531,11 +503,7 @@ COMMON_FLAGS=(
     # (AetherEngine's AudioCodecCompat maps an unrecognised id to .unsupported and
     # the session drops to video-only), which presents as a playback bug rather than
     # an honest unsupported-format error. wmv3 here covers WMV9 inside Matroska and
-    # MPEG-TS, where the container's own demuxer supplies the stream. Asked in #3
-    # whether the field carries native .wmv / .asf at all, the reporter answered on
-    # 2026-08-28 that Matroska and MPEG-TS are the only shapes their library holds
-    # and that nothing upstream of it produces the native form, so this boundary
-    # rests on a field answer and not only on the argument above.
+    # MPEG-TS, where the container's own demuxer supplies the stream.
     --enable-decoder=msmpeg4v1 --enable-decoder=msmpeg4v2 --enable-decoder=msmpeg4v3
     --enable-decoder=wmv1 --enable-decoder=wmv2 --enable-decoder=wmv3
     --enable-decoder=aac --enable-decoder=aac_latm --enable-decoder=ac3
@@ -697,9 +665,9 @@ fix_install_names() {
     install_name_tool -id "@rpath/${SUBPATH}" "${BIN}"
 
     local PAIRS=(
-        "libavcodec:AetherLibavcodec" "libavformat:AetherLibavformat" "libavutil:AetherLibavutil"
-        "libswresample:AetherLibswresample" "libswscale:AetherLibswscale" "libavfilter:AetherLibavfilter"
-        "libdav1d:AetherLibdav1d" "libzimg:AetherLibzimg" "libzvbi:AetherLibzvbi"
+        "libavcodec:Libavcodec" "libavformat:Libavformat" "libavutil:Libavutil"
+        "libswresample:Libswresample" "libswscale:Libswscale" "libavfilter:Libavfilter"
+        "libdav1d:Libdav1d" "libzimg:Libzimg" "libzvbi:Libzvbi"
     )
     local DEPS
     DEPS=(${(f)"$(otool -L "${BIN}" | awk 'NR>1 {print $1}')"})
@@ -738,7 +706,7 @@ make_framework() {
 
     if [[ "${LIB}" == "zimg" ]]; then
         # Ship only the C API header; zimg++.hpp would put C++ into the
-        # framework module. No Swift consumer imports AetherLibzimg directly
+        # framework module. No Swift consumer imports Libzimg directly
         # (it is a link-only dependency of libavfilter).
         cp "${HEADER_SRC}/zimg.h" "${FW_DIR}/Headers/"
     elif [[ "${LIB}" == "zvbi" ]]; then
@@ -764,22 +732,6 @@ make_framework() {
               "${FW_DIR}/Headers/hwcontext_vaapi.h" \
               "${FW_DIR}/Headers/hwcontext_vdpau.h" \
               "${FW_DIR}/Headers/hwcontext_vulkan.h"
-    fi
-
-    # The frameworks ship under an Aether prefix (see the PAIRS arrays) so this
-    # build can sit in one app next to another FFmpeg. Clang resolves a header's
-    # `#include "libavutil/frame.h"` as a framework include, case-insensitively,
-    # which is how these headers found their siblings while the frameworks were
-    # named Libavutil and friends. Under the prefix that lookup finds nothing,
-    # so rewrite the cross-includes to name the frameworks we actually ship.
-    # FFmpeg headers only: dav1d, zimg and zvbi do not include FFmpeg.
-    if [[ "${LIB}" == lib* ]]; then
-        local SIBLING
-        for SIBLING in libavcodec libavformat libavutil libswresample libswscale libavfilter; do
-            local UPPER="Aether${(C)SIBLING[1]}${SIBLING:1}"
-            LC_ALL=C sed -i '' -E "s|(#include[[:space:]]*\")${SIBLING}/|\\1${UPPER}/|g" \
-                "${FW_DIR}/Headers/"*.h
-        done
     fi
 
     # Lipo
@@ -885,7 +837,7 @@ make_xcframeworks() {
     echo ""
     echo "━━━ Creating XCFrameworks ━━━"
 
-    local PAIRS=("libavcodec:AetherLibavcodec" "libavformat:AetherLibavformat" "libavutil:AetherLibavutil" "libswresample:AetherLibswresample" "libswscale:AetherLibswscale" "libavfilter:AetherLibavfilter" "dav1d:AetherLibdav1d" "zimg:AetherLibzimg" "zvbi:AetherLibzvbi")
+    local PAIRS=("libavcodec:Libavcodec" "libavformat:Libavformat" "libavutil:Libavutil" "libswresample:Libswresample" "libswscale:Libswscale" "libavfilter:Libavfilter" "dav1d:Libdav1d" "zimg:Libzimg" "zvbi:Libzvbi")
 
     for PAIR in "${PAIRS[@]}"; do
         local LIB="${PAIR%%:*}"

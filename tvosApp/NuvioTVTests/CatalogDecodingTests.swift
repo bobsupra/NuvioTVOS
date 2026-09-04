@@ -9,8 +9,8 @@ final class CatalogDecodingTests: XCTestCase {
 
     func testCatalogDisplayTitleTypeSuffixes() {
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "movie", showType: true), "Popular - Movies")
-        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "series", showType: true), "Popular - TV Shows")
-        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "show", showType: true), "Popular - TV Shows")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "series", showType: true), "Popular - Series")
+        XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "show", showType: true), "Popular - Series")
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "anime", showType: true), "Popular - Anime")
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Live", contentType: "channel", showType: true), "Live - Channels")
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "podcast", showType: true), "Popular - Podcast")
@@ -204,6 +204,18 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertEqual(source.normalizedProvider, "addon")
         XCTAssertEqual(source.catalogId, "popular")
         XCTAssertEqual(source.genre, "Science Fiction")
+    }
+
+    func testCollectionFolderViewModeUsesCatalogRows() {
+        XCTAssertFalse(CollectionFolderViewMode.tabbedGrid.usesCatalogRows(homeLayout: "Modern"))
+        XCTAssertFalse(CollectionFolderViewMode.tabbedGrid.usesCatalogRows(homeLayout: "Grid View"))
+        XCTAssertTrue(CollectionFolderViewMode.rows.usesCatalogRows(homeLayout: "Modern"))
+        XCTAssertTrue(CollectionFolderViewMode.rows.usesCatalogRows(homeLayout: "Grid View"))
+
+        // Follow layout honors homeLayout setting
+        XCTAssertTrue(CollectionFolderViewMode.followLayout.usesCatalogRows(homeLayout: "Modern"))
+        XCTAssertTrue(CollectionFolderViewMode.followLayout.usesCatalogRows(homeLayout: "Compact"))
+        XCTAssertFalse(CollectionFolderViewMode.followLayout.usesCatalogRows(homeLayout: "Grid View"))
     }
 
     func testStremioCatalogURLDoesNotDoubleEncodeGenre() throws {

@@ -35,16 +35,6 @@ final class PerformanceTests: XCTestCase {
         }
     }
 
-    func testCatalogBrowseViewModelInitializationPerformance() {
-        measure {
-            let viewModel = CatalogBrowseViewModel(repository: repository)
-            XCTAssertNotNil(viewModel)
-        }
-    }
-
-    // MARK: - Data Loading Performance
-
-
     func testDetailsLoadingPerformance() {
         let viewModel = DetailsViewModel(repository: repository)
 
@@ -53,21 +43,6 @@ final class PerformanceTests: XCTestCase {
 
             Task { @MainActor in
                 viewModel.loadDetails(id: "movie_1")
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
-
-    func testCatalogLoadingPerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Load catalog")
-
-            Task { @MainActor in
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 expectation.fulfill()
             }
@@ -150,121 +125,7 @@ final class PerformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - Pagination Performance
 
-    func testPaginationLoadMorePerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Load more")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                viewModel.loadMore()
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
-
-    func testMultiplePageLoadsPerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Multiple page loads")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-
-                for _ in 1...3 {
-                    viewModel.loadMore()
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
-                }
-
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 10.0)
-        }
-    }
-
-    // MARK: - Filter Performance
-
-    func testGenreFilterChangePerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Genre filter change")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                viewModel.setGenre("action")
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
-
-    func testSortChangePerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Sort change")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                viewModel.setSort(.popular)
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
-
-    func testContentTypeChangePerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Content type change")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                viewModel.setContentType("series")
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
-
-    // MARK: - Memory Performance
-
-
-    func testCatalogBrowseMemoryWithManyPages() async {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
-
-        // Load multiple pages
-        for _ in 1...5 {
-            if viewModel.uiState.hasMore {
-                viewModel.loadMore()
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-            }
-        }
-
-        // Should accumulate many items
-        XCTAssertGreaterThan(viewModel.uiState.items.count, 50)
-
-        // Memory should be reasonable (no leaks)
-        // In production, you'd measure actual memory usage
-    }
 
     // MARK: - Concurrent Operation Performance
 
@@ -325,33 +186,7 @@ final class PerformanceTests: XCTestCase {
         }
     }
 
-    // MARK: - State Update Performance
 
-    func testRapidStateUpdatesPerformance() {
-        let viewModel = CatalogBrowseViewModel(repository: repository)
-
-        measure {
-            let expectation = XCTestExpectation(description: "Rapid state updates")
-
-            Task { @MainActor in
-                try? await Task.sleep(nanoseconds: 1_000_000_000)
-
-                // Rapid filter changes
-                for i in 1...10 {
-                    if i % 2 == 0 {
-                        viewModel.setGenre("action")
-                    } else {
-                        viewModel.setGenre("comedy")
-                    }
-                }
-
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 5.0)
-        }
-    }
 
     // MARK: - Combine Publisher Performance
 

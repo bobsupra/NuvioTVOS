@@ -8,6 +8,7 @@
 import Foundation
 import SwiftUI
 import UIKit
+import ImageIO
 
 struct DetailsScreen: View {
     let id: String
@@ -44,6 +45,7 @@ struct DetailsScreen: View {
     @State private var isEpisodeMenuPresented = false
     @Environment(\.horizontalSizeClass) private var horizontalSizeClass
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
+    @AppStorage(SettingsKey.smartStreamUseTopResult) private var smartStreamUseTopResult = false
     @AppStorage(SettingsKey.smartStreamQuality) private var smartStreamQuality = "Highest"
     @AppStorage(SettingsKey.smartSubtitleMatching) private var smartSubtitleMatching = true
     @AppStorage(SettingsKey.subtitleLanguages) private var subtitleLanguages = ""
@@ -122,12 +124,14 @@ struct DetailsScreen: View {
                     onEpisodeSelected: { video in
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
-                        startStreamFlow(streamId: video.id, type: "series", reload: true)
+                        let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
+                        startStreamFlow(streamId: streamId, type: "series", reload: true)
                     },
                     onEpisodePlayManually: { video in
                         pendingEpisodeSubtitle = "S\(video.season) · E\(video.episode) · \(video.title)"
                         pendingEpisode = video
-                        startStreamFlow(streamId: video.id, type: "series", reload: true, forceManualPicker: true)
+                        let streamId = canonicalEpisodeStreamId(for: video, meta: viewModel.uiState.meta)
+                        startStreamFlow(streamId: streamId, type: "series", reload: true, forceManualPicker: true)
                     },
                     onEpisodeMenuPresented: { isPresented in
                         isEpisodeMenuPresented = isPresented
@@ -213,6 +217,7 @@ struct DetailsScreen: View {
                     includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
                     isResolvingDebrid: isResolvingDebrid,
                     onSelect: { stream, player in
+                        PlaybackStartupTiming.start(title: meta.name)
                         isStreamPickerPresented = false
                         isPreparingPlayback = true
                         playStream(stream, meta: meta, player: player)
@@ -240,6 +245,7 @@ struct DetailsScreen: View {
             } else if expandedComment != nil {
                 expandedComment = nil
             } else if isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback {
+                PlaybackStartupTiming.cancel()
                 isSmartPlaybackPending = false
                 isResolvingDebrid = false
                 isPreparingPlayback = false
@@ -264,6 +270,7 @@ struct DetailsScreen: View {
             }
         }
         .onAppear {
+            PlaybackStartupTiming.cancel()
             isSmartPlaybackPending = false
             isResolvingDebrid = false
             isPreparingPlayback = false
@@ -281,6 +288,7 @@ struct DetailsScreen: View {
     /// Waiting for onDisappear is too late: enrichment can still publish
     /// updates while the opacity transition is trying to tear Details down.
     private func handleBack() {
+        PlaybackStartupTiming.cancel()
         TVHomeDebugTrace.log("details.back.cancelTasks id=\(id)")
         viewModel.cancelAllTasks()
         onBack()
@@ -307,12 +315,23 @@ struct DetailsScreen: View {
         pendingEpisode = requestedEpisode
         if let episode = requestedEpisode {
             pendingEpisodeSubtitle = "S\(episode.season) · E\(episode.episode) · \(episode.title)"
-            viewModel.prepareStreams(forId: episode.id, type: "series")
+            let streamId = canonicalEpisodeStreamId(for: episode, meta: meta)
+            viewModel.prepareStreams(forId: streamId, type: "series")
         } else {
             pendingEpisodeSubtitle = ""
             viewModel.prepareStreams(forId: meta.streamId, type: meta.type)
         }
         isStreamPickerPresented = true
+    }
+
+    private func canonicalEpisodeStreamId(for video: NuvioVideo, meta: NuvioMeta?) -> String {
+        if video.id.hasPrefix("tt") {
+            return video.id
+        }
+        if let metaStreamId = meta?.streamId, metaStreamId.hasPrefix("tt") {
+            return "\(metaStreamId):\(video.season):\(video.episode)"
+        }
+        return video.id
     }
 
     private func startStreamFlow(streamId: String, type: String, reload: Bool, forceManualPicker: Bool = false) {
@@ -327,33 +346,72 @@ struct DetailsScreen: View {
             return
         }
 
+        PlaybackStartupTiming.start(title: meta.name)
         isSmartPlaybackPending = true
         isStreamPickerPresented = false
 
         if reload {
-            viewModel.prepareStreams(forId: streamId, type: type)
+            viewModel.prepareStreams(forId: streamId, type: type, forceRefresh: true)
         }
         finishSmartPlaybackIfPossible(meta: meta)
     }
 
     private func finishSmartPlaybackIfPossible(meta explicitMeta: NuvioMeta? = nil) {
-        guard isSmartPlaybackPending, !viewModel.uiState.isLoadingStreams else { return }
+        guard isSmartPlaybackPending else { return }
         let meta = explicitMeta ?? viewModel.uiState.meta
         guard let meta else { return }
 
+        let debrid = DebridResolver(store: ProfileSettings.current)
         let cachedOnly = (ProfileSettings.current.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
-        if let stream = SmartPlaybackSelector.bestStream(
-            from: viewModel.uiState.streams,
-            qualityPreference: smartStreamQuality,
-            subtitleLanguages: subtitleLanguagePreferences,
-            shouldMatchSubtitles: smartSubtitleMatching,
-            includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
-            preferredTags: LastStreamQualityStore.load(metaId: meta.id),
-            cachedOnly: cachedOnly
-        ) {
-            isSmartPlaybackPending = false
-            playStream(stream, meta: meta)
-        } else if !viewModel.uiState.isLoadingStreams {
+
+        let candidateStream: NuvioStream?
+        if smartStreamUseTopResult {
+            let sortRaw = ProfileSettings.current.string(forKey: SettingsKey.streamSortOption)
+            let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
+            let displayed = StreamPickerListBuilder.displayedStreams(
+                streams: viewModel.uiState.streams,
+                groups: viewModel.uiState.streamGroups,
+                selectedAddonId: nil,
+                sortOption: sortOption,
+                includeDebrid: debrid.isEnabled,
+                cachedOnly: cachedOnly
+            )
+            // Filter out 0-res / ticket streams if valid streams exist
+            let valid = displayed.filter {
+                !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
+            }
+            candidateStream = valid.first ?? displayed.first
+        } else {
+            candidateStream = SmartPlaybackSelector.bestStream(
+                from: viewModel.uiState.streams,
+                qualityPreference: smartStreamQuality,
+                subtitleLanguages: subtitleLanguagePreferences,
+                shouldMatchSubtitles: smartSubtitleMatching,
+                includeDebrid: debrid.isEnabled,
+                preferredTags: LastStreamQualityStore.load(metaId: meta.id),
+                cachedOnly: cachedOnly
+            )
+        }
+
+        if let stream = candidateStream {
+            let isIdealMatch: Bool = {
+                if !viewModel.uiState.isLoadingStreams { return true }
+                if SmartPlaybackSelector.isLowQualityOrTicketStream(stream) { return false }
+                let tags = StreamQualityTags.parse(stream: stream)
+                let res = tags.resolution > 0 ? tags.resolution : SmartPlaybackSelector.inferredResolution(for: stream)
+                let targetRes = (smartStreamQuality == "720p") ? 720 : 1080
+                if debrid.isEnabled {
+                    return tags.isCached && res >= targetRes
+                }
+                return res >= targetRes
+            }()
+
+            if isIdealMatch {
+                isSmartPlaybackPending = false
+                playStream(stream, meta: meta)
+            }
+        } else if !viewModel.uiState.isLoadingStreams && (viewModel.uiState.streamsEmptyReason != nil || !viewModel.uiState.streamGroups.isEmpty) {
+            PlaybackStartupTiming.cancel()
             isSmartPlaybackPending = false
             isStreamPickerPresented = true
         }
@@ -364,6 +422,7 @@ struct DetailsScreen: View {
     /// the picker's spinner up until a link comes back (or the attempt fails).
     private func playStream(_ stream: NuvioStream, meta: NuvioMeta, player: ExternalPlayer? = nil) {
         LastStreamQualityStore.save(metaId: meta.id, stream: stream)
+        PlaybackStartupBenchmark.shared.markSourcePicked(stream: stream)
         if let url = stream.url, !url.isEmpty {
             isStreamPickerPresented = false
             isPreparingPlayback = false
@@ -385,9 +444,11 @@ struct DetailsScreen: View {
                 isResolvingDebrid = false
                 isPreparingPlayback = false
                 if case let .success(url, _, _)? = result {
+                    PlaybackStartupBenchmark.shared.markDebridResolved()
                     isStreamPickerPresented = false
                     onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player)
                 } else {
+                    PlaybackStartupBenchmark.shared.cancel()
                     isStreamPickerPresented = true
                 }
             }
@@ -444,11 +505,15 @@ struct DetailsScreen: View {
 
     private func openTrailer(for meta: NuvioMeta) {
         Task {
-            guard let ytId = await preferredTrailerYouTubeId(for: meta) else { return }
-            let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
-
-            await MainActor.run {
-                onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
+            if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
+                await MainActor.run {
+                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
+                }
+            } else if let ytId = await preferredTrailerYouTubeId(for: meta) {
+                let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
+                await MainActor.run {
+                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
+                }
             }
         }
     }
@@ -461,6 +526,135 @@ struct DetailsScreen: View {
 actor YouTubeTrailerResolver {
     static let shared = YouTubeTrailerResolver()
     private var trailerIdCache: [String: String] = [:]
+    private var trailerioCache: [String: TrailerPlaybackSource] = [:]
+
+    private struct TrailerioResponse: Decodable {
+        struct Meta: Decodable {
+            struct Link: Decodable {
+                let trailers: String?
+                let provider: String?
+            }
+            let id: String?
+            let links: [Link]?
+        }
+        let meta: Meta?
+    }
+
+    private func scoreTrailerioLink(_ provider: String, url: String) -> Int {
+        let p = provider.lowercased()
+        var score = 0
+        if p.contains("apple tv") {
+            score += 1000
+        } else if p.contains("rotten tomatoes") || p.contains("fandango") {
+            score += 800
+        } else if p.contains("plex") {
+            score += 700
+        } else if p.contains("mubi") {
+            score += 500
+        } else if p.contains("imdb") {
+            score += 300
+        }
+
+        if p.contains("4k") || p.contains("2160p") {
+            score += 400
+        } else if p.contains("1080p") {
+            score += 300
+        } else if p.contains("720p") {
+            score += 200
+        }
+
+        if p.contains("atmos") || p.contains("5.1") {
+            score += 50
+        }
+
+        let u = url.lowercased()
+        if u.contains(".m3u8") || u.contains(".mp4") {
+            score += 100
+        }
+
+        return score
+    }
+
+    func resolveTrailerio(imdbId: String, isSeries: Bool) async -> TrailerPlaybackSource? {
+        let cleanImdb = NuvioMeta.canonicalImdbID(from: imdbId) ?? imdbId
+        guard cleanImdb.hasPrefix("tt") else { return nil }
+
+        if let cached = trailerioCache[cleanImdb] {
+            return cached
+        }
+
+        let mediaType = isSeries ? "series" : "movie"
+        guard let url = URL(string: "https://trailerio.cc/meta/\(mediaType)/\(cleanImdb).json") else {
+            return nil
+        }
+
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 5
+        request.setValue("NuvioTV/1.0", forHTTPHeaderField: "User-Agent")
+
+        guard let (data, response) = try? await session.data(for: request),
+              let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode),
+              let decoded = try? JSONDecoder().decode(TrailerioResponse.self, from: data),
+              let links = decoded.meta?.links, !links.isEmpty else {
+            return nil
+        }
+
+        let validLinks = links.compactMap { link -> (url: String, provider: String)? in
+            guard let rawUrl = link.trailers?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !rawUrl.isEmpty,
+                  rawUrl.hasPrefix("http://") || rawUrl.hasPrefix("https://") else {
+                return nil
+            }
+            return (url: rawUrl, provider: link.provider ?? "1080p")
+        }
+
+        guard !validLinks.isEmpty else { return nil }
+
+        let sorted = validLinks.sorted { scoreTrailerioLink($0.provider, url: $0.url) > scoreTrailerioLink($1.provider, url: $1.url) }
+        guard let best = sorted.first else { return nil }
+
+        let source = TrailerPlaybackSource(
+            videoUrl: best.url,
+            audioUrl: nil,
+            requestHeaders: [:],
+            qualityLabel: best.provider,
+            diagnostics: "TRAILER: \(best.provider) [Trailerio 1080p]"
+        )
+        trailerioCache[cleanImdb] = source
+        return source
+    }
+
+    func resolve(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
+        // 1. Try Trailerio first (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
+        if let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id),
+           let source = await resolveTrailerio(imdbId: imdbId, isSeries: meta.isSeries) {
+            return source
+        }
+
+        // 2. Fall back to YouTube resolver
+        guard let ytId = await preferredTrailerYouTubeId(for: meta) else { return nil }
+        return await resolve(
+            youtubeVideoId: ytId,
+            title: meta.name,
+            year: meta.year.map(String.init)
+        )
+    }
+
+    func resolvePreview(for meta: NuvioMeta) async -> TrailerPlaybackSource? {
+        // 1. Try Trailerio first (direct 1080p CDN streams from Apple TV, Rotten Tomatoes, Plex)
+        if let imdbId = meta.imdbId ?? NuvioMeta.canonicalImdbID(from: meta.id),
+           let source = await resolveTrailerio(imdbId: imdbId, isSeries: meta.isSeries) {
+            return source
+        }
+
+        // 2. Fall back to YouTube preview resolver
+        guard let ytId = await preferredTrailerYouTubeId(for: meta) else { return nil }
+        return await resolvePreview(
+            youtubeVideoId: ytId,
+            title: meta.name,
+            year: meta.year.map(String.init)
+        )
+    }
 
     static func preferredTrailerYouTubeId(for meta: NuvioMeta) async -> String? {
         await shared.preferredTrailerYouTubeId(for: meta)
@@ -476,17 +670,17 @@ actor YouTubeTrailerResolver {
 
         if let ytId = meta.trailerYtIds?
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-            .first(where: { !$0.isEmpty }) {
+            .first(where: { Self.isYouTubeVideoId($0) }) {
             resolvedId = ytId
         } else if let ytId = await TmdbDetailsService.fetchTrailerYouTubeId(for: meta),
-           !ytId.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+           Self.isYouTubeVideoId(ytId.trimmingCharacters(in: .whitespacesAndNewlines)) {
             resolvedId = ytId
         } else if let refreshed = try? await CinemetaCatalogRepository().getMetadata(
             id: meta.id,
             type: meta.type
         ), let ytId = refreshed.trailerYtIds?
             .map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) })
-            .first(where: { !$0.isEmpty }) {
+            .first(where: { Self.isYouTubeVideoId($0) }) {
             resolvedId = ytId
         }
 
@@ -552,25 +746,6 @@ actor YouTubeTrailerResolver {
 
     private static let clients: [Client] = [
         Client(
-            key: "android_vr",
-            id: "28",
-            version: "1.56.21",
-            userAgent: "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1) gzip",
-            context: [
-                "clientName": "ANDROID_VR",
-                "clientVersion": "1.56.21",
-                "deviceMake": "Oculus",
-                "deviceModel": "Quest 3",
-                "osName": "Android",
-                "osVersion": "12",
-                "platform": "MOBILE",
-                "androidSdkVersion": 32,
-                "hl": "en",
-                "gl": "US"
-            ],
-            priority: 0
-        ),
-        Client(
             key: "ios",
             id: "5",
             version: "20.10.1",
@@ -585,7 +760,7 @@ actor YouTubeTrailerResolver {
                 "hl": "en",
                 "gl": "US"
             ],
-            priority: 1
+            priority: 0
         ),
         Client(
             key: "android",
@@ -605,35 +780,23 @@ actor YouTubeTrailerResolver {
             priority: 1
         ),
         Client(
-            key: "tv_embedded",
-            id: "85",
-            version: "2.0",
-            userAgent: "Mozilla/5.0 (SMART-TV; Linux; Tizen 5.0) AppleWebKit/538.1 (KHTML, like Gecko) Version/5.0 NativeClient-FreeBSD Safari/538.1",
+            key: "android_vr",
+            id: "28",
+            version: "1.56.21",
+            userAgent: "com.google.android.apps.youtube.vr.oculus/1.56.21 (Linux; U; Android 12; en_US; Quest 3; Build/SQ3A.220605.009.A1) gzip",
             context: [
-                "clientName": "TVHTML5_SIMPLY_EMBEDDED_PLAYER",
-                "clientVersion": "2.0",
-                "clientFormFactor": "TV",
-                "platform": "TV",
+                "clientName": "ANDROID_VR",
+                "clientVersion": "1.56.21",
+                "deviceMake": "Oculus",
+                "deviceModel": "Quest 3",
+                "osName": "Android",
+                "osVersion": "12",
+                "platform": "MOBILE",
+                "androidSdkVersion": 32,
                 "hl": "en",
                 "gl": "US"
             ],
             priority: 2
-        ),
-        Client(
-            key: "web_embedded_player",
-            id: "56",
-            version: "2.20260708.00.00",
-            userAgent: "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 " +
-                "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
-            context: [
-                "clientName": "WEB_EMBEDDED_PLAYER",
-                "clientVersion": "2.20260708.00.00",
-                "clientFormFactor": "UNKNOWN_FORM_FACTOR",
-                "platform": "DESKTOP",
-                "hl": "en",
-                "gl": "US"
-            ],
-            priority: 3
         )
     ]
 
@@ -863,8 +1026,8 @@ actor YouTubeTrailerResolver {
         if !adaptDesc.isEmpty { summaryParts.append("Adaptive[\(adaptDesc)]") }
         let availableSummary = summaryParts.joined(separator: " | ")
 
-        let unthrottledAdaptiveVideo = sortedAdaptiveVideo.filter { $0.clientKey == "android_vr" }
-        let unthrottledAdaptiveAudio = sortedAdaptiveAudio.filter { $0.clientKey == "android_vr" }
+        let unthrottledAdaptiveVideo = sortedAdaptiveVideo
+        let unthrottledAdaptiveAudio = sortedAdaptiveAudio
 
         // 1. Prioritize HD HLS master manifest (1080p / 720p).
         // HLS contains video+audio natively, decoded by AetherEngine / AVPlayer in full 1080p HD with zero 403 errors.
@@ -979,6 +1142,48 @@ actor YouTubeTrailerResolver {
             )
         }
 
+        // 7. For preview: fall back to best adaptive video if no integrated stream exists.
+        // On Apple TV, card previews are muted by default and play the video track directly.
+        if preferIntegratedStream,
+           let bestAdaptive = await firstReachable(
+               sortedAdaptiveVideo,
+               includeReferer: false
+           ) {
+            let label = "\(bestAdaptive.height)p (Adaptive Video)"
+            let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] preview | Available: \(availableSummary)"
+            return TrailerPlaybackSource(
+                videoUrl: bestAdaptive.url,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestAdaptive.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
+        // 8. For full player: Fall back to any adaptive pair
+        if !preferIntegratedStream,
+           let pair = await firstReachableAdaptivePair(
+               videos: unthrottledAdaptiveVideo,
+               audios: unthrottledAdaptiveAudio,
+               includeReferer: false
+           ) {
+            let label = "\(pair.video.height)p (Adaptive)"
+            let diag = "TRAILER: \(label) [\(pair.video.clientKey)] fallback | Available: \(availableSummary)"
+            return TrailerPlaybackSource(
+                videoUrl: pair.video.url,
+                audioUrl: pair.audio.url,
+                requestHeaders: requestHeaders(
+                    for: pair.video.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
         return nil
     }
 
@@ -989,24 +1194,11 @@ actor YouTubeTrailerResolver {
             return cachedConfig
         }
 
-        guard let url = URL(string: "https://www.youtube.com/watch?v=dQw4w9WgXcQ&hl=en") else {
-            throw URLError(.badURL)
-        }
-
-        var request = URLRequest(url: url)
-        guard let timeout = requestTimeout(cap: 8) else { throw CancellationError() }
-        request.timeoutInterval = timeout
-        addDefaultHeaders(to: &request)
-
-        let (data, response) = try await session.data(for: request)
-        guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
-            throw URLError(.badServerResponse)
-        }
-
-        let html = String(data: data, encoding: .utf8) ?? ""
+        // Return the reliable fallback Innertube API key directly.
+        // Web scraping youtube.com/watch triggers 302 captcha/bot challenges that fail or stall on tvOS.
         let config = WatchConfig(
-            apiKey: firstCapture(in: html, pattern: #""INNERTUBE_API_KEY":"([^"]+)""#) ?? Self.fallbackApiKey,
-            visitorData: firstCapture(in: html, pattern: #""VISITOR_DATA":"([^"]+)""#),
+            apiKey: Self.fallbackApiKey,
+            visitorData: nil,
             fetchedAt: Date()
         )
         cachedConfig = config
@@ -1471,7 +1663,7 @@ actor YouTubeTrailerResolver {
         return String(text[captureRange])
     }
 
-    private static func isYouTubeVideoId(_ value: String) -> Bool {
+    static func isYouTubeVideoId(_ value: String) -> Bool {
         value.count == 11 && value.allSatisfy { char in
             char.isLetter || char.isNumber || char == "_" || char == "-"
         }
@@ -1525,15 +1717,46 @@ enum SmartPlaybackSelector {
             candidates = candidates.filter { $0.stream.isLikelyCached }
         }
 
-        let ranked = candidates.map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
+        // Strictly exclude ticket / N/A / 0-resolution streams whenever valid >= 720p streams exist.
+        let validCandidates = candidates.filter { item in
+            let tags = StreamQualityTags.parse(stream: item.stream)
+            let res = tags.resolution > 0 ? tags.resolution : inferredResolution(for: item.stream)
+            return !isLowQualityOrTicketStream(item.stream) && res >= 720
+        }
+        let candidatePool = validCandidates.isEmpty ? candidates : validCandidates
+
+        let preferHardware = ProfileSettings.current.object(forKey: SettingsKey.preferHardwareDecodedStreams) as? Bool ?? true
+
+        let ranked = candidatePool.map { index, stream -> (index: Int, stream: NuvioStream, score: Int) in
             let tags = StreamQualityTags.parse(stream: stream)
             let resolution = tags.resolution > 0 ? tags.resolution : inferredResolution(for: stream)
             let subtitleScore = shouldMatchSubtitles ? subtitleScore(in: stream, languages: subtitleLanguages) : 0
             let qualityScore = score(resolution: resolution, preference: qualityPreference)
             let featureScore = featureBoost(tags: tags, preference: qualityPreference)
             let resumeScore = preferredTags.map { tags.matchScore(against: $0) } ?? 0
-            let cachedBoost = tags.isCached ? 5_000 : 0
-            return (index, stream, subtitleScore + qualityScore + featureScore + resumeScore + cachedBoost)
+            let cachedBoost = tags.isCached ? 15_000 : 0
+            let lowQualityPenalty: Int = {
+                if isLowQualityOrTicketStream(stream) || resolution == 0 {
+                    return -300_000
+                }
+                if resolution < 720 {
+                    return -100_000
+                }
+                return 0
+            }()
+            let hardwareBoost: Int
+            if preferHardware, resolution >= 2160, !AppleTVCapability.current.supportsAV1HardwareDecode {
+                if tags.isHardwareAccelerated() {
+                    hardwareBoost = 25_000
+                } else if tags.isAV1 {
+                    hardwareBoost = -25_000
+                } else {
+                    hardwareBoost = 0
+                }
+            } else {
+                hardwareBoost = 0
+            }
+            return (index, stream, subtitleScore + qualityScore + featureScore + resumeScore + cachedBoost + lowQualityPenalty + hardwareBoost)
         }
 
         return ranked.sorted { lhs, rhs in
@@ -1559,7 +1782,12 @@ enum SmartPlaybackSelector {
         if cachedOnly {
             result = result.filter(\.isLikelyCached)
         }
-        return result
+        let valid = result.filter { stream in
+            let tags = StreamQualityTags.parse(stream: stream)
+            let res = tags.resolution > 0 ? tags.resolution : inferredResolution(for: stream)
+            return !isLowQualityOrTicketStream(stream) && res >= 720
+        }
+        return valid.isEmpty ? result : valid
     }
 
     /// Prefer DV / HDR / Atmos when aiming for highest quality.
@@ -1585,47 +1813,68 @@ enum SmartPlaybackSelector {
         }
     }
 
-    private static func inferredResolution(for stream: NuvioStream) -> Int {
-        let text = searchableText(for: stream)
-        if text.contains("2160p") || text.contains("2160") || text.contains("4k") || text.contains("uhd") {
-            return 2160
+    static func isLowQualityOrTicketStream(_ stream: NuvioStream) -> Bool {
+        let res = StreamPickerListBuilder.resolution(for: stream)
+        // Verified HD/UHD streams (>= 720p) are NEVER low quality or ticket streams,
+        // even if add-ons like AIOStreams annotate them with the 🎫 (ticket/debrid) emoji.
+        if res >= 720 {
+            return false
         }
-        if text.contains("1080p") || text.contains("1080") || text.contains("fhd") {
-            return 1080
+        let text = metadataSearchText(for: stream)
+        if text.contains("🎫") || text.contains("[ticket]") || text.contains("ticket") || text.contains("download ticket") {
+            return true
         }
-        if text.contains("720p") || text.contains("720") || text.contains(" hd ") {
-            return 720
+        let nameLower = (stream.name ?? "").lowercased()
+        if nameLower.contains("n/a") || text.contains("n/a") {
+            return true
         }
-        if text.contains("480p") || text.contains("480") || text.contains(" sd ") {
-            return 480
-        }
-        return 0
+        return res == 0
     }
 
-    private static func score(resolution: Int, preference: String) -> Int {
+    static func inferredResolution(for stream: NuvioStream) -> Int {
+        let text = metadataSearchText(for: stream)
+        return StreamQualityTags.resolution(in: text)
+    }
+
+    private static func metadataSearchText(for stream: NuvioStream) -> String {
+        [stream.name, stream.description, stream.filename]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+    }
+
+    static func score(resolution: Int, preference: String) -> Int {
+        if resolution == 0 { return -200_000 }
         switch preference {
         case "4K":
-            return resolution >= 2160 ? 50_000 + resolution : resolution
+            if resolution >= 2160 { return 250_000 + resolution }
+            if resolution == 1440 { return 180_000 }
+            if resolution == 1080 { return 150_000 }
+            if resolution == 720 { return 60_000 }
+            return 10_000
         case "1080p":
-            if resolution == 1080 { return 50_000 }
-            if resolution > 1080 { return 20_000 - (resolution - 1080) }
-            return resolution
+            if resolution == 1080 { return 250_000 }
+            if resolution >= 2160 { return 180_000 }
+            if resolution == 1440 { return 160_000 }
+            if resolution == 720 { return 60_000 }
+            return 10_000
         case "720p":
-            if resolution == 720 { return 50_000 }
-            if resolution > 720 { return 20_000 - (resolution - 720) }
-            return resolution
+            if resolution == 720 { return 250_000 }
+            if resolution == 1080 { return 150_000 }
+            if resolution >= 2160 { return 80_000 }
+            return 10_000
         case "Smallest":
-            return resolution == 0 ? 10_000 : 10_000 - resolution
-        default:
-            return resolution
+            return resolution == 0 ? -100_000 : 200_000 - resolution
+        default: // "Highest"
+            return resolution >= 2160 ? 300_000 + resolution : resolution * 100
         }
     }
 
     private static func subtitleScore(in stream: NuvioStream, languages: [String]) -> Int {
         for (index, language) in languages.enumerated() {
-            let priorityScore = max(1, 3 - index) * 30_000
+            let priorityScore = max(1, 3 - index) * 3_000
             if !matchingSubtitles(in: stream, languages: [language]).isEmpty {
-                return priorityScore + 10_000
+                return priorityScore + 4_000
             }
             if SubtitleLanguagePreferences.matches(searchableText(for: stream), target: language) {
                 return priorityScore
@@ -1708,6 +1957,26 @@ enum StreamSortOption: String, CaseIterable, Identifiable {
     case name = "Name"
 
     var id: String { rawValue }
+
+    init?(rawValueOrSync: String) {
+        let upper = rawValueOrSync.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        switch upper {
+        case "DEFAULT":
+            self = .default
+        case "QUALITY", "QUALITY_DESC":
+            self = .quality
+        case "SIZE", "SIZE_DESC", "SIZE_ASC":
+            self = .size
+        case "NAME":
+            self = .name
+        default:
+            if let direct = StreamSortOption(rawValue: rawValueOrSync) {
+                self = direct
+            } else {
+                return nil
+            }
+        }
+    }
 }
 
 /// Pure stream-list derivation for the tvOS stream picker. Kept free of view
@@ -1785,49 +2054,117 @@ enum StreamPickerListBuilder {
         )
     }
 
-    /// Re-orders streams for the chosen sort. `.default` is a no-op so the
-    /// add-ons' own (usually best-first) order is preserved. `.enumerated` keeps
-    /// the sort stable, so streams that tie fall back to their original order.
+    /// Re-orders streams for the chosen sort matching Android TV's `DirectDebridStreamFilter.compareFacts`.
+    /// `.default` preserves the add-on's own order for valid streams while sinking unknown/0-res items.
+    /// `.quality` (Android's QUALITY_DESC) orders:
+    ///   1. Resolution DESC (2160 > 1440 > 1080 > 720 > 576 > 480 > 360 > 0)
+    ///   2. Release Quality DESC (Remux > BluRay > Web-DL > WebRip > HDRip > HD-Rip > DVDRip > HDTV > Cam/TS/TC/SCR > UNKNOWN)
+    ///   3. Size bytes DESC
+    ///   4. Apple TV hardware acceleration (AV1 check for 4K)
+    ///   5. Stable original offset
     static func sorted(_ streams: [NuvioStream], by option: StreamSortOption) -> [NuvioStream] {
         switch option {
         case .default:
-            return streams
+            return streams.enumerated().sorted {
+                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || resolution(for: $0.element) == 0
+                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || resolution(for: $1.element) == 0
+                if bad0 != bad1 {
+                    return !bad0 && bad1
+                }
+                return $0.offset < $1.offset
+            }.map(\.element)
         case .quality:
             return streams.enumerated().sorted {
-                resolution(for: $0.element) != resolution(for: $1.element)
-                    ? resolution(for: $0.element) > resolution(for: $1.element)
-                    : $0.offset < $1.offset
+                let res0 = resolution(for: $0.element)
+                let res1 = resolution(for: $1.element)
+                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                if bad0 != bad1 {
+                    return !bad0 && bad1
+                }
+                // Tier 1: Resolution DESC (Android DebridStreamSortKey.RESOLUTION)
+                if res0 != res1 {
+                    return res0 > res1
+                }
+                // Tier 2: Release Quality DESC (Android DebridStreamSortKey.QUALITY)
+                let q0 = streamQuality(for: $0.element)
+                let q1 = streamQuality(for: $1.element)
+                if q0 != q1 {
+                    return q0 > q1
+                }
+                // Tier 3: Size bytes DESC (Android DebridStreamSortKey.SIZE)
+                let s0 = sizeBytes(for: $0.element)
+                let s1 = sizeBytes(for: $1.element)
+                if s0 != s1 {
+                    return s0 > s1
+                }
+                // Tier 4: Hardware decode capability check (Apple TV AV1 decode at 4K)
+                if res0 >= 2160, !AppleTVCapability.current.supportsAV1HardwareDecode {
+                    let hw0 = StreamQualityTags.parse(stream: $0.element).isHardwareAccelerated()
+                    let hw1 = StreamQualityTags.parse(stream: $1.element).isHardwareAccelerated()
+                    if hw0 != hw1 {
+                        return hw0 && !hw1
+                    }
+                }
+                // Tier 5: Preserved original offset
+                return $0.offset < $1.offset
             }.map(\.element)
         case .size:
             return streams.enumerated().sorted {
-                sizeBytes(for: $0.element) != sizeBytes(for: $1.element)
-                    ? sizeBytes(for: $0.element) > sizeBytes(for: $1.element)
-                    : $0.offset < $1.offset
+                let res0 = resolution(for: $0.element)
+                let res1 = resolution(for: $1.element)
+                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                if bad0 != bad1 {
+                    return !bad0 && bad1
+                }
+                let s0 = sizeBytes(for: $0.element)
+                let s1 = sizeBytes(for: $1.element)
+                if s0 != s1 {
+                    return s0 > s1
+                }
+                return $0.offset < $1.offset
             }.map(\.element)
         case .name:
-            return streams.sorted {
-                ($0.name ?? "").localizedCaseInsensitiveCompare($1.name ?? "") == .orderedAscending
-            }
+            return streams.enumerated().sorted {
+                let res0 = resolution(for: $0.element)
+                let res1 = resolution(for: $1.element)
+                let bad0 = SmartPlaybackSelector.isLowQualityOrTicketStream($0.element) || res0 == 0
+                let bad1 = SmartPlaybackSelector.isLowQualityOrTicketStream($1.element) || res1 == 0
+                if bad0 != bad1 {
+                    return !bad0 && bad1
+                }
+                let c = ($0.element.name ?? "").localizedCaseInsensitiveCompare($1.element.name ?? "")
+                if c != .orderedSame {
+                    return c == .orderedAscending
+                }
+                return $0.offset < $1.offset
+            }.map(\.element)
         }
     }
 
-    /// Best-effort resolution parsed from a stream's text (2160/1080/720/480),
+    /// Best-effort resolution parsed from a stream's release metadata (2160/1440/1080/720/576/480/360),
     /// 0 when unknown so untagged streams sink to the bottom of a Quality sort.
     static func resolution(for stream: NuvioStream) -> Int {
-        let text = "\(stream.name ?? "") \(stream.description ?? "")".lowercased()
-        if text.contains("2160") || text.contains("4k") || text.contains("uhd") { return 2160 }
-        if text.contains("1440") || text.contains("2k") { return 1440 }
-        if text.contains("1080") || text.contains("fhd") { return 1080 }
-        if text.contains("720") { return 720 }
-        if text.contains("480") { return 480 }
-        return 0
+        let tags = StreamQualityTags.parse(stream: stream)
+        if tags.resolution > 0 { return tags.resolution }
+        return SmartPlaybackSelector.inferredResolution(for: stream)
     }
 
-    /// Best-effort file size in bytes parsed from a stream's text (e.g. "12.3 GB",
-    /// "📦 700 MB"). 0 when no size is present.
+    /// Release quality tier matching Android TV's `DebridStreamQuality`.
+    static func streamQuality(for stream: NuvioStream) -> DebridStreamQuality {
+        let text = "\(stream.name ?? "") \(stream.description ?? "") \(stream.filename ?? "")"
+        return StreamQualityTags.quality(in: text)
+    }
+
+    /// Best-effort file size in bytes matching Android TV's `StreamTextSizeParser`:
+    /// structured videoSize field first, then free-text parsing as last resort.
     static func sizeBytes(for stream: NuvioStream) -> Int64 {
-        let text = "\(stream.name ?? "") \(stream.description ?? "")"
-        let pattern = #"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)"#
+        if let videoSize = stream.videoSize, videoSize > 0 {
+            return videoSize
+        }
+        let text = "\(stream.description ?? "") \(stream.name ?? "")"
+        let pattern = #"(\d+(?:[.,]\d+)?)\s*(TB|GB|MB|KB)\b"#
         guard let match = text.range(of: pattern, options: [.regularExpression, .caseInsensitive]) else {
             return 0
         }
@@ -1905,6 +2242,15 @@ struct TvDetailsContent: View {
     /// without this the episode strip keeps drawing the bar it rendered with —
     /// marking an episode watched cleared the stores but nothing re-read them.
     @State private var progressRevision = 0
+    @State private var scrollOffset: CGFloat = 0
+
+    private var isScrolledDown: Bool {
+        focusedDetailsSection != .actions || episodeFocus != nil || castHeaderFocus != nil || scrollOffset > 30
+    }
+
+    private var backdropBlurRadius: CGFloat {
+        isScrolledDown ? 22 : 0
+    }
 
     var body: some View {
         if let meta = uiState.meta {
@@ -1914,9 +2260,9 @@ struct TvDetailsContent: View {
 
             GeometryReader { proxy in
                 ZStack(alignment: .topLeading) {
-                    TvDetailsBackdrop(meta: meta)
+                    TvDetailsBackdrop(meta: meta, blurRadius: backdropBlurRadius)
 
-                    TvDetailsScrolledBackdropDimmer()
+                    TvDetailsScrolledBackdropDimmer(isScrolledDown: isScrolledDown)
 
                     ScrollViewReader { scrollProxy in
                         ScrollView(.vertical, showsIndicators: false) {
@@ -2151,6 +2497,12 @@ struct TvDetailsContent: View {
                         }
                         .scrollClipDisabledIfAvailable()
                         .coordinateSpace(name: "tv-details-scroll")
+                    }
+                }
+                .onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
+                    let newOffset = max(0, -minY)
+                    if abs(newOffset - scrollOffset) > 2 {
+                        scrollOffset = newOffset
                     }
                 }
             }
@@ -2424,27 +2776,18 @@ private struct TvDetailsScrollOffsetKey: PreferenceKey {
 }
 
 private struct TvDetailsScrolledBackdropDimmer: View {
-    @State private var offset: CGFloat = 0
-
-    private var progress: CGFloat {
-        min(max(offset / 120, 0), 1)
-    }
+    var isScrolledDown: Bool = false
 
     var body: some View {
         ZStack {
             Color.black
-                .opacity(0.78 * progress)
+                .opacity(isScrolledDown ? 0.45 : 0)
                 .ignoresSafeArea()
                 .allowsHitTesting(false)
 
-            TvDetailsScrollTransitionShadow(progress: progress)
+            TvDetailsScrollTransitionShadow(progress: isScrolledDown ? 1 : 0)
         }
-        .onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
-            let newOffset = max(0, -minY)
-            if abs(newOffset - offset) > 1 {
-                offset = newOffset
-            }
-        }
+        .animation(.easeInOut(duration: 0.35), value: isScrolledDown)
     }
 }
 
@@ -2474,6 +2817,7 @@ private struct TvDetailsScrollTransitionShadow: View {
 
 private struct TvDetailsBackdrop: View {
     let meta: NuvioMeta
+    var blurRadius: CGFloat = 0
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -2482,7 +2826,7 @@ private struct TvDetailsBackdrop: View {
 
         ZStack {
             if let imageUrl = meta.backgroundUrl ?? meta.posterUrl,
-               let url = URL(string: imageUrl) {
+               let url = URL(string: imageUrl.trimmingCharacters(in: .whitespacesAndNewlines)) {
                 AsyncImage(url: url) { phase in
                     if case .success(let image) = phase {
                         image
@@ -2492,6 +2836,8 @@ private struct TvDetailsBackdrop: View {
                         backdropColor
                     }
                 }
+                .blur(radius: blurRadius, opaque: true)
+                .animation(.easeInOut(duration: 0.35), value: blurRadius)
                 .ignoresSafeArea()
             } else {
                 backdropColor.ignoresSafeArea()
@@ -3450,6 +3796,39 @@ private struct CommentDetailOverlay: View {
     }
 }
 
+actor PersonProfileImageCache {
+    static let shared = PersonProfileImageCache()
+    private let cache = NSCache<NSURL, UIImage>()
+
+    init() {
+        cache.countLimit = 60
+        cache.totalCostLimit = 20 * 1024 * 1024 // 20 MB
+        #if canImport(UIKit)
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            Task {
+                await PersonProfileImageCache.shared.purge()
+            }
+        }
+        #endif
+    }
+
+    func purge() {
+        cache.removeAllObjects()
+    }
+
+    func image(for url: NSURL) -> UIImage? {
+        cache.object(forKey: url)
+    }
+
+    func insert(_ image: UIImage, for url: NSURL) {
+        cache.setObject(image, forKey: url)
+    }
+}
+
 private struct TvDetailsPersonCard: View {
     let person: TmdbPersonMetadata
     let onSelect: () -> Void
@@ -3457,8 +3836,6 @@ private struct TvDetailsPersonCard: View {
 
     @FocusState private var isFocused: Bool
     @State private var profileImage: UIImage?
-
-    private static let imageCache = NSCache<NSURL, UIImage>()
 
     var body: some View {
         Button(action: onSelect) {
@@ -3536,7 +3913,7 @@ private struct TvDetailsPersonCard: View {
     private func loadProfileImage() async {
         guard profileImage == nil, let url = profileURL else { return }
         let cacheKey = url as NSURL
-        if let cached = Self.imageCache.object(forKey: cacheKey) {
+        if let cached = await PersonProfileImageCache.shared.image(for: cacheKey) {
             profileImage = cached
             return
         }
@@ -3544,12 +3921,32 @@ private struct TvDetailsPersonCard: View {
         guard let (data, response) = try? await URLSession.shared.data(from: url),
               let http = response as? HTTPURLResponse,
               (200...299).contains(http.statusCode),
-              let image = UIImage(data: data),
               !Task.isCancelled else {
             return
         }
 
-        Self.imageCache.setObject(image, forKey: cacheKey)
+        let targetPixelSize: CGFloat = 376
+        let downsampledImage: UIImage? = {
+            let options: [CFString: Any] = [
+                kCGImageSourceShouldCache: false
+            ]
+            guard let source = CGImageSourceCreateWithData(data as CFData, options as CFDictionary) else {
+                return UIImage(data: data)
+            }
+            let thumbnailOptions: [CFString: Any] = [
+                kCGImageSourceCreateThumbnailFromImageAlways: true,
+                kCGImageSourceShouldCacheImmediately: true,
+                kCGImageSourceCreateThumbnailWithTransform: true,
+                kCGImageSourceThumbnailMaxPixelSize: targetPixelSize
+            ]
+            guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, thumbnailOptions as CFDictionary) else {
+                return UIImage(data: data)
+            }
+            return UIImage(cgImage: cgImage)
+        }()
+
+        guard let image = downsampledImage, !Task.isCancelled else { return }
+        await PersonProfileImageCache.shared.insert(image, for: cacheKey)
         profileImage = image
     }
 }
@@ -3574,6 +3971,7 @@ private struct TvDetailsEpisodes: View {
     let onMoveDownFromEpisode: () -> Void
 
     @State private var selectedSeason: Int
+    @State private var seasonEpisodes: [NuvioVideo]
     @State private var episodeScrollIndex: Int
     @State private var watchedEpisodeKeys: Set<String>
     @State private var userDidSelectSeason = false
@@ -3622,6 +4020,7 @@ private struct TvDetailsEpisodes: View {
             initialSeasonEpisodes.firstIndex(where: { $0.id == target.id })
         } ?? 0
         _selectedSeason = State(initialValue: initialSeason)
+        _seasonEpisodes = State(initialValue: initialSeasonEpisodes)
         _episodeScrollIndex = State(initialValue: initialIndex)
         _watchedEpisodeKeys = State(initialValue: watchedKeys)
     }
@@ -3650,20 +4049,53 @@ private struct TvDetailsEpisodes: View {
                 let seasonEps = newEpisodes
                     .filter { $0.season == targetSeason }
                     .sorted { $0.episode < $1.episode }
+                seasonEpisodes = seasonEps
                 episodeScrollIndex = targetEpisode.flatMap { target in
                     seasonEps.firstIndex(where: { $0.id == target.id })
                 } ?? 0
+            } else {
+                seasonEpisodes = newEpisodes
+                    .filter { $0.season == selectedSeason }
+                    .sorted { $0.episode < $1.episode }
             }
         }
+        .onChange(of: selectedSeason) { _, newSeason in
+            seasonEpisodes = episodes
+                .filter { $0.season == newSeason }
+                .sorted { $0.episode < $1.episode }
+        }
+    }
+
+    private func materializedEpisodeIndices(visibleCardCount: Int) -> [Int] {
+        guard !seasonEpisodes.isEmpty else { return [] }
+        let focusIndex = min(max(episodeScrollIndex, 0), seasonEpisodes.count - 1)
+        var lowerBound = max(0, focusIndex - 4)
+        var upperBound = min(seasonEpisodes.count - 1, focusIndex + visibleCardCount + 2)
+
+        if let restriction = effectiveFocusRestriction {
+            let prefix = "episode-card\u{1}"
+            if restriction.hasPrefix(prefix) {
+                let targetID = String(restriction.dropFirst(prefix.count))
+                if let targetIndex = seasonEpisodes.firstIndex(where: { $0.id == targetID }) {
+                    lowerBound = min(lowerBound, targetIndex)
+                    upperBound = max(upperBound, targetIndex)
+                }
+            }
+        }
+
+        return Array(lowerBound...upperBound)
     }
 
     private var episodeCardStrip: some View {
         GeometryReader { geo in
             let edgeInset = max(0, geo.frame(in: .global).minX)
             let stripWidth = geo.size.width + edgeInset * 2
+            let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
+            let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
 
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
-                ForEach(seasonEpisodes) { video in
+                ForEach(materializedIndices, id: \.self) { itemIndex in
+                    let video = seasonEpisodes[itemIndex]
                     TvEpisodeCard(
                         video: video,
                         fallbackRating: seriesRating,
@@ -3671,9 +4103,7 @@ private struct TvDetailsEpisodes: View {
                         isWatched: watchedEpisodeKeys.contains("\(video.season):\(video.episode)"),
                         isSeasonWatched: isSeasonWatched,
                         onFocus: {
-                            if let index = seasonEpisodes.firstIndex(where: { $0.id == video.id }) {
-                                episodeScrollIndex = index
-                            }
+                            episodeScrollIndex = itemIndex
                             onFocus()
                         },
                         onToggleWatched: {
@@ -3703,6 +4133,7 @@ private struct TvDetailsEpisodes: View {
                     )
                 }
             }
+            .padding(.leading, CGFloat(materializedIndices.first ?? 0) * TvEpisodeCardLayout.step)
             .padding(.vertical, TvEpisodeCardLayout.verticalPadding)
             .offset(x: edgeInset - CGFloat(episodeScrollIndex) * TvEpisodeCardLayout.step)
             .frame(width: stripWidth, height: TvEpisodeCardLayout.stripHeight, alignment: .leading)
@@ -3755,12 +4186,6 @@ private struct TvDetailsEpisodes: View {
         Array(Set(episodes.map(\.season))).sorted {
             (seasonSortKey($0), $0) < (seasonSortKey($1), $1)
         }
-    }
-
-    private var seasonEpisodes: [NuvioVideo] {
-        episodes
-            .filter { $0.season == selectedSeason }
-            .sorted { $0.episode < $1.episode }
     }
 
     private var effectiveFocusRestriction: String? {
@@ -4124,19 +4549,12 @@ private struct TvEpisodeCard: View {
     }
 
     private var episodeArtwork: some View {
-        Group {
-            if let thumb = video.thumbnail, let url = URL(string: thumb) {
-                AsyncImage(url: url) { phase in
-                    if case .success(let image) = phase {
-                        image.resizable().scaledToFill()
-                    } else {
-                        placeholderThumb
-                    }
-                }
-            } else {
-                placeholderThumb
-            }
-        }
+        CachedPosterArtwork(
+            urlString: video.thumbnail,
+            width: cardWidth,
+            height: cardHeight,
+            placeholder: { placeholderThumb }
+        )
         .frame(width: cardWidth, height: cardHeight)
         .clipped()
     }
@@ -4164,41 +4582,6 @@ private struct TvEpisodeCard: View {
                 }
             }
         }
-    }
-
-    private var thumbnail: some View {
-        ZStack(alignment: .bottomLeading) {
-            Group {
-                if let thumb = video.thumbnail, let url = URL(string: thumb) {
-                    AsyncImage(url: url) { phase in
-                        if case .success(let image) = phase {
-                            image.resizable().scaledToFill()
-                        } else {
-                            placeholderThumb
-                        }
-                    }
-                } else {
-                    placeholderThumb
-                }
-            }
-            .frame(width: cardWidth, height: thumbHeight)
-            .clipped()
-
-            LinearGradient(
-                colors: [.black.opacity(0.0), .black.opacity(0.55)],
-                startPoint: .center,
-                endPoint: .bottom
-            )
-
-            Text(L10n.format("details_episode_number", fallback: "EPISODE %d", video.episode))
-                .font(.system(size: 20, weight: .bold))
-                .foregroundColor(.white)
-                .padding(.horizontal, 16)
-                .padding(.vertical, 8)
-                .background(Color.black.opacity(0.55), in: Capsule())
-                .padding(18)
-        }
-        .frame(width: cardWidth, height: thumbHeight)
     }
 
     private var placeholderThumb: some View {

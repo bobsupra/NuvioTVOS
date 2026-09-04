@@ -26,5 +26,4 @@ struct PlaybackEngineCapabilities: Equatable {
         supportsHostSubtitleOverlay: false,
         supportsHTTPHeaders: true
     )
-
 }

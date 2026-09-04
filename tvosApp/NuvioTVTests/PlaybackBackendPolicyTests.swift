@@ -905,10 +905,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "MPVKit"), .mpv)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "mpv"), .mpv)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "AetherEngine"), .aether)
+        XCTAssertEqual(PlayerEngineSetting.migrated(from: "KSPlayer"), .auto)
+        XCTAssertEqual(PlayerEngineSetting.migrated(from: "ksplayer"), .auto)
+        XCTAssertEqual(PlayerEngineSetting.migrated(from: "ks"), .auto)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "unknown"), .auto)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "AVPlayer").settingsRawValue, "Auto")
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "AetherEngine").settingsRawValue, "AetherEngine")
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "MPVKit").settingsRawValue, "MPVKit")
+        XCTAssertEqual(PlayerEngineSetting.migrated(from: "KSPlayer").settingsRawValue, "Auto")
     }
 
     func testMPVFallbackConfigurationPreservesSessionState() throws {

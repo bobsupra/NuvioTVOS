@@ -1855,6 +1855,7 @@ enum PlayerSettingsSyncMapper {
         ("cached_only_streams", SettingsKey.cachedOnlyStreams),
         ("stream_sort_mode", SettingsKey.streamSortOption),
         ("smart_stream_selection", SettingsKey.smartStreamSelection),
+        ("smart_stream_use_top_result", SettingsKey.smartStreamUseTopResult),
         ("smart_stream_quality", SettingsKey.smartStreamQuality),
         ("external_player_forward_subtitles", SettingsKey.externalPlayerForwardSubtitles),
         ("frame_rate_matching", SettingsKey.frameRateMatching),
@@ -1873,6 +1874,7 @@ enum PlayerSettingsSyncMapper {
         (SettingsKey.cachedOnlyStreams, "stream_cached_only"),
         (SettingsKey.streamSortOption, "stream_sort_mode"),
         (SettingsKey.smartStreamSelection, "smart_stream_selection"),
+        (SettingsKey.smartStreamUseTopResult, "smart_stream_use_top_result"),
         (SettingsKey.smartStreamQuality, "smart_stream_quality"),
         (SettingsKey.externalPlayerForwardSubtitles, "external_player_forward_subtitles"),
         (SettingsKey.frameRateMatching, "frame_rate_matching"),
@@ -3072,6 +3074,7 @@ fileprivate final class NuvioAPIClient {
         static let useSeasonPosters = "tmdb_use_season_posters"
         static let useMoreLikeThis = "tmdb_use_more_like_this"
         static let useCollections = "tmdb_use_collections"
+        static let applyToHome = "tmdb_apply_to_home"
     }
 
     private func exportTmdbSettings(
@@ -3096,6 +3099,7 @@ fileprivate final class NuvioAPIClient {
             (SettingsKey.tmdbUseSeasonPosters, AndroidTmdbKey.useSeasonPosters),
             (SettingsKey.tmdbUseMoreLikeThis, AndroidTmdbKey.useMoreLikeThis),
             (SettingsKey.tmdbUseCollections, AndroidTmdbKey.useCollections),
+            (SettingsKey.tmdbApplyToHome, AndroidTmdbKey.applyToHome),
         ]
 
         for (localKey, androidKey) in mappings {
@@ -3127,6 +3131,7 @@ fileprivate final class NuvioAPIClient {
             (AndroidTmdbKey.useSeasonPosters, SettingsKey.tmdbUseSeasonPosters),
             (AndroidTmdbKey.useMoreLikeThis, SettingsKey.tmdbUseMoreLikeThis),
             (AndroidTmdbKey.useCollections, SettingsKey.tmdbUseCollections),
+            (AndroidTmdbKey.applyToHome, SettingsKey.tmdbApplyToHome),
         ]
 
         for (androidKey, localKey) in mappings {

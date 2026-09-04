@@ -14284,7 +14284,7 @@
     "playback_player_ask": "Ask every time",
     "playback_player_ask_desc": "Choose the player each time",
     "playback_player_auto": "Auto (Best for Content)",
-    "playback_player_auto_desc": "ExoPlayer for Movies & TV Shows · MPV for Anime",
+    "playback_player_auto_desc": "ExoPlayer for Movies & Series · MPV for Anime",
     "playback_player_external": "External",
     "playback_player_external_desc": "Always open streams in an external app",
     "playback_player_internal": "Internal",

@@ -1,5 +1,44 @@
 import Foundation
 
+/// Release quality tier matching Android TV's `DebridStreamQuality`.
+enum DebridStreamQuality: Int, Codable, Comparable, CaseIterable {
+    case unknown = 0
+    case scr = 1
+    case tc = 2
+    case ts = 3
+    case cam = 4
+    case hdtv = 5
+    case dvdrip = 6
+    case hdRip = 7
+    case hdrip = 8
+    case webrip = 9
+    case webDl = 10
+    case bluray = 11
+    case blurayRemux = 12
+
+    static func < (lhs: DebridStreamQuality, rhs: DebridStreamQuality) -> Bool {
+        lhs.rawValue < rhs.rawValue
+    }
+
+    var label: String {
+        switch self {
+        case .blurayRemux: return "BluRay REMUX"
+        case .bluray: return "BluRay"
+        case .webDl: return "WEB-DL"
+        case .webrip: return "WEBRip"
+        case .hdrip: return "HDRip"
+        case .hdRip: return "HC HD-Rip"
+        case .dvdrip: return "DVDRip"
+        case .hdtv: return "HDTV"
+        case .cam: return "CAM"
+        case .ts: return "TS"
+        case .tc: return "TC"
+        case .scr: return "SCR"
+        case .unknown: return "Unknown"
+        }
+    }
+}
+
 /// Parsed quality / delivery tags from a stream card or last-watched fingerprint.
 /// Used for ranking, resume matching, and lightweight source badges.
 struct StreamQualityTags: Equatable, Codable {
@@ -8,11 +47,30 @@ struct StreamQualityTags: Equatable, Codable {
     var isHDR: Bool = false
     var isAtmos: Bool = false
     var isCached: Bool = false
+    var isHEVC: Bool = false
+    var isAVC: Bool = false
+    var isAV1: Bool = false
+    var quality: DebridStreamQuality = .unknown
     var bingeGroup: String? = nil
     var addonName: String? = nil
 
     var hasVisualPreference: Bool { isDolbyVision || isHDR }
     var hasAudioPreference: Bool { isAtmos }
+
+    /// Returns true if this stream is hardware-accelerated on the provided Apple TV capability profile.
+    func isHardwareAccelerated(on capability: AppleTVCapability = .current) -> Bool {
+        if isAV1 {
+            return capability.supportsAV1HardwareDecode
+        }
+        if isHEVC {
+            return capability.supportsHEVCHardwareDecode && (resolution == 0 || resolution <= capability.maxResolution)
+        }
+        if isAVC {
+            return resolution == 0 || resolution <= capability.maxResolution
+        }
+        // Unknown codec defaults to hardware compatibility check based on resolution
+        return resolution == 0 || resolution <= capability.maxResolution
+    }
 
     static func parse(
         name: String? = nil,
@@ -23,29 +81,41 @@ struct StreamQualityTags: Equatable, Codable {
         addonName: String? = nil,
         isCachedHint: Bool? = nil
     ) -> StreamQualityTags {
-        let text = [name, description, filename, url]
+        // Exclude stream URLs from resolution and quality parsing. URLs often contain random
+        // hex hashes, timestamps, port numbers, or query parameters (e.g. /720/ or ?v=2k) that
+        // lead to false-positive resolution classification. Only inspect release metadata.
+        let metadataText = [name, description, filename]
+            .compactMap { $0 }
+            .joined(separator: " ")
+            .lowercased()
+
+        let fullText = [name, description, filename, url]
             .compactMap { $0 }
             .joined(separator: " ")
             .lowercased()
 
         var tags = StreamQualityTags()
-        tags.resolution = resolution(in: text)
-        tags.isDolbyVision = textContainsAny(text, [
+        tags.resolution = resolution(in: metadataText)
+        tags.quality = quality(in: metadataText)
+        tags.isDolbyVision = textContainsAny(fullText, [
             "dolby vision", "dolbyvision", " dovi", "dovi ", "dvhe", "dvh1",
             " profile 5", "profile 5", " profile 7", "profile 7", " profile 8", "profile 8",
             " dv ", "dv.", ".dv.", "[dv]", "(dv)"
-        ]) || text.range(of: #"\bdv\b"#, options: .regularExpression) != nil
+        ]) || fullText.range(of: #"\bdv\b"#, options: .regularExpression) != nil
         // Match HDR markers as standalone release tokens. `HDRip` is a common
         // SDR release label (High Definition rip), not an HDR transfer.
-        tags.isHDR = tags.isDolbyVision || textContainsHDRToken(text)
-        tags.isAtmos = textContainsAny(text, [
+        tags.isHDR = tags.isDolbyVision || textContainsHDRToken(fullText)
+        tags.isAtmos = textContainsAny(fullText, [
             "atmos", "truehd atmos", "ddp atmos", "eac3 atmos", "dd+ atmos"
         ])
-        tags.isCached = isCachedHint == true || textContainsAny(text, [
+        tags.isCached = isCachedHint == true || textContainsAny(fullText, [
             "⚡", "[cached]", "(cached)", " cached", "cached ",
             "[rd+", "rd+", "[pm+", "pm+", "[tb+", "tb+", "torbox+",
             "instant", "debrid +"
         ])
+        tags.isAV1 = textContainsAV1Token(fullText)
+        tags.isHEVC = textContainsHEVCToken(fullText)
+        tags.isAVC = textContainsAVCToken(fullText)
         if let bingeGroup, !bingeGroup.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             tags.bingeGroup = bingeGroup.trimmingCharacters(in: .whitespacesAndNewlines)
         }
@@ -69,20 +139,28 @@ struct StreamQualityTags: Equatable, Codable {
 
     /// Higher is a better match to the previously watched stream / quality prefs.
     func matchScore(against preferred: StreamQualityTags) -> Int {
+        // Preferred quality tags must have valid resolution (>= 720p). If a corrupt/ticket
+        // stream was previously saved as preference, do not match against it.
+        guard preferred.resolution >= 720 else { return 0 }
+        if resolution == 0 { return -300_000 }
+
         var score = 0
         if let preferredGroup = preferred.bingeGroup,
            let group = bingeGroup,
            preferredGroup.compare(group, options: .caseInsensitive) == .orderedSame {
             // Stremio defines bingeGroup specifically for matching the same
-            // release across episodes. It must dominate general quality ranking.
-            score += 500_000
+            // release across episodes. Only reward if the current stream is also valid (>= 720p).
+            if resolution >= 720 {
+                score += 500_000
+            }
         }
         if let preferredAddon = preferred.addonName,
            let addon = addonName,
            preferredAddon.compare(addon, options: .caseInsensitive) == .orderedSame {
-            // If an add-on does not expose bingeGroup, remain on the provider the
-            // user selected before falling back to the global smart ordering.
-            score += 250_000
+            // Only reward addon continuity if the stream has a valid resolution (not an unknown/ticket entry).
+            if resolution >= 720 {
+                score += 50_000
+            }
         }
         if preferred.isDolbyVision, isDolbyVision { score += 80_000 }
         else if preferred.isHDR, isHDR { score += 50_000 }
@@ -96,16 +174,53 @@ struct StreamQualityTags: Equatable, Codable {
         }
 
         if preferred.isCached, isCached { score += 15_000 }
+        if resolution < 720 { score -= 150_000 }
         return score
     }
 
-    private static func resolution(in text: String) -> Int {
-        if text.contains("2160") || text.contains("4k") || text.contains("uhd") { return 2160 }
-        if text.contains("1440") || text.contains("2k") { return 1440 }
-        if text.contains("1080") || text.contains("fhd") { return 1080 }
-        if text.contains("720") { return 720 }
-        if text.contains("480") { return 480 }
+    /// Canonical token-based resolution parsing matching Android TV's `resolutionValue`.
+    static func resolution(in text: String) -> Int {
+        let lower = text.lowercased()
+        func hasToken(_ pattern: String) -> Bool {
+            lower.range(
+                of: #"(?:^|[^a-z0-9])(?:"# + pattern + #")(?:[^a-z0-9]|$)"#,
+                options: .regularExpression
+            ) != nil
+        }
+
+        if hasToken("2160p?|4k|uhd") { return 2160 }
+        if hasToken("1440p?|2k") { return 1440 }
+        if hasToken("1080p?|fhd") { return 1080 }
+        if hasToken("720p?|hd") { return 720 }
+        if hasToken("576p?") { return 576 }
+        if hasToken("480p?|sd") { return 480 }
+        if hasToken("360p?") { return 360 }
         return 0
+    }
+
+    /// Canonical release quality classification matching Android TV's `streamQuality`.
+    static func quality(in text: String) -> DebridStreamQuality {
+        let lower = text.lowercased()
+        func hasToken(_ token: String) -> Bool {
+            lower.range(
+                of: #"(?:^|[^a-z0-9])"# + NSRegularExpression.escapedPattern(for: token) + #"(?:[^a-z0-9]|$)"#,
+                options: .regularExpression
+            ) != nil
+        }
+
+        if lower.contains("remux") { return .blurayRemux }
+        if lower.contains("blu-ray") || lower.contains("bluray") || lower.contains("bdrip") || lower.contains("brrip") { return .bluray }
+        if lower.contains("web-dl") || lower.contains("webdl") { return .webDl }
+        if lower.contains("webrip") || lower.contains("web-rip") { return .webrip }
+        if lower.contains("hdrip") { return .hdrip }
+        if lower.contains("hd-rip") || lower.contains("hcrip") { return .hdRip }
+        if lower.contains("dvdrip") { return .dvdrip }
+        if lower.contains("hdtv") { return .hdtv }
+        if hasToken("cam") { return .cam }
+        if hasToken("ts") { return .ts }
+        if hasToken("tc") { return .tc }
+        if hasToken("scr") { return .scr }
+        return .unknown
     }
 
     private static func textContainsAny(_ text: String, _ needles: [String]) -> Bool {
@@ -118,6 +233,27 @@ struct StreamQualityTags: Equatable, Codable {
             options: .regularExpression
         ) != nil
     }
+
+    private static func textContainsAV1Token(_ text: String) -> Bool {
+        text.range(
+            of: #"(?<![a-z0-9])(?:av1|av01)(?![a-z0-9])"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func textContainsHEVCToken(_ text: String) -> Bool {
+        text.range(
+            of: #"(?<![a-z0-9])(?:hevc|h\.?265|x265|dvhe|dvh1)(?![a-z0-9])"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    private static func textContainsAVCToken(_ text: String) -> Bool {
+        text.range(
+            of: #"(?<![a-z0-9])(?:avc1?|h\.?264|x264)(?![a-z0-9])"#,
+            options: .regularExpression
+        ) != nil
+    }
 }
 
 /// Profile-scoped memory of the last stream quality for a title, so resume can
@@ -127,13 +263,19 @@ enum LastStreamQualityStore {
     private static let prefix = "nuvio.tv.lastStreamQuality."
 
     static func save(metaId: String, tags: StreamQualityTags, profileId: String? = nil) {
+        // Never persist low-resolution (< 720p), unknown, or ticket streams as the title's preferred quality
+        guard tags.resolution >= 720 else { return }
         let key = prefix + metaId
         guard let data = try? JSONEncoder().encode(tags) else { return }
         defaults(for: profileId).set(data, forKey: key)
     }
 
     static func save(metaId: String, stream: NuvioStream, profileId: String? = nil) {
-        save(metaId: metaId, tags: StreamQualityTags.parse(stream: stream), profileId: profileId)
+        var tags = StreamQualityTags.parse(stream: stream)
+        if tags.resolution == 0 {
+            tags.resolution = SmartPlaybackSelector.inferredResolution(for: stream)
+        }
+        save(metaId: metaId, tags: tags, profileId: profileId)
     }
 
     static func save(
@@ -144,22 +286,26 @@ enum LastStreamQualityStore {
         url: String?,
         profileId: String? = nil
     ) {
-        save(
-            metaId: metaId,
-            tags: StreamQualityTags.parse(
-                name: name,
-                description: description,
-                filename: filename,
-                url: url
-            ),
-            profileId: profileId
+        let tags = StreamQualityTags.parse(
+            name: name,
+            description: description,
+            filename: filename,
+            url: url
         )
+        save(metaId: metaId, tags: tags, profileId: profileId)
     }
 
     static func load(metaId: String, profileId: String? = nil) -> StreamQualityTags? {
         let key = prefix + metaId
-        guard let data = defaults(for: profileId).data(forKey: key) else { return nil }
-        return try? JSONDecoder().decode(StreamQualityTags.self, from: data)
+        let store = defaults(for: profileId)
+        guard let data = store.data(forKey: key) else { return nil }
+        guard let tags = try? JSONDecoder().decode(StreamQualityTags.self, from: data) else { return nil }
+        // Self-heal: purge corrupt/sub-720p/ticket tags from UserDefaults so a title never gets stuck on N/A
+        if tags.resolution < 720 {
+            store.removeObject(forKey: key)
+            return nil
+        }
+        return tags
     }
 
     private static func defaults(for profileId: String?) -> UserDefaults {
@@ -237,6 +383,9 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
     case fourK = "4K"
     case fullHD = "1080p"
     case cached = "Cached"
+    case hevc = "HEVC"
+    case avc = "AVC"
+    case av1 = "AV1"
 
     var id: String { rawValue }
 
@@ -248,6 +397,9 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
         case .fourK: return (0.22, 1)
         case .fullHD: return (0.16, 1)
         case .cached: return (0.20, 1)
+        case .hevc: return (0.26, 1)
+        case .avc: return (0.18, 1)
+        case .av1: return (0.30, 1)
         }
     }
 
@@ -258,6 +410,9 @@ enum StreamBadgeKind: String, CaseIterable, Identifiable {
         if tags.isAtmos { list.append(.atmos) }
         if tags.resolution >= 2160 { list.append(.fourK) }
         else if tags.resolution >= 1080 { list.append(.fullHD) }
+        if tags.isHEVC { list.append(.hevc) }
+        else if tags.isAV1 { list.append(.av1) }
+        else if tags.isAVC { list.append(.avc) }
         if tags.isCached { list.append(.cached) }
         return list
     }
@@ -283,6 +438,29 @@ struct StreamBadgeFilter: Codable, Equatable {
     var tagStyle: String = ""
     var textColor: String = ""
     var borderColor: String = ""
+    init(
+        id: String = "",
+        groupId: String = "",
+        name: String = "",
+        pattern: String = "",
+        imageURL: String = "",
+        isEnabled: Bool = true,
+        tagColor: String = "",
+        tagStyle: String = "",
+        textColor: String = "",
+        borderColor: String = ""
+    ) {
+        self.id = id
+        self.groupId = groupId
+        self.name = name
+        self.pattern = pattern
+        self.imageURL = imageURL
+        self.isEnabled = isEnabled
+        self.tagColor = tagColor
+        self.tagStyle = tagStyle
+        self.textColor = textColor
+        self.borderColor = borderColor
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -316,6 +494,48 @@ struct StreamBadgeFilter: Codable, Equatable {
     private enum CodingKeys: String, CodingKey {
         case id, groupId, name, pattern, imageURL, imageUrl, isEnabled, tagColor, tagStyle, textColor, borderColor
     }
+
+    /// Canonical resolution tier (e.g. 2160 for 4K, 1080 for 1080p) if this filter represents a resolution badge.
+    var resolutionTier: Int? {
+        let key = " \(name) \(id) ".lowercased()
+        func hasToken(_ pat: String) -> Bool {
+            key.range(
+                of: #"(?:^|[^a-z0-9])(?:"# + pat + #")(?:[^a-z0-9]|$)"#,
+                options: .regularExpression
+            ) != nil
+        }
+        if hasToken("4k|2160p?|uhd") { return 2160 }
+        if hasToken("1440p?|2k|qhd") { return 1440 }
+        if hasToken("1080p?|fhd") { return 1080 }
+        if hasToken("720p?|hd720|hd") { return 720 }
+        if hasToken("480p?|sd480|sd") { return 480 }
+        return nil
+    }
+
+    func isResolutionFilter(in groups: [StreamBadgeGroup] = []) -> Bool {
+        if resolutionTier != nil { return true }
+        if let group = groups.first(where: { $0.id == groupId }),
+           group.name.localizedCaseInsensitiveContains("resolution") {
+            return true
+        }
+        return groupId.localizedCaseInsensitiveContains("res")
+    }
+
+    var isSDRFilter: Bool {
+        let key = " \(name) \(id) ".lowercased()
+        return key.range(
+            of: #"(?:^|[^a-z0-9])sdr(?:[^a-z0-9]|$)"#,
+            options: .regularExpression
+        ) != nil
+    }
+
+    var isHDRFilter: Bool {
+        let key = " \(name) \(id) ".lowercased()
+        return key.range(
+            of: #"(?:^|[^a-z0-9])(?:hdr(?:10\+?|10p)?|dv|dovi|dolby\s*vision)(?:[^a-z0-9]|$)"#,
+            options: .regularExpression
+        ) != nil
+    }
 }
 
 struct StreamBadgeGroup: Codable, Equatable {
@@ -323,6 +543,18 @@ struct StreamBadgeGroup: Codable, Equatable {
     var name: String = ""
     var color: String = ""
     var isExpanded: Bool = true
+
+    init(
+        id: String = "",
+        name: String = "",
+        color: String = "",
+        isExpanded: Bool = true
+    ) {
+        self.id = id
+        self.name = name
+        self.color = color
+        self.isExpanded = isExpanded
+    }
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
@@ -657,7 +889,54 @@ enum StreamBadgeMatcher {
             let key = (filter.imageURL.isEmpty ? filter.name : filter.imageURL).lowercased()
             if seen.insert(key).inserted { result.append(filter) }
         }
-        return result
+        return sanitizeMatchedBadges(result, for: stream, groups: active.groups)
+    }
+
+    private static func sanitizeMatchedBadges(
+        _ badges: [StreamBadgeFilter],
+        for stream: NuvioStream,
+        groups: [StreamBadgeGroup]
+    ) -> [StreamBadgeFilter] {
+        guard !badges.isEmpty else { return [] }
+
+        // 1. Resolution mutual exclusivity:
+        // A single stream file has one canonical resolution. Never show multiple resolution badges.
+        let canonicalResolution = StreamQualityTags.parse(stream: stream).resolution
+        let resolutionBadges = badges.filter { $0.isResolutionFilter(in: groups) }
+
+        var winningResolutionBadge: StreamBadgeFilter?
+        if !resolutionBadges.isEmpty {
+            if canonicalResolution > 0 {
+                // If stream is known to be e.g. 1080p, pick the badge matching canonical resolution
+                winningResolutionBadge = resolutionBadges.first(where: { $0.resolutionTier == canonicalResolution })
+            } else {
+                // Unknown canonical resolution: take at most one resolution badge (highest tier or first matched)
+                winningResolutionBadge = resolutionBadges.sorted {
+                    ($0.resolutionTier ?? 0) > ($1.resolutionTier ?? 0)
+                }.first
+            }
+        }
+
+        // 2. Dynamic range mutual exclusivity:
+        // SDR and HDR/DV cannot coexist. If any HDR/DV badge matched, strip SDR badges.
+        let hasHDR = badges.contains { $0.isHDRFilter }
+
+        var sanitized: [StreamBadgeFilter] = []
+        for badge in badges {
+            if badge.isResolutionFilter(in: groups) {
+                if let winner = winningResolutionBadge, badge.id == winner.id && badge.name == winner.name {
+                    sanitized.append(badge)
+                    winningResolutionBadge = nil // ensure only added once
+                }
+                continue
+            }
+            if hasHDR && badge.isSDRFilter {
+                continue
+            }
+            sanitized.append(badge)
+        }
+
+        return sanitized
     }
 
     private static func regularExpression(for pattern: String) -> CachedRegex? {
@@ -721,14 +1000,15 @@ enum StreamBadgeMatcher {
     }
 
     static func matchCandidates(for stream: NuvioStream) -> [String] {
+        // Exclude stream.url, stream.infoHash, and stream.sources. Transport URLs, hashes,
+        // and tracker hints contain random tokens, hex strings, or route parameters (e.g. /4k/)
+        // that trigger false-positive matches for resolution or source badges. Match solely
+        // against clean release metadata, identical to Android TV's badgeMatchCandidates.
         let values = [
             stream.filename,
             stream.name,
             stream.description,
-            stream.url,
-            stream.infoHash,
-            stream.addonName,
-            stream.sources.joined(separator: " ")
+            stream.addonName
         ].compactMap { value -> String? in
             guard let value else { return nil }
             let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)

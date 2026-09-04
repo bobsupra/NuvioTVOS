@@ -94,9 +94,17 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     /// library/watch-state snapshots.
     let externalRatings: [NuvioExternalRating]?
 
+    static func isSeriesType(_ type: String) -> Bool {
+        let normalized = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return [
+            "series", "show", "shows", "tv", "tvshow", "tvshows",
+            "tv_series", "tv-series", "tv_show", "tv-show",
+            "anime", "miniseries", "mini-series", "mini_series", "serial"
+        ].contains(normalized)
+    }
+
     var isSeries: Bool {
-        ["series", "show", "tv", "tvshow"].contains(type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased())
-            || videos?.isEmpty == false
+        Self.isSeriesType(type) || videos?.isEmpty == false
     }
 
     /// Canonical type used for persisted and watched-state identity. Providers
@@ -313,7 +321,10 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     }
 
     func withVideos(_ newVideos: [NuvioVideo]?) -> NuvioMeta {
-        NuvioMeta(
+        let videosToUse = newVideos ?? videos
+        let hasVideos = videosToUse?.isEmpty == false
+        let resolvedType = (hasVideos && !Self.isSeriesType(type)) ? "series" : type
+        return NuvioMeta(
             id: id,
             name: name,
             description: description,
@@ -322,7 +333,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             logoUrl: logoUrl,
             imdbId: imdbId,
             tmdbId: tmdbId,
-            type: type,
+            type: resolvedType,
             year: year,
             genres: genres,
             rating: rating,
@@ -335,7 +346,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             country: country,
             released: released,
             status: status,
-            videos: newVideos ?? videos,
+            videos: videosToUse,
             trailerYtIds: trailerYtIds,
             externalRatings: externalRatings
         )
@@ -2768,9 +2779,14 @@ enum CollectionFolderViewMode: String, CaseIterable, Hashable {
 
     /// Rows-style layout (horizontal catalog strips), including follow-home.
     var usesCatalogRows: Bool {
+        usesCatalogRows(homeLayout: "Modern")
+    }
+
+    func usesCatalogRows(homeLayout: String) -> Bool {
         switch self {
-        case .rows, .followLayout: return true
+        case .rows: return true
         case .tabbedGrid: return false
+        case .followLayout: return homeLayout != "Grid View"
         }
     }
 

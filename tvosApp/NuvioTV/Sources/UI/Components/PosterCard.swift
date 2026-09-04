@@ -354,7 +354,7 @@ struct PosterCard: View {
             .overlay(alignment: .bottomLeading) {
                 continueProgressOverlay
             }
-            .overlay(alignment: .topTrailing) {
+            .overlay(alignment: effectiveLandscape ? .topTrailing : .top) {
                 continueBadge
             }
             .overlay(alignment: .topTrailing) {
@@ -504,6 +504,7 @@ struct PosterCard: View {
                 .foregroundColor(.white)
                 .lineLimit(1)
                 .minimumScaleFactor(0.65)
+                .multilineTextAlignment(.center)
                 .padding(.horizontal, 14)
                 .padding(.vertical, 8)
                 .background {
@@ -521,7 +522,9 @@ struct PosterCard: View {
                             .fill(continueBadgeFill)
                     }
                 }
-                .padding(16)
+                .padding(.top, 16)
+                .padding(.bottom, 16)
+                .padding(.horizontal, effectiveLandscape ? 16 : 8)
         }
     }
 
@@ -705,7 +708,7 @@ struct PosterCard: View {
         didFinishTrailerPreview = false
         guard isFocused, effectiveLandscape, trailersEnabled, !isContinueOrUpcomingCard else { return }
 
-        let delay = max(1, trailerDelay)
+        let delay = max(0, trailerDelay)
         do {
             try await Task.sleep(nanoseconds: UInt64(delay) * 1_000_000_000)
         } catch {
@@ -958,7 +961,7 @@ private struct TrailerPreviewPlayer: View {
     @State private var player = AVPlayer()
     @State private var isRenderReady = false
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
-    private let resolver = YouTubeTrailerResolver()
+    private let resolver = YouTubeTrailerResolver.shared
 
     var body: some View {
         TrailerPlayerSurface(player: player) {
@@ -1014,12 +1017,7 @@ private struct TrailerPreviewPlayer: View {
     private func startPreview() async {
         isRenderReady = false
 
-        guard let youtubeVideoId = await YouTubeTrailerResolver.preferredTrailerYouTubeId(for: meta),
-              let playbackSource = await resolver.resolvePreview(
-                  youtubeVideoId: youtubeVideoId,
-                  title: meta.name,
-                  year: meta.year.map(String.init)
-              ),
+        guard let playbackSource = await resolver.resolvePreview(for: meta),
               let url = URL(string: playbackSource.videoUrl),
               !Task.isCancelled else {
             return
@@ -1484,16 +1482,16 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         self.placeholder = placeholder()
     }
 
-    @State private var image: UIImage?
-    @State private var loadedKey: String?
-    /// Keep the preceding artwork variant alive while the card changes shape.
-    /// A Home card swaps between poster and backdrop URLs; retaining both lets
-    /// the poster reappear immediately and crop down with the width animation
-    /// instead of flashing the placeholder for a frame.
-    @State private var previousImage: UIImage?
-    @State private var previousLoadedKey: String?
-    @State private var preloadedImage: UIImage?
-    @State private var preloadedKey: String?
+    private struct CardArtworkState {
+        var image: UIImage?
+        var loadedKey: String?
+        var previousImage: UIImage?
+        var previousLoadedKey: String?
+        var preloadedImage: UIImage?
+        var preloadedKey: String?
+    }
+
+    @State private var state = CardArtworkState()
 
     private var maxPixelSize: Int {
         let displayScale = UIScreen.main.scale
@@ -1536,24 +1534,24 @@ struct CachedPosterArtwork<Placeholder: View>: View {
     }
 
     private var displayedImage: UIImage? {
-        if loadedKey == cacheKey { return image }
-        if preloadedKey == cacheKey { return preloadedImage }
-        if previousLoadedKey == cacheKey { return previousImage }
+        if state.loadedKey == cacheKey { return state.image }
+        if state.preloadedKey == cacheKey { return state.preloadedImage }
+        if state.previousLoadedKey == cacheKey { return state.previousImage }
 
         // While a brand-new variant is loading, keep real artwork on screen.
         // For landscape expansion this naturally starts with a zoomed poster;
         // for collapse the matching portrait is normally `previousImage`.
-        return image ?? previousImage
+        return state.image ?? state.previousImage
     }
 
     @MainActor
     private func load() async {
         guard let urlString,
               let url = URL(string: urlString) else {
-            image = nil
-            loadedKey = nil
-            previousImage = nil
-            previousLoadedKey = nil
+            state.image = nil
+            state.loadedKey = nil
+            state.previousImage = nil
+            state.previousLoadedKey = nil
             return
         }
 
@@ -1564,13 +1562,13 @@ struct CachedPosterArtwork<Placeholder: View>: View {
             TVHomeDebugTrace.log("art.load.begin host=\(url.host ?? "unknown") key=\(key)")
         }
         let loadStartedAt = Date()
-        if loadedKey == key { return }
+        if state.loadedKey == key { return }
 
-        if preloadedKey == key, let preloadedImage {
-            previousImage = image
-            previousLoadedKey = loadedKey
-            image = preloadedImage
-            loadedKey = key
+        if state.preloadedKey == key, let preloadedImage = state.preloadedImage {
+            state.previousImage = state.image
+            state.previousLoadedKey = state.loadedKey
+            state.image = preloadedImage
+            state.loadedKey = key
             if traceLoad {
                 TVHomeDebugTrace.log(
                     "art.load.end source=preloaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
@@ -1582,11 +1580,11 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         // Moving back from landscape to portrait should be synchronous. The
         // portrait was retained when the landscape artwork replaced it, so
         // promote it without waiting for even an in-memory actor lookup.
-        if previousLoadedKey == key, let previousImage {
-            image = previousImage
-            loadedKey = key
-            self.previousImage = nil
-            previousLoadedKey = nil
+        if state.previousLoadedKey == key, let previousImage = state.previousImage {
+            state.image = previousImage
+            state.loadedKey = key
+            state.previousImage = nil
+            state.previousLoadedKey = nil
             if traceLoad {
                 TVHomeDebugTrace.log(
                     "art.load.end source=previous ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
@@ -1601,10 +1599,10 @@ struct CachedPosterArtwork<Placeholder: View>: View {
                 try? await Task.sleep(nanoseconds: UInt64(remainingDelay * 1_000_000_000))
             }
             guard !Task.isCancelled, key == cacheKey else { return }
-            previousImage = image
-            previousLoadedKey = loadedKey
-            image = cached
-            loadedKey = key
+            state.previousImage = state.image
+            state.previousLoadedKey = state.loadedKey
+            state.image = cached
+            state.loadedKey = key
         }
         if traceLoad {
             TVHomeDebugTrace.log(
@@ -1625,16 +1623,16 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         TVHomeDebugTrace.log(
             "art.preload.begin host=\(url.host ?? "unknown") key=\(key)"
         )
-        if loadedKey == key, let image {
-            preloadedImage = image
-            preloadedKey = key
+        if state.loadedKey == key, let image = state.image {
+            state.preloadedImage = image
+            state.preloadedKey = key
             onPreloadFinished()
             TVHomeDebugTrace.log(
                 "art.preload.end source=loaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
             )
             return
         }
-        if preloadedKey == key {
+        if state.preloadedKey == key {
             onPreloadFinished()
             TVHomeDebugTrace.log(
                 "art.preload.end source=preloaded ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: started))"
@@ -1648,8 +1646,8 @@ struct CachedPosterArtwork<Placeholder: View>: View {
         )
         if let cached {
             guard !Task.isCancelled, key == preloadCacheKey else { return }
-            preloadedImage = cached
-            preloadedKey = key
+            state.preloadedImage = cached
+            state.preloadedKey = key
         }
         onPreloadFinished()
         TVHomeDebugTrace.log(
@@ -1659,7 +1657,7 @@ struct CachedPosterArtwork<Placeholder: View>: View {
     }
 }
 
-private actor PosterArtworkCache {
+actor PosterArtworkCache {
     static let shared = PosterArtworkCache()
 
     private let cache = NSCache<NSString, UIImage>()
@@ -1668,6 +1666,21 @@ private actor PosterArtworkCache {
     init() {
         cache.countLimit = 220
         cache.totalCostLimit = 140 * 1024 * 1024
+        #if canImport(UIKit)
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.didReceiveMemoryWarningNotification,
+            object: nil,
+            queue: nil
+        ) { _ in
+            Task {
+                await PosterArtworkCache.shared.purge()
+            }
+        }
+        #endif
+    }
+
+    func purge() {
+        cache.removeAllObjects()
     }
 
     func image(for url: URL, maxPixelSize: Int) async -> UIImage? {

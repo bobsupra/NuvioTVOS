@@ -375,8 +375,8 @@ enum L10n {
             return string("tvos_settings_option_force", fallback: "Force")
         case "Movie":
             return string("type_movie", fallback: "Movie")
-        case "TV":
-            return string("type_series", fallback: "TV")
+        case "TV", "Series":
+            return string("type_series", fallback: "Series")
         case "Built-in":
             return string("tvos_settings_option_built_in", fallback: "Built-in")
         case "Top":

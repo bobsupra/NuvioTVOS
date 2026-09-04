@@ -34,10 +34,19 @@ class DetailsViewModel: ObservableObject {
         streamObserveTask?.cancel()
         enrichmentTask?.cancel()
 
-        // Check if full metadata is already in memory so we can render frame 0 instantly without showing a spinner
-        if let cinemetaRepo = repository as? CinemetaCatalogRepository,
-           let cached = cinemetaRepo.cachedMetadata(for: id),
-           cinemetaRepo.isCachedFullMetadata(id: id) {
+        // Check if full metadata is already in memory so we can render frame 0 instantly without showing a spinner.
+        // For movies, any cached catalog entry already has the title, artwork, rating, and description needed for frame 0,
+        // since movies don't require an episode guide.
+        let canRenderInstantly: Bool = {
+            guard let cinemetaRepo = repository as? CinemetaCatalogRepository,
+                  let cached = cinemetaRepo.cachedMetadata(for: id) else { return false }
+            if cinemetaRepo.isCachedFullMetadata(id: id) { return true }
+            return !cached.isSeries && !cached.name.isEmpty
+        }()
+
+        if canRenderInstantly,
+           let cinemetaRepo = repository as? CinemetaCatalogRepository,
+           let cached = cinemetaRepo.cachedMetadata(for: id) {
             uiState = DetailsUiState(
                 isLoading: false,
                 meta: cached,
@@ -98,77 +107,164 @@ class DetailsViewModel: ObservableObject {
     /// after the primary metadata is on screen.
     private func loadEnrichment(for meta: NuvioMeta) {
         enrichmentTask?.cancel()
-        enrichmentTask = Task {
+        enrichmentTask = Task { [weak self] in
+            guard let self else { return }
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
-            uiState.isLoadingEnrichment = true
+            self.uiState.isLoadingEnrichment = true
             defer {
                 if !Task.isCancelled {
-                    uiState.isLoadingEnrichment = false
+                    self.uiState.isLoadingEnrichment = false
                 }
             }
 
-            async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
-            async let creditsTask = TmdbDetailsService.fetchCredits(for: meta)
-            async let tmdbRelatedTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
-            async let traktRelatedTask = TraktDetailsService.fetchRelated(for: meta)
-            async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
-            async let simklTask = SimklDetailsService.fetchDetails(for: meta)
-            async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
-            async let tmdbEpisodesTask = meta.isSeries ? TmdbDetailsService.fetchEpisodes(for: meta) : nil
+            await withTaskGroup(of: Void.self) { group in
+                // 1. Credits & Cast (TMDB) -> Apply immediately when ready (~200ms)
+                group.addTask {
+                    let credits = await TmdbDetailsService.fetchCredits(for: meta)
+                    await self.applyCredits(credits, for: meta.id)
+                }
 
-            let companies = await companiesTask
-            let credits = await creditsTask
-            let tmdbRelated = await tmdbRelatedTask
-            let traktRelated = await traktRelatedTask
-            let comments = await commentsTask
-            let simkl = await simklTask
-            let mdbRatings = await mdbRatingsTask
-            let tmdbEpisodes = await tmdbEpisodesTask
+                // 2. Production & Networks (TMDB) -> Apply immediately when ready (~200ms)
+                group.addTask {
+                    let companies = await TmdbDetailsService.fetchCompanies(for: meta)
+                    await self.applyCompanies(companies, for: meta.id)
+                }
 
-            let simklRelated = simkl?.related ?? []
-            let preferred: [RelatedTitle]
-            switch TraktSettingsStore.moreLikeThisSource {
-            case .trakt: preferred = traktRelated
-            case .tmdb: preferred = tmdbRelated
-            case .simkl: preferred = simklRelated
-            }
-            let moreLikeThis = [preferred, tmdbRelated, traktRelated, simklRelated]
-                .first { !$0.isEmpty } ?? []
+                // 3. More Like This (TMDB / Trakt / Simkl) -> Progressive load & hydrate
+                group.addTask {
+                    await self.loadMoreLikeThis(for: meta)
+                }
 
-            guard !Task.isCancelled, uiState.meta?.id == meta.id else {
-                return
-            }
+                // 4. Trakt Comments -> Apply immediately when ready
+                group.addTask {
+                    let comments = await TraktDetailsService.fetchTopComments(for: meta)
+                    await self.applyComments(comments, for: meta.id)
+                }
 
-            var next = uiState
-            next.companies = companies
-            if let credits, !credits.isEmpty, let currentMeta = next.meta {
-                next.meta = credits.applying(to: currentMeta)
-                next.people = credits.people
-            }
-            if let currentMeta = next.meta {
-                next.meta = currentMeta.withExternalRatings(mdbRatings)
-            }
-            if let tmdbEpisodes, !tmdbEpisodes.isEmpty, let currentMeta = next.meta {
-                let mergedVideos = Self.mergeEpisodes(
-                    existing: currentMeta.videos,
-                    fromTmdb: tmdbEpisodes,
-                    parentId: currentMeta.id
-                )
-                next.meta = currentMeta.withVideos(mergedVideos)
-            }
-            next.moreLikeThis = moreLikeThis
-            next.comments = comments
-            next.simklRatings = simkl?.ratings
-            uiState = next
+                // 5. Simkl Ratings -> Apply immediately when ready
+                group.addTask {
+                    let simkl = await SimklDetailsService.fetchDetails(for: meta)
+                    await self.applySimklRatings(simkl?.ratings, for: meta.id)
+                }
 
-            // Trakt's related endpoint commonly omits usable artwork even with
-            // `extended=images`. Resolve those IMDb ids through Cinemeta so the
-            // row gets the same poster data as Home. Keep the initial titles on
-            // screen while these independent artwork requests finish.
-            let hydrated = await hydrateRelatedArtwork(in: moreLikeThis)
-            guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
-            uiState.moreLikeThis = hydrated
+                // 6. External Ratings (MDBList) -> Apply immediately when ready
+                group.addTask {
+                    let mdbRatings = await MdbListDetailsService.fetchRatings(for: meta)
+                    await self.applyMdbRatings(mdbRatings, for: meta.id)
+                }
+
+                // 7. TMDB Episodes (Series only!) -> Runs in background without blocking cast/production
+                let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
+                if isSeries {
+                    group.addTask {
+                        let tmdbEpisodes = await TmdbDetailsService.fetchEpisodes(for: meta)
+                        await self.applyTmdbEpisodes(tmdbEpisodes, for: meta.id)
+                    }
+                }
+            }
         }
+    }
+
+    private func applyCredits(_ credits: TmdbCreditMetadata?, for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if let credits, !credits.isEmpty {
+            if let currentMeta = uiState.meta {
+                uiState.meta = credits.applying(to: currentMeta)
+            }
+            uiState.people = credits.people
+        }
+    }
+
+    private func applyCompanies(_ companies: [MetaCompany], for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if !companies.isEmpty {
+            uiState.companies = companies
+        }
+    }
+
+    private func applyComments(_ comments: [TraktCommentReview], for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if !comments.isEmpty {
+            uiState.comments = comments
+        }
+    }
+
+    private func applySimklRatings(_ ratings: SimklTitleRatings?, for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if let ratings {
+            uiState.simklRatings = ratings
+        }
+    }
+
+    private func applyMdbRatings(_ ratings: [NuvioExternalRating], for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if !ratings.isEmpty, let currentMeta = uiState.meta {
+            uiState.meta = currentMeta.withExternalRatings(ratings)
+        }
+    }
+
+    private func applyTmdbEpisodes(_ episodes: [NuvioVideo]?, for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if let episodes, !episodes.isEmpty, let currentMeta = uiState.meta {
+            let mergedVideos = Self.mergeEpisodes(
+                existing: currentMeta.videos,
+                fromTmdb: episodes,
+                parentId: currentMeta.id
+            )
+            uiState.meta = currentMeta.withVideos(mergedVideos)
+        }
+    }
+
+    private func applyMoreLikeThis(_ items: [RelatedTitle], for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        uiState.moreLikeThis = items
+    }
+
+    private func applyInitialMoreLikeThisIfEmpty(_ items: [RelatedTitle], preferredSource: TraktMoreLikeThisSource, for metaId: String) {
+        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+        if uiState.moreLikeThis.isEmpty || preferredSource == .tmdb {
+            uiState.moreLikeThis = items
+        }
+    }
+
+    private func loadMoreLikeThis(for meta: NuvioMeta) async {
+        let preferredSource = TraktSettingsStore.moreLikeThisSource
+
+        async let tmdbTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
+        async let traktTask: [RelatedTitle] = (preferredSource == .trakt || TraktAuthStore.state.isAuthenticated)
+            ? TraktDetailsService.fetchRelated(for: meta)
+            : []
+        async let simklTask: SimklTitleDetails? = (preferredSource == .simkl || SimklDetailsService.isConfigured)
+            ? SimklDetailsService.fetchDetails(for: meta)
+            : nil
+
+        // If TMDB returns quickly, populate More Like This immediately:
+        let tmdbRelated = await tmdbTask
+        if !tmdbRelated.isEmpty {
+            await self.applyInitialMoreLikeThisIfEmpty(tmdbRelated, preferredSource: preferredSource, for: meta.id)
+        }
+
+        let traktRelated = await traktTask
+        let simklRelated = (await simklTask)?.related ?? []
+
+        let preferred: [RelatedTitle]
+        switch preferredSource {
+        case .trakt: preferred = traktRelated
+        case .tmdb: preferred = tmdbRelated
+        case .simkl: preferred = simklRelated
+        }
+        let resolved = [preferred, tmdbRelated, traktRelated, simklRelated].first { !$0.isEmpty } ?? []
+
+        guard !resolved.isEmpty else { return }
+
+        await self.applyMoreLikeThis(resolved, for: meta.id)
+
+        // Trakt's related endpoint commonly omits usable artwork even with
+        // `extended=images`. Resolve those IMDb ids through Cinemeta so the
+        // row gets the same poster data as Home. Keep the initial titles on
+        // screen while these independent artwork requests finish.
+        let hydrated = await hydrateRelatedArtwork(in: resolved)
+        await self.applyMoreLikeThis(hydrated, for: meta.id)
     }
 
     private func hydrateRelatedArtwork(in items: [RelatedTitle]) async -> [RelatedTitle] {
@@ -245,7 +341,18 @@ class DetailsViewModel: ObservableObject {
         )
 
         // Seed UI from cache immediately (return-from-playback reuse).
-        applyDiscoveryState(StreamsRepository.shared.state, expectedKey: key)
+        let cached = StreamsRepository.shared.state
+        if !forceRefresh, cached.requestKey == key {
+            applyDiscoveryState(cached, expectedKey: key)
+        } else {
+            var nextState = uiState
+            nextState.streamGroups = []
+            nextState.streams = []
+            nextState.streamsRevision &+= 1
+            nextState.isLoadingStreams = true
+            nextState.streamsEmptyReason = nil
+            uiState = nextState
+        }
 
         streamObserveTask = Task { [weak self] in
             guard let self else { return }

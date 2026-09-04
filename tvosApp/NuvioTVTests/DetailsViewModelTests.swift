@@ -262,13 +262,31 @@ final class DetailsViewModelTests: XCTestCase {
         let metaShow = NuvioMeta(id: "2", name: "S2", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "show", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
         let metaTv = NuvioMeta(id: "3", name: "S3", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "tv", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
         let metaTvShow = NuvioMeta(id: "4", name: "S4", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "tvshow", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
-        let metaMovie = NuvioMeta(id: "5", name: "M1", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "movie", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaShows = NuvioMeta(id: "5", name: "S5", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "shows", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaAnime = NuvioMeta(id: "6", name: "S6", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "anime", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaTvSeries = NuvioMeta(id: "7", name: "S7", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "tv_series", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaMiniseries = NuvioMeta(id: "8", name: "S8", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "miniseries", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        let metaMovie = NuvioMeta(id: "9", name: "M1", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "movie", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
 
         XCTAssertTrue(metaSeries.isSeries)
         XCTAssertTrue(metaShow.isSeries)
         XCTAssertTrue(metaTv.isSeries)
         XCTAssertTrue(metaTvShow.isSeries)
+        XCTAssertTrue(metaShows.isSeries)
+        XCTAssertTrue(metaAnime.isSeries)
+        XCTAssertTrue(metaTvSeries.isSeries)
+        XCTAssertTrue(metaMiniseries.isSeries)
         XCTAssertFalse(metaMovie.isSeries)
+    }
+
+    func testWithVideosUpdatesTypeToSeries() {
+        let movieMeta = NuvioMeta(id: "m1", name: "M1", description: nil, posterUrl: nil, backgroundUrl: nil, logoUrl: nil, imdbId: nil, tmdbId: nil, type: "movie", year: nil, genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil, director: nil, writer: nil, certification: nil, country: nil, released: nil, status: nil, videos: nil, trailerYtIds: nil, externalRatings: nil)
+        XCTAssertFalse(movieMeta.isSeries)
+
+        let episode = NuvioVideo(id: "m1:1:1", title: "Pilot", season: 1, episode: 1, thumbnail: nil, overview: nil, released: nil, rating: nil)
+        let updated = movieMeta.withVideos([episode])
+        XCTAssertTrue(updated.isSeries)
+        XCTAssertEqual(updated.type, "series")
     }
 
     func testVideoBearingMovieIsRecognizedAsSeries() {
