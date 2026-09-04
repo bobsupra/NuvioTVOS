@@ -48,7 +48,7 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 <!-- BEGIN LATEST_BETA -->
 **Beta 3.3.3** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.3) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.3/NuvioTV-3.3.3-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.3) · [Manage notifications](https://github.com/bobsupra/NuvioTVOS/subscription) → choose **Custom → Releases** · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 100+ stars!
