@@ -312,24 +312,26 @@ struct DiscoverSection: View {
 
 // MARK: - Filter dropdown
 
-/// A glass chip that opens a dropdown menu of options. Falls back to a static
-/// chip on tvOS < 17 (where `Menu` is unavailable). Shared by Discover & Library.
+/// A glass chip that opens a native SwiftUI dropdown menu. Shared by
+/// Discover and Library so filter selection stays consistent across both.
 struct FilterMenu<MenuContent: View>: View {
     let label: String
     var onFocusChange: ((Bool) -> Void)? = nil
     @ViewBuilder var menu: () -> MenuContent
-    @State private var showOptions = false
     @FocusState private var focused: Bool
 
     var body: some View {
-        Button { showOptions = true } label: { chipLabel }
-            .buttonStyle(PosterCardButtonStyle())
-            .focused($focused)
-            .focusEffectDisabledIfAvailable()
-            .scaleEffect(focused ? 1.05 : 1.0)
-            .animation(.easeOut(duration: 0.14), value: focused)
-            .confirmationDialog(label, isPresented: $showOptions, titleVisibility: .visible, actions: menu)
-            .onChange(of: focused) { _, isFocused in onFocusChange?(isFocused) }
+        Menu {
+            menu()
+        } label: {
+            chipLabel
+        }
+        .menuStyle(.borderlessButton)
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(focused ? 1.05 : 1.0)
+        .animation(.easeOut(duration: 0.14), value: focused)
+        .onChange(of: focused) { _, isFocused in onFocusChange?(isFocused) }
     }
 
     private var chipLabel: some View {
