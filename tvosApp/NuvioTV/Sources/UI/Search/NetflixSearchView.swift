@@ -5,14 +5,11 @@ import SwiftUI
 /// search screen. Wired to the same `CatalogRepository` search use case as
 /// `SearchView` via `NetflixSearchViewModel`.
 ///
-/// Text entry uses the tvOS system keyboard, embedded in the screen the way
-/// Fusion and Apple's own TV apps do it: the query header is a real, focusable
-/// `TextField`, so the system keyboard appears as part of the layout whenever
-/// the field has focus. That brings the full-size linear alphabet keyboard,
-/// the suggestions strip, and Siri dictation via a long-press on the remote's
-/// speaker/mic button with no in-app microphone button at all. Moving focus
-/// down into the filters or results resigns the field, which collapses the
-/// keyboard; moving back up to the field brings it back.
+/// Text entry uses a real tvOS `TextField` in the search layout. Its native
+/// editor stays in the focus hierarchy while the visible text is rendered by
+/// the app's glass chrome, preventing tvOS's default white focus platter from
+/// covering the design. This preserves the full-size linear alphabet keyboard,
+/// suggestions strip, Siri dictation, and native focus transitions.
 ///
 /// Reuses `PosterGridCard`, `GlassChip`, `GlassCapsule`, `GlassChipBackground`,
 /// `PosterCardButtonStyle`, `DiscoverSection`, `SearchContentType` and
@@ -37,9 +34,8 @@ struct NetflixSearchView: View {
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
-    /// The query header's text field. Focus here is the entry point of the
-    /// whole screen: it shows the system keyboard (with dictation) and, since
-    /// the field is a real first responder, the remote's mic button works.
+    /// The query field is the screen's entry point. Its native editor remains
+    /// focusable so tvOS owns keyboard presentation and Siri dictation.
     @FocusState private var searchFieldFocused: Bool
     /// One shared focus id-space for both the text list and the poster grid,
     /// namespaced ("list:"/"grid:") so the same result can be focused in
@@ -111,7 +107,9 @@ struct NetflixSearchView: View {
         }
         .onAppear {
             viewModel.reloadRecent()
-            focusSearchField()
+        }
+        .onDisappear {
+            searchFieldFocused = false
         }
         .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
         .onChange(of: focusedItemID) { _, newValue in
@@ -150,34 +148,48 @@ struct NetflixSearchView: View {
 
     // MARK: - Header: query field (system keyboard + dictation)
 
-    /// A real text field in a glass capsule. While it has focus the tvOS
-    /// system keyboard is on screen with its suggestions strip, and a
-    /// long-press on the Siri Remote's speaker button starts dictation.
+    /// Keeps the real tvOS editor in the focus hierarchy while rendering the
+    /// query with the same glass treatment used by the rest of Search. The
+    /// editor is nearly transparent rather than off-screen, so the native
+    /// keyboard is attached directly to this search surface.
     private var queryHeader: some View {
-        HStack(spacing: 16) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 30, weight: .semibold))
-                .foregroundColor(.white.opacity(0.7))
-
+        ZStack(alignment: .leading) {
             TextField(
-                L10n.string("search_placeholder", fallback: "Search for movies and TV shows"),
+                "",
                 text: $viewModel.searchText
             )
-            .font(.system(size: 30, weight: .medium))
-            .foregroundColor(.white)
-            .lineLimit(1)
+            .textFieldStyle(.plain)
+            .focused($searchFieldFocused)
+            .focusEffectDisabledIfAvailable()
             .textInputAutocapitalization(.never)
             .autocorrectionDisabled()
-            .focused($searchFieldFocused)
+            .frame(maxWidth: .infinity, minHeight: 72)
+            // tvOS's native editor paints a white focus platter even when
+            // the app supplies its own background. Keep the editor alive and
+            // focusable, but let the glass overlay below own the appearance.
+            .opacity(0.02)
+
+            HStack(spacing: 16) {
+                Image(systemName: "magnifyingglass")
+                    .font(.system(size: 30, weight: .semibold))
+                    .foregroundColor(.white.opacity(0.7))
+
+                Text(
+                    viewModel.searchText.isEmpty
+                        ? L10n.string("search_placeholder", fallback: "Search for movies and TV shows")
+                        : viewModel.searchText
+                )
+                .font(.system(size: 30, weight: .medium))
+                .foregroundColor(viewModel.searchText.isEmpty ? .white.opacity(0.45) : .white)
+                .lineLimit(1)
+                .allowsHitTesting(false)
+            }
+            .allowsHitTesting(false)
         }
         .padding(.horizontal, 26)
         .frame(height: 72)
         .frame(maxWidth: .infinity, alignment: .leading)
         .modifier(GlassCapsule(focused: searchFieldFocused))
-        // The capsule's own focus styling (border + brightening) is the only
-        // indicator we want; the system's default highlight would draw a
-        // white pill over it.
-        .focusEffectDisabledIfAvailable()
     }
 
     // MARK: - Type filter
@@ -425,24 +437,12 @@ struct NetflixSearchView: View {
 
     // MARK: - Focus helpers
 
-    /// Makes the query field the screen's entry point whenever the tab
-    /// appears: the system keyboard is up immediately, so dictation (hold the
-    /// remote's mic button) and typing are available without any first tap.
-    /// The request is retried because focus can only land on a view that has
-    /// joined the window's focus tree.
+    /// Back button from the results returns to the query field, matching the
+    /// old behavior where Menu re-opened the on-screen keyboard.
     private func focusSearchField() {
         guard isEnabled, overlayRestoreItemID == nil, !discoverOverlayTransitionActive else { return }
         searchFieldFocused = true
-        DispatchQueue.main.async {
-            if focusedItemID == nil, focusedTypeFilterID == nil,
-               focusedRecentSearchID == nil, !clearRecentFocused {
-                searchFieldFocused = true
-            }
-        }
     }
-
-    /// Back button from the results returns to the query field, matching the
-    /// old behavior where Menu re-opened the on-screen keyboard.
     private var canHandleExitCommand: Bool {
         guard isEnabled,
               overlayRestoreItemID == nil,

@@ -1,12 +1,10 @@
 import Foundation
 import Combine
 
-/// Netflix-style alternative to `SearchViewModel`. Same catalog search use
-/// case (`CatalogRepository.search(query:)`) and the same debounce/cache/
-/// recent-search shape, but exposes a couple of small keyboard-input helpers
-/// instead of a raw `searchText` binding, since `NetflixSearchView` builds
-/// its query from an on-screen key-by-key keyboard rather than a hidden text
-/// field.
+/// Netflix-style alternative to `SearchViewModel`. It uses the same catalog
+/// search use case (`CatalogRepository.search(query:)`) and the same
+/// debounce/cache/recent-search behavior while keeping the Netflix results
+/// presentation independent until the two search styles are consolidated.
 @MainActor
 class NetflixSearchViewModel: ObservableObject {
     @Published var searchText = ""
@@ -194,19 +192,6 @@ class NetflixSearchViewModel: ObservableObject {
 
     func clear() {
         searchText = ""
-    }
-
-    // MARK: - On-screen keyboard input
-
-    /// Appends one key from the on-screen keyboard. The keyboard has no
-    /// shift state, so letters always arrive lowercase.
-    func typeCharacter(_ character: String) {
-        searchText += character
-    }
-
-    func deleteLastCharacter() {
-        guard !searchText.isEmpty else { return }
-        searchText.removeLast()
     }
 
     private func commitRecentSearch(_ term: String) {
