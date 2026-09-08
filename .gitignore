@@ -38,6 +38,7 @@ server
 
 # Local implementation notes are not part of the product repository
 /IMPLEMENTATION_PLAN.md
+/FUTURE_IMPLEMENTATION.md
 
 # Built IPAs are distributed via GitHub Releases, not committed
 *.ipa
