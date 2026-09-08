@@ -36,6 +36,9 @@ server
 # Local Android TV reference checkout; this tvOS repository does not track it
 /NuvioTVandroid/
 
+# Local implementation notes are not part of the product repository
+/IMPLEMENTATION_PLAN.md
+
 # Built IPAs are distributed via GitHub Releases, not committed
 *.ipa
 build-ipa/
