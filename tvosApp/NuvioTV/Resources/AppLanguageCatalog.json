@@ -9845,6 +9845,7 @@
     "tvos_layout_show_unaired_subtitle": "Keep upcoming episodes in Continue Watching with their air date",
     "tvos_library_content": "Content",
     "tvos_library_group": "Group",
+    "tvos_nav_switch_user": "Switch User",
     "tvos_playback_audio_subtitles": "Audio & Subtitles",
     "tvos_playback_audio_subtitles_subtitle": "Language and subtitle rendering defaults",
     "tvos_playback_choose_audio": "Choose the default audio language.",

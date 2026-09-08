@@ -333,6 +333,10 @@ enum L10n {
             return string("tvos_settings_option_compact", fallback: "Compact")
         case "Grid View":
             return string("tvos_settings_option_grid_view", fallback: "Grid View")
+        case "Sidebar":
+            return string("tvos_settings_option_sidebar", fallback: "Sidebar")
+        case "Top Bar":
+            return string("tvos_settings_option_top_bar", fallback: "Top Bar")
         case "Search":
             return string("nav_search", fallback: "Search")
         case "Home":

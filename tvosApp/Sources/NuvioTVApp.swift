@@ -1997,8 +1997,13 @@ private struct TVMainTabView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.discoverLocation) private var discoverLocation = "Search"
     @AppStorage(SettingsKey.searchStyle) private var searchStyle = "Netflix"
+    @AppStorage(SettingsKey.menuStyle) private var menuStyle = MenuStyle.defaultValue
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
     @StateObject private var profileTabAvatar = ProfileTabAvatarRenderer()
+    /// The profile control is a menu trigger rather than a destination, so
+    /// using it raises this panel instead of navigating anywhere.
+    @State private var isProfileMenuPresented = false
+    @FocusState private var isProfileButtonFocused: Bool
 
     private var displayedProfile: Profile? {
         if isAuthenticated { return activeProfile }
@@ -2013,12 +2018,72 @@ private struct TVMainTabView: View {
     }
 
     var body: some View {
+        styledTabs
+            .overlay(alignment: .topTrailing) {
+                if usesTopBarChrome {
+                    ProfileNavButton(
+                        title: profileTabTitle,
+                        avatarId: displayedProfile?.avatarId,
+                        isFocused: isProfileButtonFocused
+                    ) {
+                        withAnimation(.easeInOut(duration: 0.2)) { isProfileMenuPresented = true }
+                    }
+                    .focused($isProfileButtonFocused)
+                    .padding(.top, ProfileNavChrome.buttonTop)
+                    .padding(.trailing, ProfileNavChrome.trailingInset)
+                    // Its own section, so moving right off the tab bar reaches
+                    // the button instead of being kept inside the bar.
+                    .focusSection()
+                    .opacity(isProfileMenuPresented ? 0 : 1)
+                    .ignoresSafeArea(edges: .top)
+                }
+            }
+            .overlay {
+                if isProfileMenuPresented {
+                    ProfileNavMenuOverlay(
+                        profileName: profileTabTitle,
+                        anchoredToButton: usesTopBarChrome,
+                        onSwitchUser: {
+                            isProfileMenuPresented = false
+                            onSwitchProfile()
+                        },
+                        onDismiss: {
+                            withAnimation(.easeInOut(duration: 0.2)) { isProfileMenuPresented = false }
+                            // Hand focus back to the control that opened it.
+                            if usesTopBarChrome {
+                                DispatchQueue.main.async { isProfileButtonFocused = true }
+                            }
+                        }
+                    )
+                    .transition(.opacity)
+                }
+            }
+    }
+
+    @ViewBuilder
+    private var styledTabs: some View {
+        // Settings → Layout & Discovery → Navigation picks the chrome. The two
+        // styles are distinct types, so this has to branch rather than pass a
+        // ternary to `.tabViewStyle` — flipping the setting rebuilds the tab
+        // view, which is fine for a preference that changes this rarely.
+        // tvOS 17 has no styled variants at all and always draws the top bar.
         if #available(tvOS 18.0, *) {
-            tabs
-                .tabViewStyle(.sidebarAdaptable)
+            switch MenuStyle.resolved(menuStyle) {
+            case .sidebar:
+                tabs.tabViewStyle(.sidebarAdaptable)
+            case .topBar:
+                tabs.tabViewStyle(.tabBarOnly)
+            }
         } else {
             tabs
         }
+    }
+
+    /// The top bar lifts profile switching out of the tab bar entirely, into a
+    /// button of its own in the top-trailing corner. The sidebar keeps it as a
+    /// tab row, where a vertical list already reads it as its own thing.
+    private var usesTopBarChrome: Bool {
+        MenuStyle.resolved(menuStyle) == .topBar
     }
 
     /// Search screen chosen in Settings → Layout & Discovery → Search Style.
@@ -2043,26 +2108,29 @@ private struct TVMainTabView: View {
 
     private var tabs: some View {
         TabView(selection: $selectedTab) {
-            // Keep profile switching as a regular tab on every supported tvOS
-            // version. This compiles with the tvOS 26.5 SDK and remains visible
+            // Only the sidebar still carries profile switching as a tab row.
+            // The top bar hands it to `ProfileNavButton`, off in the corner on
+            // its own. This compiles with the tvOS 26.5 SDK and remains visible
             // when the app is sideloaded onto tvOS 27.
             // The tab label carries the profile name + avatar icon so the menu
             // shows who's signed in instead of a generic "Profile" entry. Its
-            // content stays empty: selecting it goes straight to profile
-            // switching, while editing now lives in Settings.
-            Color.clear
-                .tabItem {
-                    Label {
-                        Text(profileTabTitle)
-                    } icon: {
-                        if let avatar = profileTabAvatar.image {
-                            Image(uiImage: avatar).renderingMode(.original)
-                        } else {
-                            Image(systemName: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId))
+            // content stays empty: selecting it opens the profile menu, while
+            // editing now lives in Settings.
+            if !usesTopBarChrome {
+                Color.clear
+                    .tabItem {
+                        Label {
+                            Text(profileTabTitle)
+                        } icon: {
+                            if let avatar = profileTabAvatar.image {
+                                Image(uiImage: avatar).renderingMode(.original)
+                            } else {
+                                Image(systemName: ProfileAvatarCatalog.symbolName(for: displayedProfile?.avatarId))
+                            }
                         }
                     }
-                }
-                .tag(TVTab.profile)
+                    .tag(TVTab.profile)
+            }
 
             TVHomeView(
                 store: homeStore,
@@ -2125,16 +2193,176 @@ private struct TVMainTabView: View {
         .onChange(of: displayedProfile?.avatarId) { _, newValue in
             profileTabAvatar.refresh(avatarId: newValue)
         }
-        .onChange(of: selectedTab) { _, tab in
-            if tab == .profile {
-                onSwitchProfile()
-            }
+        .onChange(of: selectedTab) { previousTab, tab in
+            // Sidebar only — the top bar has no profile tab to select. Hand the
+            // selection straight back so the menu opens over whatever was
+            // showing instead of over this tab's empty content.
+            guard tab == .profile else { return }
+            selectedTab = previousTab == .profile ? .home : previousTab
+            withAnimation(.easeInOut(duration: 0.2)) { isProfileMenuPresented = true }
         }
         // Re-attempt once the catalog finishes loading, since the first refresh
         // can't resolve the avatar image before then.
         .onReceive(AvatarCatalogStore.shared.$items) { _ in
             profileTabAvatar.refresh(avatarId: displayedProfile?.avatarId)
         }
+    }
+}
+
+/// Shared geometry for the top bar's profile chrome, so the button and the menu
+/// it raises stay lined up with each other and with the tab bar's own capsule.
+private enum ProfileNavChrome {
+    /// Measured from the top of the screen, not the safe area: the system draws
+    /// the tab bar's capsule into the top inset, and the button has to sit on
+    /// the same line as it. Hence the `.ignoresSafeArea(edges: .top)` that goes
+    /// with this padding.
+    static let buttonTop: CGFloat = 49
+    static let buttonHeight: CGFloat = 60
+    /// Added to the trailing safe-area inset, landing the button's edge on the
+    /// same margin the catalog rows keep on the left. A `trailing` inset rather
+    /// than an offset, so it mirrors in right-to-left languages.
+    static let trailingInset: CGFloat = 43
+    static let menuWidth: CGFloat = 420
+    static var menuTop: CGFloat { buttonTop + buttonHeight + 14 }
+}
+
+/// Profile switching, lifted out of the tab bar into its own control in the
+/// top-trailing corner. Selecting it opens `ProfileNavMenuOverlay`.
+private struct ProfileNavButton: View {
+    let title: String
+    let avatarId: String?
+    let isFocused: Bool
+    let action: () -> Void
+
+    @ObservedObject private var catalog = AvatarCatalogStore.shared
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                avatar
+                Text(title)
+                    .font(.system(size: 24, weight: .semibold))
+                    .lineLimit(1)
+            }
+            .foregroundColor(isFocused ? .black : .white)
+            .padding(.leading, 10)
+            .padding(.trailing, 24)
+            .frame(height: ProfileNavChrome.buttonHeight)
+            .loginGlassCapsule(highlighted: isFocused)
+            .contentShape(Capsule())
+            .scaleEffect(isFocused ? 1.04 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: isFocused)
+        .onAppear { catalog.loadIfNeeded() }
+    }
+
+    /// Matches the tab item it replaces: the catalog face when there is one,
+    /// otherwise the generic person symbol rather than `ProfileAvatarView`'s
+    /// brand-gradient placeholder, which reads as a real avatar.
+    @ViewBuilder
+    private var avatar: some View {
+        if let avatarId, !avatarId.isEmpty, catalog.item(for: avatarId) != nil {
+            ProfileAvatarView(avatarId: avatarId, size: 40)
+        } else {
+            Image(systemName: ProfileAvatarCatalog.symbolName(for: avatarId))
+                .font(.system(size: 34, weight: .regular))
+                .frame(width: 40, height: 40)
+        }
+    }
+}
+
+/// Menu raised by the profile control: the same glass treatment as the card
+/// action menus, floating over a still-mounted Home.
+private struct ProfileNavMenuOverlay: View {
+    let profileName: String
+    /// Hangs the panel under the top-trailing button. The sidebar has no such
+    /// button, so there the panel centres instead.
+    let anchoredToButton: Bool
+    let onSwitchUser: () -> Void
+    let onDismiss: () -> Void
+
+    private enum Field: Hashable { case switchUser }
+
+    @FocusState private var focused: Field?
+
+    var body: some View {
+        ZStack(alignment: anchoredToButton ? .topTrailing : .top) {
+            Color.black.opacity(0.14)
+                .ignoresSafeArea()
+
+            GlassControlsContainer {
+                VStack(alignment: .leading, spacing: 12) {
+                    Text(profileName)
+                        .font(.system(size: 30, weight: .bold))
+                        .foregroundColor(.white)
+                        .lineLimit(1)
+                        .padding(.bottom, 4)
+
+                    ProfileNavMenuButton(
+                        title: L10n.string("tvos_nav_switch_user", fallback: "Switch User"),
+                        systemImage: "person.2",
+                        isFocused: focused == .switchUser,
+                        action: onSwitchUser
+                    )
+                    .focused($focused, equals: .switchUser)
+                }
+                .padding(26)
+                .frame(width: ProfileNavChrome.menuWidth, alignment: .leading)
+                .glassRoundedRect(cornerRadius: 28)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 28, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
+                .focusSection()
+            }
+            .padding(.top, anchoredToButton ? ProfileNavChrome.menuTop : 170)
+            .padding(.trailing, anchoredToButton ? ProfileNavChrome.trailingInset : 0)
+            .ignoresSafeArea(edges: anchoredToButton ? .top : [])
+        }
+        .onAppear {
+            // Seed focus once the control that opened this has handed it over,
+            // mirroring the card action menus.
+            DispatchQueue.main.async { focused = .switchUser }
+        }
+        .onChange(of: focused) { _, newValue in
+            if newValue == nil {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                    if focused == nil { focused = .switchUser }
+                }
+            }
+        }
+        .onExitCommand(perform: onDismiss)
+    }
+}
+
+private struct ProfileNavMenuButton: View {
+    let title: String
+    let systemImage: String
+    let isFocused: Bool
+    let action: () -> Void
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 12) {
+                Image(systemName: systemImage)
+                    .font(.system(size: 20, weight: .semibold))
+                    .frame(width: 26)
+                Text(title)
+                    .font(.system(size: 22, weight: .semibold))
+                Spacer(minLength: 0)
+            }
+            .foregroundColor(isFocused ? .black : .white)
+            .padding(.horizontal, 22)
+            .frame(maxWidth: .infinity, minHeight: 58, alignment: .leading)
+            .loginGlassCapsule(highlighted: isFocused)
+            .contentShape(Capsule())
+            .scaleEffect(isFocused ? 1.03 : 1)
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .animation(.easeOut(duration: 0.12), value: isFocused)
     }
 }
 

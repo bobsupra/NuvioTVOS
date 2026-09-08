@@ -244,15 +244,20 @@ final class StreamsRepository: ObservableObject {
         print("[StreamsRepo] compatible=\(targets.count) of enabled=\(enabledURLs.count)")
 
         guard !targets.isEmpty else {
+            // Owned media must survive this branch: a Jellyfin id
+            // ("jellyfin-<serverID>-<itemId>") matches no add-on's
+            // `idPrefixes`, so every enabled add-on filters out and this is
+            // the *normal* path for a Jellyfin title — publishing an empty
+            // group list here would discard streams already resolved.
             state = StreamsDiscoveryState(
                 requestKey: requestKey,
                 revision: state.revision &+ 1,
-                groups: [],
+                groups: ownedGroups,
                 isAnyLoading: false,
-                emptyStateReason: .noCompatibleAddons,
+                emptyStateReason: ownedGroups.isEmpty ? .noCompatibleAddons : nil,
                 hasResolvedTargets: true
             )
-            print("[StreamsRepo] no compatible stream add-ons")
+            print("[StreamsRepo] no compatible stream add-ons, owned=\(ownedGroups.reduce(0) { $0 + $1.streams.count })")
             return
         }
 

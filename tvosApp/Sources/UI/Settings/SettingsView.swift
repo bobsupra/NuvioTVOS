@@ -127,6 +127,10 @@ enum SettingsKey {
     static let amoledSurfaces = "nuvio.tv.settings.appearance.amoledSurfaces"
     static let reduceMotion = "nuvio.tv.settings.appearance.reduceMotion"
 
+    /// Which main navigation chrome the tab view uses: `"Sidebar"` (the
+    /// collapsible left-edge menu) or `"Top Bar"` (every tab laid out across
+    /// the top). tvOS 17 has no sidebar style, so it always shows the top bar.
+    static let menuStyle = "nuvio.tv.settings.layout.menuStyle"
     static let homeLayout = "nuvio.tv.settings.layout.homeLayout"
     /// JSON `[String]` of home section ids in the user's preferred order.
     static let homeCatalogOrder = "nuvio.tv.settings.layout.homeCatalogOrder"
@@ -286,6 +290,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState, iCloudSyncEnabled, iCloudSyncSecrets,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
+        menuStyle,
         homeLayout, heroEnabled, heroCatalogs, posterLabels, catalogAddonNames, discoverLocation,
         searchStyle,
         continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
@@ -821,6 +826,34 @@ struct AISubtitleTranslationSettings: Equatable {
     }
 
     var cacheModelIdentifier: String { "\(provider.rawValue):\(model)" }
+}
+
+/// Chrome used by the app's main `TabView`. Stored values stay English (see
+/// `L10n.optionLabel`) so a language change never rewrites the preference.
+enum MenuStyle: String, CaseIterable, Identifiable {
+    /// The collapsible left-edge menu (`.sidebarAdaptable`), tvOS 18+ only.
+    case sidebar = "Sidebar"
+    /// Every tab laid out across the top of the screen (`.tabBarOnly`).
+    case topBar = "Top Bar"
+
+    var id: String { rawValue }
+
+    static let defaultValue = MenuStyle.sidebar.rawValue
+    static let allValues = MenuStyle.allCases.map(\.rawValue)
+
+    /// tvOS 17 has no sidebar tab style, so the top bar is the only thing the
+    /// system can draw there and the preference is not offered.
+    static var isSelectable: Bool {
+        if #available(tvOS 18.0, *) { return true }
+        return false
+    }
+
+    /// Resolves a stored value, falling back to the top bar on tvOS 17 where
+    /// the sidebar style does not exist.
+    static func resolved(_ stored: String) -> MenuStyle {
+        guard isSelectable else { return .topBar }
+        return MenuStyle(rawValue: stored) ?? .sidebar
+    }
 }
 
 enum SettingsAccent: String, CaseIterable, Identifiable {
@@ -2176,6 +2209,7 @@ private struct AppearanceSettingsView: View {
 private struct LayoutDiscoverySettingsView: View {
     let accentColor: Color
 
+    @AppStorage(SettingsKey.menuStyle) private var menuStyle = MenuStyle.defaultValue
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
@@ -2193,6 +2227,7 @@ private struct LayoutDiscoverySettingsView: View {
 
     /// Classic was never a distinct layout (behaved like Modern).
     private let layouts = ["Modern", "Compact", "Grid View"]
+    private let menuStyles = MenuStyle.allValues
     // Search is the only screen that currently hosts the full Discover surface.
     // Do not offer Home/Library as dead selections that merely hide Discover.
     private let discoverLocations = ["Search", "Off"]
@@ -2201,6 +2236,25 @@ private struct LayoutDiscoverySettingsView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 22) {
+            SettingsGroup(
+                title: L10n.string("tvos_layout_navigation", fallback: "Navigation"),
+                subtitle: L10n.string(
+                    "tvos_layout_navigation_subtitle",
+                    fallback: "Where the main menu sits on screen"
+                )
+            ) {
+                SettingsOptionRow(
+                    title: L10n.string("tvos_layout_menu_style", fallback: "Menu Style"),
+                    subtitle: menuStyleSubtitle,
+                    selection: $menuStyle,
+                    options: menuStyles,
+                    accentColor: accentColor
+                )
+                .settingsEntryAnchor()
+                .disabled(!MenuStyle.isSelectable)
+                .opacity(MenuStyle.isSelectable ? 1 : 0.46)
+            }
+
             SettingsGroup(
                 title: L10n.string("tvos_layout_home", fallback: "Home Layout"),
                 subtitle: L10n.string(
@@ -2218,7 +2272,6 @@ private struct LayoutDiscoverySettingsView: View {
                     options: layouts,
                     accentColor: accentColor
                 )
-                .settingsEntryAnchor()
                 .onAppear {
                     if homeLayout == "Classic" { homeLayout = "Modern" }
                 }
@@ -2408,6 +2461,19 @@ private struct LayoutDiscoverySettingsView: View {
                 )
             }
         }
+    }
+
+    private var menuStyleSubtitle: String {
+        guard MenuStyle.isSelectable else {
+            return L10n.string(
+                "tvos_layout_menu_style_unavailable",
+                fallback: "This tvOS version only supports the top menu"
+            )
+        }
+        return L10n.string(
+            "tvos_layout_menu_style_subtitle",
+            fallback: "Sidebar keeps the menu on the left edge; Top Bar shows every tab across the top"
+        )
     }
 }
 
