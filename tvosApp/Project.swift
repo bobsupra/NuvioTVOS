@@ -134,14 +134,17 @@ let appTarget: Target = .target(
         .target(name: "TopShelf"),
         .package(product: "AetherEngine"),
         .package(product: "AetherEngineSMB"),
+        .package(product: "LibTorrent"),
         .package(product: "MPVKit"),
     ],
     settings: .settings(
         base: [
             "ASSETCATALOG_COMPILER_APPICON_NAME": "AppIcon",
             "ENABLE_BITCODE": "NO",
+            "FRAMEWORK_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
+            "HEADER_SEARCH_PATHS": ["$(inherited)", "$(SRCROOT)/../Vendor/LibTorrent"],
             "LD_RUNPATH_SEARCH_PATHS": ["$(inherited)", "@executable_path/Frameworks"],
-            "OTHER_LDFLAGS": ["$(inherited)", "-ObjC", "-lc++"],
+            "OTHER_LDFLAGS": ["$(inherited)", "-ObjC", "-lc++", "-framework", "SystemConfiguration"],
             "SWIFT_OBJC_BRIDGING_HEADER": "NuvioTV/NuvioTV-Bridging-Header.h",
             "VERSIONING_SYSTEM": "apple-generic",
         ],
@@ -233,6 +236,7 @@ let project = Project(
     organizationName: "Nuvio",
     packages: [
         .local(path: "../Vendor/AetherEngine"),
+        .local(path: "../Vendor/LibTorrent"),
         .local(path: "../MPVKit"),
     ],
     settings: .settings(
