@@ -1,0 +1,13 @@
+// Tracked, and always present so Project.swift can reference it
+// unconditionally — a conditional reference breaks when Tuist's generation
+// metadata cache is stale.
+//
+// Developer-specific values go in Signing.local.xcconfig, which is untracked.
+// `#include?` is xcconfig's optional include: when the file is absent Xcode
+// simply skips it, so a fresh clone generates and builds unsigned with no
+// setup at all.
+#include? "Signing.local.xcconfig"
+
+// Lets Xcode manage a development profile for on-device debugging. Signed
+// distribution would set this to Manual and add a specifier; see README.md.
+CODE_SIGN_STYLE = Automatic

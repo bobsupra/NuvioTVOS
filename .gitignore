@@ -52,3 +52,12 @@ artifacts/*-ipa/
 # Local backend credentials
 supabase/functions/**/.env
 supabase/functions/**/.env.local
+
+# Tuist: the Xcode project is generated, not tracked. Run `tuist generate`.
+tvosApp/NuvioTV.xcodeproj/
+tvosApp/NuvioTV.xcworkspace/
+/.tuist/
+**/Derived/
+# Local signing values (Team ID); see tvosApp/Configurations/README.md.
+# Signing.xcconfig itself IS tracked and optional-includes this file.
+tvosApp/Configurations/Signing.local.xcconfig
