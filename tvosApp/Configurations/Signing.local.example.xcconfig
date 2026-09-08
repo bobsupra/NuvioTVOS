@@ -1,0 +1,16 @@
+// Copy to Signing.local.xcconfig (untracked) to build onto a real device:
+//
+//   cp Configurations/Signing.local.example.xcconfig \
+//      Configurations/Signing.local.xcconfig
+//
+// A Team ID is an identifier rather than a credential, but it is
+// developer-specific, so it stays out of the tracked project. Skip this file
+// entirely for unsigned builds, which is how releases ship.
+
+// From the Membership page of the Apple Developer portal.
+DEVELOPMENT_TEAM = YOUR_TEAM_ID
+
+// Manual signing only.
+// CODE_SIGN_STYLE = Manual
+// PROVISIONING_PROFILE_SPECIFIER = Your Profile Name
+// CODE_SIGN_IDENTITY = Apple Distribution

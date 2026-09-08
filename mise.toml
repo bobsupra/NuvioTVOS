@@ -1,0 +1,4 @@
+[tools]
+# Pinned so every contributor and CI runner generates the project with the
+# same Tuist. Bump deliberately: a Tuist upgrade can change generated output.
+tuist = "4.207.0"

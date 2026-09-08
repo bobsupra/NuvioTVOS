@@ -346,14 +346,9 @@ struct TVCatalogRow: View {
 
             #if DEBUG
             if TVHomeDebugTrace.enabled {
-                traceRowLayout(
-                    enabled: true,
-                    rowID: id,
-                    itemCount: items.count,
-                    mountedCount: materializedCards.count,
-                    guideEntries: 0,
-                    index: effectiveScrollIndex
-                )
+                // Keep this disabled inside the ViewBuilder. A Void-returning
+                // helper is not a valid builder expression when DEBUG is
+                // enabled; the row timing log below remains active.
             }
             #endif
 
