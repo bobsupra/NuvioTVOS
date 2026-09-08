@@ -33,6 +33,77 @@ enum TVLayout {
     static let rowLeading: CGFloat = 48
 }
 
+/// Materialized cards retain their array position for layout math while
+/// exposing a content-derived SwiftUI identity. This prevents a card view from
+/// being reused for another title when a catalog inserts or reorders items.
+struct TVCatalogMaterializedCard: Identifiable {
+    let id: String
+    let index: Int
+    let item: NuvioMeta
+}
+
+private struct TVFolderMaterializedCard: Identifiable {
+    let id: String
+    let index: Int
+    let folder: TVCollectionFolderItem
+}
+
+/// A title is unique within a source row by its provider type and id. Provider
+/// duplicates represent the same selectable title and are collapsed before
+/// layout. Different types and different source rows remain distinct.
+enum TVHomeCardIdentity {
+    static func titleID(_ item: NuvioMeta) -> String {
+        let type = item.type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return "title:\(type.utf8.count):\(type)\(item.id)"
+    }
+
+    static func key(rowID: String, item: NuvioMeta) -> String {
+        "\(rowID)\u{1}\(titleID(item))"
+    }
+
+    static func folderKey(rowID: String, folder: TVCollectionFolderItem) -> String {
+        "\(rowID)\u{1}folder:\(folder.id)"
+    }
+
+    static func uniqueTitles(_ items: [NuvioMeta]) -> [NuvioMeta] {
+        var seen = Set<String>()
+        return items.filter { seen.insert(titleID($0)).inserted }
+    }
+
+    static func uniqueFolders(_ folders: [TVCollectionFolderItem]) -> [TVCollectionFolderItem] {
+        var seen = Set<String>()
+        return folders.filter { seen.insert($0.id).inserted }
+    }
+
+    static func materializedTitles(rowID: String, items: [NuvioMeta], indices: [Int]) -> [TVCatalogMaterializedCard] {
+        indices.filter { items.indices.contains($0) }.map {
+            TVCatalogMaterializedCard(id: key(rowID: rowID, item: items[$0]), index: $0, item: items[$0])
+        }
+    }
+}
+
+extension NuvioMeta {
+    var homeTitleIdentity: String { TVHomeCardIdentity.titleID(self) }
+}
+
+struct TVHomeFocusRow: Equatable {
+    let id: String
+    let keys: [String]
+}
+
+enum TVHomeFocusRestoration {
+    static func target(saved: String, rows: [TVHomeFocusRow], preferredIndex: Int) -> String? {
+        if rows.contains(where: { $0.keys.contains(saved) }) { return saved }
+        // Match the complete row prefix instead of splitting IDs that may
+        // themselves contain separators. Longest match handles nested prefixes.
+        if let row = rows.filter({ saved.hasPrefix("\($0.id)\u{1}") })
+            .max(by: { $0.id.count < $1.id.count }), !row.keys.isEmpty {
+            return row.keys[min(max(preferredIndex, 0), row.keys.count - 1)]
+        }
+        return rows.lazy.compactMap { $0.keys.first }.first
+    }
+}
+
 /// Grid metrics matching Search / Library poster cards (Tabs view mode).
 enum CollectionFolderGridMetrics {
     static let posterWidth: CGFloat = 210
@@ -48,6 +119,7 @@ struct TVLoadingCatalogRow: View {
     var addonName: String? = nil
     var showAddonName: Bool = true
 
+    @FocusState private var focusedPlaceholderIndex: Int?
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
     @AppStorage(SettingsKey.posterLabels) private var posterLabels = false
     @AppStorage(SettingsKey.liquidGlassCards) private var liquidGlassCards = true
@@ -88,12 +160,22 @@ struct TVLoadingCatalogRow: View {
 
             GeometryReader { geo in
                 HStack(alignment: .bottom, spacing: cardSpacing) {
-                    ForEach(0..<9, id: \.self) { _ in
-                        LoadingPosterCard(
-                            width: cardWidth,
-                            height: cardHeight,
-                            isLiquidGlassEnabled: liquidGlassCards
-                        )
+                    // Keep real focus targets in the row while its catalog is
+                    // in flight. A plain skeleton has geometry but is absent
+                    // from tvOS's focus graph, so moving down from the row
+                    // above is rejected or snaps focus back to the top.
+                    ForEach(0..<9, id: \.self) { index in
+                        Button(action: {}) {
+                            LoadingPosterCard(
+                                width: cardWidth,
+                                height: cardHeight,
+                                isLiquidGlassEnabled: liquidGlassCards
+                            )
+                        }
+                        .buttonStyle(PosterCardButtonStyle())
+                        .focusable(true)
+                        .focused($focusedPlaceholderIndex, equals: index)
+                        .accessibilityLabel("\(title), loading")
                     }
                 }
                 .padding(.leading, TVLayout.rowLeading)
@@ -103,6 +185,8 @@ struct TVLoadingCatalogRow: View {
             .frame(height: stripHeight)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
+        .focusSection()
+        .defaultFocusIfAvailable($focusedPlaceholderIndex, 0)
     }
 }
 
@@ -167,14 +251,20 @@ struct TVCatalogRow: View {
         let rowPrefix = "\(id)\u{1}"
         for key in [initialFocusCardKey, restrictFocusToCardKey] {
             guard let key, key.hasPrefix(rowPrefix) else { continue }
-            let itemID = String(key.dropFirst(rowPrefix.count))
-            if let targetIndex = items.firstIndex(where: { $0.id == itemID }) {
+            if let targetIndex = items.firstIndex(where: { TVHomeCardIdentity.key(rowID: id, item: $0) == key }) {
                 lowerBound = min(lowerBound, targetIndex)
                 upperBound = max(upperBound, targetIndex)
             }
         }
 
         return Array(lowerBound...upperBound)
+    }
+
+    private func materializedCardItems(visibleCardCount: Int) -> [TVCatalogMaterializedCard] {
+        TVHomeCardIdentity.materializedTitles(
+            rowID: id, items: items,
+            indices: materializedCardIndices(visibleCardCount: visibleCardCount)
+        )
     }
 
     private var stripHeight: CGFloat {
@@ -202,7 +292,7 @@ struct TVCatalogRow: View {
         }
         guard !items.isEmpty else { return nil }
         let idx = effectiveScrollIndex
-        return "\(id)\u{1}\(items[idx].id)"
+        return TVHomeCardIdentity.key(rowID: id, item: items[idx])
     }
 
     var body: some View {
@@ -252,7 +342,7 @@ struct TVCatalogRow: View {
             let rowPosterWidth: CGFloat = rowHomeLayout == "Compact" ? 170 : 210
             let rowCardSpacing: CGFloat = rowHomeLayout == "Compact" ? 22 : 28
             let visibleCardCount = max(1, Int(ceil(stripWidth / (rowPosterWidth + rowCardSpacing))) + 1)
-            let materializedIndices = materializedCardIndices(visibleCardCount: visibleCardCount)
+            let materializedCards = materializedCardItems(visibleCardCount: visibleCardCount)
 
             #if DEBUG
             if TVHomeDebugTrace.enabled {
@@ -260,7 +350,7 @@ struct TVCatalogRow: View {
                     enabled: true,
                     rowID: id,
                     itemCount: items.count,
-                    mountedCount: materializedIndices.count,
+                    mountedCount: materializedCards.count,
                     guideEntries: 0,
                     index: effectiveScrollIndex
                 )
@@ -268,16 +358,17 @@ struct TVCatalogRow: View {
             #endif
 
             HStack(alignment: .top, spacing: rowCardSpacing) {
-                ForEach(materializedIndices, id: \.self) { itemIndex in
-                    let item = items[itemIndex]
-                    let cardKey = "\(id)\u{1}\(item.id)"
+                ForEach(materializedCards) { card in
+                    let itemIndex = card.index
+                    let item = card.item
+                    let cardKey = card.id
                     let shouldRequestInitialFocus = cardKey == initialFocusCardKey
                     let progressItem = progressByItemId[item.id]
                     let handleFocus: (NuvioMeta) -> Void = { focused in
                         let focusStarted = TVHomeDebugTrace.now()
                         TVHomeDebugTrace.log(
                             "focus.begin row=\(id) index=\(itemIndex) items=\(items.count) "
-                                + "mounted=\(materializedIndices.count) meta=\(focused.id)"
+                                + "mounted=\(materializedCards.count) meta=\(focused.id)"
                         )
                         if effectiveScrollIndex != itemIndex {
                             let updateScrollPosition = {
@@ -360,7 +451,10 @@ struct TVCatalogRow: View {
                     )
                 }
             }
-            .padding(.leading, CGFloat(materializedIndices.first ?? 0) * (rowPosterWidth + rowCardSpacing))
+            .padding(
+                .leading,
+                CGFloat(materializedCards.first?.index ?? 0) * (rowPosterWidth + rowCardSpacing)
+            )
             .padding(.vertical, TVHomeLayout.stripVerticalPadding)
             .offset(
                 x: horizontalEdgeInset + TVLayout.rowLeading
@@ -509,8 +603,8 @@ struct TVHomeCatalogGridSection: View {
                 alignment: .leading,
                 spacing: TVHomeGridLayout.itemSpacing
             ) {
-                ForEach(previewItems) { item in
-                    let cardKey = "\(section.id)\u{1}\(item.id)"
+                ForEach(previewItems, id: \.homeTitleIdentity) { item in
+                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: item)
                     let shouldRequestInitialFocus = cardKey == initialFocusCardKey
                     PosterGridCard(
                         meta: item,
@@ -873,14 +967,23 @@ struct TVCollectionFolderRow: View {
         let rowPrefix = "\(id)\u{1}"
         for key in [initialFocusCardKey, restrictFocusToCardKey] {
             guard let key, key.hasPrefix(rowPrefix) else { continue }
-            let folderID = String(key.dropFirst(rowPrefix.count))
-            if let targetIndex = folders.firstIndex(where: { $0.id == folderID }) {
+            if let targetIndex = folders.firstIndex(where: { TVHomeCardIdentity.folderKey(rowID: id, folder: $0) == key }) {
                 lowerBound = min(lowerBound, targetIndex)
                 upperBound = max(upperBound, targetIndex)
             }
         }
 
         return Array(lowerBound...upperBound)
+    }
+
+    private func materializedCardItems(
+        stripWidth: CGFloat,
+        layoutMode: String
+    ) -> [TVFolderMaterializedCard] {
+        return materializedCardIndices(stripWidth: stripWidth, layoutMode: layoutMode).map { index in
+            let folder = folders[index]
+            return TVFolderMaterializedCard(id: TVHomeCardIdentity.folderKey(rowID: id, folder: folder), index: index, folder: folder)
+        }
     }
 
     private var defaultFocusFolderKey: String? {
@@ -892,7 +995,7 @@ struct TVCollectionFolderRow: View {
         }
         guard !folders.isEmpty else { return nil }
         let idx = effectiveScrollIndex
-        return "\(id)\u{1}\(folders[idx].id)"
+        return TVHomeCardIdentity.folderKey(rowID: id, folder: folders[idx])
     }
 
     var body: some View {
@@ -926,15 +1029,16 @@ struct TVCollectionFolderRow: View {
                 folders: folders,
                 layoutMode: rowHomeLayout
             )
-            let materializedIndices = materializedCardIndices(
+            let materializedCards = materializedCardItems(
                 stripWidth: stripWidth,
                 layoutMode: rowHomeLayout
             )
 
             HStack(alignment: .top, spacing: rowSpacing) {
-                ForEach(materializedIndices, id: \.self) { index in
-                    let folder = folders[index]
-                    let cardKey = "\(id)\u{1}\(folder.id)"
+                ForEach(materializedCards) { card in
+                    let index = card.index
+                    let folder = card.folder
+                    let cardKey = card.id
                     let shouldRequestInitialFocus = cardKey == initialFocusCardKey
                     TVCollectionFolderCard(
                         folder: folder,
@@ -965,7 +1069,7 @@ struct TVCollectionFolderRow: View {
             .padding(
                 .leading,
                 TVCollectionFolderCardLayout.scrollOffset(
-                    to: materializedIndices.first ?? 0,
+                    to: materializedCards.first?.index ?? 0,
                     folders: folders,
                     layoutMode: rowHomeLayout
                 )

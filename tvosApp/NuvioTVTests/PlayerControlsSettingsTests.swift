@@ -64,20 +64,33 @@ final class PlayerControlsSettingsTests: XCTestCase {
 
     @MainActor
     func testAetherEngineVideoNowPlayingSessionOptIn() {
-        let controller = AetherPlaybackController()
+        guard let controller = AetherPlaybackController() else {
+            XCTFail("AetherEngine should initialize in the test environment")
+            return
+        }
         XCTAssertTrue(controller.engine.ownsVideoNowPlayingSession)
+        controller.destroyPlayer()
     }
 
     @MainActor
-    func testAetherPlaybackControllerExternalSubtitleSelectionAndMapping() {
-        let controller = AetherPlaybackController()
-        let sub = NuvioSubtitle(url: "https://example.com/test.srt", language: "en", label: "English Subtitle", source: "OpenSubtitles")
+    func testAetherPlaybackControllerExternalSubtitleSelectionAndMapping() throws {
+        guard let controller = AetherPlaybackController() else {
+            XCTFail("AetherEngine should initialize in the test environment")
+            return
+        }
+        let subtitleURL = FileManager.default.temporaryDirectory.appendingPathComponent("\(UUID().uuidString).srt")
+        try Data("1\n00:00:01,000 --> 00:00:02,000\nTest subtitle\n".utf8).write(to: subtitleURL)
+        defer {
+            controller.destroyPlayer()
+            try? FileManager.default.removeItem(at: subtitleURL)
+        }
+        let sub = NuvioSubtitle(url: subtitleURL.absoluteString, language: "en", label: "English Subtitle", source: "OpenSubtitles")
         controller.addSubtitle(sub, select: true)
 
         XCTAssertEqual(controller.subtitleTracks.count, 1)
         let track = controller.subtitleTracks.first
         XCTAssertEqual(track?.title, "English Subtitle")
-        XCTAssertEqual(track?.externalFilename, "https://example.com/test.srt")
+        XCTAssertEqual(track?.externalFilename, subtitleURL.absoluteString)
         XCTAssertEqual(track?.selected, true)
 
         controller.selectSubtitle(-1)
@@ -153,4 +166,3 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertFalse(externalTrack.externalFilename.isEmpty)
     }
 }
-

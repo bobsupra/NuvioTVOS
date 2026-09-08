@@ -8,9 +8,14 @@ final class PlaybackSessionCoordinator: ObservableObject {
     @Published private(set) var activeBackend: PlayerBackendKind = .aether
     @Published private(set) var statusToast: String?
     @Published private(set) var lastPolicyReason: String = ""
+    @Published private(set) var lastLoadError: String?
 
-    let aetherController = AetherPlaybackController()
+    private let aetherControllerFactory: @MainActor () -> AetherPlaybackController?
+    private let engineSettingProvider: @MainActor () -> String?
+    private let loadDispatcher: (@MainActor (PlaybackLoadRequest, PlayerBackendKind, UInt64) -> Void)?
+    private(set) var aetherController: AetherPlaybackController?
     let mpvController = MPVPlayerViewController()
+    private let unavailableEngine = UnavailablePlaybackEngine()
 
     /// Generation token for the in-flight load. Completions for older gens are ignored.
     private(set) var loadGeneration: UInt64 = 0
@@ -18,6 +23,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
     private var didFallbackForCurrentURL = false
     private var currentURLString: String?
     private var lastRequest: PlaybackLoadRequest?
+    private var lastRequiresMPVAudioControls = false
     private var isHandoffInProgress = false
     private var handoffTargetSeconds: Double?
     private var userStopped = false
@@ -25,26 +31,45 @@ final class PlaybackSessionCoordinator: ObservableObject {
     private(set) var isProgressSaveSuspended = false
 
     var onHandoffToast: ((String) -> Void)?
+    var onAetherControllerChanged: ((AetherPlaybackController?) -> Void)?
 
     var activeEngine: PlaybackEngineControlling {
         switch activeBackend {
-        case .aether: return aetherController
+        case .aether:
+            if let aetherController { return aetherController }
+            unavailableEngine.currentErrorMessage = lastLoadError ?? ""
+            return unavailableEngine
         case .mpv: return mpvController
         }
     }
 
-    init() {
-        aetherController.onTerminalError = { [weak self] message in
-            self?.handleAetherTerminalError(message)
-        }
+    init(
+        aetherController: AetherPlaybackController? = nil,
+        aetherControllerFactory: @escaping @MainActor () -> AetherPlaybackController? = { AetherPlaybackController() },
+        engineSettingProvider: @escaping @MainActor () -> String? = {
+            let stored = ProfileSettings.current.string(forKey: SettingsKey.playerEngine)
+            let migrated = PlayerEngineSetting.migrated(from: stored).settingsRawValue
+            if stored != migrated { ProfileSettings.current.set(migrated, forKey: SettingsKey.playerEngine) }
+            return migrated
+        },
+        loadDispatcher: (@MainActor (PlaybackLoadRequest, PlayerBackendKind, UInt64) -> Void)? = nil
+    ) {
+        self.aetherControllerFactory = aetherControllerFactory
+        self.engineSettingProvider = engineSettingProvider
+        self.loadDispatcher = loadDispatcher
+        self.aetherController = aetherController
+        bindAetherCallbacks()
     }
 
     // MARK: - Public API
 
     func prepareControllers() {
-        // Touch view controllers so viewDidLoad binds surfaces early.
-        _ = aetherController.view
-        _ = mpvController.view
+        // Rebind only the selected host (for example on PiP return). Preparing
+        // the MPV view eagerly also creates a decoder for native-only sessions.
+        switch activeBackend {
+        case .aether: _ = aetherController?.view
+        case .mpv: _ = mpvController.view
+        }
     }
 
     func load(
@@ -56,13 +81,13 @@ final class PlaybackSessionCoordinator: ObservableObject {
         isProgressSaveSuspended = false
         didFallbackForCurrentURL = false
         lastRequest = request
+        lastRequiresMPVAudioControls = requiresMPVAudioControls
         currentURLString = request.videoURL.absoluteString
+        statusToast = nil
+        loadGeneration &+= 1
 
-        let storedEngine = ProfileSettings.current.string(forKey: SettingsKey.playerEngine)
+        let storedEngine = engineSettingProvider()
         let migratedEngine = PlayerEngineSetting.migrated(from: storedEngine)
-        if storedEngine != migratedEngine.settingsRawValue {
-            ProfileSettings.current.set(migratedEngine.settingsRawValue, forKey: SettingsKey.playerEngine)
-        }
         let policy = PlaybackBackendPolicy.resolve(
             .init(
                 urlString: request.videoURL.absoluteString,
@@ -77,12 +102,55 @@ final class PlaybackSessionCoordinator: ObservableObject {
         )
         lastPolicyReason = policy.reason
         allowAutomaticFallback = policy.allowAutomaticFallback
+        lastLoadError = nil
         print("[PlaybackCoordinator] \(policy.reason)")
 
-        loadGeneration += 1
+        var selectedBackend = policy.backend
+        if selectedBackend == .aether {
+            if aetherController == nil {
+                aetherController = aetherControllerFactory()
+                bindAetherCallbacks()
+                _ = aetherController?.view
+            }
+            if aetherController == nil {
+                let message = "AetherEngine is unavailable on this device."
+                if policy.allowAutomaticFallback {
+                    selectedBackend = .mpv
+                    allowAutomaticFallback = false
+                    lastPolicyReason = "\(policy.reason); \(message) Using MPVKit."
+                    statusToast = "Compatibility player enabled"
+                    print("[PlaybackCoordinator] \(lastPolicyReason)")
+                } else {
+                    activeEngine.pausePlayback()
+                    activeBackend = .aether
+                    lastLoadError = message
+                    statusToast = message
+                    onAetherControllerChanged?(nil)
+                    return
+                }
+            }
+        }
+
         let generation = loadGeneration
-        selectBackend(policy.backend, toast: policy.statusMessage, pauseOutgoing: true)
-        startLoad(request, on: policy.backend, generation: generation)
+        selectBackend(selectedBackend, toast: policy.statusMessage ?? statusToast, pauseOutgoing: true)
+        onAetherControllerChanged?(aetherController)
+        startLoad(request, on: selectedBackend, generation: generation)
+    }
+
+    /// Re-attempts the last request after a recoverable Aether construction
+    /// failure. Auto requests can simply be reloaded; explicit Aether requests
+    /// use this action to retry without recreating the player view.
+    func retryLastLoad() {
+        guard let lastRequest else { return }
+        guard !userStopped else { return }
+        loadGeneration &+= 1
+        aetherController?.onTerminalError = nil
+        aetherController?.destroyPlayer()
+        aetherController = nil
+        bindAetherCallbacks()
+        onAetherControllerChanged?(aetherController)
+        statusToast = nil
+        load(lastRequest, requiresMPVAudioControls: lastRequiresMPVAudioControls)
     }
 
     /// Explicit Aether → MPV handoff (audio delay / amplification / terminal error).
@@ -95,11 +163,11 @@ final class PlaybackSessionCoordinator: ObservableObject {
             return
         }
 
+        guard let aetherController else { return }
         isHandoffInProgress = true
         isProgressSaveSuspended = true
         didFallbackForCurrentURL = true
         allowAutomaticFallback = false
-
         let captured = resumeSeconds
             ?? aetherController.coherentSourceTimeSeconds()
         lastPolicyReason = "AetherEngine → MPVKit: \(reason)"
@@ -158,7 +226,8 @@ final class PlaybackSessionCoordinator: ObservableObject {
         isProgressSaveSuspended = false
         isHandoffInProgress = false
         handoffTargetSeconds = nil
-        aetherController.destroyPlayer()
+        statusToast = nil
+        aetherController?.destroyPlayer()
         mpvController.destroyPlayer()
     }
 
@@ -167,6 +236,14 @@ final class PlaybackSessionCoordinator: ObservableObject {
     }
 
     // MARK: - Internals
+
+    private func bindAetherCallbacks() {
+        guard let controller = aetherController else { return }
+        controller.onTerminalError = { [weak self, weak controller] message in
+            guard let self, let controller, self.aetherController === controller else { return }
+            self.handleAetherTerminalError(message)
+        }
+    }
 
     private func handleAetherTerminalError(_ message: String) {
         guard !userStopped, !isHandoffInProgress else { return }
@@ -186,9 +263,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
         activeBackend = kind
         statusToast = toast
         if let toast {
+            let generation = loadGeneration
             Task { @MainActor [weak self] in
                 try? await Task.sleep(nanoseconds: 4_000_000_000)
-                if self?.statusToast == toast {
+                if self?.loadGeneration == generation, self?.statusToast == toast {
                     self?.statusToast = nil
                 }
             }
@@ -196,12 +274,58 @@ final class PlaybackSessionCoordinator: ObservableObject {
     }
 
     private func startLoad(_ request: PlaybackLoadRequest, on backend: PlayerBackendKind, generation: UInt64) {
+        guard !userStopped, loadGeneration == generation else { return }
+        if let loadDispatcher {
+            loadDispatcher(request, backend, generation)
+            return
+        }
         switch backend {
         case .aether:
+            guard let aetherController else {
+                lastLoadError = "AetherEngine is unavailable on this device."
+                return
+            }
             aetherController.load(request, generation: generation)
         case .mpv:
+            _ = mpvController.view
             mpvController.load(request)
             mpvController.setAspectMode(.fit)
         }
     }
+}
+
+/// An unavailable selection must not route controls into another live backend.
+@MainActor
+private final class UnavailablePlaybackEngine: PlaybackEngineControlling {
+    var onPlaybackSuspended: ((Int64, Int64) -> Void)?
+    let audioTracks: [PlaybackTrackInfo] = []
+    let subtitleTracks: [PlaybackTrackInfo] = []
+    let isPlayerLoading = false
+    let isPlayerPlaying = false
+    let isPlayerEnded = false
+    let isAtEndOfFile = false
+    let hasCoherentTimeSample = false
+    let durationMs: Int64 = 0
+    let positionMs: Int64 = 0
+    let bufferedMs: Int64 = 0
+    let currentSpeed: Float = 1
+    var currentErrorMessage = ""
+    let videoFrameSize = CGSize.zero
+    var playbackDebugInfo: PlaybackDebugInfo { PlaybackDebugInfo(player: "Unavailable") }
+    func loadFile(_ urlString: String) {}
+    func playPlayback() {}
+    func pausePlayback() {}
+    func seekToMs(_ ms: Int64) {}
+    func setSpeed(_ speed: Float) {}
+    func setAspectMode(_ mode: PlayerAspectMode) {}
+    func setSubtitleDelay(_ seconds: Double) {}
+    func setAudioDelay(_ seconds: Double) {}
+    func setAudioVolumeGain(dB: Double) {}
+    func selectAudio(_ trackId: Int) {}
+    func selectSubtitle(_ trackId: Int) {}
+    func addSubtitle(_ subtitle: NuvioSubtitle, select: Bool) {}
+    func addAudioUrl(_ url: String) {}
+    func applySubtitleStyle() {}
+    func destroyPlayer() {}
+    func refreshPlaybackState() {}
 }

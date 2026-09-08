@@ -8,31 +8,61 @@
 import Foundation
 import Combine
 
+/// Selects where Details gets its progressive stream results. Keeping this
+/// decision at composition time makes the view model independent of concrete
+/// repository types and lets tests use deterministic repository streams.
+enum DetailsStreamDiscoveryMode: Equatable {
+    case shared
+    case repository
+}
+
 @MainActor
 class DetailsViewModel: ObservableObject {
+    typealias AsyncDelay = () async throws -> Void
+    typealias EnrichmentStarter = @MainActor (NuvioMeta, UInt64) -> Void
+
     @Published private(set) var uiState = DetailsUiState()
 
     private let repository: CatalogRepository
-    /// When false (MockCatalogRepository tests), stream loading uses the
-    /// repository's progressive API instead of the shared discovery service.
-    private let usesSharedStreamDiscovery: Bool
+    private let streamDiscoveryMode: DetailsStreamDiscoveryMode
+    private var metadataTask: Task<Void, Never>?
     private var streamObserveTask: Task<Void, Never>?
     private var enrichmentTask: Task<Void, Never>?
     private var deferredLoadTask: Task<Void, Never>?
+    /// Invalidates every asynchronous completion from an older details load.
+    /// This is intentionally separate from the content id: the same title can
+    /// be refreshed while its previous request is still in flight.
+    private var detailsRequestGeneration: UInt64 = 0
     private var observedRequestKey: String?
     private var lastAppliedStreamsRequestKey: String?
     private var lastAppliedStreamsRevision: UInt64?
+    private let deferredPreparationDelay: AsyncDelay
+    private let injectedEnrichmentStarter: EnrichmentStarter?
 
-    init(repository: CatalogRepository) {
+    init(
+        repository: CatalogRepository,
+        streamDiscoveryMode: DetailsStreamDiscoveryMode = .shared,
+        deferredPreparationDelay: @escaping AsyncDelay = {
+            try await Task.sleep(nanoseconds: 350_000_000)
+        },
+        enrichmentStarter: EnrichmentStarter? = nil
+    ) {
         self.repository = repository
-        self.usesSharedStreamDiscovery = !(repository is MockCatalogRepository)
+        self.streamDiscoveryMode = streamDiscoveryMode
+        self.deferredPreparationDelay = deferredPreparationDelay
+        self.injectedEnrichmentStarter = enrichmentStarter
     }
 
-    func loadDetails(id: String, type: String) {
+    @discardableResult
+    func loadDetails(id: String, type: String) -> Task<Void, Never> {
         TVHomeDebugTrace.log("details.load.begin id=\(id) type=\(type)")
+        metadataTask?.cancel()
         deferredLoadTask?.cancel()
         streamObserveTask?.cancel()
         enrichmentTask?.cancel()
+        uiState.isLoadingEnrichment = false
+        detailsRequestGeneration &+= 1
+        let requestGeneration = detailsRequestGeneration
 
         // Check if full metadata is already in memory so we can render frame 0 instantly without showing a spinner.
         // For movies, any cached catalog entry already has the title, artwork, rating, and description needed for frame 0,
@@ -58,9 +88,12 @@ class DetailsViewModel: ObservableObject {
             uiState = DetailsUiState(isLoading: true, error: nil)
         }
 
-        Task {
+        let task = Task { [weak self] in
+            guard let self else { return }
             do {
                 let meta = try await repository.getMetadata(id: id, type: type)
+                guard !Task.isCancelled,
+                      self.detailsRequestGeneration == requestGeneration else { return }
                 
                 var primaryState = uiState
                 primaryState.meta = meta
@@ -75,44 +108,67 @@ class DetailsViewModel: ObservableObject {
                 // has completed (350ms). If the user quickly backs out, zero heavy work
                 // or image decompression is performed!
                 deferredLoadTask?.cancel()
-                deferredLoadTask = Task { @MainActor in
-                    try? await Task.sleep(nanoseconds: 350_000_000)
-                    guard !Task.isCancelled, uiState.meta?.id == meta.id else { return }
+                deferredLoadTask = Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    do {
+                        try await self.deferredPreparationDelay()
+                    } catch {
+                        return
+                    }
+                    guard !Task.isCancelled,
+                          self.detailsRequestGeneration == requestGeneration,
+                          self.uiState.meta?.id == meta.id else { return }
 
                     if !meta.isSeries {
-                        prepareStreams(forId: meta.streamId, type: meta.type)
+                        self.prepareStreams(forId: meta.streamId, type: meta.type)
                     }
-                    loadEnrichment(for: meta)
+                    if let enrichmentStarter = self.injectedEnrichmentStarter {
+                        enrichmentStarter(meta, requestGeneration)
+                    } else {
+                        self.loadEnrichment(for: meta, generation: requestGeneration)
+                    }
                 }
+            } catch is CancellationError {
+                return
             } catch {
-                if uiState.meta == nil {
-                    uiState.isLoading = false
-                    uiState.error = error.localizedDescription
+                guard !Task.isCancelled,
+                      self.detailsRequestGeneration == requestGeneration else { return }
+                if self.uiState.meta == nil {
+                    self.uiState.isLoading = false
+                    self.uiState.error = error.localizedDescription
                 }
             }
         }
+        metadataTask = task
+        return task
     }
 
     func cancelAllTasks() {
         TVHomeDebugTrace.log("details.cancelAllTasks")
+        detailsRequestGeneration &+= 1
+        metadataTask?.cancel()
+        metadataTask = nil
         deferredLoadTask?.cancel()
         deferredLoadTask = nil
         streamObserveTask?.cancel()
         streamObserveTask = nil
         enrichmentTask?.cancel()
         enrichmentTask = nil
+        uiState.isLoadingEnrichment = false
     }
 
     /// Loads More Like This, Production companies, and top Trakt comments
     /// after the primary metadata is on screen.
-    private func loadEnrichment(for meta: NuvioMeta) {
+    private func loadEnrichment(for meta: NuvioMeta, generation: UInt64) {
         enrichmentTask?.cancel()
         enrichmentTask = Task { [weak self] in
             guard let self else { return }
+            guard self.detailsRequestGeneration == generation,
+                  self.uiState.meta?.id == meta.id else { return }
             TVHomeDebugTrace.log("details.enrich.begin id=\(meta.id)")
             self.uiState.isLoadingEnrichment = true
             defer {
-                if !Task.isCancelled {
+                if self.detailsRequestGeneration == generation {
                     self.uiState.isLoadingEnrichment = false
                 }
             }
@@ -121,36 +177,36 @@ class DetailsViewModel: ObservableObject {
                 // 1. Credits & Cast (TMDB) -> Apply immediately when ready (~200ms)
                 group.addTask {
                     let credits = await TmdbDetailsService.fetchCredits(for: meta)
-                    await self.applyCredits(credits, for: meta.id)
+                    await self.applyCredits(credits, for: meta.id, generation: generation)
                 }
 
                 // 2. Production & Networks (TMDB) -> Apply immediately when ready (~200ms)
                 group.addTask {
                     let companies = await TmdbDetailsService.fetchCompanies(for: meta)
-                    await self.applyCompanies(companies, for: meta.id)
+                    await self.applyCompanies(companies, for: meta.id, generation: generation)
                 }
 
                 // 3. More Like This (TMDB / Trakt / Simkl) -> Progressive load & hydrate
                 group.addTask {
-                    await self.loadMoreLikeThis(for: meta)
+                    await self.loadMoreLikeThis(for: meta, generation: generation)
                 }
 
                 // 4. Trakt Comments -> Apply immediately when ready
                 group.addTask {
                     let comments = await TraktDetailsService.fetchTopComments(for: meta)
-                    await self.applyComments(comments, for: meta.id)
+                    await self.applyComments(comments, for: meta.id, generation: generation)
                 }
 
                 // 5. Simkl Ratings -> Apply immediately when ready
                 group.addTask {
                     let simkl = await SimklDetailsService.fetchDetails(for: meta)
-                    await self.applySimklRatings(simkl?.ratings, for: meta.id)
+                    await self.applySimklRatings(simkl?.ratings, for: meta.id, generation: generation)
                 }
 
                 // 6. External Ratings (MDBList) -> Apply immediately when ready
                 group.addTask {
                     let mdbRatings = await MdbListDetailsService.fetchRatings(for: meta)
-                    await self.applyMdbRatings(mdbRatings, for: meta.id)
+                    await self.applyMdbRatings(mdbRatings, for: meta.id, generation: generation)
                 }
 
                 // 7. TMDB Episodes (Series only!) -> Runs in background without blocking cast/production
@@ -158,15 +214,19 @@ class DetailsViewModel: ObservableObject {
                 if isSeries {
                     group.addTask {
                         let tmdbEpisodes = await TmdbDetailsService.fetchEpisodes(for: meta)
-                        await self.applyTmdbEpisodes(tmdbEpisodes, for: meta.id)
-                    }
+                        await self.applyTmdbEpisodes(tmdbEpisodes, for: meta.id, generation: generation)
+                }
                 }
             }
         }
     }
 
-    private func applyCredits(_ credits: TmdbCreditMetadata?, for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func isCurrentRequest(metaId: String, generation: UInt64) -> Bool {
+        !Task.isCancelled && detailsRequestGeneration == generation && uiState.meta?.id == metaId
+    }
+
+    private func applyCredits(_ credits: TmdbCreditMetadata?, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if let credits, !credits.isEmpty {
             if let currentMeta = uiState.meta {
                 uiState.meta = credits.applying(to: currentMeta)
@@ -175,36 +235,36 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
-    private func applyCompanies(_ companies: [MetaCompany], for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyCompanies(_ companies: [MetaCompany], for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if !companies.isEmpty {
             uiState.companies = companies
         }
     }
 
-    private func applyComments(_ comments: [TraktCommentReview], for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyComments(_ comments: [TraktCommentReview], for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if !comments.isEmpty {
             uiState.comments = comments
         }
     }
 
-    private func applySimklRatings(_ ratings: SimklTitleRatings?, for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applySimklRatings(_ ratings: SimklTitleRatings?, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if let ratings {
             uiState.simklRatings = ratings
         }
     }
 
-    private func applyMdbRatings(_ ratings: [NuvioExternalRating], for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyMdbRatings(_ ratings: [NuvioExternalRating], for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if !ratings.isEmpty, let currentMeta = uiState.meta {
             uiState.meta = currentMeta.withExternalRatings(ratings)
         }
     }
 
-    private func applyTmdbEpisodes(_ episodes: [NuvioVideo]?, for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyTmdbEpisodes(_ episodes: [NuvioVideo]?, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if let episodes, !episodes.isEmpty, let currentMeta = uiState.meta {
             let mergedVideos = Self.mergeEpisodes(
                 existing: currentMeta.videos,
@@ -215,19 +275,19 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
-    private func applyMoreLikeThis(_ items: [RelatedTitle], for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyMoreLikeThis(_ items: [RelatedTitle], for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         uiState.moreLikeThis = items
     }
 
-    private func applyInitialMoreLikeThisIfEmpty(_ items: [RelatedTitle], preferredSource: TraktMoreLikeThisSource, for metaId: String) {
-        guard !Task.isCancelled, uiState.meta?.id == metaId else { return }
+    private func applyInitialMoreLikeThisIfEmpty(_ items: [RelatedTitle], preferredSource: TraktMoreLikeThisSource, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if uiState.moreLikeThis.isEmpty || preferredSource == .tmdb {
             uiState.moreLikeThis = items
         }
     }
 
-    private func loadMoreLikeThis(for meta: NuvioMeta) async {
+    private func loadMoreLikeThis(for meta: NuvioMeta, generation: UInt64) async {
         let preferredSource = TraktSettingsStore.moreLikeThisSource
 
         async let tmdbTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
@@ -241,7 +301,7 @@ class DetailsViewModel: ObservableObject {
         // If TMDB returns quickly, populate More Like This immediately:
         let tmdbRelated = await tmdbTask
         if !tmdbRelated.isEmpty {
-            self.applyInitialMoreLikeThisIfEmpty(tmdbRelated, preferredSource: preferredSource, for: meta.id)
+            self.applyInitialMoreLikeThisIfEmpty(tmdbRelated, preferredSource: preferredSource, for: meta.id, generation: generation)
         }
 
         let traktRelated = await traktTask
@@ -257,14 +317,14 @@ class DetailsViewModel: ObservableObject {
 
         guard !resolved.isEmpty else { return }
 
-        self.applyMoreLikeThis(resolved, for: meta.id)
+        self.applyMoreLikeThis(resolved, for: meta.id, generation: generation)
 
         // Trakt's related endpoint commonly omits usable artwork even with
         // `extended=images`. Resolve those IMDb ids through Cinemeta so the
         // row gets the same poster data as Home. Keep the initial titles on
         // screen while these independent artwork requests finish.
         let hydrated = await hydrateRelatedArtwork(in: resolved)
-        self.applyMoreLikeThis(hydrated, for: meta.id)
+        self.applyMoreLikeThis(hydrated, for: meta.id, generation: generation)
     }
 
     private func hydrateRelatedArtwork(in items: [RelatedTitle]) async -> [RelatedTitle] {
@@ -313,7 +373,7 @@ class DetailsViewModel: ObservableObject {
     func prepareStreams(forId streamId: String, type: String, forceRefresh: Bool = false) {
         streamObserveTask?.cancel()
 
-        if usesSharedStreamDiscovery {
+        if streamDiscoveryMode == .shared {
             prepareSharedStreams(forId: streamId, type: type, forceRefresh: forceRefresh)
         } else {
             prepareRepositoryStreams(forId: streamId, type: type)

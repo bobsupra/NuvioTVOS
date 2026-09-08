@@ -214,7 +214,7 @@ struct DetailsScreen: View {
                     streamsRevision: viewModel.uiState.streamsRevision,
                     isLoading: viewModel.uiState.isLoadingStreams,
                     emptyReason: viewModel.uiState.streamsEmptyReason,
-                    includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled,
+                    includeDebrid: DebridResolver(store: ProfileSettings.current).isEnabled || TorrentSettings.isEnabled(),
                     isResolvingDebrid: isResolvingDebrid,
                     onSelect: { stream, player in
                         PlaybackStartupTiming.start(title: meta.name)
@@ -379,7 +379,7 @@ struct DetailsScreen: View {
                 groups: viewModel.uiState.streamGroups,
                 selectedAddonId: nil,
                 sortOption: sortOption,
-                includeDebrid: debrid.isEnabled,
+                includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
                 cachedOnly: cachedOnly
             )
             // Filter out 0-res / ticket streams if valid streams exist
@@ -393,7 +393,7 @@ struct DetailsScreen: View {
                 qualityPreference: smartStreamQuality,
                 subtitleLanguages: subtitleLanguagePreferences,
                 shouldMatchSubtitles: smartSubtitleMatching,
-                includeDebrid: debrid.isEnabled,
+                includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
                 preferredTags: LastStreamQualityStore.load(metaId: meta.id),
                 cachedOnly: cachedOnly
             )
@@ -431,7 +431,7 @@ struct DetailsScreen: View {
     private func playStream(_ stream: NuvioStream, meta: NuvioMeta, player: ExternalPlayer? = nil) {
         LastStreamQualityStore.save(metaId: meta.id, stream: stream)
         PlaybackStartupBenchmark.shared.markSourcePicked(stream: stream)
-        if let url = stream.url, !url.isEmpty {
+        if let url = stream.directURL, !url.isEmpty {
             isStreamPickerPresented = false
             isPreparingPlayback = true
             isSmartPlaybackPending = false
@@ -450,11 +450,32 @@ struct DetailsScreen: View {
         isResolvingDebrid = true
         isPreparingPlayback = true
         Task {
-            let result = await DebridResolver(store: ProfileSettings.current)
-                .resolvedURL(for: stream, season: season, episode: episode)
+            let debridResolver = DebridResolver(store: ProfileSettings.current)
+            var resolvedURL: URL? = nil
+            if debridResolver.isEnabled {
+                let result = await debridResolver
+                    .resolvedURL(for: stream, season: season, episode: episode)
+                if case let .success(url, _, _)? = result {
+                    resolvedURL = url
+                }
+            }
+
+            if resolvedURL == nil, TorrentSettings.isEnabled(), let infoHash = stream.effectiveInfoHash, !infoHash.isEmpty {
+                do {
+                    resolvedURL = try await TorrentEngineManager.shared.startStream(
+                        infoHash: infoHash,
+                        fileIdx: stream.effectiveFileIdx,
+                        trackers: stream.sources,
+                        filename: stream.filename
+                    )
+                } catch {
+                    print("[DetailsScreen] Torrent stream start failed: \(error)")
+                }
+            }
+
             await MainActor.run {
                 isResolvingDebrid = false
-                if case let .success(url, _, _)? = result {
+                if let url = resolvedURL {
                     PlaybackStartupBenchmark.shared.markDebridResolved()
                     isStreamPickerPresented = false
                     isPreparingPlayback = true
@@ -1729,11 +1750,11 @@ enum SmartPlaybackSelector {
         cachedOnly: Bool = false
     ) -> [NuvioStream] {
         let playable = streams.enumerated().compactMap { index, stream -> (index: Int, stream: NuvioStream)? in
-            if let url = stream.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
+            if let url = stream.directURL?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
                 return (index, stream)
             }
-            // Torrent-only streams are candidates only when a debrid provider is
-            // configured to resolve them into a direct URL.
+            // Torrent-only streams are candidates when either Debrid or the
+            // embedded P2P engine can turn them into a playable URL.
             if includeDebrid, stream.isDebridResolvable { return (index, stream) }
             return nil
         }
@@ -1798,7 +1819,7 @@ enum SmartPlaybackSelector {
         cachedOnly: Bool = false
     ) -> [NuvioStream] {
         let playable = streams.filter { stream in
-            if let url = stream.url?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
+            if let url = stream.directURL?.trimmingCharacters(in: .whitespacesAndNewlines), !url.isEmpty {
                 return true
             }
             return includeDebrid && stream.isDebridResolvable
@@ -4142,10 +4163,11 @@ private struct TvDetailsEpisodes: View {
             let stripWidth = geo.size.width + edgeInset * 2
             let visibleCardCount = max(1, Int(ceil(stripWidth / TvEpisodeCardLayout.step)) + 1)
             let materializedIndices = materializedEpisodeIndices(visibleCardCount: visibleCardCount)
+            let materializedEpisodes = materializedIndices.map { seasonEpisodes[$0] }
 
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
-                ForEach(materializedIndices, id: \.self) { itemIndex in
-                    let video = seasonEpisodes[itemIndex]
+                ForEach(materializedEpisodes) { video in
+                    let itemIndex = seasonEpisodes.firstIndex(where: { $0.id == video.id }) ?? 0
                     TvEpisodeCard(
                         video: video,
                         fallbackRating: seriesRating,
@@ -4749,7 +4771,7 @@ private struct TvStreamPickerOverlay: View {
     let streamsRevision: UInt64
     let isLoading: Bool
     let emptyReason: StreamsEmptyStateReason?
-    /// Whether torrent-only streams should be listed (a debrid provider is set).
+    /// Whether torrent-only streams should be listed (Debrid or local P2P is enabled).
     let includeDebrid: Bool
     /// A torrent stream is being turned into a playable link right now.
     let isResolvingDebrid: Bool

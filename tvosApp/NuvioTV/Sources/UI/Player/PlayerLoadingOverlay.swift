@@ -206,6 +206,7 @@ struct PlayerLoadingOverlay: View {
     @State private var isPulsing = false
     @State private var logoLoadFailed = false
     @State private var mountedDate = Date()
+    @ObservedObject private var torrentManager = TorrentEngineManager.shared
 
     private var effectiveStartTime: Date {
         startTime ?? PlaybackStartupTiming.requestDate ?? mountedDate
@@ -315,6 +316,57 @@ struct PlayerLoadingOverlay: View {
                                 )
                                 .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
                             }
+                        }
+
+                        if torrentManager.isStreaming && !TorrentSettings.hideStats() {
+                            let stats = torrentManager.activeStats
+                            HStack(spacing: 12) {
+                                HStack(spacing: 5) {
+                                    Image(systemName: "arrow.down.circle.fill")
+                                        .font(.system(size: 13))
+                                        .foregroundColor(.green)
+                                    Text(stats.downloadRateFormatted)
+                                        .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                                }
+
+                                Text("•")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.4))
+
+                                HStack(spacing: 4) {
+                                    Text("\(stats.connectedSeeds)")
+                                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.green)
+                                    Text("seeds")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.white.opacity(0.7))
+                                }
+
+                                Text("•")
+                                    .font(.system(size: 11))
+                                    .foregroundColor(.white.opacity(0.4))
+
+                                HStack(spacing: 4) {
+                                    Text("\(stats.connectedPeers)")
+                                        .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                        .foregroundColor(.blue)
+                                    Text("peers")
+                                        .font(.system(size: 12, weight: .medium))
+                                        .foregroundColor(.white.opacity(0.7))
+                                }
+                            }
+                            .foregroundColor(.white)
+                            .padding(.horizontal, 14)
+                            .padding(.vertical, 5)
+                            .background(
+                                Capsule()
+                                    .fill(Color.black.opacity(0.45))
+                                    .overlay(
+                                        Capsule()
+                                            .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                                    )
+                            )
+                            .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
                         }
                     }
                 }

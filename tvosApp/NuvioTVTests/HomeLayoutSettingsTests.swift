@@ -2,6 +2,65 @@ import XCTest
 @testable import NuvioTV
 
 final class HomeLayoutSettingsTests: XCTestCase {
+    private func title(_ id: String, type: String = "movie") throws -> NuvioMeta {
+        let data = try JSONSerialization.data(withJSONObject: ["id": id, "type": type, "name": id])
+        return try JSONDecoder().decode(NuvioMeta.self, from: data)
+    }
+
+    func testHomeTitleIdentitySurvivesWindowShiftInsertionAndReorder() throws {
+        let a = try title("a")
+        let b = try title("b")
+        let c = try title("c")
+        var section = TVHomeSection(id: "provider", title: "Catalog", items: [a, b, b, c])
+        XCTAssertEqual(section.items.map(\.id), ["a", "b", "c"])
+        let original = TVHomeCardIdentity.materializedTitles(rowID: section.id, items: section.items, indices: [0, 1])
+        let shifted = TVHomeCardIdentity.materializedTitles(rowID: section.id, items: section.items, indices: [1, 2])
+        XCTAssertEqual(original[1].id, shifted[0].id)
+        XCTAssertEqual(shifted[0].id, TVHomeCardIdentity.key(rowID: section.id, item: b))
+        section.items = [c, b, a, b]
+        let reordered = TVHomeCardIdentity.materializedTitles(rowID: section.id, items: section.items, indices: [1, 2])
+        XCTAssertEqual(reordered[0].id, original[1].id)
+        section.items.insert(try title("inserted"), at: 0)
+        XCTAssertEqual(TVHomeCardIdentity.key(rowID: section.id, item: section.items[2]), original[1].id)
+    }
+
+    func testHomeIdentityDistinguishesTypeAndProviderWithoutPayloadCollisions() throws {
+        let movie = try title("shared")
+        let series = try title("shared", type: "series")
+        let section = TVHomeSection(id: "p", title: "Mixed", items: [movie, series, movie])
+        XCTAssertEqual(section.items.count, 2)
+        XCTAssertNotEqual(TVHomeCardIdentity.key(rowID: "p", item: movie), TVHomeCardIdentity.key(rowID: "p", item: series))
+        XCTAssertNotEqual(TVHomeCardIdentity.key(rowID: "p", item: movie), TVHomeCardIdentity.key(rowID: "q", item: movie))
+        XCTAssertNotEqual(TVHomeCardIdentity.titleID(try title("bc", type: "a")), TVHomeCardIdentity.titleID(try title("c", type: "ab")))
+    }
+
+    func testRestoreKeepsSurvivorAndUsesNearestSlotForRemovedTitle() {
+        let row = TVHomeFocusRow(id: "row", keys: ["row\u{1}a", "row\u{1}c"])
+        XCTAssertEqual(TVHomeFocusRestoration.target(saved: row.keys[1], rows: [row], preferredIndex: 0), row.keys[1])
+        XCTAssertEqual(TVHomeFocusRestoration.target(saved: "row\u{1}removed", rows: [row], preferredIndex: 1), row.keys[1])
+        XCTAssertEqual(TVHomeFocusRestoration.target(saved: "row\u{1}removed", rows: [row], preferredIndex: 99), row.keys[1])
+        XCTAssertEqual(TVHomeFocusRestoration.target(saved: "gone\u{1}a", rows: [row], preferredIndex: 0), row.keys[0])
+        XCTAssertNil(TVHomeFocusRestoration.target(saved: row.keys[0], rows: [], preferredIndex: 0))
+    }
+
+    func testRestoreSupportsRowIDsContainingSeparators() {
+        let row = TVHomeFocusRow(id: "row\u{1}nested", keys: ["row\u{1}nested\u{1}b"])
+        let other = TVHomeFocusRow(id: "row", keys: ["row\u{1}a"])
+        XCTAssertEqual(TVHomeFocusRestoration.target(saved: "row\u{1}nested\u{1}removed", rows: [other, row], preferredIndex: 0), row.keys[0])
+    }
+
+    func testFolderDuplicatesCollapseBeforeLayoutAndRetainIdentityAfterReordering() throws {
+        let decoded = try JSONDecoder().decode(NuvioCollectionFolder.self, from: Data(#"{"id":"folder","title":"Folder"}"#.utf8))
+        let first = TVCollectionFolderItem(collectionId: "one", folder: decoded, sources: [])
+        let second = TVCollectionFolderItem(collectionId: "two", folder: decoded, sources: [])
+        var section = TVHomeSection(id: "folders", title: "Folders", items: [], collectionFolders: [first, first, second])
+        XCTAssertEqual(section.collectionFolders.count, 2)
+        let key = TVHomeCardIdentity.folderKey(rowID: section.id, folder: second)
+        section.collectionFolders = [second, first, second]
+        XCTAssertEqual(section.collectionFolders.count, 2)
+        XCTAssertEqual(TVHomeCardIdentity.folderKey(rowID: section.id, folder: section.collectionFolders[0]), key)
+    }
+
     func testFullscreenHeroBackdropSettingsKeyDefined() {
         XCTAssertEqual(SettingsKey.fullscreenHeroBackdrop, "nuvio.tv.settings.layout.fullscreenHeroBackdrop")
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.fullscreenHeroBackdrop))
@@ -406,5 +465,3 @@ final class HomeLayoutSettingsTests: XCTestCase {
         TVHomeCatalogOrder.clearOrder()
     }
 }
-
-

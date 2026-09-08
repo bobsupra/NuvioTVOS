@@ -94,15 +94,52 @@ final class PictureInPictureManager: NSObject, ObservableObject {
         coordinator: PlaybackSessionCoordinator,
         context: ActivePlaybackContext
     ) {
+        if let previous = activeCoordinator, previous !== coordinator {
+            clearController()
+            previous.stopAll()
+        }
         self.activeCoordinator = coordinator
         self.activeContext = context
+        refreshController(for: coordinator)
+    }
 
-        setupPipController(for: coordinator.aetherController)
+    /// A retry may replace the controller while preserving its registered
+    /// session/context. Ignore notifications from unregistered player screens.
+    func refreshController(for coordinator: PlaybackSessionCoordinator) {
+        guard activeCoordinator === coordinator else { return }
+        guard coordinator.activeBackend == .aether,
+              let controller = coordinator.aetherController else {
+            clearController()
+            return
+        }
+        setupPipController(for: controller)
+    }
+
+    private func clearController() {
+        let oldController = pipController
+        let completion = pendingRestoreCompletion
+        pipController = nil
+        oldController?.delegate = nil
+        possibleObservation?.invalidate()
+        possibleObservation = nil
+        cancellables.removeAll()
+        if isPictureInPictureActive { oldController?.stopPictureInPicture() }
+        activeAetherController?.engine.pictureInPictureActive = false
+        activeAetherController = nil
+        isPictureInPictureActive = false
+        isPictureInPicturePossible = false
+        configuredSoftwareDisplayLayer = nil
+        pendingRestoreCompletion = nil
+        pendingRestoreResult = nil
+        isRestoringUI = false
+        restoreSurfaceReady = false
+        completion?(false)
     }
 
     /// Sets up or reconfigures the `AVPictureInPictureController` for the given Aether controller.
     func setupPipController(for aetherController: AetherPlaybackController) {
         let controllerChanged = activeAetherController !== aetherController
+        if controllerChanged { clearController() }
         self.activeAetherController = aetherController
         if controllerChanged {
             configuredSoftwareDisplayLayer = nil
@@ -221,7 +258,7 @@ final class PictureInPictureManager: NSObject, ObservableObject {
         if isPictureInPictureActive {
             oldPipController?.stopPictureInPicture()
         }
-        retainedCoordinator?.aetherController.engine.pictureInPictureActive = false
+        retainedCoordinator?.aetherController?.engine.pictureInPictureActive = false
         retainedCoordinator?.stopAll()
         activeCoordinator = nil
         activeAetherController = nil

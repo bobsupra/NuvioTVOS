@@ -9,20 +9,90 @@ import XCTest
 import Combine
 @testable import NuvioTV
 
+/// Returns metadata only when the test explicitly releases the request. It
+/// deliberately ignores task cancellation so generation checks are exercised.
+private final class ControlledDetailsRepository: MockCatalogRepository {
+    var didStartStreams = false
+    var metadataWaiterEntered: ((String) -> Void)?
+    private var releaseCount = 0
+    private let waiterLock = NSLock()
+    private var waiters: [String: [CheckedContinuation<NuvioMeta, Never>]] = [:]
+
+    override func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        await withCheckedContinuation { (continuation: CheckedContinuation<NuvioMeta, Never>) in
+            waiterLock.lock()
+            waiters[id, default: []].append(continuation)
+            waiterLock.unlock()
+            metadataWaiterEntered?(id)
+        }
+    }
+
+    override func getStreams(id: String, type: String) async throws -> [NuvioStream] {
+        didStartStreams = true
+        return []
+    }
+
+    func release(id: String, type: String = "movie") {
+        waiterLock.lock()
+        releaseCount += 1
+        let revision = releaseCount
+        let waiter = waiters[id]?.popLast()
+        waiterLock.unlock()
+        waiter?.resume(returning: Self.makeMeta(id: id, type: type, revision: revision))
+    }
+
+    static func makeMeta(id: String, type: String, revision: Int = 0) -> NuvioMeta {
+        NuvioMeta(id: id, name: "\(id)-v\(revision)", description: id, posterUrl: nil, backgroundUrl: nil,
+                  logoUrl: nil, imdbId: nil, tmdbId: nil, type: type, year: 2024,
+                  genres: nil, rating: nil, releaseInfo: nil, runtime: nil, cast: nil,
+                  director: nil, writer: nil, certification: nil, country: nil,
+                  released: nil, status: nil, videos: nil, trailerYtIds: nil,
+                  externalRatings: nil)
+    }
+}
+
+private final class ImmediateDetailsRepository: MockCatalogRepository {
+    override func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        return Self.makeMeta(id: id, type: type)
+    }
+
+    override func getStreams(id: String, type: String) async throws -> [NuvioStream] {
+        [NuvioStream(url: "https://example.com/stream.mp4", name: "HD", description: "HD", addonName: "Test")]
+    }
+
+    private static func makeMeta(id: String, type: String) -> NuvioMeta {
+        NuvioMeta(id: id, name: id, description: id, posterUrl: "https://example.com/poster.jpg", backgroundUrl: nil,
+                  logoUrl: nil, imdbId: nil, tmdbId: nil, type: type, year: 2024,
+                  genres: ["test"], rating: 8, releaseInfo: nil, runtime: nil, cast: nil,
+                  director: nil, writer: nil, certification: nil, country: nil,
+                  released: nil, status: nil, videos: nil, trailerYtIds: nil,
+                  externalRatings: nil)
+    }
+}
+
 @MainActor
 final class DetailsViewModelTests: XCTestCase {
 
     var viewModel: DetailsViewModel!
     var repository: MockCatalogRepository!
     var cancellables: Set<AnyCancellable>!
+    private var originalLibrarySourceMode: TraktLibrarySourceMode!
 
     override func setUp() async throws {
-        repository = MockCatalogRepository()
-        viewModel = DetailsViewModel(repository: repository)
+        originalLibrarySourceMode = TraktSettingsStore.librarySourceMode
+        TraktSettingsStore.librarySourceMode = .local
+        repository = ImmediateDetailsRepository()
+        viewModel = DetailsViewModel(repository: repository, streamDiscoveryMode: .repository,
+                                     deferredPreparationDelay: { },
+                                     enrichmentStarter: { _, _ in })
         cancellables = Set<AnyCancellable>()
     }
 
     override func tearDown() {
+        viewModel?.cancelAllTasks()
+        LibraryStore.remove(metaId: "watchlist_remove", type: "movie")
+        LibraryStore.remove(metaId: "watchlist_multiple", type: "movie")
+        TraktSettingsStore.librarySourceMode = originalLibrarySourceMode
         viewModel = nil
         repository = nil
         cancellables = nil
@@ -41,10 +111,7 @@ final class DetailsViewModelTests: XCTestCase {
     // MARK: - Load Details Tests
 
     func testLoadDetailsSuccess() async {
-        viewModel.loadDetails(id: "movie_1")
-
-        // Wait for loading to complete
-        try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
 
         XCTAssertFalse(viewModel.uiState.isLoading, "Should not be loading after data loads")
         XCTAssertNil(viewModel.uiState.error, "Error should be nil on success")
@@ -52,10 +119,7 @@ final class DetailsViewModelTests: XCTestCase {
     }
 
     func testLoadDetailsMetadata() async {
-        viewModel.loadDetails(id: "movie_1")
-
-        // Wait for loading to complete
-        try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
 
         guard let meta = viewModel.uiState.meta else {
             XCTFail("Meta should be loaded")
@@ -70,10 +134,17 @@ final class DetailsViewModelTests: XCTestCase {
     }
 
     func testLoadDetailsStreams() async {
-        viewModel.loadDetails(id: "movie_1")
-
         // Wait for loading to complete (including streams)
-        try? await Task.sleep(nanoseconds: 2_000_000_000) // 2 seconds
+        let streams = expectation(description: "streams loaded")
+        var didFulfillStreams = false
+        viewModel.$uiState.sink { state in
+            if !state.streams.isEmpty && !didFulfillStreams {
+                didFulfillStreams = true
+                streams.fulfill()
+            }
+        }.store(in: &cancellables)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
+        await fulfillment(of: [streams], timeout: 5)
 
         XCTAssertFalse(viewModel.uiState.streams.isEmpty, "Streams should be loaded")
         XCTAssertGreaterThan(viewModel.uiState.streams.count, 0, "Should have at least one stream")
@@ -87,10 +158,7 @@ final class DetailsViewModelTests: XCTestCase {
     }
 
     func testLoadDetailsSeriesContent() async {
-        viewModel.loadDetails(id: "series_1")
-
-        // Wait for loading to complete
-        try? await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        await viewModel.loadDetails(id: "series_1", type: "series").value
 
         guard let meta = viewModel.uiState.meta else {
             XCTFail("Meta should be loaded")
@@ -100,17 +168,124 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertEqual(meta.type, "series", "Meta type should be series")
     }
 
+    func testOlderMetadataCannotOverwriteNewerRequest() async {
+        let delayedRepository = ControlledDetailsRepository()
+        let delayedViewModel = DetailsViewModel(
+            repository: delayedRepository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { },
+            enrichmentStarter: { _, _ in }
+        )
+
+        let oldWaiter = expectation(description: "old metadata waiter")
+        let newWaiter = expectation(description: "new metadata waiter")
+        delayedRepository.metadataWaiterEntered = { id in
+            if id == "old_request" { oldWaiter.fulfill() }
+            if id == "new_request" { newWaiter.fulfill() }
+        }
+        let oldLoad = delayedViewModel.loadDetails(id: "old_request", type: "movie")
+        let newLoad = delayedViewModel.loadDetails(id: "new_request", type: "movie")
+        await fulfillment(of: [oldWaiter, newWaiter], timeout: 1)
+        delayedRepository.release(id: "new_request")
+        await newLoad.value
+        delayedRepository.release(id: "old_request")
+        await oldLoad.value
+
+        XCTAssertEqual(delayedViewModel.uiState.meta?.name, "new_request-v1")
+        XCTAssertNil(delayedViewModel.uiState.error)
+    }
+
+    func testOlderSameIDMetadataCannotOverwriteReload() async {
+        let delayedRepository = ControlledDetailsRepository()
+        let delayedViewModel = DetailsViewModel(repository: delayedRepository,
+                                                  streamDiscoveryMode: .repository,
+                                                  deferredPreparationDelay: { },
+                                                  enrichmentStarter: { _, _ in })
+        let firstWaiter = expectation(description: "first metadata waiter")
+        let secondWaiter = expectation(description: "second metadata waiter")
+        var waiterCount = 0
+        delayedRepository.metadataWaiterEntered = { _ in
+            waiterCount += 1
+            (waiterCount == 1 ? firstWaiter : secondWaiter).fulfill()
+        }
+        let firstLoad = delayedViewModel.loadDetails(id: "same_request", type: "movie")
+        await fulfillment(of: [firstWaiter], timeout: 1)
+        let secondLoad = delayedViewModel.loadDetails(id: "same_request", type: "movie")
+        await fulfillment(of: [secondWaiter], timeout: 1)
+        delayedRepository.release(id: "same_request")
+        await secondLoad.value
+        delayedRepository.release(id: "same_request")
+        await firstLoad.value
+        XCTAssertEqual(delayedViewModel.uiState.meta?.name, "same_request-v1")
+    }
+
+    func testCancellationInvalidatesMetadataAndDeferredWork() async {
+        let delayedRepository = ControlledDetailsRepository()
+        let delayedViewModel = DetailsViewModel(
+            repository: delayedRepository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { },
+            enrichmentStarter: { _, _ in }
+        )
+
+        let waiter = expectation(description: "metadata waiter")
+        delayedRepository.metadataWaiterEntered = { _ in waiter.fulfill() }
+        let load = delayedViewModel.loadDetails(id: "old_request", type: "movie")
+        await fulfillment(of: [waiter], timeout: 1)
+        delayedViewModel.cancelAllTasks()
+        delayedRepository.release(id: "old_request")
+        await load.value
+
+        XCTAssertNil(delayedViewModel.uiState.meta)
+        XCTAssertNil(delayedViewModel.uiState.error)
+    }
+
+    func testCancellationBeforeDeferredPreparationPreventsStreamsAndEnrichment() async {
+        let delayedRepository = ControlledDetailsRepository()
+        let gate = AsyncStream<Void>.makeStream()
+        let deferredEntered = expectation(description: "deferred preparation entered")
+        let deferredCompleted = expectation(description: "deferred preparation completed")
+        var didStartEnrichment = false
+        let delayedViewModel = DetailsViewModel(
+            repository: delayedRepository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: {
+                deferredEntered.fulfill()
+                for await _ in gate.stream { break }
+                deferredCompleted.fulfill()
+            },
+            enrichmentStarter: { _, _ in didStartEnrichment = true }
+        )
+
+        let waiter = expectation(description: "metadata waiter")
+        delayedRepository.metadataWaiterEntered = { _ in waiter.fulfill() }
+        let load = delayedViewModel.loadDetails(id: "deferred_request", type: "movie")
+        await fulfillment(of: [waiter], timeout: 1)
+        delayedRepository.release(id: "deferred_request")
+        await load.value
+        await fulfillment(of: [deferredEntered], timeout: 1)
+        delayedViewModel.cancelAllTasks()
+        gate.continuation.yield(())
+        await fulfillment(of: [deferredCompleted], timeout: 1)
+
+        XCTAssertFalse(delayedRepository.didStartStreams)
+        XCTAssertFalse(didStartEnrichment)
+    }
+
     // MARK: - Watchlist Tests
 
-    func testToggleWatchlistAdd() {
+    func testToggleWatchlistAddWithoutMetadataIsNoOp() {
         XCTAssertFalse(viewModel.uiState.isInWatchlist, "Should not be in watchlist initially")
 
         viewModel.toggleWatchlist()
 
-        XCTAssertTrue(viewModel.uiState.isInWatchlist, "Should be in watchlist after toggle")
+        XCTAssertFalse(viewModel.uiState.isInWatchlist, "Missing metadata must be a no-op")
     }
 
-    func testToggleWatchlistRemove() {
+    func testToggleWatchlistRemove() async {
+        await viewModel.loadDetails(id: "watchlist_remove", type: "movie").value
+        TraktSettingsStore.librarySourceMode = .local
+        LibraryStore.remove(metaId: "watchlist_remove", type: "movie")
         viewModel.toggleWatchlist() // Add to watchlist
         XCTAssertTrue(viewModel.uiState.isInWatchlist, "Should be in watchlist")
 
@@ -118,7 +293,10 @@ final class DetailsViewModelTests: XCTestCase {
         XCTAssertFalse(viewModel.uiState.isInWatchlist, "Should not be in watchlist after second toggle")
     }
 
-    func testToggleWatchlistMultipleTimes() {
+    func testToggleWatchlistMultipleTimes() async {
+        await viewModel.loadDetails(id: "watchlist_multiple", type: "movie").value
+        TraktSettingsStore.librarySourceMode = .local
+        LibraryStore.remove(metaId: "watchlist_multiple", type: "movie")
         for i in 1...5 {
             viewModel.toggleWatchlist()
             let expectedState = i % 2 == 1
@@ -141,7 +319,7 @@ final class DetailsViewModelTests: XCTestCase {
             }
             .store(in: &cancellables)
 
-        viewModel.loadDetails(id: "movie_1")
+        viewModel.loadDetails(id: "movie_1", type: "movie")
 
         await fulfillment(of: [expectation], timeout: 5.0)
     }
@@ -150,13 +328,11 @@ final class DetailsViewModelTests: XCTestCase {
 
     func testMultipleLoadDetailsCalls() async {
         // First load
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
         let firstMeta = viewModel.uiState.meta
 
         // Second load with different ID
-        viewModel.loadDetails(id: "movie_2")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await viewModel.loadDetails(id: "movie_2", type: "movie").value
         let secondMeta = viewModel.uiState.meta
 
         XCTAssertNotEqual(firstMeta?.id, secondMeta?.id, "Multiple loads should replace data")
@@ -166,8 +342,7 @@ final class DetailsViewModelTests: XCTestCase {
     // MARK: - Metadata Validation Tests
 
     func testMetadataHasRequiredFields() async {
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
 
         guard let meta = viewModel.uiState.meta else {
             XCTFail("Meta should be loaded")
@@ -183,8 +358,7 @@ final class DetailsViewModelTests: XCTestCase {
     }
 
     func testMetadataGenresPopulated() async {
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
 
         guard let meta = viewModel.uiState.meta else {
             XCTFail("Meta should be loaded")
@@ -199,8 +373,7 @@ final class DetailsViewModelTests: XCTestCase {
     }
 
     func testMetadataRatingInValidRange() async {
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 1_000_000_000)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
 
         guard let meta = viewModel.uiState.meta else {
             XCTFail("Meta should be loaded")
@@ -216,30 +389,22 @@ final class DetailsViewModelTests: XCTestCase {
     // MARK: - Stream Validation Tests
 
     func testStreamsHaveValidData() async {
-        viewModel.loadDetails(id: "movie_1")
-        try? await Task.sleep(nanoseconds: 2_000_000_000) // Wait for streams
+        let streams = expectation(description: "streams loaded")
+        var didFulfillStreams = false
+        viewModel.$uiState.sink { state in
+            if !state.streams.isEmpty && !didFulfillStreams {
+                didFulfillStreams = true
+                streams.fulfill()
+            }
+        }.store(in: &cancellables)
+        await viewModel.loadDetails(id: "movie_1", type: "movie").value
+        await fulfillment(of: [streams], timeout: 5)
 
         XCTAssertFalse(viewModel.uiState.streams.isEmpty, "Should have streams")
 
         for stream in viewModel.uiState.streams {
             XCTAssertNotNil(stream.url, "Stream should have URL")
             XCTAssertNotNil(stream.name, "Stream should have name")
-        }
-    }
-
-    // MARK: - Performance Tests
-
-    func testLoadDetailsPerformance() {
-        measure {
-            let expectation = XCTestExpectation(description: "Load details performance")
-
-            Task { @MainActor in
-                viewModel.loadDetails(id: "movie_1")
-                try? await Task.sleep(nanoseconds: 2_000_000_000)
-                expectation.fulfill()
-            }
-
-            wait(for: [expectation], timeout: 10.0)
         }
     }
 

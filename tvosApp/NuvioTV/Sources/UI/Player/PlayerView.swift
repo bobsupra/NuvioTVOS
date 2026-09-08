@@ -46,6 +46,7 @@ struct PlayerView: View {
     @State private var didHandleFinished = false
     @State private var didReportPlaybackStarted = false
     @FocusState private var remoteInputFocused: Bool
+    @FocusState private var startupRetryFocused: Bool
     @FocusState private var nextEpisodeFocused: Bool
     @FocusState private var cancelAutoPlayFocused: Bool
     @FocusState private var skipSegmentFocused: Bool
@@ -62,16 +63,21 @@ struct PlayerView: View {
                     Group {
                         switch viewModel.activeEngineKind {
                         case .aether:
-                            AetherPlayerSurface(controller: viewModel.aetherController)
+                            if let controller = viewModel.aetherController {
+                                AetherPlayerSurface(controller: controller)
+                            } else {
+                                Color.black
+                            }
                         case .mpv:
                             MPVVideoSurface(controller: viewModel.playerController)
                         }
                     }
 
-                    if viewModel.activeEngineKind == .aether {
+                    if viewModel.activeEngineKind == .aether,
+                       let aetherController = viewModel.aetherController {
                         PlayerSubtitleOverlay(
-                            playback: viewModel.aetherController.subtitleOverlayState,
-                            translation: viewModel.aetherController.subtitleTranslationState,
+                            playback: aetherController.subtitleOverlayState,
+                            translation: aetherController.subtitleTranslationState,
                             subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
                             videoNaturalSize: viewModel.videoNaturalSize,
                             aspectMode: viewModel.aspectMode,
@@ -152,10 +158,15 @@ struct PlayerView: View {
                     onBack: {
                         if viewModel.postPlayState.isTrailerPlaying {
                             viewModel.stopPostPlayTrailer()
-                        } else if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
-                            viewModel.returnToPlayerFromPostPlay()
                         } else {
-                            onBack()
+                            let endGuard: Double = max(0, viewModel.time.duration - 3)
+                            if viewModel.postPlayState.canReturnToPlayer,
+                               viewModel.time.current < endGuard,
+                               viewModel.status != .ended {
+                                viewModel.returnToPlayerFromPostPlay()
+                            } else {
+                                onBack()
+                            }
                         }
                     }
                 )
@@ -166,7 +177,7 @@ struct PlayerView: View {
             // Window-level trackpad capture for Infuse-style scrubbing / peek.
             RemoteTouchCatcher(
                 isActive: {
-                    !viewModel.showSettingsPanel
+                    viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                         && viewModel.sidePanel == nil
                         && !viewModel.postPlayState.isVisible
                         && (viewModel.isScrubbing
@@ -184,7 +195,7 @@ struct PlayerView: View {
                 // when the timeline is focused. (Arrow holds are unreliable while
                 // a focused progress bar owns the focus engine — hide chrome to
                 // hold-seek.)
-                isActive: !viewModel.showSettingsPanel
+                isActive: viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.isScrubbing
                     && !viewModel.postPlayState.isVisible
@@ -234,6 +245,7 @@ struct PlayerView: View {
                 .contentShape(Rectangle())
                 .focusable(
                     (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.isScrubbing || viewModel.showPauseOverlay)
+                        && viewModel.playbackStartupError == nil
                         && !viewModel.showNextEpisodeCard
                         && !viewModel.showSkipSegmentCard
                         && !viewModel.showSettingsPanel
@@ -460,6 +472,9 @@ struct PlayerView: View {
             if !PictureInPictureManager.shared.isPictureInPictureActive {
                 PlaybackWakeLock.release()
                 viewModel.shutdown()
+                Task {
+                    await TorrentEngineManager.shared.stopActiveStream()
+                }
             }
         }
         .onChange(of: viewModel.isPictureInPictureActive) { _, isActive in
@@ -602,12 +617,13 @@ struct PlayerView: View {
             }
         }
         .onPlayPauseCommand {
+            guard viewModel.playbackStartupError == nil else { return }
             viewModel.togglePlayPause()
         }
         .onMoveCommand { direction in
             // The Episodes/Sources sheet exclusively owns directional input.
             // Do not let list navigation also seek or reveal player controls.
-            guard viewModel.sidePanel == nil else { return }
+            guard viewModel.sidePanel == nil, viewModel.playbackStartupError == nil else { return }
 
             // Trackpad swipes also emit move commands; the pan recognizer sets
             // moveSuppressed so a swipe does not double-fire as a skip.
@@ -676,7 +692,10 @@ struct PlayerView: View {
                 return
             }
             if viewModel.postPlayState.isVisible {
-                if viewModel.postPlayState.canReturnToPlayer && viewModel.time.current < max(0, viewModel.time.duration - 3) && viewModel.status != .ended {
+                let endGuard: Double = max(0, viewModel.time.duration - 3)
+                if viewModel.postPlayState.canReturnToPlayer,
+                   viewModel.time.current < endGuard,
+                   viewModel.status != .ended {
                     viewModel.returnToPlayerFromPostPlay()
                 } else {
                     onBack()
@@ -710,8 +729,9 @@ struct PlayerView: View {
     }
 
     private func focusRemoteInput() {
-        guard !viewModel.postPlayState.isVisible else { return }
+        guard !viewModel.postPlayState.isVisible, viewModel.playbackStartupError == nil else { return }
         DispatchQueue.main.async {
+            guard viewModel.playbackStartupError == nil else { return }
             remoteInputFocused = true
         }
     }
@@ -768,6 +788,32 @@ struct PlayerView: View {
 
     @ViewBuilder
     private var playerStatusOverlay: some View {
+        if let startupError = viewModel.playbackStartupError {
+            VStack(spacing: 18) {
+                Image(systemName: "exclamationmark.triangle")
+                    .font(.system(size: 48))
+                    .foregroundColor(.yellow)
+                Text(L10n.string("player_status_playback_failed", fallback: "Playback failed"))
+                    .font(.title2.weight(.semibold))
+                    .foregroundColor(.white)
+                Text(startupError)
+                    .font(.body)
+                    .foregroundColor(.white.opacity(0.7))
+                    .multilineTextAlignment(.center)
+                Button(L10n.string("common_retry", fallback: "Retry")) {
+                    viewModel.retryPlaybackStartup()
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("player.retryStartup")
+                .focused($startupRetryFocused)
+                .onAppear {
+                    remoteInputFocused = false
+                    startupRetryFocused = true
+                }
+            }
+            .padding(48)
+            .glassRoundedRect(cornerRadius: 32)
+        } else {
         switch viewModel.status {
         case .buffering, .idle:
             if viewModel.isSwitchingSource || viewModel.isReloadingStream || viewModel.didDetectReplacementStream {
@@ -821,6 +867,7 @@ struct PlayerView: View {
             .glassRoundedRect(cornerRadius: 32)
         default:
             EmptyView()
+        }
         }
     }
 
@@ -946,6 +993,10 @@ struct PlaybackDebugHUDView: View {
             VStack(alignment: .leading, spacing: 3) {
                 hudRow(label: "Add-on", value: info.addon.isEmpty ? "Direct" : info.addon)
                 hudRow(label: "Provider", value: info.provider.isEmpty ? "Direct" : info.provider)
+                if TorrentEngineManager.shared.isStreaming {
+                    let stats = TorrentEngineManager.shared.activeStats
+                    hudRow(label: "P2P Swarm", value: "\(stats.connectedSeeds) seeds · \(stats.connectedPeers) peers · \(stats.downloadRateFormatted)")
+                }
                 hudRow(label: "Server", value: info.server.isEmpty ? "--" : info.server)
                 fileRow
                 hudRow(label: "Size", value: info.size.isEmpty ? "--" : info.size)

@@ -1,8 +1,122 @@
 import Foundation
+import Combine
 import XCTest
 @testable import NuvioTV
 
 final class PlaybackBackendPolicyTests: XCTestCase {
+    @MainActor
+    func testFailedStartupRetryPublishesErrorWithoutSourceWatchdog() {
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil }, engineSettingProvider: { "AetherEngine" }, loadDispatcher: { _, _, _ in XCTFail("Failed startup must not dispatch a load") })
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        model.reloadCurrentStream = { _ in XCTFail("Initialization error must not switch sources"); return nil }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie")!))
+        XCTAssertEqual(model.playbackStartupError, coordinator.lastLoadError)
+        model.retryPlaybackStartup()
+        XCTAssertNotNil(model.playbackStartupError)
+        XCTAssertNil(model.loadWatchdogTask)
+        XCTAssertEqual(model.status, .error("AetherEngine is unavailable on this device."))
+        model.shutdown()
+    }
+
+    @MainActor
+    func testCoordinatorFallsBackToMPVWhenAetherCannotInitialize() {
+
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil }, engineSettingProvider: { "Auto" }, loadDispatcher: { _, _, _ in })
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
+
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+        XCTAssertNil(coordinator.aetherController)
+        XCTAssertTrue(coordinator.lastPolicyReason.contains("Using MPVKit"))
+    }
+
+    @MainActor
+    func testCoordinatorDoesNotConstructAetherForForcedMPV() {
+
+        var constructionCount = 0
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: {
+            constructionCount += 1
+            return nil
+        }, engineSettingProvider: { "MPVKit" }, loadDispatcher: { _, _, _ in })
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
+
+        XCTAssertEqual(constructionCount, 0)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+        XCTAssertNil(coordinator.aetherController)
+    }
+
+    @MainActor
+    func testExplicitAetherFailureIsRecoverable() {
+
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil }, engineSettingProvider: { "AetherEngine" }, loadDispatcher: { _, _, _ in })
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
+
+        XCTAssertEqual(coordinator.activeBackend, .aether)
+        XCTAssertEqual(coordinator.lastLoadError, "AetherEngine is unavailable on this device.")
+        XCTAssertFalse(coordinator.activeEngine === coordinator.mpvController)
+        coordinator.activeEngine.playPlayback()
+        XCTAssertFalse(coordinator.activeEngine.isPlayerPlaying)
+    }
+
+    @MainActor
+    func testRetryReconnectsReplacementAndRejectsOldTerminalCallback() throws {
+        let first = try XCTUnwrap(AetherPlaybackController())
+        let second = try XCTUnwrap(AetherPlaybackController())
+        var creations = 0
+        var loaded: [PlayerBackendKind] = []
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: {
+            creations += 1
+            return creations == 1 ? first : second
+        }, engineSettingProvider: { "Auto" }, loadDispatcher: { _, backend, _ in loaded.append(backend) })
+        var latestHost: AetherPlaybackController?
+        coordinator.onAetherControllerChanged = { latestHost = $0 }
+        defer { coordinator.stopAll() }
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie")!))
+        let oldFailure = first.onTerminalError
+        coordinator.retryLastLoad()
+        XCTAssertTrue(latestHost === second)
+        oldFailure?("stale failure")
+        XCTAssertEqual(loaded, [.aether, .aether])
+        XCTAssertEqual(coordinator.activeBackend, .aether)
+    }
+
+    @MainActor
+    func testRetryConstructsAetherOnceAndStopPreventsRestart() {
+        var constructionCount = 0
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: {
+                constructionCount += 1
+                return nil
+            },
+            engineSettingProvider: { "AetherEngine" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let request = PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!)
+
+        coordinator.load(request)
+        XCTAssertEqual(constructionCount, 1)
+        coordinator.retryLastLoad()
+        XCTAssertEqual(constructionCount, 2)
+        coordinator.stopAll()
+        coordinator.retryLastLoad()
+        XCTAssertEqual(constructionCount, 2)
+    }
+
+    @MainActor
+    func testRetryForForcedMPVNeverConstructsAether() {
+        var constructionCount = 0
+        let coordinator = PlaybackSessionCoordinator(
+            aetherControllerFactory: {
+                constructionCount += 1
+                return nil
+            },
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
+        coordinator.retryLastLoad()
+        XCTAssertEqual(constructionCount, 0)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+    }
 
     func testLiveStreamFailoverRetriesCurrentURLOnceBeforeExcludingIt() {
         let url = "https://sports.example/live.m3u8"
@@ -683,8 +797,13 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(state.sourceText, "Old")
 
         state.update(sourceText: "Before settings", settings: initial)
+        let translated = expectation(description: "Current settings translation is published")
+        let observation = state.$translatedText.filter { $0 == "fresh" }.first().sink { _ in
+            translated.fulfill()
+        }
+        defer { observation.cancel(); state.cancelPendingTranslations() }
         state.update(sourceText: "New", settings: changed)
-        try await Task.sleep(nanoseconds: 80_000_000)
+        await fulfillment(of: [translated], timeout: 5)
         XCTAssertEqual(state.sourceText, "New")
         XCTAssertEqual(state.translatedText, "fresh")
     }
@@ -3004,4 +3123,3 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
         XCTAssertEqual(resolvedSimkl?.remainingText, "20m left")
     }
 }
-

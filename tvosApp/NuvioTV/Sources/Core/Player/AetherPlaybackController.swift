@@ -1792,19 +1792,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         )
     }
 
-    init(engine: AetherEngine? = nil) {
-        if let engine {
-            self.engine = engine
-        } else {
-            do {
-                self.engine = try AetherEngine()
-            } catch {
-                // AetherEngine() is failable for rare resource setup failures.
-                // Fall back to a second attempt; if it throws again, crash early
-                // in debug so the spike surfaces immediately.
-                self.engine = try! AetherEngine()
-            }
+    /// Creates an Aether host when the engine can be initialized. A failed
+    /// construction is returned to the session coordinator so Auto can select
+    /// MPVKit and an explicitly forced Aether session can show a recoverable
+    /// error instead of crashing during view-model initialization.
+    init?(engine: AetherEngine? = nil) {
+        guard let resolvedEngine = engine ?? (try? AetherEngine()) else {
+            return nil
         }
+        self.engine = resolvedEngine
         super.init(nibName: nil, bundle: nil)
         #if os(tvOS) || os(iOS)
         self.engine.ownsVideoNowPlayingSession = true

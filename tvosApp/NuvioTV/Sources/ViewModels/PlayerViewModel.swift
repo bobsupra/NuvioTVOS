@@ -125,6 +125,7 @@ class PlayerViewModel: ObservableObject {
     @Published var isPictureInPictureActive: Bool = false
     @Published var isPictureInPicturePossible: Bool = false
     private var cancellables = Set<AnyCancellable>()
+    private var coordinatorErrorCancellable: AnyCancellable?
 
     // MARK: Next episode
 
@@ -186,7 +187,7 @@ class PlayerViewModel: ObservableObject {
     /// Convenience: libmpv Metal host (fallback / forced MPV).
     var playerController: MPVPlayerViewController { sessionCoordinator.mpvController }
     /// Aether surface host.
-    var aetherController: AetherPlaybackController { sessionCoordinator.aetherController }
+    var aetherController: AetherPlaybackController? { sessionCoordinator.aetherController }
     /// Which backend is driving the current (or next) stream.
     @Published private(set) var activeEngineKind: PlayerEngineKind = .aether
     /// Short on-screen note after engine selection (native DV vs HDR fallback).
@@ -199,6 +200,8 @@ class PlayerViewModel: ObservableObject {
     @Published private(set) var trailerQualityLabel: String?
     private var playbackDebugHUDBackend: PlayerEngineKind?
     private var didShowPlaybackDebugHUDForStream = false
+
+    @Published private(set) var playbackStartupError: String? = nil
 
     /// Backend used for transport / poll — switches with `activeEngineKind`.
     private var engine: PlaybackEngineControlling {
@@ -349,19 +352,20 @@ class PlayerViewModel: ObservableObject {
     /// otherwise read as `.paused` — a black screen with no spinner, and the
     /// pause metadata sheet arming behind it.
     private var isAwaitingStreamStart = false
-    private var loadWatchdogTask: Task<Void, Never>?
+    private(set) var loadWatchdogTask: Task<Void, Never>?
     private var isFailingOver = false
     private var toastClearTask: Task<Void, Never>?
     /// A source that hasn't started within this long is treated as dead.
     private let loadTimeoutSeconds: UInt64 = 30
 
-    init() {
+    init(sessionCoordinator suppliedCoordinator: PlaybackSessionCoordinator? = nil) {
         // A PiP restore creates this view model after the app has already
         // dismissed the original PlayerView. Adopt the retained coordinator
         // before SwiftUI mounts a surface so it never binds a fresh, empty
         // Aether controller for the first render pass.
-        sessionCoordinator = PictureInPictureManager.shared.activeCoordinator
+        sessionCoordinator = suppliedCoordinator ?? PictureInPictureManager.shared.activeCoordinator
             ?? PlaybackSessionCoordinator()
+        activeEngineKind = sessionCoordinator.activeBackend
         sessionCoordinator.prepareControllers()
         bindSessionCoordinatorCallbacks()
         setupPipObservers()
@@ -380,20 +384,48 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func bindSessionCoordinatorCallbacks() {
-        let suspend: (Int64, Int64) -> Void = { [weak self] positionMs, durationMs in
-            Task { @MainActor [weak self] in
-                self?.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
+        coordinatorErrorCancellable?.cancel()
+        playbackStartupError = sessionCoordinator.lastLoadError
+        coordinatorErrorCancellable = sessionCoordinator.$lastLoadError
+            .sink { [weak self] error in
+                guard let self else { return }
+                self.playbackStartupError = error
+                if let error {
+                    self.loadWatchdogTask?.cancel()
+                    self.loadWatchdogTask = nil
+                    self.isAwaitingStreamStart = false
+                    self.status = .error(error)
+                }
+            }
+
+        let coordinator = sessionCoordinator
+        let generation = coordinator.loadGeneration
+        let suspend: (Int64, Int64) -> Void = { [weak self, weak coordinator] positionMs, durationMs in
+            Task { @MainActor [weak self, weak coordinator] in
+                guard let self, let coordinator,
+                      self.sessionCoordinator === coordinator,
+                      coordinator.loadGeneration == generation else { return }
+                self.playbackDidSuspend(positionMs: positionMs, durationMs: durationMs)
             }
         }
         playerController.onPlaybackSuspended = suspend
-        aetherController.onPlaybackSuspended = suspend
-        aetherController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
+        aetherController?.onPlaybackSuspended = suspend
+        aetherController?.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
             self?.handleAISubtitleTranslationOutcome(outcome)
+        }
+        sessionCoordinator.onAetherControllerChanged = { [weak self] _ in
+            guard let self else { return }
+            self.bindSessionCoordinatorCallbacks()
+            PictureInPictureManager.shared.refreshController(for: self.sessionCoordinator)
         }
         playerController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
             self?.handleAISubtitleTranslationOutcome(outcome)
         }
         sessionCoordinator.onHandoffToast = { [weak self] message in
+            if let self {
+                self.bindSessionCoordinatorCallbacks()
+                PictureInPictureManager.shared.refreshController(for: self.sessionCoordinator)
+            }
             self?.hdrModeToast = message
             self?.showPlayerToast(message)
             self?.activeEngineKind = self?.sessionCoordinator.activeBackend ?? .mpv
@@ -402,6 +434,20 @@ class PlayerViewModel: ObservableObject {
                 self?.isPlaybackDebugHUDVisible = true
             }
         }
+    }
+
+    func retryPlaybackStartup() {
+        guard !didShutdown else { return }
+        playbackStartupError = nil
+        sessionCoordinator.retryLastLoad()
+        activeEngineKind = sessionCoordinator.activeBackend
+        guard sessionCoordinator.lastLoadError == nil else { return }
+        status = .buffering
+        isAwaitingStreamStart = true
+        currentLoadStarted = false
+        startPolling()
+        startLoadWatchdog()
+        hdrModeToast = sessionCoordinator.statusToast
     }
 
     deinit {
@@ -452,7 +498,7 @@ class PlayerViewModel: ObservableObject {
             bindSessionCoordinatorCallbacks()
             self.activeEngineKind = activeCoord.activeBackend
             self.hasLoaded = true
-            activeCoord.aetherController.rebindSurface()
+            activeCoord.aetherController?.rebindSurface()
             applyStreamState(
                 url: url,
                 meta: meta,
@@ -1259,14 +1305,16 @@ class PlayerViewModel: ObservableObject {
 
     private func startLoadWatchdog() {
         // Trailers / missing resolver: no alternate sources to fail over to.
-        guard reloadCurrentStream != nil else { return }
-        currentLoadStarted = false
         loadWatchdogTask?.cancel()
+        loadWatchdogTask = nil
+        guard reloadCurrentStream != nil, sessionCoordinator.lastLoadError == nil else { return }
+        currentLoadStarted = false
         let targetURL = activeStreamURL
         let timeout = loadTimeoutSeconds
         loadWatchdogTask = Task { [weak self] in
             try? await Task.sleep(nanoseconds: timeout * 1_000_000_000)
             guard !Task.isCancelled, let self,
+                  self.sessionCoordinator.lastLoadError == nil,
                   !self.currentLoadStarted,
                   !self.didShutdown,
                   !self.isFailingOver,
@@ -1588,6 +1636,10 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func tick() {
+        guard sessionCoordinator.lastLoadError == nil else {
+            status = .error(sessionCoordinator.lastLoadError ?? "Playback failed")
+            return
+        }
         let sampledEngineKind = activeEngineKind
         let c = engine
         c.refreshPlaybackState()
@@ -1975,7 +2027,7 @@ class PlayerViewModel: ObservableObject {
         saveProgress(force: true)
         // Leave the fallback host destroyed so re-entry cannot resume a ghost pipeline.
         playerController.destroyPlayer()
-        aetherController.destroyPlayer()
+        aetherController?.destroyPlayer()
         PictureInPictureManager.shared.invalidateSession()
         postPlayController.stop()
         status = .idle
@@ -2541,7 +2593,7 @@ class PlayerViewModel: ObservableObject {
         isAISubtitleTranslationManuallyEnabled = enabled
         switch activeEngineKind {
         case .aether:
-            aetherController.subtitleTranslationState.setManualActivation(enabled)
+            aetherController?.subtitleTranslationState.setManualActivation(enabled)
         case .mpv:
             playerController.subtitleTranslationState.setManualActivation(enabled)
         }
@@ -3191,7 +3243,7 @@ class PlayerViewModel: ObservableObject {
 
     func isCurrentSource(_ stream: NuvioStream) -> Bool {
         guard let active = activeStreamURL else { return false }
-        if let url = stream.url, !url.isEmpty {
+        if let url = stream.directURL, !url.isEmpty {
             return url == active
         }
         return false

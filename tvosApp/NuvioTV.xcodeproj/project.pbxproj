@@ -18,6 +18,11 @@
 		51A100060000000000000006 /* SimklAuthServiceTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A100050000000000000005 /* SimklAuthServiceTests.swift */; };
 		51A100080000000000000008 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A100070000000000000007 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift */; };
 		51A1000B000000000000000B /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift in Sources */ = {isa = PBXBuildFile; fileRef = 51A1000A000000000000000A /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift */; };
+		T00100020000000000000001 /* NuvioTV/Sources/Core/Torrent/TorrentSettings.swift in Sources */ = {isa = PBXBuildFile; fileRef = T00100010000000000000001 /* NuvioTV/Sources/Core/Torrent/TorrentSettings.swift */; };
+		T00100020000000000000002 /* NuvioTV/Sources/Core/Torrent/TorrentModels.swift in Sources */ = {isa = PBXBuildFile; fileRef = T00100010000000000000002 /* NuvioTV/Sources/Core/Torrent/TorrentModels.swift */; };
+		T00100020000000000000003 /* NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift in Sources */ = {isa = PBXBuildFile; fileRef = T00100010000000000000003 /* NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift */; };
+		T00100020000000000000004 /* NuvioTV/Sources/Core/Torrent/TorrentSession.swift in Sources */ = {isa = PBXBuildFile; fileRef = T00100010000000000000004 /* NuvioTV/Sources/Core/Torrent/TorrentSession.swift */; };
+		T00100020000000000000005 /* NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = T00100010000000000000005 /* NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift */; };
 		7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */ = {isa = PBXBuildFile; productRef = A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */; };
 		7E51000000000000000000B1 /* TopShelf.appex in Embed App Extensions */ = {isa = PBXBuildFile; fileRef = 7E51000000000000000000A1 /* TopShelf.appex */; settings = {ATTRIBUTES = (RemoveHeadersOnCopy, ); }; };
 		7E51000000000000000000B2 /* TopShelf/TopShelfContentProvider.swift in Sources */ = {isa = PBXBuildFile; fileRef = 7E51000000000000000000A2 /* TopShelf/TopShelfContentProvider.swift */; };
@@ -29,6 +34,7 @@
 		A1L100020000000000000002 /* NuvioTV/Sources/Core/AppLanguage.swift in Sources */ = {isa = PBXBuildFile; fileRef = A1L100010000000000000001 /* NuvioTV/Sources/Core/AppLanguage.swift */; };
 		A1L100040000000000000004 /* NuvioTV/Resources/AppLanguageCatalog.json in Resources */ = {isa = PBXBuildFile; fileRef = A1L100030000000000000003 /* NuvioTV/Resources/AppLanguageCatalog.json */; };
 		AE00BF010000000000000001 /* AetherEngine in Frameworks */ = {isa = PBXBuildFile; productRef = AE00PD010000000000000001 /* AetherEngine */; };
+		LT00BF010000000000000001 /* LibTorrent in Frameworks */ = {isa = PBXBuildFile; productRef = LT00PD010000000000000001 /* LibTorrent */; };
 		A21100000000000000000002 /* AetherEngineSMB in Frameworks */ = {isa = PBXBuildFile; productRef = A21100000000000000000001 /* AetherEngineSMB */; };
 		A21300000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000001 /* NuvioTV/Sources/Core/SMB/MediaFilenameParser.swift */; };
 		A21300000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift in Sources */ = {isa = PBXBuildFile; fileRef = A21200000000000000000002 /* NuvioTV/Sources/Core/SMB/SMBCredentialStore.swift */; };
@@ -62,8 +68,10 @@
 		AE10B00E /* NuvioTV/Sources/Core/Player/AppleTVCapability.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00E /* NuvioTV/Sources/Core/Player/AppleTVCapability.swift */; };
 		AE10B00F /* AppleTVCapabilityTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F00F /* AppleTVCapabilityTests.swift */; };
 		AE10B011 /* PictureInPictureTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F011 /* PictureInPictureTests.swift */; };
- 		AE10B01B /* PosterCardStyleSyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F01B /* PosterCardStyleSyncTests.swift */; };
+		AE10B01B /* PosterCardStyleSyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F01B /* PosterCardStyleSyncTests.swift */; };
+		D0A100010000000000000001 /* DetailsViewModelTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = D0A100000000000000000001 /* DetailsViewModelTests.swift */; };
 		DEB010030000000000000003 /* DebridStreamPresentationTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = DEB000030000000000000003 /* DebridStreamPresentationTests.swift */; };
+		TOR010060000000000000006 /* TorrentStreamTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = TOR000060000000000000006 /* TorrentStreamTests.swift */; };
 		AE10B01C /* ContinueWatchingAndPlayerSyncTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F01C /* ContinueWatchingAndPlayerSyncTests.swift */; };
 		AE10B01D /* PlayerControlsSettingsTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F01D /* PlayerControlsSettingsTests.swift */; };
 		AE10B01E /* AuthReauthFlowTests.swift in Sources */ = {isa = PBXBuildFile; fileRef = AE10F01E /* AuthReauthFlowTests.swift */; };
@@ -204,6 +212,11 @@
 		51A100050000000000000005 /* SimklAuthServiceTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = SimklAuthServiceTests.swift; sourceTree = "<group>"; };
 		51A100070000000000000007 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Simkl/SimklSyncService.swift; sourceTree = "<group>"; };
 		51A1000A000000000000000A /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift; sourceTree = "<group>"; };
+		T00100010000000000000001 /* NuvioTV/Sources/Core/Torrent/TorrentSettings.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Torrent/TorrentSettings.swift; sourceTree = "<group>"; };
+		T00100010000000000000002 /* NuvioTV/Sources/Core/Torrent/TorrentModels.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Torrent/TorrentModels.swift; sourceTree = "<group>"; };
+		T00100010000000000000003 /* NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift; sourceTree = "<group>"; };
+		T00100010000000000000004 /* NuvioTV/Sources/Core/Torrent/TorrentSession.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Torrent/TorrentSession.swift; sourceTree = "<group>"; };
+		T00100010000000000000005 /* NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift; sourceTree = "<group>"; };
 		7E51000000000000000000A1 /* TopShelf.appex */ = {isa = PBXFileReference; explicitFileType = "wrapper.app-extension"; includeInIndex = 0; path = TopShelf.appex; sourceTree = BUILT_PRODUCTS_DIR; };
 		7E51000000000000000000A2 /* TopShelf/TopShelfContentProvider.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TopShelf/TopShelfContentProvider.swift; sourceTree = "<group>"; };
 		7E51000000000000000000A3 /* TopShelf/Info.plist */ = {isa = PBXFileReference; lastKnownFileType = text.plist.xml; path = TopShelf/Info.plist; sourceTree = "<group>"; };
@@ -245,7 +258,9 @@
 		AE10F00F /* AppleTVCapabilityTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AppleTVCapabilityTests.swift; sourceTree = "<group>"; };
 		AE10F011 /* PictureInPictureTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PictureInPictureTests.swift; sourceTree = "<group>"; };
 		AE10F01B /* PosterCardStyleSyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PosterCardStyleSyncTests.swift; sourceTree = "<group>"; };
+		D0A100000000000000000001 /* DetailsViewModelTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DetailsViewModelTests.swift; sourceTree = "<group>"; };
 		DEB000030000000000000003 /* DebridStreamPresentationTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DebridStreamPresentationTests.swift; sourceTree = "<group>"; };
+		TOR000060000000000000006 /* TorrentStreamTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = TorrentStreamTests.swift; sourceTree = "<group>"; };
 		AE10F01C /* ContinueWatchingAndPlayerSyncTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ContinueWatchingAndPlayerSyncTests.swift; sourceTree = "<group>"; };
 		AE10F01D /* PlayerControlsSettingsTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PlayerControlsSettingsTests.swift; sourceTree = "<group>"; };
 		AE10F01E /* AuthReauthFlowTests.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = AuthReauthFlowTests.swift; sourceTree = "<group>"; };
@@ -352,6 +367,7 @@
 			files = (
 				7397CF462F80FE3A00AC0F84 /* MPVKit in Frameworks */,
 				AE00BF010000000000000001 /* AetherEngine in Frameworks */,
+				LT00BF010000000000000001 /* LibTorrent in Frameworks */,
 				A21100000000000000000002 /* AetherEngineSMB in Frameworks */,
 				0B5F05C3171C7AB141FBE349 /* Pods_NuvioTV.framework in Frameworks */,
 			);
@@ -497,6 +513,11 @@
 				51A100010000000000000001 /* NuvioTV/Sources/Core/Simkl/SimklAPIClient.swift */,
 				51A100030000000000000003 /* NuvioTV/Sources/Core/Simkl/SimklAuthService.swift */,
 				51A1000A000000000000000A /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift */,
+				T00100010000000000000001 /* NuvioTV/Sources/Core/Torrent/TorrentSettings.swift */,
+				T00100010000000000000002 /* NuvioTV/Sources/Core/Torrent/TorrentModels.swift */,
+				T00100010000000000000003 /* NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift */,
+				T00100010000000000000004 /* NuvioTV/Sources/Core/Torrent/TorrentSession.swift */,
+				T00100010000000000000005 /* NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift */,
 				51A100070000000000000007 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift */,
 				C0D3002D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift */,
 				C0D30060 /* NuvioTV/Sources/Core/Streams/StreamQualityTags.swift */,
@@ -601,6 +622,7 @@
 		T0D320E200000000000000E2 /* NuvioTVTests */ = {
 			isa = PBXGroup;
 			children = (
+				D0A100000000000000000001 /* DetailsViewModelTests.swift */,
 				AE10F00B /* PlaybackBackendPolicyTests.swift */,
 				AE10F062 /* PlaybackIdlePolicyTests.swift */,
 				AE10F01A /* CatalogArtworkMergeTests.swift */,
@@ -608,6 +630,7 @@
 				AE10F011 /* PictureInPictureTests.swift */,
 				AE10F01B /* PosterCardStyleSyncTests.swift */,
 				DEB000030000000000000003 /* DebridStreamPresentationTests.swift */,
+				TOR000060000000000000006 /* TorrentStreamTests.swift */,
 				AE10F01C /* ContinueWatchingAndPlayerSyncTests.swift */,
 				AE10F01D /* PlayerControlsSettingsTests.swift */,
 				AE10F01E /* AuthReauthFlowTests.swift */,
@@ -663,6 +686,7 @@
 			packageProductDependencies = (
 				A1B2C3D4E5F6A7B8C9D0E1F2 /* MPVKit */,
 				AE00PD010000000000000001 /* AetherEngine */,
+				LT00PD010000000000000001 /* LibTorrent */,
 				A21100000000000000000001 /* AetherEngineSMB */,
 			);
 			productName = NuvioTV;
@@ -718,6 +742,7 @@
 			packageReferences = (
 				F1E2D3C4B5A6F7E8D9C0B1A2 /* XCLocalSwiftPackageReference "../MPVKit" */,
 				AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */,
+				LT00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/LibTorrent" */,
 			);
 			productRefGroup = 83CBBA001A601CBA00E9B192 /* Products */;
 			projectDirPath = "";
@@ -808,6 +833,7 @@
 			isa = PBXSourcesBuildPhase;
 			buildActionMask = 2147483647;
 			files = (
+				D0A100010000000000000001 /* DetailsViewModelTests.swift in Sources */,
 				AE10B00B /* PlaybackBackendPolicyTests.swift in Sources */,
 				AE10B062 /* PlaybackIdlePolicyTests.swift in Sources */,
 				AE10B01A /* CatalogArtworkMergeTests.swift in Sources */,
@@ -815,6 +841,7 @@
 				AE10B011 /* PictureInPictureTests.swift in Sources */,
 				AE10B01B /* PosterCardStyleSyncTests.swift in Sources */,
 				DEB010030000000000000003 /* DebridStreamPresentationTests.swift in Sources */,
+				TOR010060000000000000006 /* TorrentStreamTests.swift in Sources */,
 				AE10B01C /* ContinueWatchingAndPlayerSyncTests.swift in Sources */,
 				AE10B01D /* PlayerControlsSettingsTests.swift in Sources */,
 				AE10B01E /* AuthReauthFlowTests.swift in Sources */,
@@ -914,6 +941,11 @@
 				51A100040000000000000004 /* NuvioTV/Sources/Core/Simkl/SimklAuthService.swift in Sources */,
 				51A100080000000000000008 /* NuvioTV/Sources/Core/Simkl/SimklSyncService.swift in Sources */,
 				51A1000B000000000000000B /* NuvioTV/Sources/Core/Simkl/SimklDetailsService.swift in Sources */,
+				T00100020000000000000001 /* NuvioTV/Sources/Core/Torrent/TorrentSettings.swift in Sources */,
+				T00100020000000000000002 /* NuvioTV/Sources/Core/Torrent/TorrentModels.swift in Sources */,
+				T00100020000000000000003 /* NuvioTV/Sources/Core/Torrent/TorrentStreamServer.swift in Sources */,
+				T00100020000000000000004 /* NuvioTV/Sources/Core/Torrent/TorrentSession.swift in Sources */,
+				T00100020000000000000005 /* NuvioTV/Sources/Core/Torrent/TorrentEngineManager.swift in Sources */,
 				C0D3102D000000000000002D /* NuvioTV/Sources/Core/Skip/IntroDBSkipService.swift in Sources */,
 				C0D31072 /* NuvioTV/Sources/UI/Details/ProductionBrowseView.swift in Sources */,
 				C0D31071 /* NuvioTV/Sources/Core/Trakt/TraktDetailsService.swift in Sources */,
@@ -1038,6 +1070,14 @@
 				DEVELOPMENT_TEAM = RNNQM69L4M;
 				ENABLE_BITCODE = NO;
 				ENABLE_TESTABILITY = YES;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../Vendor/LibTorrent",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../Vendor/LibTorrent",
+				);
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1049,6 +1089,8 @@
 					"$(inherited)",
 					"-ObjC",
 					"-lc++",
+					"-framework",
+					"SystemConfiguration",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos;
 				PRODUCT_NAME = NuvioTV;
@@ -1071,6 +1113,14 @@
 				CODE_SIGN_ENTITLEMENTS = NuvioTV/NuvioTV.entitlements;
 				CURRENT_PROJECT_VERSION = 65;
 				DEVELOPMENT_TEAM = RNNQM69L4M;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../Vendor/LibTorrent",
+				);
+				HEADER_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(SRCROOT)/../Vendor/LibTorrent",
+				);
 				INFOPLIST_FILE = NuvioTV/Info.plist;
 				IPHONEOS_DEPLOYMENT_TARGET = 15.1;
 				LD_RUNPATH_SEARCH_PATHS = (
@@ -1082,6 +1132,8 @@
 					"$(inherited)",
 					"-ObjC",
 					"-lc++",
+					"-framework",
+					"SystemConfiguration",
 				);
 				PRODUCT_BUNDLE_IDENTIFIER = com.pyksel.nuviotvos;
 				PRODUCT_NAME = NuvioTV;
@@ -1302,6 +1354,10 @@
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../Vendor/AetherEngine;
 		};
+		LT00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/LibTorrent" */ = {
+			isa = XCLocalSwiftPackageReference;
+			relativePath = ../Vendor/LibTorrent;
+		};
 		F1E2D3C4B5A6F7E8D9C0B1A2 /* XCLocalSwiftPackageReference "../MPVKit" */ = {
 			isa = XCLocalSwiftPackageReference;
 			relativePath = ../MPVKit;
@@ -1318,6 +1374,11 @@
 			isa = XCSwiftPackageProductDependency;
 			package = AE00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/AetherEngine" */;
 			productName = AetherEngine;
+		};
+		LT00PD010000000000000001 /* LibTorrent */ = {
+			isa = XCSwiftPackageProductDependency;
+			package = LT00PR010000000000000001 /* XCLocalSwiftPackageReference "../Vendor/LibTorrent" */;
+			productName = LibTorrent;
 		};
 		A21100000000000000000001 /* AetherEngineSMB */ = {
 			isa = XCSwiftPackageProductDependency;

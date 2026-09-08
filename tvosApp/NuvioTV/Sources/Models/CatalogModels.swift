@@ -749,9 +749,16 @@ struct NuvioStream: Identifiable, Codable {
     /// Stable identity for lists and focus. Prefer URL / torrent key; never mint a
     /// fresh UUID on each access (that forces full SwiftUI list rebuilds).
     var id: String {
-        if let url, !url.isEmpty { return url }
-        if let infoHash, !infoHash.isEmpty {
-            return "\(infoHash):\(fileIdx ?? -1)"
+        let parsed = TorrentSourceParser.parse(
+            url: url,
+            infoHash: infoHash,
+            fileIdx: fileIdx
+        )
+        if let directURL = parsed.directURL, !directURL.isEmpty {
+            return directURL
+        }
+        if let infoHash = parsed.infoHash, !infoHash.isEmpty {
+            return "\(infoHash):\(parsed.fileIdx ?? -1)"
         }
         // Deterministic content fallback for rare shells with no playable key.
         return "stream:\(name ?? "")|\(description ?? "")|\(addonName ?? "")|\(filename ?? "")"
@@ -765,8 +772,8 @@ struct NuvioStream: Identifiable, Codable {
     /// generic placeholder. `nil` when the add-on manifest has no logo.
     let addonLogoURL: String?
     /// Torrent info-hash from add-ons like Torrentio. Present when the add-on
-    /// returns a torrent instead of a direct URL; a debrid provider turns this
-    /// into a playable link. See `Core/Debrid`.
+    /// returns a torrent instead of a direct URL; Debrid or the local P2P
+    /// engine can turn it into a playable link. See `Core/Torrent`.
     let infoHash: String?
     /// Index of the wanted file inside the torrent (for multi-file torrents).
     let fileIdx: Int?
@@ -802,15 +809,20 @@ struct NuvioStream: Identifiable, Codable {
         isCached: Bool? = nil,
         httpHeaders: [String: String]? = nil
     ) {
-        self.url = url
+        let parsed = TorrentSourceParser.parse(
+            url: url,
+            infoHash: infoHash,
+            fileIdx: fileIdx
+        )
+        self.url = parsed.directURL ?? (parsed.infoHash == nil ? url : nil)
         self.name = name
         self.description = description
         self.addonName = addonName
         self.subtitles = subtitles
         self.addonLogoURL = addonLogoURL
-        self.infoHash = infoHash
-        self.fileIdx = fileIdx
-        self.sources = sources
+        self.infoHash = parsed.infoHash
+        self.fileIdx = parsed.fileIdx
+        self.sources = TorrentSourceParser.normalizedTrackers(sources)
         self.filename = filename
         self.videoSize = videoSize
         self.bingeGroup = bingeGroup
@@ -818,10 +830,34 @@ struct NuvioStream: Identifiable, Codable {
         self.httpHeaders = httpHeaders
     }
 
-    /// A stream that has no direct URL but carries a torrent info-hash: it must
-    /// be run through a debrid provider before it can play.
+    /// The direct HTTP URL, if this stream is not a magnet/torrent transport.
+    /// Computed from all supported forms so decoded legacy values behave like
+    /// streams normalized by `StreamAddonStreamDTO`.
+    var directURL: String? {
+        TorrentSourceParser.parse(url: url, infoHash: infoHash, fileIdx: fileIdx).directURL
+    }
+
+    /// The explicit or URL-embedded torrent hash.
+    var effectiveInfoHash: String? {
+        TorrentSourceParser.parse(url: url, infoHash: infoHash, fileIdx: fileIdx).infoHash
+    }
+
+    /// The explicit or URL-embedded file index.
+    var effectiveFileIdx: Int? {
+        TorrentSourceParser.parse(url: url, infoHash: infoHash, fileIdx: fileIdx).fileIdx
+    }
+
+    /// A stream that has no direct URL but carries a torrent info-hash. It can
+    /// be resolved by Debrid or streamed through the embedded P2P engine.
     var isDebridResolvable: Bool {
-        (url?.isEmpty ?? true) && (infoHash?.isEmpty == false)
+        let parsed = TorrentSourceParser.parse(url: url, infoHash: infoHash, fileIdx: fileIdx)
+        return parsed.directURL == nil && parsed.infoHash != nil
+    }
+
+    /// A stream that has no direct URL but carries a torrent info-hash: it can
+    /// be streamed directly via the embedded P2P BitTorrent engine.
+    var isTorrentStream: Bool {
+        isDebridResolvable
     }
 
     /// True when the stream is known or strongly labeled as debrid-cached.

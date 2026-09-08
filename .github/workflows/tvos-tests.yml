@@ -1,0 +1,39 @@
+name: tvOS tests
+
+on:
+  workflow_dispatch:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  unit-tests:
+    # Match the Apple Silicon / Xcode 27 configuration used for local validation.
+    runs-on: xcode-27
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Check local package inputs
+        run: |
+          test -f Vendor/LibTorrent/Package.swift || { echo 'Missing Vendor/LibTorrent: include the local package and its binary inputs in the checkout.'; exit 1; }
+          test -f MPVKit/Package.swift
+
+      - name: Install pods
+        run: pod install --project-directory=tvosApp --deployment
+
+      - name: Run tvOS unit tests
+        env:
+          NUVIO_TEST_ARTIFACTS: ${{ runner.temp }}/nuvio-tests
+          NUVIO_DERIVED_DATA: ${{ runner.temp }}/NuvioTVDerivedData
+        run: bash scripts/test-tvos.sh
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tvos-test-results
+          path: ${{ runner.temp }}/nuvio-tests
+          if-no-files-found: ignore

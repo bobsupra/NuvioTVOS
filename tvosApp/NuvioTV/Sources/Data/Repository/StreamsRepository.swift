@@ -731,11 +731,16 @@ struct StreamAddonStreamDTO: Decodable {
     let infoHash: String?
     let fileIdx: Int?
     let sources: [String]?
+    let clientResolve: StreamAddonClientResolveDTO?
 
     func toNuvioStream(addonName: String) -> NuvioStream? {
-        let streamURL = cleaned(url) ?? cleaned(externalUrl)
-        let hash = cleaned(infoHash)?.lowercased()
-        guard streamURL != nil || hash != nil else { return nil }
+        let resolve = clientResolve
+        let parsed = TorrentSourceParser.parse(
+            urls: [url, externalUrl, resolve?.magnetUri],
+            infoHash: infoHash ?? resolve?.infoHash,
+            fileIdx: fileIdx ?? resolve?.fileIdx
+        )
+        guard parsed.directURL != nil || parsed.infoHash != nil else { return nil }
 
         let displayName = cleaned(name) ?? cleaned(title) ?? "Stream"
         var detailLines: [String] = []
@@ -749,15 +754,15 @@ struct StreamAddonStreamDTO: Decodable {
         }
 
         return NuvioStream(
-            url: streamURL,
+            url: parsed.directURL,
             name: displayName,
             description: detailLines.joined(separator: "\n"),
             addonName: addonName,
             subtitles: subtitles?.compactMap { $0.toNuvioSubtitle(source: addonName) } ?? [],
-            infoHash: hash,
-            fileIdx: fileIdx,
-            sources: sources ?? [],
-            filename: cleaned(behaviorHints?.filename),
+            infoHash: parsed.infoHash,
+            fileIdx: parsed.fileIdx,
+            sources: (sources ?? []) + (resolve?.sources ?? []),
+            filename: cleaned(behaviorHints?.filename) ?? cleaned(resolve?.filename),
             videoSize: behaviorHints?.videoSize,
             bingeGroup: cleaned(behaviorHints?.bingeGroup),
             isCached: behaviorHints?.cached ?? behaviorHints?.isCached,
@@ -777,6 +782,17 @@ struct StreamAddonStreamDTO: Decodable {
         formatter.countStyle = .file
         return formatter
     }()
+}
+
+/// Optional resolver metadata emitted by newer add-ons/plugins. tvOS does not
+/// need the Android service-specific fields, but it can use the common torrent
+/// identity and tracker/file hints to stream the raw source locally.
+struct StreamAddonClientResolveDTO: Decodable {
+    let infoHash: String?
+    let fileIdx: Int?
+    let magnetUri: String?
+    let sources: [String]?
+    let filename: String?
 }
 
 struct StreamAddonSubtitleDTO: Decodable {

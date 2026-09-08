@@ -31,12 +31,12 @@ struct DebridResolver {
     /// isn't a torrent, no provider is configured, or resolution fails — the
     /// caller should then move on to the next stream.
     func resolvedURL(for stream: NuvioStream, season: Int?, episode: Int?) async -> DebridResult? {
-        guard stream.isDebridResolvable, let infoHash = stream.infoHash else { return nil }
+        guard stream.isDebridResolvable, let infoHash = stream.effectiveInfoHash else { return nil }
         guard let provider = provider(for: selectedKind) else { return nil }
 
         let request = DebridRequest(
             infoHash: infoHash,
-            fileIdx: stream.fileIdx,
+            fileIdx: stream.effectiveFileIdx,
             sources: stream.sources,
             filename: stream.filename,
             season: season,

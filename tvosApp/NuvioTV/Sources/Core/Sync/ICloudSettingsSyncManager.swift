@@ -200,6 +200,7 @@ final class ICloudSettingsSyncManager: ObservableObject {
     private func extractSettingsPayload(from defaults: UserDefaults) -> [String: Any] {
         var payload: [String: Any] = [:]
         for key in SettingsKey.all {
+            guard !SettingsKey.deviceLocal.contains(key) else { continue }
             if let value = defaults.object(forKey: key) {
                 // Only encode plist-compatible types supported by NSUbiquitousKeyValueStore
                 if let str = value as? String {
@@ -218,7 +219,7 @@ final class ICloudSettingsSyncManager: ObservableObject {
 
     private func applySettingsPayload(_ payload: [String: Any], to defaults: UserDefaults) {
         for (key, value) in payload {
-            guard SettingsKey.all.contains(key) else { continue }
+            guard SettingsKey.all.contains(key), !SettingsKey.deviceLocal.contains(key) else { continue }
             // Don't overwrite if identical
             let currentVal = defaults.object(forKey: key)
             if let strVal = value as? String, (currentVal as? String) != strVal {

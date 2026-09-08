@@ -5,6 +5,54 @@ import AVFoundation
 
 @MainActor
 final class PictureInPictureTests: XCTestCase {
+    override func setUp() async throws {
+        PictureInPictureManager.shared.invalidateSession()
+    }
+
+    override func tearDown() async throws {
+        PictureInPictureManager.shared.invalidateSession()
+        PictureInPictureManager.shared.onRestoreUI = nil
+    }
+
+    func testRegisteringNoAetherSessionClearsOldBridge() throws {
+        let manager = PictureInPictureManager.shared
+        let host = try XCTUnwrap(AetherPlaybackController())
+        let old = PlaybackSessionCoordinator(aetherController: host)
+        let context = ActivePlaybackContext(url: URL(string: "https://example.test/video")!, meta: makeTestMeta(id: "test", name: "Test", type: "movie"), subtitle: "")
+        manager.registerSession(coordinator: old, context: context)
+        XCTAssertTrue(manager.activeAetherController === host)
+        let replacement = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        manager.registerSession(coordinator: replacement, context: context)
+        XCTAssertTrue(manager.activeCoordinator === replacement)
+        XCTAssertNil(manager.activeAetherController)
+        XCTAssertNil(manager.pipController)
+        XCTAssertFalse(manager.isPictureInPicturePossible)
+        manager.refreshController(for: old)
+        XCTAssertNil(manager.activeAetherController)
+    }
+
+    func testSuccessfulStartupRetryRebindsViewModelAndRegisteredPiPContext() throws {
+        let host = try XCTUnwrap(AetherPlaybackController())
+        var attempts = 0
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: {
+            attempts += 1
+            return attempts == 1 ? nil : host
+        }, engineSettingProvider: { "AetherEngine" }, loadDispatcher: { _, _, _ in })
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer { model.shutdown() }
+        let url = URL(string: "https://example.test/retry")!
+        coordinator.load(PlaybackLoadRequest(videoURL: url))
+        let context = ActivePlaybackContext(url: url, meta: makeTestMeta(id: "retry", name: "Retry", type: "movie"), subtitle: "")
+        PictureInPictureManager.shared.registerSession(coordinator: coordinator, context: context)
+        XCTAssertNotNil(model.playbackStartupError)
+        model.retryPlaybackStartup()
+        XCTAssertNil(model.playbackStartupError)
+        XCTAssertNotNil(host.onPlaybackSuspended)
+        XCTAssertNotNil(host.subtitleTranslationState.onFirstOutcome)
+        XCTAssertTrue(PictureInPictureManager.shared.activeAetherController === host)
+        XCTAssertEqual(PictureInPictureManager.shared.activeContext, context)
+        XCTAssertEqual(attempts, 2)
+    }
     private func makeTestMeta(id: String, name: String, type: String) -> NuvioMeta {
         NuvioMeta(
             id: id,
@@ -87,7 +135,11 @@ final class PictureInPictureTests: XCTestCase {
 
     func testSessionRegistrationAndInvalidation() {
         let manager = PictureInPictureManager.shared
-        let coordinator = PlaybackSessionCoordinator()
+        guard let aether = AetherPlaybackController() else {
+            XCTFail("AetherEngine should initialize in the test environment")
+            return
+        }
+        let coordinator = PlaybackSessionCoordinator(aetherController: aether)
         let url = URL(string: "https://example.com/test.mp4")!
         let meta = makeTestMeta(id: "tt9999999", name: "Test Show", type: "series")
         let context = ActivePlaybackContext(

@@ -206,6 +206,11 @@ enum SettingsKey {
     static let debridProvider = "nuvio.tv.settings.integrations.debridProvider"
     static let debridApiKey = "nuvio.tv.settings.integrations.debridApiKey"
     static let debridEnabled = "nuvio.tv.settings.integrations.debridEnabled"
+    static let p2pEnabled = "nuvio.tv.settings.integrations.p2pEnabled"
+    /// Device/profile-local acknowledgement for direct peer-to-peer playback.
+    static let p2pConsentAccepted = "nuvio.tv.settings.integrations.p2pConsentAccepted"
+    static let p2pHideTorrentStats = "nuvio.tv.settings.integrations.p2pHideTorrentStats"
+    static let p2pCacheLimitGB = "nuvio.tv.settings.integrations.p2pCacheLimitGB"
     static let cloudLibraryEnabled = "nuvio.tv.settings.integrations.cloudLibraryEnabled"
     /// Provider-specific device-flow tokens. Keeping them separate matches the
     /// Android TV debrid screen so multiple providers can stay linked.
@@ -283,10 +288,11 @@ enum SettingsKey {
     static let iCloudLastSyncDate = "nuvio.tv.settings.advanced.iCloudLastSyncDate"
     static let simklAccessToken = "nuvio.tv.settings.integrations.simklAccessToken"
 
-    /// API app credentials must remain on the Apple TV and never enter the
-    /// account settings payload.
+    /// Credentials and device acknowledgements must remain on this Apple TV
+    /// and never enter the account settings payload.
     static let deviceLocal = Set([
-        traktClientID, traktClientSecret, simklClientID, aiSubtitlesGeminiAPIKey
+        traktClientID, traktClientSecret, simklClientID, aiSubtitlesGeminiAPIKey,
+        p2pConsentAccepted
     ])
 
     static let all = [
@@ -310,7 +316,8 @@ enum SettingsKey {
         mdbListEnabled, mdbListApiKey, mdbListUseImdb, mdbListUseTmdb,
         mdbListUseTomatoes, mdbListUseMetacritic, mdbListUseTrakt,
         mdbListUseLetterboxd, mdbListUseAudience,
-        debridProvider, debridApiKey, debridEnabled, cloudLibraryEnabled,
+        debridProvider, debridApiKey, debridEnabled, p2pEnabled, p2pConsentAccepted,
+        p2pHideTorrentStats, p2pCacheLimitGB, cloudLibraryEnabled,
         torboxAccessToken, premiumizeAccessToken, realDebridAccessToken,
         aiSubtitlesEnabled, aiSubtitlesProvider, aiSubtitlesGeminiAPIKey, aiSubtitlesGeminiModel,
         aiSubtitlesOpenRouterModel,
@@ -3279,6 +3286,11 @@ private struct IntegrationSettingsView: View {
     @AppStorage(SettingsKey.premiumizeAccessToken) private var premiumizeAccessToken = ""
     @AppStorage(SettingsKey.realDebridAccessToken) private var realDebridAccessToken = ""
     @AppStorage(SettingsKey.aiSubtitlesEnabled) private var aiSubtitlesEnabled = false
+    @AppStorage private var p2pEnabled: Bool
+    @AppStorage private var p2pConsentAccepted: Bool
+    @AppStorage private var p2pHideTorrentStats: Bool
+    @AppStorage private var p2pCacheLimitGB: Int
+    @State private var currentCacheSizeText: String = TorrentSettings.cacheSizeFormatted()
     @State private var debridAccountToConnect: DebridAccountProvider?
     @State private var showingTraktLogin = false
     @State private var showingTraktSettings = false
@@ -3287,6 +3299,7 @@ private struct IntegrationSettingsView: View {
     @State private var showingTmdbOptions = false
     @State private var showingMdbListOptions = false
     @State private var showingAISubtitleOptions = false
+    @State private var showingP2PConsent = false
     @StateObject private var debridConnection = DebridAccountConnectionViewModel()
 
     init(accentColor: Color, profileID: String?) {
@@ -3321,6 +3334,26 @@ private struct IntegrationSettingsView: View {
         _traktClientIDDraft = State(initialValue: storedTraktClientID)
         _traktClientSecretDraft = State(initialValue: storedTraktClientSecret)
         _simklClientIDDraft = State(initialValue: storedSimklClientID)
+        _p2pEnabled = AppStorage(
+            wrappedValue: false,
+            SettingsKey.p2pEnabled,
+            store: profileStore
+        )
+        _p2pConsentAccepted = AppStorage(
+            wrappedValue: false,
+            SettingsKey.p2pConsentAccepted,
+            store: profileStore
+        )
+        _p2pHideTorrentStats = AppStorage(
+            wrappedValue: false,
+            SettingsKey.p2pHideTorrentStats,
+            store: profileStore
+        )
+        _p2pCacheLimitGB = AppStorage(
+            wrappedValue: 10,
+            SettingsKey.p2pCacheLimitGB,
+            store: profileStore
+        )
     }
 
     var body: some View {
@@ -3491,15 +3524,74 @@ private struct IntegrationSettingsView: View {
                 }
             }
 
+            SettingsGroup(
+                title: L10n.string("tvos_settings_p2p_title", fallback: "P2P BitTorrent"),
+                subtitle: L10n.string("tvos_settings_p2p_subtitle", fallback: "Embedded client for raw torrent streams (Torrentio, TPB+)")
+            ) {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_p2p_enabled_title", fallback: "P2P Torrent Streaming"),
+                    subtitle: L10n.string("tvos_settings_p2p_enabled_subtitle", fallback: "Stream raw torrents directly on Apple TV without an external server or Debrid."),
+                    isOn: p2pToggleBinding,
+                    accentColor: accentColor
+                )
+
+                if p2pIsEnabled {
+                    SettingsToggleRow(
+                        title: L10n.string("tvos_settings_p2p_hide_stats_title", fallback: "Hide Swarm Stats"),
+                        subtitle: L10n.string("tvos_settings_p2p_hide_stats_subtitle", fallback: "Hide live peer/seed count and download speeds during buffering and playback."),
+                        isOn: $p2pHideTorrentStats,
+                        accentColor: accentColor
+                    )
+
+                    SettingsStepperRow(
+                        title: L10n.string("tvos_settings_p2p_cache_limit_title", fallback: "Cache Storage Limit"),
+                        subtitle: L10n.string("tvos_settings_p2p_cache_limit_subtitle", fallback: "Maximum disk storage allocated for buffering and cached torrent chunks."),
+                        value: $p2pCacheLimitGB,
+                        range: 2...40,
+                        step: 2,
+                        suffix: " GB",
+                        accentColor: accentColor
+                    )
+
+                    SettingsActionRow(
+                        title: L10n.string("tvos_settings_p2p_clear_cache_title", fallback: "Clear Torrent Cache"),
+                        subtitle: L10n.string("tvos_settings_p2p_clear_cache_subtitle", fallback: "Delete cached torrent chunks from disk."),
+                        value: currentCacheSizeText,
+                        accentColor: accentColor
+                    ) {
+                        TorrentSettings.clearCache()
+                        currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
+                    }
+                }
+            }
+
             SMBSettingsSection(accentColor: accentColor)
 
             JellyfinSettingsSection(accentColor: accentColor)
         }
         .onAppear {
+            currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
             traktViewModel.reload()
             traktViewModel.loadConnectedData()
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
+        }
+        .alert(
+            L10n.string("tvos_settings_p2p_consent_title", fallback: "P2P Torrent Streaming"),
+            isPresented: $showingP2PConsent
+        ) {
+            Button(L10n.string("tvos_settings_p2p_consent_enable", fallback: "Enable P2P")) {
+                p2pConsentAccepted = true
+                p2pEnabled = true
+            }
+            Button(L10n.string("tvos_settings_p2p_consent_cancel", fallback: "Cancel"), role: .cancel) {
+                p2pEnabled = false
+            }
+        } message: {
+            Text(L10n.string(
+                "tvos_settings_p2p_consent_message",
+                fallback: "P2P connects directly to other peers. Your public IP address may be visible to them, and your device may upload data. Enable this only for content you have the legal right to access."
+            ))
         }
         .onChange(of: tmdbApiKey) { _, _ in
             if !tmdbHasApiKey {
@@ -3584,6 +3676,28 @@ private struct IntegrationSettingsView: View {
 
     private var hasAnyDebridConnected: Bool {
         !connectedProviders.isEmpty
+    }
+
+    private var p2pIsEnabled: Bool {
+        p2pEnabled && p2pConsentAccepted
+    }
+
+    private var p2pToggleBinding: Binding<Bool> {
+        Binding(
+            get: { p2pIsEnabled },
+            set: { enabled in
+                if enabled {
+                    if p2pConsentAccepted {
+                        p2pEnabled = true
+                    } else {
+                        p2pEnabled = false
+                        showingP2PConsent = true
+                    }
+                } else {
+                    p2pEnabled = false
+                }
+            }
+        )
     }
 
     private var connectedProviders: [DebridAccountProvider] {

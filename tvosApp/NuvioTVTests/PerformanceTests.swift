@@ -30,19 +30,19 @@ final class PerformanceTests: XCTestCase {
 
     func testDetailsViewModelInitializationPerformance() {
         measure {
-            let viewModel = DetailsViewModel(repository: repository)
+            let viewModel = DetailsViewModel(repository: repository, streamDiscoveryMode: .repository)
             XCTAssertNotNil(viewModel)
         }
     }
 
     func testDetailsLoadingPerformance() {
-        let viewModel = DetailsViewModel(repository: repository)
+        let viewModel = DetailsViewModel(repository: repository, streamDiscoveryMode: .repository)
 
         measure {
             let expectation = XCTestExpectation(description: "Load details")
 
             Task { @MainActor in
-                viewModel.loadDetails(id: "movie_1")
+                viewModel.loadDetails(id: "movie_1", type: "movie")
                 try? await Task.sleep(nanoseconds: 2_000_000_000)
                 expectation.fulfill()
             }
@@ -227,7 +227,7 @@ final class PerformanceTests: XCTestCase {
     // MARK: - Watchlist Toggle Performance
 
     func testWatchlistTogglePerformance() {
-        let viewModel = DetailsViewModel(repository: repository)
+        let viewModel = DetailsViewModel(repository: repository, streamDiscoveryMode: .repository)
 
         measure {
             for _ in 1...100 {

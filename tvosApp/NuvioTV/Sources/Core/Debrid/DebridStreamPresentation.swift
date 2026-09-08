@@ -35,7 +35,7 @@ struct DebridStreamPresentation {
         let torrentStreams = streams.filter { $0.isDebridResolvable }
         guard !torrentStreams.isEmpty else { return streams }
 
-        let hashes = Array(Set(torrentStreams.compactMap { $0.infoHash }))
+        let hashes = Array(Set(torrentStreams.compactMap(\.effectiveInfoHash)))
         let service = LocalDebridService()
         let cachedMap = await service.checkCached(provider: provider, apiKey: token, hashes: hashes)
 
@@ -44,7 +44,7 @@ struct DebridStreamPresentation {
                 // Direct URL stream (already resolved by add-on or direct HTTP)
                 return stream
             }
-            guard let infoHash = stream.infoHash?.lowercased() else { return nil }
+            guard let infoHash = stream.effectiveInfoHash?.lowercased() else { return nil }
 
             if let cachedMap {
                 guard let cachedItem = cachedMap[infoHash] else {
@@ -95,7 +95,7 @@ struct DebridStreamPresentation {
             subtitles: stream.subtitles,
             addonLogoURL: stream.addonLogoURL,
             infoHash: stream.infoHash,
-            fileIdx: stream.fileIdx,
+            fileIdx: stream.effectiveFileIdx,
             sources: stream.sources,
             filename: finalFilename,
             videoSize: finalSize,
