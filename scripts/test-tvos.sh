@@ -2,9 +2,8 @@
 set -euo pipefail
 
 # Run from the repository root. Extra arguments may select focused test suites.
-test -f tvosApp/NuvioTV.xcworkspace/contents.xcworkspacedata
-test -f tvosApp/Pods/Manifest.lock || {
-  echo 'Run pod install --project-directory=tvosApp --deployment first.' >&2
+test -f tvosApp/NuvioTV.xcworkspace/contents.xcworkspacedata || {
+  echo 'Run tuist generate --path tvosApp --no-open first.' >&2
   exit 1
 }
 

@@ -21,8 +21,11 @@ jobs:
           test -f Vendor/LibTorrent/Package.swift || { echo 'Missing Vendor/LibTorrent: include the local package and its binary inputs in the checkout.'; exit 1; }
           test -f MPVKit/Package.swift
 
-      - name: Install pods
-        run: pod install --project-directory=tvosApp --deployment
+      - name: Install Tuist
+        run: brew install tuist
+
+      - name: Generate Xcode project
+        run: tuist generate --path tvosApp --no-open
 
       - name: Run tvOS unit tests
         env:
