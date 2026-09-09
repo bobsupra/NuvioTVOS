@@ -1953,10 +1953,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
             .store(in: &cancellables)
 
-        engine.$playbackPhase
+        // `.stalled` outranks `.rebuffering` in the engine's phase fold, so the buffer axis
+        // has to be observed alongside it to tell a masked reconnect from a frozen picture.
+        Publishers.CombineLatest(engine.$playbackPhase, engine.$isBuffering)
             .receive(on: DispatchQueue.main)
-            .sink { [weak self] phase in
-                self?.applyPhase(phase)
+            .sink { [weak self] phase, isBuffering in
+                self?.applyPhase(phase, engineIsBuffering: isBuffering)
             }
             .store(in: &cancellables)
 
@@ -2040,7 +2042,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             .store(in: &cancellables)
     }
 
-    private func applyPhase(_ phase: PlaybackPhase) {
+    private func applyPhase(_ phase: PlaybackPhase, engineIsBuffering: Bool) {
         switch phase {
         case .idle:
             isPlayerLoading = false
@@ -2063,7 +2065,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerLoading = true
             // Keep last isPlayerPlaying so UI does not flicker pause icons.
         case .stalled:
-            isPlayerLoading = true
+            // A reader reconnect over still-buffered media leaves the picture rolling.
+            isPlayerLoading = !isPlayerPlaying || engineIsBuffering
         case .ended:
             isPlayerLoading = false
             isPlayerPlaying = false
@@ -2519,7 +2522,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         refreshClock()
         mapAudioTracks(engine.audioTracks)
         mapSubtitleTracks(engine.subtitleTracks)
-        applyPhase(engine.playbackPhase)
+        applyPhase(engine.playbackPhase, engineIsBuffering: engine.isBuffering)
         #if os(tvOS) || os(iOS)
         configureRemoteCommandsIfNeeded()
         #endif
