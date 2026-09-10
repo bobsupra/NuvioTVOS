@@ -46,25 +46,49 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3.4** is the latest tvOS release.
+**Beta 3.3.5** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.4/NuvioTV-3.3.4-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.4) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.5/NuvioTV-3.3.5-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.5) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 100+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 100+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3.4
+### New in Beta 3.3.5
 
-- **Fixed Issues #52 – #62:** Addresses community-reported bugs and feature requests including watch progress resume (#52), addon name display toggle (#53), cache clearing options (#54), Cinemeta layout persistence (#56), subtitle discovery (#57), home scroll smoothness (#58), debrid stream link resolution (#59), and sleep while paused (#62).
-- **Native tvOS Search Keyboard & Dictation (#55, #60):** Integrates native Apple TV keyboard with Siri dictation support and fast focus navigation.
-- **Enhanced Subtitle Selector (#61):** In-player subtitle picker with track selection and timing offset adjustments.
-- **AetherEngine Diagnostics & Hardening:** Enhanced TLS handshakes, HLS origin relay, and software performance snapshot tracking.
+- **Full MDBList Integration:** QR-code device authentication, custom user lists, watchlists, ratings sync, and playback progress scrobbling.
+- **Custom Backend & Server Discovery:** Connect to self-hosted or remote Nuvio servers with automatic local network discovery.
+- **Native P2P & Torrent Streaming:** Stream torrents and magnet links directly on Apple TV with live seed, peer, and download speed indicators.
+- **Smart Buffering Spinner Policy:** Network fluctuations over buffered media no longer pop up buffering spinners over active playback.
+- **Search & Focus Refinements:** Streamlined focus transitions across native search keyboard, category filters, and results grid.
 
-### The new player
+### Built-in Player
 
-Nuvio now uses **AetherEngine** as its primary built-in player instead of the legacy AVPlayer implementation. It supports tvOS-native playback controls, precise seeking and resume, embedded and configured subtitles, styled text and PGS bitmap subtitles, saved audio/subtitle selections, and automatic frame-rate matching. **MPVKit** remains available as a one-way compatibility fallback for sources or controls that AetherEngine cannot currently handle, including separate video/audio URLs, audio delay, audio amplification, and ASS Scale mode.
+Nuvio ships with **AetherEngine** — a free, built-in player with native tvOS controls, subtitle support, resume, audio delay adjustment, and frame-rate matching. **MPVKit** stays as a fallback for edge cases AetherEngine doesn't cover yet (including audio amplification, separate video/audio streams, and full ASS typesetting).
+
+#### AetherEngine vs Infuse
+
+| Feature | AetherEngine (Nuvio) | Infuse |
+|---|---|---|
+| **Price** | ✅ 100% Free & built-in | ❌ Subscription / paid Pro unlock |
+| **Open source** | ✅ Open source (ships with Nuvio) | ❌ Proprietary / closed source |
+| **Native tvOS controls** | ✅ Siri Remote, swipe seek | ✅ Yes |
+| **Resume & watch progress** | ✅ Precise resume | ✅ Yes |
+| **Text subtitles (SRT/VTT)** | ✅ Styled, embedded & external | ✅ Yes |
+| **PGS bitmap subtitles** | ✅ Yes | ✅ Yes |
+| **ASS/SSA subtitles** | ⚠️ Styled (no typesetting) | ✅ Full typesetting |
+| **Audio & subtitle selection** | ✅ Saved per item | ✅ Yes |
+| **Frame-rate & dynamic range matching** | ✅ Automatic | ✅ Automatic |
+| **HDR10, HDR10+ & HLG** | ✅ Native support | ✅ Supported |
+| **Dolby Vision (P5/P8)** | ✅ Built-in | 🔒 Requires paid Infuse Pro |
+| **Dolby Atmos** | ✅ Built-in passthrough (EAC3+JOC) | 🔒 Requires paid Infuse Pro |
+| **High-end audio codecs (DTS-HD, TrueHD)** | ✅ Included free (stream-copy / EAC3 bridge) | 🔒 Requires paid Infuse Pro |
+| **In-player audio delay (lip-sync)** | ✅ Live ±ms offset stepper | ❌ No in-player delay (system/AVR only) |
+| **Audio amplification (boost)** | ⚠️ MPVKit fallback | ✅ Built-in volume boost |
+| **Custom HTTP headers (Referer/User-Agent)** | ✅ Built-in relay & custom headers | ❌ Standard URLs only |
+| **Trakt & Simkl scrobbling** | ✅ Built-in (custom API apps) | 🔌 Trakt only (Simkl not supported) |
+| **Separate video+audio URLs** | ⚠️ MPVKit fallback | ❌ Not supported |
 
 ### Trakt sign-in with your own API app
 
