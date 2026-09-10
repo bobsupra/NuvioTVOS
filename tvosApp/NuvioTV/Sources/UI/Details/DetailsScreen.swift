@@ -39,6 +39,7 @@ struct DetailsScreen: View {
     @State private var pendingEpisode: NuvioVideo?
     @State private var didHandleInitialStreamPicker = false
     @State private var expandedComment: TraktCommentReview?
+    @State private var showingMdbListRating = false
     /// Set while an episode card's context menu is up. tvOS hands the Menu press
     /// that dismisses the menu to this screen as well, and without this the
     /// screen would treat it as Back and return to Home.
@@ -138,6 +139,9 @@ struct DetailsScreen: View {
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
                     onWatchedClick: { viewModel.toggleWatched() },
+                    mdbListUserRating: viewModel.uiState.mdbListUserRating,
+                    showMdbListRating: MdbListRuntimeSession.isAuthenticated(),
+                    onRateClick: { showingMdbListRating = true },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onTrailerClick: { openTrailer(for: viewModel.uiState.meta!) },
                     onOpenTitle: { contentId, contentType in
@@ -199,6 +203,20 @@ struct DetailsScreen: View {
             #endif
         }
         .animation(.easeInOut(duration: 0.18), value: isStreamPickerPresented)
+        .confirmationDialog(
+            viewModel.uiState.meta.map { "Rate \($0.name)" } ?? "Rate on MDBList",
+            isPresented: $showingMdbListRating,
+            titleVisibility: .visible
+        ) {
+            ForEach(Array(stride(from: 10, through: 1, by: -1)), id: \.self) { rating in
+                Button("\(rating)/10") {
+                    submitMdbListRating(rating)
+                }
+            }
+            Button("Remove Rating", role: .destructive) {
+                submitMdbListRating(nil)
+            }
+        }
         #if os(tvOS)
         // Present sources in an isolated full-screen focus hierarchy. Keeping
         // this overlay inside the details screen's vertical ScrollView ancestry
@@ -298,6 +316,15 @@ struct DetailsScreen: View {
         onBack()
     }
 
+    private func submitMdbListRating(_ rating: Int?) {
+        guard let meta = viewModel.uiState.meta else { return }
+        Task { @MainActor in
+            let succeeded = await MdbListRatingsService.setRating(meta, rating: rating)
+            guard succeeded, viewModel.uiState.meta?.id == meta.id else { return }
+            viewModel.setMdbListUserRating(rating)
+        }
+    }
+
     private func presentInitialStreamPickerIfNeeded() {
         guard initiallyPresentStreamPicker,
               !didHandleInitialStreamPicker,
@@ -329,13 +356,7 @@ struct DetailsScreen: View {
     }
 
     private func canonicalEpisodeStreamId(for video: NuvioVideo, meta: NuvioMeta?) -> String {
-        if video.id.hasPrefix("tt") {
-            return video.id
-        }
-        if let metaStreamId = meta?.streamId, metaStreamId.hasPrefix("tt") {
-            return "\(metaStreamId):\(video.season):\(video.episode)"
-        }
-        return video.id
+        meta?.canonicalEpisodeStreamId(for: video) ?? video.id
     }
 
     private func startStreamFlow(streamId: String, type: String, reload: Bool, forceManualPicker: Bool = false) {
@@ -2260,6 +2281,9 @@ struct TvDetailsContent: View {
     var onEpisodeMenuPresented: ((Bool) -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
+    var mdbListUserRating: Int? = nil
+    var showMdbListRating: Bool = false
+    var onRateClick: (() -> Void)? = nil
     let onShareClick: () -> Void
     let onTrailerClick: () -> Void
     var onOpenTitle: ((String, String) -> Void)? = nil
@@ -2330,7 +2354,7 @@ struct TvDetailsContent: View {
 
                                 TvDetailsActionRow(
                                     isInWatchlist: uiState.isInWatchlist,
-                                    isWatched: uiState.isWatched,
+                                    isWatched: WatchedStore.isWatchedForDisplay(meta: meta),
                                     playTitle: playTarget.label,
                                     playHint: smartStreamSelection
                                         ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
@@ -2361,6 +2385,9 @@ struct TvDetailsContent: View {
                                     } : nil,
                                     onWatchlistClick: onWatchlistClick,
                                     onWatchedClick: onWatchedClick,
+                                    mdbListUserRating: mdbListUserRating,
+                                    showMdbListRating: showMdbListRating,
+                                    onRateClick: onRateClick,
                                     onTrailerClick: onTrailerClick,
                                     focus: $actionFocus,
                                     entryLocked: focusedDetailsSection != .actions,
@@ -2589,6 +2616,9 @@ struct TvDetailsContent: View {
             // hop later — so every one of them has to be able to invalidate this
             // view, not just the mark itself.
             .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
             .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -2951,7 +2981,7 @@ private struct TvDetailsLogo: View {
 /// (tvOS doesn't auto-focus the primary button when the details content swaps in
 /// after the async load — see `TvDetailsContent`).
 private enum DetailsActionFocus: Hashable {
-    case play, watchlist, watched, trailer
+    case play, watchlist, watched, rate, trailer
 }
 
 private enum DetailsCastHeaderFocus: Hashable {
@@ -2967,6 +2997,9 @@ private struct TvDetailsActionRow: View {
     var onPlayLongPress: (() -> Void)? = nil
     let onWatchlistClick: () -> Void
     let onWatchedClick: () -> Void
+    var mdbListUserRating: Int? = nil
+    var showMdbListRating: Bool = false
+    var onRateClick: (() -> Void)? = nil
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
     let entryLocked: Bool
@@ -3005,6 +3038,21 @@ private struct TvDetailsActionRow: View {
                 onFocus: onFocus
             )
             .disabled(entryLocked)
+
+            if showMdbListRating {
+                TvDetailsActionButton(
+                    title: mdbListUserRating.map { "\($0)/10" },
+                    systemName: "star.fill",
+                    accessibilityLabel: mdbListUserRating.map { "MDBList rating \($0) out of 10" } ?? "Rate on MDBList",
+                    accessibilityHint: "Choose a personal rating on MDBList",
+                    isPrimary: false,
+                    focus: focus,
+                    tag: .rate,
+                    action: { onRateClick?() },
+                    onFocus: onFocus
+                )
+                .disabled(entryLocked)
+            }
 
             TvDetailsActionButton(
                 title: nil,
@@ -3248,19 +3296,13 @@ private struct TvDetailsSummary: View {
         return items
     }
 
-    /// Simkl's community numbers. Drop rate is Simkl-only — neither Trakt nor
-    /// TMDB reports how many viewers gave up on a title.
+    /// Simkl's community rating. Rank and drop-rate indicators are intentionally
+    /// omitted from the Details summary.
     private var simklMetaItems: [String] {
         guard let simkl else { return [] }
         var items: [String] = []
         if let rating = simkl.rating {
             items.append(String(format: "★ %.1f Simkl", rating))
-        }
-        if let rank = simkl.rank {
-            items.append("#\(rank)")
-        }
-        if let dropRate = simkl.dropRate, dropRate != "0%" {
-            items.append("\(dropRate) dropped")
         }
         return items
     }
@@ -4098,10 +4140,17 @@ private struct TvDetailsEpisodes: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 30) {
+            watchedProgressSummary
             seasonSelector
             episodeCardStrip
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
         }
         .onChange(of: episodes) { _, newEpisodes in
@@ -4134,6 +4183,49 @@ private struct TvDetailsEpisodes: View {
             seasonEpisodes = episodes
                 .filter { $0.season == newSeason }
                 .sorted { $0.episode < $1.episode }
+        }
+    }
+
+    @ViewBuilder
+    private var watchedProgressSummary: some View {
+        if let summary = WatchedEpisodeSummary.make(
+            videos: episodes,
+            watchedEpisodeKeys: watchedEpisodeKeys
+        ) {
+            HStack(spacing: 18) {
+                Label {
+                    Text(
+                        L10n.format(
+                            "details_watched_progress",
+                            fallback: "Watched %d/%d episodes",
+                            summary.watchedCount,
+                            summary.totalCount
+                        )
+                    )
+                } icon: {
+                    Image(systemName: "checkmark.circle.fill")
+                }
+                .font(.system(size: 24, weight: .semibold))
+                .foregroundColor(.white.opacity(0.84))
+
+                ProgressView(value: summary.progress, total: 1)
+                    .progressViewStyle(LinearProgressViewStyle(tint: Color(red: 0.10, green: 0.68, blue: 0.34)))
+                    .frame(width: 260)
+                    .accessibilityLabel(
+                        L10n.format(
+                            "details_watched_progress",
+                            fallback: "Watched %d/%d episodes",
+                            summary.watchedCount,
+                            summary.totalCount
+                        )
+                    )
+            }
+            .padding(.horizontal, 34)
+            .padding(.vertical, 14)
+            .background(
+                Capsule()
+                    .fill(Color.white.opacity(0.10))
+            )
         }
     }
 

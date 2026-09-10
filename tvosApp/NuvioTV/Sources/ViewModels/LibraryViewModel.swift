@@ -8,6 +8,8 @@ public class LibraryViewModel: ObservableObject {
     @Published public var groupOption: GroupOption = .none
     @Published public var contentTypeFilter: String?
     @Published public var genreFilter: String?
+    @Published private(set) var mdbListLists: [MdbListUserList] = []
+    @Published private(set) var selectedMdbListListID: Int?
     /// Last focused card, kept here (outside the view, like
     /// `TVHomeStore.lastFocusedCardID`) so it survives the details push and
     /// returning restores that card instead of snapping to the top.
@@ -15,8 +17,10 @@ public class LibraryViewModel: ObservableObject {
     private var libraryObserver: NSObjectProtocol?
     private var traktAuthObserver: NSObjectProtocol?
     private var simklAuthObserver: NSObjectProtocol?
+    private var mdbListAuthObserver: NSObjectProtocol?
     private var traktSettingsObserver: NSObjectProtocol?
     private var traktMutationObserver: NSObjectProtocol?
+    private var mdbListMutationObserver: NSObjectProtocol?
     private var displayedSource: TraktLibrarySourceMode?
     private var refreshGeneration = 0
     private let repository: CatalogRepository = CinemetaCatalogRepository()
@@ -86,6 +90,15 @@ public class LibraryViewModel: ObservableObject {
                 await self?.refreshSelectedLibrary()
             }
         }
+        mdbListAuthObserver = NotificationCenter.default.addObserver(
+            forName: MdbListAuthStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                await self?.refreshSelectedLibrary()
+            }
+        }
         traktSettingsObserver = NotificationCenter.default.addObserver(
             forName: TraktSettingsStore.libraryChangedNotification,
             object: nil,
@@ -105,12 +118,22 @@ public class LibraryViewModel: ObservableObject {
                 self?.applyTraktMutation(mutation)
             }
         }
+        mdbListMutationObserver = NotificationCenter.default.addObserver(
+            forName: MdbListLibraryService.mutationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard let mutation = notification.object as? MdbListLibraryMutation else { return }
+            Task { @MainActor in
+                self?.applyMdbListMutation(mutation)
+            }
+        }
     }
 
     deinit {
         for observer in [
-            libraryObserver, traktAuthObserver, simklAuthObserver,
-            traktSettingsObserver, traktMutationObserver
+            libraryObserver, traktAuthObserver, simklAuthObserver, mdbListAuthObserver,
+            traktSettingsObserver, traktMutationObserver, mdbListMutationObserver
         ].compactMap({ $0 }) {
             NotificationCenter.default.removeObserver(observer)
         }
@@ -121,12 +144,18 @@ public class LibraryViewModel: ObservableObject {
             if displayedSource != TraktSettingsStore.librarySourceMode {
                 displayedSource = TraktSettingsStore.librarySourceMode
                 items = []
+                if TraktSettingsStore.librarySourceMode != .mdblist {
+                    mdbListLists = []
+                    selectedMdbListListID = nil
+                }
                 validateFilters()
             }
             return
         }
 
         displayedSource = .local
+        mdbListLists = []
+        selectedMdbListListID = nil
         items = LibraryStore.items().map(\.stremioMeta)
         validateFilters()
     }
@@ -155,8 +184,62 @@ public class LibraryViewModel: ObservableObject {
             return
         }
 
-        displayedSource = TraktSettingsStore.librarySourceMode
+        let source = TraktSettingsStore.librarySourceMode
+        displayedSource = source
         items = remoteItems.map(\.stremioMeta)
+        if source == .mdblist {
+            let lists = await MdbListListService.fetchUserLists()
+            guard !Task.isCancelled,
+                  generation == refreshGeneration,
+                  profileID == LibraryStore.activeProfileId,
+                  usesRemoteLibrary else { return }
+            mdbListLists = lists ?? []
+            if let selectedMdbListListID,
+               mdbListLists.contains(where: { $0.id == selectedMdbListListID }) {
+                await loadMdbListListItems(
+                    selectedMdbListListID,
+                    generation: generation,
+                    profileID: profileID
+                )
+            } else {
+                selectedMdbListListID = nil
+            }
+        } else {
+            mdbListLists = []
+            selectedMdbListListID = nil
+        }
+        validateFilters()
+    }
+
+    public func selectMdbListList(_ listID: Int?) async {
+        guard TraktSettingsStore.librarySourceMode == .mdblist,
+              usesRemoteLibrary else { return }
+        refreshGeneration &+= 1
+        let generation = refreshGeneration
+        let profileID = LibraryStore.activeProfileId
+        selectedMdbListListID = listID
+        guard let listID else {
+            await refreshSelectedLibrary()
+            return
+        }
+        await loadMdbListListItems(listID, generation: generation, profileID: profileID)
+    }
+
+    private func loadMdbListListItems(
+        _ listID: Int,
+        generation: Int,
+        profileID: String?
+    ) async {
+        guard let listItems = await MdbListListService.fetchItems(
+            listID: listID,
+            repository: repository
+        ),
+        !Task.isCancelled,
+        generation == refreshGeneration,
+        profileID == LibraryStore.activeProfileId,
+        TraktSettingsStore.librarySourceMode == .mdblist,
+        usesRemoteLibrary else { return }
+        items = listItems.map(\.stremioMeta)
         validateFilters()
     }
 
@@ -168,9 +251,27 @@ public class LibraryViewModel: ObservableObject {
     /// validated watchlist mutation. Do the same here so navigation into
     /// Library never waits on a second network pull to reveal the title.
     private func applyTraktMutation(_ mutation: TraktLibraryMutation) {
-        guard usesRemoteLibrary else { return }
-        let item = LibraryStoreItem(meta: mutation.meta, addedAt: Date()).stremioMeta
+        applyLibraryMutation(meta: mutation.meta, isInWatchlist: mutation.isInWatchlist)
+    }
+
+    private func applyMdbListMutation(_ mutation: MdbListLibraryMutation) {
+        guard TraktSettingsStore.librarySourceMode == .mdblist,
+              usesRemoteLibrary else { return }
+        guard selectedMdbListListID == nil else {
+            Task { @MainActor in await refreshSelectedLibrary() }
+            return
+        }
         if mutation.isInWatchlist {
+            applyLibraryMutation(meta: mutation.meta, isInWatchlist: true)
+        } else {
+            Task { @MainActor in await refreshSelectedLibrary() }
+        }
+    }
+
+    private func applyLibraryMutation(meta: NuvioMeta, isInWatchlist: Bool) {
+        guard usesRemoteLibrary else { return }
+        let item = LibraryStoreItem(meta: meta, addedAt: Date()).stremioMeta
+        if isInWatchlist {
             items = [item] + items.filter {
                 !($0.id == item.id && $0.contentType.caseInsensitiveCompare(item.contentType) == .orderedSame)
             }

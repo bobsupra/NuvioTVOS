@@ -7,6 +7,82 @@ import XCTest
 final class CatalogDecodingTests: XCTestCase {
     private let decoder = JSONDecoder()
 
+    func testCanonicalEpisodeStreamIdUsesSeriesImdbNamespace() {
+        let meta = NuvioMeta(
+            id: "tmdb:123",
+            name: "Test Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt456",
+            tmdbId: 123,
+            type: "series",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: nil
+        )
+        let episode = NuvioVideo(
+            id: "tmdb:123:1:2",
+            title: "Episode 2",
+            season: 1,
+            episode: 2,
+            thumbnail: nil,
+            overview: nil,
+            released: nil,
+            rating: nil
+        )
+
+        XCTAssertEqual(meta.canonicalEpisodeStreamId(for: episode), "tt456:1:2")
+    }
+
+    func testCanonicalEpisodeStreamIdPreservesMatchingImdbEpisodeId() {
+        let meta = NuvioMeta(
+            id: "tt456",
+            name: "Test Series",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt456",
+            tmdbId: nil,
+            type: "series",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            released: nil,
+            videos: nil
+        )
+        let episode = NuvioVideo(
+            id: "tt456:1:2",
+            title: "Episode 2",
+            season: 1,
+            episode: 2,
+            thumbnail: nil,
+            overview: nil,
+            released: nil,
+            rating: nil
+        )
+
+        XCTAssertEqual(meta.canonicalEpisodeStreamId(for: episode), "tt456:1:2")
+    }
+
     func testCatalogDisplayTitleTypeSuffixes() {
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "movie", showType: true), "Popular - Movies")
         XCTAssertEqual(TVHomeCatalogOrder.catalogDisplayTitle("Popular", contentType: "series", showType: true), "Popular - Series")
@@ -658,6 +734,60 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertFalse(catalog3.eligibleForHome)
     }
 
+    func testSearchDeduplicatesCanonicalAliasesAndPreservesDistinctTitles() {
+        func meta(
+            id: String,
+            type: String,
+            name: String,
+            year: Int,
+            imdbId: String? = nil,
+            tmdbId: Int? = nil
+        ) -> NuvioMeta {
+            NuvioMeta(
+                id: id,
+                name: name,
+                description: nil,
+                posterUrl: nil,
+                backgroundUrl: nil,
+                logoUrl: nil,
+                imdbId: imdbId,
+                tmdbId: tmdbId,
+                type: type,
+                year: year,
+                genres: nil,
+                rating: nil,
+                releaseInfo: nil,
+                runtime: nil,
+                cast: nil,
+                director: nil,
+                writer: nil,
+                certification: nil,
+                country: nil,
+                released: nil,
+                status: nil,
+                videos: nil,
+                trailerYtIds: nil,
+                externalRatings: nil
+            )
+        }
+
+        let results = [
+            meta(id: "tt1234567", type: "movie", name: "Spider-Man", year: 2002, tmdbId: 123),
+            meta(id: "tmdb:123", type: "movie", name: "Spider Man", year: 2002, tmdbId: 123),
+            meta(id: "tmdb:456", type: "movie", name: "Spider-Man", year: 2002, tmdbId: 456),
+            meta(id: "tmdb:789", type: "series", name: "Spider-Man", year: 2002, tmdbId: 789),
+            meta(id: "addon:a:1", type: "movie", name: "Spider Man", year: 2020),
+            meta(id: "addon:b:2", type: "movie", name: "Spider-Man", year: 2020)
+        ]
+
+        let deduplicated = CinemetaCatalogRepository.deduplicatedSearchResults(results)
+
+        XCTAssertEqual(
+            deduplicated.map(\.id),
+            ["tt1234567", "tmdb:456", "tmdb:789", "addon:a:1"]
+        )
+    }
+
     @MainActor
     func testDiscoverCatalogOptionsAndViewModelStateTransitions() async throws {
         let repo = MockCatalogRepository()
@@ -687,4 +817,3 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertEqual(viewModel.selectedGenre, "Action")
     }
 }
-

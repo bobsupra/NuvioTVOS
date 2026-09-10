@@ -27,6 +27,7 @@ struct AuthSession: Codable, Equatable {
     var email: String?
     /// Unix epoch seconds when the access token expires (best-effort).
     var expiresAt: TimeInterval?
+    var backendIdentity: String? = nil
 
     var isExpired: Bool {
         guard let expiresAt else { return false }

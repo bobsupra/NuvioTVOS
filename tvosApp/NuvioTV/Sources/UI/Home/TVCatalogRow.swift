@@ -273,11 +273,10 @@ struct TVCatalogRow: View {
     }
 
     private func isWatched(_ item: NuvioMeta) -> Bool? {
-        let normalizedType = item.type.lowercased()
         let titleWatched = !watchedTitleKeys.isDisjoint(
             with: WatchedStore.catalogTitleIdentityKeys(for: item)
         )
-        guard ["series", "tv", "show", "tvshow"].contains(normalizedType) else {
+        guard item.isSeries else {
             return titleWatched
         }
         return titleWatched ? true : nil

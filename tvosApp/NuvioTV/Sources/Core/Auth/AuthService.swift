@@ -11,9 +11,17 @@ import Foundation
 struct AuthService {
     private let session: URLSession = .shared
     private let decoder = JSONDecoder()
+    private let configuration: ServerConfiguration
 
-    private var baseURL: String { AuthConfig.normalizedAPIBaseURL }
-    private var apiKey: String { AuthConfig.apiKey }
+    init(configuration: ServerConfiguration = AuthConfig.currentConfiguration) {
+        self.configuration = configuration
+    }
+
+    private var baseURL: String { configuration.normalizedBackendURL }
+    private var apiKey: String { configuration.publishableKey }
+    private var tvLoginWebBaseURL: String { configuration.normalizedBackendURL + "/tv-login" }
+    private var isCustom: Bool { configuration.backendIdentity != AuthConfig.officialAPIBaseURL }
+    private var backendIdentity: String { configuration.backendIdentity }
 
     // MARK: - Email auth
 
@@ -62,7 +70,7 @@ struct AuthService {
                 accessToken: accessToken,
                 deviceNonce: deviceNonce,
                 deviceName: deviceName,
-                redirectBaseURL: AuthConfig.tvLoginWebBaseURL,
+                redirectBaseURL: tvLoginWebBaseURL,
                 includeDeviceName: includeDeviceName
             )
         } catch {
@@ -74,7 +82,7 @@ struct AuthService {
                         accessToken: accessToken,
                         deviceNonce: deviceNonce,
                         deviceName: deviceName,
-                        redirectBaseURL: AuthConfig.tvLoginWebBaseURL,
+                        redirectBaseURL: tvLoginWebBaseURL,
                         includeDeviceName: false
                     )
                 } catch {
@@ -82,8 +90,9 @@ struct AuthService {
                 }
             }
 
-            guard shouldRetryLegacyRedirectBase(lastError),
-                  AuthConfig.legacyTvLoginWebBaseURL != AuthConfig.tvLoginWebBaseURL else {
+            guard !isCustom,
+                  shouldRetryLegacyRedirectBase(lastError),
+                  AuthConfig.legacyTvLoginWebBaseURL != tvLoginWebBaseURL else {
                 throw lastError
             }
 
@@ -168,7 +177,8 @@ struct AuthService {
             refreshToken: result.refreshToken,
             userId: user.id,
             email: user.email,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            backendIdentity: backendIdentity
         )
     }
 
@@ -220,7 +230,8 @@ struct AuthService {
             refreshToken: token.refreshToken,
             userId: user.id,
             email: user.email,
-            expiresAt: expiresAt
+            expiresAt: expiresAt,
+            backendIdentity: backendIdentity
         )
     }
 
@@ -231,8 +242,8 @@ struct AuthService {
         bearer: String,
         json: [String: Any]?
     ) async throws -> T {
-        guard AuthConfig.isConfigured else {
-            throw AuthError(message: "Account backend is not configured. Add the Nuvio API URL and publishable key in AuthConfig.swift.")
+        guard !baseURL.isEmpty, !apiKey.isEmpty else {
+            throw AuthError(message: "Account backend is not configured.")
         }
         guard var components = URLComponents(string: baseURL + path) else {
             throw AuthError(message: "Invalid backend URL")

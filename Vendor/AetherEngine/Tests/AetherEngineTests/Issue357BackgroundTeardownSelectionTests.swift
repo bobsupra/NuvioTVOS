@@ -153,4 +153,24 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(selection.audioTrackIndex == 4)
         #expect(selection.discTitleID == 9)
     }
+
+    @Test("teardown while paused parks resumesPlaying as false so reload mounts paused")
+    func teardownWhilePausedParksPausedTransport() throws {
+        let engine = try AetherEngine()
+        engine.state = .paused
+
+        backgroundTeardown(engine)
+        let selection = engine.consumeReloadSelection()
+        #expect(!selection.resumesPlaying)
+    }
+
+    @Test("teardown while playing parks resumesPlaying as true so reload resumes playing")
+    func teardownWhilePlayingParksPlayingTransport() throws {
+        let engine = try AetherEngine()
+        engine.state = .playing
+
+        backgroundTeardown(engine)
+        let selection = engine.consumeReloadSelection()
+        #expect(selection.resumesPlaying)
+    }
 }

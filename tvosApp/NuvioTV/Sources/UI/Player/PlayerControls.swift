@@ -1743,20 +1743,18 @@ struct PlayerSettingsPanel: View {
     }
 
     private var audioAdjustmentsColumn: some View {
-        let aetherAudioAdjustmentsUnavailable = viewModel.activeEngineKind == .aether
+        let aetherAmplificationUnavailable = viewModel.activeEngineKind == .aether
         return VStack(alignment: .leading, spacing: 28) {
             audioOutputSection
 
             audioStepper(
                 title: "Audio Delay",
                 value: String(format: "%.3fs", Double(viewModel.audioDelayMs) / 1000.0),
-                caption: aetherAudioAdjustmentsUnavailable
-                    ? "Unavailable with Aether"
-                    : "Range: -3.00s to 3.00s",
+                caption: "Range: -3.00s to 3.00s",
                 minusKey: .delayMinus,
                 plusKey: .delayPlus,
-                minusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioDelayMs <= -3000,
-                plusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioDelayMs >= 3000,
+                minusDisabled: viewModel.audioDelayMs <= -3000,
+                plusDisabled: viewModel.audioDelayMs >= 3000,
                 onMinus: { viewModel.setAudioDelayMs(viewModel.audioDelayMs - 50) },
                 onPlus: { viewModel.setAudioDelayMs(viewModel.audioDelayMs + 50) }
             )
@@ -1764,13 +1762,13 @@ struct PlayerSettingsPanel: View {
             audioStepper(
                 title: "Amplification (PCM)",
                 value: "\(viewModel.audioAmplificationDb) dB",
-                caption: aetherAudioAdjustmentsUnavailable
+                caption: aetherAmplificationUnavailable
                     ? "Unavailable with Aether"
                     : "Range: 0 dB to 10 dB",
                 minusKey: .ampMinus,
                 plusKey: .ampPlus,
-                minusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioAmplificationDb <= 0,
-                plusDisabled: aetherAudioAdjustmentsUnavailable || viewModel.audioAmplificationDb >= 10,
+                minusDisabled: aetherAmplificationUnavailable || viewModel.audioAmplificationDb <= 0,
+                plusDisabled: aetherAmplificationUnavailable || viewModel.audioAmplificationDb >= 10,
                 onMinus: { viewModel.setAudioAmplificationDb(viewModel.audioAmplificationDb - 1) },
                 onPlus: { viewModel.setAudioAmplificationDb(viewModel.audioAmplificationDb + 1) }
             )

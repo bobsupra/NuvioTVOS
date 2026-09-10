@@ -128,13 +128,9 @@ extension PlayerView {
     var debugOverlayLayer: some View {
         if viewModel.isPlaybackDebugHUDVisible,
            let info = viewModel.playbackDebugInfo {
-            let dur = viewModel.clock.duration > 0 ? viewModel.clock.duration : viewModel.time.duration
-            let pos = viewModel.clock.duration > 0 ? viewModel.clock.position : viewModel.time.current
-            let remaining = dur > 0 ? max(0, dur - pos) : nil
             PlaybackDebugHUDView(
                 info: info,
-                reason: viewModel.playbackDebugReason,
-                remainingSeconds: remaining
+                reason: viewModel.playbackDebugReason
             )
             .transition(.opacity.combined(with: .move(edge: .top)))
             .zIndex(100)

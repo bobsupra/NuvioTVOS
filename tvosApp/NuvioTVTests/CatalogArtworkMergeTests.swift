@@ -269,11 +269,71 @@ final class CatalogArtworkMergeTests: XCTestCase {
         XCTAssertEqual(enriched[1].tmdbId, 603, "complete record must be untouched")
     }
 
+    func testSearchCrossProviderDeduplicationAndAliasAdoption() {
+        // Cinemeta search results return IMDb IDs without TMDB IDs.
+        // TMDB/add-on search results return tmdb: prefixes without IMDb IDs.
+        let rawCinemeta = makeMeta(id: "tt1375666", imdbId: "tt1375666", tmdbId: nil, type: "movie", name: "Inception", year: 2010)
+        let rawTmdbAddon = makeMeta(id: "tmdb:27205", imdbId: nil, tmdbId: nil, type: "movie", name: "Inception", year: 2010)
+        let rawCustomAddon = makeMeta(id: "addon:custom:99", imdbId: nil, tmdbId: nil, type: "movie", name: "Inception", year: 2010)
+        let releaseInfoItem = makeMeta(id: "addon:date:1", imdbId: nil, tmdbId: nil, type: "movie", name: "Inception", year: nil, releaseInfo: "2010-07-16")
+        let remakeDifferentYear = makeMeta(id: "tt9999999", imdbId: "tt9999999", tmdbId: nil, type: "movie", name: "Inception", year: 1980)
+        let seriesDifferentType = makeMeta(id: "tt8888888", imdbId: "tt8888888", tmdbId: nil, type: "series", name: "Inception", year: 2010)
+        let conflictingTmdb = makeMeta(id: "tmdb:99999", imdbId: nil, tmdbId: 99999, type: "movie", name: "Inception", year: 2010)
+
+        let items = [
+            rawCinemeta,
+            rawTmdbAddon,
+            rawCustomAddon,
+            releaseInfoItem,
+            remakeDifferentYear,
+            seriesDifferentType,
+            conflictingTmdb
+        ]
+
+        let deduplicated = CinemetaCatalogRepository.deduplicatedSearchResults(items)
+
+        // Only rawCinemeta (kept), remake (1980), series (different type), and conflicting TMDB ID should remain.
+        XCTAssertEqual(
+            deduplicated.map(\.id),
+            ["tt1375666", "tt9999999", "tt8888888", "tmdb:99999"]
+        )
+
+        // Kept item must adopt the tmdbId from rawTmdbAddon
+        let kept = deduplicated.first { $0.id == "tt1375666" }
+        XCTAssertEqual(kept?.imdbId, "tt1375666")
+        XCTAssertEqual(kept?.tmdbId, 27205)
+    }
+
+    func testSearchEnrichmentDeduplicatesPostEnrichedAliases() async {
+        // Two search results for the same movie with disjoint names / missing dates that initially slipped through
+        let rawA = makeMeta(id: "tt0133093", imdbId: nil, tmdbId: nil, type: "movie", name: "The Matrix", year: nil)
+        let rawB = makeMeta(id: "tmdb:603", imdbId: nil, tmdbId: nil, type: "movie", name: "Matrix", year: nil)
+
+        // Both refresh to the authoritative The Matrix (1999) records with shared canonical IDs
+        let fullA = makeMeta(id: "tt0133093", imdbId: "tt0133093", tmdbId: 603, type: "movie", name: "The Matrix", year: 1999)
+        let fullB = makeMeta(id: "tmdb:603", imdbId: "tt0133093", tmdbId: 603, type: "movie", name: "The Matrix", year: 1999)
+
+        let repository = StubRefreshRepository(fullByID: [
+            "tt0133093": fullA,
+            "tmdb:603": fullB
+        ])
+
+        let enriched = await SearchResultEnrichment.enrich([rawA, rawB], repository: repository)
+
+        // Post-enrichment deduplication pass must eliminate the duplicate poster
+        XCTAssertEqual(enriched.map(\.id), ["tt0133093"])
+        XCTAssertEqual(enriched.first?.imdbId, "tt0133093")
+        XCTAssertEqual(enriched.first?.tmdbId, 603)
+    }
+
     private func makeMeta(
         id: String,
         imdbId: String?,
         tmdbId: Int?,
         type: String = "series",
+        name: String = "Test Title",
+        year: Int? = nil,
+        releaseInfo: String? = nil,
         posterUrl: String? = "https://cdn.example/poster.jpg",
         backgroundUrl: String? = "bg",
         logoUrl: String? = "logo",
@@ -282,7 +342,7 @@ final class CatalogArtworkMergeTests: XCTestCase {
     ) -> NuvioMeta {
         NuvioMeta(
             id: id,
-            name: "Test Title",
+            name: name,
             description: nil,
             posterUrl: posterUrl,
             backgroundUrl: backgroundUrl,
@@ -290,10 +350,10 @@ final class CatalogArtworkMergeTests: XCTestCase {
             imdbId: imdbId,
             tmdbId: tmdbId,
             type: type,
-            year: nil,
+            year: year,
             genres: nil,
             rating: nil,
-            releaseInfo: nil,
+            releaseInfo: releaseInfo ?? year.map(String.init),
             runtime: runtime,
             cast: nil,
             director: nil,

@@ -49,7 +49,7 @@ enum PlaybackBackendPolicy {
         var streamDescription: String?
         var filename: String?
         var engineSetting: PlayerEngineSetting
-        /// Non-zero audio delay or amplification forces MPV for the session.
+        /// Non-zero audio amplification forces MPV for the session (audio delay is supported on Aether).
         var requiresMPVAudioControls: Bool
         var assMode: PlaybackASSMode
     }
@@ -76,8 +76,8 @@ enum PlaybackBackendPolicy {
             return Result(
                 backend: .mpv,
                 allowAutomaticFallback: false,
-                reason: "Audio delay/amplification requires MPVKit",
-                statusMessage: "Compatibility player (audio delay)"
+                reason: "Audio amplification requires MPVKit",
+                statusMessage: "Compatibility player (audio amplification)"
             )
         }
         // Authored ASS Scale is not yet rendered by Nuvio's host overlay.

@@ -13,6 +13,17 @@ import Security
 
 @MainActor
 final class AuthManager: ObservableObject {
+    private struct AuthOperation: Equatable {
+        let generation: Int
+        let backendIdentity: String
+    }
+
+    private struct QROperation: Equatable {
+        let generation: Int
+        let authGeneration: Int
+        let backendIdentity: String
+    }
+
     // Global auth state.
     @Published private(set) var authState: AuthState = .loading
 
@@ -36,9 +47,12 @@ final class AuthManager: ObservableObject {
     // Shared.
     @Published var isBusy = false
     @Published var errorMessage: String?
+    @Published private(set) var discoveredServer: DiscoveredServer?
+    @Published private(set) var isDiscoveringServer = false
 
-    private let service = AuthService()
     private let store = SessionStore()
+    private let configurationStore = ServerConfigurationStore()
+    private let discoveryService = ServerDiscoveryService()
     /// Authoritative for the current process. Persistence is a restore aid, not
     /// a prerequisite for using a session that just authenticated successfully.
     private var currentSession: AuthSession?
@@ -47,9 +61,16 @@ final class AuthManager: ObservableObject {
     private var qrAnonAccessToken: String?
     private var pollTask: Task<Void, Never>?
     private var refreshTask: Task<AuthSession?, Never>?
+    private var refreshOperation: AuthOperation?
+    private var qrStartTask: Task<Void, Never>?
+    private var authOperationGeneration = 0
+    private var qrOperationGeneration = 0
+    private var discoveryGeneration = 0
+    private var discoveryInFlight = false
 
     var isAuthenticated: Bool { authState.isAuthenticated }
     var isBackendConfigured: Bool { AuthConfig.isConfigured }
+    var serverCapabilities: ServerCapabilities { AuthConfig.capabilities }
 
     var currentEmail: String? {
         if case let .fullAccount(_, email) = authState { return email }
@@ -103,6 +124,12 @@ final class AuthManager: ObservableObject {
             authState = .signedOut
             return
         }
+        guard session.backendIdentity == AuthConfig.backendIdentity || (session.backendIdentity == nil && !AuthConfig.isCustom) else {
+            store.clear()
+            store.didSkipLogin = false
+            authState = .signedOut
+            return
+        }
         currentSession = session
         authState = .fullAccount(userId: session.userId, email: session.email ?? "")
         if session.isExpired {
@@ -136,10 +163,15 @@ final class AuthManager: ObservableObject {
                 return nil
             }
         }
+        let operation = currentAuthOperation()
+        guard isSession(candidate, for: operation) else { return nil }
         guard validateWithServer else { return candidate }
+
+        let service = makeService()
 
         do {
             _ = try await service.getUser(accessToken: candidate.accessToken)
+            guard isCurrent(operation) else { return nil }
             return candidate
         } catch let error as AuthError where Self.isCredentialRejection(error) {
             // The server is authoritative. A token can be revoked/rejected
@@ -152,7 +184,7 @@ final class AuthManager: ObservableObject {
         } catch {
             // A transient validation outage should not discard a locally valid
             // session; the sync request will surface its own network failure.
-            return candidate
+            return isCurrent(operation) ? candidate : nil
         }
     }
 
@@ -167,8 +199,9 @@ final class AuthManager: ObservableObject {
     }
 
     func refreshSessionForSync() async -> AuthSession? {
-        if let refreshTask {
-            guard let refreshed = await refreshTask.value, isAuthenticated else { return nil }
+        if let refreshTask, let operation = refreshOperation {
+            guard let refreshed = await refreshTask.value,
+                  isCurrent(operation), isAuthenticated else { return nil }
             if currentSession?.refreshToken != refreshed.refreshToken {
                 apply(session: refreshed)
             }
@@ -176,33 +209,45 @@ final class AuthManager: ObservableObject {
         }
 
         guard let session = currentSessionForSync() else { return nil }
+        let operation = currentAuthOperation()
+        guard isSession(session, for: operation) else { return nil }
+        let service = makeService()
         let task = Task { [weak self, service] () -> AuthSession? in
             do {
                 return try await service.refresh(refreshToken: session.refreshToken)
             } catch {
                 // Only the server refusing the refresh token is fatal: a TV that
                 // is merely offline must not be told to sign in again.
-                if let authError = error as? AuthError, Self.isCredentialRejection(authError) {
-                    self?.sessionNeedsReauthentication = true
+                if let self, self.isCurrent(operation),
+                   let authError = error as? AuthError, Self.isCredentialRejection(authError) {
+                    self.sessionNeedsReauthentication = true
                     print("Nuvio session cannot be renewed (\(authError.message)). Sign in again to resume sync.")
                 }
                 return nil
             }
         }
         refreshTask = task
+        refreshOperation = operation
         guard let refreshed = await task.value else {
-            refreshTask = nil
+            if refreshOperation == operation {
+                refreshTask = nil
+                refreshOperation = nil
+            }
             return nil
         }
+        guard refreshOperation == operation else { return nil }
         refreshTask = nil
+        refreshOperation = nil
         // Never resurrect a session after sign-out while refresh was in flight.
         guard isAuthenticated,
+              isCurrent(operation),
               currentSession?.refreshToken == session.refreshToken else { return nil }
         apply(session: refreshed)
         return refreshed
     }
 
     private func apply(session: AuthSession) {
+        guard isSession(session, for: currentAuthOperation()) else { return }
         currentSession = session
         // A working session, however it was obtained, retires the warning.
         sessionNeedsReauthentication = false
@@ -229,7 +274,13 @@ final class AuthManager: ObservableObject {
     }
 
     func signOut() {
+        let operation = beginAuthOperation()
+        let service = makeService()
         pollTask?.cancel()
+        qrStartTask?.cancel()
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshOperation = nil
         let session = currentSession ?? store.load()
         currentSession = nil
         store.clear()
@@ -237,39 +288,119 @@ final class AuthManager: ObservableObject {
         clearQrState()
         sessionNeedsReauthentication = false
         authState = .signedOut
-        Task {
-            if let accessToken = session?.accessToken {
-                try? await service.signOut(accessToken: accessToken)
-            }
+        Task { [weak self, service] in
+            guard let self, let accessToken = session?.accessToken, self.isCurrent(operation) else { return }
+            try? await service.signOut(accessToken: accessToken)
         }
+    }
+
+    func discoverCustomServer(input: String) async {
+        discoveryGeneration &+= 1
+        let operation = discoveryGeneration
+        discoveryInFlight = true
+        isDiscoveringServer = true
+        errorMessage = nil
+        discoveredServer = nil
+        do {
+            let discovered = try await discoveryService.discover(input: input)
+            guard isCurrentDiscovery(operation) else { return }
+            discoveredServer = discovered
+        } catch {
+            guard isCurrentDiscovery(operation) else { return }
+            discoveredServer = nil
+            errorMessage = friendly(error)
+        }
+        guard isCurrentDiscovery(operation) else { return }
+        isDiscoveringServer = false
+        discoveryInFlight = false
+    }
+
+    func clearDiscoveredServer() {
+        discoveryGeneration &+= 1
+        discoveredServer = nil
+        errorMessage = nil
+        if discoveryInFlight {
+            discoveryInFlight = false
+            isDiscoveringServer = false
+        }
+    }
+
+    @discardableResult
+    func activateCustomConfiguration(_ configuration: ServerConfiguration) -> Bool {
+        invalidateAuthOperations()
+        clearQrState()
+        discoveredServer = nil
+        currentSession = nil
+        store.clear()
+        store.didSkipLogin = false
+        guard configurationStore.save(configuration) else {
+            errorMessage = "Could not save the server configuration."
+            return false
+        }
+        sessionNeedsReauthentication = false
+        errorMessage = nil
+        authState = .signedOut
+        return true
+    }
+
+    func useOfficialServer() {
+        invalidateAuthOperations()
+        clearQrState()
+        currentSession = nil
+        store.clear()
+        store.didSkipLogin = false
+        configurationStore.clear()
+        discoveredServer = nil
+        sessionNeedsReauthentication = false
+        errorMessage = nil
+        authState = .signedOut
     }
 
     // MARK: - Email
 
     func signIn(email: String, password: String) async {
-        await runEmail { try await self.service.signInWithEmail(email: email, password: password) }
+        await runEmail { service in
+            try await service.signInWithEmail(email: email, password: password)
+        }
     }
 
     func signUp(email: String, password: String) async {
-        await runEmail { try await self.service.signUpWithEmail(email: email, password: password) }
+        await runEmail { service in
+            try await service.signUpWithEmail(email: email, password: password)
+        }
     }
 
-    private func runEmail(_ op: @escaping () async throws -> AuthSession) async {
+    private func runEmail(_ op: @escaping (AuthService) async throws -> AuthSession) async {
         guard ensureConfigured() else { return }
+        guard AuthConfig.capabilities.emailPasswordAuth else {
+            errorMessage = "Email sign-in is not supported by this server."
+            return
+        }
+        let operation = beginAuthOperation()
+        let service = makeService()
         isBusy = true
         errorMessage = nil
         do {
-            apply(session: try await op())
+            let session = try await op(service)
+            guard isCurrent(operation) else { return }
+            apply(session: session)
         } catch {
+            guard isCurrent(operation) else { return }
             errorMessage = friendly(error)
         }
-        isBusy = false
+        if isCurrent(operation) { isBusy = false }
     }
 
     // MARK: - QR login
 
     func startQrLogin(force: Bool = false) {
         guard ensureConfigured() else { return }
+        guard AuthConfig.capabilities.tvLogin else {
+            stopQrLogin()
+            clearQrState()
+            errorMessage = "QR sign-in is not supported by this server."
+            return
+        }
 
         // Reuse the current pending session when possible: every fresh start
         // consumes an anonymous sign-in plus a TV-login session server-side,
@@ -280,11 +411,20 @@ final class AuthManager: ObservableObject {
            let expires = qrExpiresAt, expires.timeIntervalSinceNow > 30,
            qrCode != nil, qrNonce != nil, qrAnonAccessToken != nil, qrImage != nil {
             qrStatusMessage = "Waiting for approval on your phone…"
-            startPolling(intervalSeconds: 2)
+            startPolling(
+                intervalSeconds: 2,
+                operation: currentAuthOperation(),
+                qrOperation: beginQROperation(),
+                service: makeService()
+            )
             return
         }
 
+        let operation = beginAuthOperation()
+        let qrOperation = beginQROperation()
+        let service = makeService()
         pollTask?.cancel()
+        qrStartTask?.cancel()
         clearQrState()
         isBusy = true
         errorMessage = nil
@@ -293,54 +433,91 @@ final class AuthManager: ObservableObject {
         let nonce = Self.makeNonce()
         qrNonce = nonce
 
-        Task {
+        qrStartTask = Task { [weak self, service] in
             do {
                 let anon = try await service.signInAnonymously()
-                qrAnonAccessToken = anon.accessToken
+                guard let self,
+                      self.isCurrent(operation),
+                      self.isCurrent(qrOperation) else { return }
+                self.qrAnonAccessToken = anon.accessToken
                 let start = try await service.startTvLoginSession(
                     accessToken: anon.accessToken,
                     deviceNonce: nonce,
                     deviceName: Self.deviceName
                 )
-                qrCode = start.code
-                qrImage = QRCode.image(from: start.webUrl)
-                qrExpiresAt = Self.parseDate(start.expiresAt)
-                qrStatusMessage = "Scan QR, approve in browser, then return here."
-                isBusy = false
-                startPolling(intervalSeconds: max(start.pollIntervalSeconds, 2))
+                guard self.isCurrent(operation), self.isCurrent(qrOperation) else { return }
+                self.qrCode = start.code
+                self.qrImage = QRCode.image(from: start.webUrl)
+                self.qrExpiresAt = Self.parseDate(start.expiresAt)
+                self.qrStatusMessage = "Scan QR, approve in browser, then return here."
+                self.isBusy = false
+                self.startPolling(
+                    intervalSeconds: max(start.pollIntervalSeconds, 2),
+                    operation: operation,
+                    qrOperation: qrOperation,
+                    service: service
+                )
             } catch {
-                errorMessage = friendly(error)
-                qrStatusMessage = "Failed to start QR login"
-                isBusy = false
+                guard let self,
+                      self.isCurrent(operation),
+                      self.isCurrent(qrOperation) else { return }
+                self.errorMessage = self.friendly(error)
+                self.qrStatusMessage = "Failed to start QR login"
+                self.isBusy = false
             }
         }
     }
 
     func stopQrLogin() {
+        qrOperationGeneration &+= 1
         pollTask?.cancel()
         pollTask = nil
+        qrStartTask?.cancel()
+        qrStartTask = nil
+        isBusy = false
     }
 
-    private func startPolling(intervalSeconds: Int) {
+    private func startPolling(
+        intervalSeconds: Int,
+        operation: AuthOperation? = nil,
+        qrOperation: QROperation? = nil,
+        service: AuthService? = nil
+    ) {
         pollTask?.cancel()
-        pollTask = Task { [weak self] in
+        let operation = operation ?? currentAuthOperation()
+        let qrOperation = qrOperation ?? currentQROperation()
+        let service = service ?? makeService()
+        pollTask = Task { [weak self, service] in
             var interval = intervalSeconds
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: UInt64(interval) * 1_000_000_000)
                 if Task.isCancelled { return }
                 guard let self else { return }
-                interval = await self.pollOnce(currentInterval: interval)
+                guard self.isCurrent(operation), self.isCurrent(qrOperation) else { return }
+                interval = await self.pollOnce(
+                    currentInterval: interval,
+                    operation: operation,
+                    qrOperation: qrOperation,
+                    service: service
+                )
             }
         }
     }
 
     /// Runs a single poll; returns the (possibly updated) poll interval.
-    private func pollOnce(currentInterval: Int) async -> Int {
+    private func pollOnce(
+        currentInterval: Int,
+        operation: AuthOperation,
+        qrOperation: QROperation,
+        service: AuthService
+    ) async -> Int {
+        guard isCurrent(operation), isCurrent(qrOperation) else { return currentInterval }
         guard let code = qrCode, let nonce = qrNonce, let anon = qrAnonAccessToken else {
             return currentInterval
         }
         do {
             let result = try await service.pollTvLoginSession(accessToken: anon, code: code, deviceNonce: nonce)
+            guard isCurrent(operation), isCurrent(qrOperation) else { return currentInterval }
             var interval = currentInterval
             if let secs = result.pollIntervalSeconds { interval = max(secs, 2) }
             if let exp = result.expiresAt.flatMap(Self.parseDate) { qrExpiresAt = exp }
@@ -348,7 +525,14 @@ final class AuthManager: ObservableObject {
             switch result.status.lowercased() {
             case "approved":
                 qrStatusMessage = "Login approved. Finishing sign in…"
-                await exchange(code: code, nonce: nonce, anon: anon)
+                await exchange(
+                    code: code,
+                    nonce: nonce,
+                    anon: anon,
+                    operation: operation,
+                    qrOperation: qrOperation,
+                    service: service
+                )
                 pollTask?.cancel()
                 pollTask = nil
             case "pending":
@@ -365,23 +549,33 @@ final class AuthManager: ObservableObject {
             }
             return interval
         } catch {
+            guard isCurrent(operation), isCurrent(qrOperation) else { return currentInterval }
             errorMessage = friendly(error)
             return currentInterval
         }
     }
 
-    private func exchange(code: String, nonce: String, anon: String) async {
+    private func exchange(
+        code: String,
+        nonce: String,
+        anon: String,
+        operation: AuthOperation,
+        qrOperation: QROperation,
+        service: AuthService
+    ) async {
         isBusy = true
         do {
             let session = try await service.exchangeTvLoginSession(accessToken: anon, code: code, deviceNonce: nonce)
+            guard isCurrent(operation), isCurrent(qrOperation) else { return }
             apply(session: session)
             qrStatusMessage = "Signed in successfully"
             clearQrState()
         } catch {
+            guard isCurrent(operation), isCurrent(qrOperation) else { return }
             errorMessage = friendly(error)
             qrStatusMessage = "Could not complete QR sign in"
         }
-        isBusy = false
+        if isCurrent(operation) { isBusy = false }
     }
 
     private func clearQrState() {
@@ -392,12 +586,76 @@ final class AuthManager: ObservableObject {
         qrAnonAccessToken = nil
     }
 
+    private func beginAuthOperation() -> AuthOperation {
+        authOperationGeneration &+= 1
+        return currentAuthOperation()
+    }
+
+    private func currentAuthOperation() -> AuthOperation {
+        AuthOperation(
+            generation: authOperationGeneration,
+            backendIdentity: AuthConfig.backendIdentity
+        )
+    }
+
+    private func beginQROperation() -> QROperation {
+        qrOperationGeneration &+= 1
+        return currentQROperation()
+    }
+
+    private func currentQROperation() -> QROperation {
+        QROperation(
+            generation: qrOperationGeneration,
+            authGeneration: authOperationGeneration,
+            backendIdentity: AuthConfig.backendIdentity
+        )
+    }
+
+    private func makeService() -> AuthService {
+        AuthService(configuration: AuthConfig.currentConfiguration)
+    }
+
+    private func isSession(_ session: AuthSession, for operation: AuthOperation) -> Bool {
+        session.backendIdentity == operation.backendIdentity ||
+            (session.backendIdentity == nil && !AuthConfig.isCustom)
+    }
+
+    private func invalidateAuthOperations() {
+        authOperationGeneration &+= 1
+        qrOperationGeneration &+= 1
+        pollTask?.cancel()
+        pollTask = nil
+        qrStartTask?.cancel()
+        qrStartTask = nil
+        refreshTask?.cancel()
+        refreshTask = nil
+        refreshOperation = nil
+        discoveryGeneration &+= 1
+        discoveryInFlight = false
+        isDiscoveringServer = false
+        isBusy = false
+    }
+
+    private func isCurrent(_ operation: AuthOperation) -> Bool {
+        authOperationGeneration == operation.generation && AuthConfig.backendIdentity == operation.backendIdentity
+    }
+
+    private func isCurrent(_ operation: QROperation) -> Bool {
+        qrOperationGeneration == operation.generation &&
+            authOperationGeneration == operation.authGeneration &&
+            AuthConfig.backendIdentity == operation.backendIdentity
+    }
+
+    private func isCurrentDiscovery(_ operation: Int) -> Bool {
+        discoveryGeneration == operation
+    }
+
     // MARK: - Helpers
 
     @discardableResult
     private func ensureConfigured() -> Bool {
         if AuthConfig.isConfigured { return true }
-        errorMessage = "Account backend isn't configured yet. Add the Nuvio API URL and publishable key in AuthConfig.swift."
+        errorMessage = "Account sign-in is unavailable because no server is configured."
         return false
     }
 

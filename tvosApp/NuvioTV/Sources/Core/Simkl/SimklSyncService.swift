@@ -1546,6 +1546,8 @@ enum SelectedLibraryService {
             return TraktAuthStore.state.isAuthenticated
         case .simkl:
             return SimklRuntimeSession.authenticatedState() != nil
+        case .mdblist:
+            return MdbListRuntimeSession.isAuthenticated()
         }
     }
 
@@ -1557,6 +1559,8 @@ enum SelectedLibraryService {
             return await TraktLibraryService.setWatchlist(meta, isInWatchlist: isInWatchlist)
         case .simkl:
             return await SimklLibraryService.setWatchlist(meta, isInWatchlist: isInWatchlist)
+        case .mdblist:
+            return await MdbListLibraryService.setWatchlist(meta, isInWatchlist: isInWatchlist)
         }
     }
 
@@ -1568,6 +1572,8 @@ enum SelectedLibraryService {
             return await TraktLibraryService.fetchLibrary(repository: repository)
         case .simkl:
             return await SimklLibraryService.fetchLibrary(repository: repository)
+        case .mdblist:
+            return await MdbListLibraryService.fetchLibrary(repository: repository)
         }
     }
 }

@@ -302,6 +302,7 @@ private final class UnavailablePlaybackEngine: PlaybackEngineControlling {
     let subtitleTracks: [PlaybackTrackInfo] = []
     let isPlayerLoading = false
     let isPlayerPlaying = false
+    let isTransportPlaying = false
     let isPlayerEnded = false
     let isAtEndOfFile = false
     let hasCoherentTimeSample = false

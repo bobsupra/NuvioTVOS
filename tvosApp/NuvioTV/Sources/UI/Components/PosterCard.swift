@@ -2109,6 +2109,12 @@ struct WatchedCheckmarkBadge: View {
                 // allowing an older result to overwrite a newer watched state.
                 refreshVersion &+= 1
             }
+            .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
     }
 
     /// Re-runs the lookup whenever the card's identity changes. Search results
@@ -2135,7 +2141,7 @@ struct WatchedCheckmarkBadge: View {
         }
 
         let snapshot = WatchedStore.currentSnapshot()
-        let isSeries = ["series", "tv", "show", "tvshow"].contains(type.lowercased())
+        let isSeries = meta?.isSeries ?? NuvioMeta.isSeriesType(type)
         guard isSeries else {
             let result = meta.map { snapshot.contains(meta: $0) }
                 ?? snapshot.contains(metaId: metaId, type: type)

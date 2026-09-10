@@ -29,6 +29,8 @@ private enum NetflixSearchMetrics {
 struct NetflixSearchView: View {
     @StateObject private var viewModel: NetflixSearchViewModel
     let showDiscover: Bool
+    let isFullScreenOverlayPresented: Bool
+    let detailsDidDisappearGeneration: UInt
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
@@ -44,8 +46,13 @@ struct NetflixSearchView: View {
     /// re-place focus geometrically instead of snapping to the first result.
     @State private var lastFocusedItemID: String?
     @State private var shouldRestoreFocus = false
+    @State private var restoreArmTask: Task<Void, Never>?
     @State private var overlayRestoreItemID: String?
     @State private var overlayRestoreGeneration = 0
+    @State private var overlayFocusRestoreStartedGeneration: Int?
+    @State private var overlayFocusRestorationActive = false
+    @State private var suppressOverlayDismissalExit = false
+    @State private var resultsScrollTopGeneration = 0
     @State private var discoverOverlayTransitionActive = false
     /// Match Native search: the tvOS keyboard stays mounted for focus
     /// restoration but collapses while browsing results.
@@ -56,9 +63,18 @@ struct NetflixSearchView: View {
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
 
-    init(viewModel: NetflixSearchViewModel, showDiscover: Bool = true, onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil) {
+    init(
+        viewModel: NetflixSearchViewModel,
+        showDiscover: Bool = true,
+        isFullScreenOverlayPresented: Bool = false,
+        detailsDidDisappearGeneration: UInt = 0,
+        onContentClick: @escaping (String, String) -> Void,
+        onLongPress: ((NuvioMeta) -> Void)? = nil
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
         self.showDiscover = showDiscover
+        self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
+        self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
     }
@@ -81,7 +97,7 @@ struct NetflixSearchView: View {
                             .disabled(overlayRestoreItemID != nil || (searchPresented && focusedTypeFilterID == nil))
                         resultsBody
                     } else {
-                        if !viewModel.recentSearches.isEmpty {
+                        if searchPresented, !viewModel.recentSearches.isEmpty {
                             recentRow
                                 .disabled(discoverOverlayTransitionActive)
                         }
@@ -133,29 +149,31 @@ struct NetflixSearchView: View {
         .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
         .onChange(of: focusedItemID) { _, newValue in
             resultFocusGeneration &+= 1
-            let generation = resultFocusGeneration
             if let newValue {
                 withAnimation(.easeInOut(duration: 0.22)) {
                     searchPresented = false
                 }
                 lastFocusedItemID = newValue
                 shouldRestoreFocus = false
-                if isEnabled, newValue == overlayRestoreItemID { overlayRestoreItemID = nil }
-            } else if lastFocusedItemID != nil {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
-                    guard resultFocusGeneration == generation,
-                          focusedItemID == nil,
-                          focusedTypeFilterID == nil,
-                          viewModel.hasQuery,
-                          isEnabled,
-                          overlayRestoreItemID == nil else { return }
-                    showKeyboard()
-                    shouldRestoreFocus = true
+                if isEnabled,
+                   newValue == overlayRestoreItemID,
+                   !overlayFocusRestorationActive {
+                    overlayRestoreItemID = nil
                 }
+            } else if lastFocusedItemID != nil {
+                // A fast lazy-list/grid transition can briefly report nil
+                // focus. Match Discover: wait for a stable departure and arm
+                // card restoration without reopening the keyboard.
+                scheduleRestoreArm()
             }
         }
         .onChange(of: focusedTypeFilterID) { _, newValue in
-            if newValue != nil { showKeyboard() }
+            guard newValue != nil,
+                  focusedItemID == nil,
+                  isEnabled,
+                  overlayRestoreItemID == nil,
+                  !overlayFocusRestorationActive else { return }
+            showKeyboard()
         }
         .onChange(of: isEnabled) { _, enabled in
             if !enabled {
@@ -166,9 +184,37 @@ struct NetflixSearchView: View {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
         }
+        .onChange(of: detailsDidDisappearGeneration) { _, _ in
+            guard !isFullScreenOverlayPresented,
+                  let target = overlayRestoreItemID else { return }
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
+        }
+    }
+
+    private func scheduleRestoreArm() {
+        guard lastFocusedItemID != nil, focusedItemID == nil else { return }
+        restoreArmTask?.cancel()
+        restoreArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled,
+                  focusedItemID == nil,
+                  focusedTypeFilterID == nil,
+                  viewModel.hasQuery,
+                  isEnabled,
+                  overlayRestoreItemID == nil,
+                  !searchPresented,
+                  !overlayFocusRestorationActive else { return }
+            shouldRestoreFocus = true
+        }
     }
 
     private func restoreOverlayFocus(to target: String, generation: Int) {
+        guard overlayFocusRestoreStartedGeneration != generation else { return }
+        overlayFocusRestoreStartedGeneration = generation
+        // Invalidate any focus-loss callback left over from the detail
+        // transition before placing focus back on the saved result.
+        resultFocusGeneration &+= 1
+        overlayFocusRestorationActive = true
         searchPresented = false
         for delay in [0.06, 0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
@@ -182,6 +228,12 @@ struct NetflixSearchView: View {
                 overlayRestoreItemID = nil
             }
         }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            if overlayRestoreGeneration == generation {
+                overlayFocusRestorationActive = false
+                suppressOverlayDismissalExit = false
+            }
+        }
     }
 
     private var canHandleExitCommand: Bool {
@@ -192,19 +244,39 @@ struct NetflixSearchView: View {
             focusedTypeFilterID != nil ||
             focusedRecentSearchID != nil ||
             clearRecentFocused ||
-            (!searchPresented && (viewModel.hasQuery || showDiscover))
+            (viewModel.hasQuery && !searchPresented)
     }
 
     private func handleExitCommand() {
-        showKeyboard()
-        focusedItemID = nil
+        if suppressOverlayDismissalExit {
+            suppressOverlayDismissalExit = false
+            return
+        }
+        returnToResultsTop()
         focusedTypeFilterID = nil
         focusedRecentSearchID = nil
         clearRecentFocused = false
+        shouldRestoreFocus = false
+    }
+
+    /// Back on search behaves like Discover: leave the keyboard collapsed and
+    /// return the results columns to their top edge.
+    private func returnToResultsTop() {
+        searchPresented = false
+        resultsScrollTopGeneration &+= 1
+        guard let first = visibleResults.first else {
+            focusedItemID = nil
+            return
+        }
+        let prefix = focusedItemID?.hasPrefix("grid:") == true ? "grid:" : "list:"
+        focusedItemID = "\(prefix)\(first.id)"
     }
 
     /// Re-expands the shared Native search host after focus leaves results.
     private func showKeyboard() {
+        guard isEnabled,
+              overlayRestoreItemID == nil,
+              !overlayFocusRestorationActive else { return }
         withAnimation(.easeInOut(duration: 0.22)) {
             searchPresented = true
         }
@@ -360,37 +432,52 @@ struct NetflixSearchView: View {
     }
 
     private var resultsList: some View {
-        ScrollView {
-            LazyVStack(alignment: .leading, spacing: 8) {
-                ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
-                    let focusID = "list:\(item.id)"
-                    let isFocused = focusedItemID == focusID
-                    Button {
-                        overlayRestoreItemID = focusID
-                        lastFocusedItemID = focusID
-                        onContentClick(item.id, item.type)
-                    } label: {
-                        Text(item.name)
-                            .font(.system(size: 24, weight: isFocused ? .bold : .regular))
-                            .foregroundColor(isFocused ? .black : .white.opacity(0.85))
-                            .lineLimit(1)
-                            .padding(.horizontal, 20)
-                            .frame(height: 54)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                            .modifier(GlassChipBackground(filled: isFocused))
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focused($focusedItemID, equals: focusID)
-                    .focusEffectDisabledIfAvailable()
-                    .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
-                    .onMoveCommand { direction in
-                        guard index == 0, direction == .up else { return }
-                        transferFirstRowFocusToAllFilter()
+        ScrollViewReader { proxy in
+            ScrollView {
+                Color.clear
+                    .frame(height: 1)
+                    .id("netflix-search-list-top")
+
+                LazyVStack(alignment: .leading, spacing: 8) {
+                    ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
+                        let focusID = "list:\(item.id)"
+                        let isFocused = focusedItemID == focusID
+                        Button {
+                            overlayRestoreGeneration &+= 1
+                            overlayFocusRestoreStartedGeneration = nil
+                            overlayFocusRestorationActive = true
+                            suppressOverlayDismissalExit = true
+                            overlayRestoreItemID = focusID
+                            lastFocusedItemID = focusID
+                            onContentClick(item.id, item.type)
+                        } label: {
+                            Text(item.name)
+                                .font(.system(size: 24, weight: isFocused ? .bold : .regular))
+                                .foregroundColor(isFocused ? .black : .white.opacity(0.85))
+                                .lineLimit(1)
+                                .padding(.horizontal, 20)
+                                .frame(height: 54)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .modifier(GlassChipBackground(filled: isFocused))
+                        }
+                        .buttonStyle(PosterCardButtonStyle())
+                        .focused($focusedItemID, equals: focusID)
+                        .focusEffectDisabledIfAvailable()
+                        .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
+                        .onMoveCommand { direction in
+                            guard index == 0, direction == .up else { return }
+                            transferFirstRowFocusToAllFilter()
+                        }
                     }
                 }
+                .padding(.top, 6)
+                .padding(.bottom, 40)
             }
-            .padding(.top, 6)
-            .padding(.bottom, 40)
+            .onChange(of: resultsScrollTopGeneration) { _, _ in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo("netflix-search-list-top", anchor: .top)
+                }
+            }
         }
         .frame(width: NetflixSearchMetrics.listWidth)
         .disabled(searchPresented && focusedTypeFilterID == nil && focusedItemID == nil)
@@ -399,36 +486,49 @@ struct NetflixSearchView: View {
     }
 
     private var resultsGrid: some View {
-        ScrollView {
-            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: NetflixSearchMetrics.posterGap) {
-                ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
-                    let focusID = "grid:\(item.id)"
-                    PosterGridCard(
-                        meta: item,
-                        width: NetflixSearchMetrics.posterWidth,
-                        height: NetflixSearchMetrics.posterHeight,
-                        externalFocus: $focusedItemID,
-                        focusValue: focusID,
-                        retainFocusAppearance: overlayRestoreItemID == focusID,
-                        onLongPress: onLongPress.map { cb in { cb(item) } },
-                        forceShowLabels: true,
-                        onMove: index < gridColumns.count ? { direction in
-                            guard direction == .up else { return }
-                            transferFirstRowFocusToAllFilter()
-                        } : nil
-                    ) {
-                        overlayRestoreItemID = focusID
-                        lastFocusedItemID = focusID
-                        onContentClick(item.id, item.type)
+        ScrollViewReader { proxy in
+            ScrollView {
+                Color.clear
+                    .frame(height: 1)
+                    .id("netflix-search-grid-top")
+
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: NetflixSearchMetrics.posterGap) {
+                    ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
+                        let focusID = "grid:\(item.id)"
+                        PosterGridCard(
+                            meta: item,
+                            width: NetflixSearchMetrics.posterWidth,
+                            height: NetflixSearchMetrics.posterHeight,
+                            externalFocus: $focusedItemID,
+                            focusValue: focusID,
+                            retainFocusAppearance: overlayRestoreItemID == focusID,
+                            onLongPress: onLongPress.map { cb in { cb(item) } },
+                            forceShowLabels: true,
+                            onMove: index < gridColumns.count ? { direction in
+                                guard direction == .up else { return }
+                                transferFirstRowFocusToAllFilter()
+                            } : nil
+                        ) {
+                            overlayRestoreGeneration &+= 1
+                            overlayFocusRestoreStartedGeneration = nil
+                            overlayFocusRestorationActive = true
+                            suppressOverlayDismissalExit = true
+                            overlayRestoreItemID = focusID
+                            lastFocusedItemID = focusID
+                            onContentClick(item.id, item.type)
+                        }
+                        .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
                     }
-                    .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)
+                }
+                .padding(.top, 12)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 40)
+            }
+            .onChange(of: resultsScrollTopGeneration) { _, _ in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo("netflix-search-grid-top", anchor: .top)
                 }
             }
-            // Room on every edge so a focused card's 1.06 scale and outline
-            // remain fully visible, including the last card at the right.
-            .padding(.top, 12)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 40)
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .focusSection()

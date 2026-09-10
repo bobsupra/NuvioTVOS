@@ -4,10 +4,12 @@ extension PlayerView {
     var layersWithRemoteCommands: some View {
         layersObservingFocus
             .onPlayPauseCommand {
+                guard !isWakingFromBackground else { return }
                 guard viewModel.playbackStartupError == nil else { return }
                 viewModel.togglePlayPause()
             }
             .onMoveCommand { direction in
+                guard !isWakingFromBackground else { return }
                 // The Episodes/Sources sheet exclusively owns directional input.
                 // Do not let list navigation also seek or reveal player controls.
                 guard viewModel.sidePanel == nil, viewModel.playbackStartupError == nil else { return }

@@ -417,6 +417,40 @@ struct NuvioVideo: Identifiable, Codable, Hashable {
     let rating: String?
 }
 
+extension NuvioMeta {
+    /// Returns the stream lookup id for an episode. Metadata enrichment can
+    /// replace Cinemeta's IMDb episode id with a TMDB id, while stream add-ons
+    /// still expect the parent series id plus season/episode.
+    func canonicalEpisodeStreamId(for video: NuvioVideo) -> String {
+        let rawId = video.id.trimmingCharacters(in: .whitespacesAndNewlines)
+        let parentId = streamId.trimmingCharacters(in: .whitespacesAndNewlines)
+        let suffix = ":\(video.season):\(video.episode)"
+
+        if rawId.hasSuffix(suffix) {
+            let rawParentId = String(rawId.dropLast(suffix.count))
+            let rawIMDbId = Self.canonicalImdbID(from: rawParentId)
+            let metaIMDbId = Self.canonicalImdbID(from: parentId)
+
+            // Preserve a correctly namespaced IMDb id, but normalize its case.
+            if let rawIMDbId, rawIMDbId == metaIMDbId {
+                return "\(rawIMDbId)\(suffix)"
+            }
+
+            // Non-IMDb providers can be valid when the metadata uses the same
+            // provider namespace for the parent and the episode.
+            if metaIMDbId == nil,
+               rawParentId.caseInsensitiveCompare(parentId) == .orderedSame {
+                return rawId
+            }
+        }
+
+        if let metaIMDbId = Self.canonicalImdbID(from: parentId) {
+            return "\(metaIMDbId)\(suffix)"
+        }
+        return rawId
+    }
+}
+
 enum EpisodeReleasePolicy {
     static let showUnairedNextUpKey = "nuvio.tv.settings.layout.showUnairedNextUp"
     static let upcomingNextSeasonWindowDays = 7
@@ -622,22 +656,57 @@ enum EpisodeReleasePolicy {
 /// dated today or later does not hold back the badge until it has aired under
 /// the app's existing date-only release policy.
 enum CatalogWatchedPolicy {
+    static func airedRegularEpisodes(_ videos: [NuvioVideo]?) -> [NuvioVideo] {
+        (videos ?? []).filter {
+            $0.season > 0
+                && $0.episode > 0
+                && EpisodeReleasePolicy.hasAired($0.released)
+        }
+    }
+
     static func hasWatchedAllAiredEpisodes(
         videos: [NuvioVideo]?,
         watchedEpisodeKeys: Set<String>
     ) -> Bool {
-        guard let videos, !videos.isEmpty, !watchedEpisodeKeys.isEmpty else { return false }
-        var airedCount = 0
-        for video in videos {
-            guard video.season > 0, video.episode > 0 else { continue }
-            guard EpisodeReleasePolicy.hasAired(video.released) else { continue }
-            airedCount += 1
+        let episodes = airedRegularEpisodes(videos)
+        guard !episodes.isEmpty, !watchedEpisodeKeys.isEmpty else { return false }
+        for video in episodes {
             let key = "\(video.season):\(video.episode)"
             if !watchedEpisodeKeys.contains(key) {
                 return false
             }
         }
-        return airedCount > 0
+        return true
+    }
+}
+
+/// Aggregate watched progress for the Details episode section. The denominator
+/// intentionally matches catalog watched badges: regular aired episodes only,
+/// excluding specials and future releases.
+struct WatchedEpisodeSummary: Equatable {
+    let watchedCount: Int
+    let totalCount: Int
+
+    var progress: Double {
+        guard totalCount > 0 else { return 0 }
+        return Double(watchedCount) / Double(totalCount)
+    }
+
+    static func make(
+        videos: [NuvioVideo]?,
+        watchedEpisodeKeys: Set<String>
+    ) -> WatchedEpisodeSummary? {
+        let episodes = CatalogWatchedPolicy.airedRegularEpisodes(videos)
+        guard !episodes.isEmpty else { return nil }
+        let watchedCount = episodes.reduce(into: 0) { count, video in
+            if watchedEpisodeKeys.contains("\(video.season):\(video.episode)") {
+                count += 1
+            }
+        }
+        return WatchedEpisodeSummary(
+            watchedCount: watchedCount,
+            totalCount: episodes.count
+        )
     }
 }
 
@@ -4221,9 +4290,16 @@ struct WatchedSnapshot {
     /// Episode keys grouped by normalized series title and year
     let episodeKeysBySeriesTitle: [String: [(year: Int?, keys: Set<String>)]]
 
-    init(items: [WatchedStoreItem], source: TraktWatchProgressSource) {
+    init(
+        items: [WatchedStoreItem],
+        source: TraktWatchProgressSource,
+        additionalVisibleSources: Set<TraktWatchProgressSource> = []
+    ) {
         self.source = source
-        let visible = items.filter { $0.isVisible(under: source) }
+        let visible = items.filter { item in
+            item.isVisible(under: source)
+                || additionalVisibleSources.contains { item.isVisible(under: $0) }
+        }
         self.visibleItems = visible
 
         var wholeTitleKeysByType: [String: Set<String>] = [:]
@@ -4395,6 +4471,7 @@ enum WatchedStore {
     private static var cachedData: Data?
     private static var cachedSnapshot: WatchedSnapshot?
     private static var cachedSource: TraktWatchProgressSource?
+    private static var cachedTraktHistoryVisibility = false
     private static var cacheGeneration = 0
 
     private enum PersistenceError: LocalizedError {
@@ -4439,6 +4516,7 @@ enum WatchedStore {
         cachedData = nil
         cachedSnapshot = nil
         cachedSource = nil
+        cachedTraktHistoryVisibility = false
     }
 
     /// Pre-warms the in-memory cache in the background off the main actor.
@@ -4583,17 +4661,25 @@ enum WatchedStore {
 
         let key = storageKey
         let currentSource = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
+        let shouldShowConnectedTraktHistory = currentSource != .trakt
+            && RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: ProfileSettings.current)
 
         if cachedKey == key,
            let snapshot = cachedSnapshot,
-           cachedSource == currentSource {
+           cachedSource == currentSource,
+           cachedTraktHistoryVisibility == shouldShowConnectedTraktHistory {
             return snapshot
         }
 
         let allItems = itemsLocked()
-        let snapshot = WatchedSnapshot(items: allItems, source: currentSource)
+        let snapshot = WatchedSnapshot(
+            items: allItems,
+            source: currentSource,
+            additionalVisibleSources: shouldShowConnectedTraktHistory ? [.trakt] : []
+        )
         cachedSnapshot = snapshot
         cachedSource = currentSource
+        cachedTraktHistoryVisibility = shouldShowConnectedTraktHistory
         return snapshot
     }
 
@@ -4604,9 +4690,10 @@ enum WatchedStore {
         currentSnapshot().contains(metaId: metaId, type: type)
     }
 
-    /// Rows the selected backend actually has — which is what every "is this
-    /// watched?" question in the UI means. ``items()`` stays the full local
-    /// union, because sync pushes and history transfers work from that.
+    /// Rows the selected backend has, plus connected Trakt history. Trakt is an
+    /// account-level watched-history mirror and remains visible even when a
+    /// different provider owns Continue Watching. ``items()`` stays the full
+    /// local union, because sync pushes and history transfers work from that.
     static func visibleItems() -> [WatchedStoreItem] {
         currentSnapshot().visibleItems
     }
@@ -4624,6 +4711,13 @@ enum WatchedStore {
 
     static func contains(meta: NuvioMeta) -> Bool {
         currentSnapshot().contains(meta: meta)
+    }
+
+    /// Watched state for the Details title action. A fully watched series may
+    /// have only episode rows after a Trakt pull, so the aggregate episode
+    /// policy must be considered alongside an explicit title marker.
+    static func isWatchedForDisplay(meta: NuvioMeta) -> Bool {
+        contains(meta: meta) || (meta.isSeries && hasSeriesWatchedState(meta))
     }
 
     /// Catalog cards can use a provider-local id while the watched marker was
@@ -4806,7 +4900,7 @@ enum WatchedStore {
         for season in episodesBySeason.keys.sorted() {
             let episodes = (episodesBySeason[season] ?? []).sorted()
             guard !episodes.isEmpty else { continue }
-            if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: store) {
+            if RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: store) {
                 for episode in episodes {
                     _ = enqueuePendingTraktMutation(
                         meta: meta,
@@ -4834,6 +4928,18 @@ enum WatchedStore {
                         episodes: episodes,
                         isWatched: isWatched,
                         store: store
+                    )
+                }
+            }
+            if RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: store) {
+                Task { @MainActor in
+                    _ = await MdbListProgressService.setWatched(
+                        meta,
+                        season: season,
+                        episodes: episodes,
+                        isWatched: isWatched,
+                        store: store,
+                        profileScope: profileId
                     )
                 }
             }
@@ -4903,7 +5009,7 @@ enum WatchedStore {
         }
 
         let traktStore = ProfileSettings.current
-        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
+        if RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: traktStore) {
             let profileId = activeProfileId
             // The pending ledger stays per episode — it is what confirms and
             // retries each row individually on the next pull.
@@ -4934,6 +5040,18 @@ enum WatchedStore {
                     episodes: episodeNumbers.sorted(),
                     isWatched: isWatched,
                     store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: traktStore) {
+            Task { @MainActor in
+                _ = await MdbListProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episodes: episodeNumbers.sorted(),
+                    isWatched: isWatched,
+                    store: traktStore,
+                    profileScope: activeProfileId
                 )
             }
         }
@@ -4984,8 +5102,8 @@ enum WatchedStore {
 
     @discardableResult
     static func markWatched(_ meta: NuvioMeta, season: Int? = nil, episode: Int? = nil) -> Bool {
-        // A new mark belongs to whichever backend is selected — that is the one
-        // it gets pushed to, and the only one that will confirm it on a pull.
+        // A new mark is attributed to the selected backend immediately. Trakt
+        // is also mirrored when connected, even if another backend owns resume.
         let item = WatchedStoreItem(
             meta: meta.persistenceSnapshot,
             watchedAt: Date(),
@@ -5020,7 +5138,7 @@ enum WatchedStore {
             )
         }
         let traktStore = ProfileSettings.current
-        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
+        if RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: traktStore) {
             let profileId = activeProfileId
             _ = enqueuePendingTraktMutation(
                 meta: meta,
@@ -5047,6 +5165,18 @@ enum WatchedStore {
                     episode: episode,
                     isWatched: true,
                     store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: traktStore) {
+            Task { @MainActor in
+                _ = await MdbListProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: true,
+                    store: traktStore,
+                    profileScope: activeProfileId
                 )
             }
         }
@@ -5111,7 +5241,7 @@ enum WatchedStore {
         episode: Int?
     ) {
         let traktStore = ProfileSettings.current
-        if RemoteTrackingState.shouldSyncWatchedHistory(to: .trakt, in: traktStore) {
+        if RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: traktStore) {
             let profileId = activeProfileId
             _ = enqueuePendingTraktMutation(
                 meta: meta,
@@ -5138,6 +5268,18 @@ enum WatchedStore {
                     episode: episode,
                     isWatched: false,
                     store: traktStore
+                )
+            }
+        }
+        if RemoteTrackingState.shouldSyncWatchedHistory(to: .mdblist, in: traktStore) {
+            Task { @MainActor in
+                _ = await MdbListProgressService.setWatched(
+                    meta,
+                    season: season,
+                    episode: episode,
+                    isWatched: false,
+                    store: traktStore,
+                    profileScope: activeProfileId
                 )
             }
         }
@@ -5256,6 +5398,42 @@ enum WatchedStore {
             guard !item.sources.isEmpty else { return nil }
             var retained = item
             retained.sources.remove(TraktWatchProgressSource.simkl.rawValue)
+            return retained.sources.isEmpty ? nil : retained
+        }
+        let changed = updated.count != current.count || zip(updated, current).contains {
+            $0.id != $1.id || $0.sources != $1.sources
+        }
+        return !changed || persist(updated)
+    }
+
+    /// Applies MDBList's complete watched snapshot while removing only rows
+    /// previously attributed to MDBList. Local, Trakt, and Simkl ownership is
+    /// preserved when the same title is known by more than one source.
+    @discardableResult
+    static func reconcileMdbListSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        previousRemoteItems: [WatchedStoreItem],
+        syncStartedAt: Date
+    ) -> Bool {
+        let source = TraktWatchProgressSource.mdblist.rawValue
+        let remoteItems = remoteItems.map { $0.adding(source: .mdblist) }
+        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
+
+        let currentRemoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
+        let removedRemoteKeys = Set(previousRemoteItems.flatMap(watchedIdentityKeys))
+            .subtracting(currentRemoteKeys)
+        guard !removedRemoteKeys.isEmpty else { return true }
+
+        let current = items()
+        let updated = current.compactMap { item -> WatchedStoreItem? in
+            guard item.watchedAt <= syncStartedAt,
+                  !watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys),
+                  item.sources.isEmpty || item.sources.contains(source) else {
+                return item
+            }
+            guard !item.sources.isEmpty else { return nil }
+            var retained = item
+            retained.sources.remove(source)
             return retained.sources.isEmpty ? nil : retained
         }
         let changed = updated.count != current.count || zip(updated, current).contains {
@@ -6039,8 +6217,14 @@ enum ProfileSettings {
         current = .standard
         activeProfileID = nil
         let simklTokenStorage = SimklKeychainTokenStorage()
+        let mdbListTokenStorage = MdbListKeychainTokenStorage()
         for id in Set(profileIds) where !id.isEmpty {
             simklTokenStorage.setAccessToken(nil, for: id)
+            MdbListAuthStore.clearAuth(
+                profileScope: id,
+                store: store(for: id),
+                tokenStorage: mdbListTokenStorage
+            )
             AISubtitleKeyStore.remove(profileScope: id)
             Task { await AISubtitleTranslationCache.shared.removeAll(profileScope: id) }
             UserDefaults.standard.removePersistentDomain(forName: "\(suitePrefix).\(id)")
@@ -6052,6 +6236,12 @@ enum ProfileSettings {
             store: .standard,
             tokenStorage: simklTokenStorage
         )
+        MdbListAuthStore.clearAuth(
+            profileScope: "default",
+            store: .standard,
+            tokenStorage: mdbListTokenStorage
+        )
+        mdbListTokenStorage.removeAll()
         // Removing the suites no longer takes the sync caches with them — they
         // are files now, and would otherwise be inherited by the next account.
         SimklSyncCache.eraseAll()
@@ -6217,6 +6407,8 @@ struct DetailsUiState {
     var people: [TmdbPersonMetadata] = []
     /// Simkl community rating, catalog rank, and drop rate.
     var simklRatings: SimklTitleRatings? = nil
+    /// The authenticated user's optional MDBList rating for this title.
+    var mdbListUserRating: Int? = nil
     /// Top liked Trakt comments (max 5).
     var comments: [TraktCommentReview] = []
     var isLoadingEnrichment: Bool = false

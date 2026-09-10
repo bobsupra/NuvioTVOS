@@ -845,10 +845,13 @@ struct ContentView: View {
             // Keep the provider-backed path aligned with built-in playback:
             // optimistic local state plus one pause/stop report. A zero
             // fraction is an Infuse close-before-play signal, not playback.
+            let completionFraction = TraktSettingsStore.watchProgressSource == .mdblist
+                ? MdbListProgressService.completionPercent / 100
+                : WatchProgressLedger.completionFraction
             if progress > 0 {
                 let reportDuration = duration ?? 100
                 let reportPosition = duration.map { $0 * progress } ?? (100 * progress)
-                let action: TraktScrobbleAction = progress >= WatchProgressLedger.completionFraction
+                let action: TraktScrobbleAction = progress >= completionFraction
                     ? .stop
                     : .pause
                 let store = ProfileSettings.current
@@ -874,7 +877,7 @@ struct ContentView: View {
                     )
                 }
             }
-            if progress >= WatchProgressLedger.completionFraction {
+            if progress >= completionFraction {
                 _ = WatchedStore.markWatched(
                     session.meta,
                     season: session.season,
@@ -1070,9 +1073,9 @@ struct ContentView: View {
         season <= 0 ? Int.max : season
     }
 
-    /// Starts a Continue Watching card immediately. Locally played entries use
-    /// their last stream URL; synced and Next Up entries fetch and smart-select
-    /// a stream in the background without opening Details first.
+    /// Starts a Continue Watching card. Normal resume uses Details' picker when
+    /// Smart Playback is off; with Smart Playback on, locally played entries use
+    /// their last stream URL and synced/Next Up entries smart-select in place.
     ///
     /// `startFromBeginning` plays the same episode with no resume point, for the
     /// card menu's "Start from beginning".
@@ -1084,6 +1087,22 @@ struct ContentView: View {
         let item = RemoteTrackingState.isProgressSourceAuthenticated
             ? (TraktProgressService.currentContinueWatchingItem(for: item.meta) ?? item)
             : item
+
+        // Read the active profile directly at tap time. ContentView's own
+        // @AppStorage would use the standard store before the descendant
+        // defaultAppStorage environment is applied.
+        let smartStreamSelection = ProfileSettings.store(
+            for: profileViewModel.activeProfile?.id
+        ).bool(forKey: SettingsKey.smartStreamSelection)
+
+        // Normal resume must let the viewer choose a source when Smart Playback
+        // is disabled. Start from beginning deliberately keeps its existing
+        // direct/resolve path so it still starts at zero.
+        if !startFromBeginning, !smartStreamSelection {
+            playContinueWatchingManually(item)
+            return
+        }
+
         let context = Self.episodeContext(for: item)
         playbackEpisodes = context.episodes
         playbackCurrentEpisode = context.current
@@ -1120,12 +1139,15 @@ struct ContentView: View {
         continueWatchingPlaybackTask = Task {
             let prepared: PreparedNextStream?
             if let episode = context.current {
-                prepared = await Self.resolveNextEpisodeStream(episode: episode, profileId: profileId)
-            } else if item.meta.isSeries, let numbers = item.episodeNumbers {
-                prepared = await Self.resolveStream(
-                    contentId: "\(item.meta.id):\(numbers.season):\(numbers.episode)",
-                    type: "series",
-                    subtitleLine: item.episodeSubtitle ?? "",
+                prepared = await Self.resolveNextEpisodeStream(
+                    episode: episode,
+                    seriesMeta: item.meta,
+                    profileId: profileId
+                )
+            } else if let episode = Self.manualPlaybackEpisode(for: item) {
+                prepared = await Self.resolveNextEpisodeStream(
+                    episode: episode,
+                    seriesMeta: item.meta,
                     profileId: profileId
                 )
             } else {
@@ -1231,6 +1253,7 @@ struct ContentView: View {
         // on this device. Retire the row on the account as well; it no-ops
         // unless Simkl is the selected progress source.
         Task { await SimklProgressService.removePlayback(for: item) }
+        Task { @MainActor in await MdbListProgressService.removePlayback(for: item) }
 
         let keysArray = Array(keysToDelete)
         if !keysArray.isEmpty {
@@ -1823,9 +1846,14 @@ struct ContentView: View {
     /// seamless auto-advance: fetches the episode's streams (concurrently) and
     /// applies the same smart selection the details screen uses. Returns nil when
     /// nothing real is available, so the player falls back to a normal end.
-    private static func resolveNextEpisodeStream(episode: NuvioVideo, profileId: String?) async -> PreparedNextStream? {
-        await resolveStream(
-            contentId: episode.id,
+    private static func resolveNextEpisodeStream(
+        episode: NuvioVideo,
+        seriesMeta: NuvioMeta,
+        profileId: String?
+    ) async -> PreparedNextStream? {
+        let streamId = seriesMeta.canonicalEpisodeStreamId(for: episode)
+        return await resolveStream(
+            contentId: streamId,
             type: "series",
             subtitleLine: "S\(episode.season) · E\(episode.episode) · \(episode.title)",
             profileId: profileId
@@ -2153,14 +2181,19 @@ struct ContentView: View {
             autoPlayNextEnabled: autoPlayNext,
             autoPlayNextCountdownSeconds: autoPlayNextCountdown,
             resolveNextStream: (isTrailer || !meta.isSeries) ? nil : { episode in
-                await Self.resolveNextEpisodeStream(episode: episode, profileId: profileViewModel.activeProfile?.id)
+                await Self.resolveNextEpisodeStream(
+                    episode: episode,
+                    seriesMeta: meta,
+                    profileId: profileViewModel.activeProfile?.id
+                )
             },
-            reloadCurrentStream: isTrailer ? nil : { excludedURLs in
+            reloadCurrentStream: isTrailer ? nil : { currentEpisode, excludedURLs in
                 let profileId = profileViewModel.activeProfile?.id
                 let excluded = Set(excludedURLs)
-                if let episode = playbackCurrentEpisode {
+                if let episode = currentEpisode {
+                    let streamId = meta.canonicalEpisodeStreamId(for: episode)
                     return await Self.resolveStream(
-                        contentId: episode.id,
+                        contentId: streamId,
                         type: "series",
                         subtitleLine: "S\(episode.season) · E\(episode.episode) · \(episode.title)",
                         profileId: profileId,
@@ -2674,6 +2707,8 @@ private struct TVMainTabView: View {
             NativeSearchView(
                 viewModel: searchViewModel,
                 showDiscover: discoverLocation == "Search",
+                isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+                detailsDidDisappearGeneration: detailsDidDisappearGeneration,
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
@@ -2681,6 +2716,8 @@ private struct TVMainTabView: View {
             NetflixSearchView(
                 viewModel: netflixSearchViewModel,
                 showDiscover: discoverLocation == "Search",
+                isFullScreenOverlayPresented: isFullScreenOverlayPresented,
+                detailsDidDisappearGeneration: detailsDidDisappearGeneration,
                 onContentClick: onNavigateToDetails,
                 onLongPress: onLongPressCard
             )
@@ -3182,6 +3219,7 @@ struct TVHomeView: View {
     @State private var displayedProgressSource: TraktWatchProgressSource?
     @State private var continueWatchingRefreshGeneration = 0
     @State private var continueWatchingRefreshTask: Task<Void, Never>?
+    @State private var traktWatchedHistorySyncTask: Task<Void, Never>?
     @State private var simklLoadingDebugInfo: String?
     @State private var simklLoadingTimeoutTask: Task<Void, Never>?
     @State private var simklLoadingStartedAt: Date?
@@ -3696,6 +3734,7 @@ struct TVHomeView: View {
             refreshContinueWatching()
             refreshWatchedTitles()
             scheduleContinueWatchingRefresh()
+            scheduleTraktWatchedHistorySync()
         }
         // Home stays mounted behind Details/Player, so `onAppear` no longer
         // fires on return. Refresh the Continue Watching row whenever the store
@@ -3719,10 +3758,12 @@ struct TVHomeView: View {
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
             guard isActive else { return }
             scheduleContinueWatchingRefresh()
+            scheduleTraktWatchedHistorySync()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             guard isActive else { return }
             scheduleContinueWatchingRefresh()
+            scheduleTraktWatchedHistorySync()
         }
         // TabView can keep Home mounted while Settings is selected, so returning
         // to Home does not reliably produce another onAppear.
@@ -3877,6 +3918,10 @@ struct TVHomeView: View {
                 }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: MdbListAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+            guard isActive else { return }
+            scheduleContinueWatchingRefresh()
+        }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
             guard isActive else { return }
             if SimklSettingsStore.isPlanToWatchHomeCatalogsEnabled {
@@ -3915,6 +3960,8 @@ struct TVHomeView: View {
             homeReloadTask?.cancel()
             continueWatchingRefreshTask?.cancel()
             continueWatchingRefreshTask = nil
+            traktWatchedHistorySyncTask?.cancel()
+            traktWatchedHistorySyncTask = nil
             finishSimklHomeLoadingDiagnostic()
             continueWatchingRefreshGeneration &+= 1
         }
@@ -5062,7 +5109,7 @@ struct TVHomeView: View {
             let wasEmpty = store.sections.allSatisfy(\.isLoadingPlaceholder)
             // The snapshot is what the next launch seeds skeletons *from*, so only
             // rows that actually resolved belong in it.
-            TVHomeCatalogOrder.writeSnapshot(composed)
+            TVHomeCatalogOrder.scheduleSnapshotWrite(composed)
 
             let isSameSections = store.sections.count == visible.count && zip(store.sections, visible).allSatisfy { old, new in
                 old.id == new.id &&
@@ -5216,7 +5263,7 @@ struct TVHomeView: View {
         let pinned = fresh.filter(\.isPinnedCollection)
         let unpinned = fresh.filter { !$0.isPinnedCollection }
         let merged = homeOrderedSections(pinned + catalogRows + unpinned)
-        TVHomeCatalogOrder.writeSnapshot(merged)
+        TVHomeCatalogOrder.scheduleSnapshotWrite(merged)
         // Compare ids *and* folder tile shapes / titles so edits like switching
         // Poster ↔ Landscape actually re-render Home (id-only checks skip them).
         let currentSignature = collectionSectionsSignature(store.sections)
@@ -5712,6 +5759,28 @@ struct TVHomeView: View {
         }
     }
 
+    /// Watched history is an account-level Trakt mirror, so it must refresh
+    /// independently of the provider selected for Continue Watching. The
+    /// service coalesces overlapping requests and the captured profile keeps a
+    /// late response from refreshing another profile's UI.
+    private func scheduleTraktWatchedHistorySync() {
+        traktWatchedHistorySyncTask?.cancel()
+        guard isActive,
+              let profileID = WatchedStore.activeProfileId,
+              !profileID.isEmpty,
+              TraktAuthStore.state.isAuthenticated(in: ProfileSettings.current) else {
+            traktWatchedHistorySyncTask = nil
+            return
+        }
+
+        let store = ProfileSettings.store(for: profileID)
+        traktWatchedHistorySyncTask = Task { @MainActor in
+            _ = await TraktHistoryService.syncWatchedHistory(store: store)
+            guard !Task.isCancelled, WatchedStore.activeProfileId == profileID else { return }
+            refreshWatchedTitles()
+        }
+    }
+
     @MainActor
     private func refreshContinueWatchingFromSelectedSource() async {
         continueWatchingRefreshGeneration &+= 1
@@ -5772,15 +5841,18 @@ struct TVHomeView: View {
         setContinueWatching(visibleItems)
         displayedProgressSource = source
 
-        // Continue Watching is visible now. Refresh watched checkmarks afterward
-        // so a full history sync never blocks the row during a source switch.
+        // Continue Watching is visible now. Other providers own their own
+        // watched snapshots; Trakt is refreshed independently above so its
+        // history remains available even when another provider owns resume.
         switch source {
         case .nuvioSync:
             break
         case .trakt:
-            _ = await TraktHistoryService.syncWatchedHistory()
+            break
         case .simkl:
             _ = await SimklHistoryService.syncWatchedHistory()
+        case .mdblist:
+            _ = await MdbListProgressService.syncWatchedHistory()
         }
     }
 
@@ -5999,6 +6071,7 @@ struct TVHomeSection: Identifiable {
 enum TVHomeCatalogOrder {
     static let changedNotification = Notification.Name("nuvio.tv.homeCatalogOrder.changed")
     static let snapshotChangedNotification = Notification.Name("nuvio.tv.homeCatalogSnapshot.changed")
+    private static let snapshotWriter = TVHomeCatalogSnapshotWriter()
 
     static func catalogDisplayTitle(_ name: String, contentType: String, showType: Bool) -> String {
         guard showType else { return name }
@@ -6165,7 +6238,7 @@ enum TVHomeCatalogOrder {
 
     /// One row as the Settings list needs it: what to call it, which add-on it
     /// came from, and the key that hides it.
-    struct SnapshotRow: Equatable {
+    struct SnapshotRow: Equatable, Sendable {
         let id: String
         let title: String
         let addonName: String?
@@ -6190,25 +6263,23 @@ enum TVHomeCatalogOrder {
     /// layout order is never purged or scrambled.
     static func writeSnapshot(_ sections: [TVHomeSection]) {
         TVHomeDebugTrace.measure("TVHomeCatalogOrder.writeSnapshot count=\(sections.count)") {
-            var rows = sections.map {
-                SnapshotRow(
-                    id: $0.id,
-                    title: $0.title,
-                    addonName: $0.addonName,
-                    addonId: $0.addonId,
-                    contentType: $0.contentType,
-                    catalogId: $0.catalogId,
-                    settingsKey: $0.catalogSettingsKey
-                )
-            }
+            let rows = mergedSnapshotRows(
+                current: makeSnapshotRows(from: sections),
+                previous: snapshotRows(in: ProfileSettings.current)
+            )
+            writeSnapshotRows(rows, in: ProfileSettings.current)
+        }
+    }
 
-            var seen = Set(rows.map(\.id))
-            for (index, previous) in snapshotRows().enumerated() {
-                guard seen.insert(previous.id).inserted else { continue }
-                rows.insert(previous, at: min(index, rows.count))
-            }
-
-            writeSnapshotRows(rows)
+    /// Coalesces Home's progressive catalog updates and persists the result on
+    /// a non-main actor. The caller only builds the small row descriptor array;
+    /// UserDefaults I/O, JSON serialization, and notification delivery happen
+    /// after a quiet period so a catalog response cannot block focus/layout.
+    static func scheduleSnapshotWrite(_ sections: [TVHomeSection]) {
+        let rows = makeSnapshotRows(from: sections)
+        let profileID = ProfileSettings.activeProfileID
+        Task {
+            await snapshotWriter.schedule(rows: rows, profileID: profileID)
         }
     }
 
@@ -6240,6 +6311,10 @@ enum TVHomeCatalogOrder {
     /// Keeps the Settings list's snapshot aligned after an in-list move so
     /// re-entering the pane shows the new order even before Home reloads.
     static func writeSnapshotRows(_ rows: [SnapshotRow]) {
+        writeSnapshotRows(rows, in: ProfileSettings.current)
+    }
+
+    fileprivate static func writeSnapshotRows(_ rows: [SnapshotRow], in settings: UserDefaults) {
         TVHomeDebugTrace.measure("TVHomeCatalogOrder.writeSnapshotRows count=\(rows.count)") {
             let payload = rows.map { row -> [String: String] in
                 var entry = ["id": row.id, "title": row.title]
@@ -6251,14 +6326,13 @@ enum TVHomeCatalogOrder {
                 return entry
             }
             guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
-            ProfileSettings.current.set(data, forKey: SettingsKey.homeCatalogTitles)
-            NotificationCenter.default.post(name: snapshotChangedNotification, object: nil)
+            settings.set(data, forKey: SettingsKey.homeCatalogTitles)
+            postSnapshotChangedNotification()
         }
     }
 
-    /// Rows for the Settings reorder list, from the last Home snapshot.
-    static func snapshotRows() -> [SnapshotRow] {
-        guard let data = ProfileSettings.current.data(forKey: SettingsKey.homeCatalogTitles),
+    fileprivate static func snapshotRows(in settings: UserDefaults) -> [SnapshotRow] {
+        guard let data = settings.data(forKey: SettingsKey.homeCatalogTitles),
               let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] else {
             return []
         }
@@ -6274,6 +6348,49 @@ enum TVHomeCatalogOrder {
                 settingsKey: row["key"]
             )
         }
+    }
+
+    private static func makeSnapshotRows(from sections: [TVHomeSection]) -> [SnapshotRow] {
+        sections.map {
+            SnapshotRow(
+                id: $0.id,
+                title: $0.title,
+                addonName: $0.addonName,
+                addonId: $0.addonId,
+                contentType: $0.contentType,
+                catalogId: $0.catalogId,
+                settingsKey: $0.catalogSettingsKey
+            )
+        }
+    }
+
+    fileprivate static func mergedSnapshotRows(
+        current: [SnapshotRow],
+        previous: [SnapshotRow]
+    ) -> [SnapshotRow] {
+        var rows = current
+        var seen = Set(rows.map(\.id))
+        for (index, previous) in previous.enumerated() {
+            guard seen.insert(previous.id).inserted else { continue }
+            rows.insert(previous, at: min(index, rows.count))
+        }
+        return rows
+    }
+
+    private static func postSnapshotChangedNotification() {
+        let post = {
+            NotificationCenter.default.post(name: snapshotChangedNotification, object: nil)
+        }
+        if Thread.isMainThread {
+            post()
+        } else {
+            DispatchQueue.main.async(execute: post)
+        }
+    }
+
+    /// Rows for the Settings reorder list, from the last Home snapshot.
+    static func snapshotRows() -> [SnapshotRow] {
+        snapshotRows(in: ProfileSettings.current)
     }
 
     /// Builds the account payload for the current Home catalog snapshot.
@@ -6390,6 +6507,47 @@ enum TVHomeCatalogOrder {
     private static func persist(_ keys: Set<String>, forKey key: String) {
         guard let data = try? JSONEncoder().encode(Array(keys).sorted()) else { return }
         ProfileSettings.current.set(data, forKey: key)
+    }
+}
+
+/// Debounces Home snapshot writes away from the main actor. The latest tree is
+/// the only one that matters once progressive catalog responses settle.
+private actor TVHomeCatalogSnapshotWriter {
+    private var pendingRows: [TVHomeCatalogOrder.SnapshotRow]?
+    private var pendingProfileID: String?
+    private var scheduledFlush: Task<Void, Never>?
+
+    func schedule(
+        rows: [TVHomeCatalogOrder.SnapshotRow],
+        profileID: String?
+    ) {
+        pendingRows = rows
+        pendingProfileID = profileID
+        scheduledFlush?.cancel()
+        scheduledFlush = Task { [weak self] in
+            do {
+                try await Task.sleep(nanoseconds: 150_000_000)
+            } catch {
+                return
+            }
+            guard !Task.isCancelled else { return }
+            await self?.flush()
+        }
+    }
+
+    private func flush() {
+        guard let rows = pendingRows else { return }
+        let profileID = pendingProfileID
+        pendingRows = nil
+        pendingProfileID = nil
+        scheduledFlush = nil
+
+        let settings = ProfileSettings.store(for: profileID)
+        let merged = TVHomeCatalogOrder.mergedSnapshotRows(
+            current: rows,
+            previous: TVHomeCatalogOrder.snapshotRows(in: settings)
+        )
+        TVHomeCatalogOrder.writeSnapshotRows(merged, in: settings)
     }
 }
 

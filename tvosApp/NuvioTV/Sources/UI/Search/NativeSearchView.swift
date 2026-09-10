@@ -21,6 +21,8 @@ private enum NativeSearchGridMetrics {
 struct NativeSearchView: View {
     @StateObject private var viewModel: SearchViewModel
     let showDiscover: Bool
+    let isFullScreenOverlayPresented: Bool
+    let detailsDidDisappearGeneration: UInt
     let onContentClick: (String, String) -> Void
     var onLongPress: ((NuvioMeta) -> Void)? = nil
 
@@ -31,22 +33,37 @@ struct NativeSearchView: View {
     @State private var restoreArmTask: Task<Void, Never>?
     @State private var overlayRestoreResultID: String?
     @State private var overlayRestoreGeneration = 0
+    @State private var overlayFocusRestoreStartedGeneration: Int?
+    @State private var overlayFocusRestorationActive = false
+    @State private var suppressOverlayDismissalExit = false
+    @State private var resultsScrollTopGeneration = 0
+    @State private var nativeGridColumnCount = Int(NativeSearchGridMetrics.columnCount)
     @State private var discoverOverlayTransitionActive = false
     /// Controls the native `.searchable` keyboard visibility. Collapsed when
     /// focus enters the result grid or Discover cards, restored when the user
     /// exits back up (matching Netflix's collapse behaviour).
     @State private var searchPresented = true
-    /// Debounces a rapid nil→value focus transition that tvOS generates while
-    /// realizing a new lazy cell during a fast swipe.
+    /// Arms result-focus restoration only after a nil focus survives the same
+    /// short debounce used by Discover. A lazy cell can briefly blur while a
+    /// fast swipe realizes the next card; that must not open the keyboard.
     @State private var resultFocusGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
     @AppStorage(SettingsKey.hideUnreleased) private var hideUnreleased = false
 
-    init(viewModel: SearchViewModel, showDiscover: Bool = true, onContentClick: @escaping (String, String) -> Void, onLongPress: ((NuvioMeta) -> Void)? = nil) {
+    init(
+        viewModel: SearchViewModel,
+        showDiscover: Bool = true,
+        isFullScreenOverlayPresented: Bool = false,
+        detailsDidDisappearGeneration: UInt = 0,
+        onContentClick: @escaping (String, String) -> Void,
+        onLongPress: ((NuvioMeta) -> Void)? = nil
+    ) {
         _viewModel = StateObject(wrappedValue: viewModel)
         self.showDiscover = showDiscover
+        self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
+        self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
         self.onContentClick = onContentClick
         self.onLongPress = onLongPress
     }
@@ -76,7 +93,7 @@ struct NativeSearchView: View {
                         resultsContainer
                             .zIndex(0)
                     } else {
-                        if !viewModel.recentSearches.isEmpty {
+                        if searchPresented, !viewModel.recentSearches.isEmpty {
                             recentRow
                                 .disabled(discoverOverlayTransitionActive)
                         }
@@ -122,7 +139,6 @@ struct NativeSearchView: View {
         }
         .onChange(of: focusedResultID) { _, newValue in
             resultFocusGeneration &+= 1
-            let generation = resultFocusGeneration
             if let newValue {
                 restoreArmTask?.cancel()
                 lastFocusedResultID = newValue
@@ -131,18 +147,16 @@ struct NativeSearchView: View {
                 withAnimation(.easeInOut(duration: 0.22)) {
                     searchPresented = false
                 }
-                if isEnabled, newValue == overlayRestoreResultID { overlayRestoreResultID = nil }
-            } else if lastFocusedResultID != nil {
-                // Focus left the results (rapid swipe or real exit). Wait a
-                // beat so a transient nil during a lazy-cell swap doesn't
-                // flash the keyboard back.
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.14) {
-                    guard resultFocusGeneration == generation,
-                          focusedResultID == nil,
-                          isEnabled else { return }
-                    showKeyboard()
-                    shouldRestoreResultFocus = true
+                if isEnabled,
+                   newValue == overlayRestoreResultID,
+                   !overlayFocusRestorationActive {
+                    overlayRestoreResultID = nil
                 }
+            } else if lastFocusedResultID != nil {
+                // Focus can be nil for a frame while a lazy cell is realized.
+                // Arm restoration only if it remains nil; do not expand the
+                // keyboard from this passive focus transition.
+                scheduleRestoreArm()
             }
         }
         .onChange(of: isEnabled) { _, enabled in
@@ -153,20 +167,36 @@ struct NativeSearchView: View {
                 restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
             }
         }
-        .onExitCommand {
-            guard isEnabled,
-                  overlayRestoreResultID == nil,
-                  !discoverOverlayTransitionActive else { return }
-            if focusedResultID != nil || !searchPresented {
-                showKeyboard()
-            }
+        .onChange(of: detailsDidDisappearGeneration) { _, _ in
+            guard !isFullScreenOverlayPresented,
+                  let target = overlayRestoreResultID else { return }
+            restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
         }
+        .onExitCommand(perform: canHandleExitCommand ? handleExitCommand : nil)
     }
 
     // MARK: - Overlay focus restoration
 
+    private func scheduleRestoreArm() {
+        guard lastFocusedResultID != nil, focusedResultID == nil else { return }
+        restoreArmTask?.cancel()
+        restoreArmTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled,
+                  focusedResultID == nil,
+                  isEnabled,
+                  overlayRestoreResultID == nil,
+                  !searchPresented,
+                  !overlayFocusRestorationActive else { return }
+            shouldRestoreResultFocus = true
+        }
+    }
+
     /// Re-presents the native `.searchable` keyboard after it was collapsed.
     private func showKeyboard() {
+        guard isEnabled,
+              overlayRestoreResultID == nil,
+              !overlayFocusRestorationActive else { return }
         withAnimation(.easeInOut(duration: 0.22)) {
             searchPresented = true
         }
@@ -191,7 +221,39 @@ struct NativeSearchView: View {
         }
     }
 
+    /// Back on the search results behaves like the Discover surface: keep the
+    /// keyboard collapsed and return the result viewport/focus to its top.
+    private func returnToResultsTop() {
+        searchPresented = false
+        resultsScrollTopGeneration &+= 1
+        focusedResultID = visibleResults.first?.id
+    }
+
+    private var canHandleExitCommand: Bool {
+        guard isEnabled,
+              overlayRestoreResultID == nil,
+              !discoverOverlayTransitionActive,
+              viewModel.hasQuery else { return false }
+        return focusedResultID != nil || clearRecentFocused || !searchPresented
+    }
+
+    private func handleExitCommand() {
+        if suppressOverlayDismissalExit {
+            suppressOverlayDismissalExit = false
+            return
+        }
+        returnToResultsTop()
+        clearRecentFocused = false
+    }
+
     private func restoreOverlayFocus(to target: String, generation: Int) {
+        guard overlayFocusRestoreStartedGeneration != generation else { return }
+        overlayFocusRestoreStartedGeneration = generation
+        // A delayed nil-focus callback from the detail transition must not
+        // reopen the keyboard while the saved result is being restored.
+        resultFocusGeneration &+= 1
+        overlayFocusRestorationActive = true
+        searchPresented = false
         for delay in [0.12, 0.45] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
@@ -202,6 +264,12 @@ struct NativeSearchView: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 1.0) {
             if overlayRestoreGeneration == generation, overlayRestoreResultID == target {
                 overlayRestoreResultID = nil
+            }
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.75) {
+            if overlayRestoreGeneration == generation {
+                overlayFocusRestorationActive = false
+                suppressOverlayDismissalExit = false
             }
         }
     }
@@ -275,31 +343,55 @@ struct NativeSearchView: View {
     }
 
     private var resultsGrid: some View {
-        ScrollView {
-            LazyVGrid(columns: gridColumns, alignment: .leading, spacing: NativeSearchGridMetrics.posterGap) {
-                ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
-                    PosterGridCard(
-                        meta: item,
-                        width: NativeSearchGridMetrics.posterWidth,
-                        height: NativeSearchGridMetrics.posterHeight,
-                        externalFocus: $focusedResultID,
-                        retainFocusAppearance: overlayRestoreResultID == item.id,
-                        onLongPress: onLongPress.map { cb in { cb(item) } },
-                        forceShowLabels: true,
-                        onMove: index < Int(NativeSearchGridMetrics.columnCount) ? { direction in
-                            guard direction == .up else { return }
-                            transferFirstRowFocusToKeyboard()
-                        } : nil
-                    ) {
-                        overlayRestoreResultID = item.id
-                        lastFocusedResultID = item.id
-                        onContentClick(item.id, item.type)
+        ScrollViewReader { proxy in
+            ScrollView {
+                Color.clear
+                    .frame(height: 1)
+                    .id("native-search-results-top")
+
+                LazyVGrid(columns: gridColumns, alignment: .leading, spacing: NativeSearchGridMetrics.posterGap) {
+                    ForEach(Array(visibleResults.enumerated()), id: \.element.id) { index, item in
+                        PosterGridCard(
+                            meta: item,
+                            width: NativeSearchGridMetrics.posterWidth,
+                            height: NativeSearchGridMetrics.posterHeight,
+                            externalFocus: $focusedResultID,
+                            retainFocusAppearance: overlayRestoreResultID == item.id,
+                            onLongPress: onLongPress.map { cb in { cb(item) } },
+                            forceShowLabels: true,
+                            onMove: index < nativeGridColumnCount ? { direction in
+                                guard direction == .up else { return }
+                                transferFirstRowFocusToKeyboard()
+                            } : nil
+                        ) {
+                            overlayRestoreGeneration &+= 1
+                            overlayFocusRestoreStartedGeneration = nil
+                            overlayFocusRestorationActive = true
+                            suppressOverlayDismissalExit = true
+                            overlayRestoreResultID = item.id
+                            lastFocusedResultID = item.id
+                            onContentClick(item.id, item.type)
+                        }
+                        .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
                     }
-                    .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)
+                }
+                .padding(.top, 16)
+                .padding(.horizontal, NativeSearchGridMetrics.gridContentInset)
+            }
+            .onChange(of: resultsScrollTopGeneration) { _, _ in
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    proxy.scrollTo("native-search-results-top", anchor: .top)
                 }
             }
-            .padding(.top, 16)
-            .padding(.horizontal, NativeSearchGridMetrics.gridContentInset)
+            .background {
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear { updateNativeGridColumnCount(for: geometry.size.width) }
+                        .onChange(of: geometry.size.width) { _, width in
+                            updateNativeGridColumnCount(for: width)
+                        }
+                }
+            }
         }
         .focusSection()
         .defaultFocusIfAvailable($focusedResultID, defaultResultFocusID)
@@ -320,6 +412,15 @@ struct NativeSearchView: View {
             spacing: NativeSearchGridMetrics.posterGap,
             alignment: .top
         )]
+    }
+
+    private func updateNativeGridColumnCount(for width: CGFloat) {
+        let contentWidth = max(0, width - (NativeSearchGridMetrics.gridContentInset * 2))
+        let step = NativeSearchGridMetrics.posterWidth + NativeSearchGridMetrics.posterGap
+        let count = max(1, Int((contentWidth + NativeSearchGridMetrics.posterGap) / step))
+        if nativeGridColumnCount != count {
+            nativeGridColumnCount = count
+        }
     }
 
     // MARK: - Recent searches
@@ -413,11 +514,17 @@ struct NativeSearchKeyboardHost: View {
     var body: some View {
         NavigationStack {
             Color.clear
+                // `Color.clear` has no intrinsic width. Without an explicit
+                // width here, tvOS can size the searchable host to its small
+                // ideal width, which leaves the native keyboard compressed
+                // to the leading part of the screen on some devices.
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .searchable(text: $text, prompt: prompt)
                 #if os(tvOS)
                 .toolbar(.hidden, for: .navigationBar)
                 #endif
         }
+        .frame(maxWidth: .infinity, alignment: .top)
         .frame(
             height: isPresented ? expandedHeight : collapsedHeight,
             alignment: .top

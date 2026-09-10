@@ -11,7 +11,7 @@ struct PlaybackEngineCapabilities: Equatable {
 
     static let aether = PlaybackEngineCapabilities(
         supportsSeparateAudioURL: false,
-        supportsAudioDelay: false,
+        supportsAudioDelay: true,
         supportsAudioAmplification: false,
         supportsAuthoredASS: false,
         supportsHostSubtitleOverlay: true,

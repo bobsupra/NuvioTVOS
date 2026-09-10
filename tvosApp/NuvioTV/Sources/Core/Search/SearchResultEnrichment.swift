@@ -42,11 +42,12 @@ enum SearchResultEnrichment {
     ) async -> [NuvioMeta] {
         guard !results.isEmpty else { return results }
 
-        let candidateIndices = Array(results.indices.prefix(maxResultsToEnrich))
-            .filter { results[$0].needsSearchMetadataEnrichment }
-        guard !candidateIndices.isEmpty else { return results }
+        let deduplicatedResults = CinemetaCatalogRepository.deduplicatedSearchResults(results)
+        let candidateIndices = Array(deduplicatedResults.indices.prefix(maxResultsToEnrich))
+            .filter { deduplicatedResults[$0].needsSearchMetadataEnrichment }
+        guard !candidateIndices.isEmpty else { return deduplicatedResults }
 
-        var enriched = results
+        var enriched = deduplicatedResults
         var cursor = 0
         while cursor < candidateIndices.count {
             guard !Task.isCancelled else { break }
@@ -60,7 +61,7 @@ enum SearchResultEnrichment {
             ) { group in
                 for index in slice {
                     group.addTask {
-                        let meta = results[index]
+                        let meta = deduplicatedResults[index]
                         let full = try? await repository.refreshMetadata(
                             id: meta.id,
                             type: meta.type
@@ -77,10 +78,10 @@ enum SearchResultEnrichment {
 
             for (index, full) in refreshed {
                 guard let full, !Task.isCancelled else { continue }
-                enriched[index] = results[index].mergingSearchMetadata(from: full)
+                enriched[index] = deduplicatedResults[index].mergingSearchMetadata(from: full)
             }
             cursor = end
         }
-        return enriched
+        return CinemetaCatalogRepository.deduplicatedSearchResults(enriched)
     }
 }

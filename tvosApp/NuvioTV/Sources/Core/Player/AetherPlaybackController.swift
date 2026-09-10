@@ -1569,6 +1569,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private(set) var subtitleTracks: [PlaybackTrackInfo] = []
     private(set) var isPlayerLoading = true
     private(set) var isPlayerPlaying = false
+    var isTransportPlaying: Bool { engine.isTransportPlaying }
     private(set) var isPlayerEnded = false
     private(set) var isAtEndOfFile = false
     private(set) var hasCoherentTimeSample = false
@@ -1882,7 +1883,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
         needsForegroundReload = true
-        playbackWasPlayingBeforeBackground = engine.state == .playing
+        playbackWasPlayingBeforeBackground = (engine.state == .playing || (isPlayerPlaying && engine.state != .paused))
     }
 
     @objc private func appDidBecomeActive() {
@@ -1909,7 +1910,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 }
             }
             do {
-                try await self.engine.reloadAtCurrentPosition()
+                try await self.engine.reloadAtCurrentPosition {
+                    $0.autoplay = shouldResume
+                }
             } catch {
                 guard self.lifecycleReloadToken == token else { return }
                 let message = error.localizedDescription
@@ -2292,7 +2295,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments,
-            autoplay: request.autoplay
+            autoplay: request.autoplay,
+            audioDelaySeconds: request.audioDelaySeconds
         )
 
         let start = request.resumePositionSeconds
@@ -2412,8 +2416,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func setAudioDelay(_ seconds: Double) {
-        // No public Aether API — coordinator should have handed off to MPV.
-        _ = seconds
+        engine.setAudioDelay(seconds)
     }
 
     func setAudioVolumeGain(dB: Double) {
@@ -2551,10 +2554,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         center.togglePlayPauseCommand.isEnabled = true
         center.togglePlayPauseCommand.addTarget { [weak self] _ in
             guard let self else { return .commandFailed }
-            if self.isPlayerPlaying {
-                self.pausePlayback()
-            } else {
-                self.playPlayback()
+            switch self.engine.state {
+            case .loading, .playing, .paused, .seeking:
+                if self.isTransportPlaying {
+                    self.pausePlayback()
+                } else {
+                    self.playPlayback()
+                }
+            case .idle, .ended, .error:
+                return .commandFailed
             }
             return .success
         }

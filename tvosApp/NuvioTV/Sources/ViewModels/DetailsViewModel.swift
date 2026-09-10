@@ -209,7 +209,28 @@ class DetailsViewModel: ObservableObject {
                     await self.applyMdbRatings(mdbRatings, for: meta.id, generation: generation)
                 }
 
-                // 7. TMDB Episodes (Series only!) -> Runs in background without blocking cast/production
+                // 7. Authenticated MDBList user rating -> Apply immediately when ready
+                group.addTask {
+                    guard MdbListRuntimeSession.isAuthenticated() else { return }
+                    let rating = await MdbListRatingsService.fetchRating(for: meta)
+                    await self.applyMdbListUserRating(rating, for: meta.id, generation: generation)
+                }
+
+                // 8. MDBList watchlist membership -> Keep the library action
+                // aligned with the selected remote library owner.
+                group.addTask {
+                    guard TraktSettingsStore.librarySourceMode == .mdblist,
+                          MdbListRuntimeSession.isAuthenticated(),
+                          let membership = await MdbListLibraryService.isInWatchlist(meta)
+                    else { return }
+                    await self.applyMdbListWatchlistMembership(
+                        membership,
+                        for: meta.id,
+                        generation: generation
+                    )
+                }
+
+                // 9. TMDB Episodes (Series only!) -> Runs in background without blocking cast/production
                 let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
                 if isSeries {
                     group.addTask {
@@ -261,6 +282,20 @@ class DetailsViewModel: ObservableObject {
         if !ratings.isEmpty, let currentMeta = uiState.meta {
             uiState.meta = currentMeta.withExternalRatings(ratings)
         }
+    }
+
+    private func applyMdbListUserRating(_ rating: Int?, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+        uiState.mdbListUserRating = rating
+    }
+
+    private func applyMdbListWatchlistMembership(
+        _ membership: Bool,
+        for metaId: String,
+        generation: UInt64
+    ) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+        uiState.isInWatchlist = membership
     }
 
     private func applyTmdbEpisodes(_ episodes: [NuvioVideo]?, for metaId: String, generation: UInt64) {
@@ -517,6 +552,10 @@ class DetailsViewModel: ObservableObject {
     func toggleWatched() {
         guard let meta = uiState.meta else { return }
         uiState.isWatched = WatchedStore.toggle(meta: meta)
+    }
+
+    func setMdbListUserRating(_ rating: Int?) {
+        uiState.mdbListUserRating = rating
     }
 
     static func mergeEpisodes(

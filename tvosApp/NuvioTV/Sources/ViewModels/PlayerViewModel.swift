@@ -321,7 +321,7 @@ class PlayerViewModel: ObservableObject {
     /// Re-resolves a fresh stream for the current title/episode when a link
     /// expires or a source fails. `excludedURLs` are links already tried this
     /// session so failover never loops a dead source. Nil disables recovery.
-    var reloadCurrentStream: ((_ excludedURLs: [String]) async -> PreparedNextStream?)?
+    var reloadCurrentStream: ((_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream?)?
     /// Lists playable sources for a content id (Sources panel).
     var fetchPlaybackSources: ((_ contentId: String, _ type: String) async -> [NuvioStream])?
     /// Resolves a user-picked source into a ready stream (debrid + URL).
@@ -653,7 +653,7 @@ class PlayerViewModel: ObservableObject {
         )
         sessionCoordinator.load(
             request,
-            requiresMPVAudioControls: audioDelayMs != 0 || audioAmplificationDb > 0
+            requiresMPVAudioControls: audioAmplificationDb > 0
         )
         // The coordinator owns initial seek and subtitle registration on both
         // backends; later progressive subtitle results still flow through the
@@ -1433,7 +1433,7 @@ class PlayerViewModel: ObservableObject {
                 self.isFailingOver = false
                 // isSwitchingSource cleared in replaceStream / error paths
             }
-            guard let prepared = await reloadCurrentStream(excluded) else {
+            guard let prepared = await reloadCurrentStream(currentEpisodeVideo, excluded) else {
                 self.isReloadingStream = false
                 self.isSwitchingSource = false
                 self.status = .error(reason)
@@ -1936,6 +1936,20 @@ class PlayerViewModel: ObservableObject {
         if status == .ended { seek(to: 0) }
         engine.playPlayback()
         status = .playing
+        // MDBList has an explicit start transition for resuming a paused
+        // session. The normal progress save path will still handle a fresh
+        // playback whose timeline is not ready yet.
+        if let activeMeta,
+           time.current > 0,
+           time.duration > 0,
+           RemoteTrackingState.isProgressSourceAuthenticated {
+            reportTraktProgress(
+                meta: activeMeta,
+                playbackTime: time,
+                action: .start,
+                force: true
+            )
+        }
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
         showControls = true
@@ -1945,7 +1959,7 @@ class PlayerViewModel: ObservableObject {
     func pause() {
         engine.pausePlayback()
         status = .paused
-        saveProgress(force: true)
+        saveProgress(force: true, eventAction: .pause)
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
         // Show transport first; metadata sheet fades in after a short delay
@@ -2024,7 +2038,7 @@ class PlayerViewModel: ObservableObject {
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = nil
         playerController.pausePlayback()
-        saveProgress(force: true)
+        saveProgress(force: true, eventAction: .pause)
         // Leave the fallback host destroyed so re-entry cannot resume a ghost pipeline.
         playerController.destroyPlayer()
         aetherController?.destroyPlayer()
@@ -2060,7 +2074,10 @@ class PlayerViewModel: ObservableObject {
             commitScrub()
             return
         }
-        if status == .playing { pause() } else { play() }
+        switch PlaybackToggleDirection(isTransportPlaying: engine.isTransportPlaying) {
+        case .pause: pause()
+        case .play: play()
+        }
     }
 
     func seek(to seconds: Double) {
@@ -2102,7 +2119,7 @@ class PlayerViewModel: ObservableObject {
         clock.position = snapshot.current
         clock.duration = snapshot.duration
         lastStablePlaybackTime = snapshot
-        saveProgress(force: true)
+        saveProgress(force: true, eventAction: .pause)
     }
 
     func skipActiveInterval() {
@@ -2608,16 +2625,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     /// Shifts audio timing; positive delays the audio.
-    /// Aether has no public audio-delay API, so the control is disabled and
-    /// this guard prevents non-UI callers from touching the unsupported path.
     func setAudioDelayMs(_ ms: Int) {
-        guard activeEngineKind != .aether else {
-            if audioDelayMs != 0 {
-                audioDelayMs = 0
-                sessionCoordinator.updateAudioDelay(0)
-            }
-            return
-        }
         let clamped = min(max(ms, -3_000), 3_000)
         audioDelayMs = clamped
         sessionCoordinator.updateAudioDelay(Double(clamped) / 1_000)
@@ -3400,10 +3408,14 @@ class PlayerViewModel: ObservableObject {
         // the normal cadence (and Trakt's separate 30-second report cadence).
         let interval: TimeInterval = usesTraktProgress && !didStartTraktScrobble ? 1 : 5
         guard Date().timeIntervalSince(lastProgressSave) >= interval else { return }
-        saveProgress(force: false)
+        saveProgress(force: false, isPeriodicHeartbeat: true)
     }
 
-    private func saveProgress(force: Bool) {
+    private func saveProgress(
+        force: Bool,
+        eventAction: TraktScrobbleAction? = nil,
+        isPeriodicHeartbeat: Bool = false
+    ) {
         guard !isLiveStream else { return }
         // Never persist progress during an Aether→MPV handoff.
         if sessionCoordinator.isProgressSaveSuspended { return }
@@ -3479,8 +3491,9 @@ class PlayerViewModel: ObservableObject {
             reportTraktProgress(
                 meta: activeMeta,
                 playbackTime: progressTime,
-                action: completesPlayback ? .stop : nil,
-                force: force || completesPlayback
+                action: completesPlayback ? .stop : eventAction,
+                force: force || completesPlayback,
+                isPeriodicHeartbeat: isPeriodicHeartbeat
             )
         } else if completesPlayback {
             // Record completion, not the raw position. An ending marker fires
@@ -3531,7 +3544,8 @@ class PlayerViewModel: ObservableObject {
         meta: NuvioMeta,
         playbackTime: PlayerTime,
         action: TraktScrobbleAction?,
-        force: Bool
+        force: Bool,
+        isPeriodicHeartbeat: Bool = false
     ) {
         guard playbackTime.current.isFinite,
               playbackTime.duration.isFinite,
@@ -3544,6 +3558,7 @@ class PlayerViewModel: ObservableObject {
         if TraktSettingsStore.watchProgressSource == .simkl,
            didStartTraktScrobble,
            action == nil,
+           isPeriodicHeartbeat,
            !force {
             // Simkl extrapolates between real player events and explicitly
             // warns against periodic heartbeat scrobbles. Keep the optimistic
@@ -3564,7 +3579,8 @@ class PlayerViewModel: ObservableObject {
             return
         }
 
-        let scrobbleAction = action ?? (didStartTraktScrobble ? .pause : .start)
+        let scrobbleAction = action
+            ?? (isPeriodicHeartbeat ? .start : (didStartTraktScrobble ? .pause : .start))
         if scrobbleAction == .stop, didQueueTraktStop { return }
         didStartTraktScrobble = true
         if scrobbleAction == .stop { didQueueTraktStop = true }
@@ -3622,7 +3638,10 @@ class PlayerViewModel: ObservableObject {
            playbackTime.current >= max(ending.startTime - Self.skipSegmentStartLead, 0) {
             return true
         }
-        return playbackTime.current / playbackTime.duration >= 0.90
+        let completionThreshold = TraktSettingsStore.watchProgressSource == .mdblist
+            ? MdbListProgressService.completionPercent / 100
+            : WatchProgressLedger.completionFraction
+        return playbackTime.current / playbackTime.duration >= completionThreshold
     }
 
     /// Season/episode for the item currently playing. Prefer the structured

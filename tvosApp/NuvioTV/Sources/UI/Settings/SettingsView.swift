@@ -3268,6 +3268,7 @@ private struct IntegrationSettingsView: View {
 
     @StateObject private var traktViewModel: TraktSettingsViewModel
     @StateObject private var simklViewModel: SimklSettingsViewModel
+    @StateObject private var mdbListViewModel: MdbListSettingsViewModel
     @AppStorage private var traktClientID: String
     @AppStorage private var traktClientSecret: String
     @AppStorage private var simklClientID: String
@@ -3296,6 +3297,8 @@ private struct IntegrationSettingsView: View {
     @State private var showingTraktSettings = false
     @State private var showingSimklLogin = false
     @State private var showingSimklSettings = false
+    @State private var showingMdbListLogin = false
+    @State private var showingMdbListSettings = false
     @State private var showingTmdbOptions = false
     @State private var showingMdbListOptions = false
     @State private var showingAISubtitleOptions = false
@@ -3315,6 +3318,9 @@ private struct IntegrationSettingsView: View {
         )
         _simklViewModel = StateObject(
             wrappedValue: SimklSettingsViewModel(store: profileStore, profileScope: profileScope)
+        )
+        _mdbListViewModel = StateObject(
+            wrappedValue: MdbListSettingsViewModel(store: profileStore, profileScope: profileScope)
         )
         _traktClientID = AppStorage(
             wrappedValue: "",
@@ -3419,6 +3425,40 @@ private struct IntegrationSettingsView: View {
             }
 
             SettingsGroup(
+                title: L10n.string("settings_mdblist_title", fallback: "MDBList"),
+                subtitle: L10n.string(
+                    "tvos_settings_mdblist_tracking_subtitle",
+                    fallback: "Sync playback, watched history, and Continue Watching with MDBList"
+                )
+            ) {
+                MdbListConnectionSettingsCard(
+                    viewModel: mdbListViewModel,
+                    accentColor: accentColor,
+                    onStartLogin: connectMdbList,
+                    onOpenSettings: { showingMdbListSettings = true }
+                )
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_watch_progress_title", fallback: "Watch Progress"),
+                subtitle: L10n.string(
+                    "tvos_settings_watch_progress_subtitle",
+                    fallback: "Choose the single service that owns Resume, Continue Watching, and watched updates"
+                )
+            ) {
+                SettingsChoiceRow(
+                    title: L10n.string("trakt_watch_progress_dialog_title", fallback: "Watch Progress"),
+                    subtitle: L10n.string(
+                        "tvos_settings_choose_the_source_for_resume_and_continu_53af657c",
+                        fallback: "Choose the source for Resume, Continue Watching, and watched updates"
+                    ),
+                    selection: globalWatchProgressSelection,
+                    options: RemoteTrackingState.availableProgressSources().map(\.label),
+                    accentColor: accentColor
+                )
+            }
+
+            SettingsGroup(
                 title: L10n.string("settings_ai_subtitles_title", fallback: "AI Subtitles"),
                 subtitle: L10n.string("tvos_settings_ai_subtitles_integration_subtitle", fallback: "Translate active subtitle cues live with Gemini or OpenRouter")
             ) {
@@ -3449,7 +3489,7 @@ private struct IntegrationSettingsView: View {
                 }
 
                 SettingsActionRow(
-                    title: L10n.string("settings_mdblist_title", fallback: "MDBList"),
+                    title: L10n.string("settings_mdblist_ratings_title", fallback: "MDBList Ratings"),
                     subtitle: L10n.string("tvos_settings_mdblist_integration_subtitle", fallback: "Get a free API key at mdblist.com/preferences"),
                     value: mdbListEnabled && mdbListHasApiKey ? L10n.string("tvos_common_on", fallback: "On") : L10n.string("settings_open", fallback: "Open"),
                     accentColor: accentColor
@@ -3571,10 +3611,14 @@ private struct IntegrationSettingsView: View {
         }
         .onAppear {
             currentCacheSizeText = TorrentSettings.cacheSizeFormatted()
+            RemoteTrackingState.normalizeWatchProgressSource()
+            RemoteTrackingState.normalizeLibrarySource()
+            RemoteTrackingState.normalizeMoreLikeThisSource()
             traktViewModel.reload()
             traktViewModel.loadConnectedData()
             simklViewModel.reload()
             simklViewModel.loadConnectedData()
+            mdbListViewModel.reload()
         }
         .alert(
             L10n.string("tvos_settings_p2p_consent_title", fallback: "P2P Torrent Streaming"),
@@ -3641,6 +3685,19 @@ private struct IntegrationSettingsView: View {
             SimklConnectedSettingsSheet(viewModel: simklViewModel, accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
         }
+        .sheet(isPresented: $showingMdbListLogin, onDismiss: {
+            mdbListViewModel.reload()
+            if mdbListViewModel.mode == .connected {
+                showingMdbListSettings = true
+            }
+        }) {
+            MdbListDeviceLoginSheet(viewModel: mdbListViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(isPresented: $showingMdbListSettings) {
+            MdbListConnectedSettingsSheet(viewModel: mdbListViewModel, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
         .sheet(isPresented: $showingTmdbOptions) {
             TmdbOptionsSheet(accentColor: accentColor)
                 .modifier(ClearPresentationBackgroundIfAvailable())
@@ -3658,6 +3715,9 @@ private struct IntegrationSettingsView: View {
         }
         .onChange(of: simklViewModel.mode) { _, mode in
             if mode == .connected { showingSimklLogin = false }
+        }
+        .onChange(of: mdbListViewModel.mode) { _, mode in
+            if mode == .connected { showingMdbListLogin = false }
         }
         .onChange(of: debridProvider) { _, newKind in
             guard let kind = DebridProviderKind(rawValue: newKind) else { return }
@@ -3738,6 +3798,17 @@ private struct IntegrationSettingsView: View {
         !simklClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
+    private var globalWatchProgressSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.watchProgressSource.label },
+            set: { label in
+                TraktSettingsStore.markWatchProgressSourceChosenByUser()
+                TraktSettingsStore.watchProgressSource =
+                    TraktWatchProgressSource.allCases.first { $0.label == label } ?? .nuvioSync
+            }
+        )
+    }
+
     private func connectTrakt() {
         traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         traktClientSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -3751,6 +3822,11 @@ private struct IntegrationSettingsView: View {
         simklViewModel.credentialsDidChange()
         guard simklViewModel.credentialsConfigured else { return }
         showingSimklLogin = true
+    }
+
+    private func connectMdbList() {
+        mdbListViewModel.reload()
+        showingMdbListLogin = true
     }
 }
 
@@ -4793,8 +4869,8 @@ private struct TraktConnectedSettingsSheet: View {
                     }
 
                     SettingsGroup(
-                        title: L10n.string("tvos_settings_cached", fallback: "Cached"),
-                        subtitle: L10n.string("tvos_settings_trakt_cached_subtitle", fallback: "Watched activity currently loaded from your Trakt account")
+                        title: L10n.string("tvos_settings_watch_stats", fallback: "Watch Stats"),
+                        subtitle: L10n.string("tvos_settings_trakt_watch_stats_subtitle", fallback: "Watched activity returned from your Trakt account")
                     ) {
                         TraktConnectedStatsStrip(
                             stats: viewModel.connectedStats,
@@ -4805,7 +4881,7 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
                             subtitle: L10n.string(
                                 "tvos_settings_refresh_trakt_user_info_and_cached_stats",
-                                fallback: "Refresh Trakt watch progress, user info, and cached stats"
+                                fallback: "Refresh Trakt watch progress, account information, and watch stats"
                             ),
                             value: viewModel.isLoading
                                 ? L10n.string("tvos_settings_syncing", fallback: "Syncing")
@@ -4825,7 +4901,7 @@ private struct TraktConnectedSettingsSheet: View {
                             title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
                             subtitle: L10n.string("tvos_settings_trakt_library_source_subtitle", fallback: "Choose which library to use for saving and viewing your collection"),
                             selection: librarySourceSelection,
-                            options: ["Trakt", "Simkl", "Nuvio Library"],
+                            options: RemoteTrackingState.availableLibrarySources().map(\.label),
                             accentColor: accentColor
                         )
 
@@ -4836,7 +4912,7 @@ private struct TraktConnectedSettingsSheet: View {
                                 fallback: "Choose the source for Resume, Continue Watching, and watched updates"
                             ),
                             selection: watchProgressSelection,
-                            options: ["Trakt", "Simkl", "Nuvio Sync"],
+                            options: RemoteTrackingState.availableProgressSources().map(\.label),
                             accentColor: accentColor
                         )
 
@@ -4859,16 +4935,18 @@ private struct TraktConnectedSettingsSheet: View {
                             accentColor: accentColor
                         )
 
-                        SettingsChoiceRow(
-                            title: L10n.string("tmdb_more_like_this_title", fallback: "More Like This"),
-                            subtitle: L10n.string(
-                                "tvos_settings_recommendation_source_for_related_titles",
-                                fallback: "Choose where recommendations come from on detail pages"
-                            ),
-                            selection: moreLikeThisSelection,
-                            options: TraktMoreLikeThisSource.allCases.map(\.label),
-                            accentColor: accentColor
-                        )
+                        if !RemoteTrackingState.availableMoreLikeThisSources().isEmpty {
+                            SettingsChoiceRow(
+                                title: L10n.string("tmdb_more_like_this_title", fallback: "More Like This"),
+                                subtitle: L10n.string(
+                                    "tvos_settings_recommendation_source_for_related_titles",
+                                    fallback: "Choose where recommendations come from on detail pages"
+                                ),
+                                selection: moreLikeThisSelection,
+                                options: RemoteTrackingState.availableMoreLikeThisSources().map(\.label),
+                                accentColor: accentColor
+                            )
+                        }
                     }
 
                     if let message = viewModel.statusMessage, !message.isEmpty {
@@ -5021,6 +5099,53 @@ private struct TraktConnectedStatsStrip: View {
             stat(
                 text: stats?.totalWatchedHours.map { "\($0)h" },
                 label: L10n.string("tvos_settings_hours", fallback: "Watched Hours")
+            )
+        }
+        .padding(.vertical, 18)
+        .frame(maxWidth: .infinity)
+        .overlay(alignment: .top) { Divider().overlay(Color.white.opacity(0.16)) }
+        .overlay(alignment: .bottom) { Divider().overlay(Color.white.opacity(0.16)) }
+    }
+
+    private var divider: some View {
+        Rectangle()
+            .fill(Color.white.opacity(0.16))
+            .frame(width: 1, height: 72)
+    }
+
+    private func stat(value: Int?, label: String) -> some View {
+        stat(text: value.map(String.init), label: label)
+    }
+
+    private func stat(text: String?, label: String) -> some View {
+        VStack(spacing: 7) {
+            Text(text ?? (isLoading ? "..." : "-"))
+                .font(.system(size: 27, weight: .semibold))
+                .foregroundColor(.white)
+            Text(label)
+                .font(.system(size: 17, weight: .medium))
+                .foregroundColor(.white.opacity(0.62))
+                .lineLimit(1)
+        }
+        .frame(maxWidth: .infinity)
+    }
+}
+
+private struct MdbListConnectedStatsStrip: View {
+    let stats: MdbListWatchStats?
+    let isLoading: Bool
+
+    var body: some View {
+        HStack(spacing: 0) {
+            stat(value: stats?.moviesWatched, label: L10n.string("nav_movies", fallback: "Movies"))
+            divider
+            stat(value: stats?.showsWatched, label: L10n.string("trakt_stat_shows", fallback: "Shows"))
+            divider
+            stat(value: stats?.episodesWatched, label: L10n.string("tmdb_episodes_title", fallback: "Episodes"))
+            divider
+            stat(
+                text: stats?.totalWatchedHours.map { "\($0)h" },
+                label: L10n.string("tvos_settings_hours", fallback: "Hours")
             )
         }
         .padding(.vertical, 18)
@@ -5298,6 +5423,384 @@ private struct SimklConnectionSettingsCard: View {
     }
 }
 
+private struct MdbListConnectionSettingsCard: View {
+    @ObservedObject var viewModel: MdbListSettingsViewModel
+    let accentColor: Color
+    let onStartLogin: () -> Void
+    let onOpenSettings: () -> Void
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(alignment: .top, spacing: 18) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 18, style: .continuous)
+                        .fill(
+                            LinearGradient(
+                                colors: [
+                                    Color(red: 0.10, green: 0.34, blue: 0.24),
+                                    Color(red: 0.12, green: 0.23, blue: 0.18)
+                                ],
+                                startPoint: .topLeading,
+                                endPoint: .bottomTrailing
+                            )
+                        )
+                    Text("MDBList")
+                        .font(.system(size: 19, weight: .black))
+                        .foregroundColor(.white)
+                }
+                .frame(width: 112, height: 62)
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(statusTitle)
+                        .font(.system(size: 24, weight: .bold))
+                        .foregroundColor(.white)
+
+                    Text(statusSubtitle)
+                        .font(.system(size: 18, weight: .medium))
+                        .foregroundColor(.white.opacity(0.62))
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+
+                Spacer(minLength: 16)
+            }
+
+            switch viewModel.mode {
+            case .disconnected, .awaitingApproval:
+                SettingsActionRow(
+                    title: viewModel.mode == .awaitingApproval
+                        ? "Continue MDBList Login"
+                        : "Connect MDBList Account",
+                    subtitle: viewModel.hasAPIKey
+                        ? "An API key is available for playback; account login adds account status and renewable access."
+                        : "Scan the QR code and approve MDBList on your phone.",
+                    value: viewModel.mode == .awaitingApproval ? "Resume" : "Connect",
+                    accentColor: accentColor
+                ) {
+                    onStartLogin()
+                }
+            case .connected:
+                SettingsActionRow(
+                    title: "MDBList Account",
+                    subtitle: "Manage playback, watched history, and the connected account.",
+                    value: "Open",
+                    accentColor: accentColor,
+                    action: onOpenSettings
+                )
+            }
+
+            if let message = viewModel.statusMessage, !message.isEmpty, viewModel.mode == .connected {
+                Text(message)
+                    .font(.system(size: 17, weight: .medium))
+                    .foregroundColor(.white.opacity(0.62))
+            }
+
+            if let error = viewModel.errorMessage, !error.isEmpty, viewModel.mode != .awaitingApproval {
+                Text(error)
+                    .font(.system(size: 17, weight: .semibold))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+            }
+        }
+    }
+
+    private var statusTitle: String {
+        switch viewModel.mode {
+        case .disconnected:
+            return viewModel.hasAPIKey ? "API key ready" : "Not connected"
+        case .awaitingApproval:
+            return "Waiting for approval"
+        case .connected:
+            let name = viewModel.displayName?.isEmpty == false
+                ? (viewModel.displayName ?? "MDBList User")
+                : (viewModel.username ?? "MDBList User")
+            return "Connected as \(name)"
+        }
+    }
+
+    private var statusSubtitle: String {
+        switch viewModel.mode {
+        case .disconnected:
+            return "MDBList can provide remote Continue Watching and watched-state sync."
+        case .awaitingApproval:
+            return "Finish approving this Apple TV in MDBList, or resume the login sheet."
+        case .connected:
+            return "This profile can use MDBList-backed playback and watched history."
+        }
+    }
+}
+
+private struct MdbListConnectedSettingsSheet: View {
+    @ObservedObject var viewModel: MdbListSettingsViewModel
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+    @State private var showingDisconnectConfirmation = false
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor)
+                .ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("MDBList")
+                            .font(.system(size: 36, weight: .bold))
+                            .foregroundColor(.white)
+                        Text("Connected as \(connectedUsername). Manage remote playback and watched history.")
+                            .font(.system(size: 20, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+
+                    SettingsGroup(
+                        title: "Account",
+                        subtitle: "This profile's MDBList connection"
+                    ) {
+                        SettingsInfoRow(title: "Name", value: connectedUsername)
+                        if let accountID = viewModel.accountID, !accountID.isEmpty {
+                            SettingsInfoRow(title: "Account ID", value: accountID)
+                        }
+                        SettingsActionRow(
+                            title: "Disconnect",
+                            subtitle: "Remove this profile's MDBList tokens from this Apple TV",
+                            value: "Disconnect",
+                            accentColor: accentColor
+                        ) {
+                            showingDisconnectConfirmation = true
+                        }
+                    }
+
+                    SettingsGroup(
+                        title: "Watch Stats",
+                        subtitle: "Watched activity returned from your MDBList account"
+                    ) {
+                        MdbListConnectedStatsStrip(
+                            stats: viewModel.connectedStats,
+                            isLoading: viewModel.isStatsLoading
+                        )
+
+                        SettingsActionRow(
+                            title: "Sync Now",
+                            subtitle: "Refresh MDBList watch progress, account information, and watch stats",
+                            value: (viewModel.isLoading || viewModel.isStatsLoading) ? "Syncing" : "Refresh",
+                            accentColor: accentColor
+                        ) {
+                            viewModel.refreshNow()
+                        }
+                        .disabled(viewModel.isLoading || viewModel.isStatsLoading)
+                    }
+
+                    SettingsGroup(
+                        title: "MDBList Features",
+                        subtitle: "Choose where playback, watched updates, and the Library are stored"
+                    ) {
+                        SettingsChoiceRow(
+                            title: "Watch Progress",
+                            subtitle: "Use MDBList for remote playback progress and watched updates",
+                            selection: watchProgressSelection,
+                            options: RemoteTrackingState.availableProgressSources().map(\.label),
+                            accentColor: accentColor
+                        )
+
+                        SettingsChoiceRow(
+                            title: "Library Source",
+                            subtitle: "Use MDBList collection and watchlist as your Nuvio library",
+                            selection: librarySourceSelection,
+                            options: RemoteTrackingState.availableLibrarySources().map(\.label),
+                            accentColor: accentColor
+                        )
+
+                    }
+
+                    if let message = viewModel.statusMessage, !message.isEmpty {
+                        Text(message)
+                            .font(.system(size: 18, weight: .medium))
+                            .foregroundColor(.white.opacity(0.62))
+                    }
+                    if let error = viewModel.errorMessage, !error.isEmpty {
+                        Text(error)
+                            .font(.system(size: 18, weight: .semibold))
+                            .foregroundColor(.red.opacity(0.9))
+                    }
+                }
+                .frame(width: 1_000, alignment: .leading)
+                .padding(.horizontal, 52)
+                .padding(.vertical, 38)
+            }
+            .focusSection()
+        }
+        .onExitCommand { dismiss() }
+        .task {
+            viewModel.reload()
+            viewModel.loadConnectedData()
+        }
+        .onChange(of: viewModel.mode) { _, mode in
+            if mode != .connected { dismiss() }
+        }
+        .confirmationDialog(
+            "Disconnect MDBList?",
+            isPresented: $showingDisconnectConfirmation,
+            titleVisibility: .visible
+        ) {
+            Button("Disconnect", role: .destructive) {
+                viewModel.disconnect()
+            }
+            Button(L10n.string("action_cancel", fallback: "Cancel"), role: .cancel) {}
+        }
+    }
+
+    private var connectedUsername: String {
+        let username = (viewModel.displayName ?? viewModel.username ?? "")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return username.isEmpty ? "MDBList User" : username
+    }
+
+    private var watchProgressSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.watchProgressSource.label },
+            set: { label in
+                TraktSettingsStore.markWatchProgressSourceChosenByUser()
+                TraktSettingsStore.watchProgressSource =
+                    TraktWatchProgressSource.allCases.first { $0.label == label } ?? .mdblist
+            }
+        )
+    }
+
+    private var librarySourceSelection: Binding<String> {
+        Binding(
+            get: { TraktSettingsStore.librarySourceMode.label },
+            set: { label in
+                TraktSettingsStore.librarySourceMode =
+                    TraktLibrarySourceMode.allCases.first { $0.label == label } ?? .local
+            }
+        )
+    }
+
+}
+
+private struct MdbListDeviceLoginSheet: View {
+    @ObservedObject var viewModel: MdbListSettingsViewModel
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+
+    private var activationURL: String {
+        viewModel.verificationURL ?? MdbListConfig.deviceLoginURL
+    }
+
+    var body: some View {
+        VStack(spacing: 28) {
+            Text(viewModel.mode == .connected ? "MDBList Connected" : "Connect MDBList")
+                .font(.system(size: 42, weight: .regular))
+                .foregroundColor(.white)
+
+            if viewModel.mode == .connected {
+                Text((viewModel.displayName ?? viewModel.username).map { "Signed in as \($0)" } ?? "This Apple TV is linked to MDBList.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.66))
+                    .multilineTextAlignment(.center)
+                dialogButton(title: "Done", isPrimary: true) { dismiss() }
+            } else if let code = viewModel.deviceUserCode, !code.isEmpty {
+                Text("Scan the QR on your phone, or open the MDBList sign-in page and enter the code.")
+                    .font(.system(size: 23, weight: .medium))
+                    .foregroundColor(.white.opacity(0.68))
+                    .multilineTextAlignment(.center)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if let image = QRCode.image(from: activationURL, scale: 10) {
+                    Image(uiImage: image)
+                        .interpolation(.none)
+                        .resizable()
+                        .frame(width: 300, height: 300)
+                        .padding(16)
+                        .background(Color.white, in: RoundedRectangle(cornerRadius: 24, style: .continuous))
+                }
+
+                VStack(spacing: 12) {
+                    Text(code)
+                        .font(.system(size: 54, weight: .bold, design: .rounded))
+                        .tracking(4)
+                        .foregroundColor(.white)
+                        .accessibilityLabel("MDBList activation code \(code)")
+                    Text(activationURL)
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.54))
+                        .lineLimit(1)
+                }
+
+                HStack(spacing: 10) {
+                    if viewModel.isPolling { ProgressView().tint(.white) }
+                    Text(viewModel.statusMessage ?? "Waiting for approval…")
+                        .font(.system(size: 20, weight: .medium))
+                        .foregroundColor(.white.opacity(0.64))
+                }
+
+                if let error = viewModel.errorMessage, !error.isEmpty {
+                    Text(error)
+                        .font(.system(size: 20, weight: .semibold))
+                        .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                        .multilineTextAlignment(.center)
+                }
+
+                HStack(spacing: 18) {
+                    dialogButton(title: "Cancel", isPrimary: false) {
+                        viewModel.cancelLogin()
+                        dismiss()
+                    }
+                    dialogButton(title: "Retry", isPrimary: true) {
+                        viewModel.cancelLogin()
+                        viewModel.connect()
+                    }
+                }
+            } else if viewModel.errorMessage == nil {
+                ProgressView()
+                    .controlSize(.large)
+                    .tint(.white)
+                    .frame(height: 320)
+                Text(viewModel.statusMessage ?? "Starting MDBList login…")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundColor(.white.opacity(0.64))
+                dialogButton(title: "Cancel", isPrimary: false) {
+                    viewModel.cancelLogin()
+                    dismiss()
+                }
+            } else {
+                Text(viewModel.errorMessage ?? "Unable to start MDBList login.")
+                    .font(.system(size: 22, weight: .medium))
+                    .foregroundColor(Color(red: 1.0, green: 0.43, blue: 0.43))
+                    .multilineTextAlignment(.center)
+                HStack(spacing: 18) {
+                    dialogButton(title: "Close", isPrimary: false) { dismiss() }
+                    dialogButton(title: "Retry", isPrimary: true) { viewModel.connect() }
+                }
+            }
+        }
+        .frame(width: 960)
+        .padding(.horizontal, 88)
+        .padding(.vertical, 64)
+        .loginGlassPanel()
+        .onAppear {
+            viewModel.reload()
+            if viewModel.mode == .disconnected && viewModel.deviceUserCode == nil {
+                viewModel.connect()
+            }
+        }
+        .onChange(of: viewModel.mode) { _, mode in
+            if mode == .connected {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.6) {
+                    dismiss()
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func dialogButton(title: String, isPrimary: Bool, action: @escaping () -> Void) -> some View {
+        ProviderLoginGlassButton(title: title, isPrimary: isPrimary, action: action)
+    }
+}
+
 private struct SimklConnectedSettingsSheet: View {
     @ObservedObject var viewModel: SimklSettingsViewModel
     let accentColor: Color
@@ -5347,8 +5850,8 @@ private struct SimklConnectedSettingsSheet: View {
                         }
 
                         SettingsGroup(
-                            title: L10n.string("tvos_settings_cached", fallback: "Cached"),
-                            subtitle: L10n.string("tvos_settings_simkl_cached_subtitle", fallback: "Watched activity currently loaded from your Simkl account")
+                            title: L10n.string("tvos_settings_watch_stats", fallback: "Watch Stats"),
+                            subtitle: L10n.string("tvos_settings_simkl_watch_stats_subtitle", fallback: "Watched activity returned from your Simkl account")
                         ) {
                             SimklConnectedStatsStrip(
                                 stats: viewModel.connectedStats,
@@ -5357,7 +5860,7 @@ private struct SimklConnectedSettingsSheet: View {
 
                             SettingsActionRow(
                                 title: L10n.string("tvos_settings_sync_now", fallback: "Sync Now"),
-                                subtitle: L10n.string("tvos_settings_simkl_sync_subtitle", fallback: "Refresh Simkl watch progress, account information, and cached stats"),
+                                subtitle: L10n.string("tvos_settings_simkl_sync_watch_stats_subtitle", fallback: "Refresh Simkl watch progress, account information, and watch stats"),
                                 value: viewModel.isLoading
                                     ? L10n.string("tvos_settings_syncing", fallback: "Syncing")
                                     : L10n.string("tvos_settings_refresh", fallback: "Refresh"),
@@ -5381,7 +5884,7 @@ private struct SimklConnectedSettingsSheet: View {
                                 title: L10n.string("trakt_library_source_dialog_title", fallback: "Library Source"),
                                 subtitle: L10n.string("tvos_settings_simkl_library_source_subtitle", fallback: "Use Simkl Plan to Watch as your Nuvio library"),
                                 selection: librarySourceSelection,
-                                options: TraktLibrarySourceMode.allCases.map(\.label),
+                                options: RemoteTrackingState.availableLibrarySources().map(\.label),
                                 accentColor: accentColor
                             )
                             .disabled(
@@ -5394,7 +5897,7 @@ private struct SimklConnectedSettingsSheet: View {
                                 title: L10n.string("trakt_watch_progress_dialog_title", fallback: "Watch Progress"),
                                 subtitle: L10n.string("tvos_settings_simkl_watch_progress_subtitle", fallback: "Use Simkl for Resume, Continue Watching, and watched updates"),
                                 selection: watchProgressSelection,
-                                options: TraktWatchProgressSource.allCases.map(\.label),
+                                options: RemoteTrackingState.availableProgressSources().map(\.label),
                                 accentColor: accentColor
                             )
                             .disabled(
@@ -5403,13 +5906,15 @@ private struct SimklConnectedSettingsSheet: View {
                                     || viewModel.isTransferringProgress
                             )
 
-                            SettingsChoiceRow(
-                                title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
-                                subtitle: L10n.string("tvos_settings_simkl_more_like_this_subtitle", fallback: "Choose where recommendations come from on detail pages"),
-                                selection: moreLikeThisSelection,
-                                options: TraktMoreLikeThisSource.allCases.map(\.label),
-                                accentColor: accentColor
-                            )
+                            if !RemoteTrackingState.availableMoreLikeThisSources().isEmpty {
+                                SettingsChoiceRow(
+                                    title: L10n.string("settings_tmdb_module_more_like_this", fallback: "More Like This"),
+                                    subtitle: L10n.string("tvos_settings_simkl_more_like_this_subtitle", fallback: "Choose where recommendations come from on detail pages"),
+                                    selection: moreLikeThisSelection,
+                                    options: RemoteTrackingState.availableMoreLikeThisSources().map(\.label),
+                                    accentColor: accentColor
+                                )
+                            }
 
                             SettingsToggleRow(
                                 title: L10n.string("tvos_settings_simkl_plan_to_watch_home", fallback: "Plan to Watch on Home"),

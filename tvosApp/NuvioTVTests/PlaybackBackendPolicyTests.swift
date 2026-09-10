@@ -4,11 +4,16 @@ import XCTest
 @testable import NuvioTV
 
 final class PlaybackBackendPolicyTests: XCTestCase {
+    func testPlaybackToggleDirectionUsesBackendTransportTruth() {
+        XCTAssertEqual(PlaybackToggleDirection(isTransportPlaying: true), .pause)
+        XCTAssertEqual(PlaybackToggleDirection(isTransportPlaying: false), .play)
+    }
+
     @MainActor
     func testFailedStartupRetryPublishesErrorWithoutSourceWatchdog() {
         let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil }, engineSettingProvider: { "AetherEngine" }, loadDispatcher: { _, _, _ in XCTFail("Failed startup must not dispatch a load") })
         let model = PlayerViewModel(sessionCoordinator: coordinator)
-        model.reloadCurrentStream = { _ in XCTFail("Initialization error must not switch sources"); return nil }
+        model.reloadCurrentStream = { _, _ in XCTFail("Initialization error must not switch sources"); return nil }
         coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.test/movie")!))
         XCTAssertEqual(model.playbackStartupError, coordinator.lastLoadError)
         model.retryPlaybackStartup()
@@ -1002,6 +1007,11 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(result.backend, .mpv)
     }
 
+    func testAetherCapabilitiesIncludeAudioDelay() {
+        XCTAssertTrue(PlaybackEngineCapabilities.aether.supportsAudioDelay)
+        XCTAssertFalse(PlaybackEngineCapabilities.aether.supportsAudioAmplification)
+    }
+
     func testASSScaleForcesMPV() {
         let result = PlaybackBackendPolicy.resolve(
             .init(
@@ -1254,6 +1264,105 @@ final class CatalogWatchedPolicyTests: XCTestCase {
             overview: nil,
             released: released,
             rating: nil
+        )
+    }
+}
+
+final class WatchedEpisodeSummaryTests: XCTestCase {
+    func testCountsOnlyAiredRegularEpisodes() {
+        let videos = [
+            episode(season: 0, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 2, released: "2000-01-02"),
+            episode(season: 1, episode: 3, released: "2999-01-01"),
+            episode(season: 2, episode: 1, released: "2000-02-01"),
+        ]
+
+        guard let summary = WatchedEpisodeSummary.make(
+            videos: videos,
+            watchedEpisodeKeys: ["1:1", "2:1"]
+        ) else {
+            XCTFail("Expected an aired episode summary")
+            return
+        }
+
+        XCTAssertEqual(summary.watchedCount, 2)
+        XCTAssertEqual(summary.totalCount, 3)
+        XCTAssertEqual(summary.progress, 2.0 / 3.0, accuracy: 0.0001)
+    }
+
+    func testReturnsNilWhenThereAreNoAiredRegularEpisodes() {
+        let videos = [
+            episode(season: 0, episode: 1, released: "2000-01-01"),
+            episode(season: 1, episode: 1, released: "2999-01-01"),
+        ]
+
+        XCTAssertNil(
+            WatchedEpisodeSummary.make(
+                videos: videos,
+                watchedEpisodeKeys: ["1:1"]
+            )
+        )
+    }
+
+    private func episode(season: Int, episode: Int, released: String) -> NuvioVideo {
+        NuvioVideo(
+            id: "summary:\(season):\(episode)",
+            title: "Episode \(episode)",
+            season: season,
+            episode: episode,
+            thumbnail: nil,
+            overview: nil,
+            released: released,
+            rating: nil
+        )
+    }
+}
+
+final class TraktWatchedHistoryPaginationTests: XCTestCase {
+    func testShortNonEmptyPageWithoutHeaderStillContinues() {
+        XCTAssertTrue(
+            TraktWatchedHistoryPagination.shouldFetchNextPage(
+                page: 1,
+                itemCount: 7,
+                pageCount: nil
+            )
+        )
+    }
+
+    func testEmptyPageStopsPagination() {
+        XCTAssertFalse(
+            TraktWatchedHistoryPagination.shouldFetchNextPage(
+                page: 2,
+                itemCount: 0,
+                pageCount: nil
+            )
+        )
+    }
+
+    func testPageCountAndMaximumPageStopPagination() {
+        XCTAssertFalse(
+            TraktWatchedHistoryPagination.shouldFetchNextPage(
+                page: 3,
+                itemCount: 250,
+                pageCount: 3
+            )
+        )
+        XCTAssertFalse(
+            TraktWatchedHistoryPagination.shouldFetchNextPage(
+                page: TraktWatchedHistoryPagination.maxPages,
+                itemCount: 250,
+                pageCount: nil
+            )
+        )
+    }
+
+    func testReadsPaginationHeader() {
+        XCTAssertEqual(
+            TraktWatchedHistoryPagination.pageCount(
+                from: ["x-pagination-page-count": "4, 4"]
+            ),
+            4
         )
     }
 }

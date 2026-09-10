@@ -176,6 +176,32 @@ public struct LibraryView: View {
                                 }
                             }
                         }
+
+                        if TraktSettingsStore.librarySourceMode == .mdblist,
+                           !viewModel.mdbListLists.isEmpty {
+                            FilterMenu(
+                                label: "MDBList: \(selectedMdbListListLabel)"
+                            ) {
+                                Button {
+                                    Task { await viewModel.selectMdbListList(nil) }
+                                } label: {
+                                    menuItem(
+                                        "Library",
+                                        selected: viewModel.selectedMdbListListID == nil
+                                    )
+                                }
+                                ForEach(viewModel.mdbListLists) { list in
+                                    Button {
+                                        Task { await viewModel.selectMdbListList(list.id) }
+                                    } label: {
+                                        menuItem(
+                                            list.name,
+                                            selected: viewModel.selectedMdbListListID == list.id
+                                        )
+                                    }
+                                }
+                            }
+                        }
                     } else {
                         // Cloud filters: Select provider & Select type
                         FilterMenu(
@@ -238,11 +264,7 @@ public struct LibraryView: View {
             .padding(.top, 56)
             .ignoresSafeArea(edges: .bottom)
         }
-        .onExitCommand {
-            if openCloudItem != nil {
-                closeCloudItem()
-            }
-        }
+        .onExitCommand(perform: openCloudItem == nil ? nil : closeCloudItem)
         .onChange(of: focusedItemID) { _, newValue in
             if let newValue {
                 restoreArmTask?.cancel()
@@ -308,6 +330,14 @@ public struct LibraryView: View {
             return type.localizedTitle
         }
         return L10n.string("cloud_library_type_all", fallback: L10n.string("library_type_all", fallback: "All"))
+    }
+
+    private var selectedMdbListListLabel: String {
+        guard let selected = viewModel.selectedMdbListListID,
+              let list = viewModel.mdbListLists.first(where: { $0.id == selected }) else {
+            return "Library"
+        }
+        return list.name
     }
 
     private var savedContent: some View {

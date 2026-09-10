@@ -1489,6 +1489,11 @@ final class NuvioSyncManager: ObservableObject {
             return !TraktAuthStore.state(in: store).isAuthenticated(in: store)
         case .simkl:
             return !SimklAuthStore.state(in: store, profileScope: profileId).isAuthenticated(in: store)
+        case .mdblist:
+            return !MdbListRuntimeSession.isAuthenticated(
+                in: store,
+                profileScope: profileId
+            )
         }
     }
 
@@ -1507,6 +1512,11 @@ final class NuvioSyncManager: ObservableObject {
             return !TraktAuthStore.state(in: store).isAuthenticated(in: store)
         case .simkl:
             return !SimklAuthStore.state(in: store, profileScope: profileId).isAuthenticated(in: store)
+        case .mdblist:
+            return !MdbListRuntimeSession.isAuthenticated(
+                in: store,
+                profileScope: profileId
+            )
         }
     }
 

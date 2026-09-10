@@ -4346,6 +4346,15 @@ public final class AetherEngine: ObservableObject {
         return nativeHost
     }
 
+    /// Live transport state used by app-level controls. Native AVPlayer's status is authoritative
+    /// when it owns video transport; the published engine state remains authoritative for the other hosts.
+    public var isTransportPlaying: Bool {
+        if let nativeHost, !audioAVPlayerActive, audioHost == nil, softwareHost == nil {
+            return nativeHost.isEffectivelyPlaying
+        }
+        return state == .playing
+    }
+
     public func play() {
         // AetherEngine#164: a VOD parked at its final frame (scrubbed to the end, or paused there)
         // cannot advance; AVPlayer.play() would no-op and leave the button frozen. Rewind to the start
@@ -4424,9 +4433,9 @@ public final class AetherEngine: ObservableObject {
         // AE#464 round 2: come back in the transport state the session is IN, not the one its first
         // mount was given. Written before the branch because only the URL branch below carries a
         // struct into `load`; the custom-source branch reads `loadedOptions` field by field.
-        // A torn-down session (#357 background teardown) has no transport left to read and its
-        // resume is the host's call, so that path keeps replaying the mount flag exactly as before.
-        if !resumesTornDownSession { setLoadedAutoplay(sessionRebuildResumesPlaying) }
+        // A torn-down session (#357 background teardown) restores its transport state from the parked
+        // snapshot captured before stopInternal.
+        setLoadedAutoplay(selection.resumesPlaying)
         if isCustomSource {
             // Rebuild on retained reader (seekable only); no URL to reopen.
             guard customSourceIsSeekable, let placeholderURL = loadedURL else { return }

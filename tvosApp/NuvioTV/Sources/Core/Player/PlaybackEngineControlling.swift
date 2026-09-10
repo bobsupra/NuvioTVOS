@@ -171,6 +171,8 @@ protocol PlaybackEngineControlling: AnyObject {
 
     var isPlayerLoading: Bool { get }
     var isPlayerPlaying: Bool { get }
+    /// Backend transport truth for directional toggles; unlike `isPlayerPlaying`, this is not a UI mirror.
+    var isTransportPlaying: Bool { get }
     var isPlayerEnded: Bool { get }
     var isAtEndOfFile: Bool { get }
     var hasCoherentTimeSample: Bool { get }
@@ -198,6 +200,15 @@ protocol PlaybackEngineControlling: AnyObject {
     func applySubtitleStyle()
     func destroyPlayer()
     func refreshPlaybackState()
+}
+
+enum PlaybackToggleDirection: Equatable {
+    case play
+    case pause
+
+    init(isTransportPlaying: Bool) {
+        self = isTransportPlaying ? .pause : .play
+    }
 }
 
 /// Diagnostics and host system telemetry sampler for the playback debug overlay.

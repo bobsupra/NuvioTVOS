@@ -13,6 +13,7 @@ struct BackgroundTeardownSelection: Sendable, Equatable {
     var subtitles = SubtitleSessionCarryover()
     var audioTrackIndex: Int?
     var discTitleID: Int?
+    var resumesPlaying: Bool = false
 }
 
 extension AetherEngine {
@@ -23,7 +24,8 @@ extension AetherEngine {
         backgroundTeardownSelection = BackgroundTeardownSelection(
             subtitles: captureSubtitleSessionCarryover(),
             audioTrackIndex: activeAudioTrackIndex,
-            discTitleID: activeDiscTitleID
+            discTitleID: activeDiscTitleID,
+            resumesPlaying: sessionRebuildResumesPlaying
         )
     }
 
@@ -36,7 +38,8 @@ extension AetherEngine {
             subtitles: Self.mergedSubtitleCarryover(
                 live: captureSubtitleSessionCarryover(), snapshot: parked?.subtitles),
             audioTrackIndex: activeAudioTrackIndex ?? parked?.audioTrackIndex,
-            discTitleID: activeDiscTitleID ?? parked?.discTitleID
+            discTitleID: activeDiscTitleID ?? parked?.discTitleID,
+            resumesPlaying: parked?.resumesPlaying ?? sessionRebuildResumesPlaying
         )
     }
 

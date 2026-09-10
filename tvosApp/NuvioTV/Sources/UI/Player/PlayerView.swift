@@ -41,8 +41,9 @@ struct PlayerView: View {
     var resolveNextStream: ((NuvioVideo) async -> PreparedNextStream?)? = nil
     /// Re-resolves a fresh stream for the *current* title/episode, used to
     /// recover from an expired link, load timeout, or playback error.
-    /// `excludedURLs` are sources already tried this session. Nil disables failover.
-    var reloadCurrentStream: ((_ excludedURLs: [String]) async -> PreparedNextStream?)? = nil
+    /// The first argument is the episode currently playing; `excludedURLs` are
+    /// sources already tried this session. Nil disables failover.
+    var reloadCurrentStream: ((_ episode: NuvioVideo?, _ excludedURLs: [String]) async -> PreparedNextStream?)? = nil
     /// Lists alternate streams for the Sources side panel.
     var fetchPlaybackSources: ((_ contentId: String, _ type: String) async -> [NuvioStream])? = nil
     /// Resolves a user-selected source for mid-playback switching.
@@ -59,12 +60,17 @@ struct PlayerView: View {
 
     @State var didHandleFinished = false
     @State var didReportPlaybackStarted = false
+    @State var lastBecameActiveAt: Date = Date()
     @FocusState var remoteInputFocused: Bool
     @FocusState var startupRetryFocused: Bool
     @FocusState var nextEpisodeFocused: Bool
     @FocusState var cancelAutoPlayFocused: Bool
     @FocusState var skipSegmentFocused: Bool
     @FocusState var postPlayFocus: PostPlayFocusItem?
+
+    var isWakingFromBackground: Bool {
+        Date().timeIntervalSince(lastBecameActiveAt) < 0.6
+    }
 
     var body: some View {
         layersWithRemoteCommands

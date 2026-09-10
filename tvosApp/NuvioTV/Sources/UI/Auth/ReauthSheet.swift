@@ -84,9 +84,7 @@ struct ReauthSheet: View {
         .padding(.vertical, 48)
         .loginGlassPanel()
         .onAppear {
-            if method == .qr {
-                auth.startQrLogin(force: true)
-            }
+            selectSupportedMethod(startQR: true)
         }
         .onDisappear {
             auth.stopQrLogin()
@@ -96,7 +94,7 @@ struct ReauthSheet: View {
         }
         .onChange(of: method) { _, newMethod in
             auth.errorMessage = nil
-            if newMethod == .qr {
+            if newMethod == .qr && auth.serverCapabilities.tvLogin {
                 auth.startQrLogin()
             } else {
                 auth.stopQrLogin()
@@ -112,6 +110,19 @@ struct ReauthSheet: View {
                 handleSuccess()
             }
         }
+        .onChange(of: auth.serverCapabilities) { _, _ in
+            selectSupportedMethod(startQR: true)
+        }
+    }
+
+    private func selectSupportedMethod(startQR: Bool) {
+        if method == .qr && auth.serverCapabilities.tvLogin {
+            if startQR { auth.startQrLogin(force: true) }
+        } else if auth.serverCapabilities.tvLogin {
+            method = .qr
+        } else if auth.serverCapabilities.emailPasswordAuth {
+            method = .email
+        }
     }
 
     private func handleSuccess() {
@@ -126,7 +137,7 @@ struct ReauthSheet: View {
 
     private var methodToggle: some View {
         HStack(spacing: 12) {
-            ForEach(Method.allCases) { m in
+            ForEach(Method.allCases.filter { $0 == .qr ? auth.serverCapabilities.tvLogin : auth.serverCapabilities.emailPasswordAuth }) { m in
                 MethodTab(title: m.rawValue, isSelected: method == m) {
                     if method != m { method = m }
                 }

@@ -24,6 +24,9 @@ struct LoginView: View {
     @State private var password = ""
     @State private var isSignUp = false
     @State private var didTriggerContinue = false
+    @State private var showingServerOptions = false
+    @State private var backendInput = ""
+    @State private var trustServer = false
 
     var body: some View {
         ZStack {
@@ -43,12 +46,12 @@ struct LoginView: View {
                 triggerContinue()
                 return
             }
-            if method == .qr { auth.startQrLogin() }
+            selectSupportedMethod(startQR: true)
         }
         .onDisappear { auth.stopQrLogin() }
         .onChange(of: method) { _, newMethod in
             auth.errorMessage = nil
-            if newMethod == .qr {
+            if newMethod == .qr && auth.serverCapabilities.tvLogin {
                 auth.startQrLogin()
             } else {
                 auth.stopQrLogin()
@@ -56,6 +59,19 @@ struct LoginView: View {
         }
         .onChange(of: auth.authState) { _, state in
             if state.isAuthenticated { triggerContinue(delay: 0.9) }
+        }
+        .onChange(of: auth.serverCapabilities) { _, _ in
+            selectSupportedMethod(startQR: true)
+        }
+    }
+
+    private func selectSupportedMethod(startQR: Bool) {
+        if method == .qr && auth.serverCapabilities.tvLogin {
+            if startQR { auth.startQrLogin() }
+        } else if auth.serverCapabilities.tvLogin {
+            method = .qr
+        } else if auth.serverCapabilities.emailPasswordAuth {
+            method = .email
         }
     }
 
@@ -108,6 +124,8 @@ struct LoginView: View {
                 methodToggle
             }
 
+            serverOptions
+
             if auth.isAuthenticated {
                 connectedContent
             } else if method == .qr {
@@ -121,7 +139,7 @@ struct LoginView: View {
             }
 
             if !auth.isBackendConfigured {
-                statusPill("Backend not configured — add the Nuvio API URL and publishable key in AuthConfig.swift.", isError: false)
+                statusPill("No account server is configured.", isError: false)
             }
 
             Divider().background(Color.white.opacity(0.1)).padding(.vertical, 4)
@@ -137,9 +155,64 @@ struct LoginView: View {
 
     private var methodToggle: some View {
         HStack(spacing: 12) {
-            ForEach(Method.allCases) { m in
+            ForEach(Method.allCases.filter { $0 == .qr ? auth.serverCapabilities.tvLogin : auth.serverCapabilities.emailPasswordAuth }) { m in
                 MethodTab(title: m.rawValue, isSelected: method == m) {
                     if method != m { method = m }
+                }
+            }
+        }
+    }
+
+    private var serverOptions: some View {
+        VStack(spacing: 12) {
+            LoginButton(title: showingServerOptions ? "Hide Server Options" : "Use a Self-Hosted Server", systemImage: "server.rack") {
+                showingServerOptions.toggle()
+                if showingServerOptions { backendInput = AuthConfig.apiBaseURL == AuthConfig.officialAPIBaseURL ? "" : AuthConfig.apiBaseURL }
+            }
+            if showingServerOptions {
+                LoginGlassField(placeholder: "Backend URL", text: $backendInput, keyboardType: .URL)
+                    .onChange(of: backendInput) { _, _ in
+                        auth.clearDiscoveredServer()
+                        trustServer = false
+                    }
+                LoginButton(
+                    title: auth.isDiscoveringServer ? "Checking Server…" : "Check Server",
+                    systemImage: "checkmark.shield",
+                    disabled: auth.isDiscoveringServer || backendInput.isEmpty
+                ) {
+                    trustServer = false
+                    auth.clearDiscoveredServer()
+                    Task { await auth.discoverCustomServer(input: backendInput) }
+                }
+                if let discovered = auth.discoveredServer {
+                    Text("Found \(discovered.configuration.backendURL)")
+                        .font(.system(size: 18, weight: .semibold)).foregroundColor(.white)
+                    Text("Sign-in: \(discovered.configuration.capabilities.emailPasswordAuth ? "Email " : "")\(discovered.configuration.capabilities.tvLogin ? "QR" : "")")
+                        .font(.system(size: 17)).foregroundColor(.white.opacity(0.7))
+                    ForEach(discovered.securityWarnings, id: \.self) { warning in
+                        Text(warning).font(.system(size: 16)).foregroundColor(.orange).multilineTextAlignment(.center)
+                    }
+                    Toggle("I trust this server", isOn: $trustServer)
+                        .foregroundColor(.white)
+                    LoginButton(title: "Connect", systemImage: "link", prominent: true, disabled: auth.isDiscoveringServer || !trustServer) {
+                        let configuration = discovered.configuration
+                        let selectedMethod: Method = configuration.capabilities.tvLogin ? .qr : .email
+                        let shouldStartQR = selectedMethod == .qr && method == .qr
+                        guard auth.activateCustomConfiguration(configuration) else { return }
+                        showingServerOptions = false
+                        trustServer = false
+                        method = selectedMethod
+                        if shouldStartQR { auth.startQrLogin() }
+                    }
+                }
+                if AuthConfig.isCustom {
+                    LoginButton(title: "Use Official Server", systemImage: "arrow.uturn.backward") {
+                        let shouldStartQR = method == .qr
+                        auth.useOfficialServer()
+                        method = .qr
+                        showingServerOptions = false
+                        if shouldStartQR { auth.startQrLogin() }
+                    }
                 }
             }
         }

@@ -1,15 +1,9 @@
 import SwiftUI
-import Combine
 
 /// Comprehensive playback diagnostics and telemetry overlay matching the HUD specification.
 struct PlaybackDebugHUDView: View {
     let info: PlaybackDebugInfo
     let reason: String
-    let remainingSeconds: Double?
-
-    @State private var currentTimeString: String = ""
-    @State private var endsAtTimeString: String = ""
-    @State private var timer: AnyCancellable?
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -58,21 +52,6 @@ struct PlaybackDebugHUDView: View {
         .padding(.leading, 48)
         .padding(.top, 36)
         .allowsHitTesting(false)
-        .onAppear {
-            updateClock()
-            timer = Timer.publish(every: 1.0, on: .main, in: .common)
-                .autoconnect()
-                .sink { _ in
-                    updateClock()
-                }
-        }
-        .onChange(of: remainingSeconds) { _, _ in
-            updateClock()
-        }
-        .onDisappear {
-            timer?.cancel()
-            timer = nil
-        }
         .accessibilityElement(children: .combine)
         .accessibilityLabel("Playback debug overlay")
     }
@@ -81,26 +60,10 @@ struct PlaybackDebugHUDView: View {
 
     private var sourceSection: some View {
         VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .top) {
-                Text("SOURCE")
-                    .font(.system(size: 14, weight: .bold, design: .monospaced))
-                    .foregroundColor(Color.white.opacity(0.55))
-                    .tracking(1.2)
-
-                Spacer()
-
-                VStack(alignment: .trailing, spacing: 2) {
-                    Text(currentTimeString)
-                        .font(.system(size: 18, weight: .bold, design: .monospaced))
-                        .foregroundColor(Color.white.opacity(0.9))
-
-                    if !endsAtTimeString.isEmpty {
-                        Text(endsAtTimeString)
-                            .font(.system(size: 13, weight: .medium, design: .monospaced))
-                            .foregroundColor(Color.white.opacity(0.55))
-                    }
-                }
-            }
+            Text("SOURCE")
+                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                .foregroundColor(Color.white.opacity(0.55))
+                .tracking(1.2)
 
             VStack(alignment: .leading, spacing: 3) {
                 hudRow(label: "Add-on", value: info.addon.isEmpty ? "Direct" : info.addon)
@@ -326,19 +289,4 @@ struct PlaybackDebugHUDView: View {
         }
     }
 
-    // MARK: - Clock Calculation
-
-    private func updateClock() {
-        let now = Date()
-        let formatter = DateFormatter()
-        formatter.dateFormat = "HH:mm"
-        currentTimeString = formatter.string(from: now)
-
-        if let remaining = remainingSeconds, remaining > 0 {
-            let endsAt = now.addingTimeInterval(remaining)
-            endsAtTimeString = "Ends at \(formatter.string(from: endsAt))"
-        } else {
-            endsAtTimeString = ""
-        }
-    }
 }

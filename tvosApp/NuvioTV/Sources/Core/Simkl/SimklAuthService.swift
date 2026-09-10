@@ -261,6 +261,9 @@ enum SimklAuthStore {
             Key.settingsWatermark
         ].forEach { defaults.removeObject(forKey: $0) }
         NotificationCenter.default.post(name: changedNotification, object: nil)
+        RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
+        RemoteTrackingState.normalizeLibrarySource(in: defaults)
+        RemoteTrackingState.normalizeMoreLikeThisSource(in: defaults)
     }
 
     /// Clears auth when the settings Client ID no longer matches the one that

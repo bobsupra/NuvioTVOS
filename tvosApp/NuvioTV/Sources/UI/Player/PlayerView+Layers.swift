@@ -158,7 +158,8 @@ extension PlayerView {
         // Window-level trackpad capture for Infuse-style scrubbing / peek.
         RemoteTouchCatcher(
             isActive: {
-                viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
+                !isWakingFromBackground
+                    && viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.postPlayState.isVisible
                     && (viewModel.isScrubbing
@@ -179,7 +180,8 @@ extension PlayerView {
             // when the timeline is focused. (Arrow holds are unreliable while
             // a focused progress bar owns the focus engine — hide chrome to
             // hold-seek.)
-            isActive: viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
+            isActive: !isWakingFromBackground
+                && viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                 && viewModel.sidePanel == nil
                 && !viewModel.isScrubbing
                 && !viewModel.postPlayState.isVisible
@@ -242,6 +244,7 @@ extension PlayerView {
             )
             .focused($remoteInputFocused)
             .onTapGesture {
+                guard !isWakingFromBackground else { return }
                 if viewModel.isScrubbing {
                     viewModel.commitScrub()
                 } else if viewModel.showPauseOverlay {
@@ -310,7 +313,10 @@ extension PlayerView {
     @ViewBuilder
     var skipSegmentLayer: some View {
         if viewModel.showSkipSegmentCard, let interval = viewModel.activeSkipInterval {
-            Button(action: { viewModel.skipActiveInterval() }) {
+            Button(action: {
+                guard !isWakingFromBackground else { return }
+                viewModel.skipActiveInterval()
+            }) {
                 SkipSegmentOverlay(
                     interval: interval,
                     countdown: viewModel.skipSegmentCountdown,
@@ -334,7 +340,10 @@ extension PlayerView {
         // after the current episode reaches genuine end-of-media.
         if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
             VStack(spacing: 8) {
-                Button(action: { viewModel.playNextEpisode() }) {
+                Button(action: {
+                    guard !isWakingFromBackground else { return }
+                    viewModel.playNextEpisode()
+                }) {
                     NextEpisodeOverlay(episode: next, isAdvancing: viewModel.isAdvancingEpisode, isFocused: nextEpisodeFocused, isAutoPlayCancelled: viewModel.isAutoPlayCancelled)
                 }
                 .buttonStyle(PosterCardButtonStyle())

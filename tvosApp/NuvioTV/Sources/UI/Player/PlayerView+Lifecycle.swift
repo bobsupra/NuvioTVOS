@@ -118,8 +118,12 @@ extension PlayerView {
             }
             .onChange(of: scenePhase) { _, phase in
                 if phase == .active {
+                    lastBecameActiveAt = Date()
                     syncPlaybackWakeLock()
                 }
+            }
+            .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+                lastBecameActiveAt = Date()
             }
     }
 

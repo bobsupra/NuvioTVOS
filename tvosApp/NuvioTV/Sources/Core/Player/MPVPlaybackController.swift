@@ -407,6 +407,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     // State (polled from the view model every 250ms)
     var isPlayerLoading: Bool = true
     var isPlayerPlaying: Bool = false
+    var isTransportPlaying: Bool { isPlayerPlaying }
     var isPlayerEnded: Bool = false
     private(set) var isAtEndOfFile: Bool = false
     private(set) var hasCoherentTimeSample: Bool = false
