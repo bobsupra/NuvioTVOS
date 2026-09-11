@@ -13,7 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout repository
-        uses: actions/checkout@main
+        uses: actions/checkout@v4
 
       - name: Fetch releases and build JSON
         env:
@@ -35,7 +35,7 @@ jobs:
             | ($rel.assets | map(select(.name | test("\\.ipa$"; "i"))) | first) as $ipa
             | select($ipa != null)
             | {
-                version: ($rel.tag_name | sub("^v"; "")),
+                version: ($rel.tag_name | sub("^(tvos-beta-|tvos-|v)"; "")),
                 date: $rel.published_at,
                 localizedDescription: ($rel.body // "Update via GitHub Releases"),
                 downloadURL: $ipa.browser_download_url,
