@@ -113,6 +113,7 @@ let appTarget: Target = .target(
     resources: [
         "NuvioTV/Images.xcassets",
         "NuvioTV/Resources/AppLanguageCatalog.json",
+        "NuvioTV/Resources/AppIcon.png",
         "NuvioTV/Fonts/inter_variable.ttf",
         "NuvioTV/SplashScreen.storyboard",
     ],
