@@ -1,0 +1,61 @@
+name: Update AltStore Source
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-source:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@main
+
+      - name: Fetch releases and build JSON
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Detect upstream parent if running inside a fork
+          PARENT_REPO=$(gh api "repos/$GITHUB_REPOSITORY" --jq '.parent.full_name // empty')
+          TARGET_REPO="${PARENT_REPO:-$GITHUB_REPOSITORY}"
+          echo "Fetching releases from: $TARGET_REPO"
+
+          # Fetch up to 30 recent releases
+          RELEASES=$(gh api "repos/$TARGET_REPO/releases?per_page=30")
+
+          # Filter for .ipa assets and format for AltStore
+          VERSIONS=$(echo "$RELEASES" | jq '[
+            .[]
+            | select(.draft == false)
+            | . as $rel
+            | ($rel.assets | map(select(.name | test("\\.ipa$"; "i"))) | first) as $ipa
+            | select($ipa != null)
+            | {
+                version: ($rel.tag_name | sub("^v"; "")),
+                date: $rel.published_at,
+                localizedDescription: ($rel.body // "Update via GitHub Releases"),
+                downloadURL: $ipa.browser_download_url,
+                size: $ipa.size
+              }
+          ]')
+
+          # Inject into apps.json
+          jq --argjson v "$VERSIONS" '.apps[0].versions = $v' apps.json > apps.tmp.json
+          mv apps.tmp.json apps.json
+
+      - name: Commit and push changes
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps.json
+
+          if git diff --staged --quiet; then
+            echo "No updates to apps.json."
+          else
+            git commit -m "chore(altstore): sync releases to apps.json [skip ci]"
+            git push
+          fi

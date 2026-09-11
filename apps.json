@@ -1,0 +1,16 @@
+{
+  "name": "bobsupra's NuvioTVOS",
+  "identifier": "com.pyksel.bobsupra-nuvio-tvos",
+  "apps": [
+    {
+      "name": "NuvioTVOS",
+      "bundleIdentifier": "com.pyksel.nuviotvos",
+      "developerName": "bobsupra",
+      "subtitle": "Nuvio TV for tvOS",
+      "localizedDescription": "A modern Apple TV media player for browsing catalogs and playing user-configured sources. SwiftUI tvOS shell - catalog browsing - AetherEngine / MPVKit playback",
+      "iconURL": "https://raw.githubusercontent.com/bobsupra/NuvioTVOS/refs/heads/main/nuviotvos-icon.png",
+      "tintColor": "007AFF",
+      "versions": []
+    }
+  ]
+}
