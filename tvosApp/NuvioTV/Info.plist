@@ -34,6 +34,18 @@
 			</array>
 		</dict>
 	</array>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon.png</string>
+	<key>CFBundleIcons</key>
+	<dict>
+		<key>CFBundlePrimaryIcon</key>
+		<dict>
+			<key>CFBundleIconFiles</key>
+			<array>
+				<string>AppIcon</string>
+			</array>
+		</dict>
+	</dict>
 	<key>CFBundleVersion</key>
 	<string>$(CURRENT_PROJECT_VERSION)</string>
 	<key>LSApplicationQueriesSchemes</key>
