@@ -236,6 +236,7 @@ class PlayerViewModel: ObservableObject {
     private var activeAddonName: String?
     private var activeProviderName: String?
     private var activeFilename: String?
+    private var activeCacheFileIdentity: PlaybackCacheFileIdentity?
     private var activeVideoSize: Int64?
     private var livePlaybackHasStarted = false
     private var liveBufferingBeganAt: Date?
@@ -266,6 +267,7 @@ class PlayerViewModel: ObservableObject {
     /// never replace a subtitle (including Off) explicitly chosen in the panel.
     private var hasExplicitSubtitleSelection = false
     private var lastProgressSave = Date.distantPast
+    private var lastSavedProgressPosition: Double?
     /// Last coherent, non-EOF MPV sample. Forced lifecycle saves use this
     /// instead of a transient reattach/keep-open sample that can report the
     /// title's full duration as its current position.
@@ -322,6 +324,7 @@ class PlayerViewModel: ObservableObject {
     private var lastScrubTargetSeconds: Double?
     private var speculativePrefetchTask: Task<Void, Never>?
     private var scrubLastDx: CGFloat = 0
+    private var scrubEngagedThisStroke = false
     private var suppressMoveUntil = Date.distantPast
     var moveSuppressed: Bool { Date() < suppressMoveUntil }
     private enum TouchIntent { case undecided, scrub, consumed }
@@ -337,6 +340,8 @@ class PlayerViewModel: ObservableObject {
     private var lastNudgeAt: Date?
     private var nudgeStreak = 0
     private var didConfigureWheelTracking = false
+    private var diskCachedBufferedPosition: Double = 0
+    private var diskCachePollTask: Task<Void, Never>?
 
     /// Best estimate of the real title's length, captured at load time from the
     /// existing Continue Watching entry (most reliable) or the metadata runtime.
@@ -532,6 +537,7 @@ class PlayerViewModel: ObservableObject {
         provider: String? = nil,
         filename: String? = nil,
         videoSize: Int64? = nil,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         trickplayURL: URL? = nil,
         currentEpisode: NuvioVideo? = nil
     ) {
@@ -546,6 +552,7 @@ class PlayerViewModel: ObservableObject {
         activeProviderName = provider
         activeFilename = filename
         activeVideoSize = videoSize
+        activeCacheFileIdentity = cacheFileIdentity
         activeTrickplayURL = trickplayURL
         if !hasLoaded { sessionTrackSelection = nil }
 
@@ -556,6 +563,9 @@ class PlayerViewModel: ObservableObject {
            pipManager.isPictureInPictureActive
             || pipManager.isRestoringUIInProgress
             || sessionCoordinator === activeCoord {
+            if cacheFileIdentity == nil {
+                activeCacheFileIdentity = pipManager.activeContext?.cacheFileIdentity
+            }
             self.sessionCoordinator = activeCoord
             bindSessionCoordinatorCallbacks()
             self.activeEngineKind = activeCoord.activeBackend
@@ -665,6 +675,7 @@ class PlayerViewModel: ObservableObject {
                 meta: meta,
                 subtitle: subtitle,
                 httpHeaders: httpHeaders,
+                cacheFileIdentity: activeCacheFileIdentity,
                 externalSubtitles: externalSubtitles,
                 resumeFrom: resumeFrom,
                 episodes: seriesEpisodes,
@@ -688,6 +699,7 @@ class PlayerViewModel: ObservableObject {
         streamName: String?,
         streamDescription: String?,
         filename: String?,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         artworkURL: URL? = nil
     ) {
         let frameRateMode = ProfileSettings.current.string(forKey: SettingsKey.frameRateMatching) ?? "Always"
@@ -727,6 +739,7 @@ class PlayerViewModel: ObservableObject {
             streamDescription: streamDescription,
             filename: filename,
             canonicalMediaKey: canonicalKey,
+            cacheFileIdentity: cacheFileIdentity ?? activeCacheFileIdentity,
             trickplayURL: activeTrickplayURL,
             artworkURL: resolvedArtwork
         )
@@ -889,6 +902,9 @@ class PlayerViewModel: ObservableObject {
         self.clock.position = 0
         self.clock.duration = 0
         self.clock.buffered = 0
+        self.diskCachedBufferedPosition = 0
+        self.diskCachePollTask?.cancel()
+        self.diskCachePollTask = nil
         self.clock.scrubTarget = nil
         self.resetScrubSession()
         self.pendingSeekDelta = 0
@@ -1050,6 +1066,7 @@ class PlayerViewModel: ObservableObject {
                 meta: meta,
                 subtitle: subtitle,
                 httpHeaders: activeHTTPHeaders,
+                cacheFileIdentity: activeCacheFileIdentity,
                 externalSubtitles: pendingExternalSubtitles,
                 resumeFrom: pendingResumeSeconds,
                 episodes: episodes,
@@ -1395,6 +1412,10 @@ class PlayerViewModel: ObservableObject {
         self.activeProviderName = prepared.provider
         self.activeFilename = prepared.filename
         self.activeVideoSize = prepared.videoSize
+        // A replacement without an explicitly proven identity must not inherit
+        // the previous file's cache namespace. Next-episode resolvers may supply
+        // a new identity on the prepared stream.
+        self.activeCacheFileIdentity = prepared.cacheFileIdentity
         if let bg = prepared.bingeGroup, !bg.isEmpty {
             self.activeBingeGroup = bg
         }
@@ -1420,6 +1441,7 @@ class PlayerViewModel: ObservableObject {
             streamName: prepared.streamName,
             streamDescription: prepared.streamDescription ?? prepared.subtitleLine,
             filename: prepared.filename,
+            cacheFileIdentity: prepared.cacheFileIdentity,
             artworkURL: prepared.artworkURL
         )
         videoNaturalSize = .zero
@@ -1474,6 +1496,8 @@ class PlayerViewModel: ObservableObject {
                   !self.isFailingOver,
                   self.activeStreamURL == targetURL
             else { return }
+            let memReport = TVMemoryDiagnostic.detailedReport(label: "LOAD_WATCHDOG_TIMEOUT")
+            print("[TVTrace] ⚠️ [LOAD_WATCHDOG_TIMEOUT] Source failed to start within \(timeout)s for url=\(targetURL ?? "nil")\n\(memReport)")
             if let url = self.activeStreamURL {
                 self.failedStreamURLs.insert(url)
             }
@@ -1863,8 +1887,27 @@ class PlayerViewModel: ObservableObject {
             // the coarser `time` publication is throttled by the settings panel.
             if clock.position != latestTime.current { clock.position = latestTime.current }
             if clock.duration != latestTime.duration { clock.duration = latestTime.duration }
-            let bufferedSeconds = Double(c.bufferedMs) / 1000.0
-            if clock.buffered != bufferedSeconds { clock.buffered = bufferedSeconds }
+            let engineBufferedSeconds = Double(c.bufferedMs) / 1000.0
+            let effectiveBuffered = max(engineBufferedSeconds, diskCachedBufferedPosition)
+            if clock.buffered != effectiveBuffered { clock.buffered = effectiveBuffered }
+
+            if diskCachePollTask == nil, latestTime.duration > 0 {
+                let currentPos = latestTime.current
+                let duration = latestTime.duration
+                diskCachePollTask = Task { @MainActor [weak self] in
+                    let forwardSec = await PlaybackStreamCacheManager.shared.contiguousCachedForwardSeconds(
+                        playheadSeconds: currentPos, totalDuration: duration
+                    )
+                    guard let self else { return }
+                    if forwardSec > 0 {
+                        self.diskCachedBufferedPosition = min(duration, currentPos + forwardSec)
+                    } else {
+                        self.diskCachedBufferedPosition = 0
+                    }
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                    self.diskCachePollTask = nil
+                }
+            }
         }
 
         // PlayerControls can focus the timeline before Aether has finished
@@ -2008,12 +2051,21 @@ class PlayerViewModel: ObservableObject {
             }
         }
 
+        let isPresentingFrames = c.hasFirstFrameReadyForDisplay || (c.isPlayerPlaying && !c.isPlayerLoading && (c.videoFrameSize != .zero || c.durationMs > 0))
+        if isPresentingFrames {
+            if !hasRenderedFirstFrame {
+                hasRenderedFirstFrame = true
+            }
+            isAwaitingStreamStart = false
+            markLoadStarted()
+        }
+
         let engineStatus: PlayerStatus
         if !c.currentErrorMessage.isEmpty {
             engineStatus = .error(c.currentErrorMessage)
         } else if c.isPlayerEnded {
             engineStatus = .ended
-        } else if c.isPlayerLoading && !c.isPlayerPlaying {
+        } else if c.isPlayerLoading && !c.isPlayerPlaying && !c.hasFirstFrameReadyForDisplay {
             if isLiveStream, livePlaybackHasStarted {
                 let beganAt = liveBufferingBeganAt ?? Date()
                 liveBufferingBeganAt = beganAt
@@ -2035,18 +2087,20 @@ class PlayerViewModel: ObservableObject {
             markLoadStarted()
         }
 
-        if c.hasFirstFrameReadyForDisplay || (c.isPlayerPlaying && !c.isPlayerLoading && (c.videoFrameSize != .zero || c.durationMs > 0)) {
-            if !hasRenderedFirstFrame {
-                hasRenderedFirstFrame = true
-            }
-        }
-
         // A stream that was just handed to the engine hasn't opened yet, so the
         // idle pipeline reads as paused. Keep reporting `.buffering` until it
         // really starts, so a source/episode switch shows the spinner over the
         // black frame instead of parked transport controls.
         let latestStatus = (isAwaitingStreamStart && engineStatus == .paused) ? .buffering : engineStatus
-        if status != latestStatus { status = latestStatus }
+        if status != latestStatus {
+            status = latestStatus
+            if latestStatus == .paused, previousStatus == .playing {
+                cancelPauseOverlaySchedule()
+                showPauseOverlay = false
+                showControls = true
+                isTimelineFocused = true
+            }
+        }
 
         updatePlaybackDebugHUD(from: c)
 
@@ -2139,8 +2193,9 @@ class PlayerViewModel: ObservableObject {
         }
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
-        showControls = true
-        scheduleControlsHide()
+        if showControls {
+            scheduleControlsHide()
+        }
     }
 
     func pause(forBackground: Bool = false) {
@@ -2150,14 +2205,9 @@ class PlayerViewModel: ObservableObject {
         cancelPauseOverlaySchedule()
         guard !forBackground else { return }
         showPauseOverlay = false
-        // Show transport first; metadata sheet fades in after a short delay
-        // (trailers stay on simple controls only).
+        // Show progress bar and transport controls when paused
         showControls = true
-        if subtitle != PlaybackMarkers.trailerSubtitle, !showSettingsPanel, !isScrubbing {
-            schedulePauseOverlay()
-        } else {
-            scheduleControlsHide()
-        }
+        isTimelineFocused = true
     }
 
     /// After 3s of still being paused, hide transport and show the metadata sheet.
@@ -2202,6 +2252,9 @@ class PlayerViewModel: ObservableObject {
         stopRepeatingSkip()
         cancelScrub()
         hidePeek()
+        diskCachePollTask?.cancel()
+        diskCachePollTask = nil
+        diskCachedBufferedPosition = 0
         seekDebounceTask?.cancel()
         loadWatchdogTask?.cancel()
         loadWatchdogTask = nil
@@ -2262,7 +2315,7 @@ class PlayerViewModel: ObservableObject {
 
     func togglePlayPause() {
         if isScrubbing {
-            commitScrub()
+            commitScrub(andPlay: true)
             return
         }
         switch PlaybackToggleDirection(isTransportPlaying: engine.isTransportPlaying) {
@@ -2278,6 +2331,16 @@ class PlayerViewModel: ObservableObject {
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
         engine.seekToMs(Int64(target * 1000))
+        if let source = activeStreamURL.flatMap(URL.init(string:)) {
+            let generation = sessionCoordinator.loadGeneration
+            Task { @MainActor [weak self] in
+                guard let self, !self.didShutdown,
+                      self.sessionCoordinator.loadGeneration == generation else { return }
+                await PlaybackStreamCacheManager.shared.notifySeek(
+                    for: source, playheadSeconds: target, totalDuration: duration
+                )
+            }
+        }
         // Instant UI feedback while mpv catches up.
         clock.position = target
         var snapshot = time
@@ -2483,22 +2546,23 @@ class PlayerViewModel: ObservableObject {
     }
 
     /// Computes velocity-aware scrub delta seconds from a pan movement increment.
-    /// Provides frame-accurate second-by-second precision for gentle pans while
+    /// Provides smooth, frame-accurate second-by-second precision for gentle pans while
     /// dynamically accelerating during faster swipes and flicks.
     private func scrubDeltaSeconds(for inc: CGFloat, duration: Double) -> Double {
         let absInc = abs(Double(inc))
         guard absInc > 0.0001 else { return 0 }
         let sign = inc >= 0 ? 1.0 : -1.0
 
-        let baseRate = 0.08
+        let baseRate = 0.06
         let durationFactor = duration > 0 ? max(0.8, min(sqrt(duration / 3600.0), 1.8)) : 1.0
 
         let speed = absInc
         let speedMultiplier: Double
-        if speed <= 2.5 {
-            speedMultiplier = 1.0
+        if speed <= 3.0 {
+            let t = speed / 3.0
+            speedMultiplier = 0.7 + t * 0.3
         } else if speed <= 8.0 {
-            let t = (speed - 2.5) / 5.5
+            let t = (speed - 3.0) / 5.0
             speedMultiplier = 1.0 + t * 1.5 * durationFactor
         } else {
             let t = min((speed - 8.0) / 12.0, 1.0)
@@ -2564,7 +2628,7 @@ class PlayerViewModel: ObservableObject {
         let targets = [seconds + step, seconds + step * 2]
             .filter { $0 >= 0 && $0 <= duration }
         guard !targets.isEmpty else { return }
-        let provider = scrubThumbnailProvider
+        guard let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
         speculativePrefetchTask = Task(priority: .utility) { [weak provider] in
             for target in targets {
                 guard !Task.isCancelled else { break }
@@ -2741,16 +2805,19 @@ class PlayerViewModel: ObservableObject {
         clock.scrubTarget = nil
         touchIntent = .undecided
         scrubLastDx = 0
+        scrubEngagedThisStroke = false
     }
 
     func beginScrub() {
         guard !isLiveStream, hasStartedPlayback, !showSettingsPanel else { return }
+        guard status == .paused else { return }
         hidePeek()
         aetherController?.suspendCoarseThumbnailWork()
         commitPendingSeekIfNeeded()
         // Scrubbing replaces the pause sheet for the gesture.
         dismissPauseOverlay()
-        showControls = false
+        showControls = true
+        isTimelineFocused = true
         scrubThumbnailInteractionToken &+= 1
         scrubThumbnail = nil
         scrubThumbnailTargetSeconds = nil
@@ -2771,15 +2838,16 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    func commitScrub() {
+    func commitScrub(andPlay: Bool = true) {
         guard let target = scrubValue else {
             resetScrubSession()
             return
         }
         seek(to: target)
         resetScrubSession()
-        showControls = true
-        if status == .paused,
+        if andPlay || status == .playing {
+            play()
+        } else if status == .paused,
            subtitle != PlaybackMarkers.trailerSubtitle,
            !showSettingsPanel {
             // Transport first; pause sheet returns after the usual idle delay.
@@ -2791,10 +2859,10 @@ class PlayerViewModel: ObservableObject {
 
     func cancelScrub() {
         resetScrubSession()
+        showControls = true
         if status == .paused,
            subtitle != PlaybackMarkers.trailerSubtitle,
            !showSettingsPanel {
-            showControls = false
             schedulePauseOverlay()
         }
     }
@@ -2813,6 +2881,7 @@ class PlayerViewModel: ObservableObject {
 
     func remoteTouchBegan() {
         scrubLastDx = 0
+        scrubEngagedThisStroke = false
         suppressMoveBriefly()
         noteSwipeStarted()
         touchIntent = isScrubbing ? .scrub : .undecided
@@ -2822,6 +2891,11 @@ class PlayerViewModel: ObservableObject {
         suppressMoveBriefly()
         switch touchIntent {
         case .scrub:
+            if !scrubEngagedThisStroke {
+                // Ignore micro-shifts (< 10pt) during taps or physical OK clicks on the touchpad
+                guard abs(dx) >= 10 else { return }
+                scrubEngagedThisStroke = true
+            }
             scrubPanPoints(dx: dx)
         case .consumed:
             break
@@ -2833,10 +2907,14 @@ class PlayerViewModel: ObservableObject {
                 // Vertical swipe: reveal controls. (Info panel is a later port.)
                 revealControls()
             } else {
-                // Horizontal drag → enter Infuse scrub and start tracking.
-                // beginScrub dismisses the pause sheet if it was up.
+                // Horizontal drag → enter scrub whenever paused, bringing the Infuse scrubber to the front
+                guard status == .paused else {
+                    touchIntent = .consumed
+                    return
+                }
                 beginScrub()
                 touchIntent = .scrub
+                scrubEngagedThisStroke = true
                 scrubLastDx = dx
                 scrubPanPoints(dx: dx)
             }
@@ -2845,6 +2923,7 @@ class PlayerViewModel: ObservableObject {
 
     func remoteTouchEnded(dx: CGFloat, dy: CGFloat) {
         if touchIntent == .scrub { endScrubGesture() }
+        scrubEngagedThisStroke = false
         touchIntent = .undecided
     }
 
@@ -2994,6 +3073,7 @@ class PlayerViewModel: ObservableObject {
             revealControls()
             return
         }
+        guard status == .playing else { return }
         guard hasStartedPlayback, !isScrubbing, !showSettingsPanel else { return }
         // Discrete tap: do not interrupt an active hold-to-seek session
         guard !isHoldingSeek else { return }
@@ -3111,6 +3191,7 @@ class PlayerViewModel: ObservableObject {
             revealControls()
             return
         }
+        guard status == .playing else { return }
         guard hasStartedPlayback, !isScrubbing, !showSettingsPanel else { return }
 
         // If already in hold-to-seek mode:
@@ -3704,16 +3785,17 @@ class PlayerViewModel: ObservableObject {
 
     // MARK: - Controls visibility
 
-    func scheduleControlsHide() {
+    func scheduleControlsHide(after interval: TimeInterval? = nil) {
         controlsHideTimer?.invalidate()
-        controlsHideTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: false) { [weak self] _ in
+        let timeout = interval ?? (isTimelineFocused ? 5.0 : 10.0)
+        controlsHideTimer = Timer.scheduledTimer(withTimeInterval: timeout, repeats: false) { [weak self] _ in
             Task { @MainActor [weak self] in
                 guard let self else { return }
                 guard !self.controlsAutoHideSuspended else { return }
                 guard !self.isHoldingSeek else { return }
-                // While paused, the dedicated pause-overlay timer owns visibility
-                // (3s delay). Don't fight it by auto-hiding controls early.
-                guard self.status == .playing else { return }
+                guard !self.showSettingsPanel else { return }
+                guard self.sidePanel == nil else { return }
+                guard !self.isScrubbing else { return }
                 self.showControls = false
                 self.updateSkipIntervalState()
             }
@@ -3732,6 +3814,7 @@ class PlayerViewModel: ObservableObject {
         controlsAutoHideSuspended = false
         cancelPauseOverlaySchedule()
         showControls = false
+        isTimelineFocused = false
         updateSkipIntervalState()
     }
 
@@ -3742,14 +3825,10 @@ class PlayerViewModel: ObservableObject {
         cancelPauseOverlaySchedule()
         showPauseOverlay = false
         showControls = true
+        isTimelineFocused = true
         updateSkipIntervalState()
         if status == .playing {
             scheduleControlsHide()
-        } else if status == .paused {
-            // Restart the 3s countdown to the pause sheet.
-            if subtitle != PlaybackMarkers.trailerSubtitle, !showSettingsPanel {
-                schedulePauseOverlay()
-            }
         }
     }
 
@@ -3884,12 +3963,26 @@ class PlayerViewModel: ObservableObject {
         Task { @MainActor [weak self] in
             guard let self else { return }
             defer { self.isSwitchingSource = false }
-            guard let prepared = await resolvePlaybackStream(stream, contentId, subtitleLine) else {
+            guard var prepared = await resolvePlaybackStream(stream, contentId, subtitleLine) else {
                 self.showPlayerToast("Couldn't open this source")
                 self.isAwaitingStreamStart = false
                 self.status = .paused
                 return
             }
+            // The source resolver owns URL/debrid selection, while the source
+            // card owns the torrent file identity. A debrid/P2P resolver may
+            // choose a different file, so carry the identity only for a direct
+            // HTTP(S) stream whose explicit hash and file index survive
+            // normalization; otherwise replaceStream clears the prior one.
+            let isDirectHTTP = stream.directURL.flatMap(URL.init(string:))?.scheme
+                .map { $0.caseInsensitiveCompare("http") == .orderedSame || $0.caseInsensitiveCompare("https") == .orderedSame }
+                ?? false
+            prepared.cacheFileIdentity = isDirectHTTP
+                ? PlaybackCacheFileIdentity(
+                    infoHash: stream.effectiveInfoHash,
+                    fileIndex: stream.effectiveFileIdx
+                )
+                : nil
             self.failedStreamURLs.removeAll()
             let group = stream.bingeGroup ?? StreamQualityTags.syntheticBingeGroup(for: stream)
             if let group, !group.isEmpty {
@@ -4017,6 +4110,7 @@ class PlayerViewModel: ObservableObject {
 
     private func saveProgressIfNeeded() {
         guard isTrackablePlayback else { return }
+        guard status == .playing else { return }
         // Start a Trakt scrobble promptly so its remote Continue Watching feed
         // has an entry before the user leaves the player. Subsequent saves keep
         // the normal cadence (and Trakt's separate 30-second report cadence).
@@ -4039,6 +4133,12 @@ class PlayerViewModel: ObservableObject {
                 : nil
         }
         let progressTime = checkpointTime ?? (force ? (lastStablePlaybackTime ?? time) : time)
+        if isPeriodicHeartbeat, !force {
+            if let lastSavedProgressPosition,
+               abs(progressTime.current - lastSavedProgressPosition) < 2.0 {
+                return
+            }
+        }
         // Nuvio Sync retains the 10-second accidental-playback safeguard. A
         // Trakt start scrobble is the source of its Continue Watching row, so
         // send it once playback has genuinely begun instead of waiting 10+ s.
@@ -4085,6 +4185,7 @@ class PlayerViewModel: ObservableObject {
                     seedSeason: resolvedEpisodeNumbers?.season
                 )
             }
+            lastSavedProgressPosition = progressTime.current
             lastProgressSave = Date()
             return
         }
@@ -4142,6 +4243,7 @@ class PlayerViewModel: ObservableObject {
                 episodeId: currentEpisodeVideo?.id
             )
         }
+        lastSavedProgressPosition = progressTime.current
         lastProgressSave = Date()
 
         // Ending start / 90% — checkmark without sitting through the credits.

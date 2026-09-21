@@ -16,7 +16,7 @@ struct DetailsScreen: View {
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
     /// The last two carry series context for the player's next-episode auto-play;
     /// both are empty/nil for movies and trailers.
-    let onPlayClick: (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?) -> Void
+    let onPlayClick: (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?, PlaybackCacheFileIdentity?) -> Void
     let onBack: () -> Void
     /// Open another title (More Like This / production catalog).
     var onOpenTitle: ((String, String) -> Void)? = nil
@@ -68,7 +68,7 @@ struct DetailsScreen: View {
         initiallyPresentStreamPicker: Bool = false,
         initialStreamPickerEpisode: NuvioVideo? = nil,
         onInitialStreamPickerPresented: (() -> Void)? = nil,
-        onPlayClick: @escaping (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?) -> Void,
+        onPlayClick: @escaping (String, [String: String], NuvioMeta, String, [NuvioSubtitle], NuvioVideo?, [NuvioVideo], ExternalPlayer?, PlaybackCacheFileIdentity?) -> Void,
         onBack: @escaping () -> Void,
         onOpenTitle: ((String, String) -> Void)? = nil,
         onOpenProduction: ((MetaCompany) -> Void)? = nil,
@@ -168,7 +168,7 @@ struct DetailsScreen: View {
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
-                            onPlayClick(url, [:], meta, "", [], nil, [], nil)
+                            onPlayClick(url, [:], meta, "", [], nil, [], nil, nil)
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
@@ -492,7 +492,7 @@ struct DetailsScreen: View {
             isPreparingPlayback = true
             isSmartPlaybackPending = false
             armExternalPlayerTimeoutIfNeeded(player: player)
-            onPlayClick(url, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player)
+            onPlayClick(url, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player, PlaybackCacheFileIdentity(infoHash: stream.effectiveInfoHash, fileIndex: stream.effectiveFileIdx))
             return
         }
 
@@ -540,7 +540,7 @@ struct DetailsScreen: View {
                     isPreparingPlayback = true
                     isSmartPlaybackPending = false
                     armExternalPlayerTimeoutIfNeeded(player: player)
-                    onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player)
+                    onPlayClick(url.absoluteString, stream.httpHeaders ?? [:], meta, pendingEpisodeSubtitle, stream.subtitles, pendingEpisode, orderedEpisodes(for: meta), player, nil)
                 } else {
                     PlaybackStartupBenchmark.shared.cancel()
                     isPreparingPlayback = false
@@ -617,12 +617,12 @@ struct DetailsScreen: View {
         Task {
             if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
                 await MainActor.run {
-                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
+                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil)
                 }
             } else if let ytId = await preferredTrailerYouTubeId(for: meta) {
                 let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
                 await MainActor.run {
-                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil)
+                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil)
                 }
             }
         }
@@ -3974,11 +3974,18 @@ private struct CommentDetailOverlay: View {
 
 actor PersonProfileImageCache {
     static let shared = PersonProfileImageCache()
+    private static let tracker = NSCacheMemoryTracker(maxCost: 20 * 1024 * 1024)
+
+    static func telemetryMetrics() -> (count: Int, totalBytes: Int, maxCost: Int) {
+        tracker.metrics()
+    }
+
     private let cache = NSCache<NSURL, UIImage>()
 
     init() {
         cache.countLimit = 60
-        cache.totalCostLimit = 20 * 1024 * 1024 // 20 MB
+        cache.totalCostLimit = Self.tracker.maxCost
+        cache.delegate = Self.tracker
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -3994,6 +4001,7 @@ actor PersonProfileImageCache {
 
     func purge() {
         cache.removeAllObjects()
+        Self.tracker.reset()
     }
 
     func image(for url: NSURL) -> UIImage? {
@@ -4001,7 +4009,9 @@ actor PersonProfileImageCache {
     }
 
     func insert(_ image: UIImage, for url: NSURL) {
-        cache.setObject(image, forKey: url)
+        let cost = image.decodedByteCost
+        cache.setObject(image, forKey: url, cost: cost)
+        Self.tracker.recordInsertion(cost: cost)
     }
 }
 

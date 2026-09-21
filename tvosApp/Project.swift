@@ -1,4 +1,37 @@
+import Foundation
 import ProjectDescription
+
+// MARK: - Submodule Validation
+//
+// If the repository was cloned without `--recurse-submodules`, MPVKit/Package.swift
+// will be missing. Attempt automatic submodule initialization or halt with a
+// clear actionable error message.
+let mpvKitManifest = URL(fileURLWithPath: #file)
+    .deletingLastPathComponent()
+    .appendingPathComponent("../MPVKit/Package.swift")
+    .standardized
+
+if !FileManager.default.fileExists(atPath: mpvKitManifest.path) {
+    let repoRoot = URL(fileURLWithPath: #file)
+        .deletingLastPathComponent()
+        .appendingPathComponent("..")
+        .standardized
+    let process = Process()
+    process.currentDirectoryURL = repoRoot
+    process.executableURL = URL(fileURLWithPath: "/usr/bin/git")
+    process.arguments = ["submodule", "update", "--init", "--recursive"]
+    try? process.run()
+    process.waitUntilExit()
+
+    if !FileManager.default.fileExists(atPath: mpvKitManifest.path) {
+        fatalError("""
+        \n\n❌ [NuvioTV] Missing MPVKit submodule manifest at: \(mpvKitManifest.path)
+        Please initialize git submodules by running:
+            git submodule update --init --recursive
+        \n
+        """)
+    }
+}
 
 // MARK: - Signing
 //

@@ -85,7 +85,7 @@ extension PlayerView {
                     message: L10n.string("player_status_starting_stream", fallback: "Starting stream")
                 )
                 .transition(.opacity)
-            } else {
+            } else if !viewModel.hasRenderedFirstFrame {
                 ProgressView()
                     .progressViewStyle(CircularProgressViewStyle(tint: .white))
                     .scaleEffect(2)

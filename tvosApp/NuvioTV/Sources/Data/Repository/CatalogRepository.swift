@@ -196,6 +196,11 @@ extension CatalogRepository {
 /// must decode the same response or their row identities immediately diverge.
 actor StremioManifestDataCache {
     static let shared = StremioManifestDataCache()
+    private static let tracker = SimpleCountTracker()
+
+    static func telemetryMetrics() -> (count: Int, totalBytes: Int) {
+        tracker.metrics
+    }
 
     private var cachedData: [URL: Data] = [:]
     private var inFlight: [URL: Task<Data?, Never>] = [:]
@@ -219,13 +224,18 @@ actor StremioManifestDataCache {
         inFlight[url] = task
         let data = await task.value
         inFlight[url] = nil
-        if let data { cachedData[url] = data }
+        if let data {
+            cachedData[url] = data
+            let totalBytes = cachedData.values.reduce(0) { $0 + $1.count }
+            Self.tracker.set(count: cachedData.count, bytes: totalBytes)
+        }
         return data
     }
 
     func clear() {
         cachedData.removeAll()
         inFlight.removeAll()
+        Self.tracker.reset()
     }
 }
 
@@ -447,14 +457,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         catalogId: spec.catalogId
                     )
                 ) else { continue }
-                guard CatalogHomeVisibilityResolver.shouldInclude(
-                    addonID: Self.cinemetaAddonId,
-                    contentType: spec.type,
-                    catalogID: spec.catalogId,
-                    collectionSources: collectionSources,
-                    manifestURL: baseURL.appendingPathComponent("manifest.json"),
-                    explicitHomeKeys: activeHomeKeys
-                ) else { continue }
                 cacheMetadata(page)
                 result.append(
                     NuvioCatalog(
@@ -529,7 +531,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
         var progressiveAddonCatalogs: [NuvioCatalog] = []
         var lastProgressiveUpdateAt: UInt64?
         var lastProgressiveUpdateCount = 0
-        let progressiveUpdateIntervalNanoseconds: UInt64 = 600_000_000
+        let progressiveUpdateIntervalNanoseconds: UInt64 = 1_500_000_000
         let addonResult = await addonHomeCatalogs(
             collectionSources: collectionSources,
             activeHomeKeys: activeHomeKeys
@@ -593,15 +595,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
         var result: [NuvioCatalog] = []
 
-        if !disabledKeys.contains(movieKey),
-           CatalogHomeVisibilityResolver.shouldInclude(
-               addonID: "simkl",
-               contentType: "movie",
-               catalogID: "plantowatch",
-               collectionSources: sources,
-               manifestURL: URL(string: "https://simkl.com/manifest.json") ?? URL(fileURLWithPath: "/"),
-               explicitHomeKeys: activeKeys
-           ) {
+        if !disabledKeys.contains(movieKey) {
             let movieItems = await SimklLibraryService.fetchPlanToWatchItems(
                 type: "movie",
                 repository: self
@@ -631,15 +625,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        if !disabledKeys.contains(seriesKey),
-           CatalogHomeVisibilityResolver.shouldInclude(
-               addonID: "simkl",
-               contentType: "series",
-               catalogID: "plantowatch",
-               collectionSources: sources,
-               manifestURL: URL(string: "https://simkl.com/manifest.json") ?? URL(fileURLWithPath: "/"),
-               explicitHomeKeys: activeKeys
-           ) {
+        if !disabledKeys.contains(seriesKey) {
             let seriesItems = await SimklLibraryService.fetchPlanToWatchItems(
                 type: "series",
                 repository: self
@@ -706,14 +692,6 @@ final class CinemetaCatalogRepository: CatalogRepository {
             let eligible = (manifest.catalogs ?? []).filter { catalog in
                 guard catalog.eligibleForHome else { return false }
                 let key = "\(manifest.id)_\(catalog.type)_\(catalog.id)"
-                guard CatalogHomeVisibilityResolver.shouldInclude(
-                    addonID: manifest.id,
-                    contentType: catalog.type,
-                    catalogID: catalog.id,
-                    collectionSources: collectionSources,
-                    manifestURL: manifestURL,
-                    explicitHomeKeys: activeHomeKeys
-                ) else { return false }
                 guard !disabledCatalogKeys.contains(key) else {
                     return false
                 }

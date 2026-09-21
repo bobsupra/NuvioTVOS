@@ -12,7 +12,7 @@ struct PlayerProgressTrack: View {
     var played: Double
     var buffered: Double
     var height: CGFloat = 10
-    var showThumb: Bool = true
+    var showThumb: Bool = false
     var emphasized: Bool = false
     /// When true, the track is a frosted glass capsule (one bar, not glassEffect).
     var glassTrack: Bool = false
@@ -23,7 +23,6 @@ struct PlayerProgressTrack: View {
             let p = CGFloat(min(max(played, 0), 1))
             let b = CGFloat(min(max(buffered, 0), 1))
             let h = emphasized ? height + 2 : height
-            let thumbSize: CGFloat = emphasized ? 22 : 16
 
             ZStack(alignment: .leading) {
                 // Single track layer (fills + clip = one bar, not glassEffect).
@@ -40,18 +39,23 @@ struct PlayerProgressTrack: View {
                     }
 
                     if b > p {
-                        Capsule()
-                            .fill(Color.white.opacity(glassTrack ? 0.22 : 0.42))
+                        Rectangle()
+                            .fill(Color.white.opacity(glassTrack ? 0.22 : 0.35))
                             .frame(width: w * b)
                     }
 
-                    Capsule()
-                        .fill(Color.white.opacity(0.95))
-                        .frame(width: max(w * p, h))
-                        .shadow(
-                            color: .white.opacity(emphasized ? 0.75 : 0.4),
-                            radius: emphasized ? 5 : 2
-                        )
+                    if p > 0 {
+                        // Played progress bar (semi-opaque grey)
+                        Rectangle()
+                            .fill(Color.white.opacity(0.65))
+                            .frame(width: w * p)
+
+                        // Leading edge tick: bright white cap flush with the track height
+                        Rectangle()
+                            .fill(Color.white)
+                            .frame(width: 2, height: h)
+                            .position(x: min(max(w * p - 1, 1), w - 1), y: h / 2)
+                    }
                 }
                 .frame(height: h)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -60,9 +64,9 @@ struct PlayerProgressTrack: View {
                 if showThumb {
                     Circle()
                         .fill(Color.white)
-                        .frame(width: thumbSize, height: thumbSize)
+                        .frame(width: emphasized ? 22 : 16, height: emphasized ? 22 : 16)
                         .shadow(color: .black.opacity(0.45), radius: 4)
-                        .offset(x: min(max(w * p - thumbSize / 2, 0), w - thumbSize))
+                        .offset(x: min(max(w * p - (emphasized ? 11 : 8), 0), w - (emphasized ? 22 : 16)))
                 }
             }
             .frame(maxHeight: .infinity, alignment: .center)
@@ -155,7 +159,7 @@ struct SeekHUD: View {
                     played: duration > 0 ? target / duration : 0,
                     buffered: duration > 0 ? buffered / duration : 0,
                     height: 10,
-                    showThumb: true,
+                    showThumb: false,
                     emphasized: true
                 )
                 .frame(height: 14)
@@ -307,7 +311,7 @@ struct InfuseScrubHUD: View {
                             played: target / duration,
                             buffered: buffered / duration,
                             height: 10,
-                            showThumb: true,
+                            showThumb: false,
                             emphasized: true
                         )
                         .frame(height: 14)
@@ -384,7 +388,7 @@ struct PeekBar: View {
                     played: clock.duration > 0 ? min(clock.position / clock.duration, 1) : 0,
                     buffered: clock.duration > 0 ? min(clock.buffered / clock.duration, 1) : 0,
                     height: 8,
-                    showThumb: true,
+                    showThumb: false,
                     emphasized: false
                 )
                 HStack {

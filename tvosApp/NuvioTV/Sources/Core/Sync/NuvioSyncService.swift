@@ -65,6 +65,17 @@ final class NuvioSyncManager: ObservableObject {
     // points back to this manager, so this creates no retain cycle.
     private var authManager: AuthManager?
     private var profileViewModel: ProfileViewModel?
+    struct SyncPushScope: OptionSet, Sendable {
+        let rawValue: Int
+        static let settings = SyncPushScope(rawValue: 1 << 0)
+        static let library  = SyncPushScope(rawValue: 1 << 1)
+        static let watched  = SyncPushScope(rawValue: 1 << 2)
+        static let progress = SyncPushScope(rawValue: 1 << 3)
+        static let all: SyncPushScope = [.settings, .library, .watched, .progress]
+    }
+
+    private var pendingPushScopes: SyncPushScope = []
+    private var isPushExecuting = false
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
@@ -136,56 +147,49 @@ final class NuvioSyncManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .settings) }
         })
         observers.append(center.addObserver(
             forName: LibraryStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .library) }
         })
         observers.append(center.addObserver(
             forName: WatchedStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .watched) }
         })
         observers.append(center.addObserver(
             forName: ContinueWatchingStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .progress, delay: 3.0) }
         })
         observers.append(center.addObserver(
             forName: ContinueWatchingDismissStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
-        })
-        observers.append(center.addObserver(
-            forName: UserDefaults.didChangeNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .progress, delay: 1.5) }
         })
         observers.append(center.addObserver(
             forName: ProfileSettings.settingsChangedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .settings) }
         })
         observers.append(center.addObserver(
             forName: StreamBadgeSettingsStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush() }
+            Task { @MainActor in self?.schedulePush(scope: .settings) }
         })
         observers.append(center.addObserver(
             forName: Self.addonOrderChangedNotification,
@@ -325,6 +329,9 @@ final class NuvioSyncManager: ObservableObject {
             pullTask?.cancel()
             pullTask = nil
             pushTask?.cancel()
+            pushTask = nil
+            pendingPushScopes = []
+            isPushExecuting = false
             homeCatalogPushTask?.cancel()
             profileSelectionRefreshTask?.cancel()
             profileSelectionRefreshTask = nil
@@ -411,6 +418,8 @@ final class NuvioSyncManager: ObservableObject {
         // A delayed snapshot captured the previous profile and must not resume
         // by reading the newly-active profile's global stores.
         pushTask?.cancel()
+        pendingPushScopes = []
+        isPushExecuting = false
         homeCatalogPushTask?.cancel()
 
         // A profile the account has already pulled this session has all its data
@@ -794,16 +803,23 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
-    private func schedulePush() {
+    private func schedulePush(scope: SyncPushScope = .all, delay: TimeInterval = 1.5) {
         guard !isApplyingRemote else { return }
         guard AuthConfig.isConfigured else { return }
         guard authManager?.isAuthenticated == true else { return }
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
 
+        pendingPushScopes.insert(scope)
+        guard !isPushExecuting else {
+            // An upload is already in flight. Do not cancel active URLSession tasks.
+            // When it finishes, executePendingPushes will pick up pendingPushScopes.
+            return
+        }
+
         pushTask?.cancel()
         pushTask = Task(priority: .utility) { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: 1_500_000_000)
+                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
             } catch {
                 return
             }
@@ -811,8 +827,23 @@ final class NuvioSyncManager: ObservableObject {
                   !Task.isCancelled,
                   let key = self.currentSyncKey(),
                   self.completedInitialPullKeys.contains(key) else { return }
-            await self.pushLocalSnapshots()
+            await self.executePendingPushes()
         }
+    }
+
+    private func executePendingPushes() async {
+        guard !isPushExecuting else { return }
+        let scopesToPush = pendingPushScopes
+        guard !scopesToPush.isEmpty else { return }
+        pendingPushScopes = []
+        isPushExecuting = true
+        defer {
+            isPushExecuting = false
+            if !pendingPushScopes.isEmpty {
+                schedulePush(scope: pendingPushScopes, delay: 1.5)
+            }
+        }
+        await pushLocalSnapshots(scopes: scopesToPush)
     }
 
     /// Task cancellation is cooperative, so a pull that is mid-flight when the
@@ -1326,7 +1357,7 @@ final class NuvioSyncManager: ObservableObject {
         return nil
     }
 
-    private func pushLocalSnapshots() async {
+    private func pushLocalSnapshots(scopes: SyncPushScope = .all) async {
         guard let authManager, let profileViewModel else { return }
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
         guard let session = await authManager.validSessionForSync() else { return }
@@ -1338,15 +1369,17 @@ final class NuvioSyncManager: ObservableObject {
         )
 
         do {
-            // A push racing a sign-out would upload the freshly wiped (empty)
-            // local snapshots over the account's server data — abort between
-            // steps the moment auth flips.
-            try ensureStillSyncing(profileId: activeProfile.id)
-            try await client.pushProfileSettings(
-                session: session,
-                remoteProfileId: remoteProfileId,
-                localProfileId: activeProfile.id
-            )
+            if scopes.contains(.settings) {
+                // A push racing a sign-out would upload the freshly wiped (empty)
+                // local snapshots over the account's server data — abort between
+                // steps the moment auth flips.
+                try ensureStillSyncing(profileId: activeProfile.id)
+                try await client.pushProfileSettings(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    localProfileId: activeProfile.id
+                )
+            }
 
             guard Self.watchStateSyncEnabled(for: activeProfile.id) else { return }
 
@@ -1359,26 +1392,39 @@ final class NuvioSyncManager: ObservableObject {
 
             let profileStore = ProfileSettings.store(for: activeProfile.id)
             let ownsLibrary = Self.ownsLibrary(for: activeProfile.id)
-            if ownsLibrary {
+            if scopes.contains(.library) && ownsLibrary {
                 try ensureStillSyncing(profileId: activeProfile.id)
                 try await client.pushLibrary(session: session, remoteProfileId: remoteProfileId)
             }
 
             let ownsWatchState = Self.ownsWatchState(for: activeProfile.id)
             if ownsWatchState {
-                try ensureStillSyncing(profileId: activeProfile.id)
-                try await client.pushWatched(session: session, remoteProfileId: remoteProfileId)
-                try ensureStillSyncing(profileId: activeProfile.id)
-                try await client.pushWatchProgress(session: session, remoteProfileId: remoteProfileId)
+                if scopes.contains(.watched) {
+                    try ensureStillSyncing(profileId: activeProfile.id)
+                    try await client.pushWatched(session: session, remoteProfileId: remoteProfileId)
+                }
+                if scopes.contains(.progress) {
+                    try ensureStillSyncing(profileId: activeProfile.id)
+                    try await client.pushWatchProgress(session: session, remoteProfileId: remoteProfileId)
+                }
             }
 
-            let library = ownsLibrary
-                ? "\(LibraryStore.items().count) library item(s)"
-                : "library owned by \(TraktSettingsStore.librarySourceMode(in: profileStore).rawValue)"
-            let watchState = ownsWatchState
-                ? "\(WatchedStore.items().count) watched, \(ContinueWatchingStore.items().count) progress item(s)"
-                : "watch state owned by \(TraktSettingsStore.watchProgressSource(in: profileStore).rawValue)"
-            print("Nuvio sync pushed \(library); \(watchState).")
+            var pushedParts: [String] = []
+            if scopes.contains(.settings) {
+                pushedParts.append("settings")
+            }
+            if scopes.contains(.library) && ownsLibrary {
+                pushedParts.append("\(LibraryStore.items().count) library item(s)")
+            }
+            if scopes.contains(.watched) && ownsWatchState {
+                pushedParts.append("\(WatchedStore.items().count) watched")
+            }
+            if scopes.contains(.progress) && ownsWatchState {
+                pushedParts.append("\(ContinueWatchingStore.items().count) progress item(s)")
+            }
+            if !pushedParts.isEmpty {
+                print("Nuvio sync pushed \(pushedParts.joined(separator: "; ")).")
+            }
         } catch is CancellationError {
             // Signed out mid-push: stop quietly, nothing was corrupted.
         } catch {

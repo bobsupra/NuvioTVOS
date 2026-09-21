@@ -431,7 +431,9 @@ enum WatchProgressLedger {
             return false
         }
         // Left behind by a build that stored the ledger in preferences.
-        UserDefaults.standard.removeObject(forKey: key)
+        if UserDefaults.standard.object(forKey: key) != nil {
+            UserDefaults.standard.removeObject(forKey: key)
+        }
         cachedRecords = trimmed
         cachedKey = key
         NotificationCenter.default.post(name: changedNotification, object: nil)

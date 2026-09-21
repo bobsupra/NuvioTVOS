@@ -16,8 +16,9 @@
 
 ## View Hierarchy & Performance
 
-- **Lazy Layouts**:
-  - Maintain stable element identities (`id`) in `LazyVStack` and `LazyHStack` to prevent focus jumping to the top of the row during re-renders.
+- **Focus Windowed Layouts & Home Invariant**:
+  - Always use `VStack` with Focus Windowing (`focusedRowIndex ± 2` mounting real rows and `Color.clear.frame` for off-screen rows) for Home catalog rows and Home Grid inside `ScrollView(.vertical)`. This prevents tvOS focus engine drops and scroll jitter while keeping memory low.
+  - Maintain stable element identities (`id`) in `VStack` and `LazyHStack` to prevent focus jumping to the top of the row during re-renders.
   - Avoid heavy computations inside view body properties; offload to ViewModels on background actors.
 
 - **Playback & Engine Integration**:

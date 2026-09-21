@@ -16,9 +16,6 @@ extension PlayerView {
             playerStatusOverlay
             playerToastLayer
             focusSinkLayer
-            peekTimelineLayer
-            scrubHUDLayer
-            seekPreviewLayer
             pauseOverlayLayer
             skipSegmentLayer
             nextEpisodeLayer
@@ -155,15 +152,14 @@ extension PlayerView {
 
     @ViewBuilder
     var remoteTouchCatcherLayer: some View {
-        // Window-level trackpad capture for Infuse-style scrubbing / peek.
+        // Window-level trackpad capture for scrubbing.
         RemoteTouchCatcher(
             isActive: {
                 !isWakingFromBackground
                     && viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.postPlayState.isVisible
-                    && (viewModel.isScrubbing
-                        || (!viewModel.showControls && !viewModel.showNextEpisodeCard))
+                    && viewModel.status == .paused
             },
             onBegan: { viewModel.remoteTouchBegan() },
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
@@ -233,7 +229,8 @@ extension PlayerView {
             .ignoresSafeArea()
             .contentShape(Rectangle())
             .focusable(
-                (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.isScrubbing || viewModel.showPauseOverlay)
+                (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
+                    && !viewModel.isScrubbing
                     && viewModel.playbackStartupError == nil
                     && !viewModel.showNextEpisodeCard
                     && !viewModel.showSkipSegmentCard
@@ -248,57 +245,11 @@ extension PlayerView {
                     viewModel.commitScrub()
                 } else if viewModel.showPauseOverlay {
                     viewModel.play()
-                } else if viewModel.peekVisible {
-                    viewModel.beginScrub()
                 } else {
                     viewModel.togglePlayPause()
                 }
             }
             .accessibilityHidden(true)
-    }
-
-    @ViewBuilder
-    var peekTimelineLayer: some View {
-        // Light-tap peek timeline (no full chrome).
-        if viewModel.peekVisible, !viewModel.showControls, !viewModel.isScrubbing {
-            PeekBar(clock: viewModel.clock)
-                .transition(.opacity)
-                .zIndex(1)
-        }
-    }
-
-    @ViewBuilder
-    var scrubHUDLayer: some View {
-        // Infuse scrub HUD (trackpad / D-pad fine seek).
-        if viewModel.isScrubbing {
-            InfuseScrubHUD(
-                clock: viewModel.clock,
-                title: viewModel.title,
-                episodeLine: viewModel.subtitle.isEmpty ? nil : viewModel.subtitle,
-                thumbnail: viewModel.isSeekPreviewEnabled ? viewModel.scrubThumbnail : nil,
-                naturalSize: viewModel.videoNaturalSize,
-                wheelEngaged: viewModel.wheelEngaged,
-                showThumbnailCard: viewModel.isSeekPreviewEnabled
-            )
-            .transition(.opacity)
-            .zIndex(4)
-        }
-    }
-
-    @ViewBuilder
-    var seekPreviewLayer: some View {
-        // Accumulated D-pad skip preview over bare video.
-        if viewModel.pendingSeekDelta != 0, !viewModel.showControls, !viewModel.isScrubbing {
-            SeekHUD(
-                clock: viewModel.clock,
-                delta: viewModel.pendingSeekDelta,
-                thumbnail: (viewModel.isHoldingSeek && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
-                naturalSize: viewModel.videoNaturalSize,
-                speedMultiplier: viewModel.seekSpeedMultiplier
-            )
-                .transition(.opacity)
-                .zIndex(4)
-        }
     }
 
     @ViewBuilder
@@ -320,7 +271,7 @@ extension PlayerView {
 
     @ViewBuilder
     var skipSegmentLayer: some View {
-        if viewModel.showSkipSegmentCard, let interval = viewModel.activeSkipInterval {
+        if viewModel.showSkipSegmentCard && !viewModel.isScrubbing, let interval = viewModel.activeSkipInterval {
             Button(action: {
                 guard !isWakingFromBackground else { return }
                 viewModel.skipActiveInterval()
@@ -364,7 +315,7 @@ extension PlayerView {
     var nextEpisodeLayer: some View {
         // Next-episode prompt, shown near the end. Auto-play occurs only
         // after the current episode reaches genuine end-of-media.
-        if viewModel.showNextEpisodeCard, let next = viewModel.nextEpisode {
+        if viewModel.showNextEpisodeCard && !viewModel.isScrubbing, let next = viewModel.nextEpisode {
             VStack(spacing: 8) {
                 Button(action: {
                     guard !isWakingFromBackground else { return }
@@ -450,28 +401,25 @@ extension PlayerView {
             onFocusNextEpisode: { focusNextEpisode() }
         )
             .opacity(
-                viewModel.showControls
+                (viewModel.showControls || viewModel.isScrubbing)
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
-                    && !viewModel.isScrubbing
                     && !viewModel.showPauseOverlay
                 ? 1 : 0
             )
             .scaleEffect(
-                viewModel.showControls
+                (viewModel.showControls || viewModel.isScrubbing)
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
-                    && !viewModel.isScrubbing
                     && !viewModel.showPauseOverlay
                 ? 1 : 0.95
             )
             .allowsHitTesting(
-                viewModel.showControls
+                (viewModel.showControls || viewModel.isScrubbing)
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
-                    && !viewModel.isScrubbing
                     && !viewModel.showPauseOverlay
             )
             .animation(.playerControls, value: viewModel.showControls)

@@ -128,6 +128,7 @@ enum TVHomeDebugTrace {
     private static var isPingInFlight = false
     private static var isStallActive = false
     private static var stallStartTime: UInt64 = 0
+    private static var heartbeatTicks: UInt64 = 0
 
     static func startWatchdogIfNeeded() {
         guard enabled else { return }
@@ -135,25 +136,49 @@ enum TVHomeDebugTrace {
             guard !isWatchdogRunning else { return }
             isWatchdogRunning = true
 
+            #if canImport(UIKit)
+            NotificationCenter.default.addObserver(
+                forName: UIApplication.didReceiveMemoryWarningNotification,
+                object: nil,
+                queue: nil
+            ) { _ in
+                let report = TVMemoryDiagnostic.detailedReport(label: "SYSTEM_MEMORY_WARNING")
+                print("[TVTrace] ⚠️🚨 \(report)")
+                logger.fault("⚠️🚨 [SYSTEM_MEMORY_WARNING] Low memory warning received from OS!\n\(report, privacy: .public)")
+            }
+            #endif
+
             let timer = DispatchSource.makeTimerSource(queue: watchdogQueue)
-            timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(15))
+            timer.schedule(deadline: .now() + .milliseconds(500), repeating: .milliseconds(25))
             timer.setEventHandler {
                 let current = now()
+                heartbeatTicks &+= 1
+
+                // Every ~5 seconds (200 * 25ms = 5000ms), log periodic RAM heartbeat breadcrumb
+                if heartbeatTicks % 200 == 0 {
+                    let pulse = TVMemoryDiagnostic.summaryPulse()
+                    breadcrumb("[RAM] \(pulse)")
+                }
+
                 if isPingInFlight {
                     let elapsedMs = Double(current - pingDispatchedTime) / 1_000_000
-                    if elapsedMs >= 35.0 {
+                    if elapsedMs >= 120.0 {
                         if !isStallActive {
                             isStallActive = true
                             stallStartTime = pingDispatchedTime
+                            let memReport = TVMemoryDiagnostic.detailedReport(label: "MAIN_THREAD_STALL_START")
                             let crumbs = recentBreadcrumbs(count: 12)
-                            var lines = ["🚨🚨🚨 [MAIN_THREAD_STALL_START] Main thread frozen for \(String(format: "%.1f", elapsedMs))ms!"]
-                            lines.append("🚨 Recent breadcrumbs leading up to freeze:")
+                            var lines = [
+                                "🚨🚨🚨 [MAIN_THREAD_STALL_START] Main thread frozen for \(String(format: "%.1f", elapsedMs))ms!",
+                                memReport,
+                                "🚨 Recent breadcrumbs leading up to freeze:"
+                            ]
                             for (idx, crumb) in crumbs.enumerated() {
                                 lines.append("  (\(idx + 1)) \(crumb)")
                             }
                             let fullText = lines.map { "[TVTrace] \($0)" }.joined(separator: "\n")
                             print(fullText)
-                            logger.fault("🚨 [MAIN_THREAD_STALL_START] Main thread frozen for \(String(format: "%.1f", elapsedMs))ms!")
+                            logger.fault("🚨 [MAIN_THREAD_STALL_START] Main thread frozen for \(String(format: "%.1f", elapsedMs))ms!\n\(memReport, privacy: .public)")
                         }
                     }
                 } else {
@@ -164,7 +189,8 @@ enum TVHomeDebugTrace {
                         watchdogQueue.async {
                             if isStallActive {
                                 let totalStallMs = Double(mainNow - stallStartTime) / 1_000_000
-                                let message = "✅ [MAIN_THREAD_STALL_RESOLVED] Main thread UNBLOCKED after \(String(format: "%.1f", totalStallMs))ms total freeze!"
+                                let memPulse = TVMemoryDiagnostic.summaryPulse()
+                                let message = "✅ [MAIN_THREAD_STALL_RESOLVED] Main thread UNBLOCKED after \(String(format: "%.1f", totalStallMs))ms total freeze! [\(memPulse)]"
                                 print("[TVTrace] \(message)")
                                 logger.notice("\(message, privacy: .public)")
                                 isStallActive = false
@@ -176,8 +202,8 @@ enum TVHomeDebugTrace {
             }
             watchdogTimer = timer
             timer.resume()
-            print("[TVTrace] Main thread watchdog started (interval: 15ms, threshold: 35ms)")
-            logger.notice("Main thread watchdog started (interval: 15ms, threshold: 35ms)")
+            print("[TVTrace] Main thread watchdog started (interval: 25ms, threshold: 120ms)")
+            logger.notice("Main thread watchdog started (interval: 25ms, threshold: 120ms)")
         }
     }
 }
@@ -295,6 +321,7 @@ struct ContentView: View {
     @State private var playbackEpisodes: [NuvioVideo] = []
     @State private var playbackCurrentEpisode: NuvioVideo?
     @State private var playbackOrigin: PlaybackOrigin = .main
+    @State private var playbackCacheFileIdentity: PlaybackCacheFileIdentity?
     @State private var playbackDidStart = false
     @State private var reopenStreamPickerOnDetails = false
     @State private var reopenStreamPickerEpisode: NuvioVideo?
@@ -1278,7 +1305,8 @@ struct ContentView: View {
         resumeFrom: Double?,
         httpHeaders: [String: String] = [:],
         origin: PlaybackOrigin = .main,
-        customPlayer: ExternalPlayer? = nil
+        customPlayer: ExternalPlayer? = nil,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
@@ -1359,7 +1387,8 @@ struct ContentView: View {
             httpHeaders: httpHeaders,
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
-            origin: origin
+            origin: origin,
+            cacheFileIdentity: cacheFileIdentity
         )
     }
 
@@ -1370,13 +1399,15 @@ struct ContentView: View {
         httpHeaders: [String: String],
         externalSubtitles: [NuvioSubtitle],
         resumeFrom: Double?,
-        origin: PlaybackOrigin
+        origin: PlaybackOrigin,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil
     ) {
         if PictureInPictureManager.shared.isPictureInPictureActive,
            PictureInPictureManager.shared.activeContext?.url != url {
             PictureInPictureManager.shared.invalidateSession()
         }
         playbackOrigin = origin
+        playbackCacheFileIdentity = cacheFileIdentity
         playbackDidStart = false
         withAnimation(.easeInOut(duration: 0.28)) {
             activeScreen = .player(
@@ -1394,6 +1425,7 @@ struct ContentView: View {
         PictureInPictureManager.shared.onRestoreUI = { [self] context, completion in
             withAnimation(.easeInOut(duration: 0.24)) {
                 self.playbackOrigin = context.playbackOrigin
+                self.playbackCacheFileIdentity = context.cacheFileIdentity
                 self.playbackEpisodes = context.episodes
                 self.playbackCurrentEpisode = context.currentEpisode
                 self.activeScreen = .player(
@@ -1787,7 +1819,7 @@ struct ContentView: View {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
             },
-            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player in
+            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player, cacheFileIdentity in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
@@ -1802,7 +1834,8 @@ struct ContentView: View {
                         resumeFrom: isTrailer ? nil : Self.resumePosition(for: meta, episode: currentEpisode),
                         httpHeaders: httpHeaders,
                         origin: .details,
-                        customPlayer: player
+                        customPlayer: player,
+                        cacheFileIdentity: cacheFileIdentity
                     )
                 }
             },
@@ -2030,6 +2063,7 @@ struct ContentView: View {
             )
             return PreparedNextStream(
                 url: url,
+                cacheFileIdentity: PlaybackCacheFileIdentity(infoHash: candidate.effectiveInfoHash, fileIndex: candidate.effectiveFileIdx),
                 httpHeaders: candidate.httpHeaders ?? [:],
                 subtitleLine: subtitleLine,
                 subtitles: candidate.subtitles,
@@ -2180,6 +2214,7 @@ struct ContentView: View {
         )
         return PreparedNextStream(
             url: url,
+                cacheFileIdentity: PlaybackCacheFileIdentity(infoHash: stream.effectiveInfoHash, fileIndex: stream.effectiveFileIdx),
             httpHeaders: stream.httpHeaders ?? [:],
             subtitleLine: subtitleLine,
             subtitles: stream.subtitles,
@@ -2277,6 +2312,7 @@ struct ContentView: View {
             externalSubtitles: externalSubtitles,
             resumeFrom: resumeFrom,
             playbackOrigin: playbackOrigin,
+            cacheFileIdentity: isTrailer ? nil : playbackCacheFileIdentity,
             episodes: isTrailer ? [] : playbackEpisodes,
             currentEpisode: isTrailer ? nil : playbackCurrentEpisode,
             autoPlayNextEnabled: autoPlayNext,
@@ -2590,22 +2626,29 @@ extension CrossfadingBackdrop: Equatable {
 /// instant (no decode flicker) and repeated focus changes don't refetch.
 actor BackdropImageCache {
     static let shared = BackdropImageCache()
+    private static let tracker = NSCacheMemoryTracker(
+        maxCost: {
+            let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+            if gib > 3.5 {
+                return 96 * 1024 * 1024 // 96 MB (Apple TV 4K Gen 2/3)
+            } else if gib > 2.5 {
+                return 64 * 1024 * 1024 // 64 MB (Apple TV 4K Gen 1)
+            } else {
+                return 40 * 1024 * 1024 // 40 MB (Apple TV HD)
+            }
+        }()
+    )
+
+    static func telemetryMetrics() -> (count: Int, totalBytes: Int, maxCost: Int) {
+        tracker.metrics()
+    }
 
     private let cache = NSCache<NSString, UIImage>()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
 
     init() {
-        // Backdrops are shown at screen size. Retaining a bounded decoded-byte
-        // budget avoids keeping dozens of full-resolution source images alive
-        // after rapid focus changes, scaled to available physical RAM.
-        let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
-        if gib > 3.5 {
-            cache.totalCostLimit = 96 * 1024 * 1024 // 96 MB (Apple TV 4K Gen 2/3)
-        } else if gib > 2.5 {
-            cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB (Apple TV 4K Gen 1)
-        } else {
-            cache.totalCostLimit = 40 * 1024 * 1024 // 40 MB (Apple TV HD)
-        }
+        cache.totalCostLimit = Self.tracker.maxCost
+        cache.delegate = Self.tracker
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -2623,6 +2666,7 @@ actor BackdropImageCache {
 
     func purge() {
         cache.removeAllObjects()
+        Self.tracker.reset()
     }
 
     func image(for url: URL) async -> UIImage? {
@@ -2630,7 +2674,7 @@ actor BackdropImageCache {
         if let cached = cache.object(forKey: key) { return cached }
         if let pending = inFlight[url.absoluteString] { return await pending.value }
         let pixelSize = Self.maxPixelSize
-        let task = Task.detached(priority: .utility) { () -> UIImage? in
+        let task = Task.detached(priority: .userInitiated) { () -> UIImage? in
             guard let (data, response) = try? await URLSession.shared.data(from: url),
                   !Task.isCancelled,
                   let http = response as? HTTPURLResponse,
@@ -2641,7 +2685,9 @@ actor BackdropImageCache {
         inFlight[url.absoluteString] = task
         defer { inFlight[url.absoluteString] = nil }
         guard let decoded = await task.value else { return nil }
-        cache.setObject(decoded, forKey: key, cost: decoded.backdropDecodedByteCost)
+        let cost = decoded.decodedByteCost
+        cache.setObject(decoded, forKey: key, cost: cost)
+        Self.tracker.recordInsertion(cost: cost)
         return decoded
     }
 }
@@ -2667,13 +2713,6 @@ private func downsampleBackdropImage(data: Data, maxPixelSize: CGFloat) -> UIIma
             return nil
         }
         return UIImage(cgImage: image)
-    }
-}
-
-private extension UIImage {
-    var backdropDecodedByteCost: Int {
-        guard let cgImage else { return 0 }
-        return cgImage.bytesPerRow * cgImage.height
     }
 }
 
@@ -3560,6 +3599,7 @@ struct TVHomeView: View {
                                 folder: folder,
                                 sectionTitle: heroCollectionSection?.title
                             )
+                            .equatable()
                         } else if let heroMeta = visibleFocusedMeta ?? visibleHero {
                             let catalogSection = heroCatalogSection
                             TVHeroView(
@@ -3616,12 +3656,23 @@ struct TVHomeView: View {
                                         }
 
                                         ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
-                                            homeSectionRow(
-                                                index: index,
-                                                section: section,
-                                                horizontalEdgeInset: horizontalEdgeInset,
-                                                verticalScrollProxy: verticalScrollProxy
-                                            )
+                                            let isNearFocusedRow = abs(index - focusedRowIndex) <= 2
+                                            if isNearFocusedRow {
+                                                homeSectionRow(
+                                                    index: index,
+                                                    section: section,
+                                                    horizontalEdgeInset: horizontalEdgeInset,
+                                                    verticalScrollProxy: verticalScrollProxy
+                                                )
+                                            } else {
+                                                Color.clear
+                                                    .frame(
+                                                        height: estimatedHeight(for: section),
+                                                        alignment: .topLeading
+                                                    )
+                                                    .id(section.id)
+                                                    .accessibilityHidden(true)
+                                            }
                                         }
                                     }
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -3704,14 +3755,14 @@ struct TVHomeView: View {
             await loadLocalTitlesSection()
         }
         .onReceive(NotificationCenter.default.publisher(for: SMBLibraryIndex.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             Task { await loadLocalTitlesSection() }
         }
         .task(id: "\(contentIdentity.profileId):jellyfinTitles:\(jellyfinLocalRowEnabled)") {
             await loadJellyfinSection()
         }
         .onReceive(NotificationCenter.default.publisher(for: JellyfinLibraryIndex.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             Task { await loadJellyfinSection() }
         }
         .onAppear {
@@ -3739,14 +3790,14 @@ struct TVHomeView: View {
         // changes (progress saved during playback, item finished/removed).
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingStore.changedNotification)
             .debounce(for: .milliseconds(30), scheduler: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             refreshContinueWatching()
         }
         // A removal has to leave the row immediately, including under Trakt/Simkl
         // where the displayed list belongs to the provider and only changes on
         // the next fetch.
         .onReceive(NotificationCenter.default.publisher(for: ContinueWatchingDismissStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             let all = continueWatching + upcomingItems
             let remaining = all.filter { !ContinueWatchingDismissStore.isDismissed($0) }
             if remaining.count != all.count {
@@ -3754,12 +3805,12 @@ struct TVHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             scheduleContinueWatchingRefresh()
             scheduleTraktWatchedHistorySync()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             scheduleContinueWatchingRefresh()
             scheduleTraktWatchedHistorySync()
         }
@@ -3871,7 +3922,7 @@ struct TVHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             refreshWatchedTitles()
             // A watched mark can be the only history left for a completed
             // series. Rebuild the local row so a newly aired episode can seed a
@@ -3882,7 +3933,7 @@ struct TVHomeView: View {
         }
         // Settings → Home Catalogs reorder applies to the mounted Home live.
         .onReceive(NotificationCenter.default.publisher(for: TVHomeCatalogOrder.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             let reordered = homeOrderedSections(store.sections)
             if reordered.map(\.id) != store.sections.map(\.id) {
                 store.sections = reordered
@@ -3896,7 +3947,7 @@ struct TVHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: SimklAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             scheduleContinueWatchingRefresh()
             if repository.homeCatalogInputSignature != lastLoadedInputSignature {
                 homeReloadTask?.cancel()
@@ -3907,11 +3958,11 @@ struct TVHomeView: View {
             }
         }
         .onReceive(NotificationCenter.default.publisher(for: MdbListAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             scheduleContinueWatchingRefresh()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
-            guard isActive else { return }
+            guard isActive && !isFullScreenOverlayPresented else { return }
             if SimklSettingsStore.isPlanToWatchHomeCatalogsEnabled {
                 homeReloadTask?.cancel()
                 let identity = contentIdentity
@@ -4374,6 +4425,11 @@ struct TVHomeView: View {
             TVHomeDebugTrace.log("home.overlay.dismissal fallback restoring to target=\(target) gen=\(overlayRestoreGeneration)")
             restoreOverlayFocus(to: target, generation: overlayRestoreGeneration)
         }
+
+        if !isPresented {
+            refreshContinueWatching()
+            refreshWatchedTitles()
+        }
     }
 
     private func restoreOverlayFocus(
@@ -4391,7 +4447,7 @@ struct TVHomeView: View {
         // Home and the outgoing overlay can overlap briefly during the opacity
         // transition. Retry after the target modifier is mounted instead of
         // depending on a single lifecycle callback ordering.
-        for delay in [0.04, 0.12, 0.25, 0.45] {
+        for delay in [0.06, 0.18, 0.35] {
             DispatchQueue.main.asyncAfter(deadline: .now() + delay) {
                 if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
                     TVHomeDebugTrace.log("home.restoreOverlayFocus fire target=\(target) delay=\(delay)")
@@ -4401,7 +4457,7 @@ struct TVHomeView: View {
         }
 
         // Fast fallback completion to ensure all cards are unlocked even if focus callback was missed
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
             if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
                 completeOverlayFocusRestore(for: target)
             }
@@ -4428,6 +4484,7 @@ struct TVHomeView: View {
     /// in the six-row focus window (two rows above).
     private func completeOverlayFocusRestore(for cardKey: String) {
         guard focusWork.restoringOverlayCardID == cardKey || overlayRestoreCardID == cardKey else { return }
+        focusWork.restoringOverlayCardID = nil
         let generation = overlayRestoreGeneration
         TVHomeDebugTrace.log("home.completeOverlayFocusRestore start cardKey=\(cardKey) gen=\(generation)")
         DispatchQueue.main.async {
@@ -4435,7 +4492,6 @@ struct TVHomeView: View {
                   overlayRestoreCardID == cardKey else { return }
 
             TVHomeDebugTrace.log("home.completeOverlayFocusRestore done cardKey=\(cardKey)")
-            focusWork.restoringOverlayCardID = nil
             var transaction = Transaction()
             transaction.animation = nil
             withTransaction(transaction) {
@@ -5504,10 +5560,6 @@ struct TVHomeView: View {
             // count, or the focus seeding below would be skipped once the first
             // genuine row lands.
             let wasEmpty = store.sections.allSatisfy(\.isLoadingPlaceholder)
-            // The snapshot is what the next launch seeds skeletons *from*, so only
-            // rows that actually resolved belong in it.
-            TVHomeCatalogOrder.scheduleSnapshotWrite(composed)
-
             let isSameSections = store.sections.count == visible.count && zip(store.sections, visible).allSatisfy { old, new in
                 old.id == new.id &&
                 old.items.count == new.items.count &&
@@ -5518,6 +5570,9 @@ struct TVHomeView: View {
             if !isSameSections {
                 TVHomeDebugTrace.log("home.publishHomeSections updating store.sections count=\(visible.count)")
                 store.sections = visible
+                // The snapshot is what the next launch seeds skeletons *from*, so only
+                // rows that actually resolved belong in it.
+                TVHomeCatalogOrder.scheduleSnapshotWrite(composed)
             } else {
                 TVHomeDebugTrace.log("home.publishHomeSections store.sections unchanged (\(visible.count) sections)")
             }
@@ -5552,7 +5607,6 @@ struct TVHomeView: View {
     private func homeSkeletonSections(excluding published: Set<String>) -> [TVHomeSection] {
         let hiddenCatalogs = TVHomeCatalogOrder.disabledCatalogKeys()
         let hiddenCollections = TVHomeCatalogOrder.disabledCollectionIds()
-        let collectionSources = CatalogHomeVisibilityResolver.activeCollectionSources()
 
         return TVHomeCatalogOrder.snapshotRows().compactMap { row in
             guard !published.contains(row.id),
@@ -5565,15 +5619,6 @@ struct TVHomeView: View {
             }
             if let settingsKey = row.settingsKey, hiddenCatalogs.contains(settingsKey) {
                 return nil
-            }
-            if let addonId = row.addonId, let type = row.contentType, let catalogId = row.catalogId {
-                let isDirectSource = collectionSources.contains { source in
-                    (source.addonIdentifier.caseInsensitiveCompare(addonId) == .orderedSame
-                     || source.addonIdentifier.contains(addonId))
-                        && source.contentType == type
-                        && source.catalogID == catalogId
-                }
-                if isDirectSource { return nil }
             }
             return TVHomeSection(
                 id: row.id,
@@ -6567,6 +6612,21 @@ enum TVHomeCatalogOrder {
     static let snapshotChangedNotification = Notification.Name("nuvio.tv.homeCatalogSnapshot.changed")
     private static let snapshotDirectoryName = "catalogSnapshots"
     private static let snapshotWriter = TVHomeCatalogSnapshotWriter()
+    private static let snapshotCacheLock = NSLock()
+    private static var snapshotCacheData: [String: Data] = [:]
+    private static var snapshotCacheRows: [String: [SnapshotRow]] = [:]
+
+    static func invalidateSnapshotCache(for storageKey: String? = nil) {
+        snapshotCacheLock.lock()
+        defer { snapshotCacheLock.unlock() }
+        if let storageKey {
+            snapshotCacheData.removeValue(forKey: storageKey)
+            snapshotCacheRows.removeValue(forKey: storageKey)
+        } else {
+            snapshotCacheData.removeAll()
+            snapshotCacheRows.removeAll()
+        }
+    }
 
     private static func snapshotStorageKey(for settings: UserDefaults) -> String {
         let profileID = settings.string(forKey: "nuvio.tv.profile.settings.profileID") ?? (ProfileSettings.activeProfileID ?? "default")
@@ -6687,6 +6747,9 @@ enum TVHomeCatalogOrder {
         ProfileSettings.current.removeObject(forKey: SettingsKey.homeCatalogSyncedOrder)
         ProfileSettings.current.removeObject(forKey: SettingsKey.homeCatalogCustomTitles)
         ProfileSettings.current.removeObject(forKey: SettingsKey.homeCatalogTitles)
+        let storageKey = snapshotStorageKey(for: ProfileSettings.current)
+        LargePayloadStore.remove(key: storageKey, directory: snapshotDirectoryName)
+        invalidateSnapshotCache(for: storageKey)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         NotificationCenter.default.post(name: snapshotChangedNotification, object: nil)
     }
@@ -6903,22 +6966,57 @@ enum TVHomeCatalogOrder {
             }
             guard let data = try? JSONSerialization.data(withJSONObject: payload) else { return }
             let storageKey = snapshotStorageKey(for: settings)
+            let isSameAsCached: Bool = snapshotCacheLock.withLock {
+                snapshotCacheData[storageKey] == data
+            }
+            if isSameAsCached {
+                if settings.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
+                if UserDefaults.standard.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
+                return
+            }
+
             let existing = LargePayloadStore.read(key: storageKey, directory: snapshotDirectoryName)
             if existing != data {
                 if LargePayloadStore.write(data, key: storageKey, directory: snapshotDirectoryName) {
-                    settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
-                    UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                    if settings.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                        settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                    }
+                    if UserDefaults.standard.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                        UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                    }
+                }
+                snapshotCacheLock.withLock {
+                    snapshotCacheData[storageKey] = data
+                    snapshotCacheRows[storageKey] = rows
                 }
                 postSnapshotChangedNotification()
             } else {
-                settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
-                UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                snapshotCacheLock.withLock {
+                    snapshotCacheData[storageKey] = data
+                    snapshotCacheRows[storageKey] = rows
+                }
+                if settings.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
+                if UserDefaults.standard.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
             }
         }
     }
 
     static func snapshotRows(in settings: UserDefaults = ProfileSettings.current) -> [SnapshotRow] {
         let storageKey = snapshotStorageKey(for: settings)
+        let cached = snapshotCacheLock.withLock {
+            snapshotCacheRows[storageKey]
+        }
+        if let cached {
+            return cached
+        }
         let data: Data? = {
             if let fileData = LargePayloadStore.read(key: storageKey, directory: snapshotDirectoryName) {
                 return fileData
@@ -6927,14 +7025,19 @@ enum TVHomeCatalogOrder {
                 return nil
             }
             if LargePayloadStore.write(legacy, key: storageKey, directory: snapshotDirectoryName) {
-                settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
-                UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                if settings.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    settings.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
+                if UserDefaults.standard.object(forKey: SettingsKey.homeCatalogTitles) != nil {
+                    UserDefaults.standard.removeObject(forKey: SettingsKey.homeCatalogTitles)
+                }
             }
             return legacy
         }()
         guard let data else { return [] }
         guard let rows = (try? JSONSerialization.jsonObject(with: data)) as? [[String: String]] else {
             LargePayloadStore.remove(key: storageKey, directory: snapshotDirectoryName)
+            invalidateSnapshotCache(for: storageKey)
             return []
         }
         let customTitles: [String: String]
@@ -6944,7 +7047,7 @@ enum TVHomeCatalogOrder {
         } else {
             customTitles = [:]
         }
-        return rows.compactMap { row in
+        let resolvedRows: [SnapshotRow] = rows.compactMap { (row: [String: String]) -> SnapshotRow? in
             guard let id = row["id"], let title = row["title"] else { return nil }
             let addonName = row["addon"]
             let settingsKey = row["key"]
@@ -6967,6 +7070,11 @@ enum TVHomeCatalogOrder {
                 posterShape: row["posterShape"]
             )
         }
+        snapshotCacheLock.withLock {
+            snapshotCacheData[storageKey] = data
+            snapshotCacheRows[storageKey] = resolvedRows
+        }
+        return resolvedRows
     }
 
     private static func makeSnapshotRows(from sections: [TVHomeSection]) -> [SnapshotRow] {
@@ -6990,21 +7098,9 @@ enum TVHomeCatalogOrder {
     ) -> [SnapshotRow] {
         var rows = current
         var seen = Set(rows.map(\.id))
-        let collectionSources = CatalogHomeVisibilityResolver.activeCollectionSources()
 
         for (index, previousRow) in previous.enumerated() {
             guard seen.insert(previousRow.id).inserted else { continue }
-            if let addonId = previousRow.addonId,
-               let type = previousRow.contentType,
-               let catalogId = previousRow.catalogId {
-                let isDirectSource = collectionSources.contains { source in
-                    (source.addonIdentifier.caseInsensitiveCompare(addonId) == .orderedSame
-                     || source.addonIdentifier.contains(addonId))
-                        && source.contentType == type
-                        && source.catalogID == catalogId
-                }
-                if isDirectSource { continue }
-            }
             rows.insert(previousRow, at: min(index, rows.count))
         }
         return rows
@@ -7234,35 +7330,8 @@ enum CatalogHomeVisibilityResolver {
         manifestURL: URL,
         explicitHomeKeys: Set<String>
     ) -> Bool {
-        let key = TVHomeCatalogOrder.catalogSettingsKey(
-            addonId: addonID, contentType: contentType, catalogId: catalogID
-        )
-        let matchingSources = collectionSources.filter {
-            matches($0.addonIdentifier, addonID: addonID, manifestURL: manifestURL)
-        }
-        guard !matchingSources.isEmpty else { return true }
-
-        let isDirectCollectionSource = matchingSources.contains {
-            $0.contentType == contentType && $0.catalogID == catalogID
-        }
-
-        // Direct collection sources are displayed inside their collection folder
-        // and must not be duplicated as individual Home rows.
-        if isDirectCollectionSource {
-            return false
-        }
-
-        // If this add-on has an active collection row on Home, that collection
-        // row is authoritative for the add-on. Other (generic/sibling) catalogs
-        // from the same add-on are only shown if explicitly represented in explicitHomeKeys.
-        let hasMatchingCollectionKey = matchingSources.contains {
-            !($0.collectionID.isEmpty)
-                && explicitHomeKeys.contains("collection_\($0.collectionID)")
-        }
-        if hasMatchingCollectionKey {
-            return explicitHomeKeys.contains(key)
-        }
-
+        // Matching Android TV: catalogs inside collection folders remain visible
+        // in layout and on Home unless explicitly disabled by user/account settings.
         return true
     }
 
@@ -7447,12 +7516,20 @@ let TVHomeRowPrefetchThreshold = 18
 /// label. Both sit at the bottom of the hero frame, matching Android Modern
 /// Home. A large top padding (copied from poster heroes) was making this area
 /// sit too high.
-private struct TVCollectionFolderHeroView: View {
+private struct TVCollectionFolderHeroView: View, Equatable {
     let folder: TVCollectionFolderItem
     /// The Home collection-row label. Collections do not provide a movie
     /// description, so this is placed directly below the folder logo/title.
     let sectionTitle: String?
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+
+    static func == (lhs: TVCollectionFolderHeroView, rhs: TVCollectionFolderHeroView) -> Bool {
+        lhs.folder.id == rhs.folder.id &&
+        lhs.folder.title == rhs.folder.title &&
+        lhs.folder.coverEmoji == rhs.folder.coverEmoji &&
+        lhs.folder.preferredTitleLogoURLString == rhs.folder.preferredTitleLogoURLString &&
+        lhs.sectionTitle == rhs.sectionTitle
+    }
 
     private var emoji: String? {
         let raw = folder.coverEmoji?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -7507,6 +7584,7 @@ private struct TVCollectionFolderHeroView: View {
                         addonName: nil,
                         showAddonName: false
                     )
+                    .equatable()
                 }
             }
             // Match the gap under poster-hero descriptions so the first catalog
@@ -7520,11 +7598,17 @@ private struct TVCollectionFolderHeroView: View {
     }
 }
 
-private struct TVHeroCatalogTitleView: View {
+private struct TVHeroCatalogTitleView: View, Equatable {
     let title: String
     let addonName: String?
     let showAddonName: Bool
     @AppStorage(SettingsKey.theme) private var theme = SettingsAccent.white.rawValue
+
+    static func == (lhs: TVHeroCatalogTitleView, rhs: TVHeroCatalogTitleView) -> Bool {
+        lhs.title == rhs.title &&
+        lhs.addonName == rhs.addonName &&
+        lhs.showAddonName == rhs.showAddonName
+    }
 
     var body: some View {
         HStack(alignment: .center, spacing: 14) {

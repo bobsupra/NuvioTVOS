@@ -2,6 +2,11 @@
 set -euo pipefail
 
 # Run from the repository root. Extra arguments may select focused test suites.
+if [[ ! -f "MPVKit/Package.swift" ]]; then
+  echo "Initializing git submodules (MPVKit)..."
+  git submodule update --init --recursive
+fi
+
 test -f tvosApp/NuvioTV.xcworkspace/contents.xcworkspacedata || {
   echo 'Run tuist generate --path tvosApp --no-open first.' >&2
   exit 1

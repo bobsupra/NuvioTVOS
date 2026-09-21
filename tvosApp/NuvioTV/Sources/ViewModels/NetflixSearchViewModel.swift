@@ -27,13 +27,11 @@ class NetflixSearchViewModel: ObservableObject {
     /// enriched results once the background enrichment finishes.
     private var cachedResults: [String: [NuvioMeta]] = [:]
     private var cacheOrder: [String] = []
-    // Same UserDefaults key as `SearchViewModel` so a user's search history
-    // carries over regardless of which search UI is wired up to navigation.
-    private let recentKey = "nuvio.search.recent"
+    private var sessionCommittedQuery: String?
 
     init(repository: CatalogRepository = CinemetaCatalogRepository()) {
         self.repository = repository
-        recentSearches = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+        recentSearches = SearchHistoryStore.load()
 
         $searchText
             .dropFirst()
@@ -59,6 +57,7 @@ class NetflixSearchViewModel: ObservableObject {
     private func handleQueryChange(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            sessionCommittedQuery = nil
             searchTask?.cancel()
             enrichmentTask?.cancel()
             allResults = []
@@ -104,6 +103,7 @@ class NetflixSearchViewModel: ObservableObject {
             applyFilter()
             error = nil
             isLoading = false
+            if !cached.isEmpty { commitRecentSearch(trimmed) }
             if SearchResultEnrichment.hasIncompleteLeadingResults(cached) {
                 enrich(cached, cacheKey: cacheKey)
             }
@@ -179,30 +179,38 @@ class NetflixSearchViewModel: ObservableObject {
     }
 
     func clearRecent() {
+        sessionCommittedQuery = nil
         recentSearches = []
-        saveRecent()
+        SearchHistoryStore.save([])
     }
 
     /// Re-reads the shared recent-search list. `SearchViewModel` writes the
     /// same key, so whichever search style isn't on screen goes stale until its
     /// view reappears.
     func reloadRecent() {
-        recentSearches = UserDefaults.standard.stringArray(forKey: recentKey) ?? []
+        recentSearches = SearchHistoryStore.load()
     }
 
     func clear() {
+        sessionCommittedQuery = nil
         searchText = ""
     }
 
-    private func commitRecentSearch(_ term: String) {
-        var list = recentSearches.filter { $0.caseInsensitiveCompare(term) != .orderedSame }
-        list.insert(term, at: 0)
-        recentSearches = Array(list.prefix(8))
-        saveRecent()
+    func commitCurrentSearch() {
+        guard hasQuery else { return }
+        commitRecentSearch(searchText)
     }
 
-    private func saveRecent() {
-        UserDefaults.standard.set(recentSearches, forKey: recentKey)
+    private func commitRecentSearch(_ term: String) {
+        let (updated, newSession) = SearchHistoryStore.commit(
+            term,
+            current: recentSearches,
+            sessionQuery: sessionCommittedQuery
+        )
+        guard updated != recentSearches else { return }
+        sessionCommittedQuery = newSession
+        recentSearches = updated
+        SearchHistoryStore.save(updated)
     }
 
     private func cache(_ results: [NuvioMeta], for key: String) {

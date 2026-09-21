@@ -35,7 +35,11 @@ struct PlayerControls: View {
             }
         }
         .onExitCommand {
-            viewModel.hideControls()
+            if viewModel.isScrubbing {
+                viewModel.cancelScrub()
+            } else {
+                viewModel.hideControls()
+            }
         }
         .onChange(of: requestedFocus) { _, target in
             guard let target, viewModel.showControls else { return }
@@ -65,7 +69,16 @@ struct PlayerControls: View {
             }
         }
         .onChange(of: viewModel.status) { _, status in
-            if (status == .playing || status == .paused),
+            if status == .paused,
+               viewModel.showControls,
+               !viewModel.showPauseOverlay,
+               !viewModel.postPlayState.isVisible,
+               !isSkipSegmentFocused,
+               !isNextEpisodeFocused {
+                DispatchQueue.main.async {
+                    focusedControl = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
+                }
+            } else if status == .playing,
                viewModel.showControls,
                !viewModel.showPauseOverlay,
                !viewModel.postPlayState.isVisible,
@@ -86,6 +99,23 @@ struct PlayerControls: View {
                !viewModel.postPlayState.isVisible,
                !isSkipSegmentFocused,
                !isNextEpisodeFocused {
+                DispatchQueue.main.async {
+                    focusedControl = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
+                }
+            } else if !isVisible {
+                DispatchQueue.main.async {
+                    focusedControl = nil
+                }
+            }
+        }
+        .onChange(of: viewModel.isTimelineFocused) { _, isTimelineFocused in
+            if isTimelineFocused,
+               viewModel.showControls,
+               !viewModel.showPauseOverlay,
+               !viewModel.postPlayState.isVisible,
+               !isSkipSegmentFocused,
+               !isNextEpisodeFocused,
+               focusedControl != .timeline {
                 DispatchQueue.main.async {
                     focusedControl = viewModel.isLiveStream ? (transportFocusOrder.first ?? .settings) : .timeline
                 }
@@ -118,16 +148,13 @@ struct PlayerControls: View {
         .onChange(of: focusedControl) { _, newControl in
             // Keep this in lockstep with focus so hold-to-seek gating is correct
             // even before the next render cycle.
-            viewModel.setTimelineFocused(newControl == .timeline)
-            // Keep chrome pinned while browsing buttons that open another panel.
-            if let newControl,
-               newControl != .timeline {
-                viewModel.setControlsAutoHideSuspended(true)
-            } else if newControl == .timeline {
-                viewModel.setControlsAutoHideSuspended(false)
-                if viewModel.status == .playing {
-                    viewModel.scheduleControlsHide()
-                }
+            let onTimeline = (newControl == .timeline)
+            viewModel.setTimelineFocused(onTimeline)
+            viewModel.setControlsAutoHideSuspended(false)
+            if onTimeline {
+                viewModel.scheduleControlsHide(after: 5.0)
+            } else if newControl != nil {
+                viewModel.scheduleControlsHide(after: 10.0)
             }
         }
         .onDisappear {
@@ -137,14 +164,14 @@ struct PlayerControls: View {
     }
 
     private var isPlaybackStarted: Bool {
-        viewModel.status == .playing || viewModel.status == .paused || viewModel.time.duration > 0 || viewModel.isLiveStream
+        viewModel.status == .playing || viewModel.status == .paused || viewModel.time.duration > 0 || viewModel.isLiveStream || viewModel.hasRenderedFirstFrame
     }
 
     /// Transport + timeline are focusable whenever chrome is up. Do not gate on
     /// `focusedControl != .timeline` — toggling `.focusable` when moving between
     /// buttons left Select dead after visiting settings/episodes/sources.
     private var controlsInteractable: Bool {
-        viewModel.showControls
+        (viewModel.showControls || viewModel.isScrubbing)
             && isPlaybackStarted
             && !viewModel.isSwitchingSource
             && !viewModel.showPauseOverlay
@@ -243,7 +270,11 @@ struct PlayerControls: View {
             }
         case .left:
             if origin == .timeline, !viewModel.isLiveStream {
-                viewModel.handleMoveSeek(direction: .left)
+                if viewModel.isScrubbing {
+                    viewModel.scrubJump(-Double(max(viewModel.seekStepSeconds * 4, 60)))
+                } else if viewModel.status == .playing {
+                    viewModel.handleMoveSeek(direction: .left)
+                }
                 moveFocus(to: .timeline)
             } else if let index = transportFocusOrder.firstIndex(of: origin),
                       index > 0 {
@@ -253,7 +284,11 @@ struct PlayerControls: View {
             }
         case .right:
             if origin == .timeline, !viewModel.isLiveStream {
-                viewModel.handleMoveSeek(direction: .right)
+                if viewModel.isScrubbing {
+                    viewModel.scrubJump(Double(max(viewModel.seekStepSeconds * 4, 60)))
+                } else if viewModel.status == .playing {
+                    viewModel.handleMoveSeek(direction: .right)
+                }
                 moveFocus(to: .timeline)
             } else if let index = transportFocusOrder.firstIndex(of: origin),
                       index < transportFocusOrder.count - 1 {
@@ -267,39 +302,49 @@ struct PlayerControls: View {
     // MARK: - Top bar
 
     private var topBar: some View {
-        VStack(spacing: 12) {
-            HStack(alignment: .top, spacing: 24) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text(viewModel.title)
-                        .font(.system(size: 38, weight: .bold))
-                        .foregroundColor(.white)
-                        .lineLimit(1)
+        Group {
+            if !viewModel.isScrubbing {
+                VStack(spacing: 12) {
+                    HStack(alignment: .top, spacing: 24) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text(viewModel.title)
+                                .font(.system(size: 38, weight: .bold))
+                                .foregroundColor(.white)
+                                .lineLimit(1)
 
-                    if !viewModel.subtitle.isEmpty {
-                        Text(viewModel.subtitle)
-                            .font(.system(size: 21, weight: .medium))
-                            .foregroundColor(.white.opacity(0.68))
-                            .lineLimit(1)
+                            if !viewModel.subtitle.isEmpty {
+                                Text(viewModel.subtitle)
+                                    .font(.system(size: 21, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.68))
+                                    .lineLimit(1)
+                            }
+                        }
+
+                        Spacer()
                     }
                 }
-
-                Spacer()
+                .padding(.horizontal, 60)
+                .padding(.top, 34)
+                .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
+                .transition(.opacity)
             }
         }
-        .padding(.horizontal, 60)
-        .padding(.top, 34)
-        .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
+        .animation(.playerControls, value: viewModel.isScrubbing)
     }
 
     // MARK: - Bottom controls
 
     private var bottomControls: some View {
         VStack(alignment: .leading, spacing: 18) {
-            transportRow
+            if !viewModel.isScrubbing {
+                transportRow
+                    .transition(.opacity)
+            }
             timelineBar
         }
         .padding(.horizontal, 60)
         .padding(.bottom, 54)
+        .animation(.playerControls, value: viewModel.isScrubbing)
     }
 
     private var transportRow: some View {
@@ -613,6 +658,7 @@ struct PlayerControls: View {
         PlayerTimelineBar(
             clock: viewModel.clock,
             isTimelineFocused: isTimelineFocused,
+            isScrubbing: viewModel.isScrubbing,
             pendingSeekDelta: viewModel.pendingSeekDelta,
             speedMultiplier: viewModel.seekSpeedMultiplier
         )
@@ -622,26 +668,31 @@ struct PlayerControls: View {
             // overlay never participates in controls layout or hit testing.
             SeekPreviewTimelineCard(
                 clock: viewModel.clock,
+                isScrubbing: viewModel.isScrubbing,
                 pendingSeekDelta: viewModel.pendingSeekDelta,
-                image: (viewModel.isHoldingSeek && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
+                image: ((viewModel.isHoldingSeek || viewModel.isScrubbing || viewModel.pendingSeekDelta != 0) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
                 naturalSize: viewModel.videoNaturalSize,
-                speedMultiplier: viewModel.seekSpeedMultiplier
+                speedMultiplier: viewModel.seekSpeedMultiplier,
+                wheelEngaged: viewModel.wheelEngaged
             )
-            // PlayerTimelineBar follows the 18pt bottom-controls spacing.
-            // Keep the card 16pt above the 70pt transport row.
-            .offset(y: -(270 + 70 + 18 + 16))
+            .offset(y: -(270 + 16))
             .allowsHitTesting(false)
             .transaction { transaction in transaction.animation = nil }
         }
         .focusable(
-            viewModel.showControls
+            (viewModel.showControls || viewModel.isScrubbing)
                 && !viewModel.showSettingsPanel
-                && !viewModel.isScrubbing
                 && !viewModel.showPauseOverlay
         )
         .focused($focusedControl, equals: .timeline)
         .focusEffectDisabledIfAvailable()
-        .onTapGesture { viewModel.togglePlayPause() }
+        .onTapGesture {
+            if viewModel.isScrubbing {
+                viewModel.commitScrub()
+            } else {
+                viewModel.togglePlayPause()
+            }
+        }
         .onMoveCommand { direction in
             // Timeline owns move while focused so hold-to-seek cannot promote
             // focus onto the transport buttons. Always route from `.timeline`
@@ -651,18 +702,24 @@ struct PlayerControls: View {
         .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
         .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
+        .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
     }
 }
 
 private struct SeekPreviewTimelineCard: View {
     @ObservedObject var clock: PlaybackClock
+    let isScrubbing: Bool
     let pendingSeekDelta: Double
     let image: CGImage?
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
     var speedMultiplier: Int? = nil
+    var wheelEngaged: Bool = false
 
     private var target: Double {
-        min(max(clock.position + pendingSeekDelta, 0), max(clock.duration, 0))
+        if isScrubbing {
+            return clock.scrubTarget ?? clock.position
+        }
+        return min(max(clock.position + pendingSeekDelta, 0), max(clock.duration, 0))
     }
 
     var body: some View {
@@ -675,10 +732,12 @@ private struct SeekPreviewTimelineCard: View {
                 maxWidth: width,
                 maxHeight: width * 9 / 16
             )
-            let x = min(max(geo.size.width * fraction, cardSize.width / 2 + 16), geo.size.width - cardSize.width / 2 - 16)
+            let cardHalfW = cardSize.width / 2
+            let targetX = geo.size.width * fraction
+            let cardX = min(max(targetX, cardHalfW + 16), geo.size.width - cardHalfW - 16)
 
-            if pendingSeekDelta != 0, let image {
-                VStack(spacing: 8) {
+            if isScrubbing || pendingSeekDelta != 0 {
+                VStack(spacing: 0) {
                     SeekPreviewCard(image: image, width: width, naturalSize: naturalSize)
                     if let speedMultiplier {
                         Text("\(speedMultiplier)x")
@@ -690,9 +749,10 @@ private struct SeekPreviewTimelineCard: View {
                             .overlay(
                                 Capsule().strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
                             )
+                            .padding(.top, 6)
                     }
                 }
-                .position(x: x, y: 270 - cardSize.height / 2)
+                .position(x: cardX, y: 270 - cardSize.height / 2)
             }
         }
         .frame(height: 270)
@@ -704,6 +764,7 @@ private struct SeekPreviewTimelineCard: View {
 private struct PlayerTimelineBar: View {
     @ObservedObject var clock: PlaybackClock
     let isTimelineFocused: Bool
+    let isScrubbing: Bool
     let pendingSeekDelta: Double
     var speedMultiplier: Int? = nil
 
@@ -711,53 +772,96 @@ private struct PlayerTimelineBar: View {
         max(clock.duration, 0.001)
     }
 
-    private var displayCurrent: Double {
+    private var targetPosition: Double {
+        if isScrubbing {
+            return clock.scrubTarget ?? clock.position
+        }
         let position = clock.position + pendingSeekDelta
         return min(max(position, 0), max(clock.duration, 0))
     }
 
-    private var displayRemaining: Double {
-        max(0, clock.duration - displayCurrent)
-    }
-
     private var progress: CGFloat {
-        CGFloat(min(max((clock.position + pendingSeekDelta) / duration, 0), 1))
+        CGFloat(min(max(targetPosition / duration, 0), 1))
     }
 
     var body: some View {
-        VStack(spacing: 8) {
-            PlayerProgressTrack(
-                played: Double(progress),
-                buffered: clock.buffered / duration,
-                height: isTimelineFocused ? 10 : 7,
-                showThumb: isTimelineFocused,
-                emphasized: isTimelineFocused,
-                glassTrack: true
-            )
-            .frame(height: 14)
+        VStack(spacing: 10) {
+            GeometryReader { geo in
+                let w = geo.size.width
+                let targetX = min(max(w * progress, 0), w)
+                let trackHeight: CGFloat = (isTimelineFocused || isScrubbing) ? 10 : 7
+                let h: CGFloat = (isTimelineFocused || isScrubbing) ? trackHeight + 2 : trackHeight
+                let needleHeight: CGFloat = 22
+                let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
+                let originalX = min(max(w * originalProgress, 0), w)
+                let bottomOfTrack = geo.size.height / 2 + h / 2
 
-            HStack(spacing: 10) {
-                Text(PlayerTime.formatted(time: displayCurrent))
-                if pendingSeekDelta != 0 {
-                    Text(PlayerTimeFormat.signedDelta(pendingSeekDelta))
-                        .foregroundColor(.white.opacity(0.85))
-                    if let speedMultiplier {
-                        Text("\(speedMultiplier)x")
-                            .font(.system(size: 16, weight: .bold).monospacedDigit())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 2)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .overlay(
-                                Capsule().strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
-                            )
+                ZStack(alignment: .leading) {
+                    PlayerProgressTrack(
+                        played: Double(progress),
+                        buffered: clock.buffered / duration,
+                        height: trackHeight,
+                        showThumb: false,
+                        emphasized: isTimelineFocused || isScrubbing,
+                        glassTrack: true
+                    )
+
+                    if isScrubbing {
+                        // Ghost tick: original paused playback position flush within track
+                        if abs(targetX - originalX) > 3 {
+                            Rectangle()
+                                .fill(Color.white.opacity(0.4))
+                                .frame(width: 1.5, height: h)
+                                .position(x: originalX, y: geo.size.height / 2)
+                        }
+
+                        // Active scrub needle: extends upwards toward preview card and is flush at bottom of track
+                        Rectangle()
+                            .fill(Color.white)
+                            .frame(width: 2, height: needleHeight)
+                            .shadow(color: .black.opacity(0.45), radius: 1.5)
+                            .position(x: targetX, y: bottomOfTrack - needleHeight / 2)
                     }
                 }
-                Spacer()
-                Text("-" + PlayerTime.formatted(time: displayRemaining))
             }
-            .font(.system(size: 22, weight: .bold))
-            .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
+            .frame(height: (isTimelineFocused || isScrubbing) ? 16 : 11)
+
+            // Timestamps: when scrubbing, center the time directly beneath the needle
+            if isScrubbing {
+                GeometryReader { geo in
+                    let w = geo.size.width
+                    let targetX = min(max(w * progress, 50), w - 50)
+                    Text(PlayerTime.formatted(time: targetPosition))
+                        .font(.system(size: 26, weight: .bold).monospacedDigit())
+                        .foregroundColor(.white)
+                        .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
+                        .position(x: targetX, y: 14)
+                }
+                .frame(height: 28)
+            } else {
+                HStack(spacing: 10) {
+                    Text(PlayerTime.formatted(time: targetPosition))
+                    if pendingSeekDelta != 0 {
+                        Text(PlayerTimeFormat.signedDelta(pendingSeekDelta))
+                            .foregroundColor(.white.opacity(0.85))
+                        if let speedMultiplier {
+                            Text("\(speedMultiplier)x")
+                                .font(.system(size: 16, weight: .bold).monospacedDigit())
+                                .foregroundStyle(.white)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 2)
+                                .background(.ultraThinMaterial, in: Capsule())
+                                .overlay(
+                                    Capsule().strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
+                                )
+                        }
+                    }
+                    Spacer()
+                    Text("-" + PlayerTime.formatted(time: max(0, duration - targetPosition)))
+                }
+                .font(.system(size: 22, weight: .bold))
+                .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
+            }
         }
     }
 }

@@ -547,6 +547,7 @@ struct NetflixSearchView: View {
                             suppressOverlayDismissalExit = true
                             overlayRestoreItemID = focusID
                             lastFocusedItemID = focusID
+                            viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         } label: {
                             Text(item.name)
@@ -613,6 +614,7 @@ struct NetflixSearchView: View {
                             suppressOverlayDismissalExit = true
                             overlayRestoreItemID = focusID
                             lastFocusedItemID = focusID
+                            viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         }
                         .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != focusID)

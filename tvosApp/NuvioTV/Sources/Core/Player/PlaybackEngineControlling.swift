@@ -3,6 +3,7 @@ import CoreGraphics
 import UIKit
 import AVFoundation
 import Darwin
+import OSLog
 
 struct PlaybackDebugInfo: Equatable {
     // Engine / Backend identification
@@ -366,3 +367,373 @@ enum PlaybackSystemMonitor {
         return "TV Speakers / HDMI"
     }
 }
+
+// MARK: - TVMemoryDiagnostic
+
+/// Comprehensive memory inspection and telemetry sampler for NuvioTVOS.
+public enum TVMemoryDiagnostic {
+    private static let logger = Logger(
+        subsystem: "com.pyksel.nuviotvos",
+        category: "TVMemory"
+    )
+
+    // MARK: - Snapshot Model
+
+    public struct Snapshot: Sendable {
+        public let timestamp: Date
+
+        // Process & Mach VM metrics
+        public let physicalFootprintMB: Double
+        public let residentMB: Double
+        public let virtualMB: Double
+        public let dirtyInternalMB: Double
+        public let externalMB: Double
+        public let compressedMB: Double
+        public let ioSurfaceMB: Double
+
+        // Device headroom
+        public let availableMemoryMB: Double
+        public let totalPhysicalRAMMB: Double
+        public let thermalState: String
+
+        // URLCache
+        public let urlCacheMemoryMB: Double
+        public let urlCacheMemoryCapacityMB: Double
+        public let urlCacheDiskMB: Double
+        public let urlCacheDiskCapacityMB: Double
+
+        // In-App Image Caches
+        public let posterCacheCount: Int
+        public let posterCacheBytesMB: Double
+        public let posterCacheLimitMB: Double
+
+        public let backdropCacheCount: Int
+        public let backdropCacheBytesMB: Double
+        public let backdropCacheLimitMB: Double
+
+        public let personProfileCacheCount: Int
+        public let personProfileCacheBytesMB: Double
+
+        public let profileAvatarCacheCount: Int
+        public let profileAvatarCacheBytesMB: Double
+
+        public let animatedGIFCacheCount: Int
+        public let animatedGIFCacheBytesMB: Double
+
+        // In-App Metadata Caches
+        public let catalogWatchedCacheCount: Int
+        public let stremioManifestCacheCount: Int
+        public let stremioManifestCacheBytesKB: Double
+        public let streamManifestCacheCount: Int
+
+        public var footprintPercentOfRAM: Double {
+            guard totalPhysicalRAMMB > 0 else { return 0 }
+            return (physicalFootprintMB / totalPhysicalRAMMB) * 100.0
+        }
+
+        public var totalKnownAppCachesMB: Double {
+            urlCacheMemoryMB
+            + posterCacheBytesMB
+            + backdropCacheBytesMB
+            + personProfileCacheBytesMB
+            + profileAvatarCacheBytesMB
+            + animatedGIFCacheBytesMB
+            + (stremioManifestCacheBytesKB / 1024.0)
+        }
+    }
+
+    // MARK: - Capture
+
+    public static func capture() -> Snapshot {
+        // 1. Mach VM task info
+        var vmInfo = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size / 4)
+        let kerr = withUnsafeMutablePointer(to: &vmInfo) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+
+        let footprint = kerr == KERN_SUCCESS ? Double(vmInfo.phys_footprint) / (1024.0 * 1024.0) : 0
+        let resident = kerr == KERN_SUCCESS ? Double(vmInfo.resident_size) / (1024.0 * 1024.0) : 0
+        let virtual = kerr == KERN_SUCCESS ? Double(vmInfo.virtual_size) / (1024.0 * 1024.0) : 0
+        let dirtyInternal = kerr == KERN_SUCCESS ? Double(vmInfo.internal) / (1024.0 * 1024.0) : 0
+        let external = kerr == KERN_SUCCESS ? Double(vmInfo.external) / (1024.0 * 1024.0) : 0
+        let compressed = kerr == KERN_SUCCESS ? Double(vmInfo.compressed) / (1024.0 * 1024.0) : 0
+        let ioSurface = kerr == KERN_SUCCESS ? Double(vmInfo.device) / (1024.0 * 1024.0) : 0
+
+        // 2. Device headroom
+        let available = Double(os_proc_available_memory()) / (1024.0 * 1024.0)
+        let totalRAM = Double(ProcessInfo.processInfo.physicalMemory) / (1024.0 * 1024.0)
+
+        let thermalStateStr: String
+        switch ProcessInfo.processInfo.thermalState {
+        case .nominal: thermalStateStr = "Nominal"
+        case .fair: thermalStateStr = "Fair"
+        case .serious: thermalStateStr = "Serious"
+        case .critical: thermalStateStr = "Critical"
+        @unknown default: thermalStateStr = "Unknown"
+        }
+
+        // 3. System URLCache
+        let urlMemMB = Double(URLCache.shared.currentMemoryUsage) / (1024.0 * 1024.0)
+        let urlMemCapMB = Double(URLCache.shared.memoryCapacity) / (1024.0 * 1024.0)
+        let urlDiskMB = Double(URLCache.shared.currentDiskUsage) / (1024.0 * 1024.0)
+        let urlDiskCapMB = Double(URLCache.shared.diskCapacity) / (1024.0 * 1024.0)
+
+        // 4. App Image Caches (via thread-safe synchronized metrics)
+        let posterMetrics = PosterArtworkCache.telemetryMetrics()
+        let backdropMetrics = BackdropImageCache.telemetryMetrics()
+        let personMetrics = PersonProfileImageCache.telemetryMetrics()
+        let avatarMetrics = ProfileAvatarCache.telemetryMetrics()
+        let gifMetrics = AnimatedGIFCache.telemetryMetrics()
+
+        // 5. Metadata Caches
+        let watchedCount = CatalogWatchedMetadataCache.telemetryCount()
+        let stremioManifestMetrics = StremioManifestDataCache.telemetryMetrics()
+        let streamManifestCount = StreamManifestCache.telemetryCount()
+
+        return Snapshot(
+            timestamp: Date(),
+            physicalFootprintMB: footprint,
+            residentMB: resident,
+            virtualMB: virtual,
+            dirtyInternalMB: dirtyInternal,
+            externalMB: external,
+            compressedMB: compressed,
+            ioSurfaceMB: ioSurface,
+            availableMemoryMB: available,
+            totalPhysicalRAMMB: totalRAM,
+            thermalState: thermalStateStr,
+            urlCacheMemoryMB: urlMemMB,
+            urlCacheMemoryCapacityMB: urlMemCapMB,
+            urlCacheDiskMB: urlDiskMB,
+            urlCacheDiskCapacityMB: urlDiskCapMB,
+            posterCacheCount: posterMetrics.count,
+            posterCacheBytesMB: Double(posterMetrics.totalBytes) / (1024.0 * 1024.0),
+            posterCacheLimitMB: Double(posterMetrics.maxCost) / (1024.0 * 1024.0),
+            backdropCacheCount: backdropMetrics.count,
+            backdropCacheBytesMB: Double(backdropMetrics.totalBytes) / (1024.0 * 1024.0),
+            backdropCacheLimitMB: Double(backdropMetrics.maxCost) / (1024.0 * 1024.0),
+            personProfileCacheCount: personMetrics.count,
+            personProfileCacheBytesMB: Double(personMetrics.totalBytes) / (1024.0 * 1024.0),
+            profileAvatarCacheCount: avatarMetrics.count,
+            profileAvatarCacheBytesMB: Double(avatarMetrics.totalBytes) / (1024.0 * 1024.0),
+            animatedGIFCacheCount: gifMetrics.count,
+            animatedGIFCacheBytesMB: Double(gifMetrics.totalBytes) / (1024.0 * 1024.0),
+            catalogWatchedCacheCount: watchedCount,
+            stremioManifestCacheCount: stremioManifestMetrics.count,
+            stremioManifestCacheBytesKB: Double(stremioManifestMetrics.totalBytes) / 1024.0,
+            streamManifestCacheCount: streamManifestCount
+        )
+    }
+
+    // MARK: - Formatting
+
+    /// Generates a comprehensive multi-line RAM report suitable for stall/freeze diagnostics.
+    public static func detailedReport(snapshot: Snapshot = capture(), label: String = "WATCHDOG_RAM_DIAGNOSTIC") -> String {
+        var lines: [String] = []
+        lines.append("📊 [\(label)] Memory & Resource Breakdown:")
+        lines.append(
+            String(
+                format: "  ├─ Total Physical Footprint: %.1f MB (%.1f%% of %.0f MB RAM) | Available Headroom: %.1f MB",
+                snapshot.physicalFootprintMB,
+                snapshot.footprintPercentOfRAM,
+                snapshot.totalPhysicalRAMMB,
+                snapshot.availableMemoryMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Mach VM: Dirty/Anonymous: %.1f MB | Compressed: %.1f MB | Resident (RSS): %.1f MB | IOSurface/GPU: %.1f MB | Virtual: %.1f MB",
+                snapshot.dirtyInternalMB,
+                snapshot.compressedMB,
+                snapshot.residentMB,
+                snapshot.ioSurfaceMB,
+                snapshot.virtualMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Network URLCache: %.1f MB / %.0f MB Memory (%.1f%%) | %.1f MB / %.0f MB Disk",
+                snapshot.urlCacheMemoryMB,
+                snapshot.urlCacheMemoryCapacityMB,
+                snapshot.urlCacheMemoryCapacityMB > 0 ? (snapshot.urlCacheMemoryMB / snapshot.urlCacheMemoryCapacityMB) * 100.0 : 0,
+                snapshot.urlCacheDiskMB,
+                snapshot.urlCacheDiskCapacityMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Poster Image Cache: %d items (~%.1f MB decoded / Limit: %.0f MB)",
+                snapshot.posterCacheCount,
+                snapshot.posterCacheBytesMB,
+                snapshot.posterCacheLimitMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Backdrop Image Cache: %d items (~%.1f MB decoded / Limit: %.0f MB)",
+                snapshot.backdropCacheCount,
+                snapshot.backdropCacheBytesMB,
+                snapshot.backdropCacheLimitMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Cast & Avatar Caches: %d person (%.1f MB) | %d avatars (%.1f MB) | %d GIFs (%.1f MB)",
+                snapshot.personProfileCacheCount,
+                snapshot.personProfileCacheBytesMB,
+                snapshot.profileAvatarCacheCount,
+                snapshot.profileAvatarCacheBytesMB,
+                snapshot.animatedGIFCacheCount,
+                snapshot.animatedGIFCacheBytesMB
+            )
+        )
+        lines.append(
+            String(
+                format: "  ├─ Metadata Caches: %d watched series guide items | %d stremio manifests (%.1f KB) | %d stream manifests",
+                snapshot.catalogWatchedCacheCount,
+                snapshot.stremioManifestCacheCount,
+                snapshot.stremioManifestCacheBytesKB,
+                snapshot.streamManifestCacheCount
+            )
+        )
+        lines.append(
+            String(
+                format: "  └─ Tracked App In-Memory Caches: %.1f MB | Device Thermal State: %@",
+                snapshot.totalKnownAppCachesMB,
+                snapshot.thermalState
+            )
+        )
+        return lines.joined(separator: "\n")
+    }
+
+    /// Generates a concise single-line summary for periodic watchdog heartbeats.
+    public static func summaryPulse(snapshot: Snapshot = capture()) -> String {
+        String(
+            format: "Footprint: %.1fMB (Avail: %.0fMB, %.1f%% RAM) | URLCache: %.1fMB | Posters: %d (%.1fMB) | Backdrops: %d (%.1fMB) | Caches: %.1fMB",
+            snapshot.physicalFootprintMB,
+            snapshot.availableMemoryMB,
+            snapshot.footprintPercentOfRAM,
+            snapshot.urlCacheMemoryMB,
+            snapshot.posterCacheCount,
+            snapshot.posterCacheBytesMB,
+            snapshot.backdropCacheCount,
+            snapshot.backdropCacheBytesMB,
+            snapshot.totalKnownAppCachesMB
+        )
+    }
+
+    /// Logs the detailed memory breakdown to console and unified logging.
+    public static func logSnapshot(label: String = "WATCHDOG_RAM_DIAGNOSTIC", isFault: Bool = false) {
+        let text = detailedReport(label: label)
+        print("[TVTrace] \(text)")
+        if isFault {
+            logger.fault("\(text, privacy: .public)")
+        } else {
+            logger.notice("\(text, privacy: .public)")
+        }
+    }
+}
+
+// MARK: - Memory Trackers
+
+/// Thread-safe tracker and delegate for `NSCache` instances to maintain accurate
+/// counts and decoded byte costs without blocking or actor isolation locks.
+public final class NSCacheMemoryTracker: NSObject, NSCacheDelegate, @unchecked Sendable {
+    private let lock = NSLock()
+    private var trackedCount: Int = 0
+    private var trackedBytes: Int = 0
+    public let maxCost: Int
+
+    public init(maxCost: Int = 0) {
+        self.maxCost = maxCost
+        super.init()
+    }
+
+    public func recordInsertion(cost: Int) {
+        lock.lock()
+        trackedCount += 1
+        trackedBytes += cost
+        lock.unlock()
+    }
+
+    public func cache(_ cache: NSCache<AnyObject, AnyObject>, willEvictObject obj: Any) {
+        let cost = (obj as? UIImage)?.decodedByteCost ?? 0
+        lock.lock()
+        trackedCount = max(0, trackedCount - 1)
+        trackedBytes = max(0, trackedBytes - cost)
+        lock.unlock()
+    }
+
+    public func reset() {
+        lock.lock()
+        trackedCount = 0
+        trackedBytes = 0
+        lock.unlock()
+    }
+
+    public func metrics() -> (count: Int, totalBytes: Int, maxCost: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (trackedCount, trackedBytes, maxCost)
+    }
+}
+
+/// Generic thread-safe counter for collections and dictionaries.
+public final class SimpleCountTracker: @unchecked Sendable {
+    private let lock = NSLock()
+    private var trackedCount: Int = 0
+    private var trackedBytes: Int = 0
+
+    public init() {}
+
+    public func set(count: Int, bytes: Int = 0) {
+        lock.lock()
+        trackedCount = count
+        trackedBytes = bytes
+        lock.unlock()
+    }
+
+    public func increment(bytes: Int = 0) {
+        lock.lock()
+        trackedCount += 1
+        trackedBytes += bytes
+        lock.unlock()
+    }
+
+    public func decrement(bytes: Int = 0) {
+        lock.lock()
+        trackedCount = max(0, trackedCount - 1)
+        trackedBytes = max(0, trackedBytes - bytes)
+        lock.unlock()
+    }
+
+    public func reset() {
+        lock.lock()
+        trackedCount = 0
+        trackedBytes = 0
+        lock.unlock()
+    }
+
+    public var metrics: (count: Int, totalBytes: Int) {
+        lock.lock()
+        defer { lock.unlock() }
+        return (trackedCount, trackedBytes)
+    }
+
+    public var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return trackedCount
+    }
+}
+
+public extension UIImage {
+    var decodedByteCost: Int {
+        guard let cgImage else { return 0 }
+        return cgImage.bytesPerRow * cgImage.height
+    }
+}
+

@@ -1156,6 +1156,46 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(coordinator.lastLoadError, "HTTP 403 Forbidden")
     }
 
+    func testPlaybackASSModeMapping() {
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Off"), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("off"), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Native"), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Authored"), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Disabled"), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings(nil), .off)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Strip"), .strip)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("strip"), .strip)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Scale"), .scale)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("scale"), .scale)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("Force"), .force)
+        XCTAssertEqual(PlaybackASSMode.fromSettings("force"), .force)
+    }
+
+    func testIsRemoteHTTPLocalLoopback() {
+        XCTAssertFalse(PlaybackBackendPolicy.isRemoteHTTP("http://127.0.0.1:8080/stream.mkv"))
+        XCTAssertFalse(PlaybackBackendPolicy.isRemoteHTTP("http://localhost:8080/stream.mkv"))
+        XCTAssertTrue(PlaybackBackendPolicy.isRemoteHTTP("https://cdn.example.com/stream.mkv"))
+        XCTAssertTrue(PlaybackBackendPolicy.isRemoteHTTP("http://cdn.example.com/stream.mkv"))
+        XCTAssertFalse(PlaybackBackendPolicy.isRemoteHTTP("file:///local/stream.mkv"))
+    }
+
+    func testForcedMPVOnLocalLoopbackUsesMPV() {
+        let result = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "http://127.0.0.1:8080/stream.mkv",
+                separateAudioURL: nil,
+                streamName: nil,
+                streamDescription: nil,
+                filename: nil,
+                engineSetting: .mpv,
+                requiresMPVAudioControls: false,
+                assMode: .off
+            )
+        )
+        XCTAssertEqual(result.backend, .mpv)
+        XCTAssertFalse(result.allowAutomaticFallback)
+    }
+
     func testSettingsMigration() {
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "Auto"), .auto)
         XCTAssertEqual(PlayerEngineSetting.migrated(from: "AVPlayer"), .auto)

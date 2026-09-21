@@ -6597,7 +6597,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.networkCache) private var networkCache = "Auto"
     @AppStorage(SettingsKey.hybridDiskCacheEnabled) private var hybridDiskCacheEnabled = true
     @AppStorage(SettingsKey.hybridDiskCacheLimitGB) private var hybridDiskCacheLimitGB = 20
-    @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Strip"
+    @AppStorage(SettingsKey.assOverrideMode) private var assOverrideMode = "Off"
     @AppStorage(SettingsKey.playerShowPiP) private var playerShowPiP = true
     @AppStorage(SettingsKey.playerShowEpisodes) private var playerShowEpisodes = true
     @AppStorage(SettingsKey.playerShowSources) private var playerShowSources = true
@@ -6615,7 +6615,7 @@ private struct PlaybackSettingsView: View {
     /// Buffer profiles: Auto scales to RAM; Conservative/Large match product names;
     /// legacy Small/Medium/Large keys still work via PlaybackCacheSettings.
     private let cacheModes = ["Auto", "Conservative", "Medium", "Large", "Max", "Ultra"]
-    private let assModes = ["Strip", "Scale", "Force"]
+    private let assModes = ["Off", "Strip", "Scale", "Force"]
     private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
 
     var body: some View {
@@ -6905,7 +6905,7 @@ private struct PlaybackSettingsView: View {
 
                 SettingsOptionRow(
                     title: L10n.string("tvos_settings_ass_ssa_override", fallback: "ASS/SSA Override"),
-                    subtitle: L10n.string("tvos_settings_strip_forces_dialogue_into_your_style_sa_2d8b1dff", fallback: "Strip forces dialogue into your style (safest). Scale keeps layout with size adjust. Force applies style aggressively."),
+                    subtitle: L10n.string("tvos_settings_ass_ssa_override_subtitle", fallback: "Off preserves authored styling and positioning. Strip forces dialogue into app style. Scale keeps layout with size adjust. Force applies style aggressively."),
                     selection: $assOverrideMode,
                     options: assModes,
                     accentColor: accentColor
@@ -9425,18 +9425,8 @@ private struct AddonsSettingsSection: View {
         addonID: String,
         addonName: String
     ) -> [TVHomeCatalogOrder.SnapshotRow] {
-        let activeHomeKeys = Set(TVHomeCatalogOrder.effectiveOrderKeys())
-        let collectionSources = CatalogHomeVisibilityResolver.activeCollectionSources()
         let catalogs = (manifest.catalogs ?? []).filter { catalog in
             catalog.eligibleForHome
-                && CatalogHomeVisibilityResolver.shouldInclude(
-                    addonID: addonID,
-                    contentType: catalog.type ?? "",
-                    catalogID: catalog.id ?? "",
-                    collectionSources: collectionSources,
-                    manifestURL: manifestURL,
-                    explicitHomeKeys: activeHomeKeys
-                )
                 && (!catalog.requiresGenre || catalog.firstGenreOption != nil)
         }
         return catalogs.compactMap { catalog in

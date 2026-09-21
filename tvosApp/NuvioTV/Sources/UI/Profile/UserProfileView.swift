@@ -590,12 +590,19 @@ enum ProfileAvatarCatalog {
 @MainActor
 final class ProfileAvatarCache {
     static let shared = ProfileAvatarCache()
+    nonisolated private static let tracker = NSCacheMemoryTracker(maxCost: 64 * 1024 * 1024)
+
+    nonisolated static func telemetryMetrics() -> (count: Int, totalBytes: Int, maxCost: Int) {
+        tracker.metrics()
+    }
+
     private let cache = NSCache<NSURL, UIImage>()
     private let diskCacheDirectory: URL
 
     private init() {
         cache.countLimit = 200
-        cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB
+        cache.totalCostLimit = Self.tracker.maxCost
+        cache.delegate = Self.tracker
         let caches = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first
             ?? URL(fileURLWithPath: NSTemporaryDirectory())
         diskCacheDirectory = caches.appendingPathComponent("ProfileAvatars", isDirectory: true)
@@ -614,14 +621,18 @@ final class ProfileAvatarCache {
         let diskURL = diskFileURL(for: url)
         if let data = try? Data(contentsOf: diskURL),
            let image = UIImage(data: data) {
-            cache.setObject(image, forKey: url as NSURL)
+            let cost = image.decodedByteCost
+            cache.setObject(image, forKey: url as NSURL, cost: cost)
+            Self.tracker.recordInsertion(cost: cost)
             return image
         }
         return nil
     }
 
     func setImage(_ image: UIImage, for url: URL) {
-        cache.setObject(image, forKey: url as NSURL)
+        let cost = image.decodedByteCost
+        cache.setObject(image, forKey: url as NSURL, cost: cost)
+        Self.tracker.recordInsertion(cost: cost)
         let diskURL = diskFileURL(for: url)
         if let data = image.pngData() {
             try? data.write(to: diskURL, options: .atomic)
@@ -635,14 +646,18 @@ final class ProfileAvatarCache {
         let diskURL = diskFileURL(for: url)
         if let diskData = try? Data(contentsOf: diskURL),
            let diskImage = UIImage(data: diskData) {
-            cache.setObject(diskImage, forKey: url as NSURL)
+            let cost = diskImage.decodedByteCost
+            cache.setObject(diskImage, forKey: url as NSURL, cost: cost)
+            Self.tracker.recordInsertion(cost: cost)
             return diskImage
         }
         guard let (data, _) = try? await URLSession.shared.data(from: url),
               let decoded = UIImage(data: data) else {
             return nil
         }
-        cache.setObject(decoded, forKey: url as NSURL)
+        let cost = decoded.decodedByteCost
+        cache.setObject(decoded, forKey: url as NSURL, cost: cost)
+        Self.tracker.recordInsertion(cost: cost)
         try? data.write(to: diskURL, options: .atomic)
         return decoded
     }

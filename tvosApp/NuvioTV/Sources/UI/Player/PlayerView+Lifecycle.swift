@@ -10,7 +10,6 @@ extension PlayerView {
             .animation(.playerControls, value: viewModel.showNextEpisodeCard)
             .animation(.playerControls, value: viewModel.showSkipSegmentCard)
             .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
-            .animation(.easeOut(duration: 0.16), value: viewModel.peekVisible)
             .animation(.easeOut(duration: 0.16), value: viewModel.pendingSeekDelta != 0)
             .animation(.easeOut(duration: 0.2), value: viewModel.isSwitchingSource)
             .animation(.easeOut(duration: 0.2), value: viewModel.playerToast)
@@ -40,6 +39,7 @@ extension PlayerView {
                     provider: provider,
                     filename: filename,
                     videoSize: videoSize,
+                    cacheFileIdentity: cacheFileIdentity,
                     trickplayURL: trickplayURL,
                     currentEpisode: currentEpisode
                 )

@@ -1171,6 +1171,7 @@ struct TVCollectionFolderRow: View {
                     onMove: onMove,
                     onSelect: { onSelect(folder) }
                 )
+                .equatable()
                 .disabled(
                     restrictFocusToCardKey != nil && restrictFocusToCardKey != cardKey
                 )
@@ -1492,3 +1493,18 @@ struct TVCollectionFolderCard: View {
         }
     }
 }
+
+extension TVCollectionFolderCard: Equatable {
+    static func == (lhs: TVCollectionFolderCard, rhs: TVCollectionFolderCard) -> Bool {
+        lhs.folder == rhs.folder &&
+        lhs.shouldRequestInitialFocus == rhs.shouldRequestInitialFocus &&
+        lhs.externalFocusValue == rhs.externalFocusValue &&
+        lhs.layoutMode == rhs.layoutMode &&
+        lhs.showPosterLabels == rhs.showPosterLabels &&
+        lhs.smoothFocusAnimations == rhs.smoothFocusAnimations &&
+        lhs.focusHighlighterEnabled == rhs.focusHighlighterEnabled &&
+        lhs.retainFocusAppearance == rhs.retainFocusAppearance &&
+        lhs.allowsFocus == rhs.allowsFocus
+    }
+}
+

@@ -227,7 +227,7 @@ struct CollectionFolderBrowseView: View {
             cinematicBackdrop
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 34) {
+                LazyVStack(alignment: .leading, spacing: 34) {
                     cinematicHero
 
                     if isLoading {
@@ -453,7 +453,8 @@ struct CollectionFolderBrowseView: View {
                 Spacer()
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
+                    // ARCHITECTURAL INVARIANT: Always use LazyVStack for catalog browse rows. Do not revert to VStack.
+                    LazyVStack(alignment: .leading, spacing: TVHomeLayout.sectionSpacing) {
                         ForEach(catalogRows) { row in
                             CollectionFolderHomeStyleRow(
                                 id: row.id,

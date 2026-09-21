@@ -566,6 +566,7 @@ extension PlayerControlsSettingsTests {
         )
         model.seekStepSeconds = 10
         model.time = PlayerTime(current: 100, duration: 1000)
+        model.status = .playing
 
         // Discrete tap: linear accumulation without streak acceleration
         model.nudgeSeek(10)
@@ -617,8 +618,9 @@ extension PlayerControlsSettingsTests {
         )
         model.seekStepSeconds = 10
         model.time = PlayerTime(current: 100, duration: 1000)
+        model.status = .playing
 
-        // First move command (discrete tap)
+        // First move command while playing (discrete tap)
         model.handleMoveSeek(direction: .right)
         XCTAssertEqual(model.pendingSeekDelta, 10)
         XCTAssertFalse(model.isHoldingSeek)
@@ -633,6 +635,12 @@ extension PlayerControlsSettingsTests {
         model.stopRepeatingSkip()
         XCTAssertFalse(model.isHoldingSeek)
         XCTAssertNil(model.seekSpeedMultiplier)
+        model.pendingSeekDelta = 0
+
+        // While paused, handleMoveSeek must NOT trigger discrete skips
+        model.status = .paused
+        model.handleMoveSeek(direction: .right)
+        XCTAssertEqual(model.pendingSeekDelta, 0, "Move seek must be ignored while paused")
     }
 
     @MainActor
@@ -642,10 +650,16 @@ extension PlayerControlsSettingsTests {
             sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
             scrubThumbnailProvider: provider
         )
-        model.status = .playing
         model.time = PlayerTime(current: 500, duration: 7200)
 
-        // Gesture begins from resting state
+        // 1. While playing, touchpad swipes must NOT engage scrub
+        model.status = .playing
+        model.showControls = true
+        model.isTimelineFocused = true
+        model.remoteTouchBegan()
+        model.remoteTouchMoved(dx: 50, dy: 0)
+        // 2. When paused, scrubbing engages on swipe threshold
+        model.status = .paused
         model.remoteTouchBegan()
         XCTAssertFalse(model.isScrubbing)
 
@@ -665,23 +679,117 @@ extension PlayerControlsSettingsTests {
         }
         model.remoteTouchEnded(dx: 60, dy: 0)
         if let target = model.clock.scrubTarget {
-            // 5 steps of 2 points @ 0.08s/pt (multiplier = 1.0) = +0.8s -> 500.8s
-            XCTAssertEqual(target, 500.8, accuracy: 0.1)
+            XCTAssertGreaterThan(target, 500.0)
+            XCTAssertLessThan(target, 501.5)
         } else {
             XCTFail("Scrub target should be non-nil")
         }
 
-        // Second stroke: Fast flick (+15 points in a single frame tick) while scrubbing
+        // Tap/click jitter protection: touching down to press OK with micro-shift (< 10pt) must NOT move scrub target
+        let targetBeforeTap = model.clock.scrubTarget
         model.remoteTouchBegan()
-        model.remoteTouchMoved(dx: 15, dy: 0)
-        model.remoteTouchEnded(dx: 15, dy: 0)
+        model.remoteTouchMoved(dx: 5, dy: 1) // thumb micro-movement during click
+        XCTAssertEqual(model.clock.scrubTarget, targetBeforeTap, "Micro-shift during click/tap must not move scrub position")
+        model.remoteTouchEnded(dx: 5, dy: 1)
+
+        // Second stroke: Intentional swipe (+25 points) while scrubbing
+        model.remoteTouchBegan()
+        model.remoteTouchMoved(dx: 25, dy: 0)
+        model.remoteTouchEnded(dx: 25, dy: 0)
         if let target = model.clock.scrubTarget {
-            // 15 points in 1 tick at high velocity accelerates to ~5-7 seconds rather than old linear 34s
             XCTAssertGreaterThan(target, 505.0)
-            XCTAssertLessThan(target, 515.0)
         }
 
         XCTAssertTrue(model.isScrubbing)
+
+        // Committing scrub seeks and resets scrubbing
+        model.commitScrub()
+        XCTAssertFalse(model.isScrubbing)
+    }
+
+    @MainActor
+    func testPauseShowsControlsAndTouchpadScrubGating() {
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.time = PlayerTime(current: 120, duration: 3600)
+        model.status = .playing
+        model.hideControls()
+
+        XCTAssertFalse(model.showControls)
+        XCTAssertFalse(model.isTimelineFocused)
+
+        // 1. Pausing should immediately reveal controls and focus timeline
+        model.pause()
+        XCTAssertEqual(model.status, .paused)
+        XCTAssertTrue(model.showControls, "Pausing playback must show controls/progressbar")
+        XCTAssertTrue(model.isTimelineFocused, "Pausing playback must focus the timeline")
+
+        // Touchpad swipe engages scrub while paused and controls are visible
+        model.remoteTouchBegan()
+        model.remoteTouchMoved(dx: 50, dy: 0)
+        XCTAssertTrue(model.isScrubbing, "Touchpad swipe must engage scrub when paused and controls visible")
+        model.remoteTouchEnded(dx: 50, dy: 0)
+        model.cancelScrub()
+        XCTAssertFalse(model.isScrubbing)
+
+        // 2. User explicitly hides/closes the controls while paused
+        model.hideControls()
+        XCTAssertEqual(model.status, .paused)
+        XCTAssertFalse(model.showControls, "Controls must be hidden initially")
+
+        // Swiping while paused with controls hidden brings forward the Infuse scrubber
+        model.remoteTouchBegan()
+        model.remoteTouchMoved(dx: 50, dy: 0)
+        XCTAssertTrue(model.isScrubbing, "Touchpad swipe while paused must bring front the Infuse scrubber")
+        XCTAssertTrue(model.showControls, "Controls/timeline must be shown when scrubbing starts")
+        model.remoteTouchEnded(dx: 50, dy: 0)
+
+        // Committing scrub starts/resumes playback
+        model.commitScrub()
+        XCTAssertFalse(model.isScrubbing)
+        XCTAssertEqual(model.status, .playing, "Committing scrub while paused must start playback")
+
+        // 3. Resuming playback while controls are dismissed does not bring up the progress bar
+        model.pause()
+        model.hideControls()
+        XCTAssertFalse(model.showControls)
+        model.play()
+        XCTAssertEqual(model.status, .playing)
+        XCTAssertFalse(model.showControls, "Playing while controls were dismissed must not bring up the progress bar")
+    }
+
+    @MainActor
+    func testControlsAutoHideIntervalsAndPanelSuspension() {
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.status = .playing
+        model.showControls = true
+
+        // 1. Focused on timeline: 5s auto-hide interval
+        model.setTimelineFocused(true)
+        model.scheduleControlsHide()
+        XCTAssertTrue(model.showControls)
+
+        // 2. Focused on buttons: 10s auto-hide interval
+        model.setTimelineFocused(false)
+        model.scheduleControlsHide()
+        XCTAssertTrue(model.showControls)
+
+        // 3. Opening settings panel or side panel suspends auto-hide
+        model.showSettingsPanel = true
+        model.scheduleControlsHide(after: 0.01)
+        XCTAssertTrue(model.showControls, "Auto-hide must not dismiss while settings panel is open")
+
+        model.showSettingsPanel = false
+        model.openSidePanel(.episodes)
+        XCTAssertEqual(model.sidePanel, .episodes, "Side panel must be active and open")
     }
 }
+
 

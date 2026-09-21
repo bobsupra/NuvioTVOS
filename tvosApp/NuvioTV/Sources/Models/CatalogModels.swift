@@ -600,7 +600,20 @@ enum EpisodeReleasePolicy {
         }
 
         let parsed: Date?
-        if let date = fractionalISO8601Formatter.date(from: raw) {
+        if !raw.contains("T"), let day = isoDay(raw) {
+            let parts = day.split(separator: "-").compactMap { Int($0) }
+            if parts.count == 3 {
+                var calendar = Calendar(identifier: .gregorian)
+                calendar.timeZone = TimeZone(secondsFromGMT: 0) ?? .gmt
+                var components = DateComponents()
+                components.year = parts[0]
+                components.month = parts[1]
+                components.day = parts[2]
+                parsed = calendar.date(from: components)
+            } else {
+                parsed = nil
+            }
+        } else if let date = fractionalISO8601Formatter.date(from: raw) {
             parsed = date
         } else if let date = standardISO8601Formatter.date(from: raw) {
             parsed = date
@@ -1648,11 +1661,14 @@ enum ContinueWatchingStore {
     /// detected exactly (same Encoding size, no `Equatable` conformance needed)
     /// without re-decoding or re-encoding the multi-megabyte payload.
     private static var cachedData: Data?
+    private static let cacheLock = NSLock()
 
     private static func invalidateCache() {
-        cachedItems = nil
-        cachedKey = nil
-        cachedData = nil
+        cacheLock.withLock {
+            cachedItems = nil
+            cachedKey = nil
+            cachedData = nil
+        }
     }
 
     private enum PersistenceError: LocalizedError {
@@ -1723,13 +1739,16 @@ enum ContinueWatchingStore {
 
     static func items() -> [ContinueWatchingItem] {
         let key = storageKey
-        if cachedKey == key, let cachedItems {
-            return cachedItems
+        if let items = cacheLock.withLock({ cachedKey == key ? cachedItems : nil }) {
+            return items
         }
+
         guard let data = data(for: key) else {
-            cachedItems = []
-            cachedKey = key
-            cachedData = nil
+            cacheLock.withLock {
+                cachedItems = []
+                cachedKey = key
+                cachedData = nil
+            }
             return []
         }
         let decoded: [ContinueWatchingItem]
@@ -1747,9 +1766,11 @@ enum ContinueWatchingStore {
         let kept = decoded
             .filter { shouldKeep(position: $0.position, duration: $0.duration) }
             .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-        cachedItems = kept
-        cachedKey = key
-        cachedData = data
+        cacheLock.withLock {
+            cachedItems = kept
+            cachedKey = key
+            cachedData = data
+        }
         return kept
     }
 
@@ -1901,6 +1922,17 @@ enum ContinueWatchingStore {
               position > 0,
               duration >= 60 else { return }
 
+        // If an item for this title already exists and has the same episode, stream,
+        // and playback position within 1 second, the progress is unchanged.
+        let existing = item(for: meta.id)
+        if let existing,
+           existing.season == (season ?? existing.season),
+           existing.episode == (episode ?? existing.episode),
+           abs(existing.position - position) < 1.0,
+           existing.streamUrl == streamUrl {
+            return
+        }
+
         // Going back to a title retires the removal the user made earlier, so a
         // months-old dismissal can never hide progress they just made.
         ContinueWatchingDismissStore.clear(contentId: meta.id)
@@ -1953,7 +1985,6 @@ enum ContinueWatchingStore {
 
         // A save that doesn't know its episode (resume paths that only carry a
         // stream URL) must not erase the episode identity an earlier save recorded.
-        let existing = item(for: meta.id)
         let item = ContinueWatchingItem(
             meta: meta,
             streamUrl: streamUrl,
@@ -2392,60 +2423,80 @@ enum ContinueWatchingStore {
         TVHomeDebugTrace.measure("cw.persist items=\(items.count)") {
             let persistStarted = TVHomeDebugTrace.now()
             let storedItems = Array(items.prefix(maxItems))
-            let data: Data
-            do {
-                data = try makeEncoder().encode(storedItems)
-            } catch {
-                persistenceDiagnostic = "encode failed: \(diagnosticText(for: error))"
-                return false
-            }
-
             let key = storageKey
-            // A rebuild with no real change (an account pull that did not move the
-            // row) must not shear the multi-megabyte payload back to disk every
-            // time. The encoded bytes are authoritative — if they match the last
-            // written bytes exactly, nothing changed, so skip the disk write and
-            // the notification.
-            if cachedKey == key, let cachedData, cachedData == data {
-                return true
-            }
-            guard let url = storageURL(for: key) else {
-                persistenceDiagnostic = "save failed: Caches unavailable"
-                return false
+            let kept = storedItems
+                .filter { shouldKeep(position: $0.position, duration: $0.duration) }
+                .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+
+            let previousItems = cacheLock.withLock { () -> [ContinueWatchingItem]? in
+                let prev = cachedItems
+                cachedItems = kept
+                cachedKey = key
+                return prev
             }
 
-            do {
-                try writeAndVerify(data, to: url)
-                // Retire any copy an older build left in a directory tvOS will not
-                // let us write to again.
-                for legacyURL in legacyStorageURLs(for: key) {
-                    try? FileManager.default.removeItem(at: legacyURL)
+            Task.detached(priority: .utility) {
+                guard let data = try? makeEncoder().encode(storedItems) else {
+                    persistenceDiagnostic = "encode failed"
+                    return
                 }
-                let defaults = UserDefaults.standard
-                defaults.removeObject(forKey: key)
-                defaults.removeObject(forKey: fallbackMarkerKey(for: key))
-                // What was just written *is* what the next read would decode, so
-                // refresh the memo rather than clearing it — a save during playback
-                // would otherwise force a full re-decode on the next row refresh.
-                cachedItems = storedItems
-                    .filter { shouldKeep(position: $0.position, duration: $0.duration) }
-                    .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-                cachedKey = key
-                cachedData = data
-                persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
-                TVHomeDebugTrace.log("cw.persist posting changedNotification dataBytes=\(data.count) elapsed=\(TVHomeDebugTrace.elapsedMilliseconds(since: persistStarted))ms")
-                NotificationCenter.default.post(name: changedNotification, object: nil)
-                writeTopShelfFeed()
-                return true
-            } catch {
-                // Deliberately no UserDefaults fallback: a synced list carries several
-                // megabytes of episode metadata, and tvOS 27 aborts the process when a
-                // value that large is written to UserDefaults.
-                // The file may have been partially written, so trust disk over memory.
-                invalidateCache()
-                persistenceDiagnostic = "save failed: \(diagnosticText(for: error))"
-                return false
+
+                let alreadyCached = cacheLock.withLock { () -> Bool in
+                    cachedKey == key && cachedData == data
+                }
+                guard !alreadyCached else { return }
+
+                guard let url = storageURL(for: key) else {
+                    persistenceDiagnostic = "save failed: Caches unavailable"
+                    return
+                }
+
+                do {
+                    try writeAndVerify(data, to: url)
+                    for legacyURL in legacyStorageURLs(for: key) {
+                        try? FileManager.default.removeItem(at: legacyURL)
+                    }
+                    let defaults = UserDefaults.standard
+                    if defaults.object(forKey: key) != nil {
+                        defaults.removeObject(forKey: key)
+                    }
+                    let markerKey = fallbackMarkerKey(for: key)
+                    if defaults.object(forKey: markerKey) != nil {
+                        defaults.removeObject(forKey: markerKey)
+                    }
+
+                    cacheLock.withLock {
+                        if cachedKey == key {
+                            cachedData = data
+                        }
+                        persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
+                    }
+
+                    writeTopShelfFeed()
+                } catch {
+                    invalidateCache()
+                    persistenceDiagnostic = "save failed: \(diagnosticText(for: error))"
+                }
             }
+
+            let isUnchanged: Bool
+            if let previousItems {
+                isUnchanged = previousItems.count == kept.count && zip(previousItems, kept).allSatisfy { old, new in
+                    old.meta.id == new.meta.id &&
+                    old.season == new.season &&
+                    old.episode == new.episode &&
+                    abs(old.position - new.position) < 1.0 &&
+                    old.isUpNext == new.isUpNext
+                }
+            } else {
+                isUnchanged = false
+            }
+
+            if !isUnchanged {
+                TVHomeDebugTrace.log("cw.persist posting changedNotification dataBytes=\(cachedData?.count ?? 0) elapsed=\(TVHomeDebugTrace.elapsedMilliseconds(since: persistStarted))ms")
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+            }
+            return true
         }
     }
 
@@ -6041,38 +6092,52 @@ enum WatchedStore {
 
     @discardableResult
     private static func persist(_ items: [WatchedStoreItem]) -> Bool {
-        let data: Data
-        do {
-            data = try makeEncoder().encode(items)
-        } catch {
-            persistenceDiagnostic = "encode failed: \(diagnosticText(for: error))"
-            print("[WatchedStore] Watched storage encode failed: \(error.localizedDescription)")
-            return false
-        }
-
-        cacheLock.lock()
-        let key = storageKey
-        if cachedKey == key, let cachedData, cachedData == data {
-            cacheLock.unlock()
-            return true
-        }
-
-        let saved = writeData(data, forKey: key)
-        guard saved else {
-            cacheLock.unlock()
-            return false
-        }
-
         let sorted = items.sorted { $0.watchedAt > $1.watchedAt }
-        cacheGeneration &+= 1
-        cachedItems = sorted
-        cachedKey = key
-        cachedData = data
-        cachedSnapshot = nil
-        persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
-        cacheLock.unlock()
+        let key = storageKey
 
-        NotificationCenter.default.post(name: changedNotification, object: nil)
+        let previousItems = cacheLock.withLock { () -> [WatchedStoreItem]? in
+            let prev = cachedItems
+            cacheGeneration &+= 1
+            cachedItems = sorted
+            cachedKey = key
+            cachedSnapshot = nil
+            return prev
+        }
+
+        Task.detached(priority: .utility) {
+            guard let data = try? makeEncoder().encode(items) else {
+                persistenceDiagnostic = "encode failed"
+                return
+            }
+
+            let alreadyCached = cacheLock.withLock { () -> Bool in
+                cachedKey == key && cachedData == data
+            }
+            guard !alreadyCached else { return }
+
+            let saved = writeData(data, forKey: key)
+            if saved {
+                cacheLock.withLock {
+                    if cachedKey == key {
+                        cachedData = data
+                    }
+                    persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
+                }
+            }
+        }
+
+        let isUnchanged: Bool
+        if let previousItems {
+            isUnchanged = previousItems.count == sorted.count && zip(previousItems, sorted).allSatisfy { old, new in
+                old.id == new.id && old.watchedAt == new.watchedAt
+            }
+        } else {
+            isUnchanged = false
+        }
+
+        if !isUnchanged {
+            NotificationCenter.default.post(name: changedNotification, object: nil)
+        }
         return true
     }
 

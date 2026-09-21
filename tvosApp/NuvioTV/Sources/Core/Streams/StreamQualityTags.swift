@@ -567,7 +567,10 @@ enum LastPlaybackStreamStore {
         persistRecords(records, profileId: profileId)
 
         let store = defaults(for: profileId)
-        store.removeObject(forKey: prefix + trimmedMetaId)
+        let legacyKey = prefix + trimmedMetaId
+        if store.object(forKey: legacyKey) != nil {
+            store.removeObject(forKey: legacyKey)
+        }
     }
 
     static func load(

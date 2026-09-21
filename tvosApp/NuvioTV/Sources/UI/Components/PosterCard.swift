@@ -1769,6 +1769,22 @@ struct CachedPosterArtwork<Placeholder: View>: View {
 
 actor PosterArtworkCache {
     static let shared = PosterArtworkCache()
+    private static let tracker = NSCacheMemoryTracker(
+        maxCost: {
+            let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
+            if gib > 3.5 {
+                return 140 * 1024 * 1024 // 140 MB (Apple TV 4K Gen 2/3)
+            } else if gib > 2.5 {
+                return 100 * 1024 * 1024 // 100 MB (Apple TV 4K Gen 1)
+            } else {
+                return 60 * 1024 * 1024  // 60 MB (Apple TV HD)
+            }
+        }()
+    )
+
+    static func telemetryMetrics() -> (count: Int, totalBytes: Int, maxCost: Int) {
+        tracker.metrics()
+    }
 
     private let cache = NSCache<NSString, UIImage>()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
@@ -1777,14 +1793,15 @@ actor PosterArtworkCache {
         let gib = Double(ProcessInfo.processInfo.physicalMemory) / 1_073_741_824.0
         if gib > 3.5 {
             cache.countLimit = 220
-            cache.totalCostLimit = 140 * 1024 * 1024 // 140 MB (Apple TV 4K Gen 2/3)
+            cache.totalCostLimit = Self.tracker.maxCost
         } else if gib > 2.5 {
             cache.countLimit = 160
-            cache.totalCostLimit = 100 * 1024 * 1024 // 100 MB (Apple TV 4K Gen 1)
+            cache.totalCostLimit = Self.tracker.maxCost
         } else {
             cache.countLimit = 90
-            cache.totalCostLimit = 60 * 1024 * 1024  // 60 MB (Apple TV HD)
+            cache.totalCostLimit = Self.tracker.maxCost
         }
+        cache.delegate = Self.tracker
         #if canImport(UIKit)
         NotificationCenter.default.addObserver(
             forName: UIApplication.didReceiveMemoryWarningNotification,
@@ -1800,6 +1817,7 @@ actor PosterArtworkCache {
 
     func purge() {
         cache.removeAllObjects()
+        Self.tracker.reset()
     }
 
     static func clearAllArtwork() async {
@@ -1810,7 +1828,9 @@ actor PosterArtworkCache {
     }
 
     func updateMemoryCache(_ image: UIImage, forKey key: NSString) {
-        cache.setObject(image, forKey: key, cost: image.decodedByteCost)
+        let cost = image.decodedByteCost
+        cache.setObject(image, forKey: key, cost: cost)
+        Self.tracker.recordInsertion(cost: cost)
     }
 
     func image(for url: URL, maxPixelSize: Int) async -> UIImage? {
@@ -1865,7 +1885,9 @@ actor PosterArtworkCache {
         inFlight[key as String] = nil
 
         if let image {
-            cache.setObject(image, forKey: key, cost: image.decodedByteCost)
+            let cost = image.decodedByteCost
+            cache.setObject(image, forKey: key, cost: cost)
+            Self.tracker.recordInsertion(cost: cost)
         }
         return image
     }
@@ -2084,12 +2106,6 @@ private func downsamplePosterImage(data: Data, maxPixelSize: Int) -> UIImage? {
     return UIImage(cgImage: cgImage)
 }
 
-private extension UIImage {
-    var decodedByteCost: Int {
-        guard let cgImage else { return 0 }
-        return cgImage.bytesPerRow * cgImage.height
-    }
-}
 #endif
 
 /// Deduplicates full-series metadata requests made by catalog badges. Catalog
@@ -2097,8 +2113,13 @@ private extension UIImage {
 /// episode guide is available. Only series with watched episode rows reach this
 /// cache, avoiding a request for every untouched poster on screen.
 @MainActor
-private final class CatalogWatchedMetadataCache {
+final class CatalogWatchedMetadataCache {
     static let shared = CatalogWatchedMetadataCache()
+    nonisolated private static let tracker = SimpleCountTracker()
+
+    nonisolated static func telemetryCount() -> Int {
+        tracker.count
+    }
 
     private let repository = CinemetaCatalogRepository()
     private var metadataByKey: [String: NuvioMeta] = [:]
@@ -2142,7 +2163,10 @@ private final class CatalogWatchedMetadataCache {
         inFlightByKey[key] = task
         let resolved = await task.value
         inFlightByKey[key] = nil
-        if let resolved { metadataByKey[key] = resolved }
+        if let resolved {
+            metadataByKey[key] = resolved
+            Self.tracker.set(count: metadataByKey.count)
+        }
         return resolved
     }
 }

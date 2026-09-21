@@ -151,19 +151,19 @@ final class CatalogDecodingTests: XCTestCase {
         XCTAssertEqual(metas.map(\.rating), [7.8, 8.1])
     }
 
-    func testCatalogHomeVisibilityResolverHidesCollectionOnlySources() throws {
+    func testCatalogHomeVisibilityResolverIncludesCollectionSourcesMatchingAndroid() throws {
         let manifestURL = try XCTUnwrap(URL(string: "https://example.com/manifest.json"))
         let source = CatalogHomeVisibilityResolver.Source(
             addonIdentifier: "https://example.com",
             contentType: "movie",
             catalogID: "popular"
         )
-        // Direct collection sources are hidden regardless of explicitHomeKeys presence
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        // Matching Android TV: direct collection sources remain included in layout and home
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "popular",
             collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
         ))
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "popular",
             collectionSources: [source], manifestURL: manifestURL,
             explicitHomeKeys: ["example.addon_movie_popular"]
@@ -174,13 +174,13 @@ final class CatalogDecodingTests: XCTestCase {
         ))
     }
 
-    func testCollectionBackedAddonRequiresSyncedGenericCatalogKeys() throws {
+    func testCollectionBackedAddonIncludesAllCatalogsMatchingAndroid() throws {
         let manifestURL = try XCTUnwrap(URL(string: "https://example.com/manifest.json"))
         let source = CatalogHomeVisibilityResolver.Source(
             addonIdentifier: "example.addon", contentType: "movie", catalogID: "collection", collectionID: "xperience"
         )
         let collectionOnlyKey = "collection_xperience"
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "generic",
             collectionSources: [source], manifestURL: manifestURL,
             explicitHomeKeys: [collectionOnlyKey]
@@ -204,11 +204,11 @@ final class CatalogDecodingTests: XCTestCase {
             collectionSources: [source], manifestURL: manifestURL,
             explicitHomeKeys: [collectionOnlyKey]
         ))
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "collection",
             collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
         ))
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "collection",
             collectionSources: [source], manifestURL: manifestURL,
             explicitHomeKeys: [collectionOnlyKey, "example.addon_movie_collection"]
@@ -221,7 +221,7 @@ final class CatalogDecodingTests: XCTestCase {
             addonIdentifier: "addon:example.addon:https://example.com/path",
             contentType: "movie", catalogID: "popular"
         )
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "example.addon", contentType: "movie", catalogID: "popular",
             collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
         ))
@@ -234,7 +234,7 @@ final class CatalogDecodingTests: XCTestCase {
             contentType: "movie",
             catalogID: "top"
         )
-        XCTAssertFalse(CatalogHomeVisibilityResolver.shouldInclude(
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
             addonID: "cinemeta", contentType: "movie", catalogID: "top",
             collectionSources: [source], manifestURL: manifestURL, explicitHomeKeys: []
         ))

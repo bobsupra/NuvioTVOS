@@ -11,6 +11,7 @@ struct ActivePlaybackContext: Equatable {
     let meta: NuvioMeta
     let subtitle: String
     let httpHeaders: [String: String]
+    let cacheFileIdentity: PlaybackCacheFileIdentity?
     let externalSubtitles: [NuvioSubtitle]
     let resumeFrom: Double?
     let episodes: [NuvioVideo]
@@ -24,6 +25,7 @@ struct ActivePlaybackContext: Equatable {
         meta: NuvioMeta,
         subtitle: String,
         httpHeaders: [String: String] = [:],
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         externalSubtitles: [NuvioSubtitle] = [],
         resumeFrom: Double? = nil,
         episodes: [NuvioVideo] = [],
@@ -36,6 +38,7 @@ struct ActivePlaybackContext: Equatable {
         self.meta = meta
         self.subtitle = subtitle
         self.httpHeaders = httpHeaders
+        self.cacheFileIdentity = cacheFileIdentity
         self.externalSubtitles = externalSubtitles
         self.resumeFrom = resumeFrom
         self.episodes = episodes

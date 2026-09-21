@@ -2415,7 +2415,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     /// Lazily opens the retained extractor so the first visible scrub
     /// request does not pay the demuxer-open cost.
     func prepareScrubThumbnailExtractor() {
-        guard !isRemoteStream else { return }
+        guard !isRemoteStream, engine.playbackBackend == .software else { return }
         guard !didPrewarmSoftwareFrameExtractor else { return }
         let extractor: FrameExtractor
         if let softwareFrameExtractor {
@@ -2463,8 +2463,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 )
                 return image
             }
+            // Cache-backed playback handles stills from SegmentCache. If not resident yet,
+            // return nil immediately; never open a secondary remote demuxer.
+            return nil
         }
 
+        // Only allow software frame extractor on local/non-remote streams using software decoding.
+        guard !isRemoteStream, engine.playbackBackend == .software else { return nil }
         guard loadGeneration == generation else { return nil }
         let extractor: FrameExtractor
         if let softwareFrameExtractor {
@@ -3062,6 +3067,10 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             .sink { [weak self] isReady in
                 guard let self else { return }
                 if isReady {
+                    if self.isPlayerLoading {
+                        self.isPlayerLoading = false
+                        self.isPlayerPlaying = true
+                    }
                     self.onFirstFrameReady?()
                 }
             }
@@ -3155,8 +3164,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerPlaying = false
             isPlayerEnded = false
         case .loading:
-            isPlayerLoading = true
-            isPlayerPlaying = false
+            if engine.hasFirstFrameReadyForDisplay || isTransportPlaying {
+                isPlayerLoading = false
+                isPlayerPlaying = true
+            } else {
+                isPlayerLoading = true
+                isPlayerPlaying = false
+            }
             isPlayerEnded = false
             currentErrorMessage = ""
         case .playing:
@@ -3172,14 +3186,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlayerPlaying = false
         case .rebuffering, .stalled:
             // Only flag loading if playback has actually halted / stopped while actively attempting to play.
-            // If frames are still actively rolling (isTransportPlaying / isPlayerPlaying),
+            // If frames are still actively rolling (isTransportPlaying / isPlayerPlaying / hasFirstFrameReadyForDisplay),
             // keep loading hidden so the spinner does not obscure rolling video.
             // If the transport is intentionally paused, do NOT flag loading so pause doesn't show a spinner.
             if !isTransportPlaying && engine.state == .paused {
                 isPlayerLoading = false
                 isPlayerPlaying = false
             } else {
-                let isActivelyPlaying = isTransportPlaying || isPlayerPlaying
+                let isActivelyPlaying = isTransportPlaying || isPlayerPlaying || engine.hasFirstFrameReadyForDisplay
                 isPlayerLoading = !isActivelyPlaying
                 isPlayerPlaying = isActivelyPlaying
             }
@@ -3346,6 +3360,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         resetAISubtitleStartupHold()
         loadGeneration = generation
         let isRemote = PlaybackBackendPolicy.isRemoteHTTP(request.videoURL.absoluteString)
+        // The hybrid cache is a local HTTP range server. It can keep one
+        // pull-driven response open, which avoids AVIOReader tearing down and
+        // re-opening a range request every 8–16 MB on large remote files.
+        // Do not enable this for arbitrary HTTP origins: the held transport is
+        // intentionally limited to the cache server's HTTP/1.1 loopback path.
+        let isLocalPlaybackCache = request.videoURL.host == "127.0.0.1"
+            && request.videoURL.path.hasPrefix("/stream/")
         self.isRemoteStream = isRemote
         let streamKey = request.canonicalMediaKey
             ?? TrickplayDiskCache.streamKey(for: request.videoURL.absoluteString)
@@ -3437,10 +3458,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             preserveASSMarkup: false,
             prepareNativeSubtitles: false,
             maxConcurrentSourceRequests: isRemote ? 1 : nil,
+            heldSourceConnection: isLocalPlaybackCache,
             preferredAudioLanguages: request.preferredAudioLanguages,
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,
-            forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments,
+            forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),
             autoplay: request.autoplay,
             audioDelaySeconds: request.audioDelaySeconds
         )

@@ -33,7 +33,7 @@ extension PlayerView {
                 if viewModel.showPauseOverlay {
                     switch direction {
                     case .left, .right:
-                        viewModel.handleMoveSeek(direction: direction)
+                        viewModel.revealControls()
                     default:
                         viewModel.revealControls()
                     }
@@ -43,7 +43,9 @@ extension PlayerView {
                 guard !viewModel.showControls else { return }
                 switch direction {
                 case .left, .right:
-                    viewModel.handleMoveSeek(direction: direction)
+                    if viewModel.status == .playing {
+                        viewModel.handleMoveSeek(direction: direction)
+                    }
                 default:
                     viewModel.revealControls()
                 }
@@ -66,10 +68,6 @@ extension PlayerView {
                 if viewModel.showPauseOverlay {
                     viewModel.dismissPauseOverlay()
                     viewModel.revealControls()
-                    return
-                }
-                if viewModel.peekVisible {
-                    viewModel.hidePeek()
                     return
                 }
                 if viewModel.postPlayState.isTrailerPlaying {

@@ -301,7 +301,11 @@ final class PlaybackSessionCoordinator: ObservableObject {
                 var effectiveRequest = request
                 if let localURL = await PlaybackStreamCacheManager.shared.prepareCacheServer(
                     for: request.videoURL,
-                    headers: request.httpHeaders
+                    headers: request.httpHeaders,
+                    canonicalMediaKey: request.canonicalMediaKey,
+                    cacheFileIdentity: request.cacheFileIdentity,
+                    filename: request.filename,
+                    targetLeadSeconds: request.cacheProfile.hybridCacheTargetLeadSeconds
                 ) {
                     effectiveRequest.videoURL = localURL
                 }

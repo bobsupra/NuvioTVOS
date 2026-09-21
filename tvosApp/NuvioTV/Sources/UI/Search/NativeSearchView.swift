@@ -603,6 +603,7 @@ struct NativeSearchView: View {
                             suppressOverlayDismissalExit = true
                             overlayRestoreResultID = item.id
                             lastFocusedResultID = item.id
+                            viewModel.commitCurrentSearch()
                             onContentClick(item.id, item.type)
                         }
                         .disabled(overlayRestoreResultID != nil && overlayRestoreResultID != item.id)

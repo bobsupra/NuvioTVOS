@@ -161,9 +161,14 @@ The app targets Apple TV (`SDKROOT = appletvos`) with bundle id `com.pyksel.nuvi
 ## Setup
 
 ```bash
-git clone <your-fork-url> NuvioTVOS
+git clone --recurse-submodules <your-fork-url> NuvioTVOS
 cd NuvioTVOS
 ```
+
+> **Note:** If you already cloned without `--recurse-submodules`, initialize the submodules before generating the project:
+> ```bash
+> git submodule update --init --recursive
+> ```
 
 Install the pinned toolchain and generate the Xcode project:
 
@@ -174,6 +179,7 @@ tuist generate
 ```
 
 `tuist generate` opens the workspace in Xcode. Use `--no-open` to only write it.
+
 
 Use the `NuvioTV` scheme and an Apple TV simulator.
 

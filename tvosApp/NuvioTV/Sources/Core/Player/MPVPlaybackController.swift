@@ -568,21 +568,23 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         if let slang = SubtitleLanguagePreferences.mpvLanguageList(for: preferredSubtitleLanguages) {
             checkError(mpv_set_option_string(mpv, "slang", slang))
         }
-        // ASS/SSA override: Strip (default) flattens styling into app subtitle
-        // style so top-aligned dialogue stays in the safe area; Scale keeps
-        // layout with size adjust; Force applies style more aggressively.
-        let assMode = (ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode) ?? "Strip")
+        // ASS/SSA override: Off (default) preserves original authored styling and positioning;
+        // Strip flattens styling into app subtitle style; Scale keeps layout with size adjust;
+        // Force applies style more aggressively.
+        let assMode = (ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode) ?? "Off")
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased()
         let assOverride: String
         switch assMode {
         case "scale": assOverride = "scale"
         case "force": assOverride = "force"
-        default: assOverride = "strip"
+        case "strip": assOverride = "strip"
+        case "off", "no", "disabled", "native", "authored", "none": assOverride = "no"
+        default: assOverride = "no"
         }
         checkError(mpv_set_option_string(mpv, "sub-ass-override", assOverride))
         checkError(mpv_set_option_string(mpv, "sub-use-margins", "yes"))
-        checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", "yes"))
+        checkError(mpv_set_option_string(mpv, "sub-ass-force-margins", assOverride == "no" ? "no" : "yes"))
         checkError(mpv_set_option_string(mpv, "keep-open", "yes"))
         checkError(mpv_set_option_string(mpv, "target-colorspace-hint", "yes"))
         checkError(mpv_set_option_string(mpv, "tone-mapping", "auto"))

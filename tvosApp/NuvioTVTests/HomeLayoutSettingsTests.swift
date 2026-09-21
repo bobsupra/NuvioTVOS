@@ -785,5 +785,24 @@ final class HomeLayoutSettingsTests: XCTestCase {
         let evicted = BingeGroupStore.load(seriesId: "series_1", profileId: profileId)
         XCTAssertNil(evicted)
     }
+
+    func testCatalogInCollectionFolderRemainsVisibleInLayoutMatchingAndroid() throws {
+        let manifestURL = try XCTUnwrap(URL(string: "https://example.com/manifest.json"))
+        let source = CatalogHomeVisibilityResolver.Source(
+            addonIdentifier: "sports.addon",
+            contentType: "sports",
+            catalogID: "live_streams",
+            collectionID: "sports_collection"
+        )
+        // Direct collection sources remain included in layout & Home matching Android TV
+        XCTAssertTrue(CatalogHomeVisibilityResolver.shouldInclude(
+            addonID: "sports.addon",
+            contentType: "sports",
+            catalogID: "live_streams",
+            collectionSources: [source],
+            manifestURL: manifestURL,
+            explicitHomeKeys: []
+        ))
+    }
 }
 

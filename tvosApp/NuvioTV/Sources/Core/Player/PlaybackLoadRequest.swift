@@ -1,6 +1,22 @@
 import Foundation
 import Darwin
 
+struct PlaybackCacheFileIdentity: Equatable, Sendable {
+    let infoHash: String
+    let fileIndex: Int
+
+    init?(infoHash: String?, fileIndex: Int?) {
+        guard let rawHash = infoHash, let fileIndex, fileIndex >= 0 else { return nil }
+        let hash = rawHash.lowercased()
+        guard (hash.count == 40 || hash.count == 64),
+              hash.utf8.allSatisfy({ (48...57).contains($0) || (97...102).contains($0) }) else { return nil }
+        self.infoHash = hash
+        self.fileIndex = fileIndex
+    }
+
+    var cacheKey: String { "torrent:\(infoHash):\(fileIndex)" }
+}
+
 /// Everything required to open a stream on any playback backend.
 struct PlaybackLoadRequest: Equatable {
     var videoURL: URL
@@ -28,6 +44,7 @@ struct PlaybackLoadRequest: Equatable {
     /// Canonical content identity (SHA-256 over imdbId/season/ep/durationBucket)
     /// allowing preview caches to survive debrid URL changes and token expiration.
     var canonicalMediaKey: String?
+    var cacheFileIdentity: PlaybackCacheFileIdentity?
     /// Direct storyboard/trickplay manifest URL (WebVTT) when supplied by the stream add-on.
     var trickplayURL: URL?
     /// Remote artwork URL (episode thumbnail or movie poster/backdrop) for system Now Playing publication.
@@ -43,7 +60,7 @@ struct PlaybackLoadRequest: Equatable {
         preferredSubtitleLanguages: [String] = [],
         matchContentEnabled: Bool = true,
         cacheProfile: PlaybackCacheProfile = .auto,
-        assMode: PlaybackASSMode = .strip,
+        assMode: PlaybackASSMode = .off,
         autoplay: Bool = true,
         playbackRate: Float = 1,
         subtitleDelaySeconds: Double = 0,
@@ -53,6 +70,7 @@ struct PlaybackLoadRequest: Equatable {
         streamDescription: String? = nil,
         filename: String? = nil,
         canonicalMediaKey: String? = nil,
+        cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         trickplayURL: URL? = nil,
         artworkURL: URL? = nil
     ) {
@@ -75,6 +93,7 @@ struct PlaybackLoadRequest: Equatable {
         self.streamDescription = streamDescription
         self.filename = filename
         self.canonicalMediaKey = canonicalMediaKey
+        self.cacheFileIdentity = cacheFileIdentity
         self.trickplayURL = trickplayURL
         self.artworkURL = artworkURL
     }
@@ -100,8 +119,8 @@ enum PlaybackCacheProfile: String, Equatable {
         }
     }
 
-    /// Aether `LoadOptions.forwardBufferSegments` (~4 s each).
-    var aetherForwardBufferSegments: Int {
+    /// Aether `LoadOptions.forwardBufferSegments` (~4 s each) when streaming directly without local cache.
+    var directForwardBufferSegments: Int {
         switch self {
         case .conservative: return 4
         case .medium: return 10
@@ -110,6 +129,37 @@ enum PlaybackCacheProfile: String, Equatable {
         case .ultra: return 25
         case .auto:
             return Self.resolveAutoSegments(
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                availableMemoryBytes: os_proc_available_memory()
+            )
+        }
+    }
+
+    /// Legacy / default segment window for unproxied streams.
+    var aetherForwardBufferSegments: Int {
+        directForwardBufferSegments
+    }
+
+    /// When backed by the Hybrid Disk Cache, Aether builds an immediate, comfortable in-memory playback cushion
+    /// (~40s / 10 segments for standard/high RAM profiles, bounded by directForwardBufferSegments)
+    /// to ensure rapid startup and instant seek response while the disk cache asynchronously pre-fetches minutes ahead onto flash.
+    func aetherForwardBufferSegments(isBackedByHybridDiskCache: Bool) -> Int {
+        if isBackedByHybridDiskCache {
+            return min(10, directForwardBufferSegments)
+        }
+        return directForwardBufferSegments
+    }
+
+    /// Target buffer lead (in seconds) for the Hybrid Disk Cache upstream fetch scheduler.
+    var hybridCacheTargetLeadSeconds: Double {
+        switch self {
+        case .conservative: return 45.0
+        case .medium: return 90.0
+        case .large: return 150.0
+        case .max: return 240.0
+        case .ultra: return 360.0
+        case .auto:
+            return Self.resolveAutoLeadSeconds(
                 physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
                 availableMemoryBytes: os_proc_available_memory()
             )
@@ -132,18 +182,37 @@ enum PlaybackCacheProfile: String, Equatable {
             return 4  // Conservative: ~16s readahead
         }
     }
+
+    /// Dynamically scales Hybrid Disk Cache forward buffer lead based on device physical memory and available RAM.
+    static func resolveAutoLeadSeconds(physicalMemoryBytes: UInt64, availableMemoryBytes: size_t) -> Double {
+        let gibPhysical = Double(physicalMemoryBytes) / 1_073_741_824.0
+        let mbAvailable = Double(availableMemoryBytes) / (1024.0 * 1024.0)
+
+        if gibPhysical > 3.5 && mbAvailable >= 1000 {
+            return 240.0 // 4 minutes ahead
+        } else if gibPhysical > 2.5 && mbAvailable >= 450 {
+            return 180.0 // 3 minutes ahead
+        } else if mbAvailable >= 250 {
+            return 120.0 // 2 minutes ahead
+        } else {
+            return 60.0  // 1 minute ahead
+        }
+    }
 }
 
 enum PlaybackASSMode: String, Equatable {
+    case off
     case strip
     case force
     case scale
 
     static func fromSettings(_ raw: String?) -> PlaybackASSMode {
-        switch (raw ?? "Strip").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        switch (raw ?? "Off").trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "strip": return .strip
         case "force": return .force
         case "scale": return .scale
-        default: return .strip
+        case "off", "no", "disabled", "native", "authored", "none": return .off
+        default: return .off
         }
     }
 }

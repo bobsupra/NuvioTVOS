@@ -66,6 +66,9 @@ enum PlaybackBackendPolicy {
         guard let url = URL(string: urlString), let scheme = url.scheme?.lowercased() else {
             return false
         }
+        if url.host == "127.0.0.1" || url.host == "localhost" {
+            return false
+        }
         return scheme == "https" || scheme == "http"
     }
 

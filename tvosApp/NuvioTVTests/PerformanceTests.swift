@@ -297,4 +297,93 @@ final class PerformanceTests: XCTestCase {
             _ = try? decoder.decode(Meta.self, from: json)
         }
     }
+
+    // MARK: - Watchdog Memory Diagnostic Tests
+
+    func testTVMemoryDiagnosticCaptureAndReport() {
+        let snapshot = TVMemoryDiagnostic.capture()
+        XCTAssertGreaterThan(snapshot.totalPhysicalRAMMB, 0, "Total physical RAM should be non-zero")
+        XCTAssertGreaterThan(snapshot.availableMemoryMB, 0, "Available memory should be non-zero")
+        XCTAssertGreaterThanOrEqual(snapshot.physicalFootprintMB, 0, "Physical footprint should be non-negative")
+
+        let detailed = TVMemoryDiagnostic.detailedReport(snapshot: snapshot, label: "TEST_WATCHDOG_RAM")
+        XCTAssertTrue(detailed.contains("TEST_WATCHDOG_RAM"))
+        XCTAssertTrue(detailed.contains("Total Physical Footprint"))
+        XCTAssertTrue(detailed.contains("Mach VM"))
+        XCTAssertTrue(detailed.contains("Network URLCache"))
+        XCTAssertTrue(detailed.contains("Poster Image Cache"))
+        XCTAssertTrue(detailed.contains("Backdrop Image Cache"))
+        XCTAssertTrue(detailed.contains("Tracked App In-Memory Caches"))
+
+        let pulse = TVMemoryDiagnostic.summaryPulse(snapshot: snapshot)
+        XCTAssertTrue(pulse.contains("Footprint:"))
+        XCTAssertTrue(pulse.contains("Avail:"))
+        XCTAssertTrue(pulse.contains("URLCache:"))
+    }
+
+    func testNSCacheMemoryTracker() {
+        let tracker = NSCacheMemoryTracker(maxCost: 10 * 1024 * 1024)
+        let cache = NSCache<NSString, UIImage>()
+        cache.delegate = tracker
+        cache.countLimit = 2
+
+        let m1 = tracker.metrics()
+        XCTAssertEqual(m1.count, 0)
+        XCTAssertEqual(m1.totalBytes, 0)
+        XCTAssertEqual(m1.maxCost, 10 * 1024 * 1024)
+
+        tracker.recordInsertion(cost: 1024)
+        let m2 = tracker.metrics()
+        XCTAssertEqual(m2.count, 1)
+        XCTAssertEqual(m2.totalBytes, 1024)
+
+        tracker.reset()
+        let m3 = tracker.metrics()
+        XCTAssertEqual(m3.count, 0)
+        XCTAssertEqual(m3.totalBytes, 0)
+    }
+
+    func testSimpleCountTracker() {
+        let tracker = SimpleCountTracker()
+        XCTAssertEqual(tracker.count, 0)
+
+        tracker.increment(bytes: 500)
+        XCTAssertEqual(tracker.count, 1)
+        XCTAssertEqual(tracker.metrics.totalBytes, 500)
+
+        tracker.decrement(bytes: 200)
+        XCTAssertEqual(tracker.count, 0)
+        XCTAssertEqual(tracker.metrics.totalBytes, 300)
+
+        tracker.set(count: 10, bytes: 4096)
+        XCTAssertEqual(tracker.count, 10)
+        XCTAssertEqual(tracker.metrics.totalBytes, 4096)
+
+        tracker.reset()
+        XCTAssertEqual(tracker.count, 0)
+        XCTAssertEqual(tracker.metrics.totalBytes, 0)
+    }
+
+    func testAnimatedGIFCacheGCDAndFrameExpansion() {
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(10, 20), 10)
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(15, 25), 5)
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(7, 13), 1)
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 10, height: 10))
+        let img1 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.red.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 10, height: 10)) }
+        let img2 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.blue.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 10, height: 10)) }
+
+        let frames = [
+            (image: img1, delayCentiseconds: 10),
+            (image: img2, delayCentiseconds: 20)
+        ]
+
+        let expanded = AnimatedGIFCache.expandFrames(frames: frames)
+        XCTAssertNotNil(expanded)
+        XCTAssertEqual(expanded?.images.count, 3) // 1 img1 + 2 img2
+        XCTAssertEqual(expanded?.duration, 0.30, accuracy: 0.001)
+
+        let metrics = AnimatedGIFCache.telemetryMetrics()
+        XCTAssertGreaterThanOrEqual(metrics.maxCost, 0)
+    }
 }

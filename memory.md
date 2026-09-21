@@ -523,9 +523,9 @@ Navigating vertically between catalog rows on Home (e.g. between "Popular - Seri
 
 1. **Removed `HomeTabBarScrollState`**:
    - The native `ScrollView(.vertical)` around catalog rows now handles scrolling naturally without artificial duplicate scroll view jumps.
-2. **Replaced `LazyVStack` with `VStack` inside `ScrollView(.vertical)`**:
-   - Each `TVCatalogRow` already virtualizes its horizontal cards (`materializedCardIndices` maintains only ~11 visible cards).
-   - Keeping the catalog rows pre-mounted inside `VStack` eliminates runtime row construction stalls (`0ms` mount time during scrolling).
+2. **Use `LazyVStack` inside `ScrollView(.vertical)`**:
+   - Main Home catalog rows, Grid view, and Collection folder browse views must use `LazyVStack`.
+   - Card materialization and artwork decoding are kept fast and lightweight via the focused row ±2 windowing and horizontal card virtualization (`materializedCardIndices`). Do NOT revert to `VStack`.
 3. **`Equatable` conformances and `.equatable()` modifiers**:
    - Added `Equatable, Hashable` to `NuvioMeta`.
    - Added `Equatable` conformances and `.equatable()` to:

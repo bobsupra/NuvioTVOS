@@ -604,6 +604,12 @@ final class StreamsRepository: ObservableObject {
 /// App-lifetime cache of successfully decoded manifests.
 /// Failures are never stored, so a flaky host is retried on the next discovery.
 actor StreamManifestCache {
+    private static let tracker = SimpleCountTracker()
+
+    static func telemetryCount() -> Int {
+        tracker.count
+    }
+
     private var successes: [URL: StreamAddonManifest] = [:]
 
     func success(for url: URL) -> StreamAddonManifest? {
@@ -612,11 +618,13 @@ actor StreamManifestCache {
 
     func storeSuccess(_ manifest: StreamAddonManifest, for url: URL) {
         successes[url] = manifest
+        Self.tracker.set(count: successes.count)
     }
 
     /// Test / diagnostics helper.
     func removeAll() {
         successes.removeAll()
+        Self.tracker.reset()
     }
 }
 
