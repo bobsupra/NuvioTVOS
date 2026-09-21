@@ -93,16 +93,6 @@ struct Issue309SilentTransportDeathTests {
         return got
     }
 
-    /// Poll instead of sleeping a fixed span: the observable is a state the origin reaches, and a
-    /// fixed sleep either wastes suite time or races the loopback round trip.
-    private static func waitUntil(_ budget: TimeInterval, _ condition: () -> Bool) async throws {
-        let stopAt = Date().addingTimeInterval(budget)
-        while Date() < stopAt {
-            if condition() { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
-
     // MARK: - Detection
 
     @Test("a flow that dies mid-window is ended without any read blocking on it",
@@ -129,14 +119,14 @@ struct Issue309SilentTransportDeathTests {
         // wait for that range to complete before consuming. Then consume enough to put the refill on
         // the wire and far less than the 4 MB it delivers: from here on every read is satisfied from
         // the window, which is precisely the state that used to defer detection indefinitely.
-        try await Self.waitUntil(10) { !reader.hasLiveConnectionForTesting }
+        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: 1024 * 1024) == 1024 * 1024)
-        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == silenceOffset } }
+        try await waitFor(upTo: .seconds(5)) { server.requestedRanges.contains { $0.start == silenceOffset } }
         #expect(server.requestedRanges.contains { $0.start == silenceOffset },
                 "the frontier refill never went out: \(server.requestedRanges)")
 
         // No reads at all from here: the consumer is parked, exactly as a paused player is.
-        try await Self.waitUntil(stallTimeout * 6) { !reader.hasLiveConnectionForTesting }
+        try await waitFor(upTo: .seconds(stallTimeout * 6)) { !reader.hasLiveConnectionForTesting }
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a connection that delivered nothing for \(stallTimeout)s is still installed")
@@ -171,10 +161,10 @@ struct Issue309SilentTransportDeathTests {
         defer { reader.markClosed(); reader.close() }
         try reader.open()
 
-        try await Self.waitUntil(10) { !reader.hasLiveConnectionForTesting }
+        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: 512 * 1024) == 512 * 1024)
-        try await Self.waitUntil(5) { server.requestedRanges.contains { $0.start == silenceOffset } }
-        try await Self.waitUntil(stallTimeout * 6) { !reader.hasLiveConnectionForTesting }
+        try await waitFor(upTo: .seconds(5)) { server.requestedRanges.contains { $0.start == silenceOffset } }
+        try await waitFor(upTo: .seconds(stallTimeout * 6)) { !reader.hasLiveConnectionForTesting }
 
         #expect(!reader.hasLiveConnectionForTesting,
                 "a request answered with headers and no body stayed installed")
@@ -245,7 +235,7 @@ struct Issue309SilentTransportDeathTests {
         // Nobody consumes: the window fills to high water, the connection is ended on purpose, and
         // from then on there is no delivery at all. That is the state the watchdog must NOT read as
         // a fault, or every paused player would reconnect on a timer.
-        try await Self.waitUntil(5) { reader.windowDiagnostics.parked }
+        try await waitFor(upTo: .seconds(5)) { reader.windowDiagnostics.parked }
         try await Task.sleep(for: .seconds(stallTimeout * 4))
 
         #expect(reader.windowDiagnostics.parked, "the high-water end must still own this state")

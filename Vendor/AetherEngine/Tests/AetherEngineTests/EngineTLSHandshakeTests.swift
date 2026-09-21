@@ -15,7 +15,11 @@
     /// suite. The evaluator is process global and suites otherwise run in
     /// parallel, so a second suite setting it would decide what this one is
     /// testing.
-    @Suite("EngineTLS live handshake against a self-signed origin", .serialized)
+    /// Every request below goes through `HLSLocalServer`, which is why these clients carry no deadline
+/// of their own worth reading: the hang catcher is the `.timeLimit` trait, and 150 s is only there
+/// because a URL request must name something. The 15 s they used to carry reported the server as
+/// dead twice on CI (`NSURLErrorTimedOut`) while it was merely waiting for a thread.
+@Suite("EngineTLS live handshake against a self-signed origin", .serialized, .timeLimit(.minutes(3)))
     struct EngineTLSHandshakeTests {
 
         /// Lives here rather than beside the resolver tests because reading the
@@ -131,8 +135,9 @@
                     $0.hasPrefix("http://127.0.0.1:") && !$0.contains("m3u8")
                 })
 
-            let (bytes, response) = try await URLSession.shared.data(
-                from: try #require(URL(string: segmentLine)))
+            var segmentRequest = URLRequest(url: try #require(URL(string: segmentLine)))
+            segmentRequest.timeoutInterval = 150
+            let (bytes, response) = try await URLSession.shared.data(for: segmentRequest)
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             #expect(bytes.count == 4096, "served \(bytes.count) segment bytes")
             #expect(bytes.first == 0x47, "not an MPEG-TS sync byte")
@@ -154,7 +159,7 @@
             let entry = try #require(server.relayURL(for: master))
 
             var request = URLRequest(url: entry)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (_, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 502,
                     "the upstream handshake should have failed system trust")
@@ -179,7 +184,7 @@
             let entry = try #require(server.relayURL(for: master))
 
             var request = URLRequest(url: entry)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (_, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 502,
                     "an origin the evaluator declined was served anyway")
@@ -210,7 +215,7 @@
 
         private static func text(of url: URL) async throws -> String {
             var request = URLRequest(url: url)
-            request.timeoutInterval = 15
+            request.timeoutInterval = 150
             let (data, response) = try await URLSession.shared.data(for: request)
             #expect((response as? HTTPURLResponse)?.statusCode == 200)
             return String(decoding: data, as: UTF8.self)

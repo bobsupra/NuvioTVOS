@@ -90,6 +90,82 @@ struct Issue65LivelockTests {
         #expect(d.observe(currentTarget: 53, wantsToPlay: true) == true)   // 3s -> wedge
     }
 
+    // MARK: - BackpressureWedgeDetector backward scrub (AE#528)
+
+    @Test("A backward scrub is a fetching consumer, so a receding target never trips the slow path")
+    func recedingTargetNeverTripsSlowPath() {
+        // Field capture on #528: a viewer scrubbing backwards through a 49 s storm declared
+        // 194, 185, 182 ... one new GET every ~100 ms, and the breaker tore the pump down anyway
+        // because none of those targets ever passed the high-water mark left by the forward run.
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 220)
+        for t in stride(from: 219, through: 190, by: -1) {
+            #expect(d.observe(currentTarget: t, renderedPosition: Double(t)) == false)
+        }
+    }
+
+    @Test("A target that recedes and then freezes trips, measured from the freeze")
+    func recedeThenFreezeTrips() {
+        // The #93 wedge itself: one backward seek, then the consumer goes silent. The move resets
+        // the window exactly as an advance does, and the freeze after it still trips on time.
+        var d = BackpressureWedgeDetector(breakThresholdSeconds: 3, initialTarget: 220)
+        #expect(d.observe(currentTarget: 181) == false) // the seek's own GET -> reset
+        #expect(d.observe(currentTarget: 181) == false) // 1s stuck
+        #expect(d.observe(currentTarget: 181) == false) // 2s stuck
+        #expect(d.observe(currentTarget: 181) == true)  // 3s stuck -> wedge
+    }
+
+    @Test("A receding target with a flat clock still fast-trips")
+    func recedingTargetWithFlatClockStillFastTrips() {
+        // The deliberate split between the two paths: a scrub burst that keeps declaring targets
+        // while NOTHING renders is the #35/#79 wedge, and breaking that in single digits is what the
+        // fast path is for. Only the slow path treats a move as proof of life.
+        var d = BackpressureWedgeDetector(
+            breakThresholdSeconds: 24, fastBreakThresholdSeconds: 3,
+            initialTarget: 220, initialRenderedPosition: 728.3)
+        #expect(d.observe(currentTarget: 200, renderedPosition: 728.3) == false) // 1s flat
+        #expect(d.observe(currentTarget: 190, renderedPosition: 728.3) == false) // 2s flat
+        #expect(d.observe(currentTarget: 180, renderedPosition: 728.3) == true)  // 3s flat -> fast wedge
+        #expect(d.lastTripFast == true)
+    }
+
+    // MARK: - ParkClock (AE#528: a wakeup is not a second)
+
+    @Test("Wakeups inside the same second count once")
+    func wakeupsInsideOneSecondCountOnce() {
+        // The measured rate in the capture: the cache broadcast roughly every 240 ms while the
+        // viewer scrubbed, which drove the old counter from 12 to 22 "seconds" in 2.4 s.
+        var clock = ParkClock(nowNanos: 0)
+        for ms in stride(from: 240, through: 960, by: 240) {
+            #expect(clock.advance(nowNanos: UInt64(ms) * 1_000_000) == nil)
+        }
+        #expect(clock.advance(nowNanos: 1_000_000_000) == 1)
+        #expect(clock.advance(nowNanos: 1_240_000_000) == nil)
+        #expect(clock.advance(nowNanos: 1_990_000_000) == nil)
+        #expect(clock.advance(nowNanos: 2_000_000_000) == 2)
+    }
+
+    @Test("A busy park reaches its threshold on the clock, not on the wakeup count")
+    func busyParkReachesThresholdOnTheClock() {
+        // 24 wakeups inside 10 s of wall clock: the old loop had spent its whole 24 s break budget,
+        // this one has counted 10 s.
+        var clock = ParkClock(nowNanos: 0)
+        var seconds = 0
+        for i in 1...24 {
+            if let s = clock.advance(nowNanos: UInt64(i) * 416_666_667) { seconds = s }
+        }
+        #expect(seconds == 10)
+    }
+
+    @Test("A missed second is reported once at the age, never replayed")
+    func missedSecondsAreNotReplayed() {
+        // A starved loop counts slower than the clock, never faster: the jump reports the park's
+        // age and the seconds inside it are gone, so a gap can only delay a trip.
+        var clock = ParkClock(nowNanos: 0)
+        #expect(clock.advance(nowNanos: 3_400_000_000) == 3)
+        #expect(clock.advance(nowNanos: 3_900_000_000) == nil)
+        #expect(clock.advance(nowNanos: 4_000_000_000) == 4)
+    }
+
     // MARK: - BackpressureWedgeDetector fast path (#93 retest: park + flat clock)
 
     @Test("Frozen target plus flat rendered clock trips at the fast threshold, well before the slow one")

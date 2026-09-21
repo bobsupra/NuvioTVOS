@@ -173,11 +173,11 @@ final class Issue374FirstServeAccountTests: XCTestCase {
 
         let result = Issue374WaitResult()
         let finished = expectation(description: "startup waiter finished")
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             result.store(provider.waitForFirstLiveSegment(timeout: 3))
             finished.fulfill()
         }
-        Thread.sleep(forTimeInterval: 0.3)
+        while provider.parkedWaiterCount == 0 { usleep(200) }
         append(provider, index: 0)
         append(provider, index: 1)
 

@@ -13,7 +13,17 @@ struct DoviRpuConverterTests {
         [UInt8(type << 1), 0x01] + payload
     }
 
-    private func avPacket(_ bytes: [UInt8]) -> UnsafeMutablePointer<AVPacket> {
+    /// Pack NALs into an AVCC (4-byte BE length prefix) AVPacket, the framing the MKV/MP4 demuxer guarantees.
+    private func avccPacket(_ nals: [[UInt8]]) -> UnsafeMutablePointer<AVPacket> {
+        var bytes: [UInt8] = []
+        for nal in nals {
+            let n = nal.count
+            bytes.append(UInt8((n >> 24) & 0xFF))
+            bytes.append(UInt8((n >> 16) & 0xFF))
+            bytes.append(UInt8((n >> 8) & 0xFF))
+            bytes.append(UInt8(n & 0xFF))
+            bytes.append(contentsOf: nal)
+        }
         let pkt = av_packet_alloc()!
         _ = av_new_packet(pkt, Int32(bytes.count))
         bytes.withUnsafeBytes { src in
@@ -22,27 +32,19 @@ struct DoviRpuConverterTests {
         return pkt
     }
 
-    /// Pack NALs into a length-prefixed AVPacket with the sample entry's declared prefix width.
-    private func lengthPrefixedPacket(_ nals: [[UInt8]], size: Int = 4) -> UnsafeMutablePointer<AVPacket> {
-        var bytes: [UInt8] = []
-        for nal in nals {
-            let n = nal.count
-            for i in 0..<size {
-                let shift = (size - i - 1) * 8
-                bytes.append(UInt8((n >> shift) & 0xFF))
-            }
-            bytes.append(contentsOf: nal)
-        }
-        return avPacket(bytes)
-    }
-
     /// The HEVC NAL types present in a packet, in order.
-    private func nalTypes(_ pkt: UnsafeMutablePointer<AVPacket>, framing: VideoNALFraming = .lengthPrefixed(size: 4)) -> [UInt8] {
+    private func nalTypes(_ pkt: UnsafeMutablePointer<AVPacket>) -> [UInt8] {
         guard let data = pkt.pointee.data else { return [] }
         let size = Int(pkt.pointee.size)
         var out: [UInt8] = []
-        A53SEIParser.forEachNAL(data, size, framing) { nal, _ in
-            out.append((nal[0] >> 1) & 0x3F)
+        var off = 0
+        while off + 4 <= size {
+            var len = 0
+            for i in 0..<4 { len = (len << 8) | Int(data[off + i]) }
+            let start = off + 4
+            if len == 0 || start + len > size { break }
+            out.append((data[start] >> 1) & 0x3F)
+            off = start + len
         }
         return out
     }
@@ -59,7 +61,7 @@ struct DoviRpuConverterTests {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])   // TRAIL_R base-layer VCL
         let rpu = hevcNAL(type: 62, payload: [0x00])       // malformed unspec62, libdovi rejects
         let el = hevcNAL(type: 63, payload: [0xCC])        // unspec63 enhancement layer
-        let pkt = lengthPrefixedPacket([bl, rpu, el])
+        let pkt = avccPacket([bl, rpu, el])
         defer { free(pkt) }
 
         // A libdovi failure reports false...
@@ -71,7 +73,7 @@ struct DoviRpuConverterTests {
     @Test("A non-DV packet is left untouched")
     func leavesNonDVUntouched() {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
-        let pkt = lengthPrefixedPacket([bl])
+        let pkt = avccPacket([bl])
         defer { free(pkt) }
 
         // A non-DV packet is not a conversion failure...
@@ -83,7 +85,7 @@ struct DoviRpuConverterTests {
     func dropsEnhancementLayer() {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
         let el = hevcNAL(type: 63, payload: [0xCC])
-        let pkt = lengthPrefixedPacket([bl, el])
+        let pkt = avccPacket([bl, el])
         defer { free(pkt) }
 
         #expect(DoviRpuConverter.convertPacketToProfile81(pkt) == true)
@@ -95,14 +97,14 @@ struct DoviRpuConverterTests {
     @Test("enhancementLayerType returns nil when no RPU NAL is present")
     func elTypeNilWithoutRPU() {
         let bl = hevcNAL(type: 1, payload: [0xAA, 0xBB])
-        let pkt = lengthPrefixedPacket([bl])
+        let pkt = avccPacket([bl])
         defer { free(pkt) }
         #expect(DoviRpuConverter.enhancementLayerType(pkt) == nil)
     }
 
     @Test("enhancementLayerType returns nil for an unparseable RPU")
     func elTypeNilForMalformedRPU() {
-        let pkt = lengthPrefixedPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 62, payload: [0x00])])
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 62, payload: [0x00])])
         defer { free(pkt) }
         #expect(DoviRpuConverter.enhancementLayerType(pkt) == nil)
     }
@@ -165,96 +167,12 @@ struct DoviRpuConverterTests {
         #expect(head == [0x00, 0x00, 0x00, 0x01])
     }
 
-    @Test("A two-byte length prefix is preserved while rewriting")
-    func preservesTwoByteLengthSize() {
-        let pkt = lengthPrefixedPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 63, payload: [0xCC])], size: 2)
+    @Test("A length prefix size the sample entry cannot declare leaves the packet alone")
+    func refusesUnsupportedLengthSize() {
+        let pkt = avccPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 63, payload: [0xCC])])
         defer { free(pkt) }
         #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: .lengthPrefixed(size: 2)) == true)
-        #expect(nalTypes(pkt, framing: .lengthPrefixed(size: 2)) == [1])
-        #expect(pkt.pointee.data![0] == 0 && pkt.pointee.data![1] == 3)
-    }
-
-    @Test("A one-byte length prefix is preserved while rewriting")
-    func preservesOneByteLengthSize() {
-        let pkt = lengthPrefixedPacket([hevcNAL(type: 1, payload: [0xAA]), hevcNAL(type: 63, payload: [0xCC])], size: 1)
-        defer { free(pkt) }
-        #expect(DoviRpuConverter.convertPacketToProfile81(pkt, framing: .lengthPrefixed(size: 1)) == true)
-        #expect(nalTypes(pkt, framing: .lengthPrefixed(size: 1)) == [1])
-        #expect(pkt.pointee.data![0] == 3)
-    }
-
-    @Test("Packet framing falls back when Annex-B extradata accompanies length-prefixed data")
-    func detectsPacketFramingRatherThanTrustingExtradata() {
-        let extradata: [UInt8] = [0x00, 0x00, 0x01, 0x40, 0x01]
-        let packet = lengthPrefixedPacket([hevcNAL(type: 1, payload: [0xAA, 0xBB])])
-        defer { free(packet) }
-
-        let configured: VideoNALFraming = extradata.withUnsafeBufferPointer {
-            A53SEIParser.nalFraming(codec: .hevc, extradata: $0.baseAddress, size: $0.count)
-        }
-        #expect(configured == .annexB)
-        let detected: VideoNALFraming? = packet.pointee.data.flatMap {
-            A53SEIParser.detectNALFraming(
-                $0, Int(packet.pointee.size), preferred: configured)
-        }
-        #expect(detected == .lengthPrefixed(size: 4))
-    }
-
-    @Test("A 0x00000103 length prefix is not mistaken for Annex-B")
-    func detectsLengthPrefixWithStartCodeLookingBytes() {
-        // 2-byte HEVC header + 257-byte payload = 259 bytes = 0x00000103.
-        let packet = lengthPrefixedPacket(
-            [hevcNAL(type: 1, payload: Array(repeating: 0xAA, count: 257))])
-        defer { free(packet) }
-        guard let data = packet.pointee.data else {
-            Issue.record("packet allocation returned no data")
-            return
-        }
-        #expect(A53SEIParser.detectNALFraming(
-            data, Int(packet.pointee.size), preferred: .annexB
-        ) == .lengthPrefixed(size: 4))
-    }
-
-    @Test("Length-prefixed stream resolution ignores an ambiguous packet")
-    func resolvesLengthPrefixedStreamFromConclusiveEvidence() {
-        let ambiguous = lengthPrefixedPacket(
-            [hevcNAL(type: 1, payload: Array(repeating: 0xAA, count: 257))])
-        let conclusive = lengthPrefixedPacket(
-            [hevcNAL(type: 1, payload: Array(repeating: 0xBB, count: 510))])
-        defer { free(ambiguous); free(conclusive) }
-
-        let evidence = [ambiguous, conclusive].compactMap { packet -> [VideoNALFraming]? in
-            guard let data = packet.pointee.data else { return nil }
-            return A53SEIParser.allValidNALFramings(data, Int(packet.pointee.size))
-        }
-        #expect(evidence[0].contains(.annexB))
-        #expect(evidence[0].contains(.lengthPrefixed(size: 4)))
-        #expect(evidence[1] == [.lengthPrefixed(size: 4)])
-        #expect(A53SEIParser.resolveNALFraming(samples: evidence, configured: .annexB)
-                == .lengthPrefixed(size: 4))
-    }
-
-    @Test("Annex-B stream resolution ignores a packet that synthetically closes as length-prefixed")
-    func resolvesAnnexBStreamFromConclusiveEvidence() {
-        // Start code + NAL bytes arranged so the first start code is also a valid 3-byte
-        // length-prefixed walk: length 1, then length 3, then exactly three bytes.
-        let ambiguousBytes: [UInt8] = [0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x03, 0x40, 0x01, 0xAA]
-        let ambiguous = avPacket(ambiguousBytes)
-        let conclusive = annexBPacket([
-            hevcNAL(type: 1, payload: [0xAA]),
-            hevcNAL(type: 1, payload: [0xBB])
-        ])
-        defer { free(ambiguous); free(conclusive) }
-
-        let evidence = [ambiguous, conclusive].compactMap { packet -> [VideoNALFraming]? in
-            guard let data = packet.pointee.data else { return nil }
-            return A53SEIParser.allValidNALFramings(data, Int(packet.pointee.size))
-        }
-        #expect(evidence[0].contains(.annexB))
-        #expect(evidence[0].contains(.lengthPrefixed(size: 3)))
-        #expect(evidence[1] == [.annexB])
-        #expect(A53SEIParser.resolveNALFraming(
-            samples: evidence, configured: .lengthPrefixed(size: 3)) == .annexB)
+        #expect(nalTypes(pkt) == [1, 63])   // untouched rather than rewritten into a framing nobody declared
     }
 
     @Test("enhancementLayerType walks Annex-B packets when given the framing")

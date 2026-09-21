@@ -34,7 +34,15 @@ final class ThrottledOriginServer: @unchecked Sendable {
 
     let port: UInt16
     private let listenFD: Int32
-    private let totalSize: Int64
+    /// #551: a var only so a test can make the origin's stated total CHANGE between two requests,
+    /// which is the one shape that proves the reader rechecks a warm's size against the connection
+    /// that is actually serving it. Every other test leaves it at its init value.
+    private var totalSize: Int64
+    /// #551: answer a finite range with everything from its start to the end of the source, i.e.
+    /// serve WIDER than asked. Non-conforming, and a real shape: an edge that rounds a range up to
+    /// its own chunk boundary does this. Default off keeps every existing test on the historical
+    /// behaviour.
+    private let ignoreRangeEnd: Bool
     private let chunkBytes: Int
     private let throttleUs: useconds_t
     private let firstByteDelayUs: @Sendable (_ isSuffix: Bool) -> useconds_t
@@ -65,6 +73,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     var refusedForConcurrency: Int {
         lock.lock(); defer { lock.unlock() }
         return _refusedForConcurrency
+    }
+
+    /// #551 only: restate the source's size for every request from here on.
+    func setTotalSize(_ size: Int64) {
+        lock.lock(); totalSize = size; lock.unlock()
     }
 
     var bytesWritten: Int64 {
@@ -110,9 +123,11 @@ final class ThrottledOriginServer: @unchecked Sendable {
     /// winning its race in the field. `isSuffix` is true for the `bytes=-n` form.
     init?(totalSize: Int64, chunkBytes: Int = 256 * 1024, throttleUs: useconds_t = 5000,
           refuseAboveConcurrency: Int? = nil,
+          ignoreRangeEnd: Bool = false,
           firstByteDelayUs: @escaping @Sendable (_ isSuffix: Bool) -> useconds_t = { _ in 0 },
           respond: @escaping @Sendable (_ requestIndex: Int, _ offset: Int64, _ path: String) -> Directive = { _, _, _ in .serve206 }) {
         self.totalSize = totalSize
+        self.ignoreRangeEnd = ignoreRangeEnd
         self.chunkBytes = chunkBytes
         self.throttleUs = throttleUs
         self.refuseAboveConcurrency = refuseAboveConcurrency
@@ -306,7 +321,7 @@ final class ThrottledOriginServer: @unchecked Sendable {
             pendingDelay -= slice
         }
 
-        let last = rangeEnd ?? (totalSize - 1)
+        let last = (ignoreRangeEnd ? nil : rangeEnd) ?? (totalSize - 1)
         let remaining = last - offset + 1
         // Keep-alive, not close: a bounded range that tears the socket down would make every
         // refill a fresh connection and would hide exactly the pooling question under test.

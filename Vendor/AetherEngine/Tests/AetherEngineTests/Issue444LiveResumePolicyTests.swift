@@ -110,3 +110,43 @@ struct Issue444LiveResumePolicyTests {
         #expect(LoadOptions().clampsLiveResumeToWindow)
     }
 }
+
+/// AE#444 follow-up (Sodalite#104): the clamp reports what it did.
+///
+/// The clamp has been right since AE#444 and is the only sane thing to do: a session paused for
+/// longer than its own buffer depth has had the position it was parked on evicted by the sliding
+/// window. What it could not do is tell anyone. Measured on the harness with a 30 s window and a 70 s
+/// pause, the playhead sat at 93881.2 while the window slid to 93890.0...93920.0 underneath it and
+/// the resume landed at 93895.0 in silence, so a viewer who paused a match saw it continue somewhere
+/// else with nothing on screen to say why.
+@Suite("The live resume clamp reports what it took (Sodalite#104)")
+struct LiveResumeClampReportTests {
+
+    /// The harness capture, as the payload describes it.
+    @Test("the payload names the content the window took, and where the resume landed")
+    func thepayloadDescribesTheClamp() {
+        // playhead 93881.16, window slid to 93890.0...93920.0, clamp target 93895.0, edge 93919.99.
+        let clamp = LiveResumeClamp(skippedSeconds: 93895.0 - 93881.16,
+                                    behindLiveSeconds: 93919.99 - 93895.0)
+        #expect(abs(clamp.skippedSeconds - 13.84) < 0.01)
+        #expect(abs(clamp.behindLiveSeconds - 24.99) < 0.01)
+    }
+
+    @Test("an edge snap skipped everything it was behind, and lands at the edge")
+    func anedgeSnapIsAllOfIt() {
+        // The live-only shape: no DVR window to clamp into, so the resume is the edge itself.
+        let clamp = LiveResumeClamp(skippedSeconds: 38.8, behindLiveSeconds: 0)
+        #expect(clamp.behindLiveSeconds == 0)
+        #expect(clamp.skippedSeconds > 0)
+    }
+
+    @Test("the two numbers are independent, so a host can phrase either")
+    func bothNumbersAreCarried() {
+        // A host that wants "you missed 14 seconds" and one that wants "continuing 25 seconds behind
+        // live" are both served without doing arithmetic against a window they cannot see.
+        let a = LiveResumeClamp(skippedSeconds: 14, behindLiveSeconds: 25)
+        let b = LiveResumeClamp(skippedSeconds: 14, behindLiveSeconds: 0)
+        #expect(a != b)
+        #expect(a.skippedSeconds == b.skippedSeconds)
+    }
+}

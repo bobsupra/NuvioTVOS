@@ -158,6 +158,29 @@ struct HLSOriginRelayAddressingTests {
         #expect(try await status(of: stranger) == 404, "a stale or scanned token was answered")
     }
 
+    @Test("A blocking-reload request keeps the parameters that make it block")
+    func blockingReloadParametersReachTheOrigin() throws {
+        // AVPlayer appends _HLS_msn / _HLS_part to a playlist URL that advertises CAN-BLOCK-RELOAD
+        // (#441). The relay URL already carries a query, so they arrive alongside `origin`; dropped,
+        // the reload answers at once and the player asks again immediately.
+        let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
+        let local = try #require(HLSOriginRelay.localURL(for: origin, port: 51234, token: token))
+        let asAVPlayerAsks = "\(local.query ?? "")&_HLS_msn=42&_HLS_part=3"
+
+        let upstream = try #require(HLSOriginRelay.originURL(fromQuery: asAVPlayerAsks))
+        #expect(upstream.path == "/hls/media.m3u8")
+        let query = try #require(upstream.query)
+        #expect(query.contains("ApiKey=k"), "the origin's own query was dropped: \(query)")
+        #expect(query.contains("_HLS_msn=42"), "the blocking-reload sequence was dropped: \(query)")
+        #expect(query.contains("_HLS_part=3"), "the blocking-reload part was dropped: \(query)")
+    }
+
+    // Everything from here to the end of this suite drives a REAL origin, and the origins below
+    // are subprocesses: `Process` exists only on macOS, so elsewhere these tests name servers that
+    // cannot be built. Without the gate the whole test target fails to COMPILE for iOS and tvOS,
+    // which a macOS `swift build` never shows.
+    #if os(macOS)
+
     @Test("A range is forwarded verbatim and its framing comes back")
     func rangesPassThroughUntouched() async throws {
         let upstream = try #require(RangeEchoOrigin())
@@ -206,23 +229,6 @@ struct HLSOriginRelayAddressingTests {
         let snapshot = try #require(OriginRequestBudget.shared.snapshot(for: origin))
         #expect(snapshot.refusals == 1, "a 429 through the relay was charged \(snapshot.refusals) times")
         #expect(snapshot.limit == 1, "the refusal did not bring the origin's concurrency down")
-    }
-
-    @Test("A blocking-reload request keeps the parameters that make it block")
-    func blockingReloadParametersReachTheOrigin() throws {
-        // AVPlayer appends _HLS_msn / _HLS_part to a playlist URL that advertises CAN-BLOCK-RELOAD
-        // (#441). The relay URL already carries a query, so they arrive alongside `origin`; dropped,
-        // the reload answers at once and the player asks again immediately.
-        let origin = URL(string: "https://media.example.com/hls/media.m3u8?ApiKey=k")!
-        let local = try #require(HLSOriginRelay.localURL(for: origin, port: 51234, token: token))
-        let asAVPlayerAsks = "\(local.query ?? "")&_HLS_msn=42&_HLS_part=3"
-
-        let upstream = try #require(HLSOriginRelay.originURL(fromQuery: asAVPlayerAsks))
-        #expect(upstream.path == "/hls/media.m3u8")
-        let query = try #require(upstream.query)
-        #expect(query.contains("ApiKey=k"), "the origin's own query was dropped: \(query)")
-        #expect(query.contains("_HLS_msn=42"), "the blocking-reload sequence was dropped: \(query)")
-        #expect(query.contains("_HLS_part=3"), "the blocking-reload part was dropped: \(query)")
     }
 
     @Test("An origin that says the resource is gone is not rewritten into a playlist")
@@ -348,6 +354,8 @@ struct HLSOriginRelayAddressingTests {
         let down = await HLSOriginRelay.systemTrustRefuses(URL(string: "https://127.0.0.1:9/x.m3u8")!)
         #expect(down == false, "an unreachable origin was read as a trust refusal")
     }
+
+    #endif
 
     @Test("A header value from the origin cannot write a second response")
     func headerValuesAreSanitised() {

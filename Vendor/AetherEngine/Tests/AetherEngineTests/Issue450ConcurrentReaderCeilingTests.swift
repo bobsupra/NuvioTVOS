@@ -45,14 +45,6 @@ struct Issue450ConcurrentReaderCeilingTests {
         }
     }
 
-    private static func waitUntil(_ budget: TimeInterval, _ condition: () -> Bool) async throws {
-        let stopAt = Date().addingTimeInterval(budget)
-        while Date() < stopAt {
-            if condition() { return }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-    }
-
     private static func read(_ reader: AVIOReader, bytes target: Int, deadline: TimeInterval) -> Int {
         let buf = UnsafeMutablePointer<UInt8>.allocate(capacity: target)
         defer { buf.deallocate() }
@@ -209,9 +201,9 @@ struct Issue450ConcurrentReaderCeilingTests {
 
         // Let the first range complete, then consume enough to put the refill on the wire. That
         // refill is the generation that receives headers and no body.
-        try await Self.waitUntil(10) { !reader.hasLiveConnectionForTesting }
+        try await waitFor(upTo: .seconds(10)) { !reader.hasLiveConnectionForTesting }
         #expect(Self.read(reader, bytes: 512 * 1024, deadline: 10) == 512 * 1024)
-        try await Self.waitUntil(10) { !sink.matching("no first byte after").isEmpty }
+        try await waitFor(upTo: .seconds(10)) { !sink.matching("no first byte after").isEmpty }
 
         let lines = sink.matching("no first byte after")
         #expect(!lines.isEmpty, "a generation that received headers and no body was never reported")

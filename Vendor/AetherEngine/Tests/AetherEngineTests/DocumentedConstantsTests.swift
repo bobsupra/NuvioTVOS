@@ -19,6 +19,17 @@ import AetherLibavcodec
 @MainActor
 final class DocumentedConstantsTests: XCTestCase {
 
+    func testPartialCompositionHoldBoundsMatchDocumentation() throws {
+        let docs = try documentation()
+        XCTAssertEqual(H264PartialCompositionRepair.maximumReorderDepth, 16)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumHeldPackets, 1024)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumHeldBytes, 32 << 20)
+        XCTAssertEqual(H264PartialCompositionRepair.maximumProofPictures, 64)
+        assertDocumented("to **16 pictures**", docs)
+        assertDocumented("**1024 interleaved packets and\n32 MiB**", docs)
+        assertDocumented("within **64 pictures**", docs)
+    }
+
     // MARK: - Documentation corpus
 
     private static var repoRoot: URL {
@@ -219,6 +230,36 @@ final class DocumentedConstantsTests: XCTestCase {
         let engineSource = try sourceFile("Sources/AetherEngine/AetherEngine.swift")
         XCTAssertTrue(engineSource.contains("Both paths are pitch-preserving"),
                       "setRate's own documentation must keep saying which paths correct pitch")
+    }
+
+    // MARK: - The version the engine reports about itself (AetherPlayer#7)
+
+    /// `AetherEngine.version` is the number a host puts in its About panel and in the header of the
+    /// log a reporter attaches, so a stale one does not read as stale: it reads as a fact about the
+    /// build under discussion, and an analysis then runs against the wrong engine. Nothing in the
+    /// compiler knows that 7.2.0 stopped being true.
+    ///
+    /// A release already rewrites three statements of the same number, so the constant is pinned to
+    /// all three. A forgotten bump is a red test here rather than a log line that lies.
+    func testReportedVersionMatchesEveryPublishedStatementOfIt() throws {
+        assertDocumented(#"from: "\#(AetherEngine.version)""#, try documentation())
+
+        let examples = try sourceFile("Examples/README.md")
+        XCTAssertTrue(examples.contains("starting from `\(AetherEngine.version)`"), """
+            Examples/README.md no longer says "starting from `\(AetherEngine.version)`".
+            The dependency step an adopter follows has to name the version the engine reports.
+            """)
+
+        let newestRelease = try sourceFile("CHANGELOG.md")
+            .split(separator: "\n")
+            .first { $0.hasPrefix("## [") && !$0.hasPrefix("## [Unreleased]") }
+            .map { $0.drop { $0 != "[" }.dropFirst().prefix { $0 != "]" } }
+            .map(String.init)
+        XCTAssertEqual(newestRelease, AetherEngine.version, """
+            AetherEngine.version says \(AetherEngine.version), the newest CHANGELOG entry says \
+            \(newestRelease ?? "nothing"). Both move in the release prep commit, together with the \
+            README install snippets.
+            """)
     }
 
     /// The docs corpus is README + docs/; a claim living in a source docstring is read straight.

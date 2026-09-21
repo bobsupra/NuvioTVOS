@@ -97,29 +97,29 @@ struct Issue418ReaimedGateAxisTests {
 
     @Test("the first placement of a session establishes the axis")
     func firstPlacementEstablishesTheAxis() {
-        #expect(HLSVideoEngine.axisShift(after: 0, placing: -9.0, displacement: 0) == -9.0)
+        #expect(HLSVideoEngine.placementOffset(after: 0, placing: -9.0, displacement: 0) == -9.0)
     }
 
     @Test("an axis-true segment leaves the axis where it is")
     func axisTrueSegmentChangesNothing() {
         // The reporter's seek burst: seg179 was cut on its own boundary, and the run kept -14.056.
-        #expect(HLSVideoEngine.axisShift(after: -14.056, placing: 0, displacement: 0) == -14.056)
+        #expect(HLSVideoEngine.placementOffset(after: -14.056, placing: 0, displacement: 0) == -14.056)
     }
 
     @Test("re-placing the segment the gate opened into adds its offset again")
     func rePlacingTheAnchorComposes() {
         // Measured: resume 53 reads -9.000, and a seek that re-fetches that same segment reads -18.000.
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, displacement: 0) == -18.0)
+        #expect(HLSVideoEngine.placementOffset(after: -9.0, placing: -9.0, displacement: 0) == -18.0)
         // And at the deepest tier of the tiered fixture, -11.000 -> -22.000.
-        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -11.0, displacement: 0) == -22.0)
+        #expect(HLSVideoEngine.placementOffset(after: -11.0, placing: -11.0, displacement: 0) == -22.0)
     }
 
     @Test("a later epoch's own re-aim composes onto what the timeline already carries")
     func newEpochComposesOntoTheOldAxis() {
         // Measured: a -9.000 run, seek to 60, producer restarts at seg12 and re-aims 5 s, reads -14.000.
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -5.0, displacement: 0) == -14.0)
+        #expect(HLSVideoEngine.placementOffset(after: -9.0, placing: -5.0, displacement: 0) == -14.0)
         // Tiered fixture: a -11.000 run whose seek restarts at seg23 re-aiming 7 s reads -18.000.
-        #expect(HLSVideoEngine.axisShift(after: -11.0, placing: -7.0, displacement: 0) == -18.0)
+        #expect(HLSVideoEngine.placementOffset(after: -11.0, placing: -7.0, displacement: 0) == -18.0)
     }
 
     // MARK: - Round 8: what a placement sits below its axis is measured in seconds
@@ -159,9 +159,9 @@ struct Issue418ReaimedGateAxisTests {
         // advertised at 44.000 from item 54.042, so the base was -10.042. Round 7 read the same
         // number and could learn nothing from it, because dividing it by a lead of zero is not a
         // coefficient; it then composed the next placement on the axis itself.
-        let measured = HLSVideoEngine.placementDisplacement(axis: -10.0, measuredBase: -10.042)
+        let measured = HLSVideoEngine.placementDisplacement(offset: -10.0, measuredBase: -10.042)
         #expect(abs(measured - 0.042) < 1e-9)
-        #expect(abs(HLSVideoEngine.placementBase(axis: -10.0, displacement: measured) - (-10.042)) < 1e-9)
+        #expect(abs(HLSVideoEngine.placementBase(offset: -10.0, displacement: measured) - (-10.042)) < 1e-9)
     }
 
     @Test("one source places two different ways, so no session-wide law describes it")
@@ -169,9 +169,9 @@ struct Issue418ReaimedGateAxisTests {
         // tc-bf1-cues-lie.mkv, the same segment placed twice in one session: base -9.000 on an axis
         // of -9.000, then -10.083 on an axis of -10.000. Round 6 read those as 0.00x and 1.98x of one
         // constant and round 7 took their median, which is the value that was wrong both times.
-        #expect(abs(HLSVideoEngine.placementDisplacement(axis: -9.0, measuredBase: -9.0)) < 1e-9)
+        #expect(abs(HLSVideoEngine.placementDisplacement(offset: -9.0, measuredBase: -9.0)) < 1e-9)
         #expect(abs(HLSVideoEngine.placementDisplacement(
-            axis: -10.0, measuredBase: -10.083) - 0.083) < 1e-9)
+            offset: -10.0, measuredBase: -10.083) - 0.083) < 1e-9)
     }
 
     @Test("every reading teaches, including the one that confirms")
@@ -181,17 +181,17 @@ struct Issue418ReaimedGateAxisTests {
         // learned nothing at all. Measured on tc-wide-cues-lie.mkv, 13 of 13 placements across two
         // runs carried `lead 0.000s`; the reporter's three arms produced one sample between them.
         // A displacement is in the same units as the thing it corrects, so a zero is a reading too.
-        #expect(HLSVideoEngine.placementDisplacement(axis: -9.0, measuredBase: -9.0) == 0)
+        #expect(HLSVideoEngine.placementDisplacement(offset: -9.0, measuredBase: -9.0) == 0)
         #expect(abs(HLSVideoEngine.placementDisplacement(
-            axis: -9.0, measuredBase: -9.083) - 0.083) < 1e-9)
+            offset: -9.0, measuredBase: -9.083) - 0.083) < 1e-9)
     }
 
     @Test("a placement within a hair of its axis is on it")
     func subMillisecondIsNoDisplacement() {
         // A chain of confirmations otherwise carries the float residue of its own subtraction, and
         // prints it: `sitting -0.000s below its axis` on the drought fixture, three placements deep.
-        #expect(HLSVideoEngine.placementDisplacement(axis: -10.333, measuredBase: -10.333) == 0)
-        #expect(HLSVideoEngine.placementDisplacement(axis: -10.0, measuredBase: -10.0005) == 0)
+        #expect(HLSVideoEngine.placementDisplacement(offset: -10.333, measuredBase: -10.333) == 0)
+        #expect(HLSVideoEngine.placementDisplacement(offset: -10.0, measuredBase: -10.0005) == 0)
     }
 
     @Test("a wrong reading cannot carry further than a placement ever sits")
@@ -200,9 +200,9 @@ struct Issue418ReaimedGateAxisTests {
         // undoes it. What it must not do is leave a prediction behind that outlives the mistake. The
         // widest placement measured is three frames at 24 fps; the clamp is well past that and well
         // inside the seam tolerance, so a stray can never move a composition by a segment.
-        #expect(HLSVideoEngine.placementDisplacement(axis: -9.0, measuredBase: -42.0)
+        #expect(HLSVideoEngine.placementDisplacement(offset: -9.0, measuredBase: -42.0)
             == HLSVideoEngine.maxPlacementDisplacementSeconds)
-        #expect(HLSVideoEngine.placementDisplacement(axis: -9.0, measuredBase: 33.0)
+        #expect(HLSVideoEngine.placementDisplacement(offset: -9.0, measuredBase: 33.0)
             == -HLSVideoEngine.maxPlacementDisplacementSeconds)
         #expect(HLSVideoEngine.maxPlacementDisplacementSeconds
             < HLSVideoEngine.placementSeamToleranceSeconds)
@@ -213,8 +213,8 @@ struct Issue418ReaimedGateAxisTests {
         // Which is also round 5's rule for an item's FIRST placement, and it now falls out of having
         // no reading rather than being a case of its own: AVPlayer anchors the item on that
         // placement, measured base 0.000 on every arm of every fixture.
-        #expect(HLSVideoEngine.placementBase(axis: -9.0, displacement: 0) == -9.0)
-        #expect(HLSVideoEngine.axisShift(after: -9.0, placing: -9.0, displacement: 0) == -18.0)
+        #expect(HLSVideoEngine.placementBase(offset: -9.0, displacement: 0) == -9.0)
+        #expect(HLSVideoEngine.placementOffset(after: -9.0, placing: -9.0, displacement: 0) == -18.0)
     }
 
     @Test("a composition lands on the base, and the axis is what the base and the worth make")
@@ -222,8 +222,8 @@ struct Issue418ReaimedGateAxisTests {
         // tc-bf-cues-lie.mkv, second placement: the axis stood at -9.000, AVPlayer held the re-placed
         // segment from item 53.083 rather than the 53.000 the axis alone predicts, and the picture
         // read the difference for the rest of the run.
-        #expect(abs(HLSVideoEngine.placementBase(axis: -9.0, displacement: 0.083) - (-9.083)) < 1e-9)
-        #expect(abs(HLSVideoEngine.axisShift(
+        #expect(abs(HLSVideoEngine.placementBase(offset: -9.0, displacement: 0.083) - (-9.083)) < 1e-9)
+        #expect(abs(HLSVideoEngine.placementOffset(
             after: -9.0, placing: -9.0, displacement: 0.083) - (-18.083)) < 1e-9)
     }
 
@@ -231,7 +231,7 @@ struct Issue418ReaimedGateAxisTests {
     func seamFollowsTheBase() {
         // seg13 advertised at 52.000 composing onto -9.000 with a measured displacement of 0.083
         // begins at item 61.083, which is where AVPlayer reported holding it.
-        let base = HLSVideoEngine.placementBase(axis: -9.0, displacement: 0.083)
+        let base = HLSVideoEngine.placementBase(offset: -9.0, displacement: 0.083)
         #expect(abs(HLSVideoEngine.seamItemSeconds(advertisedStart: 52.0, currentShift: base) - 61.083) < 1e-9)
     }
 
@@ -251,39 +251,27 @@ struct Issue418ReaimedGateAxisTests {
 
     // MARK: - What a producer restart does to the record
 
-    @Test("a new epoch drops what older epochs claimed at and above its own index")
-    func newEpochDropsTheIndicesItRewrites() {
-        let table = HLSVideoEngine.epochShiftTable([11: -0.875, 13: -9.0], recordingEpochAt: 12, shift: -5.0)
-        #expect(table == [11: -0.875, 12: -5.0])
-        // seg13 is now cut on its own boundary by the new producer, so claiming -9.0 for it would be
-        // the table-shaped mistake round 1 avoided by keeping a single pair.
-        #expect(table[13] == nil)
-    }
-
-    @Test("an epoch that opened on its boundary is recorded as worth nothing")
-    func exactEpochIsRecordedAsZero() {
-        // Round 2 asserted the opposite, that such an epoch is not recorded at all, and that
-        // assertion was the AE#448 defect written down: the entry is what says "an epoch begins
-        // here", so dropping it left the stretch the epoch had just taken over folding with the seam
-        // underneath it. Worth nothing to the axis VALUE is not the same as nothing to record.
-        #expect(HLSVideoEngine.epochShiftTable([13: -9.0], recordingEpochAt: 20, shift: 0)
-                == [13: -9.0, 20: 0])
-    }
-
+    // The record itself moved to `EpochAxisTable` with PR #533, and its cases with it; what a
+    // restart does to it is pinned in `EpochAxisTableTests`. Round 2 asserted that an epoch worth
+    // nothing is not recorded at all, and that assertion was the AE#448 defect written down.
     @Test("segments below a restart keep the offset their bytes still carry")
     func segmentsBelowARestartAreUntouched() {
-        let table = HLSVideoEngine.epochShiftTable([2: -0.875], recordingEpochAt: 13, shift: -9.0)
-        #expect(table == [2: -0.875, 13: -9.0])
+        var table = EpochAxisTable()
+        table.record(.zeroOrigin(-0.875), at: 2)
+        table.record(.zeroOrigin(-9.0), at: 13)
+        #expect(table.opening(at: 2)?.placedOffset == -0.875)
+        #expect(table.opening(at: 13)?.placedOffset == -9.0)
     }
 
     // MARK: - What a seek does to the axis
 
-    @Test("a sub-second axis does not survive a seek")
+    @Test("a sub-second axis does not survive a seek that leaves the buffer")
     func subSecondAxisSnaps() {
-        // Measured: -0.500 and -0.875 both read axisErr 0.000 after a seek.
-        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.5) == 0)
-        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.875) == 0)
-        #expect(HLSVideoEngine.axisShiftAfterSeek(0.375) == 0)
+        // Measured: -0.500 and -0.875 both read axisErr 0.000 after a seek. AE#534: every arm that
+        // measured this boundary LEFT the buffer, so they are stated here as what they were.
+        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.5, landingIsPlaced: false) == 0)
+        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.875, landingIsPlaced: false) == 0)
+        #expect(HLSVideoEngine.axisShiftAfterSeek(0.375, landingIsPlaced: false) == 0)
     }
 
     @Test("a second or more survives a seek unchanged")
@@ -291,13 +279,35 @@ struct Issue418ReaimedGateAxisTests {
         // Measured, every one of them across a seek: -1.000, -1.083, -1.292, -1.500, -3.000,
         // -4.000, -7.000, -9.000, -11.000. The boundary sits between -0.875 and -1.000.
         for shift in [-1.0, -1.083, -1.292, -1.5, -3.0, -4.0, -7.0, -9.0, -11.0, -22.0] {
-            #expect(HLSVideoEngine.axisShiftAfterSeek(shift) == shift)
+            #expect(HLSVideoEngine.axisShiftAfterSeek(shift, landingIsPlaced: false) == shift)
         }
     }
 
     @Test("an axis of zero stays zero")
     func zeroStaysZero() {
-        #expect(HLSVideoEngine.axisShiftAfterSeek(0) == 0)
+        #expect(HLSVideoEngine.axisShiftAfterSeek(0, landingIsPlaced: false) == 0)
+    }
+
+    // MARK: - AE#534: a landing AVPlayer already holds
+
+    @Test("a sub-second axis survives a seek whose landing is already placed")
+    func subSecondAxisSurvivesAHeldLanding() {
+        // The reported case: same standing axis of -0.375, and the only difference between the two
+        // arms is whether the landing was inside what AVPlayer had placed. Held, it keeps the
+        // displacement, so discarding it here is what put `capErr` at -0.400 for the rest of the run.
+        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.375, landingIsPlaced: true) == -0.375)
+        #expect(HLSVideoEngine.axisShiftAfterSeek(-0.5, landingIsPlaced: true) == -0.5)
+        #expect(HLSVideoEngine.axisShiftAfterSeek(0.375, landingIsPlaced: true) == 0.375)
+    }
+
+    @Test("a placed landing changes nothing for an axis that already survived")
+    func placedLandingLeavesALargeAxisAlone() {
+        // The gate may only ever ADD a survival. An axis of a second or more was never discarded, so
+        // both answers have to agree there, or the fix has moved an arm it was not asked about.
+        for shift in [-1.0, -1.292, -3.0, -9.0, -22.0, 0.0] {
+            #expect(HLSVideoEngine.axisShiftAfterSeek(shift, landingIsPlaced: true)
+                    == HLSVideoEngine.axisShiftAfterSeek(shift, landingIsPlaced: false))
+        }
     }
 
     // MARK: - What counts as a placement

@@ -123,7 +123,9 @@ struct Issue240SideReaderLinkPriorityTests {
     private static func harvestedPTS(
         link: SideReaderLinkArbiter?,
         reanchor: SubtitleForwardPrefetcher.SideReaderReanchor? = nil,
-        playheadCalls: Int = 200
+        playheadCalls: Int = 200,
+        leadSeconds: Double = 3600,
+        requestAnchor: (onCall: Int, seconds: Double)? = nil
     ) async throws -> [Double] {
         let demuxer = try makeDemuxer()
         defer { demuxer.close() }
@@ -138,11 +140,19 @@ struct Issue240SideReaderLinkPriorityTests {
             demuxer: demuxer, store: store,
             streamIndices: [subtitleIndex], assemblyIndices: [],
             pacingIndex: pacingIndex,
-            leadSeconds: 3600,                 // park disabled: the arbitration is the subject
+            leadSeconds: leadSeconds,          // 3600 disables the park: the arbitration is the subject
             parkPollNanoseconds: 1_000_000,
             link: link,
             reanchor: reanchor,
-            playhead: { await calls.next() ? 0.0 : nil })
+            playhead: {
+                guard await calls.next() else { return nil }
+                // #496: the park is what calls back, so a request posted from here arrives while
+                // the reader is parked, which is the shape a backward seek leaves behind.
+                if let requestAnchor, await calls.used == requestAnchor.onCall {
+                    reanchor?.request(requestAnchor.seconds)
+                }
+                return 0.0
+            })
         return store.entries(streamIndex: subtitleIndex, from: 0, through: 1000).map(\.ptsSeconds)
     }
 
@@ -233,6 +243,40 @@ struct Issue240SideReaderLinkPriorityTests {
         #expect(box.take() == nil, "the request is consumed once, not re-run every iteration")
     }
 
+    /// #496: both of the loop's waits sit BEFORE the point where the pending move is taken, so
+    /// either of them can hold a move the viewer has already made. Reported as subtitles dropping
+    /// out for 20 to 40 s at a time in the middle of healthy playback, with `prefetchLead` measured
+    /// at -215.8 s: a reader still banking packets for the stretch the viewer left, while the
+    /// stretch he is in is harvested by nobody.
+    @Test("a busy video path may not hold a pending re-anchor")
+    func reanchorSurvivesTheLinkYield() async throws {
+        let box = SubtitleForwardPrefetcher.SideReaderReanchor(
+            anchorStreamIndex: -1, fallbackDuration: 15, seekTimeout: 5)
+        box.request(10)
+
+        _ = try await Self.harvestedPTS(
+            link: Self.arbiter(videoProducing: true, anchorGraceSeconds: 0), reanchor: box)
+        #expect(box.take() == nil, "the move must be applied, not left waiting on the link")
+        // What the reader then BANKS at the new position is bought by the grace window, which
+        // `readerStopsWhileTheVideoPathFetches` covers; this arbiter runs with none on purpose, so
+        // that applying the move is the only thing the expectation above can be measuring.
+    }
+
+    /// The other wait, and the worse one: a backward seek leaves the read position far past the new
+    /// playhead, so the park's own condition stays true for as long as the viewer stays behind it.
+    /// The pending move is what ends that, and the park never looks.
+    @Test("a parked reader may not hold a pending re-anchor")
+    func reanchorSurvivesThePark() async throws {
+        let box = SubtitleForwardPrefetcher.SideReaderReanchor(
+            anchorStreamIndex: -1, fallbackDuration: 15, seekTimeout: 5)
+
+        // Lead 1 s against a playhead held at 0 parks the loop on the fixture's 3 s cue, and the
+        // move arrives after that, from inside the park's own callback.
+        _ = try await Self.harvestedPTS(link: nil, reanchor: box, leadSeconds: 1,
+                                        requestAnchor: (onCall: 3, seconds: 0))
+        #expect(box.take() == nil, "the move must be applied, not left waiting behind the park")
+    }
+
     /// A seek burst is several jumps in a few seconds. The reader owes the link one move to where
     /// the viewer ended up, not one per seek along the way.
     @Test("only the newest anchor survives a burst")
@@ -293,10 +337,12 @@ struct Issue240SideReaderLinkPriorityTests {
 /// loop's engine-gone exit. Lets a yielding loop terminate without a timeout.
 private actor CallBudget {
     private var remaining: Int
+    private(set) var used = 0
     init(limit: Int) { remaining = limit }
     func next() -> Bool {
         guard remaining > 0 else { return false }
         remaining -= 1
+        used += 1
         return true
     }
 }

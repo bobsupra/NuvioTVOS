@@ -199,3 +199,116 @@ struct Issue460ReloadWithOptionsTests {
         #expect(engine.loadedOptions.httpHeaders["Authorization"] == "Bearer fresh")
     }
 }
+
+/// AE#464 round 3 (cmcpherson274, read off the code at 6.81.0): `autoplay` was accepted by the
+/// correction, named inside `#460: reload applying ...` and then overwritten by the session's own
+/// transport. Neither refused nor applied is a real third answer, and it is the one the log could
+/// not give: the docs had said so since round 2, but a host reads the log while its correction is
+/// happening and the two read very differently there.
+@Suite("AE#464 round 3: a field the session owns is not a field the reload applies")
+struct Issue464SessionOwnedFieldTests {
+
+    @Test("the session-owned list is a real subset of the struct and names no identity field")
+    func inventoryHolds() {
+        for field in SessionOptionCorrection.sessionOwnedFields {
+            #expect(SessionOptionCorrection.knownFields.contains(field),
+                    "sessionOwnedFields names \(field), which LoadOptions no longer carries")
+            #expect(!SessionOptionCorrection.loadIdentityFields.contains(field),
+                    "\(field) cannot be both refused and quietly owned")
+        }
+    }
+
+    @Test("what the session owns is split out of what the reload applies")
+    func partitionSplitsTheChange() {
+        let split = SessionOptionCorrection.partitionChanges(
+            ["httpHeaders", "autoplay", "teletextPage"], sessionOwnsTransport: true)
+        #expect(split.applied == ["httpHeaders", "teletextPage"])
+        #expect(split.sessionOwned == ["autoplay"])
+    }
+
+    @Test("a correction that changes nothing else reports no applied field rather than one")
+    func autoplayAloneAppliesNothing() {
+        let split = SessionOptionCorrection.partitionChanges(["autoplay"], sessionOwnsTransport: true)
+        #expect(split.applied.isEmpty)
+        #expect(split.sessionOwned == ["autoplay"])
+    }
+
+    @Test("the resume after a background teardown has no transport to read, so the flag decides")
+    func tornDownSessionAppliesTheMountFlag() {
+        // #357: `reloadAtCurrentPosition` replays the mount flag exactly as before on that path,
+        // because there is no session transport left to preserve. The log has to match the code:
+        // the one rebuild that DOES apply the field must not be told it does not.
+        let split = SessionOptionCorrection.partitionChanges(
+            ["httpHeaders", "autoplay"], sessionOwnsTransport: false)
+        #expect(split.applied == ["httpHeaders", "autoplay"])
+        #expect(split.sessionOwned.isEmpty)
+    }
+
+    @Test("an ordinary correction is untouched by the split")
+    func tuningFieldsPassThrough() {
+        let split = SessionOptionCorrection.partitionChanges(
+            ["audioDelaySeconds"], sessionOwnsTransport: true)
+        #expect(split.applied == ["audioDelaySeconds"])
+        #expect(split.sessionOwned.isEmpty)
+    }
+}
+
+/// AE#464 round 4 (cmcpherson274, measured at 7.1.3): the third answer was in the log and nowhere
+/// else. `reloadAtCurrentPosition(applying:)` returned `Void`, threw only for a refusal, and ran the
+/// full teardown for a field the rebuild decides for itself, so a host wrapper reported `done` for a
+/// correction that changed nothing and paid a visible restart for it (202 ms and a second native
+/// host on his rig). The answer is now returned rather than logged at, and it costs no rebuild.
+@MainActor
+struct Issue464SessionOwnedCorrectionOutcomeTests {
+
+    private func seededEngine(autoplay: Bool) throws -> AetherEngine {
+        let engine = try AetherEngine()
+        var seeded = LoadOptions()
+        seeded.autoplay = autoplay
+        engine.setLoadedOptionsForTesting(seeded)
+        engine.loadedURL = URL(string: "https://s/movie.mkv")!
+        return engine
+    }
+
+    @Test("a correction the session owns comes back without a rebuild")
+    func sessionOwnedCorrectionSkipsTheRebuild() async throws {
+        let engine = try seededEngine(autoplay: true)
+        let outcome = try await engine.reloadAtCurrentPosition { $0.autoplay = false }
+        #expect(outcome.applied.isEmpty)
+        #expect(outcome.sessionOwned == ["autoplay"])
+        #expect(outcome.rebuilt == false)
+    }
+
+    @Test("the session keeps its own value, the same answer the rebuild gave")
+    func sessionOwnedCorrectionInstallsNothing() async throws {
+        // The reload writes `sessionRebuildResumesPlaying` over the mount flag before it replays the
+        // options, so a correction to `autoplay` never outlived the call. Installing it on the
+        // short-circuit alone would make the field mean one thing travelling by itself and another
+        // with a header riding along.
+        let engine = try seededEngine(autoplay: true)
+        _ = try await engine.reloadAtCurrentPosition { $0.autoplay = false }
+        #expect(engine.loadedOptions.autoplay == true)
+    }
+
+    @Test("a refusal is still a refusal, not a session-owned no-op")
+    func refusalWinsOverTheShortCircuit() async throws {
+        // Both answers are reachable from one call, and the order matters: a correction naming an
+        // identity field AND a session-owned one has to throw rather than return quietly.
+        let engine = try seededEngine(autoplay: true)
+        await #expect(throws: AetherEngineError.self) {
+            try await engine.reloadAtCurrentPosition {
+                $0.autoplay = false
+                $0.isLive = true
+            }
+        }
+    }
+
+    @Test("the outcome carries the partition the log names")
+    func outcomeMirrorsThePartition() {
+        let outcome = SessionOptionCorrectionOutcome(
+            applied: ["httpHeaders"], sessionOwned: ["autoplay"], rebuilt: true)
+        #expect(outcome.applied == ["httpHeaders"])
+        #expect(outcome.sessionOwned == ["autoplay"])
+        #expect(outcome.rebuilt)
+    }
+}

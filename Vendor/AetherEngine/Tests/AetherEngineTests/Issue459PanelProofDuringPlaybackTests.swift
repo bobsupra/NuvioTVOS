@@ -98,20 +98,20 @@ struct Issue459PanelProofDuringPlaybackTests {
     @Test("A panel that answers HDR publishes the effective format, not SDR")
     func lateProofPublishesTheEffectiveFormat() {
         #expect(AetherEngine.presentedVideoFormat(
-            effectiveFormat: .hdr10, panelPresentsHDR: true, sourceVideoFormat: .hdr10) == .hdr10)
+            effectiveFormat: .hdr10, panelPresentsHDR: true, sourceCarriesHDR10Plus: false) == .hdr10)
     }
 
     @Test("A panel that stays SDR keeps the clamped label")
     func unprovenPanelKeepsSDR() {
         #expect(AetherEngine.presentedVideoFormat(
-            effectiveFormat: .hdr10, panelPresentsHDR: false, sourceVideoFormat: .hdr10) == .sdr)
+            effectiveFormat: .hdr10, panelPresentsHDR: false, sourceCarriesHDR10Plus: false) == .sdr)
     }
 
     // SDR content on any panel is SDR content; the panel's mode does not upgrade it.
     @Test("An SDR source stays SDR on a panel presenting HDR")
     func sdrSourceStaysSDR() {
         #expect(AetherEngine.presentedVideoFormat(
-            effectiveFormat: .sdr, panelPresentsHDR: true, sourceVideoFormat: .sdr) == .sdr)
+            effectiveFormat: .sdr, panelPresentsHDR: true, sourceCarriesHDR10Plus: false) == .sdr)
     }
 
     // T.35 detection fires early in the session, while the label is still clamped to SDR, and
@@ -121,7 +121,7 @@ struct Issue459PanelProofDuringPlaybackTests {
     @Test("An HDR10+ source that was clamped past its T.35 upgrade is republished as HDR10+")
     func lateProofCarriesTheHDR10PlusUpgrade() {
         #expect(AetherEngine.presentedVideoFormat(
-            effectiveFormat: .hdr10, panelPresentsHDR: true, sourceVideoFormat: .hdr10Plus)
+            effectiveFormat: .hdr10, panelPresentsHDR: true, sourceCarriesHDR10Plus: true)
             == .hdr10Plus)
     }
 
@@ -129,7 +129,7 @@ struct Issue459PanelProofDuringPlaybackTests {
     @Test("The HDR10+ carry-over applies only to an HDR10 base")
     func hdr10PlusCarryOverIsScopedToHDR10() {
         #expect(AetherEngine.presentedVideoFormat(
-            effectiveFormat: .dolbyVision, panelPresentsHDR: true, sourceVideoFormat: .hdr10Plus)
+            effectiveFormat: .dolbyVision, panelPresentsHDR: true, sourceCarriesHDR10Plus: true)
             == .dolbyVision)
     }
 }

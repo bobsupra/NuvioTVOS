@@ -53,21 +53,9 @@ struct OriginRequestBudgetTests {
         budget.release(a); budget.release(b)
     }
 
-    /// Wait for a condition the budget itself reports, rather than for a duration. A sleep long
-    /// enough to "probably" have parked the waiter is a margin against a derived time bound, and
-    /// the first thing a slower CI machine takes away.
-    private func waitUntil(_ deadlineSeconds: Double = 10,
-                           _ condition: () -> Bool) async -> Bool {
-        let deadline = Date(timeIntervalSinceNow: deadlineSeconds)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 2_000_000)
-        }
-        return condition()
-    }
-
-    @Test("a capped origin makes the second request wait for the first to finish")
-    func cappedSerialises() async {
+    @Test("a capped origin makes the second request wait for the first to finish",
+          .timeLimit(.minutes(3)))
+    func cappedSerialises() async throws {
         let budget = freshBudget()
         budget.setHostLimit(1, for: url)
 
@@ -76,27 +64,33 @@ struct OriginRequestBudgetTests {
 
         let secondGranted = UnsafeFlag()
         let secondStarted = UnsafeFlag()
-        DispatchQueue.global().async {
+        // A detached thread, not `DispatchQueue.global().async`: the waiter IS the subject of this
+        // test, so it may not depend on a pool that hands out threads only once one is free. Under
+        // the suite's own load the global pool has kept this block waiting past every deadline the
+        // test ever put on it (30 s, twice on CI), and the failure then reads as a budget defect
+        // that was never measured.
+        Thread.detachNewThread {
             secondStarted.set(true)
-            let second = budget.acquire(for: url, label: "detour", timeout: 20)
+            // 120 s, not 20: the acquire's own wait must not be able to expire before the test's
+            // `.timeLimit`, or `secondGranted` turns from nil into false and the negative
+            // expectation below reports the OPPOSITE of what starvation did.
+            let second = budget.acquire(for: url, label: "detour", timeout: 120)
             secondGranted.set(second?.granted == true)
             budget.release(second)
         }
-        // Waiting for the park without first waiting for the THREAD spends the observation window
-        // on libdispatch. A green run and a run where the block never got a thread then look
-        // identical, and the second one reports a budget defect that was never measured. Seen on
-        // CI: `parked` false with `secondGranted` still nil, i.e. the acquire had not happened.
-        #expect(await waitUntil(30) { secondStarted.value == true },
-                "the waiter never got a thread; nothing about the budget was measured")
-        let parked = await waitUntil { budget.snapshot(for: url)?.waiting == 1 }
-        #expect(parked, "the second acquire must park rather than proceed")
+        // Waiting for the park without first waiting for the thread spends the observation window
+        // on scheduling. A green run and a run where the waiter never ran then look identical.
+        try await waitFor { secondStarted.value == true }
+        // Either outcome ends the wait, so a budget that lets the second request through is still
+        // reported at once, and starvation can only delay this line, never flip what it reads.
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || secondGranted.value != nil }
         #expect(secondGranted.value == nil, "the second request must not proceed while the slot is held")
+        #expect(budget.snapshot(for: url)?.waiting == 1, "the second acquire must park rather than proceed")
 
         budget.release(first)
-        let handed = await waitUntil { secondGranted.value == true }
-        #expect(handed, "releasing the slot must hand it to the waiter")
-        _ = await waitUntil { budget.snapshot(for: url)?.inflight == 0 }
-        #expect(budget.snapshot(for: url)?.inflight == 0)
+        try await waitFor { secondGranted.value != nil }
+        #expect(secondGranted.value == true, "releasing the slot must hand it to the waiter")
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
     }
 
     @Test("a waiter that times out proceeds anyway rather than blocking the read forever")
@@ -119,29 +113,31 @@ struct OriginRequestBudgetTests {
                 "a timed-out waiter must not leak its slot")
     }
 
-    @Test("the slot goes to the waiter at the front, not to whoever locks first")
-    func releaseIsFIFO() async {
+    @Test("the slot goes to the waiter at the front, not to whoever locks first",
+          .timeLimit(.minutes(3)))
+    func releaseIsFIFO() async throws {
         let budget = freshBudget()
         budget.setHostLimit(1, for: url)
         let held = budget.acquire(for: url, label: "pump", timeout: 1)
 
         let order = UnsafeOrder()
-        DispatchQueue.global().async {
-            let t = budget.acquire(for: url, label: "detour", timeout: 20)
+        Thread.detachNewThread {
+            let t = budget.acquire(for: url, label: "detour", timeout: 120)
             order.append("detour")
             budget.release(t)
         }
-        let parked = await waitUntil { budget.snapshot(for: url)?.waiting == 1 }
-        #expect(parked, "the detour must be in the queue before the pump gives the slot back")
+        try await waitFor { budget.snapshot(for: url)?.waiting == 1 || order.first != nil }
+        #expect(budget.snapshot(for: url)?.waiting == 1,
+                "the detour must be in the queue before the pump gives the slot back")
 
         // The pump releasing and immediately re-taking must not beat the parked detour: that is
         // exactly the starvation a range boundary every 32 MB would produce.
         budget.release(held)
-        let reacquired = budget.acquire(for: url, label: "pump", timeout: 20)
+        let reacquired = budget.acquire(for: url, label: "pump", timeout: 120)
         order.append("pump")
         budget.release(reacquired)
 
-        _ = await waitUntil { order.first != nil }
+        try await waitFor { order.first != nil }
         #expect(order.first == "detour",
                 "a pump reconnecting at a range boundary must not starve a waiting detour")
     }
@@ -182,8 +178,9 @@ struct OriginRequestBudgetTests {
     /// AE#465 round 2. The case the reversed invariant above is actually FOR: at a ceiling of one,
     /// a paced caller must leave the single slot available, or the rate rule has silently become a
     /// concurrency outage for every other path against that origin.
-    @Test("a paced caller leaves a single-slot origin's slot available")
-    func pacedCallerLeavesTheSlotFree() async {
+    @Test("a paced caller leaves a single-slot origin's slot available",
+          .timeLimit(.minutes(3)))
+    func pacedCallerLeavesTheSlotFree() async throws {
         let clock = ManualDispatchClock()
         let budget = freshBudget(now: clock.now)
         budget.setHostLimit(1, for: url)
@@ -191,24 +188,24 @@ struct OriginRequestBudgetTests {
 
         let granted = UnsafeFlag()
         let started = UnsafeFlag()
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             started.set(true)
-            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 30)
+            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 120)
             granted.set(ticket?.granted == true)
             budget.release(ticket)
         }
-        #expect(await waitUntil(30) { started.value == true },
-                "the caller never got a thread; nothing about the budget was measured")
+        try await waitFor { started.value == true }
 
-        #expect(await waitUntil { budget.snapshot(for: url)?.paced == true })
+        try await waitFor { budget.snapshot(for: url)?.paced == true }
         #expect(budget.snapshot(for: url)?.inflight == 0,
                 "the one slot must stay free while its only caller waits on the rate rule")
         #expect(granted.value == nil, "the pacer's quiet period has not elapsed yet")
 
         clock.advance(by: 4)
-        #expect(await waitUntil { granted.value == true },
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true,
                 "the pacer must hand the caller through once the quiet period is paid")
-        _ = await waitUntil { budget.snapshot(for: url)?.inflight == 0 }
+        try await waitFor { budget.snapshot(for: url)?.inflight == 0 }
         #expect(budget.snapshot(for: url)?.inflight == 0, "the granted ticket returns its slot")
     }
 
@@ -305,37 +302,39 @@ struct OriginRequestBudgetTests {
         budget.release(afterCap)
     }
 
-    @Test("an acquire inside the quiet period waits and proceeds when the injected clock advances")
-    func acquireWaitsForThePacer() async {
+    @Test("an acquire inside the quiet period waits and proceeds when the injected clock advances",
+          .timeLimit(.minutes(3)))
+    func acquireWaitsForThePacer() async throws {
         let clock = ManualDispatchClock()
         let budget = freshBudget(now: clock.now)
         budget.noteRefusal(for: url, status: 429)
 
         let started = UnsafeFlag()
         let granted = UnsafeFlag()
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             started.set(true)
             // Generous on purpose: the injected clock decides when this is released, so a real
             // budget short enough for a loaded machine to spend first would make the wall clock the
             // subject instead.
-            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 30)
+            let ticket = budget.acquire(for: self.url, label: "pump", timeout: 120)
             granted.set(ticket?.granted == true)
             budget.release(ticket)
         }
 
-        #expect(await waitUntil { started.value == true })
+        try await waitFor { started.value == true }
         // AE#465 round 2 reverses what this used to assert. Owning the slot while the pacer holds
         // you turns a rate rule into a concurrency rule: on a single-slot origin one paced request
         // then parks every other path for the whole quiet period, and a suite of readers doing that
         // blocked enough threads that unrelated CI tests could not get one. A token is consumed,
         // not held, so nothing is owed to the books until it is granted.
-        #expect(await waitUntil { budget.snapshot(for: url)?.paced == true })
+        try await waitFor { budget.snapshot(for: url)?.paced == true }
         #expect(budget.snapshot(for: url)?.inflight == 0,
                 "a request waiting on the rate rule must not be occupying a concurrency slot")
         #expect(granted.value == nil, "the request must remain parked inside the quiet period")
 
         clock.advance(by: 2)
-        #expect(await waitUntil { granted.value == true },
+        try await waitFor { granted.value != nil }
+        #expect(granted.value == true,
                 "advancing the injected clock must release the request without a two-second sleep")
     }
 

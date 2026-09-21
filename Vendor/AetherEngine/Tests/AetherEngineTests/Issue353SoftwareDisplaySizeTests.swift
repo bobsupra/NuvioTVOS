@@ -13,7 +13,6 @@ import Testing
 /// stream, #177) and drops one whose display aspect is impossible (#290), so a second computation
 /// of the same answer is a second thing that can disagree with the screen.
 @Suite("Settled software display size (#353)")
-@MainActor
 struct Issue353SoftwareDisplaySizeTests {
 
     private final class SizeCollector: @unchecked Sendable {
@@ -55,11 +54,13 @@ struct Issue353SoftwareDisplaySizeTests {
     // MARK: - The settled value
 
     @Test("no size is claimed before the first frame is built")
+    @MainActor
     func nothingSettledBeforeTheFirstFrame() {
         #expect(SampleBufferRenderer().displaySize == nil)
     }
 
     @Test("square pixels settle at the coded dimensions")
+    @MainActor
     func squarePixelsSettleAtCodedDimensions() throws {
         let renderer = SampleBufferRenderer()
 
@@ -71,6 +72,7 @@ struct Issue353SoftwareDisplaySizeTests {
     /// The case the whole issue is about: 720x576 at 64:45 is PAL 16:9. A host laying out against
     /// the coded frame draws into a 5:4 rect inside a 16:9 picture.
     @Test("an anamorphic PAR settles at the width the picture actually has")
+    @MainActor
     func anamorphicPARSettlesAtTheDisplayWidth() throws {
         let renderer = SampleBufferRenderer()
 
@@ -82,6 +84,7 @@ struct Issue353SoftwareDisplaySizeTests {
     // MARK: - When it is reported
 
     @Test("the settled size is reported once, not once per frame")
+    @MainActor
     func reportedOnChangeNotPerFrame() throws {
         let renderer = SampleBufferRenderer()
         let collector = SizeCollector()
@@ -98,6 +101,7 @@ struct Issue353SoftwareDisplaySizeTests {
     /// A mid-stream PAR change at identical geometry is exactly what the format cache invalidates
     /// on (#177), and it is the one moment the picture changes shape under a host.
     @Test("a PAR change at identical geometry reports the new size")
+    @MainActor
     func parChangeReportsTheNewSize() throws {
         let renderer = SampleBufferRenderer()
         let collector = SizeCollector()
@@ -117,6 +121,7 @@ struct Issue353SoftwareDisplaySizeTests {
     /// describes the same picture. Reporting that as a change would have every seek re-lay-out an
     /// overlay that never moved.
     @Test("a format rebuild after a flush reports nothing new")
+    @MainActor
     func flushRebuildIsNotAChange() throws {
         let renderer = SampleBufferRenderer()
         let collector = SizeCollector()
@@ -133,6 +138,7 @@ struct Issue353SoftwareDisplaySizeTests {
     /// An observer installed after the picture settled still has to learn the size it missed:
     /// nothing else will change until the format does, which on most sources is never.
     @Test("an observer installed after the fact is told the settled size")
+    @MainActor
     func lateObserverIsToldTheSettledSize() throws {
         let renderer = SampleBufferRenderer()
         _ = try #require(renderer.createSampleBuffer(from: makeBuffer(par: (64, 45)), pts: pts(0)))

@@ -35,22 +35,24 @@ struct Issue448EpochSeamTests {
     func zeroWorthEpochIsRecorded() {
         // The entry is what says "an epoch begins here". Without it the placement publishes nothing,
         // and the stretch from that placement upward keeps the seam below it.
-        let table = HLSVideoEngine.epochShiftTable([:], recordingEpochAt: 0, shift: 0)
-        #expect(table[0] == 0)
+        var table = EpochAxisTable()
+        table.record(.zeroOrigin(0), at: 0)
+        #expect(table.opening(at: 0)?.placedOffset == 0)
     }
 
     @Test("recording an epoch still drops every entry at and above it")
     func recordingStillDropsAbove() {
         // A producer that starts writing at an index rewrites everything from there forward, so an
         // older epoch's offset must stop being claimed for those segments.
-        var table = HLSVideoEngine.epochShiftTable([:], recordingEpochAt: 13, shift: -9.0)
-        table = HLSVideoEngine.epochShiftTable(table, recordingEpochAt: 3, shift: -1.667)
-        #expect(table[3] == -1.667)
-        #expect(table[13] == nil)
+        var table = EpochAxisTable()
+        table.record(.zeroOrigin(-9.0), at: 13)
+        table.record(.zeroOrigin(-1.667), at: 3)
+        #expect(table.opening(at: 3)?.placedOffset == -1.667)
+        #expect(table.opening(at: 13) == nil)
         // And the same for an epoch worth nothing, which is the case AE#448 turned on.
-        table = HLSVideoEngine.epochShiftTable(table, recordingEpochAt: 0, shift: 0)
-        #expect(table[0] == 0)
-        #expect(table[3] == nil)
+        table.record(.zeroOrigin(0), at: 0)
+        #expect(table.opening(at: 0)?.placedOffset == 0)
+        #expect(table.opening(at: 3) == nil)
     }
 
     // MARK: - What the seam is for
@@ -59,7 +61,7 @@ struct Issue448EpochSeamTests {
     func zeroWorthKeepsTheAxis() {
         // Its content begins exactly at its advertised start, so the placement adds nothing. The
         // picture agrees: axisErr read -10.709 before and after that epoch took over.
-        #expect(HLSVideoEngine.axisShift(after: -10.667, placing: 0, displacement: 0) == -10.667)
+        #expect(HLSVideoEngine.placementOffset(after: -10.667, placing: 0, displacement: 0) == -10.667)
     }
 
     @Test("the seam belongs at the placement, which is below the newest one after a backward seek")

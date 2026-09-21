@@ -19,21 +19,32 @@ struct AVFoundationOffMainTests {
         #expect(wasOffMain)
     }
 
-    @Test("a blocked body must not block the main actor")
+    @Test("a blocked body must not block the main actor", .timeLimit(.minutes(3)))
     func blockedBodyKeepsMainActorResponsive() async {
         let queue = DispatchQueue(label: "test.avfread.stall")
         let release = DispatchSemaphore(value: 0)
         let player = AVPlayer()
-        async let result = AVFoundationOffMain.read(player, on: queue) { _ -> Bool in
-            // Signalled only if the main actor keeps running below while this body blocks.
-            // Generous backstop: a real main-actor block never signals at any size, so only CI
-            // scheduling starvation needs absorbing (a parallel CPU-heavy test can starve the main
-            // actor for tens of seconds), not a tight race that flakes under parallel load.
-            release.wait(timeout: .now() + 90) == .success
+        let finished = AtomicBool(false)
+        // Barrier, not a measurement: the body may only end at the signal below, which the main
+        // actor can only send if this read left it free. A wall-clock cap here would release the
+        // body on its own under CI starvation and answer the question the test is asking (see
+        // Issue254OffMainRepositionTests); a genuinely blocked main actor never signals at any size,
+        // so the honest report of that regression is the trait's time limit. The defer covers an
+        // early exit.
+        defer { release.signal() }
+        let read = Task { @MainActor in
+            _ = await AVFoundationOffMain.read(player, on: queue) { _ -> Bool in
+                release.wait()
+                return true
+            }
+            finished.set(true)
         }
         for _ in 0..<5 { try? await Task.sleep(for: .milliseconds(20)) }
+        #expect(finished.get() == false)
+
         release.signal()
-        #expect(await result)
+        await read.value
+        #expect(finished.get())
     }
 }
 

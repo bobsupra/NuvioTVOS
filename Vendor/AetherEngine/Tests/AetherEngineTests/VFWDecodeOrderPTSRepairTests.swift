@@ -42,16 +42,48 @@ struct VFWDecodeOrderPTSRepairTests {
             shape: shape(tag: 0x3143_5657, delay: 0)) == false)
     }
 
-    /// The equivalence behind the gate is established in `matroskadec` and nowhere else. AVI carries a
-    /// FourCC on every track and would otherwise match.
-    @Test("Same shape in a non-Matroska container is left alone")
-    func nonMatroskaContainer() {
-        for format in ["avi", "mov,mp4,m4a,3gp,3g2,mj2", "asf", "mpegts"] {
+    /// Containers that do supply presentation timestamps have nothing invented to drop, whatever
+    /// shape the stream has.
+    @Test("Same shape in a PTS-carrying container is left alone")
+    func ptsCarryingContainer() {
+        for format in ["mov,mp4,m4a,3gp,3g2,mj2", "asf", "mpegts"] {
             #expect(VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(
                 formatName: format,
                 shape: shape(tag: 0x3143_5657, delay: 1)) == false,
                 "\(format) must not arm the repair")
         }
+    }
+
+    /// The measured AVI: a 2000s XviD rip, tag `XVID`, one picture of reorder delay. `avidec` has no
+    /// PTS to give, so the `+genpts` axis is decode order exactly as in the Matroska case.
+    @Test("XviD AVI loses its generated PTS")
+    func xvidAVI() {
+        #expect(VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(
+            formatName: "avi",
+            shape: shape(tag: 0x4449_5658, delay: 1, codec: AV_CODEC_ID_MPEG4)) == true)
+    }
+
+    /// AVI has no natively mapped flavour to distinguish, so the codec tag carries no signal there and
+    /// its absence must not veto the repair the way it does on Matroska.
+    @Test("AVI does not gate on the codec tag")
+    func aviIgnoresCodecTag() {
+        #expect(VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(
+            formatName: "avi",
+            shape: shape(tag: 0, delay: 1, codec: AV_CODEC_ID_MPEG4)) == true)
+    }
+
+    /// The two exclusions hold in AVI as well: nothing to transpose, and the natively routable codecs
+    /// whose packets can reach the fMP4 muxer.
+    @Test("AVI keeps the shared exclusions")
+    func aviExclusions() {
+        #expect(VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(
+            formatName: "avi",
+            shape: shape(tag: 0x4449_5658, delay: 0, codec: AV_CODEC_ID_MPEG4)) == false,
+            "no reorder delay means decode order is presentation order")
+        #expect(VFWDecodeOrderPTSRepair.suppressesGeneratedPTS(
+            formatName: "avi",
+            shape: shape(tag: 0x3436_3268, delay: 1, codec: AV_CODEC_ID_H264)) == false,
+            "H.264 can route natively and must keep its PTS")
     }
 
     /// H.264 / HEVC / AV1 can stay on the native path, where packets reach the fMP4 muxer and a
@@ -85,5 +117,14 @@ struct VFWDecodeOrderPTSRepairTests {
         #expect(VFWDecodeOrderPTSRepair.isMatroska("webm") == true)
         #expect(VFWDecodeOrderPTSRepair.isMatroska("avi") == false)
         #expect(VFWDecodeOrderPTSRepair.isMatroska("") == false)
+    }
+
+    /// Same per-element match for AVI, so a comma-joined alias cannot slip past either.
+    @Test("AVI name matching is per element, not substring")
+    func aviNameMatching() {
+        #expect(VFWDecodeOrderPTSRepair.isAVI("avi") == true)
+        #expect(VFWDecodeOrderPTSRepair.isAVI("matroska,webm") == false)
+        #expect(VFWDecodeOrderPTSRepair.isAVI("avisynth") == false)
+        #expect(VFWDecodeOrderPTSRepair.isAVI("") == false)
     }
 }

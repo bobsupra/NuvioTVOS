@@ -9,13 +9,13 @@ import CoreMedia
 /// owned the newest handed-over timestamp and the frontier, and the first real post-seek frame
 /// reported the whole seek distance as one inter-frame interval (`dpts`) over a negative cushion
 /// (`vLead`) of the same size.
-@MainActor
 @Suite("Stale pre-seek references (#491)")
 struct Issue491StaleSeekReferenceTests {
 
     /// The mechanism, stated as a test so the fix has something to be a fix OF: with no threshold
     /// standing between the flush and the landing, one pre-seek frame is enough.
     @Test("with no threshold armed, a pre-seek frame sets the spacing base and the frontier")
+    @MainActor
     func unguardedStaleFrameOwnsBothReferences() {
         let renderer = SampleBufferRenderer()
         Self.hand(renderer, seconds: [949.66, 949.70, 949.74])
@@ -34,6 +34,7 @@ struct Issue491StaleSeekReferenceTests {
     }
 
     @Test("the threshold armed at flush time keeps the pre-seek frame out of both")
+    @MainActor
     func armedThresholdRejectsTheStaleFrame() {
         let renderer = SampleBufferRenderer()
         Self.hand(renderer, seconds: [949.66, 949.70, 949.74])
@@ -56,6 +57,7 @@ struct Issue491StaleSeekReferenceTests {
     /// way through. That direction is covered by the generation guard on the decoder callback, not
     /// by the threshold, which is why both stand.
     @Test("a backward seek's threshold does not stop a stale frame past the target")
+    @MainActor
     func backwardSeekThresholdIsNotEnoughOnItsOwn() {
         let renderer = SampleBufferRenderer()
         Self.hand(renderer, seconds: [1453.90, 1453.94, 1453.98])

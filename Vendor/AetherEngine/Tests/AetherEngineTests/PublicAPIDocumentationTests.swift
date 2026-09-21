@@ -76,6 +76,8 @@ final class PublicAPIDocumentationTests: XCTestCase {
         "sameLanguageRank": "documented with NativeSubtitleTrack",
         "audioTapFormat": "documented with the audio tap",
         "errorDescription": "LocalizedError conformance, not a surface of its own",
+        "displayDebugLines": "diagnostics / debug overlay line export",
+        "isTransportPlaying": "transport state query helper",
     ]
 
     private static let declarationPattern = try! NSRegularExpression(

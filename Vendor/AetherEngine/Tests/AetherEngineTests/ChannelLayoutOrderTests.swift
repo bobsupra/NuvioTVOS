@@ -11,6 +11,12 @@ import AetherLibavutil
 /// LFE landed hard left at full gain.
 final class ChannelLayoutOrderTests: XCTestCase {
 
+    /// `av_channel_name` fills a fixed 64-byte buffer, so the tail past the NUL is padding and
+    /// has to go before the bytes become a String.
+    private static func string(fromNullTerminated buffer: [CChar]) -> String {
+        String(decoding: buffer.prefix { $0 != 0 }.map { UInt8(bitPattern: $0) }, as: UTF8.self)
+    }
+
     // MARK: - What each library says, read from the library itself
 
     /// The order the resampler writes, read back from the production call that sets it.
@@ -22,7 +28,7 @@ final class ChannelLayoutOrderTests: XCTestCase {
             let channel = av_channel_layout_channel_from_index(&layout, UInt32(index))
             var name = [CChar](repeating: 0, count: 64)
             _ = av_channel_name(&name, 64, channel)
-            return String(cString: name)
+            return Self.string(fromNullTerminated: name)
         }
     }
 
@@ -90,7 +96,7 @@ final class ChannelLayoutOrderTests: XCTestCase {
             let channel = av_channel_layout_channel_from_index(&layout, UInt32(index))
             var name = [CChar](repeating: 0, count: 64)
             _ = av_channel_name(&name, 64, channel)
-            return String(cString: name)
+            return Self.string(fromNullTerminated: name)
         }
     }
 

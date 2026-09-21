@@ -453,6 +453,22 @@ struct Issue440LiveJoinRollTests {
         #expect(paused.contains("no decision was taken"))
     }
 
+    /// The reporter's rejoin at 6.81.0: the #446 swap reuses a player that is still `.playing`, so the
+    /// fresh item's first status edge is that carried `.playing`, 1 ms after the load and long before the
+    /// item is ready. Read as a roll, it spent the one-shot silently, and the `ToMinimizeStalls` hold
+    /// that followed 15 ms later reached no decision and no line.
+    @Test("a playing status carried onto an item that is not ready yet does not spend the one-shot")
+    func carriedPlayingDoesNotSpend() {
+        #expect(!NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: false))
+    }
+
+    /// The reason the spend exists stays intact: once the item's own rate has rolled, every later hold
+    /// is a mid-stream rebuffer and keeps AVPlayer's stall policy.
+    @Test("a playing status on a ready item is the roll, and spends it")
+    func realRollSpends() {
+        #expect(NativeAVPlayerHost.playingSpendsLiveJoinOneShot(itemIsReadyToPlay: true))
+    }
+
     // MARK: - What `ahead 0.00s` was hiding (AE#447 follow-up)
 
     /// An item that has placed NOTHING is the state a wedged join is in, and it read exactly like the
@@ -468,6 +484,45 @@ struct Issue440LiveJoinRollTests {
                            loadedRangeCount: 0, nearestRangeOffsetSeconds: nil))
         #expect(clause?.contains("no loaded range at all") == true)
         #expect(clause?.contains("95258.48s") == true)
+    }
+
+    // MARK: - The item's own verdict (AE#509)
+
+    /// The field wedge: nothing placed AND the item never accepted the media. The status observer
+    /// cannot report that, because it fires on a change and this item never changes, so the account
+    /// that describes the wedge has to carry it or no engine line ever names it.
+    @Test("a wedged join names the item status it never left")
+    func nothingPlacedNamesAnUnknownStatus() {
+        let clause = NativeAVPlayerHost.liveJoinPlacementClause(
+            reading: .init(bufferEmpty: false, aheadSeconds: 0, playheadSeconds: 95173.75,
+                           loadedRangeCount: 0, nearestRangeOffsetSeconds: nil,
+                           itemStatus: .unknown))
+        #expect(clause?.contains("no loaded range at all") == true)
+        #expect(clause?.contains("has not left unknown") == true)
+    }
+
+    /// The opposite half of the same zero, and the reason the field is worth printing: an accepted item
+    /// that places nothing is a fetch problem, an unaccepted one is a segment-bytes problem. Both read
+    /// as "nothing placed" without this.
+    @Test("an accepted item that places nothing says so")
+    func nothingPlacedOnAReadyItemSaysSo() {
+        let clause = NativeAVPlayerHost.liveJoinPlacementClause(
+            reading: .init(bufferEmpty: false, aheadSeconds: 0, playheadSeconds: 95173.75,
+                           loadedRangeCount: 0, nearestRangeOffsetSeconds: nil,
+                           itemStatus: .readyToPlay))
+        #expect(clause?.contains("readyToPlay") == true)
+        #expect(clause?.contains("has not left unknown") == false)
+    }
+
+    /// A reading taken without a status must not invent one: the clause is silent rather than claiming
+    /// `.unknown`, which is itself one of the answers.
+    @Test("a reading with no status carries no status clause")
+    func absentStatusAddsNothing() {
+        #expect(NativeAVPlayerHost.liveJoinStatusClause(nil).isEmpty)
+        let clause = NativeAVPlayerHost.liveJoinPlacementClause(
+            reading: .init(bufferEmpty: false, aheadSeconds: 0, playheadSeconds: 95258.48,
+                           loadedRangeCount: 1, nearestRangeOffsetSeconds: 29.52))
+        #expect(clause?.contains("status") == false)
     }
 
     /// The opposite fact, printed identically before this: the item HAS media, just not where the

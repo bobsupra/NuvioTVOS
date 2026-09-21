@@ -8,6 +8,15 @@ enum ISO9660Fixture {
     struct FileSpec {
         let name: String   // e.g. "VTS_01_1.VOB"
         let length: Int    // declared byte length
+        /// File bytes, truncated to the single sector the fixture writes. nil = the default MPEG-PS
+        /// pack-start pattern plus the file name, which extent-boundary tests assert on.
+        let content: [UInt8]?
+
+        init(name: String, length: Int, content: [UInt8]? = nil) {
+            self.name = name
+            self.length = length
+            self.content = content
+        }
     }
 
     static func le16(_ v: Int) -> [UInt8] { [UInt8(v & 0xff), UInt8((v >> 8) & 0xff)] }
@@ -84,7 +93,7 @@ enum ISO9660Fixture {
             // MPEG-PS pack-start code + file name bytes, so concat/disc tests can assert byte identity at extent boundaries.
             var payload: [UInt8] = [0x00, 0x00, 0x01, 0xBA]
             payload += Array(fe.spec.name.utf8)
-            put(payload, atSector: fe.lba)
+            put(fe.spec.content ?? payload, atSector: fe.lba)
         }
         return Data(image)
     }

@@ -26,7 +26,6 @@ import QuartzCore
 /// direct path passed `CMTime.invalid` straight through to the display queue, and a NaN also
 /// silently breaks the reorder buffer's PTS ordering (every comparison against NaN is false).
 @Suite("Software-path surface visibility + unschedulable frame gate (#298)")
-@MainActor
 struct Issue298SoftwareSurfaceTests {
 
     // MARK: - Unschedulable frames
@@ -49,6 +48,7 @@ struct Issue298SoftwareSurfaceTests {
     }
 
     @Test("untimed frames never reach the display queue and are counted")
+    @MainActor
     func untimedFramesDropped() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -63,6 +63,7 @@ struct Issue298SoftwareSurfaceTests {
     }
 
     @Test("timed frames still reach the display queue")
+    @MainActor
     func timedFramesPass() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()
@@ -81,6 +82,7 @@ struct Issue298SoftwareSurfaceTests {
     /// comparison against NaN is false, so an untimed frame used to be appended past frames it
     /// should have preceded, reordering its neighbours as well.
     @Test("ordering of timed frames survives untimed ones in the same run")
+    @MainActor
     func orderingSurvivesUntimedFrames() throws {
         let renderer = SampleBufferRenderer()
         let pixelBuffer = try Self.makePixelBuffer()

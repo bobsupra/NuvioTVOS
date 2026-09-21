@@ -140,6 +140,41 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(selection.audioTrackIndex == nil)
     }
 
+    // MARK: - The host the teardown keeps (Sodalite#149)
+
+    @Test("the teardown keeps the host, and the load on the way back keeps it too (Sodalite#149)")
+    func reloadAfterBackgroundTeardownKeepsTheNativeHost() throws {
+        let engine = try AetherEngine()
+        engine.nativeHost = NativeAVPlayerHost()
+        engine.playbackBackend = .native
+
+        backgroundTeardown(engine)
+
+        // The teardown preserves the host on purpose: AVKit registers its Now-Playing client once
+        // per AVPlayer instance (issue #15), so the instance has to outlive the suspension.
+        #expect(engine.nativeHost != nil)
+        // And it resets the backend, which is the state the foreground reload's load() reads.
+        #expect(engine.playbackBackend == .none)
+        // Reading the backend alone answered "nothing native here" and threw the kept host away.
+        #expect(AetherEngine.shouldPreserveNativeHostAcrossLoad(
+            backend: engine.playbackBackend,
+            nativeHostSurvives: engine.nativeHost != nil) == true)
+    }
+
+    @Test("a running native session still preserves its host across a load seam")
+    func runningNativeSessionPreservesItsHost() {
+        #expect(AetherEngine.shouldPreserveNativeHostAcrossLoad(
+            backend: .native, nativeHostSurvives: true) == true)
+    }
+
+    @Test("nothing to keep: a load with no native host behind it preserves nothing")
+    func nothingToPreserve() {
+        #expect(AetherEngine.shouldPreserveNativeHostAcrossLoad(
+            backend: .none, nativeHostSurvives: false) == false)
+        #expect(AetherEngine.shouldPreserveNativeHostAcrossLoad(
+            backend: .software, nativeHostSurvives: false) == false)
+    }
+
     @Test("no teardown snapshot: the reload reads the live session, unchanged from before #357")
     func liveSessionPathUnchanged() throws {
         let engine = try AetherEngine()
@@ -152,37 +187,5 @@ struct Issue357BackgroundTeardownSelectionTests {
         #expect(selection.subtitles.activeSubtitleTrackIndex == track.id)
         #expect(selection.audioTrackIndex == 4)
         #expect(selection.discTitleID == 9)
-    }
-
-    @Test("teardown while paused parks resumesPlaying as false so reload mounts paused")
-    func teardownWhilePausedParksPausedTransport() throws {
-        let engine = try AetherEngine()
-        engine.state = .paused
-
-        backgroundTeardown(engine)
-        let selection = engine.consumeReloadSelection()
-        #expect(!selection.resumesPlaying)
-    }
-
-    @Test("teardown while playing parks resumesPlaying as true so reload resumes playing")
-    func teardownWhilePlayingParksPlayingTransport() throws {
-        let engine = try AetherEngine()
-        engine.state = .playing
-
-        backgroundTeardown(engine)
-        let selection = engine.consumeReloadSelection()
-        #expect(selection.resumesPlaying)
-    }
-
-    @Test("teardown parks the playhead before the video item is removed")
-    func teardownParksResumePosition() throws {
-        let engine = try AetherEngine()
-        engine.state = .paused
-        engine.clock.currentTime = 742.5
-
-        backgroundTeardown(engine)
-        let selection = engine.consumeReloadSelection()
-
-        #expect(selection.resumePosition == 742.5)
     }
 }

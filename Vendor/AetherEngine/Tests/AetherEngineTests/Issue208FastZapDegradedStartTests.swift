@@ -64,11 +64,14 @@ final class Issue208FastZapDegradedStartTests: XCTestCase {
     ) -> (Issue208WaitResult, XCTestExpectation) {
         let result = Issue208WaitResult()
         let finished = expectation(description: "startup waiter finished")
-        DispatchQueue.global().async {
+        // A thread of its own, and then wait for the PARK rather than for a duration: on a pool
+        // whose workers all block, this waiter can be minutes from its first instruction, and a
+        // sleep long enough to "probably" have parked it decides what the test measures.
+        Thread.detachNewThread {
             result.store(provider.waitForFirstLiveSegment(timeout: timeout))
             finished.fulfill()
         }
-        Thread.sleep(forTimeInterval: 0.05)
+        while provider.parkedWaiterCount == 0 { usleep(200) }
         return (result, finished)
     }
 

@@ -146,12 +146,12 @@ final class LiveProductionHaltTests: XCTestCase {
         final class ResultBox: @unchecked Sendable { var value = true }
         let box = ResultBox()
         let released = expectation(description: "held blocking-reload waiter released")
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             // The reporter's shape: playlist ends at segment 11, AVPlayer holds ?_HLS_msn=12.
             box.value = provider.waitForLiveSegment(index: 12, timeout: 10)
             released.fulfill()
         }
-        Thread.sleep(forTimeInterval: 0.2)  // let the waiter park
+        while provider.parkedWaiterCount == 0 { usleep(200) }  // the park, not a guess at it
         provider.markLiveProductionHalted()
         wait(for: [released], timeout: 2.0)
         XCTAssertFalse(box.value, "released waiter must report the segment as unavailable, well before its 10s timeout")

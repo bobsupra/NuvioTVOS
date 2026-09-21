@@ -33,9 +33,30 @@ import Foundation
 @Suite("AE#481: the axis belongs to the run, and a landing can read it")
 struct Issue481LandingAxisTests {
 
+    /// PR #533: the same arm on the same bytes remuxed with `-output_ts_offset 600`, so the item axis
+    /// runs 0 to 120 s over a source that runs 600 to 720 s, which is the reporter's geometry.
+    ///
+    /// The run holding the landing has no placement offset left to carry, and the reading below is
+    /// what "nothing to place" meant until #533: item time is source time here. It is not. Those
+    /// bytes were folded by the producer's 600 s normalization like every other segment of the run,
+    /// and publishing a zero for them took `capErr` from -600.000 to +0.017 in one tick and put the
+    /// host clock at `cur=-515.10` for the rest of the session.
+    @Test("a rebuilt run still carries the normalization its bytes were written with")
+    func landingOnARebuiltRunCarriesTheNormalization() {
+        let reading = HLSVideoEngine.landingAxisReading(
+            landingItemSeconds: 84.0,
+            ranges: [(52.0, 61.0), (72.0, 119.958)],
+            openingSegmentStart: 72.0,
+            worth: 600.0,
+            assumedBase: -9.0,
+            standingAxis: 591.0)
+        #expect(reading?.axis == 600.0)
+        #expect(reading?.runStart == 72.0)
+    }
+
     /// The measured arm. The session maps with -9.000, the run holding the landing opens at the
     /// playlist position of the segment that opened it, so that run carries what the segment is worth,
-    /// which is nothing.
+    /// which on a source whose timestamps start at zero is nothing.
     @Test("a run opened on its segment's own playlist position carries what the segment is worth")
     func landingOnARebuiltRunReadsZero() {
         let reading = HLSVideoEngine.landingAxisReading(

@@ -1,5 +1,6 @@
 import Foundation
 import Testing
+import AetherLibavcodec
 import AetherLibavutil
 @testable import AetherEngine
 
@@ -143,5 +144,100 @@ struct Issue493HostDisplayAssertionTests {
         #expect(corrected == ["panelPresentsDolbyVision"])
         #expect(SessionOptionCorrection.refusedFields(
             from: LoadOptions(), to: LoadOptions(panelPresentsDolbyVision: true)).isEmpty)
+    }
+
+    // MARK: - What the assertion no longer changes about the served bytes
+
+    /// An HEVC / AV1 `AVCodecParameters` carrying a DOVI configuration record, freed with the test.
+    private final class DVCodecpar {
+        let ptr: UnsafeMutablePointer<AVCodecParameters>
+
+        init(codecID: AVCodecID, profile: UInt8, compat: UInt8, trc: AVColorTransferCharacteristic) {
+            ptr = avcodec_parameters_alloc()
+            ptr.pointee.codec_type = AVMEDIA_TYPE_VIDEO
+            ptr.pointee.codec_id = codecID
+            ptr.pointee.width = 3840
+            ptr.pointee.height = 2160
+            ptr.pointee.level = 153
+            ptr.pointee.color_primaries = AVCOL_PRI_BT2020
+            ptr.pointee.color_trc = trc
+            ptr.pointee.color_space = AVCOL_SPC_BT2020_NCL
+            let size = MemoryLayout<AVDOVIDecoderConfigurationRecord>.size
+            guard let sd = av_packet_side_data_new(
+                &ptr.pointee.coded_side_data, &ptr.pointee.nb_coded_side_data,
+                AV_PKT_DATA_DOVI_CONF, size, 0
+            ) else { fatalError("could not attach a DOVI configuration record") }
+            memset(sd.pointee.data, 0, size)
+            sd.pointee.data.withMemoryRebound(to: AVDOVIDecoderConfigurationRecord.self, capacity: 1) { rec in
+                rec.pointee.dv_version_major = 1
+                rec.pointee.dv_profile = profile
+                rec.pointee.dv_level = 6
+                rec.pointee.rpu_present_flag = 1
+                rec.pointee.el_present_flag = profile == 7 ? 1 : 0
+                rec.pointee.bl_present_flag = 1
+                rec.pointee.dv_bl_signal_compatibility_id = compat
+            }
+        }
+
+        deinit {
+            var p: UnsafeMutablePointer<AVCodecParameters>? = ptr
+            avcodec_parameters_free(&p)
+        }
+    }
+
+    private static func route(
+        codecID: AVCodecID = AV_CODEC_ID_HEVC,
+        profile: UInt8,
+        compat: UInt8,
+        trc: AVColorTransferCharacteristic = AVCOL_TRC_SMPTE2084,
+        dvDisplay: Bool
+    ) throws -> HLSVideoEngine.CodecRoute {
+        let par = DVCodecpar(codecID: codecID, profile: profile, compat: compat, trc: trc)
+        let engine = HLSVideoEngine(url: URL(fileURLWithPath: "/dev/null"), dvModeAvailable: dvDisplay)
+        return try engine.resolveCodecRoute(codecpar: UnsafePointer(par.ptr))
+    }
+
+    /// Everything the muxer and the manifest read out of a route, as one comparable line.
+    private static func packaging(_ r: HLSVideoEngine.CodecRoute) -> String {
+        "tag=\(r.codecTagOverride ?? "nil") range=\(r.videoRange) codecs=\(r.primaryCodecs) "
+        + "supplemental=\(r.supplementalCodecs ?? "nil") dovi=\(r.doviConfig) "
+        + "p7convert=\(r.convertP7ToProfile81) variant=\(r.dvVariant)"
+    }
+
+    /// 6.72.0 gave the non-DV branch its `dvcC` back and 6.73.0 its `SUPPLEMENTAL-CODECS`, which left the
+    /// three grades a Dolby Vision display used to be served differently identical on both branches. So
+    /// the assertion no longer decides a byte of the served stream for them, only the published
+    /// `videoFormat`, the tvOS criteria request, and the HDR readiness that rides along. Measured the
+    /// same day against the matched Dolby P5 / P8.1 / P8.4 grades on macOS: master, media playlist,
+    /// init.mp4 and seg0.mp4 came back md5-identical with and without the claim.
+    @Test("AE#493: the assertion does not move the packaging of P5, P8.1 or P8.4",
+          arguments: [(UInt8(5), UInt8(0)), (UInt8(8), UInt8(1)), (UInt8(8), UInt8(4))])
+    func assertionLeavesTheHEVCPackagingAlone(grade: (profile: UInt8, compat: UInt8)) throws {
+        let trc: AVColorTransferCharacteristic = grade.compat == 4 ? AVCOL_TRC_ARIB_STD_B67 : AVCOL_TRC_SMPTE2084
+        let asserted = try Self.route(profile: grade.profile, compat: grade.compat, trc: trc, dvDisplay: true)
+        let control = try Self.route(profile: grade.profile, compat: grade.compat, trc: trc, dvDisplay: false)
+        #expect(Self.packaging(asserted) == Self.packaging(control))
+    }
+
+    /// The two grades where it still does, so "the claim changes nothing" cannot quietly become the rule:
+    /// P7 needs the per-packet RPU conversion to 8.1 and its supplemental, and the AV1 DV record is read
+    /// only on a display that takes it, so a non-DV display gets the base layer with no supplemental and
+    /// no Dolby Vision variant at all. Since #547 both AV1 branches carry the same `av01` sample entry,
+    /// the base layer's own; what the claim moves there is the supplemental entry beside it.
+    @Test("AE#493: P7 and AV1 Dolby Vision are still packaged by the claim")
+    func assertionStillMovesTheGatedGrades() throws {
+        let p7Asserted = try Self.route(profile: 7, compat: 0, dvDisplay: true)
+        let p7Control = try Self.route(profile: 7, compat: 0, dvDisplay: false)
+        #expect(Self.packaging(p7Asserted) != Self.packaging(p7Control))
+        #expect(p7Asserted.convertP7ToProfile81)
+        #expect(p7Control.convertP7ToProfile81 == false)
+
+        let av1Asserted = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: true)
+        let av1Control = try Self.route(codecID: AV_CODEC_ID_AV1, profile: 10, compat: 1, dvDisplay: false)
+        #expect(Self.packaging(av1Asserted) != Self.packaging(av1Control))
+        #expect(av1Asserted.codecTagOverride == "av01")
+        #expect(av1Control.codecTagOverride == "av01")
+        #expect(av1Asserted.supplementalCodecs == "dav1.10.06/db1p")
+        #expect(av1Control.supplementalCodecs == nil)
     }
 }

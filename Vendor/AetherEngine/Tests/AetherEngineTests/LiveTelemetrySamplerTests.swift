@@ -9,6 +9,7 @@ import AVFoundation
 /// a process kill. The reads now run as one coalesced batch on a dedicated background queue;
 /// these tests pin the off-main behavior via an injected read in place of the AVFoundation batch.
 @MainActor
+@Suite(.timeLimit(.minutes(3)))
 struct LiveTelemetrySamplerTests {
 
     private func makeNativeEngine() throws -> AetherEngine {
@@ -19,42 +20,29 @@ struct LiveTelemetrySamplerTests {
         return engine
     }
 
-    /// Generous default: on a loaded CI runner the main actor can be scheduled tens of seconds late
-    /// (a CPU-heavy Vision OCR test running in parallel starved it past a 15 s bound), so a tight
-    /// bound flakes even when the behavior under test is correct. It only needs to be a finite
-    /// backstop, not a measurement: a genuine main-actor block never signals at any size.
-    private func waitUntil(
-        timeout: Duration = .seconds(90),
-        _ condition: @MainActor () -> Bool
-    ) async throws -> Bool {
-        let clock = ContinuousClock()
-        let start = clock.now
-        while !condition() {
-            if clock.now - start > timeout { return false }
-            try await Task.sleep(for: .milliseconds(20))
-        }
-        return true
-    }
+    /// Condition wait, not a measurement. It carries no wall-clock cap of its own: on a loaded CI
+    /// runner the main actor is scheduled tens of seconds late (100 ms of hops took ~100 s on
+    /// 2026-09-10), so any cap here is a cap on SCHEDULING and turns a correct behavior into a
+    /// failure. The suite's `.timeLimit` bounds the genuine hang instead, and reports it as one.
 
     @Test("a stalled AVFoundation read must not block the main actor")
     func stalledReadKeepsMainActorResponsive() async throws {
         let engine = try makeNativeEngine()
         let release = DispatchSemaphore(value: 0)
-        // If the read ran on the main actor (the #134 regression), the release signal below could
-        // never be sent while the read blocks, the wait would exhaust its backstop timeout, and the
-        // published forward buffer would be the 99 sentinel instead of 12. The timeout is generous
-        // (a genuine main-actor block never signals at any size; only CI scheduling starvation from
-        // a parallel CPU-heavy test needs absorbing, which can run tens of seconds).
+        // Barrier, not a measurement (see the swap test): the read may only end at the signal below,
+        // which the main actor can only send if this read left it free. If it ran on the main actor
+        // (the #134 regression) the signal never comes and the suite's time limit reports it. The
+        // defer covers an early throw so an unsignalled wait can't park a read-queue thread.
+        defer { release.signal() }
         let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
-            let releasedInTime = release.wait(timeout: .now() + 90) == .success
-            return NativeAVFReadings(forwardBufferSeconds: releasedInTime ? 12.0 : 99.0)
+            release.wait()
+            return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
         // Main-actor work that must proceed while the read is stalled.
         for _ in 0..<5 { try await Task.sleep(for: .milliseconds(20)) }
         release.signal()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == 12.0)
         sampler.stop()
     }
@@ -71,8 +59,7 @@ struct LiveTelemetrySamplerTests {
             )
         })
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         let snapshot = engine.diagnostics.liveTelemetry
         #expect(snapshot?.droppedFrameCount == 7)
         #expect(snapshot?.networkThroughputMbps == 42.0)
@@ -88,9 +75,9 @@ struct LiveTelemetrySamplerTests {
         let entered = AtomicBool(false)
         let release = DispatchSemaphore(value: 0)
         // Barrier, not a measurement: the read must stay in flight until the test performs the swap
-        // below and signals. A finite wall-clock cap here (previously 30 s) races the outer 90 s
-        // main-actor backstop: under CI starvation the read self-releases before the swap, publishes
-        // a still-valid snapshot, and the drop assertion flakes. The defer guarantees release on any
+        // below and signals. A finite wall-clock cap here (previously 30 s) is the discriminator, not
+        // a backstop: under CI starvation the read self-releases before the swap, publishes a
+        // still-valid snapshot, and the drop assertion flakes. The defer guarantees release on any
         // early throw so an unsignalled wait can't park a read-queue thread.
         defer { release.signal() }
         let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
@@ -99,8 +86,7 @@ struct LiveTelemetrySamplerTests {
             return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
-        let readStarted = try await waitUntil { entered.get() }
-        #expect(readStarted)
+        try await waitFor { entered.get() }
         // Reload seam: the engine swaps in a new player while the old item's read is in flight.
         engine.currentAVPlayer = AVPlayer(playerItem: AVPlayerItem(url: URL(fileURLWithPath: "/nonexistent-134b.mp4")))
         release.signal()
@@ -116,8 +102,8 @@ struct LiveTelemetrySamplerTests {
         let entered = AtomicBool(false)
         let release = DispatchSemaphore(value: 0)
         // Barrier, not a measurement (see the swap test): the read must stay in flight until stop()
-        // below and the signal. A finite cap races the outer 90 s backstop and flakes under CI
-        // starvation; the defer releases on any early throw.
+        // below and the signal. A finite cap would release it on its own under CI starvation and
+        // flake; the defer releases on any early throw.
         defer { release.signal() }
         let sampler = LiveTelemetrySampler(engine: engine, nativeRead: { _, _ in
             entered.set(true)
@@ -125,8 +111,7 @@ struct LiveTelemetrySamplerTests {
             return NativeAVFReadings(forwardBufferSeconds: 12.0)
         })
         sampler.start()
-        let readStarted = try await waitUntil { entered.get() }
-        #expect(readStarted)
+        try await waitFor { entered.get() }
         sampler.stop()
         release.signal()
         // The cancelled tick resumes after stop(); give it time to (incorrectly) publish.
@@ -139,8 +124,7 @@ struct LiveTelemetrySamplerTests {
         let engine = try makeNativeEngine()
         let sampler = LiveTelemetrySampler(engine: engine)
         sampler.start()
-        let published = try await waitUntil { engine.diagnostics.liveTelemetry != nil }
-        #expect(published)
+        try await waitFor { engine.diagnostics.liveTelemetry != nil }
         // Idle player: no access log, no loaded ranges.
         #expect(engine.diagnostics.liveTelemetry?.droppedFrameCount == nil)
         #expect(engine.diagnostics.liveTelemetry?.forwardBufferSeconds == nil)

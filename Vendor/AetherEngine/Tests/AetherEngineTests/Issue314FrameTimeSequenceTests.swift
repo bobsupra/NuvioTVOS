@@ -54,7 +54,6 @@ private final class GenerationCollector: @unchecked Sendable {
 /// Every assertion here is an inequality on purpose. The sequences are process-wide, so a test running
 /// in parallel legitimately consumes values in between; consecutive values are not part of the contract.
 @Suite("Frame-time sequences across loads (#314)")
-@MainActor
 struct Issue314FrameTimeSequenceTests {
 
     // MARK: - The allocator
@@ -92,6 +91,7 @@ struct Issue314FrameTimeSequenceTests {
     /// zero therefore came up *below* the one it replaces, and a host applying the documented rule
     /// discarded every frame of the new item.
     @Test("a new renderer reports above the one it replaces")
+    @MainActor
     func newRendererOutranksTheOutgoingOne() throws {
         let outgoing = SampleBufferRenderer()
         let outgoingFrames = GenerationCollector()

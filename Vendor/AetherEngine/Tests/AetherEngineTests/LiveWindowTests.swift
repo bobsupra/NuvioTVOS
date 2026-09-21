@@ -29,9 +29,9 @@ final class LiveWindowTests: XCTestCase {
     func testBehindLiveAndAtEdge() {
         var w = LiveWindow(windowSeconds: 60); w.noteEdge(200)
         w.notePlayhead(200)
-        XCTAssertTrue(w.isAtEdge); XCTAssertEqual(w.behindLiveSeconds, 0, accuracy: 0.001)
+        XCTAssertTrue(w.isWithinEdgeTolerance); XCTAssertEqual(w.behindLiveSeconds, 0, accuracy: 0.001)
         w.notePlayhead(190)
-        XCTAssertFalse(w.isAtEdge); XCTAssertEqual(w.behindLiveSeconds, 10, accuracy: 0.001)
+        XCTAssertFalse(w.isWithinEdgeTolerance); XCTAssertEqual(w.behindLiveSeconds, 10, accuracy: 0.001)
     }
     func testNilWhenDisabled() {
         var w = LiveWindow(windowSeconds: nil); w.noteEdge(100)

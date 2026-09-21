@@ -69,6 +69,24 @@ struct HLSLocalServerSessionTokenTests {
         #expect(Self.status(port: server.port, path: "/seg0.mp4") == 404)
     }
 
+    @Test("isSocketConnected correctly identifies open vs closed socket")
+    func socketLivenessCheck() throws {
+        var fds: [Int32] = [0, 0]
+        let ret = socketpair(AF_UNIX, SOCK_STREAM, 0, &fds)
+        #expect(ret == 0)
+        defer {
+            if fds[0] >= 0 { close(fds[0]) }
+            if fds[1] >= 0 { close(fds[1]) }
+        }
+        #expect(HLSLocalServer.isSocketConnected(fd: fds[0]) == true)
+        #expect(HLSLocalServer.isSocketConnected(fd: fds[1]) == true)
+
+        // Close peer
+        close(fds[1])
+        fds[1] = -1
+        #expect(HLSLocalServer.isSocketConnected(fd: fds[0]) == false)
+    }
+
     // MARK: - Helpers
 
     /// Status line of a plain GET, or 0 when the request could not be completed.

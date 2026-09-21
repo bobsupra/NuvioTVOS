@@ -142,4 +142,153 @@ final class DVDIFOParserTests: XCTestCase {
     func test_titleDetailNilOnBadMagic() {
         XCTAssertNil(DVDIFOParser.parseTitleDetail(Array("NOTAVTSIFO!!!".utf8) + [UInt8](repeating: 0, count: 4096)))
     }
+
+    // MARK: - VTS IFO stream languages (#527)
+
+    /// audio_attr_t byte 0: audio_format(3) multichannel_extension(1) lang_type(2) application_mode(2).
+    /// `format` 0 = AC-3, 2/3 = MPEG audio, 4 = LPCM, 6 = DTS. `language` nil leaves lang_type at 0.
+    private func audioAttr(format: Int, language: String?) -> [UInt8] {
+        var a = [UInt8](repeating: 0, count: 8)
+        a[0] = UInt8((format << 5) | ((language == nil ? 0 : 1) << 2))
+        if let language { a[2] = Array(language.utf8)[0]; a[3] = Array(language.utf8)[1] }
+        return a
+    }
+    /// subp_attr_t byte 0: code_mode(3) reserved(3) type(2); type 1 means the language code is set.
+    private func subpAttr(language: String?) -> [UInt8] {
+        var a = [UInt8](repeating: 0, count: 6)
+        a[0] = language == nil ? 0 : 1
+        if let language { a[2] = Array(language.utf8)[0]; a[3] = Array(language.utf8)[1] }
+        return a
+    }
+    /// Write the VTS audio / subpicture attribute tables into a VTSI_MAT (RBP 0x0203 / 0x0255 onward).
+    private func withStreamAttributes(_ ifo: [UInt8], audio: [[UInt8]], subpicture: [[UInt8]]) -> [UInt8] {
+        var out = ifo
+        out[0x203] = UInt8(audio.count)
+        for (n, attr) in audio.enumerated() {
+            out.replaceSubrange((0x204 + n * 8)..<(0x204 + n * 8 + 8), with: attr)
+        }
+        out[0x255] = UInt8(subpicture.count)
+        for (n, attr) in subpicture.enumerated() {
+            out.replaceSubrange((0x256 + n * 6)..<(0x256 + n * 6 + 6), with: attr)
+        }
+        return out
+    }
+    /// Write a PGC's stream control tables (audio_control @ +0x0C, subp_control @ +0x1C). The PGC sits
+    /// inside the PGCIT, so patch the assembled IFO at the offset `makeVTSIFO` placed it at.
+    private func withStreamControls(_ ifo: [UInt8], pgcOffset: Int,
+                                    audio: [Int] = [], subpicture: [Int] = []) -> [UInt8] {
+        var out = ifo
+        for (n, control) in audio.enumerated() {
+            out.replaceSubrange((pgcOffset + 0x0C + n * 2)..<(pgcOffset + 0x0C + n * 2 + 2), with: be16(control))
+        }
+        for (n, control) in subpicture.enumerated() {
+            out.replaceSubrange((pgcOffset + 0x1C + n * 4)..<(pgcOffset + 0x1C + n * 4 + 4), with: be32(control))
+        }
+        return out
+    }
+    /// Byte offset of the first PGC inside an IFO built by `makeVTSIFO(pgcs:)` with one PGC.
+    private func firstPGCOffset(vtsPgcitSector: Int = 1, pgcCount: Int = 1) -> Int {
+        vtsPgcitSector * 2048 + 8 + pgcCount * 8
+    }
+    /// Control word marking a stream present at substream number `number`.
+    private func audioControl(number: Int) -> Int { 0x8000 | (number << 8) }
+    private func subpictureControl(fourThree: Int, wide: Int = 0, letterbox: Int = 0, panScan: Int = 0) -> Int {
+        0x8000_0000 | (fourThree << 24) | (wide << 16) | (letterbox << 8) | panScan
+    }
+
+    /// A DVD's VOBs carry no language anywhere in the bitstream, so the IFO attribute tables are the only
+    /// source. The key is the MPEG-PS stream id FFmpeg reports, which is codec-dependent (#527).
+    func test_parsesAudioAndSubpictureLanguagesByStreamID() {
+        let pgc = makePGC(playbackSeconds: 120, programEntryCells: [1], cellSeconds: [120])
+        var ifo = withStreamAttributes(makeVTSIFO(pgcs: [pgc]),
+                                       audio: [audioAttr(format: 0, language: "en"),    // AC-3   -> 0x80 + n
+                                               audioAttr(format: 6, language: "de"),    // DTS    -> 0x88 + n
+                                               audioAttr(format: 4, language: "fr"),    // LPCM   -> 0xA0 + n
+                                               audioAttr(format: 2, language: "it")],   // MPEG   -> 0x1C0 + n
+                                       subpicture: [subpAttr(language: "en"), subpAttr(language: "nl")])
+        ifo = withStreamControls(ifo, pgcOffset: firstPGCOffset(),
+                                 audio: (0..<4).map { audioControl(number: $0) },
+                                 subpicture: [subpictureControl(fourThree: 0), subpictureControl(fourThree: 1)])
+        let languages = DVDIFOParser.parseStreamLanguages(ifo)
+        XCTAssertEqual(languages[0x80], "en")
+        XCTAssertEqual(languages[0x89], "de")
+        XCTAssertEqual(languages[0xA2], "fr")
+        XCTAssertEqual(languages[0x1C3], "it")
+        XCTAssertEqual(languages[0x20], "en")
+        XCTAssertEqual(languages[0x21], "nl")
+    }
+
+    /// The substream number is what the PGC's control table says, not the attribute's position: a disc
+    /// that authors its second audio attribute as substream 5 must not have its language put on 0x81.
+    func test_audioControlNamesTheSubstreamNumber() {
+        let pgc = makePGC(playbackSeconds: 120, programEntryCells: [1], cellSeconds: [120])
+        var ifo = withStreamAttributes(makeVTSIFO(pgcs: [pgc]),
+                                       audio: [audioAttr(format: 0, language: "en"),
+                                               audioAttr(format: 0, language: "es")],
+                                       subpicture: [])
+        ifo = withStreamControls(ifo, pgcOffset: firstPGCOffset(),
+                                 audio: [audioControl(number: 0), audioControl(number: 5)])
+        let languages = DVDIFOParser.parseStreamLanguages(ifo)
+        XCTAssertEqual(languages[0x80], "en")
+        XCTAssertEqual(languages[0x85], "es")
+        XCTAssertNil(languages[0x81])
+    }
+
+    /// A stream the PGC does not mark present is not in this title's VOBs, so it contributes nothing.
+    func test_skipsStreamThePGCMarksUnavailable() {
+        let pgc = makePGC(playbackSeconds: 120, programEntryCells: [1], cellSeconds: [120])
+        var ifo = withStreamAttributes(makeVTSIFO(pgcs: [pgc]),
+                                       audio: [audioAttr(format: 0, language: "en")],
+                                       subpicture: [subpAttr(language: "sv")])
+        ifo = withStreamControls(ifo, pgcOffset: firstPGCOffset(), audio: [0x0000], subpicture: [0x0000_0000])
+        XCTAssertTrue(DVDIFOParser.parseStreamLanguages(ifo).isEmpty)
+    }
+
+    /// One subtitle is authored once per display mode, so every substream number the entry names carries
+    /// the same language. The three secondary fields are skipped when zero, where an unused field and
+    /// stream 0 are indistinguishable.
+    func test_subpictureControlMapsEveryDisplayModeNumber() {
+        let pgc = makePGC(playbackSeconds: 120, programEntryCells: [1], cellSeconds: [120])
+        var ifo = withStreamAttributes(makeVTSIFO(pgcs: [pgc]),
+                                       audio: [], subpicture: [subpAttr(language: "en"), subpAttr(language: "da")])
+        ifo = withStreamControls(ifo, pgcOffset: firstPGCOffset(),
+                                 subpicture: [subpictureControl(fourThree: 0, wide: 1, letterbox: 2, panScan: 3),
+                                              subpictureControl(fourThree: 4)])
+        let languages = DVDIFOParser.parseStreamLanguages(ifo)
+        XCTAssertEqual(languages[0x20], "en")
+        XCTAssertEqual(languages[0x21], "en")
+        XCTAssertEqual(languages[0x22], "en")
+        XCTAssertEqual(languages[0x23], "en")
+        XCTAssertEqual(languages[0x24], "da")   // the second entry's padded-out fields claim nothing
+    }
+
+    /// An unreadable PGCIT must not cost the languages: the attribute position is the substream number
+    /// on the great majority of discs, so it is the fallback.
+    func test_fallsBackToAttributePositionWithoutAPGC() {
+        var ifo = [UInt8](repeating: 0, count: 4096)
+        ifo.replaceSubrange(0..<12, with: Array("DVDVIDEO-VTS".utf8))   // magic, but vts_pgcit stays 0
+        ifo = withStreamAttributes(ifo,
+                                   audio: [audioAttr(format: 0, language: "en"), audioAttr(format: 0, language: "de")],
+                                   subpicture: [subpAttr(language: "fr")])
+        let languages = DVDIFOParser.parseStreamLanguages(ifo)
+        XCTAssertEqual(languages[0x80], "en")
+        XCTAssertEqual(languages[0x81], "de")
+        XCTAssertEqual(languages[0x20], "fr")
+    }
+
+    /// An attribute whose lang_type / type says no language is declared contributes nothing, and neither
+    /// does a reserved coding mode whose carriage is undefined.
+    func test_ignoresAttributesWithoutADeclaredLanguage() {
+        var ifo = [UInt8](repeating: 0, count: 4096)
+        ifo.replaceSubrange(0..<12, with: Array("DVDVIDEO-VTS".utf8))
+        ifo = withStreamAttributes(ifo,
+                                   audio: [audioAttr(format: 0, language: nil),
+                                           audioAttr(format: 7, language: "en")],   // reserved coding mode
+                                   subpicture: [subpAttr(language: nil)])
+        XCTAssertTrue(DVDIFOParser.parseStreamLanguages(ifo).isEmpty)
+    }
+
+    func test_streamLanguagesEmptyOnBadMagic() {
+        XCTAssertTrue(DVDIFOParser.parseStreamLanguages([UInt8](repeating: 0, count: 4096)).isEmpty)
+    }
 }

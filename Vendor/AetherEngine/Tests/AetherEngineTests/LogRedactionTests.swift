@@ -179,9 +179,11 @@ struct LogRedactionTests {
         EngineLog.handler = { box.append($0) }
         defer { EngineLog.handler = previous }
 
-        EngineLog.emit("[test] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
+        EngineLog.emit("[test-496a] load url=https://s/v?api_key=\(token)&Static=true", category: .engine)
 
-        let captured = box.lines
+        // #496: the handler is a process-wide singleton, so every line any concurrently running
+        // suite emits lands in this box too. Assert on THIS test's line, not on the box.
+        let captured = box.lines.filter { $0.contains("[test-496a]") }
         #expect(captured.count == 1)
         #expect(captured.first?.contains("api_key=<redacted>") == true)
         #expect(captured.first?.contains(token) == false)
@@ -197,9 +199,11 @@ struct LogRedactionTests {
         EngineLog.handler = { box.append($0) }
         defer { EngineLog.handler = previous }
 
-        EngineLog.emit("[test] per-segment trace api_key=\(token)", category: .session, level: .verbose)
+        EngineLog.emit("[test-496b] per-segment trace api_key=\(token)", category: .session, level: .verbose)
 
-        #expect(box.lines.isEmpty)
+        // #496: same singleton, same rule. The bare `box.lines.isEmpty` failed a full run once on
+        // an unrelated AVIOReader line from a parallel suite, which says nothing about `.verbose`.
+        #expect(box.lines.filter { $0.contains("[test-496b]") }.isEmpty)
     }
 
     /// The handler is called on whatever thread emitted, so the capture needs its own lock.

@@ -1,4 +1,5 @@
 import Testing
+import Foundation
 import CoreGraphics
 import CoreText
 @testable import AetherEngine
@@ -62,6 +63,69 @@ struct SubtitleOCRTests {
         let text = try #require(SubtitleImageOCR.recognizeText(in: image, language: "en"))
         #expect(text.contains("HELLO"))
         #expect(text.contains("123"))
+    }
+
+    /// #552: the accurate model is an OPTIONAL system model. On macOS 27 it spends about a minute
+    /// precompiling for the Neural Engine on first use in a process and then throws about half the
+    /// time, and a process that has seen it fail once sees it fail forever. Pinned alone, that took
+    /// PGS / DVB / DVD subtitles out of PiP, AirPlay and the external display entirely.
+    ///
+    /// Driven through the seam rather than the weather: a machine whose model works cannot reach
+    /// the fallback, and a machine whose model is broken cannot be asked for on demand.
+    @Test("a subtitle is still read when the accurate model is unavailable")
+    func fallsBackToFastRecognition() throws {
+        SubtitleImageOCR.setAccurateUnavailableForTesting(true)
+        defer { SubtitleImageOCR.setAccurateUnavailableForTesting(false) }
+
+        let width = 480, height = 96
+        let ctx = CGContext(data: nil, width: width, height: height, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let font = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, 48, nil)
+        let attrs: [CFString: Any] = [kCTFontAttributeName: font,
+                                      kCTForegroundColorAttributeName: CGColor(red: 1, green: 1, blue: 1, alpha: 1)]
+        let line = CTLineCreateWithAttributedString(
+            CFAttributedStringCreate(kCFAllocatorDefault, "HELLO 123" as CFString, attrs as CFDictionary)!)
+        ctx.textPosition = CGPoint(x: 24, y: 28)
+        CTLineDraw(line, ctx)
+        let image = ctx.makeImage()!
+
+        let text = try #require(SubtitleImageOCR.recognizeText(in: image, language: "en"),
+                                "the fallback read nothing, so the cue would have been dropped")
+        #expect(text.contains("HELLO"))
+        #expect(text.contains("123"))
+        // Deliberately no assertion on how LONG this took, though the cost is half the point of
+        // the sticky flag. Measured on this machine, the same test took 0.24 s, then 6.9 s, then
+        // 61.4 s across three runs of the same code, because the fast model gets its own Neural
+        // Engine precompile on a cold system cache exactly as the accurate one does. A wall clock
+        // here measures the OS's cache, not the engine, and any bound over it is a coin toss that
+        // fails for reasons that have nothing to do with its subject. What the flag guarantees is
+        // structural and is visible in the code instead: with it set, the accurate request is
+        // never constructed.
+    }
+
+    /// A language the fast model does not speak must not take the line down with it. Vision's fast
+    /// list is six languages; the accurate one is thirty-three.
+    @Test("a language the fallback does not support drops the pin, not the line")
+    func fallbackDropsUnsupportedLanguagePin() throws {
+        SubtitleImageOCR.setAccurateUnavailableForTesting(true)
+        defer { SubtitleImageOCR.setAccurateUnavailableForTesting(false) }
+
+        let ctx = CGContext(data: nil, width: 480, height: 96, bitsPerComponent: 8, bytesPerRow: 0,
+                            space: CGColorSpaceCreateDeviceRGB(),
+                            bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue)!
+        let font = CTFontCreateWithName("HelveticaNeue-Bold" as CFString, 48, nil)
+        let attrs: [CFString: Any] = [kCTFontAttributeName: font,
+                                      kCTForegroundColorAttributeName: CGColor(red: 1, green: 1, blue: 1, alpha: 1)]
+        let line = CTLineCreateWithAttributedString(
+            CFAttributedStringCreate(kCFAllocatorDefault, "HELLO 123" as CFString, attrs as CFDictionary)!)
+        ctx.textPosition = CGPoint(x: 24, y: 28)
+        CTLineDraw(line, ctx)
+
+        // Japanese: on the accurate list, not on the fast one.
+        let text = SubtitleImageOCR.recognizeText(in: ctx.makeImage()!, language: "ja")
+        #expect(text?.contains("HELLO") == true,
+                "an unsupported language pin took the whole recognition down: \(text ?? "nil")")
     }
 }
 

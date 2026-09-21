@@ -158,12 +158,13 @@ final class Issue209LiveTargetDurationStabilityTests: XCTestCase {
 
         let result = Issue209WaitResult()
         let finished = expectation(description: "startup waiter finishes after cancellation")
-        DispatchQueue.global().async {
+        Thread.detachNewThread {
             result.store(provider.waitForFirstLiveSegment(timeout: 2))
             finished.fulfill()
         }
 
-        Thread.sleep(forTimeInterval: 0.1)
+        // The park is observable, so it is waited for; a tenth of a second was a guess.
+        while provider.parkedWaiterCount == 0 { usleep(200) }
         cadence.value = 2.2
         provider.appendLiveSegment(index: 2, startSeconds: 1.8, durationSeconds: 0.9)
         provider.appendLiveSegment(index: 3, startSeconds: 2.7, durationSeconds: 0.9)

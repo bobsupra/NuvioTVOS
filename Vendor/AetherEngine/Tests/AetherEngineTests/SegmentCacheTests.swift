@@ -185,4 +185,35 @@ struct SegmentCacheTests {
         #expect(c.contiguousForwardFrontier(from: 9) == 8)   // 9 absent -> targetIdx - 1
         #expect(c.contiguousForwardFrontier(from: 99) == 98) // fully absent -> targetIdx - 1
     }
+
+    @Test("awaitInit succeeds immediately if already stored or waits for async arrival")
+    func awaitInitSuccess() {
+        let c = SegmentCache()
+        defer { c.close() }
+        #expect(c.awaitInit(timeout: 0.05) == false)
+
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.05)
+            c.setInit(self.makeData(16))
+        }
+        #expect(c.awaitInit(timeout: 5.0) == true)
+        // Immediate return once cached
+        #expect(c.awaitInit(timeout: 0.05) == true)
+    }
+
+    @Test("awaitSegment succeeds immediately if already stored or waits for async arrival")
+    func awaitSegmentSuccess() {
+        let c = SegmentCache(forwardWindow: 10, backwardWindow: 10)
+        defer { c.close() }
+        #expect(c.awaitSegment(index: 5, timeout: 0.05) == false)
+
+        Thread.detachNewThread {
+            Thread.sleep(forTimeInterval: 0.05)
+            c.store(index: 5, data: self.makeData(64))
+        }
+        #expect(c.awaitSegment(index: 5, timeout: 5.0) == true)
+        // Immediate return once cached
+        #expect(c.awaitSegment(index: 5, timeout: 0.05) == true)
+    }
 }
+

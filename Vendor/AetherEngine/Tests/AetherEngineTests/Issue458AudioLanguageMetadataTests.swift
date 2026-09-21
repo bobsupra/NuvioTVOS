@@ -81,10 +81,16 @@ struct Issue458AudioLanguageMetadataTests {
     /// The pass-through gate is the DISPLAY NAME, not canonicalization, and this is why:
     /// `Locale.canonicalLanguageIdentifier(from:)` echoes anything it does not know, so it answers "cnr"
     /// for "cnr" and "dub" for "dub" alike. `localizedString(forLanguageCode:)` separates them.
+    ///
+    /// A three-letter label can be an ISO 639-3 code ICU simply has no data for yet, and a newer ICU can
+    /// promote it: macOS 27's ICU names AND maps `com` (Comanche), so it resolves through `alpha3` like any other
+    /// language and left this list. The name premise is asserted per label, so the next such move fails on
+    /// the premise line instead of reading like an engine regression.
     @Test("three-letter labels ICU cannot name stay unresolved even though canonicalization echoes them")
     func namelessThreeLetterLabelsStayClosed() {
-        for label in ["dub", "com", "sub", "org", "sfx", "ost", "xyz", "zzz"] {
+        for label in ["dub", "sub", "org", "sfx", "ost", "xyz", "zzz"] {
             #expect(Locale.canonicalLanguageIdentifier(from: label) == label)
+            #expect(Locale(identifier: "en_US").localizedString(forLanguageCode: label) == nil)
             #expect(AudioLanguageMap.iso639_2T(forSourceLanguage: label) == nil)
         }
     }

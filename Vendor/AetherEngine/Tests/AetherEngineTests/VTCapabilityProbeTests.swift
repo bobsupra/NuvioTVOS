@@ -63,3 +63,34 @@ struct VTCapabilityProbeTests {
             [0x01, 0x64, 0x00], codecID: AV_CODEC_ID_H264))
     }
 }
+
+/// AE#461: the routing gate and `SoftwarePlaybackHost` read an unclassifiable format in opposite
+/// directions. The gate keeps native (AVPlayer reads in-band parameter sets); the software host must pick
+/// libavcodec, because `HardwareVideoDecoder` builds from the hvcC alone and failed a decode-path
+/// correction with `sessionCreationFailed(-4)` on exactly those formats.
+@Suite("VT capability probe verdict consumers")
+struct VTCapabilityProbeVerdictTests {
+
+    @Test("a proven hardware session keeps native and opens the hardware decoder")
+    func supported() {
+        let verdict = VTCapabilityProbe.HardwareDecodeVerdict.supported
+        #expect(verdict.keepsNativeRoute)
+        #expect(verdict.opensHardwareDecoder)
+    }
+
+    @Test("a proven refusal leaves native and never opens the hardware decoder")
+    func unsupported() {
+        let verdict = VTCapabilityProbe.HardwareDecodeVerdict.unsupported
+        #expect(!verdict.keepsNativeRoute)
+        #expect(!verdict.opensHardwareDecoder)
+    }
+
+    @Test("an unclassifiable format keeps native but never opens the hardware decoder",
+          arguments: ["no extradata", "Annex-B extradata", "in-band parameter sets",
+                      "format description failed, status=-12710"])
+    func unclassifiable(reason: String) {
+        let verdict = VTCapabilityProbe.HardwareDecodeVerdict.unclassifiable(reason: reason)
+        #expect(verdict.keepsNativeRoute)
+        #expect(!verdict.opensHardwareDecoder)
+    }
+}

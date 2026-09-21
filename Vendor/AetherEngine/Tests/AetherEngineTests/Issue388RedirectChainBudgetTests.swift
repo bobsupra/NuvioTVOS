@@ -23,18 +23,6 @@ struct Issue388RedirectChainBudgetTests {
     private let mediaHostResigned = URL(string: "https://nexus-128.example.net/signed/1325105.mkv?exp=2&sig=b")!
     private let secondEdge = URL(string: "https://nexus-175.example.net/signed/1325105.mkv?exp=1&sig=c")!
 
-    /// Wait on a state the budget itself reports rather than on a duration: a sleep long enough to
-    /// "probably" have parked a waiter is a margin against a derived bound, and the first thing a
-    /// loaded machine takes away.
-    private func waitUntil(_ deadlineSeconds: Double = 10, _ condition: () -> Bool) async -> Bool {
-        let deadline = Date().addingTimeInterval(deadlineSeconds)
-        while Date() < deadline {
-            if condition() { return true }
-            try? await Task.sleep(nanoseconds: 2_000_000)
-        }
-        return condition()
-    }
-
     // MARK: - The ceiling
 
     @Test("the ceiling declared for the loaded URL binds the host that serves the bytes")
@@ -87,8 +75,9 @@ struct Issue388RedirectChainBudgetTests {
                 "a ticket booked on the portal key still frees the chain's slot")
     }
 
-    @Test("a request against the pinned target waits for the pump instead of joining it")
-    func targetRequestQueuesBehindThePump() async {
+    @Test("a request against the pinned target waits for the pump instead of joining it",
+          .timeLimit(.minutes(3)))
+    func targetRequestQueuesBehindThePump() async throws {
         let budget = OriginRequestBudget()
         budget.setHostLimit(1, for: portal)
         let pump = budget.acquire(for: portal, label: "pump", timeout: 0.1)
@@ -96,23 +85,31 @@ struct Issue388RedirectChainBudgetTests {
 
         let granted = UnsafeBox()
         let started = UnsafeBox()
-        DispatchQueue.global().async {
+        // A detached thread, not `DispatchQueue.global().async`: this waiter is what the test
+        // measures, and the pool hands out a thread only once one is free. Measured against a pool
+        // whose workers are all in a blocking wait, which is what a full parallel run of this suite
+        // produces: the async block had not started after 35 s, a detached thread ran in 3 ms.
+        Thread.detachNewThread {
             started.set(true)
-            let ticket = budget.acquire(for: self.mediaHostResigned, label: "detour", timeout: 20)
+            // 120 s, not 20: the acquire's own wait may not expire before the test's `.timeLimit`,
+            // or `granted` turns from nil into false and the negative expectation below reports the
+            // opposite of what starvation did.
+            let ticket = budget.acquire(for: self.mediaHostResigned, label: "detour", timeout: 120)
             granted.set(ticket?.granted == true)
         }
-        // Wait for the THREAD before waiting for the park, or the observation window is spent on
-        // libdispatch and a block that never got a thread reports a budget defect nobody measured
-        // (the same trap `cappedSerialises` pays for, and this test hit it on CI first try).
-        #expect(await waitUntil(30) { started.value == true },
-                "the waiter never got a thread; nothing about the budget was measured")
+        // Wait for the thread before waiting for the park, or the observation window is spent on
+        // scheduling and a waiter that never ran reports a budget defect nobody measured.
+        try await waitFor { started.value == true }
 
-        let parked = await waitUntil { budget.snapshot(for: mediaHost)?.waiting == 1 }
-        #expect(parked, "the second request went out alongside the pump: \(String(describing: budget.snapshot(for: mediaHost)))")
+        // Either outcome ends the wait, so a budget that lets the detour through is still reported
+        // at once, while starvation can only delay these two lines, never flip what they read.
+        try await waitFor { budget.snapshot(for: mediaHost)?.waiting == 1 || granted.value != nil }
         #expect(granted.value == nil, "nothing may be granted while the pump holds the only slot")
+        #expect(budget.snapshot(for: mediaHost)?.waiting == 1,
+                "the second request went out alongside the pump: \(String(describing: budget.snapshot(for: mediaHost)))")
 
         budget.release(pump)
-        _ = await waitUntil { granted.value != nil }
+        try await waitFor { granted.value != nil }
         #expect(granted.value == true, "the waiter must be served once the pump's slot comes back")
     }
 

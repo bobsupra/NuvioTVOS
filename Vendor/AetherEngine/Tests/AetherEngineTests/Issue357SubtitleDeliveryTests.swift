@@ -158,7 +158,7 @@ struct Issue357SubtitleDeliveryTests {
         engine.clock.sourceTime = 120
         engine.subtitleDrainTick()
 
-        engine.clearSubtitleDrainTarget(channel: .primary)
+        engine.clearSubtitleDrainTarget(channel: .primary, reason: .subtitlesCleared)
         #expect(engine.subtitleDeliveryLastOutcome[.primary] == nil)
     }
 

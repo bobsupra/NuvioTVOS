@@ -121,4 +121,136 @@ final class MPLSParserTests: XCTestCase {
         let pl = try! XCTUnwrap(MPLSParser.parse(makeMPLS()))
         XCTAssertTrue(pl.chapterStartTicks.isEmpty)
     }
+
+    // MARK: - STN table languages (#527)
+
+    /// One STN stream: a length-prefixed stream_entry naming the PID, then a length-prefixed
+    /// stream_attributes block whose language offset depends on the coding type.
+    private func stnStream(type: Int, pid: Int, coding: Int, language: String?) -> [UInt8] {
+        var entry: [UInt8] = [UInt8(type)]
+        entry += be16(pid)
+        var attr: [UInt8] = [UInt8(coding)]
+        switch coding {
+        case 0x80...0x86, 0x03, 0x04, 0xA1, 0xA2: attr.append(0x11)   // audio: format / sample rate
+        case 0x92: attr.append(0x00)                                  // text subtitle: character code
+        default: break
+        }
+        if let language { attr += Array(language.utf8) }
+        return [UInt8(entry.count)] + entry + [UInt8(attr.count)] + attr
+    }
+
+    private func stnTable(video: [[UInt8]] = [], audio: [[UInt8]] = [],
+                          pg: [[UInt8]] = [], ig: [[UInt8]] = []) -> [UInt8] {
+        var body: [UInt8] = []
+        body += be16(0)                                        // reserved
+        body += [UInt8(video.count), UInt8(audio.count), UInt8(pg.count), UInt8(ig.count)]
+        body += [0, 0, 0]                                      // secondary audio / video / PiP PG counts
+        body += [UInt8](repeating: 0, count: 5)                // reserved
+        body += (video + audio + pg + ig).flatMap { $0 }
+        return be16(body.count) + body
+    }
+
+    /// A PlayItem with the full 32-byte fixed header (the short fixture above stops after the UO mask),
+    /// optionally a multi-angle block, then an STN table.
+    private func fullPlayItem(clip: String, inT: Int, outT: Int,
+                              angles: Int = 1, stn: [UInt8]) -> [UInt8] {
+        var body = [UInt8]()
+        body += Array(clip.utf8)                 // @0  clip_id
+        body += Array("M2TS".utf8)               // @5  codec_id
+        body += be16(angles > 1 ? 0x0010 : 0)    // @9  11 reserved bits, is_multi_angle, connection_condition
+        body.append(0)                           // @11 ref_to_stc_id
+        body += be32(inT)                        // @12
+        body += be32(outT)                       // @16
+        body += [UInt8](repeating: 0, count: 8)  // @20 UO mask
+        body.append(0)                           // @28 random_access_flag + reserved
+        body.append(0)                           // @29 still_mode
+        body += be16(0)                          // @30 still_time
+        if angles > 1 {
+            body.append(UInt8(angles))           // @32 angle_count
+            body.append(0)                       //     flags
+            // clip_id(5) + codec_id(4) + stc_id(1) per ADDITIONAL angle
+            for _ in 1..<angles { body += Array("00099".utf8) + Array("M2TS".utf8) + [0] }
+        }
+        body += stn
+        return be16(body.count) + body
+    }
+
+    private func makeMPLS(items: [[UInt8]]) -> [UInt8] {
+        var playlist = [UInt8]()
+        playlist += be32(0); playlist += be16(0); playlist += be16(items.count); playlist += be16(0)
+        playlist += items.flatMap { $0 }
+        var out = [UInt8]()
+        out += Array("MPLS".utf8); out += Array("0200".utf8)
+        let plStart = 40
+        out += be32(plStart); out += be32(0); out += be32(0)
+        out += [UInt8](repeating: 0, count: plStart - out.count)
+        out += playlist
+        return out
+    }
+
+    /// A Blu-ray declares its track languages only here: the clip's PMT carries no ISO 639 descriptor,
+    /// so without the STN table every track demuxes as undetermined (#527).
+    func test_parsesSTNLanguagesByPID() {
+        let stn = stnTable(
+            video: [stnStream(type: 1, pid: 0x1011, coding: 0x1B, language: nil)],
+            audio: [stnStream(type: 1, pid: 0x1100, coding: 0x80, language: "eng"),
+                    stnStream(type: 1, pid: 0x1101, coding: 0x86, language: "deu")],
+            pg: [stnStream(type: 1, pid: 0x1200, coding: 0x90, language: "fra"),
+                 stnStream(type: 1, pid: 0x1201, coding: 0x90, language: "und")],
+            ig: [stnStream(type: 1, pid: 0x1400, coding: 0x91, language: "jpn")]
+        )
+        let pl = try! XCTUnwrap(MPLSParser.parse(
+            makeMPLS(items: [fullPlayItem(clip: "00001", inT: 0, outT: 90000, stn: stn)])))
+        XCTAssertEqual(pl.clipIDs, ["00001"])
+        XCTAssertEqual(pl.streamLanguages[0x1100], "eng")
+        XCTAssertEqual(pl.streamLanguages[0x1101], "deu")
+        XCTAssertEqual(pl.streamLanguages[0x1200], "fra")
+        XCTAssertEqual(pl.streamLanguages[0x1400], "jpn")
+        XCTAssertNil(pl.streamLanguages[0x1011])   // video declares no language
+        XCTAssertNil(pl.streamLanguages[0x1201])   // an explicit "und" says nothing the container did not
+    }
+
+    /// A multi-angle PlayItem pushes the STN table past an angle block whose size depends on the angle
+    /// count. Missing that shift lands the walk in the middle of the angle clip names.
+    func test_parsesSTNLanguagesPastMultiAngleBlock() {
+        let stn = stnTable(audio: [stnStream(type: 1, pid: 0x1100, coding: 0x80, language: "ita")])
+        let pl = try! XCTUnwrap(MPLSParser.parse(
+            makeMPLS(items: [fullPlayItem(clip: "00001", inT: 0, outT: 90000, angles: 3, stn: stn)])))
+        XCTAssertEqual(pl.streamLanguages[0x1100], "ita")
+    }
+
+    /// Every PlayItem of a title repeats the table; the first declaration wins, since the demuxer opens
+    /// on the first clip's PIDs.
+    func test_firstPlayItemWinsForARepeatedPID() {
+        let first = fullPlayItem(clip: "00001", inT: 0, outT: 90000,
+                                 stn: stnTable(audio: [stnStream(type: 1, pid: 0x1100, coding: 0x80, language: "eng")]))
+        let second = fullPlayItem(clip: "00002", inT: 0, outT: 90000,
+                                  stn: stnTable(audio: [stnStream(type: 1, pid: 0x1100, coding: 0x80, language: "spa"),
+                                                        stnStream(type: 1, pid: 0x1102, coding: 0x80, language: "por")]))
+        let pl = try! XCTUnwrap(MPLSParser.parse(makeMPLS(items: [first, second])))
+        XCTAssertEqual(pl.streamLanguages[0x1100], "eng")
+        XCTAssertEqual(pl.streamLanguages[0x1102], "por")   // a PID only the later item declares still lands
+    }
+
+    /// The playlist must survive a PlayItem that ends before the STN table (the short fixture above):
+    /// no languages, but clips, duration and chapters unaffected.
+    func test_noLanguagesWhenPlayItemStopsBeforeSTNTable() {
+        let pl = try! XCTUnwrap(MPLSParser.parse(makeMPLS()))
+        XCTAssertTrue(pl.streamLanguages.isEmpty)
+        XCTAssertEqual(pl.clipIDs, ["00002", "00005"])
+        XCTAssertEqual(pl.durationTicks, 270000)
+    }
+
+    /// A truncated STN table contributes what it resolved before the cut and never fails the playlist.
+    func test_truncatedSTNTableDegrades() {
+        let stn = stnTable(audio: [stnStream(type: 1, pid: 0x1100, coding: 0x80, language: "eng"),
+                                   stnStream(type: 1, pid: 0x1101, coding: 0x80, language: "deu")])
+        var item = fullPlayItem(clip: "00001", inT: 0, outT: 90000, stn: stn)
+        item.removeLast(6)                                   // cut into the second stream's attributes
+        item[0] = UInt8((item.count - 2) >> 8)               // restate the PlayItem length
+        item[1] = UInt8((item.count - 2) & 0xff)
+        let pl = try! XCTUnwrap(MPLSParser.parse(makeMPLS(items: [item])))
+        XCTAssertEqual(pl.streamLanguages[0x1100], "eng")
+        XCTAssertNil(pl.streamLanguages[0x1101])
+    }
 }

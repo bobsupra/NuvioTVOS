@@ -35,16 +35,25 @@ struct Issue254OffMainRepositionTests {
     }
 
     @MainActor
-    @Test("a reposition waiting on the demuxer leaves the main actor free")
+    @Test("a reposition waiting on the demuxer leaves the main actor free", .timeLimit(.minutes(3)))
     func blockedRepositionKeepsMainActorLive() async {
         let demuxer = Demuxer()
         let queue = DispatchQueue(label: "test.issue254.blocked")
         let release = DispatchSemaphore(value: 0)
         let finished = Flag()
         // Stands in for the demux loop holding `accessLock` across a slow remote read: the reposition
-        // cannot begin until this returns. Generous backstop, never a discriminator; the signal below
-        // is what actually ends it.
-        queue.async { _ = release.wait(timeout: .now() + 90) }
+        // cannot begin until this returns. No wall-clock cap: a backstop that can expire on its own
+        // ENDS the block, sets `finished`, and turns the negative expectation below into its
+        // opposite, so the cap is the discriminator however generous it is (CI starved the main
+        // actor's 100 ms of hops past a 90 s cap twice on 2026-09-09/10). The regression this guards
+        // is a blocked main actor, and a blocked main actor never reaches `release.signal()`, so its
+        // honest report is the trait's time limit. Three minutes rather than the repo's usual two:
+        // the suite's own measurement puts a limit under two minutes at a coin flip (612 of 2554
+        // tests reported over 60 s in a 93 s run), and this is one of the tests that MEASURES that
+        // starvation, so it is the likeliest to be caught by it. A permanent hang is caught by any
+        // finite limit; a longer one only delays the report. The defer covers an early exit.
+        defer { release.signal() }
+        queue.async { release.wait() }
 
         let reposition = Task { @MainActor in
             _ = await demuxer.seekBounded(to: 10, timeout: 1, on: queue)
