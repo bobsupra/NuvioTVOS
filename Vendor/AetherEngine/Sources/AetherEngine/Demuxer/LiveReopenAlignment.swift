@@ -47,4 +47,41 @@ enum LiveReopenAlignment {
         case .none: return .cannotAlignReaderSilentOnPosition
         }
     }
+
+    /// What the alignment achieved, read back from the READER rather than from the seek's own
+    /// return value (AE#460 round 3).
+    ///
+    /// `avio_seek` reports the AVIO axis, which for a successful `SEEK_SET` is the offset that was
+    /// asked for, so its return proves the reader accepted the seek and nothing more. Whether the
+    /// reader is still where the axis was aligned TO has exactly one witness: the reader's own
+    /// second position report.
+    ///
+    /// It can differ, because aligning the axis round-trips the reported cursor back through the
+    /// reader's `SEEK_SET`. A reader that reports its position on one axis and takes `SEEK_SET` on
+    /// another (absolute one way, relative to a join offset the other) therefore MOVES under an
+    /// alignment meant to leave it alone, and on a live spool that is the rewind this whole rule
+    /// exists to prevent. libavformat's own probe seeks travel the same axis, so the agreement is a
+    /// contract either way (`docs/formats.md`); this only makes breaking it visible in one line
+    /// instead of in a host's re-delivered window.
+    enum Verification: Equatable {
+        /// The axis moved and the reader did not, which is the whole invariant.
+        case aligned
+        /// The reader refused the seek. The reopen reads from wherever the context is instead.
+        case seekRefused(landed: Int64)
+        /// The reader answered the seek and then reported itself somewhere else, so its position
+        /// report and its `SEEK_SET` argument are not on the same axis.
+        case readerMovedUnderAlignment(to: Int64)
+    }
+
+    /// `readerReportsAfter` is nil for a reader that will not report a position at all, which the
+    /// decision above already named and which is not re-judged here.
+    static func verify(
+        requestedOffset: Int64,
+        avioLanded: Int64,
+        readerReportsAfter: Int64?
+    ) -> Verification {
+        guard avioLanded == requestedOffset else { return .seekRefused(landed: avioLanded) }
+        guard let after = readerReportsAfter, after != requestedOffset else { return .aligned }
+        return .readerMovedUnderAlignment(to: after)
+    }
 }

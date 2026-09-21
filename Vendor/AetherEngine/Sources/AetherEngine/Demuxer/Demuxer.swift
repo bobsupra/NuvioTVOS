@@ -61,6 +61,14 @@ struct DemuxerOpenProfile: Sendable {
     /// reopen (wedge restart, revive) inherit it together.
     var avioSequentialOnly: Bool = false
 
+    /// `LoadOptions.heldSourceConnection` (#377): the playback reader asks the origin once and
+    /// pulls, rather than ending at the window high water and asking again at low water. Rides in
+    /// the profile next to `avioSequentialOnly` so every reopen of the session (wedge restart,
+    /// revive) inherits it. The side demuxers build their own profiles from `playback` and are
+    /// deliberately left on the pushed path: their readers park for minutes at a time, which is
+    /// the one shape a held connection must not take.
+    var avioHeldConnection: Bool = false
+
     /// `LoadOptions.declaredDurationSeconds`: caller-trusted duration override consumed by
     /// `Demuxer.duration`. Rides in the profile next to `avioSequentialOnly` because the two are a
     /// pair: without the ranged tail read the container resolves no duration of its own.
@@ -124,6 +132,14 @@ struct DemuxerOpenProfile: Sendable {
         return copy
     }
 
+    /// A copy of `self` carrying the host's held-connection request (#377), chainable in the style
+    /// of `withSequentialOrigin` so a call site can add it to the profile it already built.
+    func withHeldSourceConnection(_ held: Bool) -> DemuxerOpenProfile {
+        var copy = self
+        copy.avioHeldConnection = held
+        return copy
+    }
+
     /// Open profile for the #79 wedged-restart fresh reopen (#93 residual). The 44 s device
     /// restart was find_stream_info re-paying the FULL playback probe budget (50 MB / 60 s)
     /// over an already-starved link, so the reopen shrinks the budget instead of skipping the
@@ -181,6 +197,15 @@ struct DemuxerOpenProfile: Sendable {
         -> DemuxerOpenProfile {
         subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
     }
+
+    /// Open profile for the AE#532 Dolby Vision record audit. Same shape and the same reasoning as the
+    /// Atmos pass above: the audit wants packets, not stream info, and the sample entry the framing is
+    /// read from is already resolved by `avformat_open_input`. It reaches its answer in the first video
+    /// packet rather than deep in the interleave, so it is the cheaper of the two by construction.
+    static func dolbyVisionRecordAuditDemuxer(callerProbesize: Int64?, callerMaxAnalyzeDuration: Int64?)
+        -> DemuxerOpenProfile {
+        subtitleSideDemuxer(callerProbesize: callerProbesize, callerMaxAnalyzeDuration: callerMaxAnalyzeDuration)
+    }
 }
 
 /// AVFormatContext wrapper. HTTP(S) uses custom AVIO via URLSession (no built-in
@@ -201,7 +226,7 @@ public final class Demuxer: @unchecked Sendable {
     /// producer, the segment plan, the software decoder, the still extractor) reads the same axis;
     /// a repair applied per host would have them disagree by the reorder delay. nil for every stream
     /// that is not the exact defect shape, which is decided once, on the first read.
-    private var compositionRepair: H264CompositionOffsetRepairSession?
+    private var compositionRepair: (any H264TimestampRepairSession)?
     private var compositionRepairEvaluated = false
 
     /// #407: video streams whose PTS `+genpts` invented out of decode order, because the container
@@ -229,6 +254,12 @@ public final class Demuxer: @unchecked Sendable {
     // Forward-only custom sources report false.
     var isSourceSeekable: Bool { avioProvider?.isSeekable ?? true }
 
+    /// True when libavformat opened the source itself, which it does only for a local path
+    /// (`openLocal`). Every network, disc and custom source is read through an `AVIOProvider`.
+    /// A caller that only wants to spend disk to avoid a re-READ asks this: re-reading a local
+    /// file costs a page-cache hit, so a second copy of it in the temporary directory buys nothing.
+    var readsSourceDirectly: Bool { avioProvider == nil }
+
     /// Timestamp of last unplanned reconnect (drop/stall, not a seek).
     /// Live producer correlates with backward source-PTS reset to detect
     /// Jellyfin transcode respawn. See `AVIOReader.lastUnplannedReconnectAt`.
@@ -251,6 +282,13 @@ public final class Demuxer: @unchecked Sendable {
         didSet { (avioProvider as? AVIOReader)?.onNetworkPhaseChanged = onNetworkPhaseChanged }
     }
 
+    /// Passed to the source reader so a held connection can tell a parked producer from a paused
+    /// viewer. Same provider the segment producer reads. `didSet` re-forwards for the same reason
+    /// `onNetworkPhaseChanged` does: it may be set before or after `open()`.
+    var playIntentProvider: (@Sendable () -> Bool)? {
+        didSet { (avioProvider as? AVIOReader)?.playIntentProvider = playIntentProvider }
+    }
+
     /// #361: emitted as each stage of `open()` finishes, so the engine can publish startup progress
     /// through the one stretch of a load a host cannot otherwise see. Called on whatever thread the
     /// open runs on (the playback open is detached off the main actor), never after `open()` returns.
@@ -262,6 +300,12 @@ public final class Demuxer: @unchecked Sendable {
 
     private(set) var discTitles: [DiscTitle] = []
     private(set) var selectedDiscTitleIndex: Int = 0
+
+    /// Language codes the selected disc title declares for its elementary streams, keyed by `AVStream.id`
+    /// (MPEG-TS PID on Blu-ray, MPEG-PS stream / substream id on DVD). Neither disc format repeats the
+    /// language inside the stream, so `trackInfo` backfills undetermined tracks from this; empty for every
+    /// non-disc source, where it is a no-op (#527).
+    private(set) var discStreamLanguages: [Int: String] = [:]
 
     /// Per-clip presentation-offset spans for a selected multi-clip Blu-ray title (empty otherwise). When
     /// non-empty, `readPacket` and `indexedKeyframes` fold each clip's timestamps onto one contiguous
@@ -290,6 +334,7 @@ public final class Demuxer: @unchecked Sendable {
     private func adoptDiscInfo(_ info: DiscInfo) {
         discTitles = info.titles
         selectedDiscTitleIndex = info.selectedTitleIndex
+        discStreamLanguages = info.selectedTitle?.streamLanguages ?? [:]
         clipTimeline = info.clipTimeline
         lastClipIndex = 0
         lastReadClipIdx = -1
@@ -469,9 +514,11 @@ public final class Demuxer: @unchecked Sendable {
             chunkRequestTimeout: openProfile.avioRequestTimeout,
             chunkMaxRetries: openProfile.avioMaxRetries,
             boundedInitialFetch: openProfile.boundedInitialFetch,
-            sequentialOnly: openProfile.avioSequentialOnly
+            sequentialOnly: openProfile.avioSequentialOnly,
+            heldConnection: openProfile.avioHeldConnection
         )
         reader.onNetworkPhaseChanged = onNetworkPhaseChanged
+        reader.playIntentProvider = playIntentProvider
         try openWithProvider(reader, isLive: isLive)
     }
 
@@ -503,12 +550,32 @@ public final class Demuxer: @unchecked Sendable {
         ) {
         case .alignTo(let offset):
             let landed = avio_seek(provider.context, offset, SEEK_SET)
-            EngineLog.emit(
-                landed == offset
-                    ? "[Demuxer] live reopen aligned to the reader's cursor at \(offset) bytes"
-                    : "[Demuxer] live reopen could not align to \(offset) bytes (avio_seek -> \(landed))",
-                category: .demux
-            )
+            // AE#460 round 3: the seek's own return says the reader ACCEPTED it, never that the
+            // reader stayed put, so the reader is asked once more where it is. Aligning the axis
+            // round-trips the reported cursor back through the host's `SEEK_SET`, which only leaves
+            // the source untouched while its position report and its `SEEK_SET` argument are on the
+            // same axis. One extra host callback, on live reopens only.
+            switch LiveReopenAlignment.verify(
+                requestedOffset: offset,
+                avioLanded: landed,
+                readerReportsAfter: provider.currentSourceOffset
+            ) {
+            case .aligned:
+                EngineLog.emit(
+                    "[Demuxer] live reopen aligned to the reader's cursor at \(offset) bytes",
+                    category: .demux)
+            case .seekRefused(let landed):
+                EngineLog.emit(
+                    "[Demuxer] live reopen could not align to \(offset) bytes (avio_seek -> \(landed))",
+                    category: .demux)
+            case .readerMovedUnderAlignment(let after):
+                EngineLog.emit(
+                    "[Demuxer] live reopen aligned the axis to \(offset) bytes, but the reader then "
+                    + "reported \(after): its position report and its SEEK_SET argument are on "
+                    + "different axes, so the source has been repositioned by the alignment "
+                    + "(see docs/formats.md, custom byte sources)",
+                    category: .demux)
+            }
         case .cannotAlignReaderSilentOnPosition:
             EngineLog.emit(
                 "[Demuxer] live reopen: the retained reader does not report its position, "
@@ -711,7 +778,7 @@ public final class Demuxer: @unchecked Sendable {
         generatedPTSStreams.removeAll()
         guard let nameC = ctx.pointee.iformat?.pointee.name else { return }
         let formatName = String(cString: nameC)
-        guard VFWDecodeOrderPTSRepair.isMatroska(formatName) else { return }
+        guard VFWDecodeOrderPTSRepair.containerWithholdsPTS(formatName) else { return }
         for index in 0..<Int32(ctx.pointee.nb_streams) {
             guard let stream = ctx.pointee.streams[Int(index)],
                   let par = stream.pointee.codecpar,
@@ -725,7 +792,8 @@ public final class Demuxer: @unchecked Sendable {
             else { continue }
             generatedPTSStreams.insert(index)
             EngineLog.emit(
-                "[Demuxer] AE#407 stream=\(index) is VFW-carried (tag=\(fourCC(par.pointee.codec_tag)) "
+                "[Demuxer] AE#407 stream=\(index) in \(formatName) is FourCC-carried "
+                + "(tag=\(fourCC(par.pointee.codec_tag)) "
                 + "videoDelay=\(par.pointee.video_delay)); the container carries no PTS, so the "
                 + "+genpts axis is decode order. Clearing PTS, the decoder's reorder owns presentation.",
                 category: .demux
@@ -1067,7 +1135,11 @@ public final class Demuxer: @unchecked Sendable {
             codecName = "unknown"
         }
 
-        let language = metadataValue(stream.pointee.metadata, key: "language")
+        let language = Self.resolvedLanguage(
+            declared: metadataValue(stream.pointee.metadata, key: "language"),
+            streamID: stream.pointee.id,
+            discLanguages: discStreamLanguages
+        )
         let title = metadataValue(stream.pointee.metadata, key: "title")
         let name: String
         if let title = title, !title.isEmpty {
@@ -1118,6 +1190,27 @@ public final class Demuxer: @unchecked Sendable {
             isAtmos: isAtmos,
             assHeader: assHeader
         )
+    }
+
+    /// The language to publish for a stream. A disc keeps its track languages in its navigation data
+    /// rather than in the streams, so an m2ts / VOB demuxed on its own reports every track as
+    /// undetermined and no preferred-language selection can match. `discLanguages` (empty for every
+    /// non-disc source) fills those in, keyed by the stream's container id. A language the container
+    /// actually declared always wins: the disc tables describe the authored title, the stream describes
+    /// itself (#527).
+    static func resolvedLanguage(declared: String?, streamID: Int32,
+                                 discLanguages: [Int: String]) -> String? {
+        guard isUndeterminedLanguage(declared) else { return declared }
+        return discLanguages[Int(streamID)] ?? declared
+    }
+
+    /// True for a container language that names no language: absent, empty, or the ISO 639-2
+    /// "undetermined" code. This is what every Blu-ray and DVD track reports, since neither format
+    /// carries the language in the stream (#527).
+    static func isUndeterminedLanguage(_ value: String?) -> Bool {
+        guard let value = value?.trimmingCharacters(in: .whitespaces).lowercased(),
+              !value.isEmpty else { return true }
+        return value == "und" || value == "undetermined"
     }
 
     /// MKV font attachments. Payload in codec extradata; filename/MIME in stream metadata.
@@ -1243,10 +1336,13 @@ public final class Demuxer: @unchecked Sendable {
         return result
     }
 
-    func readPacket() throws -> UnsafeMutablePointer<AVPacket>? {
+    func readPacket(isCurrent: @Sendable () -> Bool = { true }) throws -> UnsafeMutablePointer<AVPacket>? {
         accessLock.lock()
         defer { accessLock.unlock() }
         while true {
+            // A read-ahead decision made before a seek cannot start a NEW-position read after
+            // the seek releases this lock, then throw that first new packet away as stale.
+            guard isCurrent() else { throw CancellationError() }
             // #409: a packet the repair held during its sampling window is handed back before any
             // new read, so the container's own order survives the verdict. Checked every pass, not
             // once on entry: the packet that completes the sample flips the phase, and the queue
@@ -1297,7 +1393,7 @@ public final class Demuxer: @unchecked Sendable {
     /// #409: resolved once per demuxer, at the first read or at the explicit decision above,
     /// because it needs the stream parameters `avformat_find_stream_info` fills in and costs nothing
     /// for the streams it does not apply to.
-    private func armCompositionRepairIfNeeded() -> H264CompositionOffsetRepairSession? {
+    private func armCompositionRepairIfNeeded() -> (any H264TimestampRepairSession)? {
         if compositionRepairEvaluated { return compositionRepair }
         compositionRepairEvaluated = true
         guard let ctx = formatContext else { return nil }
@@ -1312,11 +1408,18 @@ public final class Demuxer: @unchecked Sendable {
         guard index >= 0, index < Int32(ctx.pointee.nb_streams),
               let stream = ctx.pointee.streams[Int(index)] else { return nil }
         guard stream.pointee.discard != AVDISCARD_ALL else { return nil }
+        // #511: the same defect on a container that never had composition offsets to lose. Its
+        // policy reads the presentation slots the writer misassigned rather than rebuilding them,
+        // so the two never apply to one stream and the container picks between them.
         compositionRepair = H264CompositionOffsetRepairSession(
             containerFormatName: containerFormatName,
             stream: stream,
             streamIndex: index,
             ladderStart: firstIndexedTimestamp(of: stream)
+        ) ?? H264MatroskaSlotPermutationSession(
+            containerFormatName: containerFormatName,
+            stream: stream,
+            streamIndex: index
         )
         return compositionRepair
     }

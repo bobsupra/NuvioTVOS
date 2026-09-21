@@ -113,7 +113,22 @@ final class CustomIOReaderBridge: AVIOProvider, @unchecked Sendable {
         let here = preservesSourcePosition
             ? callingHost { reader.seek(offset: 0, whence: 1) }  // SEEK_CUR 0: report position
             : -1
-        isSeekable = callingHost { reader.seek(offset: max(0, here), whence: 0) } >= 0
+        let landed = callingHost { reader.seek(offset: max(0, here), whence: 0) }
+        isSeekable = landed >= 0
+        // AE#460 round 3: the probe hands the reported position straight back as a `SEEK_SET`, so a
+        // reader that reports on one axis and takes `SEEK_SET` on another is MOVED by a probe whose
+        // whole point is that it moves nothing, and the live alignment that follows repeats the
+        // round trip at the same offset. A conforming reader answers with the position it was asked
+        // for, so the comparison is free: no extra callback, and it fires on every live open,
+        // including every in-place rebuild. Named rather than corrected, because the axis a host
+        // means is not knowable from here (`docs/formats.md`, custom byte sources).
+        if preservesSourcePosition, here > 0, landed >= 0, landed != here {
+            EngineLog.emit(
+                "[Demuxer] custom source: the reader reported byte \(here) and answered a seek back "
+                + "to it with \(landed), so its position report and its SEEK_SET argument are not on "
+                + "the same axis; the source has been repositioned by the seekability probe",
+                category: .demux)
+        }
     }
 
     /// AE#460 follow-up: where the host's reader currently sits, or nil when it will not say.

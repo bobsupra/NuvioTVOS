@@ -7,6 +7,16 @@ final class ByteFIFO: @unchecked Sendable {
     private var storage = Data()
     private var finished = false
     private var cancelled = false
+    /// Callers parked in `read` or `write`, guarded by the condition above. A reader from another
+    /// thread only gets the lock while a caller sits in `wait()`, so a non-zero read proves the
+    /// park: that is what a test needs before it feeds or cancels the queue, and a sleep long
+    /// enough to "probably" have parked the caller is a margin against scheduling instead.
+    private var parked = 0
+    var parkedWaiterCount: Int {
+        condition.lock()
+        defer { condition.unlock() }
+        return parked
+    }
 
     init(capacity: Int) {
         self.capacity = capacity
@@ -16,9 +26,11 @@ final class ByteFIFO: @unchecked Sendable {
     func write(_ data: Data) -> Bool {
         condition.lock()
         defer { condition.unlock() }
+        parked += 1
         while storage.count >= capacity && !finished && !cancelled {
             condition.wait()
         }
+        parked -= 1
         if finished || cancelled { return false }
         storage.append(data)
         condition.broadcast()
@@ -29,9 +41,11 @@ final class ByteFIFO: @unchecked Sendable {
     func read(into buffer: UnsafeMutablePointer<UInt8>, maxLength: Int) -> Int {
         condition.lock()
         defer { condition.unlock() }
+        parked += 1
         while storage.isEmpty && !finished && !cancelled {
             condition.wait()
         }
+        parked -= 1
         if cancelled { return -1 }
         if storage.isEmpty { return 0 } // finished + drained
         let n = min(maxLength, storage.count)
