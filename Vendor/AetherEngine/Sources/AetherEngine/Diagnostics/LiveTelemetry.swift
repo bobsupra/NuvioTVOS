@@ -3,13 +3,18 @@ import Foundation
 /// 1 Hz live playback telemetry snapshot. Nil fields are path-asymmetric:
 /// observedFps=nil on native (AVPlayer has no usable live FPS counter);
 /// avSyncGapMs=nil on SW (measured by HLSSegmentProducer which only runs on the native/HLS-loopback path);
-/// forwardBufferSeconds=nil on SW, and stays nil on purpose (#306): the software demux loop reads on
-/// renderer back-pressure, so there is no seconds-deep reservoir of arrived-but-unplayed media to
-/// report there. `displayCushionSeconds` and `readerWindowAheadBytes` are what that path holds instead,
-/// and putting either of them under the same name would report a near-stall on a healthy session.
+/// forwardBufferSeconds=nil on SW: this remains the native player's loaded-range metric (#306).
+/// Software VOD compressed packet read-ahead is reported through engine.bufferedPosition and
+/// cachedBytes, separately from displayCushionSeconds and the byte-source reader window. Do not
+/// interpret a sub-second decoded queue as the size of the compressed packet cache.
 public struct LiveTelemetry: Equatable, Sendable {
     // Enthusiast section
     public let instantBitrateMbps: Double?
+    /// Lifetime mean rate of the session, over the seconds it spent consuming media rather than over
+    /// wall-clock seconds since it started (AE#514). A pause therefore leaves this value standing
+    /// still instead of dragging it toward zero for as long as the pause lasts, and so does the tail
+    /// after end-of-media. nil until the session has both accrued active time and fetched something:
+    /// like `networkThroughputMbps`, a value that cannot be measured yet is a gap, never a zero.
     public let averageBitrateMbps: Double?
     /// Live bitrate of the audio bridge's encoded output, or nil when no bridge is active (stream-copy /
     /// AVPlayer-native path) or before the first delta. Measured from the bridge's cumulative output-byte
@@ -38,6 +43,11 @@ public struct LiveTelemetry: Equatable, Sendable {
     /// the first metrics read. Cumulative for the session, so a rate comes from differencing two ticks.
     public let accumulatedFrameDelaySeconds: Double?
     public let cachedBytes: Int64?
+    /// Session-local compressed-packet cache counters. nil outside software VOD. A hit reuses
+    /// retained packets without changing the source epoch; a miss requires a source reposition.
+    public let softwareCacheSeekHits: UInt64?
+    public let softwareCacheSeekMisses: UInt64?
+    public let softwareCacheSourceEpoch: UInt64?
     /// The rate the source link delivers at while it is delivering, so it stays comparable between the
     /// two paths: `observedBitrate` from the access log on native, and on the software path the
     /// demuxer's own byte counter over the seconds bytes arrived in (#306 follow-up). Not a wall-clock
@@ -86,6 +96,9 @@ public struct LiveTelemetry: Equatable, Sendable {
         readerWindowAheadBytes: Int? = nil,
         accumulatedFrameDelaySeconds: Double? = nil,
         cachedBytes: Int64?,
+        softwareCacheSeekHits: UInt64? = nil,
+        softwareCacheSeekMisses: UInt64? = nil,
+        softwareCacheSourceEpoch: UInt64? = nil,
         networkThroughputMbps: Double?,
         networkTransferredBytes: Int64?,
         avSyncGapMs: Double?,
@@ -107,6 +120,9 @@ public struct LiveTelemetry: Equatable, Sendable {
         self.readerWindowAheadBytes = readerWindowAheadBytes
         self.accumulatedFrameDelaySeconds = accumulatedFrameDelaySeconds
         self.cachedBytes = cachedBytes
+        self.softwareCacheSeekHits = softwareCacheSeekHits
+        self.softwareCacheSeekMisses = softwareCacheSeekMisses
+        self.softwareCacheSourceEpoch = softwareCacheSourceEpoch
         self.networkThroughputMbps = networkThroughputMbps
         self.networkTransferredBytes = networkTransferredBytes
         self.avSyncGapMs = avSyncGapMs

@@ -262,6 +262,15 @@ func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
             print("ERROR: LiveFixture (native) init: \(error)")
             return 1
         }
+        // The matrix asserts LIVENESS: at the edge after a return, a rewind that lands near its
+        // target, a seekable range that advances. None of those can hold against an unpaced origin,
+        // which hands the seed over as fast as the socket takes it: the producer then runs hundreds
+        // of segments ahead, the window slides past the consumer over and over, and `behind` sits at
+        // the racing artifact `live`'s own sampler already documents as ~30 to 40 s. So the fixture
+        // is paced here, exactly as `live --realtime` paces it, and the preroll keeps a window deep
+        // enough to rewind 20 s into.
+        fixture.paced = true
+        fixture.pacingPrerollSeconds = 30
         let liveURL: URL
         do {
             liveURL = try fixture.start()
@@ -297,6 +306,15 @@ func runDVR(path: String, seconds: Double, dvrWindow: Double) -> Int32 {
             print("ERROR: LiveFixture (sw) init: \(error)")
             return 1
         }
+        // The matrix asserts LIVENESS: at the edge after a return, a rewind that lands near its
+        // target, a seekable range that advances. None of those can hold against an unpaced origin,
+        // which hands the seed over as fast as the socket takes it: the producer then runs hundreds
+        // of segments ahead, the window slides past the consumer over and over, and `behind` sits at
+        // the racing artifact `live`'s own sampler already documents as ~30 to 40 s. So the fixture
+        // is paced here, exactly as `live --realtime` paces it, and the preroll keeps a window deep
+        // enough to rewind 20 s into.
+        fixture.paced = true
+        fixture.pacingPrerollSeconds = 30
         let liveURL: URL
         do {
             liveURL = try fixture.start()

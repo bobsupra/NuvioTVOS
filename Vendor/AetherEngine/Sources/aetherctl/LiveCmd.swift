@@ -121,6 +121,7 @@ func runLive(
     fastZap: Bool = false,
     pacingPreroll: Double? = nil,
     pacingRate: Double? = nil,
+    originLead: Double? = nil,
     freezeAfter: Double? = nil,
     unfreezeAfter: Double? = nil,
     rewindBeforeFreeze: Double? = nil,
@@ -128,7 +129,8 @@ func runLive(
     rewindHold: Double? = nil,
     blockingReload: Bool? = nil,
     liveOnly: Bool = false,
-    forceMaster: Bool = false
+    forceMaster: Bool = false,
+    startPosition: Double? = nil
 ) -> Int32 {
     // Relative timestamps make join latency (readyToPlay et al.) readable off the log (AE#195).
     let logEpoch = Date()
@@ -178,6 +180,11 @@ func runLive(
     if let preroll = pacingPreroll {
         fixture.pacingPrerollSeconds = preroll
         print("aetherctl live: --preroll \(preroll)s (0 = strict-realtime origin, no backlog burst)")
+    }
+    if let lead = originLead {
+        fixture.pacingLeadSeconds = lead
+        print("aetherctl live: --origin-lead \(lead)s (the paced origin runs up to \(lead)s of media "
+              + "ahead of the wall clock, which is the distance a raw live client reads behind it)")
     }
     if let rate = pacingRate {
         fixture.pacingRateMultiple = rate
@@ -256,7 +263,8 @@ func runLive(
         box.value = await liveSmokeTest(url: liveURL, seconds: playSeconds, fastZap: fastZap,
                                         dvrWindow: dvrWindow, measureRSS: measureRSS,
                                         reportCacheBytes: reportCacheBytes,
-                                        checkMonotonic: discontinuityAt != nil)
+                                        checkMonotonic: discontinuityAt != nil,
+                                        startPosition: startPosition)
         fixture.stop()
         CFRunLoopStop(CFRunLoopGetMain())
     }
@@ -270,7 +278,8 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
                            dvrWindow: Double? = nil,
                            measureRSS: Bool = false,
                            reportCacheBytes: Bool = false,
-                           checkMonotonic: Bool = false) async -> Int32 {
+                           checkMonotonic: Bool = false,
+                           startPosition: Double? = nil) async -> Int32 {
     let engine: AetherEngine
     do {
         engine = try AetherEngine()
@@ -288,7 +297,10 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
     // a --realtime fixture A/Bs between profiles.
     let loadStartedAt = Date()
     do {
-        try await engine.load(url: url, options: options)
+        // AE#509: a live join with a host-supplied resume anchor had no harness. The anchor a host
+        // holds is on the PUBLISHED axis (the only one it is shown), the mount seek spends it on the
+        // ITEM axis, and on a live source the two are `playlistShiftSeconds` apart.
+        try await engine.load(url: url, startPosition: startPosition, options: options)
     } catch {
         print("VERDICT: live FAIL: load error: \(error.localizedDescription)")
         engine.stop()
@@ -374,6 +386,14 @@ private func liveSmokeTest(url: URL, seconds playSeconds: Double,
             tickLine += String(format: " origin=%.1fMB restarts=%d",
                                Double(telemetry.demuxerBytesFetched) / 1_048_576,
                                telemetry.producerRestartCount)
+        }
+        // AE#509: `t=` is the published clock, which carries the shift. `item=` is what AVPlayer
+        // says about its own item, which is the field a reporter's dump prints. A session where
+        // those two do not differ by the shift is a session where something put the item somewhere
+        // it cannot reach, and that difference is invisible from either number alone.
+        if let itemReading = await engine.nativeItemReading() {
+            tickLine += String(format: " item=%.2fs ranges=%d status=%d",
+                               itemReading.playhead, itemReading.loadedRangeCount, itemReading.status)
         }
         print(tickLine)
         // Print RSS sample every 30 s when --measure-rss is set.
@@ -912,6 +932,12 @@ private func liveFreezeTest(url: URL, seconds playSeconds: Double, dvrWindow: Do
                              (engine.seekableLiveRange?.upperBound ?? edge) - t))
             } else {
                 if firstPostFreezeT == nil { firstPostFreezeT = t }
+                // AE#520 round 2: this step is dominated by the FIXTURE on thaw, not by the session.
+                // The paced origin gates on wall clock, so it hands over everything the freeze owed at
+                // I/O speed the moment it thaws, and the client follows an edge that jumped. Measured
+                // on one arm at two prerolls, same code: 28.98 s at `--preroll 30` and 58.98 s at 60,
+                // which is enough to flip the no-rejoin verdict below. Compare arms at one preroll, and
+                // read the step as a property of the origin unless the ARMS differ at the same one.
                 maxForwardSnap = max(maxForwardSnap, t - prevT)
                 advanceAfterFreeze = t - (firstPostFreezeT ?? t)
             }
@@ -922,9 +948,18 @@ private func liveFreezeTest(url: URL, seconds playSeconds: Double, dvrWindow: Do
         let range = engine.seekableLiveRange.map {
             String(format: "%.1f...%.1f", $0.lowerBound, $0.upperBound)
         } ?? "nil"
-        print(String(format: "  state=%@ t=%.2fs edge=%.2fs behind=%.2fs range=%@ deaths=%d rejoins=%d",
+        // AE#520 round 2: `t` is the published SESSION clock, which is item time plus the session's
+        // shift, so it says nothing on its own about how long this consumer can keep playing. The
+        // close decision spends the segments it has not fetched yet; what it can still play is those
+        // PLUS what AVPlayer already holds, and only the item can report the second half.
+        let item = await engine.nativeItemReading()
+        let buffered = engine.liveTelemetry?.forwardBufferSeconds
+        print(String(format: "  state=%@ t=%.2fs edge=%.2fs behind=%.2fs range=%@ deaths=%d rejoins=%d"
+                     + " item=%@ buf=%@",
                      "\(engine.state)", t, edge, max(0, edge - t), range,
-                     counters.itemDeaths, counters.edgeRejoins + counters.keptPlace))
+                     counters.itemDeaths, counters.edgeRejoins + counters.keptPlace,
+                     item.map { String(format: "%.2fs", $0.playhead) } ?? "none",
+                     buffered.map { String(format: "%.2fs", $0) } ?? "none"))
     }
 
     let finalState = engine.state

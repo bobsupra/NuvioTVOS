@@ -65,11 +65,19 @@ struct DiscTitle: Sendable, Equatable {
     let dvdVTSN: Int?
     /// DVD: the title number within its VTS.
     let dvdTitleNumber: Int?
+    /// ISO 639 language codes the disc's own navigation data declares for this title's elementary
+    /// streams, keyed by the `AVStream.id` FFmpeg gives them: the MPEG-TS PID on Blu-ray (from the
+    /// MPLS STN table) and the MPEG-PS stream / substream id on DVD (from the VTS IFO attribute
+    /// tables). Neither disc format puts the language in the stream itself, so a demuxed title reports
+    /// every track as undetermined without this; `Demuxer.trackInfo` backfills from it. Empty when the
+    /// disc declares none (#527).
+    let streamLanguages: [Int: String]
 
     init(id: Int, durationTicks: UInt64, chapters: [DiscChapter] = [],
          bdClipIDs: [String]? = nil, bdClipSubtractTicks: [Int64]? = nil,
          bdClipCumulativeBeforeTicks: [UInt64]? = nil,
-         dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil) {
+         dvdVTSN: Int? = nil, dvdTitleNumber: Int? = nil,
+         streamLanguages: [Int: String] = [:]) {
         self.id = id
         self.durationTicks = durationTicks
         self.chapters = chapters
@@ -78,6 +86,7 @@ struct DiscTitle: Sendable, Equatable {
         self.bdClipCumulativeBeforeTicks = bdClipCumulativeBeforeTicks
         self.dvdVTSN = dvdVTSN
         self.dvdTitleNumber = dvdTitleNumber
+        self.streamLanguages = streamLanguages
     }
 }
 
@@ -123,6 +132,24 @@ extension ClipSpan {
 enum ClipFold {
     static func offsetSeconds(observedBaseSec: Double, base0Sec: Double, cumulativeBeforeSec: Double) -> Double {
         observedBaseSec - base0Sec - cumulativeBeforeSec
+    }
+}
+
+/// A fixed-width ISO 639 code read out of disc navigation data, as lowercase ASCII letters. Blu-ray
+/// STN tables carry three-byte 639-2 codes and DVD attribute tables two-byte 639-1 ones;
+/// `AetherEngine.languageMatches` already treats the two as equivalent, so neither is widened here.
+/// Returns nil for padding, an unset field, or the explicit "undetermined" code, none of which say
+/// more than the `und` the container already reports (#527).
+enum DiscLanguageCode {
+    static func parse(_ data: [UInt8], at index: Int, length: Int) -> String? {
+        guard index >= 0, length > 0, index + length <= data.count else { return nil }
+        var code = ""
+        for byte in data[index..<(index + length)] {
+            let lower = byte | 0x20
+            guard lower >= UInt8(ascii: "a"), lower <= UInt8(ascii: "z") else { return nil }
+            code.append(Character(UnicodeScalar(lower)))
+        }
+        return code == "und" ? nil : code
     }
 }
 

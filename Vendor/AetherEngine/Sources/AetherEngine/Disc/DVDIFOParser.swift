@@ -71,6 +71,15 @@ enum DVDIFOParser {
     /// cumulative cell playback times. Returns nil if the bytes are not a recognizable VTSI or the PGCIT is
     /// malformed (the caller then leaves the title's duration at 0 with no chapters).
     static func parseTitleDetail(_ data: [UInt8]) -> (durationTicks: UInt64, chapterStartTicks: [UInt64])? {
+        guard let pgcOffset = mainPGCOffset(data) else { return nil }
+        return (durationTicks: dvdTimeTicks(data, pgcOffset + pgcPlaybackTimeOffset),
+                chapterStartTicks: parsePGCChapters(data, pgcOffset: pgcOffset))
+    }
+
+    /// Byte offset of the title set's main program chain: the longest PGC across the VTS_PGCIT search
+    /// pointers. nil when the bytes are not a recognizable VTSI or the PGCIT is malformed. Shared, so the
+    /// duration, the chapters and the stream-language tables all describe the same chain.
+    private static func mainPGCOffset(_ data: [UInt8]) -> Int? {
         guard data.count >= vtsPgcitPointerOffset + 4,
               Array(data[0..<12]) == vtsMagic else { return nil }
         let pgcitSector = be32(data, vtsPgcitPointerOffset)
@@ -79,8 +88,6 @@ enum DVDIFOParser {
         guard pgcitBase + 8 <= data.count else { return nil }
         let nrSrp = be16(data, pgcitBase)
         guard nrSrp > 0 else { return nil }
-
-        // Pick the longest PGC across the table's search pointers (the main feature of a multi-PGC VTS).
         var bestOffset = -1
         var bestTicks: UInt64 = 0
         for i in 0..<nrSrp {
@@ -91,9 +98,7 @@ enum DVDIFOParser {
             let ticks = dvdTimeTicks(data, pgcOffset + pgcPlaybackTimeOffset)
             if bestOffset < 0 || ticks > bestTicks { bestOffset = pgcOffset; bestTicks = ticks }
         }
-        guard bestOffset >= 0 else { return nil }
-        let chapters = parsePGCChapters(data, pgcOffset: bestOffset)
-        return (durationTicks: bestTicks, chapterStartTicks: chapters)
+        return bestOffset >= 0 ? bestOffset : nil
     }
 
     /// Title-relative chapter starts from a PGC's program map + cumulative cell playback times. A chapter
@@ -120,6 +125,109 @@ enum DVDIFOParser {
         }
         var seen = Set<UInt64>()
         return starts.sorted().filter { seen.insert($0).inserted }
+    }
+
+    // MARK: - VTS IFO stream languages (#527)
+
+    /// VTSI_MAT offsets of the title-set stream attribute tables (DVD-Video VTSI_MAT from RBP 0x0200),
+    /// per libdvdread's vtsi_mat_t.
+    private static let vtsAudioCountOffset = 0x203
+    private static let vtsAudioAttrOffset = 0x204
+    private static let vtsAudioAttrSize = 8
+    private static let vtsMaxAudioStreams = 8
+    private static let vtsSubpictureCountOffset = 0x255
+    private static let vtsSubpictureAttrOffset = 0x256
+    private static let vtsSubpictureAttrSize = 6
+    private static let vtsMaxSubpictureStreams = 32
+    /// PGC stream control tables (libdvdread pgc_t): which substream number each attribute entry is
+    /// actually carried as, which is not always its position in the attribute table.
+    private static let pgcAudioControlOffset = 0x0C
+    private static let pgcSubpictureControlOffset = 0x1C
+    private static let subpictureSubstreamBase = 0x20
+
+    /// Languages a VTS IFO declares for its audio and subpicture streams, keyed by the `AVStream.id`
+    /// FFmpeg's MPEG-PS demuxer reports (it sets `st->id` to the stream / substream start code). A DVD's
+    /// VOBs carry no language anywhere in the bitstream, so without the IFO every track demuxes as
+    /// undetermined and language-based selection has nothing to match on.
+    ///
+    /// The attribute tables say WHICH language; the main PGC's control tables say which substream number
+    /// carries it, and an entry the PGC marks unavailable is not in this title's VOBs at all. Without a
+    /// readable PGC the attribute position is used as the substream number, which is what the great
+    /// majority of discs author anyway.
+    ///
+    /// Empty (never nil) on an unreadable IFO: a missing language costs auto-selection, not playback, so
+    /// every guard here degrades rather than failing the title (#527).
+    static func parseStreamLanguages(_ data: [UInt8]) -> [Int: String] {
+        guard data.count >= 12, Array(data[0..<12]) == vtsMagic else { return [:] }
+        let pgc = mainPGCOffset(data)
+        var languages: [Int: String] = [:]
+        /// First declaration wins: the attribute tables are ordered, and a later entry's padded-out
+        /// control field must not overwrite a number an earlier entry claimed outright.
+        func claim(_ id: Int, _ language: String) {
+            if languages[id] == nil { languages[id] = language }
+        }
+
+        // audio_attr_t: byte 0 packs audio_format(3) multichannel_extension(1) lang_type(2)
+        // application_mode(2); the ISO 639-1 code sits at bytes 2-3 and is only meaningful when
+        // lang_type == 1. audio_control: bit 15 = present, bits 14-8 = the substream number.
+        if data.count > vtsAudioCountOffset {
+            let count = min(Int(data[vtsAudioCountOffset]), vtsMaxAudioStreams)
+            for n in 0..<count {
+                let attr = vtsAudioAttrOffset + n * vtsAudioAttrSize
+                guard attr + vtsAudioAttrSize <= data.count else { break }
+                guard (Int(data[attr]) >> 2) & 0x3 == 1,
+                      let language = DiscLanguageCode.parse(data, at: attr + 2, length: 2),
+                      let base = audioSubstreamBase(format: Int(data[attr]) >> 5) else { continue }
+                var number = n
+                if let pgc, pgc + pgcAudioControlOffset + n * 2 + 2 <= data.count {
+                    let control = be16(data, pgc + pgcAudioControlOffset + n * 2)
+                    guard control & 0x8000 != 0 else { continue }
+                    number = (control >> 8) & 0x7F
+                }
+                claim(base + number, language)
+            }
+        }
+
+        // subp_attr_t: byte 0 packs code_mode(3) reserved(3) type(2); language at bytes 2-3, meaningful
+        // when type == 1. subp_control: bit 31 = present, then four 5-bit substream numbers, one per
+        // display mode (4:3, wide, letterbox, pan-and-scan). A disc authors the same subtitle several
+        // times, once per mode, so every number the entry names gets its language; the three secondary
+        // fields are skipped when zero, where "unused" and "stream 0" are indistinguishable.
+        if data.count > vtsSubpictureCountOffset {
+            let count = min(Int(data[vtsSubpictureCountOffset]), vtsMaxSubpictureStreams)
+            for n in 0..<count {
+                let attr = vtsSubpictureAttrOffset + n * vtsSubpictureAttrSize
+                guard attr + vtsSubpictureAttrSize <= data.count else { break }
+                guard Int(data[attr]) & 0x3 == 1,
+                      let language = DiscLanguageCode.parse(data, at: attr + 2, length: 2) else { continue }
+                guard let pgc, pgc + pgcSubpictureControlOffset + n * 4 + 4 <= data.count else {
+                    claim(subpictureSubstreamBase + n, language)
+                    continue
+                }
+                let control = be32(data, pgc + pgcSubpictureControlOffset + n * 4)
+                guard control & 0x8000_0000 != 0 else { continue }
+                claim(subpictureSubstreamBase + ((control >> 24) & 0x1F), language)
+                for shift in [16, 8, 0] {
+                    let number = (control >> shift) & 0x1F
+                    if number != 0 { claim(subpictureSubstreamBase + number, language) }
+                }
+            }
+        }
+        return languages
+    }
+
+    /// Base substream id for a DVD audio coding mode; a stream's id is this plus its substream number.
+    /// AC-3, DTS and LPCM ride in private_stream_1, where FFmpeg reports the substream byte; MPEG audio
+    /// has its own PES stream id, where FFmpeg reports the full start code. nil for the reserved coding
+    /// modes, whose carriage is undefined.
+    private static func audioSubstreamBase(format: Int) -> Int? {
+        switch format & 0x7 {
+        case 0: return 0x80         // AC-3
+        case 2, 3: return 0x1C0     // MPEG-1 / MPEG-2 extension audio
+        case 4: return 0xA0         // LPCM
+        case 6: return 0x88         // DTS
+        default: return nil
+        }
     }
 
     /// dvd_time_t (4 bytes) -> seconds. BCD hour/minute/second; the frame byte's top 2 bits select the

@@ -19,6 +19,10 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     let maxLedgerDriftAbs = UncheckedBox<Double>(0)
     let ledgerCount = UncheckedBox<Int>(0)
     let parkCount = UncheckedBox<Int>(0)
+    // AE#528: a park whose PARK line says stuck=0s is backpressure behind a consumer that is still
+    // fetching (a viewer scrubbing through resident content), and the breaker deliberately does not
+    // fire there. Counted apart so the verdict cannot read a healthy park as an unrecovered wedge.
+    let liveConsumerParkCount = UncheckedBox<Int>(0)
     // #65 fix signals: did the VOD wedge breaker fire and recover (Piece A producer re-anchor + Piece B
     // engine seek-deadline clock reconcile)? A wedge that is BROKEN + re-anchored is the fix engaging.
     let wedgeBrokenCount = UncheckedBox<Int>(0)
@@ -67,7 +71,10 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
             }
         }
         // "[HLSSegmentProducer] #65 backpressure PARK ...". Count abnormal parks (VOD wedge signature).
-        if line.contains("#65 backpressure PARK") { parkCount.value += 1 }
+        if line.contains("#65 backpressure PARK") {
+            parkCount.value += 1
+            if line.contains("stuck=0s") { liveConsumerParkCount.value += 1 }
+        }
         // Fix engaging: the wedge breaker exited the pump, the host re-anchored, and/or the seek deadline reconciled.
         if line.contains("#65 backpressure WEDGE BROKEN") { wedgeBrokenCount.value += 1 }
         if line.contains("#65 backpressure wedge: re-anchoring") { reanchorCount.value += 1 }
@@ -90,7 +97,15 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
     // #38 follow-up: record the seek-lifecycle stream for the whole run. The level signal cannot show
     // whether a falling edge was a landing, a give-up or a supersede; the ledger below can.
     let seekEvents = UncheckedBox<[SeekEvent]>([])
-    let seekEventSub = engine.seekEvents.sink { event in seekEvents.value.append(event) }
+    // AE#534: and WHEN each one arrived. The ledger could say a seek terminated but not how long it
+    // took, so "does an extra off-main read on the seek path cost anything a viewer would see" had no
+    // observable at all. Events are published on the main actor in emission order, so stamping them
+    // at the sink is the same ordering the engine emitted them in.
+    let seekEventTimes = UncheckedBox<[Date]>([])
+    let seekEventSub = engine.seekEvents.sink { event in
+        seekEvents.value.append(event)
+        seekEventTimes.value.append(Date())
+    }
     defer { seekEventSub.cancel() }
 
     var options = LoadOptions()
@@ -281,7 +296,8 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
                  distinctPub.count))
     print("  clockLead settle = \(String(format: "%.2f", settleClockLead))s  (headless ~0 by design; #65 is presented-vs-clock, invisible to ct-src)")
     print("  ledger segments opened = \(ledgerCount.value)  maxContentDrift = \(String(format: "%.3f", maxLedgerDriftAbs.value))s  (the POSITIVE Root-B signal)")
-    print("  abnormal backpressure parks (VOD wedge signature) = \(parkCount.value)")
+    print("  abnormal backpressure parks (VOD wedge signature) = \(parkCount.value)"
+          + "  (of those, \(liveConsumerParkCount.value) with the consumer still fetching, AE#528)")
     print("  #65 FIX signals: wedge breaks=\(wedgeBrokenCount.value)  producer re-anchors=\(reanchorCount.value)  seek-deadline reconciles=\(seekReconcileCount.value)")
     let fixEngaged = wedgeBrokenCount.value > 0 || reanchorCount.value > 0 || seekReconcileCount.value > 0
     if fixEngaged {
@@ -302,6 +318,10 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
         print("  >> ROOT A (cross-epoch shift divergence): the producer published MORE THAN ONE shift across")
         print("     the burst. Buffered bytes from a superseded epoch fold with the latest scalar -> picture")
         print("     leads the clock. The live seam-history port is the fix.")
+    } else if parkCount.value > 0, parkCount.value == liveConsumerParkCount.value, !fixEngaged {
+        print("  >> PARKED BEHIND A LIVE CONSUMER (not a wedge): \(parkCount.value) park(s), every one of them")
+        print("     logged stuck=0s, so the consumer kept declaring new fetch targets the whole time. The")
+        print("     breaker staying quiet here is AE#528 working; a wedge is a park whose stuck= climbs.")
     } else if parkCount.value > 0 {
         if fixEngaged {
             print("  >> PRODUCER WEDGE DETECTED AND BROKEN: \(parkCount.value) abnormal park(s) but the breaker fired")
@@ -338,6 +358,24 @@ private func seekTestRun(url: URL, seeks: Int, gapMs: Int, settleSeconds: Double
           + "late-landings=\(lateLandings.count)")
     let unpaired = begun.subtracting(terminated).sorted()
     print("  unpaired begans: " + (unpaired.isEmpty ? "none  <-- PASS" : "\(unpaired)  <-- FAIL"))
+    // AE#534: began -> first terminal, per seek, in issue order. Quote the median and the MAX: the
+    // read this measures is an XPC round trip to a media server that is least likely to answer during
+    // a seek, so a mean would bury exactly the case the question is about.
+    let stamped = Array(zip(seekEvents.value, seekEventTimes.value))
+    var latencies: [(UInt64, Double)] = []
+    for (event, at) in stamped where event.outcome == .began {
+        guard let end = stamped.first(where: { $0.0.id == event.id && $0.0.isTerminal }) else { continue }
+        latencies.append((event.id, end.1.timeIntervalSince(at) * 1000))
+    }
+    if latencies.isEmpty {
+        print("  seek latency: no began/terminal pair observed")
+    } else {
+        let sorted = latencies.map(\.1).sorted()
+        let median = sorted[sorted.count / 2]
+        print(String(format: "  seek latency ms: n=%d min=%.1f median=%.1f max=%.1f",
+                     sorted.count, sorted.first ?? 0, median, sorted.last ?? 0))
+        print("    per seek: " + latencies.map { String(format: "#%llu %.1f", $0.0, $0.1) }.joined(separator: "  "))
+    }
     for event in events.suffix(12) { print("    \(event)") }
     print("")
     print("VERDICT: seektest DONE (comparison harness; compare tallies old vs new build)")

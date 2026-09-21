@@ -46,6 +46,28 @@ enum HostCarryTrim: String {
     case none, removeFirst, subdata
 }
 
+/// AE#460 round 3: which byte axis the host's reader speaks on.
+///
+/// The engine aligns a live reopen by reading the reader's own position (`seek(0, SEEK_CUR)`) and
+/// handing it straight back as a `SEEK_SET`, so the two have to be the same axis. The reporter's
+/// adapter counts both from the offset its stream joined at, which is not this harness's absolute
+/// shape, and read the composition as an identity it could not measure on its own build. These are
+/// the three arms that measure it.
+enum ReaderAxis: String {
+    /// The harness's own shape and the default: every offset is an absolute spool position, so a
+    /// reported cursor of 15 MB means 15 MB into the file.
+    case absolute
+    /// The reporter's shape: the session joined a running stream, and every offset the reader
+    /// reports or accepts is counted from that join. The two rebases compose to the identity,
+    /// which is the claim under test.
+    case join
+    /// Deliberately non-conforming, in the spirit of `--cancel-latches`: reports absolute
+    /// positions and takes `SEEK_SET` relative to the join. Each half is a defensible reading on
+    /// its own, and a reader built that way is moved by the alignment that was supposed to leave
+    /// it alone. This arm is what the engine's axis-disagreement line is measured against.
+    case mismatched
+}
+
 final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     private let path: String
     /// Foundation arm only. The POSIX arm reads through `fd` and never builds an object.
@@ -61,6 +83,16 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     /// Total bytes the pacer has released; the live edge in logical-offset terms.
     private var released: Int64 = 0
     private var startTime = Date()
+
+    /// AE#460 round 3. `joinOffset` is where in the file this install's stream starts, so the arms
+    /// that count from the join have something to count from; `position` and `released` stay
+    /// absolute internally, which keeps every figure the run prints comparable across arms.
+    private let axis: ReaderAxis
+    private let joinOffset: Int64
+    /// `SEEK_SET 0` means the join for both non-absolute arms, which is what re-bases a spool.
+    private var seekSetBase: Int64 { axis == .absolute ? 0 : joinOffset }
+    /// Only the conforming arm reports on the same axis it takes.
+    private var reportsFromJoin: Bool { axis == .join }
 
     /// AE#460 follow-up: `IOReader.cancel()` is documented as "unblock only, do not invalidate" for
     /// a reader the engine may reload, and an in-place rebuild reuses the reader it just cancelled.
@@ -100,10 +132,14 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
 
     init(path: String, rateKbps: Int, reportsSize: Bool, wraps: Bool,
          foundationRead: Bool = false, carryTrim: HostCarryTrim = .none,
-         cancelLatches: Bool = false) throws {
+         cancelLatches: Bool = false, axis: ReaderAxis = .absolute,
+         joinOffsetBytes: Int64 = 0) throws {
         self.path = path
         self.carryTrim = carryTrim
         self.cancelLatches = cancelLatches
+        self.axis = axis
+        self.joinOffset = axis == .absolute ? 0 : joinOffsetBytes
+        self.position = axis == .absolute ? 0 : joinOffsetBytes
         let attrs = try FileManager.default.attributesOfItem(atPath: path)
         self.fileSize = (attrs[.size] as? NSNumber)?.int64Value ?? 0
         if foundationRead {
@@ -144,7 +180,8 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
             // turns one leaked object per read into hundreds of thousands per second, which measures
             // the harness rather than the source: a ring over a socket hands out what has ARRIVED.
             let earned = Int64(elapsed * rateBytesPerSecond) / Self.releaseChunk * Self.releaseChunk
-            released = min(earned, wraps ? .max : fileSize)
+            // The join is where this install's stream starts, so the edge runs from there too.
+            released = min(joinOffset + earned, wraps ? .max : fileSize)
             let available = released - position
             if available > 0 {
                 let n = min(want, Int(min(available, Int64(want))))
@@ -209,15 +246,16 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
     func seek(offset: Int64, whence: Int32) -> Int64 {
         lock.lock(); defer { lock.unlock() }
         if whence == Self.avSeekSize { return reportsSize ? fileSize : -1 }
+        let base = seekSetBase
         switch whence {
-        case 0: position = max(0, offset)               // SEEK_SET
-        case 1: position = max(0, position + offset)    // SEEK_CUR
-        case 2: return -1                               // no end to seek to on a live spool
+        case 0: position = max(base, base + offset)         // SEEK_SET, on this arm's axis
+        case 1: position = max(base, position + offset)     // SEEK_CUR takes a delta, not an axis
+        case 2: return -1                                   // no end to seek to on a live spool
         default: return -1
         }
         seekCount += 1
         maxLookbackBytes = max(maxLookbackBytes, released - position)
-        return position
+        return reportsFromJoin ? position - joinOffset : position
     }
 
     func cancel() {
@@ -237,7 +275,8 @@ final class PacedLiveSpoolIOReader: IOReader, @unchecked Sendable {
         try? PacedLiveSpoolIOReader(path: path, rateKbps: Int(rateBytesPerSecond * 8.0 / 1000.0),
                                     reportsSize: reportsSize, wraps: wraps,
                                     foundationRead: handle != nil, carryTrim: carryTrim,
-                                    cancelLatches: cancelLatches)
+                                    cancelLatches: cancelLatches, axis: axis,
+                                    joinOffsetBytes: joinOffset)
     }
 
     var discImageProbeEnabled: Bool { false }
@@ -258,7 +297,8 @@ func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow:
                         reportsSize: Bool, wraps: Bool, mallocCensus: Bool,
                         foundationReader: Bool = false, carryTrim: HostCarryTrim = .none,
                         reloadAt: Double? = nil, cancelLatches: Bool = false,
-                        reloadDecodePath: DecodePath? = nil) -> Int32 {
+                        reloadDecodePath: DecodePath? = nil,
+                        axis: ReaderAxis = .absolute, joinOffsetMB: Int = 4) -> Int32 {
     EngineLog.handler = { print($0) }
     if mallocCensus {
         // Uncapped captures: a steady mux-rate climb spends one capture per threshold climbed, so the
@@ -270,7 +310,8 @@ func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow:
           + "dvrWindow=\(dvrWindow.map { String($0) } ?? "nil") size=\(reportsSize ? "reported" : "unknown") "
           + "wrap=\(wraps) census=\(mallocCensus) "
           + "reader=\(foundationReader ? "foundation" : "posix") hostCarry=\(carryTrim.rawValue) "
-          + "cancel=\(cancelLatches ? "latches" : "unblocks"))")
+          + "cancel=\(cancelLatches ? "latches" : "unblocks") axis=\(axis.rawValue)"
+          + (axis == .absolute ? "" : " join=\(joinOffsetMB)MB") + ")")
     let box = UncheckedBox<Int32?>(nil)
     Task { @MainActor in
         box.value = await customLiveSpoolRun(path: path, seconds: seconds, rateKbps: rateKbps,
@@ -278,7 +319,8 @@ func runCustomLiveSpool(path: String, seconds: Double, rateKbps: Int, dvrWindow:
                                              foundationReader: foundationReader, carryTrim: carryTrim,
                                              reloadAt: reloadAt,
                                              reloadDecodePath: reloadDecodePath,
-                                             cancelLatches: cancelLatches)
+                                             cancelLatches: cancelLatches,
+                                             axis: axis, joinOffsetMB: joinOffsetMB)
         CFRunLoopStop(CFRunLoopGetMain())
     }
     CFRunLoopRun()
@@ -290,13 +332,15 @@ private func customLiveSpoolRun(path: String, seconds: Double, rateKbps: Int, dv
                                 reportsSize: Bool, wraps: Bool, foundationReader: Bool,
                                 carryTrim: HostCarryTrim, reloadAt: Double? = nil,
                                 reloadDecodePath: DecodePath? = nil,
-                                cancelLatches: Bool = false) async -> Int32 {
+                                cancelLatches: Bool = false,
+                                axis: ReaderAxis = .absolute, joinOffsetMB: Int = 4) async -> Int32 {
     let reader: PacedLiveSpoolIOReader
     do {
         reader = try PacedLiveSpoolIOReader(path: path, rateKbps: rateKbps,
                                             reportsSize: reportsSize, wraps: wraps,
                                             foundationRead: foundationReader, carryTrim: carryTrim,
-                                            cancelLatches: cancelLatches)
+                                            cancelLatches: cancelLatches, axis: axis,
+                                            joinOffsetBytes: Int64(joinOffsetMB) * 1_048_576)
     } catch {
         print("VERDICT: reader init failed: \(error.localizedDescription)")
         return 1

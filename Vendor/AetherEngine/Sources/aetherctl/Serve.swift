@@ -4,6 +4,7 @@ import AetherEngine
 // MARK: - serve
 
 func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
+              dolbyVisionHandling: DolbyVisionHandling = .automatic,
               nativeSubsIndex: Int? = nil, startPosition: Double? = nil,
               audioDelayMs: Int = 0) -> Never {
     EngineLog.handler = { line in
@@ -17,6 +18,7 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
+    if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
     if let idx = nativeSubsIndex { flagSuffix += " [--native-subs \(idx)]" }
     if let pos = startPosition { flagSuffix += " [--start-position \(pos)]" }
     if audioDelayMs != 0 { flagSuffix += " [--audio-delay \(audioDelayMs)]" }
@@ -26,7 +28,11 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
     let engine = HLSVideoEngine(
         url: url,
         dvModeAvailable: dvModeAvailable,
-        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
+        dolbyVisionHandling: dolbyVisionHandling,
+        // AE#532: a session gates this on its own probe; the harness has none, so it asks the audit
+        // for the whole verdict. A source with nothing to correct never gets past the gate inside.
+        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
     )
     // Resume anchor exactly like AetherEngine.loadNative's load(startPosition:) (#99 repro).
     engine.initialStartSeconds = startPosition
@@ -77,7 +83,8 @@ func runServe(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = fal
 
 // MARK: - validate
 
-func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false) -> Int32 {
+func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = false,
+                 dolbyVisionHandling: DolbyVisionHandling = .automatic) -> Int32 {
     EngineLog.handler = { line in
         let timestamp = ISO8601DateFormatter.string(
             from: Date(),
@@ -89,13 +96,16 @@ func runValidate(url: URL, dvModeAvailable: Bool, forceDVWithoutDisplay: Bool = 
 
     var flagSuffix = dvModeAvailable ? "" : " [--no-dv]"
     if forceDVWithoutDisplay { flagSuffix += " [--force-dv]" }
+    if dolbyVisionHandling == .baseLayerOnly { flagSuffix += " [--dv-base-layer]" }
     print("aetherctl validate: \(url.absoluteString)\(flagSuffix)")
     print("")
 
     let engine = HLSVideoEngine(
         url: url,
         dvModeAvailable: dvModeAvailable,
-        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay
+        forceDolbyVisionOnNonDVDisplay: forceDVWithoutDisplay,
+        dolbyVisionHandling: dolbyVisionHandling,
+        dolbyVisionRPUProfile: DolbyVisionRecordAudit.rpuCorrection(url: url)
     )
     let playbackURL: URL
     do {

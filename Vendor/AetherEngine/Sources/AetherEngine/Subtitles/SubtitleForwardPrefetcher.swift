@@ -102,6 +102,15 @@ enum SubtitleForwardPrefetcher {
             return pending
         }
 
+        /// #496: is a move waiting, without consuming it. Both of the loop's waits ask, because the
+        /// point where the move is TAKEN sits after them: a wait that outlasts the request leaves
+        /// the reader banking packets for the stretch the viewer has left.
+        var hasPending: Bool {
+            lock.lock()
+            defer { lock.unlock() }
+            return pending != nil
+        }
+
         func clear() {
             lock.lock()
             pending = nil
@@ -257,8 +266,16 @@ enum SubtitleForwardPrefetcher {
             if let link, valveGrantedUntil.map({ DispatchTime.now() > $0 }) ?? true {
                 var yielded: Double = 0
                 while !Task.isCancelled,
-                      link.shouldYield(inAnchorGrace: DispatchTime.now() < anchorGraceUntil,
-                                       yieldedSeconds: yielded) {
+                      link.shouldYield(
+                        // #496: a pending move counts as freshly anchored. The grace exists so a
+                        // reader positioned somewhere new fills against a busy video path, and a
+                        // reader the viewer has just moved is in exactly that state; without this
+                        // the request waits behind up to a full yield cap while the region in front
+                        // of the playhead is harvested by nobody. A seek in flight still wins, that
+                        // rule sits above the grace.
+                        inAnchorGrace: DispatchTime.now() < anchorGraceUntil
+                            || reanchor?.hasPending == true,
+                        yieldedSeconds: yielded) {
                     if yielded == 0 { SubtitlePrefetchTelemetry.recordLinkYield(true) }
                     // The playhead moves while we wait, so the lead shrinks: a reader parked behind
                     // a busy pump returns to fetching on its own once it falls under the floor.
@@ -377,6 +394,11 @@ enum SubtitleForwardPrefetcher {
             }
             var didPark = false
             while !Task.isCancelled, position > playheadSnapshot + leadSeconds {
+                // #496: a backward seek leaves the read position far past the new playhead, so this
+                // condition stays true for as long as the viewer stays behind it, and the loop never
+                // reaches the point where the move is taken. The pending move is what voids the
+                // position this park is judging.
+                if reanchor?.hasPending == true { break }
                 if !didPark {
                     didPark = true
                     SubtitlePrefetchTelemetry.recordPark(true)

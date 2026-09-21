@@ -11,6 +11,10 @@ struct SWPerformanceSnapshot: Equatable, Sendable {
 
     static let zero = SWPerformanceSnapshot()
 
+    var totalNanoseconds: UInt64 {
+        videoDecodeNanoseconds &+ videoConversionNanoseconds &+ audioDecodeNanoseconds
+    }
+
     static func + (lhs: Self, rhs: Self) -> Self {
         Self(
             videoPacketCalls: lhs.videoPacketCalls &+ rhs.videoPacketCalls,

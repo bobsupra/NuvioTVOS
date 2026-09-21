@@ -13,6 +13,10 @@ struct MPLSPlaylist: Equatable {
     /// Entry-mark chapter starts, 45 kHz ticks relative to the title's start, sorted ascending. Empty when
     /// the playlist declares no PlayListMark section (or only link-point marks). See `parseChapterStarts` (#67).
     var chapterStartTicks: [UInt64] = []
+    /// ISO 639-2 language codes from the PlayItems' STN tables, keyed by elementary-stream PID. A
+    /// Blu-ray keeps its track languages here, not in the clip's PMT, so this is the only place a
+    /// demuxed m2ts can learn them. Empty when no PlayItem declares one. See `parseSTNLanguages` (#527).
+    var streamLanguages: [Int: String] = [:]
 }
 
 enum MPLSParser {
@@ -29,6 +33,7 @@ enum MPLSParser {
         // the PlayItem's in_time), so the title-relative chapter start needs in_time and the running offset.
         var inTimes: [UInt64] = []
         var cumulativeBefore: [UInt64] = []
+        var languages: [Int: String] = [:]
         for _ in 0..<count {
             guard pos + 2 <= data.count else { return nil }
             let itemLen = be16(data, pos)
@@ -41,13 +46,14 @@ enum MPLSParser {
             inTimes.append(inT)
             cumulativeBefore.append(ticks)
             if outT >= inT { ticks += (outT - inT) }
+            parseSTNLanguages(data, body: body, itemLen: itemLen, into: &languages)
             pos = body + itemLen
         }
         guard !clips.isEmpty else { return nil }
         let chapters = parseChapterStarts(data, inTimes: inTimes, cumulativeBefore: cumulativeBefore)
         return MPLSPlaylist(clipIDs: clips, durationTicks: ticks,
                             inTimes: inTimes, cumulativeBefore: cumulativeBefore,
-                            chapterStartTicks: chapters)
+                            chapterStartTicks: chapters, streamLanguages: languages)
     }
 
     /// Parse the PlayListMark section (header offset 12 = PlayListMarkStartAddress) into title-relative chapter
@@ -76,6 +82,108 @@ enum MPLSParser {
         // Marks can appear out of order; present chapters in playback order, deduped.
         var seen = Set<UInt64>()
         return starts.sorted().filter { seen.insert($0).inserted }
+    }
+
+    // MARK: - STN table languages (#527)
+
+    /// Collect one PlayItem's declared ISO 639-2 languages, keyed by elementary-stream PID, into `langs`.
+    ///
+    /// A Blu-ray's clip PMTs carry no ISO 639 descriptor, so FFmpeg's MPEG-TS demuxer reports every track
+    /// as undetermined and language-based track selection has nothing to match on. The languages live in
+    /// each PlayItem's STN_table, which this walk reaches past the PlayItem's fixed header. Lenient
+    /// throughout: a table that runs short or declares a shape this does not model contributes whatever it
+    /// resolved before the malformed entry and never fails the playlist.
+    ///
+    /// First declaration wins. Every PlayItem of a title repeats the same STN table in practice, and where
+    /// a seamless-branching title disagrees, the first clip is the one whose PIDs the demuxer opens with.
+    private static func parseSTNLanguages(
+        _ data: [UInt8], body: Int, itemLen: Int, into langs: inout [Int: String]
+    ) {
+        // PlayItem fixed header: clip_id(5) codec_id(4) flags(2) stc_id(1) in_time(4) out_time(4)
+        // UO_mask(8) random_access_flag+reserved(1) still_mode(1) still_time(2) = 32 bytes.
+        let itemEnd = body + itemLen
+        guard itemEnd <= data.count else { return }
+        var pos = body + 32
+        // is_multi_angle is bit 4 of the 16-bit field at body+9 (11 reserved bits, the flag, then
+        // connection_condition), and when set, an angle block sits between the header and the STN table:
+        // angle_count(1) + flags(1), then clip_id(5) + codec_id(4) + stc_id(1) per ADDITIONAL angle.
+        guard body + 11 <= data.count else { return }
+        if (data[body + 10] >> 4) & 1 == 1 {
+            guard pos < itemEnd else { return }
+            let angleCount = max(1, Int(data[pos]))
+            pos += 2 + (angleCount - 1) * 10
+        }
+        // STN_table header: length(2) reserved(2) num_video(1) num_audio(1) num_pg(1) num_ig(1)
+        // num_secondary_audio(1) num_secondary_video(1) num_pip_pg(1) reserved(5) = 16 bytes.
+        guard pos >= 0, pos + 16 <= itemEnd else { return }
+        let numVideo = Int(data[pos + 4])
+        let numAudio = Int(data[pos + 5])
+        let numPG = Int(data[pos + 6])
+        let numIG = Int(data[pos + 7])
+        let numPIPPG = Int(data[pos + 10])
+        pos += 16
+        // Entries run video, audio, PG (+ PiP PG), IG, then the secondary streams. The walk stops after IG:
+        // secondary audio and video carry extra attribute blocks this does not model, and nothing past IG
+        // is a track the engine exposes anyway, so a wrong guess there could only corrupt what came before.
+        for _ in 0..<(numVideo + numAudio + numPG + numPIPPG + numIG) {
+            guard let entry = parseSTNStream(data, at: pos, end: itemEnd) else { return }
+            pos = entry.next
+            if let pid = entry.pid, let language = entry.language, langs[pid] == nil {
+                langs[pid] = language
+            }
+        }
+    }
+
+    private struct STNStream {
+        let pid: Int?
+        let language: String?
+        /// Byte offset of the next stream entry.
+        let next: Int
+    }
+
+    /// One STN stream: a length-prefixed stream_entry (which names the PID) followed by a length-prefixed
+    /// stream_attributes block (which names the language for the codings that have one). Both are
+    /// length-prefixed, so the walk skips a coding it does not model instead of losing its place.
+    private static func parseSTNStream(_ data: [UInt8], at pos: Int, end: Int) -> STNStream? {
+        guard pos >= 0, pos < end, end <= data.count else { return nil }
+        let entryLen = Int(data[pos])
+        let entry = pos + 1
+        let attrPos = entry + entryLen
+        guard attrPos < end else { return nil }
+        let attrLen = Int(data[attrPos])
+        let attr = attrPos + 1
+        let next = attr + attrLen
+        guard next <= end else { return nil }
+
+        // stream_entry: type(1) then the PID, placed per type. 1 = in the PlayItem's own clip,
+        // 2 and 4 = a sub-path's clip (subpath_id + subclip_id first), 3 = in-mux sub-path (subpath_id).
+        var pid: Int? = nil
+        if entryLen >= 1 {
+            switch data[entry] {
+            case 1 where entryLen >= 3: pid = be16(data, entry + 1)
+            case 2, 4: if entryLen >= 5 { pid = be16(data, entry + 3) }
+            case 3 where entryLen >= 4: pid = be16(data, entry + 2)
+            default: break
+            }
+        }
+
+        // stream_attributes: coding_type(1) then, for the codings that declare one, a 3-byte ISO 639-2
+        // code at a coding-dependent offset. Audio prefixes it with a format/rate byte, text subtitle
+        // with a character-code byte, PG and IG with nothing.
+        var language: String? = nil
+        if attrLen >= 1 {
+            let languageOffset: Int?
+            switch data[attr] {
+            case 0x03, 0x04, 0x80, 0x81, 0x82, 0x83, 0x84, 0x85, 0x86, 0xA1, 0xA2: languageOffset = 2
+            case 0x90, 0x91: languageOffset = 1
+            case 0x92: languageOffset = 2
+            default: languageOffset = nil
+            }
+            if let offset = languageOffset, attr + offset + 3 <= next {
+                language = DiscLanguageCode.parse(data, at: attr + offset, length: 3)
+            }
+        }
+        return STNStream(pid: pid, language: language, next: next)
     }
 
     private static func be16(_ b: [UInt8], _ i: Int) -> Int { (Int(b[i]) << 8) | Int(b[i+1]) }

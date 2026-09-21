@@ -29,6 +29,10 @@ public struct DiscInspection: Sendable {
         public let id: Int
         public let durationSeconds: Double
         public let chapterStartsSeconds: [Double]
+        /// Track languages the disc's navigation data declares for this title, keyed by the stream id
+        /// the demuxer sees (MPEG-TS PID on Blu-ray, MPEG-PS stream / substream id on DVD). Empty when
+        /// the disc declares none, which is what makes language-based track selection impossible (#527).
+        public let streamLanguages: [Int: String]
     }
 
     public var kind: Kind = .notADisc
@@ -140,7 +144,8 @@ enum DiscInspector {
                 DiscInspection.TitleSummary(
                     id: t.id,
                     durationSeconds: Double(t.durationTicks) / bdTickRate,
-                    chapterStartsSeconds: t.chapters.map { Double($0.startTicks) / bdTickRate }
+                    chapterStartsSeconds: t.chapters.map { Double($0.startTicks) / bdTickRate },
+                    streamLanguages: t.streamLanguages
                 )
             }
         }

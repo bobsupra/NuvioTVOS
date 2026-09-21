@@ -68,6 +68,14 @@ func runDiscInspect(url: URL, dump: Bool = false) -> Int32 {
                 let more = t.chapterStartsSeconds.count > 40 ? ", ..." : ""
                 print("        @ \(shown)\(more)")
             }
+            // The disc's own declared track languages (#527). Empty means the disc names none, which is
+            // what leaves every track undetermined and language-based selection with nothing to match.
+            if !t.streamLanguages.isEmpty {
+                let shown = t.streamLanguages.sorted { $0.key < $1.key }
+                    .map { String(format: "0x%04X=%@", $0.key, $0.value) }
+                    .joined(separator: ", ")
+                print("        languages: \(shown)")
+            }
         }
     }
     return d.wrapRecognized ? 0 : 1

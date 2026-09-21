@@ -93,7 +93,7 @@ enum DiscReader {
             clipTimeline = []
         }
         let totalBytes = allExtents.reduce(Int64(0)) { $0 + max(0, $1.length) }
-        EngineLog.emit("[disc] Blu-ray recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) m2ts-extents=\(allExtents.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count)", category: .demux)
+        EngineLog.emit("[disc] Blu-ray recognized: \(titles.count) title(s), selected \(selectedIndex) clips=\(selected.bdClipIDs ?? []) m2ts-extents=\(allExtents.count) bytes=\(totalBytes) clipSpans=\(clipTimeline.count) stnLanguages=\(selected.streamLanguages.count)", category: .demux)
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
                          formatHint: "mpegts", titles: titles, selectedIndex: selectedIndex,
                          extents: allExtents, clipTimeline: clipTimeline)
@@ -193,6 +193,8 @@ enum DiscReader {
         let titles = orderedGroups.enumerated().map { idx, g -> DiscTitle in
             var durationTicks: UInt64 = 0
             var chapters: [DiscChapter] = []
+            // The VOBs carry no track language, so the IFO's attribute tables are the only source (#527).
+            var streamLanguages: [Int: String] = [:]
             let nn = g.vtsn < 10 ? "0\(g.vtsn)" : "\(g.vtsn)"
             let ifoName = "VTS_\(nn)_0.IFO"
             if let vtsIFO = files.first(where: { $0.name.uppercased() == ifoName }) {
@@ -204,8 +206,10 @@ enum DiscReader {
                         DiscChapter(id: i, startTicks: start)
                     }
                 }
+                streamLanguages = DVDIFOParser.parseStreamLanguages(bytes)
             }
-            return DiscTitle(id: idx, durationTicks: durationTicks, chapters: chapters, dvdVTSN: g.vtsn)
+            return DiscTitle(id: idx, durationTicks: durationTicks, chapters: chapters, dvdVTSN: g.vtsn,
+                             streamLanguages: streamLanguages)
         }
         storeRecognition(cacheKey: cacheKey, selectTitleID: selectTitleID,
                          formatHint: "mpeg", titles: titles, selectedIndex: selectedIndex, extents: extents)
