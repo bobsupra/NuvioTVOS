@@ -564,6 +564,7 @@ extension PlayerControlsSettingsTests {
             sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
             scrubThumbnailProvider: provider
         )
+        defer { model.commitPendingSeekIfNeeded(); model.pendingSeekDelta = 0 }
         model.seekStepSeconds = 10
         model.time = PlayerTime(current: 100, duration: 1000)
         model.status = .playing
@@ -595,6 +596,7 @@ extension PlayerControlsSettingsTests {
             sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
             scrubThumbnailProvider: provider
         )
+        defer { model.stopRepeatingSkip(); model.pendingSeekDelta = 0 }
         model.seekStepSeconds = 10
         model.time = PlayerTime(current: 100, duration: 1000)
 
@@ -616,28 +618,30 @@ extension PlayerControlsSettingsTests {
             sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
             scrubThumbnailProvider: provider
         )
+        defer { model.commitPendingSeekIfNeeded(); model.pendingSeekDelta = 0 }
         model.seekStepSeconds = 10
         model.time = PlayerTime(current: 100, duration: 1000)
         model.status = .playing
 
-        // First move command while playing (discrete tap)
+        // First move command while playing (discrete tap: +10s)
         model.handleMoveSeek(direction: .right)
         XCTAssertEqual(model.pendingSeekDelta, 10)
         XCTAssertFalse(model.isHoldingSeek)
         XCTAssertNil(model.seekSpeedMultiplier)
 
-        // Second move command arrives immediately (autorepeat hold cadence <= 0.45s)
+        // Rapid second and third move commands (multi-tap spam: +20s, +30s) must NOT trigger hold
         model.handleMoveSeek(direction: .right)
-        XCTAssertTrue(model.isHoldingSeek)
-        XCTAssertEqual(model.seekSpeedMultiplier, 1)
-
-        // Releasing hold clears hold state and multiplier
-        model.stopRepeatingSkip()
+        XCTAssertEqual(model.pendingSeekDelta, 20)
         XCTAssertFalse(model.isHoldingSeek)
         XCTAssertNil(model.seekSpeedMultiplier)
-        model.pendingSeekDelta = 0
+
+        model.handleMoveSeek(direction: .right)
+        XCTAssertEqual(model.pendingSeekDelta, 30)
+        XCTAssertFalse(model.isHoldingSeek)
+        XCTAssertNil(model.seekSpeedMultiplier)
 
         // While paused, handleMoveSeek must NOT trigger discrete skips
+        model.pendingSeekDelta = 0
         model.status = .paused
         model.handleMoveSeek(direction: .right)
         XCTAssertEqual(model.pendingSeekDelta, 0, "Move seek must be ignored while paused")

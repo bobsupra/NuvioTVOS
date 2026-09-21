@@ -251,6 +251,8 @@ struct PlayerControls: View {
             return
         }
 
+        if viewModel.moveSuppressed { return }
+
         switch direction {
         case .up:
             viewModel.cancelMoveSeekTracking()
@@ -301,9 +303,13 @@ struct PlayerControls: View {
 
     // MARK: - Top bar
 
+    private var isSeekingOrScrubbing: Bool {
+        viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0
+    }
+
     private var topBar: some View {
         Group {
-            if !viewModel.isScrubbing {
+            if !isSeekingOrScrubbing {
                 VStack(spacing: 12) {
                     HStack(alignment: .top, spacing: 24) {
                         VStack(alignment: .leading, spacing: 4) {
@@ -329,14 +335,14 @@ struct PlayerControls: View {
                 .transition(.opacity)
             }
         }
-        .animation(.playerControls, value: viewModel.isScrubbing)
+        .animation(.playerControls, value: isSeekingOrScrubbing)
     }
 
     // MARK: - Bottom controls
 
     private var bottomControls: some View {
         VStack(alignment: .leading, spacing: 18) {
-            if !viewModel.isScrubbing {
+            if !isSeekingOrScrubbing {
                 transportRow
                     .transition(.opacity)
             }
@@ -344,7 +350,7 @@ struct PlayerControls: View {
         }
         .padding(.horizontal, 60)
         .padding(.bottom, 54)
-        .animation(.playerControls, value: viewModel.isScrubbing)
+        .animation(.playerControls, value: isSeekingOrScrubbing)
     }
 
     private var transportRow: some View {
@@ -659,8 +665,10 @@ struct PlayerControls: View {
             clock: viewModel.clock,
             isTimelineFocused: isTimelineFocused,
             isScrubbing: viewModel.isScrubbing,
+            isHoldingSeek: viewModel.isHoldingSeek,
             pendingSeekDelta: viewModel.pendingSeekDelta,
-            speedMultiplier: viewModel.seekSpeedMultiplier
+            speedMultiplier: viewModel.seekSpeedMultiplier,
+            seekStepSeconds: viewModel.seekStepSeconds
         )
         .overlay(alignment: .top) {
             // Keep the geometry mounted even while a still is unavailable so
@@ -669,8 +677,9 @@ struct PlayerControls: View {
             SeekPreviewTimelineCard(
                 clock: viewModel.clock,
                 isScrubbing: viewModel.isScrubbing,
+                isHoldingSeek: viewModel.isHoldingSeek,
                 pendingSeekDelta: viewModel.pendingSeekDelta,
-                image: ((viewModel.isHoldingSeek || viewModel.isScrubbing || viewModel.pendingSeekDelta != 0) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
+                image: ((viewModel.isHoldingSeek || viewModel.isScrubbing) && viewModel.isSeekPreviewEnabled) ? viewModel.scrubThumbnail : nil,
                 naturalSize: viewModel.videoNaturalSize,
                 speedMultiplier: viewModel.seekSpeedMultiplier,
                 wheelEngaged: viewModel.wheelEngaged
@@ -709,6 +718,7 @@ struct PlayerControls: View {
 private struct SeekPreviewTimelineCard: View {
     @ObservedObject var clock: PlaybackClock
     let isScrubbing: Bool
+    var isHoldingSeek: Bool = false
     let pendingSeekDelta: Double
     let image: CGImage?
     var naturalSize: CGSize = CGSize(width: 16, height: 9)
@@ -736,23 +746,9 @@ private struct SeekPreviewTimelineCard: View {
             let targetX = geo.size.width * fraction
             let cardX = min(max(targetX, cardHalfW + 16), geo.size.width - cardHalfW - 16)
 
-            if isScrubbing || pendingSeekDelta != 0 {
-                VStack(spacing: 0) {
-                    SeekPreviewCard(image: image, width: width, naturalSize: naturalSize)
-                    if let speedMultiplier {
-                        Text("\(speedMultiplier)x")
-                            .font(.system(size: 20, weight: .bold).monospacedDigit())
-                            .foregroundStyle(.white)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 3)
-                            .background(.ultraThinMaterial, in: Capsule())
-                            .overlay(
-                                Capsule().strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
-                            )
-                            .padding(.top, 6)
-                    }
-                }
-                .position(x: cardX, y: 270 - cardSize.height / 2)
+            if isScrubbing || isHoldingSeek {
+                SeekPreviewCard(image: image, width: width, naturalSize: naturalSize)
+                    .position(x: cardX, y: 270 - cardSize.height / 2)
             }
         }
         .frame(height: 270)
@@ -765,11 +761,26 @@ private struct PlayerTimelineBar: View {
     @ObservedObject var clock: PlaybackClock
     let isTimelineFocused: Bool
     let isScrubbing: Bool
+    var isHoldingSeek: Bool = false
     let pendingSeekDelta: Double
     var speedMultiplier: Int? = nil
+    var seekStepSeconds: Int = PlayerSeekSettings.defaultStep
 
     private var duration: Double {
         max(clock.duration, 0.001)
+    }
+
+    private var skipIconName: String {
+        let prefix = pendingSeekDelta < 0 ? "gobackward" : "goforward"
+        let validSteps = [5, 10, 15, 30, 45, 60, 75, 90]
+        if validSteps.contains(seekStepSeconds) {
+            return "\(prefix).\(seekStepSeconds)"
+        }
+        return prefix
+    }
+
+    private var isSeekingOrScrubbing: Bool {
+        isScrubbing || isHoldingSeek || pendingSeekDelta != 0
     }
 
     private var targetPosition: Double {
@@ -789,8 +800,8 @@ private struct PlayerTimelineBar: View {
             GeometryReader { geo in
                 let w = geo.size.width
                 let targetX = min(max(w * progress, 0), w)
-                let trackHeight: CGFloat = (isTimelineFocused || isScrubbing) ? 10 : 7
-                let h: CGFloat = (isTimelineFocused || isScrubbing) ? trackHeight + 2 : trackHeight
+                let trackHeight: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? 10 : 7
+                let h: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? trackHeight + 2 : trackHeight
                 let needleHeight: CGFloat = 22
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
                 let originalX = min(max(w * originalProgress, 0), w)
@@ -802,11 +813,11 @@ private struct PlayerTimelineBar: View {
                         buffered: clock.buffered / duration,
                         height: trackHeight,
                         showThumb: false,
-                        emphasized: isTimelineFocused || isScrubbing,
+                        emphasized: isTimelineFocused || isSeekingOrScrubbing,
                         glassTrack: true
                     )
 
-                    if isScrubbing {
+                    if isScrubbing || isHoldingSeek {
                         // Ghost tick: original paused playback position flush within track
                         if abs(targetX - originalX) > 3 {
                             Rectangle()
@@ -815,7 +826,7 @@ private struct PlayerTimelineBar: View {
                                 .position(x: originalX, y: geo.size.height / 2)
                         }
 
-                        // Active scrub needle: extends upwards toward preview card and is flush at bottom of track
+                        // Active scrub/seek needle: extends upwards toward preview card and is flush at bottom of track
                         Rectangle()
                             .fill(Color.white)
                             .frame(width: 2, height: needleHeight)
@@ -824,38 +835,44 @@ private struct PlayerTimelineBar: View {
                     }
                 }
             }
-            .frame(height: (isTimelineFocused || isScrubbing) ? 16 : 11)
+            .frame(height: (isTimelineFocused || isSeekingOrScrubbing) ? 16 : 11)
 
-            // Timestamps: when scrubbing, center the time directly beneath the needle
-            if isScrubbing {
+            // Timestamps: when seeking or scrubbing, center the time and direction/speed directly beneath the needle
+            if isSeekingOrScrubbing {
                 GeometryReader { geo in
                     let w = geo.size.width
-                    let targetX = min(max(w * progress, 50), w - 50)
-                    Text(PlayerTime.formatted(time: targetPosition))
-                        .font(.system(size: 26, weight: .bold).monospacedDigit())
-                        .foregroundColor(.white)
-                        .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
-                        .position(x: targetX, y: 14)
+                    let targetX = min(max(w * progress, 60), w - 60)
+                    HStack(spacing: 8) {
+                        Text(PlayerTime.formatted(time: targetPosition))
+                            .font(.system(size: 26, weight: .bold).monospacedDigit())
+                            .foregroundColor(.white)
+
+                        if isHoldingSeek || speedMultiplier != nil {
+                            let isForward = pendingSeekDelta >= 0
+                            Image(systemName: isForward ? "forward.fill" : "backward.fill")
+                                .font(.system(size: 14, weight: .bold))
+                                .foregroundColor(.white)
+                                .frame(width: 26, height: 26)
+                                .background(Color.white.opacity(0.22), in: Circle())
+
+                            if let speedMultiplier {
+                                Text("\(speedMultiplier)")
+                                    .font(.system(size: 26, weight: .bold).monospacedDigit())
+                                    .foregroundColor(.white)
+                            }
+                        } else if pendingSeekDelta != 0 {
+                            Image(systemName: skipIconName)
+                                .font(.system(size: 20, weight: .semibold))
+                                .foregroundColor(.white)
+                        }
+                    }
+                    .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
+                    .position(x: targetX, y: 14)
                 }
                 .frame(height: 28)
             } else {
                 HStack(spacing: 10) {
                     Text(PlayerTime.formatted(time: targetPosition))
-                    if pendingSeekDelta != 0 {
-                        Text(PlayerTimeFormat.signedDelta(pendingSeekDelta))
-                            .foregroundColor(.white.opacity(0.85))
-                        if let speedMultiplier {
-                            Text("\(speedMultiplier)x")
-                                .font(.system(size: 16, weight: .bold).monospacedDigit())
-                                .foregroundStyle(.white)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 2)
-                                .background(.ultraThinMaterial, in: Capsule())
-                                .overlay(
-                                    Capsule().strokeBorder(Color.white.opacity(0.24), lineWidth: 1)
-                                )
-                        }
-                    }
                     Spacer()
                     Text("-" + PlayerTime.formatted(time: max(0, duration - targetPosition)))
                 }

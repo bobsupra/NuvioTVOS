@@ -34,13 +34,13 @@ final class PlaybackBackendPolicyTests: XCTestCase {
     }
 
     @MainActor
-    func testCoordinatorSuppressesMPVFallbackWhenAetherCannotInitializeOnRemoteHTTPS() {
+    func testCoordinatorFallsBackToMPVWhenAetherCannotInitializeOnRemoteHTTPS() {
         let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil }, engineSettingProvider: { "Auto" }, loadDispatcher: { _, _, _ in })
         coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
 
-        XCTAssertEqual(coordinator.activeBackend, .aether)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
         XCTAssertNil(coordinator.aetherController)
-        XCTAssertEqual(coordinator.lastLoadError, "AetherEngine is unavailable on this device.")
+        XCTAssertNil(coordinator.lastLoadError)
     }
 
     @MainActor
@@ -58,12 +58,12 @@ final class PlaybackBackendPolicyTests: XCTestCase {
     }
 
     @MainActor
-    func testCoordinatorUsesAetherWhenForcedMPVOnRemoteHTTPS() {
+    func testCoordinatorUsesMPVWhenForcedMPVOnRemoteHTTPS() {
         let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { AetherPlaybackController() }, engineSettingProvider: { "MPVKit" }, loadDispatcher: { _, _, _ in })
         coordinator.load(PlaybackLoadRequest(videoURL: URL(string: "https://example.com/movie.mkv")!))
 
-        XCTAssertEqual(coordinator.activeBackend, .aether)
-        XCTAssertNotNil(coordinator.aetherController)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+        XCTAssertNil(coordinator.aetherController)
     }
 
     @MainActor
@@ -979,7 +979,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertTrue(result.allowAutomaticFallback)
     }
 
-    func testAutoSelectsAetherWithoutFallbackForRemoteHTTPS() {
+    func testAutoSelectsAetherWithMPVFallbackForRemoteHTTPS() {
         let result = PlaybackBackendPolicy.resolve(
             .init(
                 urlString: "https://cdn.example/movie.mkv",
@@ -993,7 +993,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             )
         )
         XCTAssertEqual(result.backend, .aether)
-        XCTAssertFalse(result.allowAutomaticFallback)
+        XCTAssertTrue(result.allowAutomaticFallback)
     }
 
     func testForcedMPV() {
@@ -1013,7 +1013,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertFalse(result.allowAutomaticFallback)
     }
 
-    func testForcedMPVOnRemoteHTTPSRoutesToAether() {
+    func testForcedMPVOnRemoteHTTPSRoutesToMPV() {
         let result = PlaybackBackendPolicy.resolve(
             .init(
                 urlString: "https://cdn.example/movie.mkv",
@@ -1026,9 +1026,9 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 assMode: .strip
             )
         )
-        XCTAssertEqual(result.backend, .aether)
+        XCTAssertEqual(result.backend, .mpv)
         XCTAssertFalse(result.allowAutomaticFallback)
-        XCTAssertEqual(result.statusMessage, "AetherEngine (MPVKit lacks HTTPS)")
+        XCTAssertNil(result.statusMessage)
     }
 
     func testForcedAetherDisablesOrdinaryFallback() {
@@ -1081,7 +1081,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(result.backend, .mpv)
     }
 
-    func testAudioControlsOnRemoteHTTPSUsesAetherEngine() {
+    func testAudioControlsOnRemoteHTTPSUsesMPV() {
         let result = PlaybackBackendPolicy.resolve(
             .init(
                 urlString: "https://cdn.example/movie.mkv",
@@ -1094,14 +1094,14 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 assMode: .strip
             )
         )
-        XCTAssertEqual(result.backend, .aether)
+        XCTAssertEqual(result.backend, .mpv)
     }
 
     func testAetherCapabilitiesIncludeAudioDelayAndHTTPS() {
         XCTAssertTrue(PlaybackEngineCapabilities.aether.supportsAudioDelay)
         XCTAssertFalse(PlaybackEngineCapabilities.aether.supportsAudioAmplification)
         XCTAssertTrue(PlaybackEngineCapabilities.aether.supportsDirectHTTPS)
-        XCTAssertFalse(PlaybackEngineCapabilities.mpv.supportsDirectHTTPS)
+        XCTAssertTrue(PlaybackEngineCapabilities.mpv.supportsDirectHTTPS)
     }
 
     func testASSScaleForcesMPVOnLocalFiles() {
@@ -1120,7 +1120,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(result.backend, .mpv)
     }
 
-    func testASSScaleOnRemoteHTTPSUsesAetherEngine() {
+    func testASSScaleOnRemoteHTTPSUsesMPV() {
         let result = PlaybackBackendPolicy.resolve(
             .init(
                 urlString: "https://cdn.example/anime.mkv",
@@ -1133,11 +1133,11 @@ final class PlaybackBackendPolicyTests: XCTestCase {
                 assMode: .scale
             )
         )
-        XCTAssertEqual(result.backend, .aether)
+        XCTAssertEqual(result.backend, .mpv)
     }
 
     @MainActor
-    func testAetherTerminalErrorOnRemoteHTTPSDoesNotHandoffToMPV() throws {
+    func testAetherTerminalErrorOnRemoteHTTPSHandoffsToMPV() throws {
         let aether = try XCTUnwrap(AetherPlaybackController())
         var loadedBackends: [PlayerBackendKind] = []
         let coordinator = PlaybackSessionCoordinator(
@@ -1152,8 +1152,8 @@ final class PlaybackBackendPolicyTests: XCTestCase {
 
         aether.onTerminalError?("HTTP 403 Forbidden")
 
-        XCTAssertEqual(coordinator.activeBackend, .aether)
-        XCTAssertEqual(coordinator.lastLoadError, "HTTP 403 Forbidden")
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+        XCTAssertNil(coordinator.lastLoadError)
     }
 
     func testPlaybackASSModeMapping() {

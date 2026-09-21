@@ -1188,6 +1188,7 @@ struct SettingsView: View {
         }
         .onDisappear {
             TVHomeDebugTrace.log("settings.disappear")
+            NuvioSyncManager.current?.flushPendingPushes()
         }
     }
 

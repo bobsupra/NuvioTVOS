@@ -159,7 +159,8 @@ extension PlayerView {
                     && viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.postPlayState.isVisible
-                    && viewModel.status == .paused
+                    && !viewModel.isHoldingSeek
+                    && viewModel.pendingSeekDelta == 0
             },
             onBegan: { viewModel.remoteTouchBegan() },
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
@@ -231,6 +232,7 @@ extension PlayerView {
             .focusable(
                 (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
                     && !viewModel.isScrubbing
+                    && !viewModel.isHoldingSeek
                     && viewModel.playbackStartupError == nil
                     && !viewModel.showNextEpisodeCard
                     && !viewModel.showSkipSegmentCard
@@ -271,7 +273,7 @@ extension PlayerView {
 
     @ViewBuilder
     var skipSegmentLayer: some View {
-        if viewModel.showSkipSegmentCard && !viewModel.isScrubbing, let interval = viewModel.activeSkipInterval {
+        if viewModel.showSkipSegmentCard && !viewModel.isScrubbing && !viewModel.isHoldingSeek, let interval = viewModel.activeSkipInterval {
             Button(action: {
                 guard !isWakingFromBackground else { return }
                 viewModel.skipActiveInterval()
@@ -315,13 +317,18 @@ extension PlayerView {
     var nextEpisodeLayer: some View {
         // Next-episode prompt, shown near the end. Auto-play occurs only
         // after the current episode reaches genuine end-of-media.
-        if viewModel.showNextEpisodeCard && !viewModel.isScrubbing, let next = viewModel.nextEpisode {
+        if viewModel.showNextEpisodeCard && !viewModel.isScrubbing && !viewModel.isHoldingSeek, let next = viewModel.nextEpisode {
             VStack(spacing: 8) {
                 Button(action: {
                     guard !isWakingFromBackground else { return }
                     viewModel.playNextEpisode()
                 }) {
-                    NextEpisodeOverlay(episode: next, isAdvancing: viewModel.isAdvancingEpisode, isFocused: nextEpisodeFocused, isAutoPlayCancelled: viewModel.isAutoPlayCancelled)
+                    NextEpisodeOverlay(
+                        episode: next,
+                        isAdvancing: viewModel.isAdvancingEpisode,
+                        isFocused: nextEpisodeFocused,
+                        isAutoPlayCancelled: viewModel.isAutoPlayCancelled
+                    )
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focusEffectDisabledIfAvailable()
@@ -330,13 +337,8 @@ extension PlayerView {
                     guard !isWakingFromBackground else { return }
                     switch direction {
                     case .down:
-                        if autoPlayNextEnabled && !viewModel.isAutoPlayCancelled && !viewModel.isAdvancingEpisode {
-                            nextEpisodeFocused = false
-                            cancelAutoPlayFocused = true
-                        } else {
-                            nextEpisodeFocused = false
-                            requestedControlFocus = .settings
-                        }
+                        nextEpisodeFocused = false
+                        requestedControlFocus = .settings
                     case .left:
                         if viewModel.showSkipSegmentCard {
                             nextEpisodeFocused = false
@@ -346,13 +348,21 @@ extension PlayerView {
                         break
                     }
                 }
-                if autoPlayNextEnabled && !viewModel.isAutoPlayCancelled && !viewModel.isAdvancingEpisode {
-                    Button(action: { viewModel.cancelAutoPlay() }) {
-                        Text(L10n.string("player_cancel_autoplay", fallback: "Cancel Auto-Play"))
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundColor(cancelAutoPlayFocused ? .black : .white.opacity(0.85))
-                            .padding(.horizontal, 18).padding(.vertical, 8)
-                            .background(cancelAutoPlayFocused ? Color.white : Color.white.opacity(0.14), in: Capsule())
+
+                if viewModel.nextEpisodeCountdown != nil {
+                    Button(action: {
+                        guard !isWakingFromBackground else { return }
+                        viewModel.cancelAutoPlay()
+                    }) {
+                        Text(L10n.string("cancel", fallback: "Cancel"))
+                            .font(.system(size: 20, weight: .semibold))
+                            .foregroundColor(cancelAutoPlayFocused ? .black : .white)
+                            .padding(.horizontal, 24)
+                            .padding(.vertical, 8)
+                            .background(
+                                Capsule()
+                                    .fill(cancelAutoPlayFocused ? Color.white : Color.white.opacity(0.15))
+                            )
                     }
                     .buttonStyle(.plain)
                     .focused($cancelAutoPlayFocused)
@@ -366,10 +376,10 @@ extension PlayerView {
                             cancelAutoPlayFocused = false
                             requestedControlFocus = .settings
                         case .left:
-                            if viewModel.showSkipSegmentCard {
-                                cancelAutoPlayFocused = false
-                                focusSkipSegment()
-                            }
+                        if viewModel.showSkipSegmentCard {
+                            cancelAutoPlayFocused = false
+                            focusSkipSegment()
+                        }
                         default:
                             break
                         }
@@ -386,12 +396,7 @@ extension PlayerView {
 
     @ViewBuilder
     var playerControlsLayer: some View {
-        // Kept mounted (not gated by an `if`) so the hide animates too: removing
-        // a view that holds tvOS focus makes the focus engine finalize the
-        // removal before the transition can play, so only the appear would
-        // animate. Animating opacity/scale on a mounted view sidesteps that —
-        // focusability is gated inside PlayerControls so focus still hands off
-        // cleanly to the remote-input overlay when hidden.
+        let isSeekingOrControlsVisible = viewModel.showControls || viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0
         PlayerControls(
             viewModel: viewModel,
             isSkipSegmentFocused: skipSegmentFocused,
@@ -401,7 +406,7 @@ extension PlayerView {
             onFocusNextEpisode: { focusNextEpisode() }
         )
             .opacity(
-                (viewModel.showControls || viewModel.isScrubbing)
+                isSeekingOrControlsVisible
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
@@ -409,14 +414,15 @@ extension PlayerView {
                 ? 1 : 0
             )
             .scaleEffect(
-                (viewModel.showControls || viewModel.isScrubbing)
+                isSeekingOrControlsVisible
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
+                    && !viewModel.showSettingsPanel
                     && !viewModel.showPauseOverlay
                 ? 1 : 0.95
             )
             .allowsHitTesting(
-                (viewModel.showControls || viewModel.isScrubbing)
+                isSeekingOrControlsVisible
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
@@ -427,6 +433,8 @@ extension PlayerView {
             .animation(.playerControls, value: viewModel.isSwitchingSource)
             .animation(.playerControls, value: viewModel.showSettingsPanel)
             .animation(.playerControls, value: viewModel.isScrubbing)
+            .animation(.playerControls, value: viewModel.isHoldingSeek)
+            .animation(.playerControls, value: viewModel.pendingSeekDelta)
             .animation(.playerControls, value: viewModel.showPauseOverlay)
     }
 

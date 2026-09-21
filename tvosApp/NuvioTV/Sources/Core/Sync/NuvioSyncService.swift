@@ -192,6 +192,16 @@ final class NuvioSyncManager: ObservableObject {
             Task { @MainActor in self?.schedulePush(scope: .settings) }
         })
         observers.append(center.addObserver(
+            forName: UserDefaults.didChangeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self, !self.isApplyingRemote else { return }
+                self.schedulePush(scope: .settings)
+            }
+        })
+        observers.append(center.addObserver(
             forName: Self.addonOrderChangedNotification,
             object: nil,
             queue: .main
@@ -831,6 +841,30 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
+    /// Flushes any debounced push tasks immediately (settings, home catalogs, watch state).
+    func flushPendingPushes() {
+        guard !isApplyingRemote else { return }
+        Task { @MainActor in
+            await self.flushPendingPushesNow()
+        }
+    }
+
+    /// Awaits flushing of any debounced push tasks immediately.
+    func flushPendingPushesNow() async {
+        guard !isApplyingRemote else { return }
+        if homeCatalogPushTask != nil {
+            homeCatalogPushTask?.cancel()
+            homeCatalogPushTask = nil
+            await pushHomeCatalogSettings()
+        }
+        pushTask?.cancel()
+        pushTask = nil
+        while isPushExecuting {
+            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
+        }
+        await executePendingPushes()
+    }
+
     private func executePendingPushes() async {
         guard !isPushExecuting else { return }
         let scopesToPush = pendingPushScopes
@@ -991,6 +1025,10 @@ final class NuvioSyncManager: ObservableObject {
             let addonProfileId = activeProfile.usesPrimaryAddons && remoteProfileId != 1
                 ? 1
                 : remoteProfileId
+
+            // Flush any pending outbound local changes first so pulling remote state
+            // does not overwrite local modifications that were queued but not yet sent.
+            await flushPendingPushesNow()
 
             var profileSettingsReconciled = true
             var pullFailures = 0

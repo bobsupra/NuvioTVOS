@@ -27,6 +27,9 @@ struct PlaybackEngineCapabilities: Equatable {
         supportsAuthoredASS: true,
         supportsHostSubtitleOverlay: false,
         supportsHTTPHeaders: true,
-        supportsDirectHTTPS: false
+        // MPVKit ships FFmpeg with network protocols and TLS enabled. The
+        // old false value forced every remote session back to AetherEngine,
+        // which made the ASS-capable player impossible to select.
+        supportsDirectHTTPS: true
     )
 }

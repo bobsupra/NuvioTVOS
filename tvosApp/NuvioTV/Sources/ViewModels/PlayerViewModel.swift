@@ -37,8 +37,6 @@ import AVFoundation
 import AVKit
 import CoreMedia
 import GameController
-import Libmpv
-
 // MARK: - Playback clock
 //
 // Time + scrub target live on a separate ObservableObject so high-frequency
@@ -2779,7 +2777,7 @@ class PlayerViewModel: ObservableObject {
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     guard !Task.isCancelled else { return }
                     if self.pendingScrubThumbnailSeconds == nil,
-                       self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 {
+                       (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
                 }
@@ -2809,6 +2807,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func beginScrub() {
+        guard !isHoldingSeek, pendingSeekDelta == 0 else { return }
         guard !isLiveStream, hasStartedPlayback, !showSettingsPanel else { return }
         guard status == .paused else { return }
         hidePeek()
@@ -2880,6 +2879,7 @@ class PlayerViewModel: ObservableObject {
     // MARK: Trackpad input
 
     func remoteTouchBegan() {
+        guard !isHoldingSeek, pendingSeekDelta == 0 else { return }
         scrubLastDx = 0
         scrubEngagedThisStroke = false
         suppressMoveBriefly()
@@ -2888,6 +2888,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func remoteTouchMoved(dx: CGFloat, dy: CGFloat) {
+        guard !isHoldingSeek, pendingSeekDelta == 0 else { return }
         suppressMoveBriefly()
         switch touchIntent {
         case .scrub:
@@ -2922,6 +2923,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func remoteTouchEnded(dx: CGFloat, dy: CGFloat) {
+        guard !isHoldingSeek, pendingSeekDelta == 0 else { return }
         if touchIntent == .scrub { endScrubGesture() }
         scrubEngagedThisStroke = false
         touchIntent = .undecided
@@ -3105,15 +3107,15 @@ class PlayerViewModel: ObservableObject {
         // transport can take over (same idea as Android onUserInteraction).
         if showPauseOverlay {
             dismissPauseOverlay()
-            showControls = false
-        } else if showControls {
+        }
+        showControls = true
+        isTimelineFocused = true
+        if status == .playing {
             scheduleControlsHide()
-            if status == .paused,
-               subtitle != PlaybackMarkers.trailerSubtitle,
-               !showSettingsPanel {
-                // Restart the 3s countdown if transport is already up while paused.
-                schedulePauseOverlay()
-            }
+        } else if status == .paused,
+                  subtitle != PlaybackMarkers.trailerSubtitle,
+                  !showSettingsPanel {
+            schedulePauseOverlay()
         }
 
         seekDebounceTask?.cancel()
@@ -3124,7 +3126,7 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    private func commitPendingSeekIfNeeded() {
+    func commitPendingSeekIfNeeded() {
         cancelMoveSeekTracking()
         seekDebounceTask?.cancel()
         let delta = pendingSeekDelta
@@ -3139,23 +3141,10 @@ class PlayerViewModel: ObservableObject {
             dismissPauseOverlay()
         }
         seek(to: playbackPosition + delta)
-        if !isScrubbing, !isTimelineFocused {
-            // A focused timeline hides the card when delta reaches zero but
-            // may retain the last successful still for the next nudge.
+        if !isScrubbing {
             resetScrubThumbnailState()
         }
-        if !isScrubbing, !showControls {
-            // After a bare-video skip, briefly flash controls so the user sees
-            // the landing position, then auto-hide (or return to pause sheet).
-            showControls = true
-            if status == .paused,
-               subtitle != PlaybackMarkers.trailerSubtitle,
-               !showSettingsPanel {
-                schedulePauseOverlay()
-            } else {
-                scheduleControlsHide()
-            }
-        } else if showControls {
+        if showControls {
             if status == .paused,
                subtitle != PlaybackMarkers.trailerSubtitle,
                !showSettingsPanel {
@@ -3166,26 +3155,10 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    // MARK: - Autorepeat-aware Move-Command Seeking
+    // MARK: - Move-Command Seeking
 
-    private var lastMoveSeekDate: Date?
-    private var lastMoveSeekDirection: MoveCommandDirection?
-    private var moveSeekWatchdogTask: Task<Void, Never>?
-
-    /// Returns true if a move command in this direction constitutes an autorepeat hold
-    /// (arrived within standard tvOS autorepeat cadence: <= 0.45s after prior command in the same direction).
-    func isAutorepeatMoveHold(direction: MoveCommandDirection) -> Bool {
-        guard let lastDate = lastMoveSeekDate,
-              lastMoveSeekDirection == direction else {
-            return false
-        }
-        return Date().timeIntervalSince(lastDate) <= 0.45
-    }
-
-    /// Handles a directional move command (left / right) with intelligent cadence detection:
-    /// - Isolated tap: performs discrete linear skip (e.g. 10s).
-    /// - Held down (autorepeat ticks <= 0.45s apart): engages Infuse-style hold-to-seek (1x->2x->3x->4x + live thumbnail).
-    /// - Button release (no ticks for 0.28s): automatically commits seek.
+    /// Handles a directional move command (left / right):
+    /// Performs discrete linear skips (e.g. +10s, +20s, +30s) per tap/move event.
     func handleMoveSeek(direction: MoveCommandDirection) {
         guard !isLiveStream else {
             revealControls()
@@ -3193,58 +3166,13 @@ class PlayerViewModel: ObservableObject {
         }
         guard status == .playing else { return }
         guard hasStartedPlayback, !isScrubbing, !showSettingsPanel else { return }
+        guard !isHoldingSeek else { return }
 
-        // If already in hold-to-seek mode:
-        if isHoldingSeek {
-            if lastMoveSeekDirection == direction {
-                extendMoveSeekWatchdog()
-                return
-            } else {
-                stopRepeatingSkip()
-            }
-        }
-
-        let now = Date()
-        let isSameDir = (lastMoveSeekDirection == direction)
-        let interval = lastMoveSeekDate.map { now.timeIntervalSince($0) } ?? 999.0
-        lastMoveSeekDate = now
-        lastMoveSeekDirection = direction
-
-        if isSameDir && interval <= 0.45 {
-            // Autorepeat hold detected!
-            if direction == .left {
-                beginRepeatingSkipBackward()
-            } else if direction == .right {
-                beginRepeatingSkipForward()
-            }
-            extendMoveSeekWatchdog()
-        } else {
-            // Discrete tap
-            let delta = direction == .left ? -Double(seekStepSeconds) : Double(seekStepSeconds)
-            nudgeSeek(delta)
-        }
+        let delta = direction == .left ? -Double(seekStepSeconds) : Double(seekStepSeconds)
+        nudgeSeek(delta)
     }
 
-    private func extendMoveSeekWatchdog() {
-        moveSeekWatchdogTask?.cancel()
-        moveSeekWatchdogTask = Task { @MainActor [weak self] in
-            // tvOS autorepeat fires every ~0.08 - 0.12s. If no move command arrives
-            // within 0.28s, the remote button has been released.
-            try? await Task.sleep(nanoseconds: 280_000_000)
-            guard !Task.isCancelled, let self else { return }
-            if self.isHoldingSeek {
-                self.stopRepeatingSkip()
-            }
-            self.cancelMoveSeekTracking()
-        }
-    }
-
-    func cancelMoveSeekTracking() {
-        moveSeekWatchdogTask?.cancel()
-        moveSeekWatchdogTask = nil
-        lastMoveSeekDate = nil
-        lastMoveSeekDirection = nil
-    }
+    func cancelMoveSeekTracking() {}
 
     func setSpeed(_ speed: PlaybackSpeed) {
         playbackSpeed = speed

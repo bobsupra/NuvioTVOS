@@ -347,4 +347,15 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertEqual(ThemeSettingsSyncMapper.themeToWire("White"), "WHITE")
         XCTAssertEqual(ThemeSettingsSyncMapper.wireToTheme("WHITE"), "White")
     }
+
+    // MARK: - Settings Sync Flush Tests
+
+    @MainActor
+    func testSettingsFlushPendingPushesDoesNotCrashWhenUnauthenticated() async {
+        let manager = NuvioSyncManager()
+        // Calling flush on a manager with no auth/profile should safely complete without throwing or hanging
+        await manager.flushPendingPushesNow()
+        manager.flushPendingPushes()
+    }
 }
+

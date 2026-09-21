@@ -82,7 +82,10 @@ final class TouchHostView: UIView, UIGestureRecognizerDelegate {
         _ g: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith other: UIGestureRecognizer
     ) -> Bool {
-        true
+        if other is UILongPressGestureRecognizer || other is UITapGestureRecognizer {
+            return false
+        }
+        return true
     }
 
     func gestureRecognizer(_ g: UIGestureRecognizer, shouldReceive touch: UITouch) -> Bool {

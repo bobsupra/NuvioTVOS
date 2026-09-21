@@ -94,20 +94,20 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         removeRecognizers()
         guard let window else { return }
 
-        let backward = makeHoldRecognizer(
+        let backwardHold = makeHoldRecognizer(
             pressType: .leftArrow,
             action: #selector(handleBackwardHold(_:))
         )
-        let forward = makeHoldRecognizer(
+        let forwardHold = makeHoldRecognizer(
             pressType: .rightArrow,
             action: #selector(handleForwardHold(_:))
         )
 
-        window.addGestureRecognizer(backward)
-        window.addGestureRecognizer(forward)
+        window.addGestureRecognizer(backwardHold)
+        window.addGestureRecognizer(forwardHold)
 
-        backwardHoldRecognizer = backward
-        forwardHoldRecognizer = forward
+        backwardHoldRecognizer = backwardHold
+        forwardHoldRecognizer = forwardHold
         attachedWindow = window
         updateRecognizerState()
     }
@@ -179,7 +179,10 @@ final class SeekPressHostView: UIView, UIGestureRecognizerDelegate {
         _ gestureRecognizer: UIGestureRecognizer,
         shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
     ) -> Bool {
-        true
+        if otherGestureRecognizer is UIPanGestureRecognizer {
+            return false
+        }
+        return true
     }
 
     func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {

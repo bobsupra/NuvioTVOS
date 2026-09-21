@@ -10,7 +10,7 @@ extension PlayerView {
             .animation(.playerControls, value: viewModel.showNextEpisodeCard)
             .animation(.playerControls, value: viewModel.showSkipSegmentCard)
             .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
-            .animation(.easeOut(duration: 0.16), value: viewModel.pendingSeekDelta != 0)
+            .animation(.easeOut(duration: 0.16), value: viewModel.isHoldingSeek)
             .animation(.easeOut(duration: 0.2), value: viewModel.isSwitchingSource)
             .animation(.easeOut(duration: 0.2), value: viewModel.playerToast)
             .animation(.easeOut(duration: 0.22), value: viewModel.showPauseOverlay)

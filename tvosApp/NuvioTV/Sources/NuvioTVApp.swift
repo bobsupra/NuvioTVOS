@@ -579,6 +579,7 @@ struct ContentView: View {
             switch phase {
             case .background:
                 backgroundedAt = Date()
+                syncManager.flushPendingPushes()
             case .active:
                 syncManager.refreshAccountIfIdle()
                 presentProfileSelectionAfterBackgroundIfNeeded()
@@ -3015,6 +3016,9 @@ private struct TVMainTabView: View {
         }
         .onChange(of: selectedTab) { oldTab, tab in
             TVHomeDebugTrace.log("app.selectedTab changed from \(oldTab.rawValue) to \(tab.rawValue)")
+            if oldTab == .settings {
+                syncManager.flushPendingPushes()
+            }
             if tab == .profile {
                 onSwitchProfile()
             }
