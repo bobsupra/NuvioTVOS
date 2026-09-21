@@ -8,15 +8,18 @@
 			<key>BinaryPath</key>
 			<string>AetherLibzimg.framework/AetherLibzimg</string>
 			<key>LibraryIdentifier</key>
-			<string>xros-arm64</string>
+			<string>ios-arm64_x86_64-simulator</string>
 			<key>LibraryPath</key>
 			<string>AetherLibzimg.framework</string>
 			<key>SupportedArchitectures</key>
 			<array>
 				<string>arm64</string>
+				<string>x86_64</string>
 			</array>
 			<key>SupportedPlatform</key>
-			<string>xros</string>
+			<string>ios</string>
+			<key>SupportedPlatformVariant</key>
+			<string>simulator</string>
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
@@ -37,8 +40,42 @@
 		<dict>
 			<key>BinaryPath</key>
 			<string>AetherLibzimg.framework/AetherLibzimg</string>
+			<key>DebugSymbolsPath</key>
+			<string>dSYMs</string>
 			<key>LibraryIdentifier</key>
-			<string>ios-arm64_x86_64-simulator</string>
+			<string>xros-arm64</string>
+			<key>LibraryPath</key>
+			<string>AetherLibzimg.framework</string>
+			<key>SupportedArchitectures</key>
+			<array>
+				<string>arm64</string>
+			</array>
+			<key>SupportedPlatform</key>
+			<string>xros</string>
+		</dict>
+		<dict>
+			<key>BinaryPath</key>
+			<string>AetherLibzimg.framework/AetherLibzimg</string>
+			<key>DebugSymbolsPath</key>
+			<string>dSYMs</string>
+			<key>LibraryIdentifier</key>
+			<string>tvos-arm64</string>
+			<key>LibraryPath</key>
+			<string>AetherLibzimg.framework</string>
+			<key>SupportedArchitectures</key>
+			<array>
+				<string>arm64</string>
+			</array>
+			<key>SupportedPlatform</key>
+			<string>tvos</string>
+		</dict>
+		<dict>
+			<key>BinaryPath</key>
+			<string>AetherLibzimg.framework/Versions/A/AetherLibzimg</string>
+			<key>DebugSymbolsPath</key>
+			<string>dSYMs</string>
+			<key>LibraryIdentifier</key>
+			<string>macos-arm64_x86_64</string>
 			<key>LibraryPath</key>
 			<string>AetherLibzimg.framework</string>
 			<key>SupportedArchitectures</key>
@@ -47,9 +84,7 @@
 				<string>x86_64</string>
 			</array>
 			<key>SupportedPlatform</key>
-			<string>ios</string>
-			<key>SupportedPlatformVariant</key>
-			<string>simulator</string>
+			<string>macos</string>
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
@@ -70,22 +105,9 @@
 		</dict>
 		<dict>
 			<key>BinaryPath</key>
-			<string>AetherLibzimg.framework/Versions/A/AetherLibzimg</string>
-			<key>LibraryIdentifier</key>
-			<string>macos-arm64_x86_64</string>
-			<key>LibraryPath</key>
-			<string>AetherLibzimg.framework</string>
-			<key>SupportedArchitectures</key>
-			<array>
-				<string>arm64</string>
-				<string>x86_64</string>
-			</array>
-			<key>SupportedPlatform</key>
-			<string>macos</string>
-		</dict>
-		<dict>
-			<key>BinaryPath</key>
 			<string>AetherLibzimg.framework/AetherLibzimg</string>
+			<key>DebugSymbolsPath</key>
+			<string>dSYMs</string>
 			<key>LibraryIdentifier</key>
 			<string>ios-arm64</string>
 			<key>LibraryPath</key>
@@ -96,20 +118,6 @@
 			</array>
 			<key>SupportedPlatform</key>
 			<string>ios</string>
-		</dict>
-		<dict>
-			<key>BinaryPath</key>
-			<string>AetherLibzimg.framework/AetherLibzimg</string>
-			<key>LibraryIdentifier</key>
-			<string>tvos-arm64</string>
-			<key>LibraryPath</key>
-			<string>AetherLibzimg.framework</string>
-			<key>SupportedArchitectures</key>
-			<array>
-				<string>arm64</string>
-			</array>
-			<key>SupportedPlatform</key>
-			<string>tvos</string>
 		</dict>
 	</array>
 	<key>CFBundlePackageType</key>

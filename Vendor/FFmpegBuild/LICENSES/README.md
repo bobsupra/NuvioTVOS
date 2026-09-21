@@ -6,10 +6,10 @@ that distribute these frameworks must reproduce the applicable license texts
 
 | Component | Frameworks | License | Text |
 | --- | --- | --- | --- |
-| FFmpeg (libavcodec, libavformat, libavutil, libswresample, libswscale, libavfilter) | `Libavcodec`, `Libavformat`, `Libavutil`, `Libswresample`, `Libswscale`, `Libavfilter` | LGPL-2.1-or-later | [LGPL-2.1.txt](LGPL-2.1.txt) |
-| dav1d | `Libdav1d` | BSD-2-Clause | [dav1d.BSD-2-Clause.txt](dav1d.BSD-2-Clause.txt) |
-| zimg | `Libzimg` | WTFPL | [zimg.WTFPL.txt](zimg.WTFPL.txt) |
-| libzvbi (library sources) | `Libzvbi` | LGPL-2.0-or-later (conveyed under LGPL-2.1), `ure.c` under MIT | [LGPL-2.1.txt](LGPL-2.1.txt), MIT notice in `ure.c` |
+| FFmpeg (libavcodec, libavformat, libavutil, libswresample, libswscale, libavfilter) | `AetherLibavcodec`, `AetherLibavformat`, `AetherLibavutil`, `AetherLibswresample`, `AetherLibswscale`, `AetherLibavfilter` | LGPL-2.1-or-later | [LGPL-2.1.txt](LGPL-2.1.txt) |
+| dav1d | `AetherLibdav1d` | BSD-2-Clause | [dav1d.BSD-2-Clause.txt](dav1d.BSD-2-Clause.txt) |
+| zimg | `AetherLibzimg` | WTFPL | [zimg.WTFPL.txt](zimg.WTFPL.txt) |
+| libzvbi (library sources) | `AetherLibzvbi` | LGPL-2.0-or-later (conveyed under LGPL-2.1), `ure.c` under MIT | [LGPL-2.1.txt](LGPL-2.1.txt), [libzvbi-ure.MIT.txt](libzvbi-ure.MIT.txt) |
 
 Notes:
 

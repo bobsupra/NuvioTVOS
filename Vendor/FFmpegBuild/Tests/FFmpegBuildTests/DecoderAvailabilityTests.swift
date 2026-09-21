@@ -95,27 +95,66 @@ struct DecoderAvailabilityTests {
         }
     }
 
-    /// The native `.wmv` chain is all-in or all-out (FFmpegBuild#3).
+    /// The native `.wmv` chain is all-in or all-out (FFmpegBuild#3), and since
+    /// September 2026 it is in.
     ///
-    /// A `.wmv` file needs the asf demuxer and a WMA decoder together. With the
-    /// demuxer but without `wmav1`/`wmav2`, AetherEngine's `AudioCodecCompat` maps
-    /// the unrecognised id to `.unsupported` and the session drops to video-only:
-    /// the file plays silently, which reads as a playback bug, where today's
-    /// `unsupportedCodec` is at least an honest failure. Enabling one of the three
-    /// therefore means enabling all three plus the engine's audio-route entry, and
-    /// this test is what refuses the half-set.
-    ///
-    /// Currently all three are out, and the field answer behind that is recorded in
-    /// build.sh: the reporter's library carries WMV9 only inside Matroska and
-    /// MPEG-TS, where the container's own demuxer supplies the stream.
-    @Test("the native .wmv chain is whole or absent")
-    func nativeWmvChainIsWholeOrAbsent() {
-        let asf = av_find_input_format("asf") != nil
-        let wmav1 = avcodec_find_decoder_by_name("wmav1") != nil
-        let wmav2 = avcodec_find_decoder_by_name("wmav2") != nil
+    /// Such a file needs three things at once: the asf demuxer to open it, a video
+    /// decoder, and a decoder for whichever WMA flavour its audio track carries. With
+    /// the demuxer but without that last one, AetherEngine's `AudioCodecCompat` maps
+    /// the unrecognised id to `.unsupported` and the session drops to video-only, so
+    /// the file plays silently, which reads as a playback bug where an honest
+    /// `unsupportedCodec` would not. Every name missing below is one such file, which
+    /// is why the whole family ships and why this test lists each one instead of
+    /// trusting the configure line.
+    @Test("the native .wmv chain is whole")
+    func theNativeWmvChainIsWhole() {
         #expect(
-            asf == wmav1 && wmav1 == wmav2,
-            "half a format chain fails silently: asf=\(asf), wmav1=\(wmav1), wmav2=\(wmav2)"
+            av_find_input_format("asf") != nil,
+            "asf demuxer missing: a native .wmv cannot be opened at all"
         )
+        for name in ["wmav1", "wmav2", "wmapro", "wmalossless", "wmavoice"] {
+            #expect(
+                avcodec_find_decoder_by_name(name) != nil,
+                "\(name) missing: files carrying it would play with silent audio"
+            )
+        }
+        // The video half belongs in the same statement, so a failure reads as one fact
+        // about the format rather than sending the reader to another suite to find out
+        // why sound alone was not enough. vc1 is what WVC1, the modern .wmv, carries.
+        for name in ["wmv1", "wmv2", "wmv3", "vc1"] {
+            #expect(avcodec_find_decoder_by_name(name) != nil, "\(name) missing")
+        }
+    }
+
+    /// The native `.flv` chain, whole since 3.2.0, and whole for the same reason.
+    ///
+    /// The container is the part that was never missing: the `flv` demuxer has been on the list
+    /// since the first build, so a Flash file from after 2008 (H.264 + AAC) always played and only
+    /// the legacy tail was absent. Both halves of that tail are asserted here, video and audio,
+    /// because they fail differently and only one of the two failures is honest: without a video
+    /// decoder the load ends in `unsupportedCodec`, without an audio decoder AetherEngine maps the
+    /// id to `.unsupported` and plays the file silently.
+    ///
+    /// Flash Screen Video is deliberately not in this list. It needs zlib, which
+    /// `--disable-autodetect` switches off, so asking for it would only produce the silent
+    /// no-op the dash demuxer once was.
+    @Test("the native .flv chain is whole")
+    func theNativeFlvChainIsWhole() {
+        #expect(
+            av_find_input_format("flv") != nil,
+            "flv demuxer missing: no Flash file opens at all"
+        )
+        // Video. `flv` IS the FLV1 decoder: it registers under the family name, so this is the
+        // spelling a consumer has to ask for, and `flv1` resolves to nothing.
+        for name in ["flv", "vp6", "vp6a", "vp6f"] {
+            #expect(avcodec_find_decoder_by_name(name) != nil, "\(name) missing: those files fail the load")
+        }
+        // Audio, every shape the container can carry, since each one left out is a silent film.
+        for name in ["nellymoser", "adpcm_swf", "speex", "pcm_s16be", "pcm_u8", "pcm_alaw", "pcm_mulaw"] {
+            #expect(
+                avcodec_find_decoder_by_name(name) != nil,
+                "\(name) missing: files carrying it would play with silent audio"
+            )
+        }
     }
 }
