@@ -53,7 +53,7 @@ extension AetherEngine {
         let rendition = liveSubtitleRenditions[ordinal]
 
         cancelSidecarTask()
-        clearSubtitleDrainTarget(channel: .primary)
+        clearSubtitleDrainTarget(channel: .primary, reason: .liveRenditionSelected)
         liveSubtitleFetchTask?.cancel()
         isSubtitleActive = true
         activeEmbeddedSubtitleStreamIndex = -1

@@ -11,7 +11,7 @@ import PackageDescription
 let package = Package(
     name: "DemoPlayerMac",
     platforms: [
-        .macOS(.v14),
+        .macOS(.v15),
     ],
     dependencies: [
         .package(path: "../..")

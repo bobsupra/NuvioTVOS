@@ -44,6 +44,7 @@ You provide the transport bar. You provide the dropdowns. You provide the pretty
 - [Silo](https://github.com/Silo-Server/silo-apple): native iOS, tvOS and macOS client for the Silo self-hosted media server.
 - [File Box](https://apps.apple.com/app/id6765818194): File Box is a simple and practical local file manager that makes it easy to manage, view, organize, and process your files on iPhone and iPad.
 - [Moonfin](https://github.com/Moonfin-Client/Moonfin-Core): A multi-platform third party Jellyfin client.
+- [Vivid](https://github.com/blurbery/vivid): open-source media app for iPhone, iPad and Apple TV.
 <!-- used-by:end -->
 
 Shipping something on AetherEngine? [Submit it](https://github.com/superuser404notfound/AetherEngine/issues/new?template=used-by-submission.yml) to get listed here and on [aetherengine.superuser404.de](https://aetherengine.superuser404.de).
@@ -54,12 +55,12 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 
 | Area | Summary |
 | --- | --- |
-| Containers | MKV, MP4, WebM, MPEG-TS, AVI, OGG, FLV |
+| Containers | MKV, MP4, WebM, MPEG-TS, AVI, ASF / WMV, OGG, FLV |
 | Disc | DVD-Video and Blu-ray ISO (decrypted): selectable titles and chapters, demuxed through the normal path |
 | Video (HW) | H.264, HEVC, HEVC Main10 via VideoToolbox; AV1 where HW AV1 exists |
-| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
+| Video (SW) | AV1 (dav1d) without HW, VP9 / VP8, MPEG-4 Part 2 / MPEG-2 / VC-1, QuickTime RLE, the Flash tail (Sorenson Spark, On2 VP6) and anything else the FFmpeg build carries a decoder for (software is the default route; only HEVC, H.264 and HW-decodable AV1 go native), H.264 High 4:2:2 / 4:4:4 / 10 and HEVC Rext where VideoToolbox has no HW decoder (Intel Macs, older chips), interlaced H.264 (AVPlayer does not deinterlace; on VOD the declared field order is verified against decoded frames, so progressive-in-interlaced-carriage keeps hardware decode); GPU deinterlace (yadif_videotoolbox, Metal, field-rate by default) with a CPU bwdif fallback |
 | HDR | HDR10, HDR10+ (per-frame ST 2094-40), Dolby Vision (P5, P7 as single-layer 8.1, P8.1, P8.4, AV1 P10.x), HLG |
-| Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray) bridge to EAC3 5.1 (default) or lossless FLAC |
+| Audio | AAC, AC3, EAC3, FLAC, ALAC stream-copy lossless; TrueHD / MLP / DTS / DTS-HD MA / MP3 / MP2 / Opus / Vorbis / LPCM (incl. Blu-ray, G.711) / WMA (Standard, Pro, Lossless, Voice) / Nellymoser / ADPCM-SWF / Speex bridge to EAC3 5.1 (default) or lossless FLAC |
 | Dolby Atmos | EAC3+JOC stream-copied on every route (HDMI MAT 2.0, AirPods spatial, BT downmix). No container reliably declares JOC pre-decode, so an honest `TrackInfo.isAtmos` needs a bounded decode: `AetherEngine.probeDetectingAtmos(url:/source:)` answers for a details screen without starting playback, and `LoadOptions.confirmAtmos` has the running session confirm its own tracks in the background and republish `audioTracks`. Both are opt-in and neither sits on the playback-start path |
 | Surround | 5.1 / 7.1 with correct `AudioChannelLayout` |
 | Audio-only | `LoadOptions.audioOnly`: lean pipeline, no video machinery, system Now-Playing on tvOS / iOS |
@@ -71,6 +72,7 @@ A scannable summary; the depth for each row lives in **[docs/formats.md](docs/fo
 | Metadata | `MediaMetadata` (title / artist / album + cover) parsed on load; a container's album artist folds into `artist` as a fallback |
 | Seek | VOD seeks into watched content are restart-free cache hits (byte-budgeted retention, 2 GiB cap); short forward scrubs ride the cached window; only never-produced targets restart the producer |
 | Streaming | One long-lived forward-streaming connection, reconnect-on-drop; CDN-stutter resilient; optional caller-bounded open-time probe budget (`LoadOptions.probesize` / `maxAnalyzeDuration`) to cut first-frame latency on sparse remote remuxes; configurable forward-buffer window (`LoadOptions.forwardBufferSegments`), from the 40 s default up to an opt-in whole-source pre-buffer that is bounded in bytes by the session's disk budget rather than in segments |
+| Prewarm | `AetherEngine.prewarm(url:httpHeaders:byteBudget:)` fetches a source's opening bytes before anything asks to play it, for a host whose UI knows what is next. The following `load()` of that URL serves its parse reads out of RAM, takes the size with the bytes instead of probing for it, and opens its data connection at the warm frontier rather than at byte zero, so nothing waits on a first byte. Static and off the main actor: no engine instance, no audio session, no layer. It never queues for the origin, the bytes live in memory only until they are adopted and are dropped under memory pressure, and the headers are part of the key |
 | Live / DVR | Unbounded live + optional timeshift; direct HLS ingest with AES-128 clear-key and SSAI ad-pod handling |
 | Custom input | Play any byte source via the `IOReader` protocol (`load(source:)`) |
 | Network | SMB2/3 shares via the optional `AetherEngineSMB` product (NTLMv2 / guest, read-only) |
@@ -339,7 +341,7 @@ Subtitle cues land in raw source PTS; render the overlay against `player.sourceT
 Install via Swift Package Manager:
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.72.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.7.1")
 ```
 
 Three samples ship in `Examples/`:
@@ -579,21 +581,23 @@ Browse all of this as a searchable site at **[aetherengine.superuser404.de](http
 AetherEngine uses [Semantic Versioning](https://semver.org). The public API surface, every `public` declaration in `Sources/AetherEngine/`, is the stability contract. **Major** removes / renames public symbols or breaks adopters; **Minor** adds public API or codec / format support; **Patch** fixes bugs with no public API change. `internal` types are not part of the contract.
 
 ```swift
-.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "6.72.0")
+.package(url: "https://github.com/superuser404notfound/AetherEngine", from: "7.7.1")
 ```
 
-Pin to `.upToNextMinor(from: "6.72.0")` for stricter teams that prefer to opt into minor bumps explicitly.
+Pin to `.upToNextMinor(from: "7.7.1")` for stricter teams that prefer to opt into minor bumps explicitly.
 
 ## Requirements
 
 | | Min |
 | --- | --- |
-| iOS | 16.0 |
-| tvOS | 17.0 |
-| macOS | 14.0 |
+| iOS | 18.0 |
+| tvOS | 18.0 |
+| macOS | 15.0 |
 | visionOS | 1.0 |
 | Swift | 6.0 |
 | Xcode | 16.0 |
+
+The 7.x line raised the floor from iOS 16, tvOS 17 and macOS 14. A project that still supports those pins the 6.x line with `.upToNextMajor(from: "6.89.1")`.
 
 ## Support
 

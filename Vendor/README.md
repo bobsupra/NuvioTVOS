@@ -1,12 +1,12 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 6.72.0)
+## AetherEngine (pin 7.7.1)
 
-Local pin of [AetherEngine 6.72.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/6.72.0) with imports rewritten to the namespaced FFmpeg modules below.
+Local pin of [AetherEngine 7.7.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.7.1) with imports rewritten to the namespaced FFmpeg modules below.
 
-## FFmpegBuild 3.0.0 (namespaced upstream)
+## FFmpegBuild 3.4.0 (namespaced upstream)
 
-Local pin of [FFmpegBuild 3.0.0](https://github.com/superuser404notfound/FFmpegBuild/tree/3.0.0). The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
+Local pin of [FFmpegBuild 3.4.0](https://github.com/superuser404notfound/FFmpegBuild/tree/3.4.0). The upstream release ships the nine dynamic frameworks and SwiftPM targets under the `AetherLib*` namespace so they can embed next to MPVKit’s `Libav*` stack in the same app binary. The umbrella product is `AetherFFmpegBuild`.
 
 | Upstream module | Nuvio module / framework |
 |---|---|

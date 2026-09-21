@@ -1,5 +1,5 @@
 // swift-tools-version: 6.0
-// Nuvio pin of AetherEngine 6.72.0 with local FFmpegBuild integrations.
+// Nuvio pin of AetherEngine 7.7.1 with local FFmpegBuild integrations.
 
 import PackageDescription
 

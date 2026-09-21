@@ -31,6 +31,10 @@ public final class AetherPlayerView: PlatformBaseView {
 
     private var hostedLayer: CALayer?
 
+    /// Engine-internal. The engine this view was last bound to, so a dismantling surface can unbind
+    /// from it synchronously and a second engine binding the view can take it over (AE#536).
+    weak var bindingEngine: AetherEngine?
+
     #if canImport(UIKit)
     public override init(frame: CGRect) {
         super.init(frame: frame)
@@ -89,27 +93,20 @@ public final class AetherPlayerView: PlatformBaseView {
     /// Engine-internal. Replace whichever layer is currently hosted with
     /// `layer`. Synchronous, runs on the main actor, no implicit
     /// animations so swaps don't flash. Idempotent if the same layer is
-    /// already attached.
+    /// already attached. A previously hosted layer is removed only while it
+    /// still sits in this view: a layer an engine has since presented on
+    /// another surface is not pulled back out of it (AE#536).
     func attach(_ layer: CALayer) {
-        #if canImport(UIKit)
-        let isAlreadySublayer = layer.superlayer === self.layer
-        #elseif canImport(AppKit)
-        let isAlreadySublayer = layer.superlayer === self.layer
-        #endif
-        if hostedLayer === layer && isAlreadySublayer { return }
+        if hostedLayer === layer { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        if hostedLayer !== layer {
-            hostedLayer?.removeFromSuperlayer()
+        if let hosted = hostedLayer, hosted.superlayer === self.layer {
+            hosted.removeFromSuperlayer()
         }
         #if canImport(UIKit)
-        if layer.superlayer !== self.layer {
-            self.layer.addSublayer(layer)
-        }
+        self.layer.addSublayer(layer)
         #elseif canImport(AppKit)
-        if layer.superlayer !== self.layer {
-            self.layer?.addSublayer(layer)
-        }
+        self.layer?.addSublayer(layer)
         // Resize the video layer in lockstep with the view's bounds during a
         // live window drag. Without this it only catches up on the next layout()
         // pass, and because an NSView's layer is anchored bottom-left that lag
@@ -122,12 +119,16 @@ public final class AetherPlayerView: PlatformBaseView {
         CATransaction.commit()
     }
 
-    /// Remove the current hosted layer without replacement (used on unbind / teardown).
-    public func detach() {
+    /// Engine-internal. Remove the current hosted layer without
+    /// replacement (used on unbind / teardown). Same ownership rule as
+    /// `attach`: a layer that has moved to another surface stays there.
+    func detach() {
         guard let hosted = hostedLayer else { return }
         CATransaction.begin()
         CATransaction.setDisableActions(true)
-        hosted.removeFromSuperlayer()
+        if hosted.superlayer === self.layer {
+            hosted.removeFromSuperlayer()
+        }
         hostedLayer = nil
         CATransaction.commit()
     }
@@ -173,10 +174,13 @@ public struct AetherPlayerSurface: UIViewRepresentable {
     }
 
     public static func dismantleUIView(_ uiView: AetherPlayerView, coordinator: ()) {
-        // The engine releases its weak ref when the view deinits, but
-        // explicit unbind keeps the layer removed promptly on teardown.
-        Task { @MainActor in
-            uiView.detach()
+        // AE#536: unbind now, not in a later Task. A surface remounted by identity
+        // is dismantled after the incoming one was bound, and SwiftUI may have
+        // rebound the outgoing view on its way out; unbinding it here hands the
+        // layer back to the incoming view at once. Identity-guarded, so it never
+        // detaches a successor.
+        MainActor.assumeIsolated {
+            uiView.bindingEngine?.unbind(view: uiView)
         }
     }
 }
@@ -201,8 +205,10 @@ public struct AetherPlayerSurface: NSViewRepresentable {
     }
 
     public static func dismantleNSView(_ nsView: AetherPlayerView, coordinator: ()) {
-        Task { @MainActor in
-            nsView.detach()
+        // AE#536: unbind synchronously so the layer moves to a surface bound
+        // after this one instead of waiting for the next session.
+        MainActor.assumeIsolated {
+            nsView.bindingEngine?.unbind(view: nsView)
         }
     }
 }

@@ -6,6 +6,16 @@
 Packages/
 .swiftpm/
 xcuserdata/
+
+# ... with one exception: the SHARED scheme for the test target. Without it a fresh checkout has
+# no `AetherEngineTests` scheme at all, so CI cannot build test code for a simulator and the only
+# machine that can is the one where Xcode happened to create it. Re-including needs the whole
+# chain: git does not descend into an excluded directory, so each level is opened in turn.
+!/.swiftpm/
+/.swiftpm/*
+!/.swiftpm/xcode/
+/.swiftpm/xcode/*
+!/.swiftpm/xcode/xcshareddata/
 DerivedData/
 .netrc
 build/

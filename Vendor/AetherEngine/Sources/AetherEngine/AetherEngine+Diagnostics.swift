@@ -79,6 +79,38 @@ extension AetherEngine {
         }
     }
 
+    /// AE#509: the item's own account of itself, in the three fields a host dumps when a live join
+    /// fetches a whole window and presents none of it.
+    ///
+    /// The engine publishes `item time + playlistShiftSeconds`, so on a live source whose axis is
+    /// hours into an encoder clock the session clock and the ITEM clock are thousands of seconds
+    /// apart in a perfectly healthy session. A diagnostic that prints only the published clock
+    /// therefore cannot be read against a reporter's `AVPlayerItem.currentTime()` at all: the two
+    /// disagree by the shift by construction, which is the same disagreement a wedged session is
+    /// being accused of. Print both or neither.
+    ///
+    /// Off-main for the same reason as the buffer probe (AE#422).
+    public struct NativeItemReading: Sendable {
+        /// `AVPlayerItem.currentTime().seconds`, on the ITEM axis. NaN before the item resolves.
+        public let playhead: Double
+        /// `AVPlayerItem.loadedTimeRanges.count`. Zero is "nothing has been PLACED", which no buffer
+        /// depth can say: `isPlaybackBufferEmpty` is false on an item that fetched and placed
+        /// nothing (AE#418, a fetch is not a placement).
+        public let loadedRangeCount: Int
+        /// `AVPlayerItem.status.rawValue`: 0 unknown, 1 readyToPlay, 2 failed.
+        public let status: Int
+    }
+
+    /// The reading above, or nil when no native item is mounted (software path, pre-load, torn down).
+    public func nativeItemReading() async -> NativeItemReading? {
+        guard let avPlayer = currentAVPlayer, let item = avPlayer.currentItem else { return nil }
+        return await AVFoundationOffMain.read(item, on: NativeAVPlayerHost.offMainReadQueue) { item in
+            NativeItemReading(playhead: item.currentTime().seconds,
+                              loadedRangeCount: item.loadedTimeRanges.count,
+                              status: item.status.rawValue)
+        }
+    }
+
     /// AE#418 round 3: check a just-published VOD axis against AVPlayer's own account of the placement
     /// it describes, and let the session correct it when the base it composed onto was never carried.
     ///
@@ -488,10 +520,16 @@ extension AetherEngine {
         softwareHost?.ioWindowDiagnostics ?? nativeVideoSession?.demuxer?.ioWindowDiagnostics
     }
 
-    /// Resident bytes in the loopback HLS segment cache. nil when no native session is active.
+    /// Compressed resident bytes: software packet spool or native loopback segment cache.
     var cachedBytes: Int64? {
+        if let bytes = softwareHost?.cachedVODBytes { return bytes }
         guard let bytes = nativeVideoSession?.segmentCacheTotalBytes else { return nil }
         return Int64(bytes)
+    }
+
+    /// Short metadata lock only; never reads the packet store from the main actor.
+    var softwarePacketCacheSnapshot: SoftwarePacketReadAhead.Snapshot? {
+        softwareHost?.vodPacketCacheSnapshot
     }
 
     /// Freshly stat-ed on-disk footprint of the segment cache. nil when no native session is active. Used by `aetherctl live --report-cache-bytes`.

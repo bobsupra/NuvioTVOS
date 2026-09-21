@@ -395,16 +395,21 @@ final class HLSLocalServer: @unchecked Sendable {
     private var mediaPlaylistBuildCount = 0  // periodic re-log of live playlist head/tail
 
     private let stateLock = NSLock()  // guards all mutable fields; never held across blocking syscalls
+    /// Active in-flight segment requests by index -> fd, to detect and supersede duplicate requests.
+    private var inFlightSegments: [Int: Int32] = [:]
+    /// File descriptors superseded by a newer request for the same segment index.
+    private var supersededFds: Set<Int32> = []
 
-    private let acceptQueue = DispatchQueue(
-        label: "com.aetherengine.hls.accept",
-        qos: .userInitiated
-    )
-    private let workQueue = DispatchQueue(
-        label: "com.aetherengine.hls.work",
-        qos: .userInitiated,
-        attributes: .concurrent
-    )
+    /// The accept loop and every connection handler run on threads this server owns, not on
+    /// dispatch queues. Both block by design: accept sits in a syscall for the server's whole life,
+    /// and a handler blocks in `UpstreamPump` while the origin feeds it. A queue hands that work a
+    /// GLOBAL POOL worker, and the pool hands out a worker only once one is free, so a process
+    /// whose pool workers are all in a blocking wait leaves a connection unserved for as long as
+    /// that lasts: the client then reads a dead server. Measured with 192 pool workers blocked, a
+    /// `DispatchQueue.global().async` block had not started after 35 s while a detached thread ran
+    /// in 3 ms. Same reason the pump owns its thread since AE#286.
+    private static let maxConcurrentConnections = 32
+    private var liveConnectionThreads = 0
 
     // MARK: - Init
 
@@ -508,9 +513,10 @@ final class HLSLocalServer: @unchecked Sendable {
         EngineLog.emit("[HLSLocalServer] Listening on port \(assignedPort)",
                        category: .hlsServer)
 
-        acceptQueue.async { [weak self] in
-            self?.acceptLoop()
-        }
+        let accepter = Thread { [weak self] in self?.acceptLoop() }
+        accepter.name = "com.aetherengine.hls.accept"
+        accepter.qualityOfService = .userInitiated
+        accepter.start()
     }
 
     func stop() {
@@ -585,15 +591,39 @@ final class HLSLocalServer: @unchecked Sendable {
                            socklen_t(MemoryLayout<timeval>.size))
 
             stateLock.lock()
-            clientFds.insert(clientFd)
+            // A thread per connection has no ceiling of its own, where the pool's 64 workers were
+            // one. AVPlayer keeps a handful open, so anything near this number is a client that
+            // has stopped making sense and gets the socket closed rather than a thread.
+            let atCapacity = liveConnectionThreads >= Self.maxConcurrentConnections
+            if !atCapacity {
+                liveConnectionThreads += 1
+                clientFds.insert(clientFd)
+            }
             stateLock.unlock()
+
+            if atCapacity {
+                EngineLog.emit(
+                    "[HLSLocalServer] refusing fd=\(clientFd): "
+                    + "\(Self.maxConcurrentConnections) connections already open",
+                    category: .hlsServer)
+                close(clientFd)
+                continue
+            }
 
             EngineLog.emit("[HLSLocalServer] conn opened fd=\(clientFd)",
                            category: .hlsServer, level: .verbose)
 
-            workQueue.async { [weak self] in
+            let worker = Thread { [weak self] in
+                defer {
+                    self?.stateLock.lock()
+                    self?.liveConnectionThreads -= 1
+                    self?.stateLock.unlock()
+                }
                 self?.handleConnection(clientFd)
             }
+            worker.name = "com.aetherengine.hls.conn.\(clientFd)"
+            worker.qualityOfService = .userInitiated
+            worker.start()
         }
     }
 
@@ -673,6 +703,26 @@ final class HLSLocalServer: @unchecked Sendable {
             }
             return nil
         }
+    }
+
+    /// Non-blocking check whether the peer connection is still alive and has not sent EOF / error.
+    static func isSocketConnected(fd: Int32) -> Bool {
+        var pfd = pollfd(fd: fd, events: Int16(POLLIN | POLLHUP | POLLERR), revents: 0)
+        let ret = poll(&pfd, 1, 0)
+        if ret < 0 { return false }
+        if ret > 0 {
+            if (pfd.revents & Int16(POLLHUP | POLLERR)) != 0 {
+                return false
+            }
+            if (pfd.revents & Int16(POLLIN)) != 0 {
+                var byte: UInt8 = 0
+                let n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+                if n == 0 {
+                    return false
+                }
+            }
+        }
+        return true
     }
 
     private func processRequest(_ request: Data, on fd: Int32) -> Bool {
@@ -921,6 +971,25 @@ final class HLSLocalServer: @unchecked Sendable {
                 stateLock.lock(); servedMediaBytes = true; stateLock.unlock()
                 let indexStr = normalizedPath.dropFirst(4).dropLast(4)
                 if let index = Int(indexStr), index >= 0 {
+                    stateLock.lock()
+                    let previousFd = inFlightSegments[index]
+                    if let previousFd, previousFd != fd {
+                        supersededFds.insert(previousFd)
+                        EngineLog.emit("[HLSLocalServer] seg\(index) requested on fd=\(fd) supersedes earlier request on fd=\(previousFd)",
+                                       category: .hlsServer)
+                    }
+                    inFlightSegments[index] = fd
+                    stateLock.unlock()
+
+                    defer {
+                        stateLock.lock()
+                        if inFlightSegments[index] == fd {
+                            inFlightSegments.removeValue(forKey: index)
+                        }
+                        supersededFds.remove(fd)
+                        stateLock.unlock()
+                    }
+
                     // AE#418 round 7: every exit from this branch says what became of the request, so
                     // a placement composed from it can tell "not delivered yet" from "never arriving".
                     func delivered(_ ok: Bool) -> Bool {
@@ -952,7 +1021,17 @@ final class HLSLocalServer: @unchecked Sendable {
                     // strikes fail the item (failedToPlayToEndTime, terminal from the couch).
                     let early = EarlyHeaderState()
                     let data = provider?.mediaSegment(at: index, onSlow: { [weak self] in
-                        guard let self, early.markSentOnce() else { return }
+                        guard let self else { return }
+                        self.stateLock.lock()
+                        let isSuperseded = self.supersededFds.contains(fd)
+                        self.stateLock.unlock()
+                        guard !isSuperseded, Self.isSocketConnected(fd: fd) else {
+                            EngineLog.emit(
+                                "[HLSLocalServer] seg\(index): skipping early header on superseded/closed fd=\(fd)",
+                                category: .hlsServer, level: .verbose)
+                            return
+                        }
+                        guard early.markSentOnce() else { return }
                         EngineLog.emit(
                             "[HLSLocalServer] seg\(index): slow serve, sending early chunked header",
                             category: .hlsServer)
@@ -960,6 +1039,16 @@ final class HLSLocalServer: @unchecked Sendable {
                                           data: Self.chunkedResponseHeader(contentType: "video/mp4"),
                                           path: "\(normalizedPath) [early header]")
                     })
+
+                    stateLock.lock()
+                    let isSuperseded = supersededFds.contains(fd)
+                    stateLock.unlock()
+                    if isSuperseded || !Self.isSocketConnected(fd: fd) {
+                        EngineLog.emit(
+                            "[HLSLocalServer] seg\(index): fd=\(fd) superseded or disconnected, discarding serve cleanly",
+                            category: .hlsServer, level: .verbose)
+                        return false
+                    }
                     if early.wasSent {
                         guard let data, !data.isEmpty else {
                             // Headers are committed; abort so AVPlayer sees a truncated transfer
@@ -1235,8 +1324,13 @@ final class HLSLocalServer: @unchecked Sendable {
             if result < 0 {
                 let err = errno
                 if err == EINTR { continue }
-                EngineLog.emit("[HLSLocalServer] send failed for \(path): errno=\(err)",
-                               category: .hlsServer)
+                if err == EPIPE || err == ECONNRESET {
+                    EngineLog.emit("[HLSLocalServer] client disconnected (\(path): errno=\(err))",
+                                   category: .hlsServer, level: .verbose)
+                } else {
+                    EngineLog.emit("[HLSLocalServer] send failed for \(path): errno=\(err)",
+                                   category: .hlsServer)
+                }
                 return false
             }
             if result == 0 {
@@ -1299,8 +1393,13 @@ final class HLSLocalServer: @unchecked Sendable {
                 if n < 0 {
                     let err = errno
                     if err == EINTR { continue }
-                    EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent + written)",
-                                   category: .hlsServer)
+                    if err == EPIPE || err == ECONNRESET {
+                        EngineLog.emit("[HLSLocalServer] client disconnected (\(path): errno=\(err) sent=\(totalSent + written))",
+                                       category: .hlsServer, level: .verbose)
+                    } else {
+                        EngineLog.emit("[HLSLocalServer] send failed \(path): errno=\(err) sent=\(totalSent + written)",
+                                       category: .hlsServer)
+                    }
                     return false
                 }
                 if n == 0 {

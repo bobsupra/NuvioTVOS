@@ -10,7 +10,7 @@ If the problem is in a host app's UI rather than the engine, report it on that a
 
 ## Building and testing
 
-AetherEngine is a Swift package. It builds for iOS 16+, tvOS 17+, macOS 14+, and visionOS 1+.
+AetherEngine is a Swift package. It builds for iOS 18+, tvOS 18+, macOS 15+, and visionOS 1+.
 
 ```bash
 swift build
@@ -20,6 +20,29 @@ swift test
 For iterative work, open `Package.swift` in Xcode 26+ and pick the `AetherEngine` scheme. `FFmpegBuild` is a transitive dependency that supplies the bundled FFmpeg / dav1d binaries; you do not build it yourself.
 
 The `aetherctl` command-line target is macOS-only (it uses `Foundation.Process`) and is excluded from the iOS / tvOS library build.
+
+## Writing tests
+
+The suite is large (3000 tests over 460 files) and cheap (the whole run is about a minute), so the
+question is never whether a behaviour deserves a test. Two conventions keep it from growing in the
+one direction that costs something, which is width.
+
+**A test file is named after the BEHAVIOUR, not after the issue that revealed it.** The issue number
+belongs in the test's name and in the comment that explains what it cost, where it is read by
+whoever hits the same thing again. Files named `Issue<N>…Tests.swift` made growth purely additive:
+a new report got a new file, because nobody could see from the outside whether the behaviour was
+already covered. That is how seek ended up spread over sixteen files, live over thirty-two, and how
+two pairs of files ended up testing the same concept under two issue numbers. Existing files are
+not worth renaming on their own; put a new test where the topic already lives.
+
+**Wait with `waitFor` from `Support/TestWaiting.swift`, never with a sleep or a private copy.** It
+carries two rules that cost three rounds of red CI to learn. A step that HAS to happen before the
+test can measure anything gets no deadline of its own, because any finite bound can be overrun by
+an oversubscribed machine, and the bound then decides what the test reports; the hang catcher is a
+`.timeLimit` trait, which reports a hang as one, with a name. And anything a test parks on its own
+gets a real thread (`Thread.detachNewThread`), never `DispatchQueue.global().async`: measured with
+192 pool workers blocked, which is what a full parallel run of this suite produces, the queue had
+not started the block after 35 seconds while a detached thread ran in 3 milliseconds.
 
 ## Where playback bugs get fixed
 

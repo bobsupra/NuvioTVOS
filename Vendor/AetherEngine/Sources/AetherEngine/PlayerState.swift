@@ -262,6 +262,43 @@ public struct DisplayCapabilities: Sendable, Equatable {
             supportsHLG: hdrEligible)
     }
 
+    /// AE#459: what a platform that HAS a per-mode table may honestly claim, now that the table has been
+    /// measured wrong about one of its entries.
+    ///
+    /// `AVPlayer.availableHDRModes` is that table on tvOS and iOS, and it is deprecated as of the 26 SDKs
+    /// in favour of `eligibleForHDRPlayback`, a single boolean: Apple has already collapsed the per-mode
+    /// question into "can this display do HDR at all". Measured against a display that answers for itself,
+    /// the table under-reports HLG over HDMI. A Samsung S93F connected straight to an Apple TV advertises
+    /// Hybrid Log-Gamma in its EDID and plays HLG in the TV's own player, while the table reports `.hlg`
+    /// absent; a second Apple TV on a different Samsung reports the same; an iPhone 17 Pro running this
+    /// engine on its built-in panel reports it present. So the absence is about the platform's HDMI path,
+    /// not about the panel.
+    ///
+    /// Eligibility is therefore the floor for the two modes that need nothing but EDR. HDR10 and HLG are a
+    /// transfer function, and a display AVFoundation calls eligible for HDR playback presents both, which
+    /// is the identical rule `onDemandEDRDisplay` already applies where no table exists at all. The table
+    /// can still ADD (a mode it names is a mode the display has), it can no longer subtract.
+    ///
+    /// Dolby Vision stays on the table alone, for the same reason it is unclaimed on macOS and for one
+    /// more: here the table is measured RIGHT about it in both directions, `false` on a Samsung with no
+    /// Dolby Vision and `true` on an iPhone 17 Pro the same day. Eligibility proves EDR, never that
+    /// AVFoundation will accept a DV variant, and a wrong claim there surfaces as -11868 with nothing
+    /// playing. That claim belongs to a host (`LoadOptions.panelPresentsDolbyVision`).
+    ///
+    /// What the HLG term actually reaches is narrow, and worth knowing before reading a bug into it:
+    /// `effectiveVideoFormat` opens with a guard on Dolby Vision, so `supportsHLG` is consulted only for a
+    /// DV source with an HLG base layer, meaning Profile 8.4. A plain HLG title was never clamped by any
+    /// of this.
+    static func observedPerModeTable(
+        hdrEligible: Bool, hdr10: Bool, hlg: Bool, dolbyVision: Bool
+    ) -> DisplayCapabilities {
+        DisplayCapabilities(
+            supportsHDR: hdrEligible,
+            supportsDolbyVision: dolbyVision,
+            supportsHDR10: hdr10 || hdrEligible,
+            supportsHLG: hlg || hdrEligible)
+    }
+
     /// AE#493 / AE#459: the capability a host asserts, because this one cannot be observed.
     ///
     /// `AVPlayer.availableHDRModes` is `API_UNAVAILABLE(macos)`, so a Mac has no per-mode table to read,
@@ -280,6 +317,19 @@ public struct DisplayCapabilities: Sendable, Equatable {
         return DisplayCapabilities(
             supportsHDR: true,
             supportsDolbyVision: true,
+            supportsHDR10: supportsHDR10,
+            supportsHLG: supportsHLG)
+    }
+
+    /// The same display with Dolby Vision left unclaimed: what `LoadOptions.dolbyVisionHandling =
+    /// .baseLayerOnly` asks the format clamp to read, so a Dolby Vision source resolves to the HDR10 /
+    /// HLG its base layer is and the criteria request follows. HDR itself is untouched: the panel still
+    /// presents HDR, it is only not asked for Dolby Vision.
+    func withoutDolbyVision() -> DisplayCapabilities {
+        guard supportsDolbyVision else { return self }
+        return DisplayCapabilities(
+            supportsHDR: supportsHDR,
+            supportsDolbyVision: false,
             supportsHDR10: supportsHDR10,
             supportsHLG: supportsHLG)
     }
@@ -335,6 +385,21 @@ public enum DecodePath: String, Sendable, Equatable, CaseIterable {
     case software
 }
 
+/// Which layer of a Dolby Vision source a session presents. See `LoadOptions.dolbyVisionHandling`.
+public enum DolbyVisionHandling: String, Sendable, Equatable, CaseIterable {
+    /// Dolby Vision wherever the profile and the display allow it. The default.
+    case automatic
+    /// Present the HDR10 / HLG base layer and leave the Dolby Vision out of the container: `hvc1` /
+    /// `av01` sample entry, `dvcC` stripped, no `SUPPLEMENTAL-CODECS`, HDR10 / HLG display criteria.
+    /// The RPU NAL units stay in the bitstream and are ignored, the way a Profile 7 already plays on a
+    /// display without Dolby Vision. Only for a source whose base layer is a YCbCr HDR signal: HEVC
+    /// Profile 7 / 8.1 / 8.4, AV1 Profile 10.1 / 10.4, and a Profile 5 record over a VUI that declares
+    /// a BT.2020 YCbCr PQ or HLG base (a mislabelled Profile 7 / 8 remux, the class this exists for).
+    /// A Profile 5 or AV1 Profile 10.0 whose VUI says nothing carries IPT-PQ-c2 and has no base layer to
+    /// present, so it keeps its Dolby Vision route and the engine says so in the log.
+    case baseLayerOnly
+}
+
 public struct LoadOptions: Sendable, Equatable {
     /// Diagnostic lever: omit BT.2020 / transfer / YCbCr matrix from AVDisplayCriteria so AVPlayer re-reads color from the bitstream. Default off.
     public var omitCriteriaColorExtensions: Bool
@@ -362,6 +427,26 @@ public struct LoadOptions: Sendable, Equatable {
     /// DrHurt against a Samsung HDR10 panel.
     public var forceDolbyVisionOnNonDVDisplay: Bool
 
+    /// A `DolbyVisionHandling`. Default `.automatic`. `.baseLayerOnly` presents the HDR10 / HLG base layer
+    /// of a Dolby Vision source and leaves the Dolby Vision out of the container, on every display: the
+    /// route a host offers as "Dolby Vision: off (HDR10)".
+    ///
+    /// The case it exists for is a source whose Dolby Vision is wrong and whose base layer is right. A
+    /// remux that carries a Profile 7 RPU under a container record claiming Profile 5 is the reported
+    /// shape: the record says IPT-PQ-c2, the VUI says BT.2020 YCbCr PQ, and a player that believes the
+    /// record decodes YCbCr as IPT (the green / violet cast of AE#4 and AE#176). No player can tell which
+    /// half is lying from the container alone, so the choice is the host's, and a host that offers it
+    /// offers it per title.
+    ///
+    /// Applies to the profiles whose base layer is a YCbCr HDR signal (HEVC 7 / 8.1 / 8.4, AV1 10.1 /
+    /// 10.4) and to a Profile 5 record whose VUI declares one; a Profile 5 or AV1 10.0 whose VUI says
+    /// nothing has no base layer to present and keeps its route. A tuning field: correctable on the
+    /// playing session through `reloadAtCurrentPosition(applying:)`. Takes precedence over
+    /// `forceDolbyVisionOnNonDVDisplay`, which asks for the opposite. The software path decodes the base
+    /// layer alone in any case, so there it only lifts the Profile 5 refusal (#176) for a record the VUI
+    /// contradicts.
+    public var dolbyVisionHandling: DolbyVisionHandling
+
     /// Mirror of `AVDisplayManager.isDisplayCriteriaMatchingEnabled`. Default `true`. When `false`, engine routes HDR sources through the media playlist (auto-tonemap path) because AVKit cannot switch the panel.
     public var matchContentEnabled: Bool
 
@@ -377,24 +462,52 @@ public struct LoadOptions: Sendable, Equatable {
     /// in HDR (a user setting, its own probe) says so here.
     public var panelIsInHDRMode: Bool
 
+    /// Serve the HDR master to an HDR-eligible display whose panel state is unproven, and let AVFoundation's
+    /// acceptance or refusal be the readout. Default `true`, VOD only.
+    ///
+    /// AE#459: `UIScreen.currentEDRHeadroom` is the only tvOS property that ever reported the panel's mode,
+    /// and it is measurably unreliable. On one Apple TV 4K 3rd gen on tvOS 26.6 it read a flat 1.00
+    /// across 46 samples of HDR content while the TV's own info display reported HDR, and later the same
+    /// day, same box, same output format, same title, it read 1.20. What moves it is not established: the
+    /// output mode was blamed and then refuted by running the comparison back the other way. The cost of a
+    /// wrong 1.00 is not the picture, which media-direct carries unchanged, but the manifest: the SUBTITLES rendition, the AUDIO rendition that
+    /// is the only place AVFoundation reads an HLS language from, and SUPPLEMENTAL-CODECS.
+    ///
+    /// Refusal costs one in-place media fallback, measured at 223 ms end to end on that box (`-11868` after
+    /// 54 ms, zero `errorLog` events, position kept, no visible black frame), and it is latched for the
+    /// process, so a genuinely SDR panel pays it once rather than per title. A panel that proves itself
+    /// through the headroom never attempts anything.
+    ///
+    /// Turn it off for a host that knows its display is SDR and would rather not spend that once. Live
+    /// never attempts regardless of this flag: a live fallback is a rejoin at the edge rather than a
+    /// restored position, and that cost is unmeasured.
+    public var attemptsHDRMasterOnUnprovenPanel: Bool
+
     /// Host assertion that this display presents Dolby Vision. Default `false`. Not a capability the engine
     /// observed, a claim the host makes about hardware it knows.
     ///
     /// AE#493: `AVPlayer.availableHDRModes` is `API_UNAVAILABLE(macos)`, so a Mac has no per-mode capability
     /// table at all, and `eligibleForHDRPlayback` answers HDR10 and HLG but cannot answer this one. Setting
-    /// it serves the source the way a DV display is served (`dvh1` sample entry, `SUPPLEMENTAL-CODECS`,
-    /// master playlist) and publishes `videoFormat = .dolbyVision`. HDR support rides along because DV is an
-    /// HDR format; HDR10 and HLG capability are not implied.
+    /// it publishes `videoFormat = .dolbyVision` and asks the tvOS display-criteria handshake for `dvh1`.
+    /// HDR support rides along because DV is an HDR format; HDR10 and HLG capability are not implied.
+    ///
+    /// It no longer decides the PACKAGING of a Profile 5, 8.1 or 8.4 source. 6.72.0 gave the non-DV branch
+    /// its `dvcC` back and 6.73.0 its `SUPPLEMENTAL-CODECS`, so those three grades serve byte-identical
+    /// manifests and segments either way (measured on macOS against the matched Dolby grades: master,
+    /// media playlist, `init.mp4` and `seg0.mp4` md5-identical with and without the claim). Profile 7,
+    /// whose RPU is converted to 8.1 per packet, and AV1 Dolby Vision, whose record is read only on a
+    /// display that takes it, are still gated on it.
     ///
     /// A wrong claim is cheap on the class of failure the engine classifies, and that class is not the whole
     /// space. AVPlayer refusing the master with -11868 / -11848 fails the ITEM, and the engine falls back to
     /// the media playlist once, in place, at the same position, where AVPlayer tone-maps the base layer;
     /// correctable mid-session through `reloadAtCurrentPosition(applying:)`. Two measured limits on that:
     /// on macOS the wrong claim was not refused at all (a DV master on a Mac with no DV display plays,
-    /// macOS 26.5.2), and on tvOS an asserted Profile 8.1 reaches the DV packaging (`dvvC` in the sample
-    /// entry plus `SUPPLEMENTAL-CODECS`), which on an HDR10-only panel was measured to reach `readyToPlay`,
-    /// play for a second or two and then stall with -15628 in the item's error log (2026-05-26, AE#4). A
-    /// stall is not an item failure, so the fallback above does not fire for it.
+    /// macOS 26.5.2), and a stall is not an item failure, so the fallback above does not fire for the
+    /// -15628 an HDR10-only panel showed on the DV packaging in May 2026 (AE#4). That stall is no longer
+    /// the claim's to own: since 6.72.0 / 6.73.0 the same packaging reaches such a panel with or without
+    /// it, and it did not reproduce on tvOS 26.6. What the claim can still move on the route is HDR
+    /// readiness, since `supportsHDR` rides along, and that is the -11848 the fallback does catch.
     ///
     /// Asserting also turns `forceDolbyVisionOnNonDVDisplay` off, since that one is gated on the display
     /// having no DV. On tvOS, DV composition on a panel without Dolby Vision is what that flag is for, and
@@ -569,6 +682,38 @@ public struct LoadOptions: Sendable, Equatable {
     /// engines on one origin are bounded by this value and by what the origin refuses, nothing else.
     public var maxConcurrentSourceRequests: Int? = nil
 
+    /// Ask the source ONCE and pull it, instead of ending the connection at the reader's window
+    /// high water and asking again every 8 to 16 MB of drain (#377).
+    ///
+    /// Set it when the origin punishes repeated requests rather than concurrency. Some CDNs refuse
+    /// new requests for minutes at a stretch while serving an already open connection at full
+    /// rate; against one of those, a reader that asks per drain cycle will ask inside a refusal
+    /// window on any long file, however large its ranges are (measured at the reporting origin:
+    /// 32 MB ranges raised to 256 MB, eight times fewer requests, the refusals unchanged). Holding
+    /// the connection is the only lever that removes the ask, which is why this exists as well as
+    /// `maxConcurrentSourceRequests`: that one bounds how many requests are in flight, this one
+    /// stops there being a second request at all.
+    ///
+    /// What it costs, and why it is opt in rather than the default:
+    ///
+    /// - **HTTP/1.1 only.** The framing is the engine's own over a demand-driven stream task, with
+    ///   no ALPN negotiation, so an origin that serves only HTTP/2 is out of scope for it.
+    /// - **The system proxy configuration is not in this read path.** A stream task connects to a
+    ///   host and port; `URLRequest` proxy handling does not apply.
+    /// - TLS is the OS's, through the same host trust decision as every other engine session, but
+    ///   it has not been exercised against a self-signed origin.
+    /// - A viewer who pauses ends the connection after five seconds, and resuming costs one
+    ///   request at the frontier. A held flow that nobody reads is the process-wide Network
+    ///   .framework starvation of #310, and a pause is where its worst episode came from.
+    ///
+    /// Applies to the playback reader. The subtitle and enrichment side readers keep the default
+    /// transport: they park deliberately for minutes, which is the one shape a held connection
+    /// must not take.
+    ///
+    /// Names the session rather than tuning it: the transport is chosen when the source is opened,
+    /// so a reload cannot change it. Default false, which is every reader shipped so far.
+    public var heldSourceConnection: Bool = false
+
     /// Trusted media duration in seconds, overriding the container/estimate-derived value (same
     /// trust family as the disc MPLS/IFO override, AE#105). Required alongside
     /// `sequentialOrigin` for VOD sources: with the tail read gone the demuxer resolves no
@@ -703,8 +848,10 @@ public struct LoadOptions: Sendable, Equatable {
         httpHeaders: [String: String] = [:],
         keepDvh1TagWithoutDV: Bool = false,
         forceDolbyVisionOnNonDVDisplay: Bool = false,
+        dolbyVisionHandling: DolbyVisionHandling = .automatic,
         matchContentEnabled: Bool = true,
         panelIsInHDRMode: Bool = false,
+        attemptsHDRMasterOnUnprovenPanel: Bool = true,
         panelPresentsDolbyVision: Bool = false,
         audioBridgeMode: AudioBridgeMode = .surroundCompat,
         isLive: Bool = false,
@@ -723,6 +870,7 @@ public struct LoadOptions: Sendable, Equatable {
         nativeSubtitlePreferredLanguages: [String] = [],
         sequentialOrigin: Bool = false,
         maxConcurrentSourceRequests: Int? = nil,
+        heldSourceConnection: Bool = false,
         declaredDurationSeconds: Double? = nil,
         probesize: Int64? = nil,
         maxAnalyzeDuration: Int64? = nil,
@@ -742,8 +890,10 @@ public struct LoadOptions: Sendable, Equatable {
         self.httpHeaders = httpHeaders
         self.keepDvh1TagWithoutDV = keepDvh1TagWithoutDV
         self.forceDolbyVisionOnNonDVDisplay = forceDolbyVisionOnNonDVDisplay
+        self.dolbyVisionHandling = dolbyVisionHandling
         self.matchContentEnabled = matchContentEnabled
         self.panelIsInHDRMode = panelIsInHDRMode
+        self.attemptsHDRMasterOnUnprovenPanel = attemptsHDRMasterOnUnprovenPanel
         self.panelPresentsDolbyVision = panelPresentsDolbyVision
         self.audioBridgeMode = audioBridgeMode
         self.isLive = isLive
@@ -762,6 +912,7 @@ public struct LoadOptions: Sendable, Equatable {
         self.nativeSubtitlePreferredLanguages = nativeSubtitlePreferredLanguages
         self.sequentialOrigin = sequentialOrigin
         self.maxConcurrentSourceRequests = maxConcurrentSourceRequests
+        self.heldSourceConnection = heldSourceConnection
         self.declaredDurationSeconds = declaredDurationSeconds
         self.probesize = probesize
         self.maxAnalyzeDuration = maxAnalyzeDuration
@@ -785,6 +936,13 @@ public enum VideoFormat: Sendable, Equatable {
     case hdr10Plus
     case dolbyVision
     case hlg
+}
+
+/// A Dolby Vision profile rewrite the engine applies to the served stream (`AetherEngine.dolbyVisionConversion`).
+public enum DolbyVisionConversion: Sendable, Equatable {
+    /// Dual-layer Profile 7 rewritten per packet to single-layer Profile 8.1 for a display presenting Dolby
+    /// Vision. The enhancement layer is discarded: a MEL carries next to nothing, a FEL loses its refinement.
+    case profile7ToProfile81
 }
 
 /// One-shot container + stream metadata from `AetherEngine.probe(url:options:)`. No HLS server, no decoders.
@@ -933,8 +1091,8 @@ public struct TrackInfo: Identifiable, Sendable, Equatable {
     /// True for host-registered external subtitle tracks (AetherEngine#88); their `id` is synthetic
     /// (`AetherEngine.externalSubtitleTrackIDBase` + ordinal), not an AVStream index.
     public let isExternal: Bool
-    /// True when the playback backend, rather than `subtitleCues`, renders this track.
-    /// Hosts can avoid presenting overlay controls that cannot affect it.
+    /// True when the playback backend, rather than `subtitleCues`, renders this
+    /// track. Hosts can avoid presenting overlay controls that cannot affect it.
     public let isNativelyRenderedSubtitle: Bool
 
     public init(id: Int, name: String, codec: String, language: String?, channels: Int = 0, bitrate: Int64 = 0, isDefault: Bool, isForced: Bool = false, isHearingImpaired: Bool = false, isCommentary: Bool = false, isAtmos: Bool = false, assHeader: String? = nil, isExternal: Bool = false, isNativelyRenderedSubtitle: Bool = false) {

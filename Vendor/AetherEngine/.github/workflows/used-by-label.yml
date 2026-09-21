@@ -1,0 +1,43 @@
+name: Label used-by submissions
+
+# The "used-by-submission" label from the issue form only ever lands when the
+# issue is actually filed through the web form. Most submissions do not arrive
+# that way (the API, gh, mobile clients, a body pasted from elsewhere), and then
+# the label is simply absent and "Add to Used by" has nothing to key on. Recognise
+# a submission by its shape instead and label it here.
+#
+# This only ever adds "used-by-submission". "approved" stays a maintainer action,
+# and it is what actually opens a pull request.
+#
+# Note: a label added with GITHUB_TOKEN does not start another workflow run, so
+# this never triggers "Add to Used by" on its own. That is the intended order:
+# the label lands at submission time, the maintainer's later "approved" is the
+# human event that starts the run.
+
+on:
+  issues:
+    types: [opened, edited]
+
+permissions:
+  issues: write
+
+jobs:
+  label:
+    if: >
+      !contains(github.event.issue.labels.*.name, 'used-by-submission') &&
+      (
+        startsWith(github.event.issue.title, '[Used by]') ||
+        (contains(github.event.issue.body, '### App name') &&
+         contains(github.event.issue.body, '### Repository or website URL'))
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - name: Add the label
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          ISSUE: ${{ github.event.issue.number }}
+        run: |
+          set -euo pipefail
+          gh issue edit "$ISSUE" --repo "$REPO" --add-label used-by-submission
+          echo "Labelled #$ISSUE as a used-by submission." >> "$GITHUB_STEP_SUMMARY"

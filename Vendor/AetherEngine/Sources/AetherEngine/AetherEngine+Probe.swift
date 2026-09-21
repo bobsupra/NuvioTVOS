@@ -616,12 +616,7 @@ extension AetherEngine {
             return capabilities.supportsHLG ? .hlg : .sdr
         }
         // SMPTE2084 base (P5/P7/P8.1) or unspecified trc (P5 with empty VUI): AVPlayer tonemaps via dvh1 on non-DV panel.
-        // tvOS 26 can report eligibleForHDRPlayback while availableHDRModes omits HDR10. For a non-DV
-        // display, an HDR-eligible PQ DV base has only one valid downgrade target: HDR10/PQ. Treat the
-        // generic HDR eligibility as the HDR10 fallback so the criteria handshake is not downgraded to SDR.
-        let canPresentHDR10Base = capabilities.supportsHDR10
-            || (capabilities.supportsHDR && !capabilities.supportsDolbyVision)
-        return canPresentHDR10Base ? .hdr10 : .sdr
+        return capabilities.supportsHDR10 ? .hdr10 : .sdr
     }
 
     /// The format to publish as `videoFormat`: what the panel is presenting, not what the file carries
@@ -631,16 +626,58 @@ extension AetherEngine {
     /// The HDR10+ carry-over exists because the two can arrive in either order. `handleHDR10PlusDetected`
     /// upgrades a `videoFormat` that already reads `.hdr10`, and on a panel whose answer is still pending
     /// the label reads `.sdr` when the T.35 payload lands, so the upgrade is skipped and the evidence
-    /// survives in `sourceVideoFormat` alone. Republishing the bare effective format would then relabel a
+    /// survives in the session's latch alone. Republishing the bare effective format would then relabel a
     /// proven HDR10+ session "HDR10+ -> HDR10", trading one wrong arrow for a quieter one.
+    ///
+    /// The latch rather than `sourceVideoFormat == .hdr10Plus`: a Dolby Vision source can carry an HDR10+
+    /// layer too (Blu-ray Profile 7, and Profile 8.1 remuxed from one), `sourceVideoFormat` keeps saying
+    /// Dolby Vision for it, and a display without Dolby Vision presents that HDR10+ base (AE#459).
     nonisolated static func presentedVideoFormat(
         effectiveFormat: VideoFormat,
         panelPresentsHDR: Bool,
-        sourceVideoFormat: VideoFormat
+        sourceCarriesHDR10Plus: Bool
     ) -> VideoFormat {
         guard effectiveFormat != .sdr, panelPresentsHDR else { return .sdr }
-        if effectiveFormat == .hdr10, sourceVideoFormat == .hdr10Plus { return .hdr10Plus }
+        if effectiveFormat == .hdr10, sourceCarriesHDR10Plus { return .hdr10Plus }
         return effectiveFormat
+    }
+
+    /// AE#515 (from #493): the label a loopback session takes back from the item AVFoundation is playing,
+    /// where the platform has no capability table to clamp it against.
+    ///
+    /// `AVPlayer.availableHDRModes` is `API_UNAVAILABLE(macos)`, so `supportsDolbyVision` is false on
+    /// every Mac unless the host asserts it, and `effectiveVideoFormat` sends a Profile 5 PQ base to
+    /// `.hdr10`. Measured with the assertion off on a 16" XDR: Profile 5 and Profile 8.1 both strobe
+    /// against Dolby's reference content, so the RPU reaches the pixels with no claim set anywhere and
+    /// the clamp was moving nothing but the label. `NativeAVPlayerHost` already parses the served item's
+    /// sample entry, and a `dvh1` / `dvhe` entry is that session's own evidence.
+    ///
+    /// An upgrade rather than the unconditional mirror `loadRemoteHLS` wires, and each term earns its
+    /// place by a case it keeps out:
+    ///
+    /// - `perModeCapabilitiesObservable` keeps tvOS and iOS out, where the table answers and the label
+    ///   follows it. A Profile 5 master carries `dvh1` on every panel, so the mirror would relabel a
+    ///   tvOS session parked in SDR, or one on an HDR10-only panel, as Dolby Vision.
+    /// - `.hdr10` is the only clamped value taken back. `.sdr` is the clamp being right about a display
+    ///   that presents no HDR at all, and `.dolbyVision` is a session that already says so.
+    /// - the item term is what the evidence actually is. Profile 8.1 reports `hvc1` and composes anyway,
+    ///   which nothing in the stack reports, so it keeps `.hdr10`.
+    /// - the source term is the engine's own probe agreeing. A probe that did not call the source Dolby
+    ///   Vision leaves no RPU to compose, and the disagreement is a packaging fault worth seeing rather
+    ///   than a label to publish.
+    ///
+    /// `nil` means leave the published label alone.
+    nonisolated static func dolbyVisionLabelUpgrade(
+        publishedFormat: VideoFormat,
+        sourceFormat: VideoFormat,
+        itemFormat: VideoFormat,
+        perModeCapabilitiesObservable: Bool
+    ) -> VideoFormat? {
+        guard !perModeCapabilitiesObservable,
+              publishedFormat == .hdr10,
+              sourceFormat == .dolbyVision,
+              itemFormat == .dolbyVision else { return nil }
+        return .dolbyVision
     }
 
     /// AE#459: what this session takes the panel to be presenting, from the host's assertion and the
@@ -658,6 +695,89 @@ extension AetherEngine {
     /// session has nothing to compare the assertion against.
     nonisolated static func sessionPanelPresentsHDR(hostAsserts: Bool, criteriaReadout: Bool?) -> Bool {
         hostAsserts || (criteriaReadout ?? false)
+    }
+
+    /// AE#459: what the ROUTE may assume about the panel, which is deliberately more than what the LABEL
+    /// may claim.
+    ///
+    /// The label answers "what is this display presenting", and where nothing can answer it the honest
+    /// value is SDR. The route answers a different question, "will AVFoundation accept an HDR master
+    /// here", and there is exactly one component that knows: AVFoundation. Predicting its answer from
+    /// `UIScreen.currentEDRHeadroom` was never more than a proxy, and the proxy is measurably unreliable.
+    /// Measured on one Apple TV 4K 3rd gen on tvOS 26.6 against a panel whose own info display reported
+    /// HDR at the time: the property read a flat 1.00 across 46 samples of HDR content and the session
+    /// routed media-direct, and later the same day, same box, same output format, same title, it read
+    /// 1.20. The TV reporting HDR while the property read 1.00 is what rules out a silently dropped link,
+    /// so the panel was presenting HDR and the property was wrong about it. What moves it is NOT
+    /// established: the "4K HDR10+" output mode was blamed and then refuted by running the comparison back
+    /// the other way. The only pattern the data supports is a correlation, that every correct reading
+    /// follows a recent output-format change while every wrong one comes from a box parked in one mode.
+    ///
+    /// So on an unproven panel the engine serves the master and lets acceptance or refusal be the readout
+    /// the display will not give. What refusal costs was measured before this was built rather than
+    /// assumed: output locked to 4K SDR with Match Content off, master forced, a PQ title. AVPlayer failed
+    /// the item with `-11868` after 54 ms with zero `errorLog` events, `MasterFallbackDecision` swapped the
+    /// media playlist onto the live `AVPlayer` at the same position, and the item was playing 223 ms after
+    /// the master was served, with no visible black frame.
+    ///
+    /// Three terms, each earning its place. A panel that PROVED itself short-circuits, so a box on plain
+    /// "4K HDR" never attempts anything and pays nothing. Eligibility is required, so a display that
+    /// cannot do HDR at all is never offered a master it has no business receiving. And the refusal is
+    /// latched for the process, so the 223 ms is paid at most once by a genuinely SDR panel rather than on
+    /// every title.
+    ///
+    /// What this deliberately does NOT do is move the label. Acceptance is better evidence than the
+    /// headroom ever was, but publishing HDR because a master was SERVED would claim exactly what this
+    /// issue was opened about, one frame earlier.
+    nonisolated static func sessionRoutesAsHDRPanel(
+        panelPresentsHDR: Bool,
+        attemptWhenUnproven: Bool,
+        displayEligibleForHDR: Bool,
+        panelRefusedHDRMaster: Bool
+    ) -> Bool {
+        if panelPresentsHDR { return true }
+        return attemptWhenUnproven && displayEligibleForHDR && !panelRefusedHDRMaster
+    }
+
+    /// AE#541: the HDR route of an in-place rebuild, composed from the same two decisions the load makes.
+    ///
+    /// The readout and the display's eligibility are the load's, because the rebuild runs no handshake to
+    /// take them again. The host's assertion and the attempt lever are the session's current options, so a
+    /// `reloadAtCurrentPosition(applying:)` correction still moves the route. The refusal latch is read
+    /// now rather than carried: a master the panel refused after the load must not be served again.
+    nonisolated static func reloadRoutesAsHDRPanel(
+        hostAsserts: Bool,
+        criteriaReadoutAtLoad: Bool?,
+        attemptWhenUnproven: Bool,
+        isLive: Bool,
+        displayEligibleForHDR: Bool,
+        panelRefusedHDRMaster: Bool
+    ) -> Bool {
+        sessionRoutesAsHDRPanel(
+            panelPresentsHDR: sessionPanelPresentsHDR(
+                hostAsserts: hostAsserts, criteriaReadout: criteriaReadoutAtLoad),
+            attemptWhenUnproven: attemptWhenUnproven && !isLive,
+            displayEligibleForHDR: displayEligibleForHDR,
+            panelRefusedHDRMaster: panelRefusedHDRMaster)
+    }
+
+    /// AE#535: the display table an in-place rebuild routes from, on the same principle as the route
+    /// above: the load's answer, because the rebuild is not a fresh look at the display.
+    ///
+    /// `displayCapabilities` answers at call time, and on tvOS a backgrounded process is answered for its
+    /// own state rather than for the display: every per-mode term reads false, the user's Match-Content
+    /// preference reads `off` beside it, and both come back when the app does. A route-death rebuild lands
+    /// inside that window (measured at 0.7 s and 2.5 s after the transition), so a table read there would
+    /// clamp an HDR source to SDR and withhold its master on a panel nothing had changed. The host's
+    /// Dolby Vision assertion is applied to it here, as at the load, because it is the session's claim and
+    /// not an observation. Reading now is the fallback for a rebuild with no load behind it, which the
+    /// engine's own paths cannot produce.
+    nonisolated static func reloadDisplayCapabilities(
+        observedAtLoad: DisplayCapabilities?,
+        hostAssertsDolbyVision: Bool,
+        readNow: () -> DisplayCapabilities
+    ) -> DisplayCapabilities {
+        (observedAtLoad ?? readNow()).assertingDolbyVision(hostAssertsDolbyVision)
     }
 
     private nonisolated static func streamHasDV(stream: UnsafeMutablePointer<AVStream>) -> Bool {

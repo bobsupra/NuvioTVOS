@@ -1,8 +1,8 @@
 name: Add to Used by
 
-# When a maintainer adds the "approved" label to a "used-by-submission" issue,
-# parse the issue form, insert the entry into the README's Used by list (between
-# the <!-- used-by:start --> / <!-- used-by:end --> markers), and open a PR.
+# When a "used-by-submission" issue carries the "approved" label, parse the issue
+# form, insert the entry into the README's Used by list (between the
+# <!-- used-by:start --> / <!-- used-by:end --> markers), and open a PR.
 # Merging the PR is the final approval gate; this workflow never pushes to main.
 
 on:
@@ -15,19 +15,57 @@ permissions:
 
 jobs:
   add-entry:
+    # Either label can arrive last. Submissions that reach the tracker outside the
+    # issue form (mobile clients, the API) carry no template label, so the
+    # maintainer adds it after "approved" is already on; keying the run on
+    # "approved" alone lost those runs with no way to retry but to re-apply the label.
     if: >
-      github.event.label.name == 'approved' &&
+      (github.event.label.name == 'approved' || github.event.label.name == 'used-by-submission') &&
+      contains(github.event.issue.labels.*.name, 'approved') &&
       contains(github.event.issue.labels.*.name, 'used-by-submission')
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Normalise the issue body
+        id: normalise
+        env:
+          # Body content stays in env, it is never interpolated into the script.
+          ISSUE_BODY: ${{ github.event.issue.body }}
+        run: |
+          set -euo pipefail
+
+          # The parser splits a section into key and value on the blank line that
+          # the web form writes after each "### " heading. A body that arrives
+          # without it (mobile clients, hand-written, copied between issues)
+          # collapses the whole section into the key, leaves the value undefined,
+          # and JSON.stringify drops undefined, so the parser returns {} and every
+          # field reads as missing. Re-inserting the blank line makes both shapes
+          # parse; a doubled blank line is harmless, the parser filters empties.
+          # Written outside the checkout so it cannot end up in the commit.
+          printf '%s\n' "$ISSUE_BODY" | awk '
+            BEGIN { fence = 0 }
+            /^```/ { fence = !fence; print; next }
+            !fence && /^### / { print; print ""; next }
+            { print }
+          ' > "$RUNNER_TEMP/body.md"
+
+          # Random delimiter: the body is untrusted and must not be able to close
+          # its own heredoc and write further outputs.
+          delim="BODY_EOF_$(openssl rand -hex 16)"
+          {
+            echo "body<<$delim"
+            cat "$RUNNER_TEMP/body.md"
+            echo "$delim"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Parse issue form
         id: parse
         uses: stefanbuck/github-issue-parser@v3
         with:
           template-path: .github/ISSUE_TEMPLATE/used-by-submission.yml
+          issue-body: ${{ steps.normalise.outputs.body }}
 
       - name: Build entry and insert into README
         id: build
@@ -41,10 +79,26 @@ jobs:
           url=$(printf '%s' "$ISSUE_JSON" | jq -r '.url // empty' | head -n1)
           desc=$(printf '%s' "$ISSUE_JSON" | jq -r '.description // empty' | head -n1)
 
+          # A submission that cannot be read is a failure, not a no-op. It used to
+          # exit 0, which left a green run, no PR and no hint that anything broke.
           if [ -z "$name" ] || [ -z "$url" ] || [ -z "$desc" ]; then
-            echo "Missing a required field (name/url/description). Skipping."
-            echo "skip=true" >> "$GITHUB_OUTPUT"
-            exit 0
+            {
+              echo "### Could not read the submission"
+              echo
+              echo "Missing:"
+              if [ -z "$name" ]; then echo "- app name"; fi
+              if [ -z "$url" ];  then echo "- url"; fi
+              if [ -z "$desc" ]; then echo "- description"; fi
+              echo
+              echo "Parsed form:"
+              echo '```json'
+              printf '%s\n' "$ISSUE_JSON"
+              echo '```'
+              echo
+              echo "Fix the issue body to match the form, then re-apply the \`approved\` label."
+            } >> "$GITHUB_STEP_SUMMARY"
+            echo "::error::Could not read name/url/description from the submission."
+            exit 1
           fi
 
           # Normalise: trim whitespace, collapse to one trailing period.
@@ -52,10 +106,18 @@ jobs:
           url=$(printf '%s'  "$url"  | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')
           desc=$(printf '%s' "$desc" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/\.*$//')
 
+          # The markers are what the insert aims at. Without them awk would print
+          # the file back unchanged and the PR step would find nothing to commit.
+          if ! grep -q '<!-- used-by:start -->' README.md || ! grep -q '<!-- used-by:end -->' README.md; then
+            echo "::error::The used-by markers are missing from README.md."
+            exit 1
+          fi
+
           # Dedupe: bail out if the URL is already listed between the markers.
           block=$(sed -n '/<!-- used-by:start -->/,/<!-- used-by:end -->/p' README.md)
           if printf '%s' "$block" | grep -qF "$url"; then
             echo "$url is already in the Used by list. Skipping."
+            echo "Skipped: [$name]($url) is already in the Used by list." >> "$GITHUB_STEP_SUMMARY"
             echo "skip=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
@@ -70,6 +132,12 @@ jobs:
           ' README.md > "$tmp"
           mv "$tmp" README.md
 
+          # Prove the insert landed, so an empty PR can never be the outcome.
+          if git diff --quiet -- README.md; then
+            echo "::error::README.md is unchanged after the insert."
+            exit 1
+          fi
+
           echo "skip=false" >> "$GITHUB_OUTPUT"
           echo "name=$name" >> "$GITHUB_OUTPUT"
           {
@@ -82,8 +150,11 @@ jobs:
 
       - name: Open pull request
         if: steps.build.outputs.skip == 'false'
+        id: pr
         uses: peter-evans/create-pull-request@v6
         with:
+          # Only the README, so no stray runner file can ride along.
+          add-paths: README.md
           branch: used-by/issue-${{ github.event.issue.number }}
           commit-message: "docs(used-by): add ${{ steps.build.outputs.name }}"
           title: "docs(used-by): add ${{ steps.build.outputs.name }}"
@@ -95,3 +166,16 @@ jobs:
             Closes #${{ github.event.issue.number }}
           labels: used-by-submission
           delete-branch: true
+
+      - name: Confirm the pull request exists
+        if: steps.build.outputs.skip == 'false'
+        env:
+          PR_NUMBER: ${{ steps.pr.outputs.pull-request-number }}
+          PR_URL: ${{ steps.pr.outputs.pull-request-url }}
+        run: |
+          set -euo pipefail
+          if [ -z "$PR_NUMBER" ]; then
+            echo "::error::The README changed but no pull request was created."
+            exit 1
+          fi
+          echo "Pull request: $PR_URL" >> "$GITHUB_STEP_SUMMARY"
