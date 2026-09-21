@@ -80,6 +80,42 @@ final class AudioBridge: @unchecked Sendable {
         encoder == AV_CODEC_ID_EAC3 ? Int64(channels) * 128_000 : 0
     }
 
+    /// The sample rates an encoder in THIS build accepts, as libavcodec itself reports them. Empty means
+    /// unconstrained (the codec advertises no list), which is the answer for FLAC.
+    ///
+    /// Asked of the codec rather than tabled here, because a table is a second source of truth that no
+    /// FFmpeg bump updates: E-AC-3 is 32 / 44.1 / 48 kHz today and the encoder is where that would change.
+    static func supportedSampleRates(for encoder: AVCodecID) -> [Int32] {
+        guard let codec = avcodec_find_encoder(encoder) else { return [] }
+        var configs: UnsafeRawPointer?
+        var count: Int32 = 0
+        let ret = avcodec_get_supported_config(nil, codec, AV_CODEC_CONFIG_SAMPLE_RATE, 0, &configs, &count)
+        guard ret >= 0, let list = configs, count > 0 else { return [] }
+        let rates = list.assumingMemoryBound(to: Int32.self)
+        return (0..<Int(count)).map { rates[$0] }
+    }
+
+    /// #548: the rate the bridge encoder is OPENED at, which is not the source's. E-AC-3 exists at 32 /
+    /// 44.1 / 48 kHz only, so a 96 kHz TrueHD track made `avcodec_open2` refuse the context and the whole
+    /// session fell to silent video-only. The resampler sits between the decoder and the encoder on every
+    /// bridged path and is configured from the encoder's rate anyway, so converting costs nothing that was
+    /// not already being paid.
+    ///
+    /// Exact match first; above the list the HIGHEST supported rate (never invent bandwidth the source
+    /// does not have, and 48 kHz carries more of a 96 kHz master than 44.1 does); below it the lowest, so
+    /// an 8 kHz oddity still plays. An empty list is an unconstrained encoder (FLAC), which keeps the
+    /// source rate and stays bit-perfect.
+    static func encoderSampleRate(supported: [Int32], source: Int32) -> Int32 {
+        // A source whose rate nobody resolved (TrueHD reports 0 pre-frame) asks for the same 48 kHz
+        // default the bridge has always fallen back to, then goes through the rules like any other.
+        let wanted: Int32 = source > 0 ? source : 48_000
+        let usable = supported.filter { $0 > 0 }.sorted()
+        guard !usable.isEmpty else { return wanted }
+        if usable.contains(wanted) { return wanted }
+        if let below = usable.last(where: { $0 < wanted }) { return below }
+        return usable[0]
+    }
+
     // MARK: - Errors
 
     enum AudioBridgeError: Error, CustomStringConvertible, LocalizedError {
@@ -205,6 +241,10 @@ final class AudioBridge: @unchecked Sendable {
     /// the resolved one is absent from the build. Incomplete source codecpar (TrueHD sometimes reports
     /// sample_rate=0 pre-frame) falls back to 48 kHz stereo, which the resampler reconfigures on the first
     /// decoded frame if it differs.
+    ///
+    /// The encoder opens at `encoderSampleRate(supported:source:)`, not at the source's rate: E-AC-3 has no
+    /// rate above 48 kHz, so a 96 kHz source used to fail `avcodec_open2` and take the session to silent
+    /// video-only (#548). swr converts into it either way.
     init(
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
@@ -263,7 +303,7 @@ final class AudioBridge: @unchecked Sendable {
 
         // 2. Source shape. The encoder cannot be chosen before this: `.surroundCompat` resolves to EAC3 only
         // for a source that HAS surround to carry, and the channel count is not final until the decoder is open.
-        let sampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
+        let sourceSampleRate: Int32 = srcCodecpar.pointee.sample_rate > 0
             ? srcCodecpar.pointee.sample_rate
             : 48000
 
@@ -323,6 +363,14 @@ final class AudioBridge: @unchecked Sendable {
         }
         encoderCtx = enc
 
+        // The rate the ENCODER accepts, which is not necessarily the source's (#548). swr already converts
+        // into the encoder's format on every bridged packet, so a rate change is free here and refusing the
+        // session was not: E-AC-3 stops at 48 kHz and a 96 kHz TrueHD track used to fall to video-only.
+        let sampleRate = Self.encoderSampleRate(
+            supported: Self.supportedSampleRates(for: encoderCodecID),
+            source: sourceSampleRate
+        )
+
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
         let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
@@ -333,7 +381,9 @@ final class AudioBridge: @unchecked Sendable {
         EngineLog.emit(
             "[AudioBridge] init: mode=\(mode.rawValue) encoder=\(encoderName)"
             + (forcedEncoder != nil ? " (forced)" : "")
-            + " srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate) "
+            + " srcCodec=\(srcCodecID.rawValue) sampleRate=\(sampleRate)"
+            + (sampleRate != sourceSampleRate ? " (resampled from \(sourceSampleRate), encoder has no such rate)" : "")
+            + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
             + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
@@ -380,7 +430,7 @@ final class AudioBridge: @unchecked Sendable {
         //    decoded frame, so a wrong seed self-corrects on the first frame.
         let inFmtRaw = dec.pointee.sample_fmt.rawValue
         let inFmt = inFmtRaw >= 0 ? dec.pointee.sample_fmt : AV_SAMPLE_FMT_FLTP
-        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sampleRate
+        let inRate = dec.pointee.sample_rate > 0 ? dec.pointee.sample_rate : sourceSampleRate
         var inLayout = AVChannelLayout()
         if dec.pointee.ch_layout.nb_channels > 0 {
             av_channel_layout_copy(&inLayout, &dec.pointee.ch_layout)
@@ -1123,3 +1173,4 @@ final class AudioBridge: @unchecked Sendable {
         }
     }
 }
+

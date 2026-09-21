@@ -168,11 +168,33 @@ final class AudioPlaybackHost {
         // Resume the synchronizer a pause() froze (rate 0). Guarded on demuxLoopStarted so a pause() before
         // first play() doesn't eager-start the un-anchored synchronizer (would tick the clock through spin-up
         // and drop the first samples; clock is armed off the first decoded sample).
-        if pausedByHost {
+        switch RendererClockResume.onPlay(
+            hostPaused: pausedByHost,
+            clockArmed: clockArmed && demuxLoopStarted,
+            synchronizerRate: audioOutput?.rate ?? 0,
+            // This host has neither a rebuffer that stops the clock nor an end-of-media park.
+            rebuffering: false,
+            parkedAtEndOfMedia: false
+        ) {
+        case .resumeHostPause:
             pausedByHost = false
             if demuxLoopStarted {
                 audioOutput?.setRate(lastRate)
             }
+        case .restartStalledClock:
+            // AE#549, same wedge as the software host: a system interruption stops this clock without
+            // going through pause(), and until now no door here could start it again.
+            if let aOut = audioOutput {
+                EngineLog.emit(
+                    "[AudioHost] AE#549: the clock stopped without a pause of ours; restarting at "
+                    + "\(String(format: "%.3f", aOut.currentTimeSeconds))s rate=\(lastRate) "
+                    + "(was \(aOut.rate), renderer self-flushes=\(aOut.automaticFlushCount))",
+                    category: .swPlayback
+                )
+                aOut.seekClock(to: aOut.currentTime, rate: lastRate)
+            }
+        case .none:
+            break
         }
         if !demuxLoopStarted {
             demuxLoopStarted = true
@@ -184,6 +206,17 @@ final class AudioPlaybackHost {
         isPlaying = true
         inFlightSeekResumeIntent = true
     }
+
+    #if DEBUG
+    /// AE#549 drill, same shape as the software host: stop the master clock behind the host's back.
+    func stallClockForTesting() -> Bool {
+        guard let aOut = audioOutput, clockArmed, demuxLoopStarted else { return false }
+        aOut.pause()
+        return true
+    }
+
+    var clockRateForTesting: Float? { audioOutput?.rate }
+    #endif
 
     func pause() {
         audioOutput?.pause()

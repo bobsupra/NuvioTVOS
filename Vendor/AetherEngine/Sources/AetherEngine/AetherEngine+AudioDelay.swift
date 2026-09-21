@@ -61,6 +61,21 @@ extension AetherEngine {
         guard AudioDelayPolicy.isChange(from: loadedOptions.audioDelaySeconds, to: clamped) else { return }
         setLoadedAudioDelay(clamped)
 
+        // Round 3: a session being rebuilt has no route to ask. `videoRoute` drops to `.none` at
+        // teardown, which is the ABSENCE of a route rather than a route that cannot carry an offset,
+        // so the switch below answered `.unavailable` and told the host its session's timestamps were
+        // not the engine's to move, while the reload underneath it was already cutting with the new
+        // value. The value is in `loadedOptions`, which is exactly what that load reads, so the
+        // honest answer is that it is on its way rather than that it cannot arrive.
+        guard state != .loading else {
+            EngineLog.emit(
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) set while the session is "
+                + "being rebuilt; the load in flight reads it from the options and delivers it",
+                category: .engine
+            )
+            return
+        }
+
         let route = videoRoute
         switch AudioDelayPolicy.application(for: route) {
         case .unavailable:
@@ -79,7 +94,7 @@ extension AetherEngine {
                 "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the software path",
                 category: .engine
             )
-            reanchorForAudioDelay(clamped) { await self.seek(to: $0, origin: .host) }
+            reanchorForAudioDelay { position, _ in await self.seek(to: position, origin: .host) }
 
         case .segmentTimestamps:
             // A seek is NOT enough here, and measuring it is what settled the shape: seeking to the
@@ -97,7 +112,7 @@ extension AetherEngine {
                 "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) on the loopback path",
                 category: .engine
             )
-            reanchorForAudioDelay(clamped) { _ in
+            reanchorForAudioDelay { _, delay in
                 // Round 2 (cmcpherson274): this was `try? await reloadAtCurrentPosition()`, under a
                 // line that had already announced the re-cut. Two claims, one of them unverified: a
                 // rebuild the session cannot make is not a rebuild, and a rebuild that threw is not
@@ -105,7 +120,7 @@ extension AetherEngine {
                 // for BEFORE the rebuild, where it still costs nothing (#460 rule 2).
                 if let refusal = self.sessionReloadRefusal {
                     EngineLog.emit(
-                        "[AetherEngine] AE#464: audio delay = \(Self.ms(clamped)) stands, but this "
+                        "[AetherEngine] AE#464: audio delay = \(Self.ms(delay)) stands, but this "
                         + "session cannot be rebuilt in place (\(refusal.rawValue)); it arrives at "
                         + "the next seam the session makes on its own",
                         category: .engine
@@ -116,13 +131,24 @@ extension AetherEngine {
                     try await self.reloadAtCurrentPosition()
                     EngineLog.emit(
                         "[AetherEngine] AE#464: re-cut at the playhead with audio delay "
-                        + "\(Self.ms(clamped))",
+                        + "\(Self.ms(delay))",
+                        category: .engine
+                    )
+                } catch is CancellationError {
+                    // Round 3: a superseded rebuild is not a failed one, and saying so cost a host
+                    // two lines telling it the nudge it was mid-delivery had not arrived. The load
+                    // that took this one's place reads the offset from `loadedOptions`, so the value
+                    // in force is the value it cuts with.
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: the re-cut at the playhead was superseded by a newer "
+                        + "load; the audio delay in force "
+                        + "(\(Self.ms(self.loadedOptions.audioDelaySeconds))) is what that load cuts with",
                         category: .engine
                     )
                 } catch {
                     EngineLog.emit(
                         "[AetherEngine] AE#464: the re-cut at the playhead failed (\(error)); the "
-                        + "audio delay \(Self.ms(clamped)) stands and arrives at the next seam",
+                        + "audio delay \(Self.ms(delay)) stands and arrives at the next seam",
                         category: .engine
                     )
                 }
@@ -140,18 +166,59 @@ extension AetherEngine {
     /// engine's own is in flight is reported as a user scrub (`setNativeScrubSeek`), which opened a
     /// second seek ticket aimed at the re-cut segment's START and left it stalled for the rest of the
     /// session, with `phase` stuck at `seeking`.
-    private func reanchorForAudioDelay(_ delay: Double, _ reanchor: @escaping (Double) async -> Void) {
+    ///
+    /// **Round 3: presses that arrive during a re-anchor are folded into it.** The setter had no
+    /// in-flight latch, so a stepper's three presses in one runloop turn raised three of these.
+    /// Round 2 made the damage survivable (the parked position rebuilds a stacked one at the playhead
+    /// rather than at the head), but the work was still done three times and the two that lost the
+    /// generation race each reported a `CancellationError` as a FAILED re-cut, naming a value that
+    /// was already superseded: a host reading its own log was told twice that the nudge it was in the
+    /// middle of delivering had not arrived.
+    ///
+    /// Folding is safe because the value does not ride the call. Every press writes
+    /// `loadedOptions.audioDelaySeconds` synchronously before this runs, and both routes read the
+    /// offset from there when they rebuild, so a re-anchor that has not reached its rebuild yet
+    /// already carries the newest value. Only a press that lands after the rebuild has read it needs
+    /// anything more, and that is one catch-up pass: the loop ends as soon as what was delivered is
+    /// what is in force, so a stepper held down converges instead of queueing a rebuild per press.
+    private func reanchorForAudioDelay(_ reanchor: @escaping (_ position: Double, _ delay: Double) async -> Void) {
         guard Self.audioDelayRecutIsPossible(state: state, isLive: isLive, liveWindow: liveWindow) else {
             EngineLog.emit(
-                "[AetherEngine] AE#464: audio delay = \(Self.ms(delay)) stands, but this session cannot "
-                + "re-anchor at the playhead (state=\(state), live=\(isLive)); it arrives at the next seam",
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(loadedOptions.audioDelaySeconds)) stands, "
+                + "but this session cannot re-anchor at the playhead (state=\(state), live=\(isLive)); "
+                + "it arrives at the next seam",
                 category: .engine
             )
             return
         }
-        let position = currentTime
+        guard !audioDelayReanchorInFlight else {
+            EngineLog.emit(
+                "[AetherEngine] AE#464: audio delay = \(Self.ms(loadedOptions.audioDelaySeconds)) folded "
+                + "into the re-anchor already in flight; that rebuild delivers it",
+                category: .engine
+            )
+            return
+        }
+        audioDelayReanchorInFlight = true
         Task { @MainActor in
-            await reanchor(position)
+            defer { self.audioDelayReanchorInFlight = false }
+            var delivered = self.loadedOptions.audioDelaySeconds
+            await reanchor(self.positionForSessionRebuild, delivered)
+            while AudioDelayPolicy.isChange(from: delivered, to: self.loadedOptions.audioDelaySeconds) {
+                guard Self.audioDelayRecutIsPossible(
+                    state: self.state, isLive: self.isLive, liveWindow: self.liveWindow) else {
+                    EngineLog.emit(
+                        "[AetherEngine] AE#464: audio delay = "
+                        + "\(Self.ms(self.loadedOptions.audioDelaySeconds)) was asked for while the last "
+                        + "rebuild ran and this session can no longer re-anchor (state=\(self.state)); "
+                        + "it arrives at the next seam",
+                        category: .engine
+                    )
+                    return
+                }
+                delivered = self.loadedOptions.audioDelaySeconds
+                await reanchor(self.positionForSessionRebuild, delivered)
+            }
         }
     }
 

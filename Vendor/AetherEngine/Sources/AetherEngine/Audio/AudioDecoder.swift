@@ -48,14 +48,6 @@ final class AudioDecoder: @unchecked Sendable {
     /// more input planes than the frame carries reads a NULL plane inside swr_convert.
     private var configuredInput = ResamplerInputParameters()
 
-    private var performance = SWPerformanceSnapshot.zero
-
-    var performanceSnapshot: SWPerformanceSnapshot {
-        stateLock.lock()
-        defer { stateLock.unlock() }
-        return performance
-    }
-
     private(set) var sampleRate: Int32 = 0
     private(set) var channels: Int32 = 0
 
@@ -85,7 +77,6 @@ final class AudioDecoder: @unchecked Sendable {
         guard avcodec_open2(ctx, codec, nil) >= 0 else {
             throw AudioDecoderError.openFailed
         }
-        performance = .zero
 
         // Resampler built lazily from the first frame, not here: TrueHD (and codecs advertising
         // AV_CHANNEL_ORDER_UNSPEC or sample_fmt=NONE in codecpar pre-frame) would fail swr_alloc_set_opts2 here,
@@ -101,12 +92,6 @@ final class AudioDecoder: @unchecked Sendable {
         defer { stateLock.unlock() }
         guard let ctx = codecContext else { return [] }
         var results: [CMSampleBuffer] = []
-        performance.audioPacketCalls &+= 1
-        let decodeStarted = DispatchTime.now().uptimeNanoseconds
-        defer {
-            performance.audioDecodeNanoseconds &+= DispatchTime.now().uptimeNanoseconds - decodeStarted
-            performance.audioBuffers &+= UInt64(results.count)
-        }
 
         let sendRet = avcodec_send_packet(ctx, packet)
         guard sendRet >= 0 else { return [] }
@@ -240,11 +225,6 @@ final class AudioDecoder: @unchecked Sendable {
         defer { stateLock.unlock() }
         guard let ctx = codecContext else { return [] }
         var results: [CMSampleBuffer] = []
-        let decodeStarted = DispatchTime.now().uptimeNanoseconds
-        defer {
-            performance.audioDecodeNanoseconds &+= DispatchTime.now().uptimeNanoseconds - decodeStarted
-            performance.audioBuffers &+= UInt64(results.count)
-        }
 
         avcodec_send_packet(ctx, nil)
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
