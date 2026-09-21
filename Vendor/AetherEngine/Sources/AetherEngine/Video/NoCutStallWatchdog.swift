@@ -44,9 +44,19 @@ final class NoCutStallWatchdog: @unchecked Sendable {
         var foreignPackets: Int
         var lastForeignStreamIndex: Int32
         var consecutiveHolds: Int
+        /// AE#446 round 8: whether anything has ever been cut on this producer. False for the window
+        /// a join is armed with, and the two shapes read differently: "nothing since the last
+        /// segment" is a source that stopped, "nothing at all" is a join that never started.
+        var everProduced: Bool = true
 
         /// Reads at full rate with nothing cut: a wedged cutter rather than a starved source.
-        var isWedge: Bool { readRate >= HLSSegmentProducer.liveWedgeProgressRateThreshold }
+        ///
+        /// AE#446 round 8: only once something has been cut. A cutter that has not reached its first
+        /// keyframe is indistinguishable from one that cannot cut what it is given, so a join is
+        /// never read as a wedge.
+        var isWedge: Bool {
+            everProduced && readRate >= HLSSegmentProducer.liveWedgeProgressRateThreshold
+        }
     }
 
     enum Decision: Equatable {
@@ -61,9 +71,11 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     private let lock = NSLock()
     private let videoTimeBaseSeconds: Double
 
-    /// Wall-clock of the last finalized live segment. Nil until the first one: before that there is
-    /// no window and nothing to judge.
+    /// Wall-clock of the last finalized live segment, or of the join this producer was armed at.
+    /// Nil until one of the two: before that there is no window and nothing to judge.
     private var lastFinalizeAt: Date?
+    /// AE#446 round 8: whether a real finalize has ever landed, as opposed to the join arming.
+    private var everFinalized = false
     /// #177 hold: the window measures from here once a slow-delivery hold has re-armed it.
     private var holdRearmedAt: Date?
     private var consecutiveHolds = 0
@@ -91,6 +103,23 @@ final class NoCutStallWatchdog: @unchecked Sendable {
     func noteFinalize(at now: Date) {
         lock.lock()
         defer { lock.unlock() }
+        lastFinalizeAt = now
+        everFinalized = true
+        holdRearmedAt = nil
+        consecutiveHolds = 0
+        resetWindowCounters()
+    }
+
+    /// AE#446 round 8: the live pump began reading and nothing has been cut yet.
+    ///
+    /// Without this the first deadline of a session is set by its first cut, so a source that stops
+    /// at the join is never judged at all: `evaluate` returns on the nil window for as long as the
+    /// session lasts. Never moves a window a finalize already owns, so a producer that starts its
+    /// pump again after cutting keeps measuring from the cut.
+    func armForJoin(at now: Date) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard lastFinalizeAt == nil else { return }
         lastFinalizeAt = now
         holdRearmedAt = nil
         consecutiveHolds = 0
@@ -170,7 +199,8 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             readRate: readRate,
             videoPtsAdvanceSeconds: ptsAdvance,
             consecutiveHolds: consecutiveHolds,
-            servingOutageRunway: servingOutageRunway
+            servingOutageRunway: servingOutageRunway,
+            hasEverProduced: everFinalized
         ) {
         case .keepReading:
             return nil
@@ -206,7 +236,8 @@ final class NoCutStallWatchdog: @unchecked Sendable {
             audioPackets: audioPackets,
             foreignPackets: foreignPackets,
             lastForeignStreamIndex: lastForeignStreamIndex,
-            consecutiveHolds: consecutiveHolds
+            consecutiveHolds: consecutiveHolds,
+            everProduced: everFinalized
         )
     }
 

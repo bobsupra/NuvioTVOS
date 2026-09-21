@@ -301,6 +301,34 @@ final class DisplayCriteriaController {
         effectiveFormat != .sdr && !panelPresentedHDRAtLoad && sessionIsPlaying
     }
 
+    /// How long to let a served master settle before reading acceptance as proof.
+    ///
+    /// A display rejection is fast and arrives before the item is playable: measured on device at 54 to
+    /// 61 ms from serving the master to `item.status=failed` with zero `errorLog` events, because
+    /// AVFoundation decides at parse and eligibility time rather than after any network activity. Half a
+    /// second is an order of magnitude past that and still inside the probe window it delays.
+    nonisolated static let masterAcceptanceSettleMs = 500
+
+    /// AE#459: an accepted HDR master answers the panel question better than the headroom does.
+    ///
+    /// `UIScreen.currentEDRHeadroom` has been measured reading 1.00 on a panel that, in the same session,
+    /// accepted an HLG master which AVFoundation then reported as `ITU_R_2100_HLG`. A display that takes an
+    /// HDR master is presenting HDR; one that is not refuses with -11868 or -11848, which is exactly what
+    /// the same box does when its output is locked to SDR. So where the headroom is silent, acceptance is
+    /// not a weaker substitute for it, it is the stronger reading.
+    ///
+    /// This proves the LABEL only. It deliberately does not latch the panel proof or re-route the running
+    /// session: the route already reaches the master on its own through the attempt, and a diagnostic that
+    /// also decided routing would answer a different question than the one being asked.
+    ///
+    /// `fellBackToMedia` is what separates acceptance from mere service. The fallback withdraws the master
+    /// in place, so a session that is still serving it after the settle window was not refused.
+    nonisolated static func masterAcceptanceProvesPanel(
+        servingHDRMaster: Bool, fellBackToMedia: Bool, sessionIsPlaying: Bool
+    ) -> Bool {
+        servingHDRMaster && !fellBackToMedia && sessionIsPlaying
+    }
+
     /// Whether the probe takes another sample. One reading above 1.0 is authoritative and latches the proof
     /// for good, so the first hit ends the probe.
     nonisolated static func playbackProbeContinues(elapsedMs: Int, observedHDR: Bool) -> Bool {
@@ -681,10 +709,6 @@ final class DisplayCriteriaController {
         // Reset up front so a skipped apply (Match Content off, no window)
         // can't leave a prior HDR session's flag for waitForSwitch to read.
         lastCriteriaWasHDR = false
-        guard #available(tvOS 17.0, *) else {
-            EngineLog.emit("[DisplayCriteria] skipped: tvOS < 17", category: .engine)
-            return .applied
-        }
 
         guard let window = resolveWindow() else {
             EngineLog.emit("[DisplayCriteria] skipped: no window", category: .engine)
@@ -1184,6 +1208,7 @@ final class DisplayCriteriaController {
         return false
         #endif
     }
+
     #if os(tvOS)
     /// Single funnel for every headroom read, so one observation of a real HDR engage is remembered after the
     /// value decays. Returns whether the panel reports HDR right now.

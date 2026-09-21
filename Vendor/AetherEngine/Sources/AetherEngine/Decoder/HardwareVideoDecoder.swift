@@ -151,15 +151,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         }
         formatDescription = formatDesc
 
-        // 2. Require hardware on tvOS 17+ so VT fails outright rather than silently falling back to SW
-        //    (which would show only as pathological CPU + frame drops at 4K). Deployment target is tvOS 26
-        //    so the if-available branch is always taken in production.
-        var decoderSpec: NSDictionary?
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            decoderSpec = [
-                kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
-            ]
-        }
+        // 2. Require hardware so VT fails outright rather than silently falling back to SW
+        //    (which would show only as pathological CPU + frame drops at 4K).
+        let decoderSpec: NSDictionary = [
+            kVTVideoDecoderSpecification_RequireHardwareAcceleratedVideoDecoder: true,
+        ]
 
         // 3. Pixel buffer attributes: 10-bit biplanar for HDR, 8-bit for SDR; IOSurface-backed for Metal rendering.
         let bitsPerSample = codecpar.pointee.bits_per_raw_sample
@@ -206,13 +202,11 @@ final class HardwareVideoDecoder: VideoDecodingPipeline, @unchecked Sendable {
         session = createdSession
 
         // 5. Pass through per-frame HDR metadata for correct tone mapping; unknown-key set returns -12911 on older OSes (swallowed).
-        if #available(tvOS 17.0, iOS 17.0, *) {
-            VTSessionSetProperty(
-                createdSession,
-                key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
-                value: kCFBooleanTrue
-            )
-        }
+        VTSessionSetProperty(
+            createdSession,
+            key: kVTDecompressionPropertyKey_PropagatePerFrameHDRDisplayMetadata,
+            value: kCFBooleanTrue
+        )
 
         EngineLog.emit(
             "[HardwareVideoDecoder] opened HEVC \(width)x\(height) "

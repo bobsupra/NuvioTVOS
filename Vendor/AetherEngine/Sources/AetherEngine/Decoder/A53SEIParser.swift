@@ -5,7 +5,7 @@ import Foundation
 ///
 /// Public because the DV P7 rewrite takes it (#365): a walker handed the wrong framing does not
 /// fail, it reads NAL boundaries at arbitrary offsets and reports that it found nothing.
-public enum VideoNALFraming: Equatable, Hashable, Sendable {
+public enum VideoNALFraming: Equatable, Sendable {
     case annexB
     case lengthPrefixed(size: Int)
 }
@@ -41,96 +41,6 @@ enum A53SEIParser {
             guard size >= 22 else { return .annexB }
             return .lengthPrefixed(size: Int(ed[21] & 0x03) + 1)
         }
-    }
-
-    /// Validate a packet payload against one framing. This is deliberately stricter than
-    /// `forEachNAL`, which is a forgiving parser for caption extraction: a probe must not trust
-    /// Annex-B/hvcC extradata when a demuxer has delivered packets in the other framing.
-    static func isValidNALFraming(
-        _ data: UnsafePointer<UInt8>, _ size: Int, _ framing: NALFraming
-    ) -> Bool {
-        guard size > 0 else { return false }
-        switch framing {
-        case .annexB:
-            var i = 0
-            var nalStart = -1
-            var found = false
-            while i + 3 <= size {
-                if data[i] == 0x00, data[i + 1] == 0x00, data[i + 2] == 0x01 {
-                    if nalStart >= 0 {
-                        var end = i
-                        if end > nalStart, data[end - 1] == 0x00 { end -= 1 }
-                        guard end > nalStart else { return false }
-                    }
-                    nalStart = i + 3
-                    found = true
-                    i += 3
-                } else {
-                    i += 1
-                }
-            }
-            guard found, nalStart >= 0, nalStart < size else { return false }
-            return true
-
-        case .lengthPrefixed(let width):
-            guard (1...4).contains(width) else { return false }
-            var offset = 0
-            var count = 0
-            while offset < size {
-                guard offset + width <= size else { return false }
-                var nalLength = 0
-                for i in 0..<width { nalLength = (nalLength << 8) | Int(data[offset + i]) }
-                offset += width
-                guard nalLength > 0, offset + nalLength <= size else { return false }
-                offset += nalLength
-                count += 1
-            }
-            return count > 0
-        }
-    }
-
-    /// Prefer the stream-level framing, but recover when packet payloads disagree with it. The
-    /// mismatch occurs in practice for Annex-B codec private data paired with length-prefixed
-    /// packets (and the reverse after a remux). Candidates are ordered to preserve the configured
-    /// width whenever it validates, then try every supported alternate length width, and only
-    /// then Annex-B. This ordering matters for a valid 4-byte prefix `00 00 01 xx`, which otherwise
-    /// looks like a start code at offset zero.
-    static func detectNALFraming(
-        _ data: UnsafePointer<UInt8>, _ size: Int, preferred: NALFraming
-    ) -> NALFraming? {
-        var candidates = allValidNALFramings(data, size)
-        // Annex-B is intentionally left last: a start code can be a valid prefix-looking byte
-        // sequence, while a full length-prefix walk is stronger evidence.
-        if preferred != .annexB, let preferredIndex = candidates.firstIndex(of: preferred) {
-            candidates.remove(at: preferredIndex)
-            candidates.insert(preferred, at: 0)
-        }
-        return candidates.first
-    }
-
-    /// Return every framing that consumes the complete packet. A packet can be valid under more
-    /// than one framing (for example, an Annex-B start code can resemble a 3-byte length), so
-    /// callers resolving a stream must retain this evidence instead of choosing the first match.
-    static func allValidNALFramings(
-        _ data: UnsafePointer<UInt8>, _ size: Int
-    ) -> [NALFraming] {
-        var candidates = (1...4).map { NALFraming.lengthPrefixed(size: $0) }
-        candidates.append(.annexB)
-        return candidates.filter { isValidNALFraming(data, size, $0) }
-    }
-
-    /// Resolve a stream framing from sampled packets. Only samples valid under exactly one
-    /// framing count as evidence; ambiguous packets are ignored. Conflicting unambiguous evidence
-    /// is treated as inconclusive so the caller can fall back to stream configuration.
-    static func resolveNALFraming(
-        samples: [[NALFraming]], configured: NALFraming
-    ) -> NALFraming? {
-        var evidence: Set<NALFraming> = []
-        for valid in samples where valid.count == 1 {
-            evidence.insert(valid[0])
-        }
-        guard evidence.count == 1 else { return nil }
-        return evidence.first ?? configured
     }
 
     /// Cheap prefilter so packets without captions skip the NAL walk. "GA94" contains no zero

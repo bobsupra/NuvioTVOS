@@ -2,7 +2,6 @@ import Foundation
 import AVFoundation
 import CoreMedia
 import CoreVideo
-import CoreGraphics
 import CoreImage
 
 /// Video renderer using AVSampleBufferDisplayLayer for optimal frame pacing.
@@ -10,32 +9,20 @@ import CoreImage
 /// Includes a small reorder buffer (4 frames) to handle B-frame decode
 /// order from VTDecompressionSession. Frames are sorted by PTS before
 /// being enqueued to the display layer in strict presentation order.
-/// Which display-layer flush operation a flush request maps to. Split out of SampleBufferRenderer.flush()
-/// as a pure value so the seek-holds-frame contract (issue #90) is testable without a live
-/// AVSampleBufferDisplayLayer.
-enum DisplayFlushOp: Equatable {
-    /// tvOS 18+/iOS 18+/macOS 15+: AVSampleBufferVideoRenderer.flush(removingDisplayedImage:).
-    case rendererFlush(removingDisplayedImage: Bool)
-    /// Legacy AVSampleBufferDisplayLayer.flushAndRemoveImage(), clears the visible frame.
-    case removeImage
-    /// Legacy AVSampleBufferDisplayLayer.flush(), keeps the last frame on screen (hold through seek).
-    case holdImage
-
-    static func resolve(removingDisplayedImage: Bool, modernRenderer: Bool) -> DisplayFlushOp {
-        if modernRenderer {
-            return .rendererFlush(removingDisplayedImage: removingDisplayedImage)
-        }
-        return removingDisplayedImage ? .removeImage : .holdImage
-    }
-}
-
 final class SampleBufferRenderer: @unchecked Sendable {
 
-    @MainActor private(set) var displayLayer: AVSampleBufferDisplayLayer
-    /// AVFoundation permits this queue interface to be used from a background thread.
-    /// Capture it once on the main actor instead of reaching through the actor-isolated layer
-    /// for every decoded frame.
-    private let renderingTarget: any AVQueuedSampleBufferRendering
+    let displayLayer: AVSampleBufferDisplayLayer
+
+    /// The layer's queue surface, taken once on the main actor at construction (#351). The 27 SDKs
+    /// isolate `AVSampleBufferDisplayLayer` to the main actor, `AVSampleBufferVideoRenderer` is not, so
+    /// the decode thread enqueues, flushes and reads status through this and never touches the layer.
+    /// A stored reference cannot drift from the layer: neither is ever replaced, HDR output flips
+    /// `preferredDynamicRange` on the same layer.
+    ///
+    /// tvOS 26+ fails the deprecated layer enqueue/flush/isReadyForMoreMediaData under an
+    /// AVSampleBufferRenderSynchronizer with FigVideoQueueRemote -12080 after the first enqueue, so
+    /// this renderer is the only queue target, and the one the synchronizer is given.
+    let videoRenderer: AVSampleBufferVideoRenderer
 
     /// SW-PiP Phase C: composites active subtitle cues into frames while PiP is active (the system
     /// window renders only this layer, the host overlay cannot reach it).
@@ -46,13 +33,13 @@ final class SampleBufferRenderer: @unchecked Sendable {
     private var reorderBuffer: [(CVPixelBuffer, CMTime, Data?)] = []
     private let reorderDepth = 4  // handles up to 3 consecutive B-frames
 
+    /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
+    private var skipUntilPTS: CMTime?
+
     /// Passive frame harvesting: mirrors the latest decoded frame handed to the presentation layer.
     private let capturedFrameLock = NSLock()
     private var _currentPixelBuffer: CVPixelBuffer?
     private lazy var ciContext = CIContext(options: [.cacheIntermediates: false])
-
-    /// Drop frames before this PTS after a seek (prevents keyframe-to-target fast-forward). Cleared after the first passing frame.
-    private var skipUntilPTS: CMTime?
 
     /// #311: fires for every frame handed to the queue target, on the decode thread. Guarded by
     /// `reorderLock` for the swap only; the call itself happens with no lock held, so a host that
@@ -96,11 +83,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
         var parV: Int?
     }
 
-    private let diagnosticsLock = NSLock()
-    private var diagnosticsRefreshPending = false
     private var loggedLayerFailed = false
-    private var cachedQueueStatusName = "unknown"
-    private var cachedQueueErrorDescription: String?
     private var loggedNotReady = false
     /// Internal (not private) for #298 tests: the gate's job is that untimed frames never get here.
     /// Guarded by `reorderLock` since #407: the 1 Hz diagnostic reads it off the main actor while the
@@ -172,15 +155,14 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// #489: the gravity is a construction parameter, not something a caller assigns afterwards.
     /// The engine holds the host app's picture mode across loads, and a layer that starts on the
     /// default and is corrected a moment later shows one frame of the wrong fill.
+    ///
+    /// Main-actor isolated because the layer is (#351); the only production caller,
+    /// `SoftwarePlaybackHost`, already is.
     @MainActor
     init(videoGravity: AVLayerVideoGravity = .resizeAspect) {
         let layer = Self.makeDisplayLayer(isHDR: false, gravity: videoGravity)
         displayLayer = layer
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            renderingTarget = layer.sampleBufferRenderer
-        } else {
-            renderingTarget = layer
-        }
+        videoRenderer = layer.sampleBufferRenderer
     }
 
     /// #303: what the display did with the frames, as the renderer itself counts them. Our own
@@ -224,24 +206,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
                        minDeltaSeconds: minD, maxDeltaSeconds: maxD)
     }
 
-    /// nil where the metrics cannot be asked for: an OS predating the API, or the pre-tvOS-18 path
-    /// where the queue target is the display layer itself rather than an `AVSampleBufferVideoRenderer`.
+    /// nil only on visionOS 1.0: the metrics accessor arrived in tvOS/iOS 17.4, macOS 14.4 and visionOS
+    /// 1.1, and visionOS is the one platform whose package floor still sits below it.
     ///
-    /// #313: main-actor isolated, and reading through the completion-handler accessor rather than
-    /// the async one, because the two halves of that constraint come from different toolchains and
-    /// no single `await` on `videoPerformanceMetrics` satisfies both. An SDK that isolates the layer
-    /// to the main actor refuses to hand `sampleBufferRenderer` to any other domain; a toolchain
-    /// that imports the async accessor as `nonisolated` refuses to take that non-Sendable renderer
-    /// from the main actor. The completion form suspends without moving the renderer anywhere, so it
-    /// holds on both. Every caller is main-actor isolated already, so the annotation costs no hop.
+    /// #313: reads through the completion-handler accessor rather than the async one. A toolchain that
+    /// imports the async accessor as `nonisolated` refuses to take the non-Sendable renderer across an
+    /// actor boundary, and the completion form suspends without moving the renderer anywhere. Main-actor
+    /// isolated because every caller is, so the annotation costs no hop.
     ///
-    /// #344: the version list gates the metrics accessor (tvOS/iOS 17.4, macOS 14.4, visionOS 1.1),
-    /// not the renderer, which exists from visionOS 1.0. tvOS/iOS 18 and macOS 15 stay as they are:
-    /// below them `queueTarget` is the display layer, so there is no renderer to ask.
+    /// #344: visionOS has to be named. Falling through to `*` resolves it to the declared floor (1.0),
+    /// which is a compile error rather than a runtime nil.
     @MainActor
     func loadRenderMetrics() async -> RenderMetrics? {
-        guard #available(tvOS 18.0, iOS 18.0, macOS 15.0, visionOS 1.1, *) else { return nil }
-        let renderer = displayLayer.sampleBufferRenderer
+        guard #available(tvOS 17.4, iOS 17.4, macOS 14.4, visionOS 1.1, *) else { return nil }
+        let renderer = videoRenderer
         return await withCheckedContinuation { (cont: CheckedContinuation<RenderMetrics?, Never>) in
             renderer.loadVideoPerformanceMetrics { m in
                 guard let m else { return cont.resume(returning: nil) }
@@ -255,15 +233,20 @@ final class SampleBufferRenderer: @unchecked Sendable {
 
     // MARK: - Queue rendering target
 
-    /// tvOS 18+ / iOS 18+ / macOS 15+: use AVSampleBufferVideoRenderer via displayLayer.sampleBufferRenderer. Calling the deprecated layer enqueue/flush/isReadyForMoreMediaData on tvOS 26+ with AVSampleBufferRenderSynchronizer fails with FigVideoQueueRemote -12080 after the first enqueue. Older OSes use the layer directly via AVQueuedSampleBufferRendering. visionOS is not named because it has the renderer from 1.0, which is the package floor, so the `*` arm is the renderer arm there and naming it would be a check that is always true.
-    var queueTarget: any AVQueuedSampleBufferRendering {
-        renderingTarget
-    }
+    /// `videoRenderer` as the protocol the enqueue path has always called it through, so the per-frame
+    /// enqueue and back-pressure calls keep the dispatch they had.
+    var queueTarget: any AVQueuedSampleBufferRendering { videoRenderer }
 
-    /// Demux-loop back-pressure gate. Post-tvOS 18 split: reading the layer's own isReadyForMoreMediaData stays optimistically true even when the sampleBufferRenderer queue is full, causing FigVideoQueueRemote -12080 on over-enqueue.
+    /// Demux-loop back-pressure gate. Read from the renderer, never the layer: the layer's own
+    /// isReadyForMoreMediaData stays optimistically true even when the renderer queue is full, causing
+    /// FigVideoQueueRemote -12080 on over-enqueue.
     var isReadyForMoreMediaData: Bool {
         queueTarget.isReadyForMoreMediaData
     }
+
+    private var queueStatus: AVQueuedSampleBufferRenderingStatus { videoRenderer.status }
+
+    private var queueError: Error? { videoRenderer.error }
 
     @MainActor
     private static func makeDisplayLayer(isHDR: Bool, gravity: AVLayerVideoGravity = .resizeAspect) -> AVSampleBufferDisplayLayer {
@@ -278,24 +261,19 @@ final class SampleBufferRenderer: @unchecked Sendable {
             layer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                layer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            layer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
         return layer
     }
 
     /// Opt the display layer into HDR mode. Pass true only when the decoder delivers raw HDR10/DV pixel buffers; false for SDR or tone-mapped output.
-    @MainActor
     func setHDROutput(_ isHDR: Bool) {
         if #available(tvOS 26.0, iOS 26.0, macOS 26.0, visionOS 26.0, *) {
             displayLayer.preferredDynamicRange = isHDR ? .high : .standard
         } else {
             #if os(iOS) || os(macOS)
-            if #available(iOS 17.0, macOS 14.0, *) {
-                displayLayer.wantsExtendedDynamicRangeContent = isHDR
-            }
+            displayLayer.wantsExtendedDynamicRangeContent = isHDR
             #endif
         }
     }
@@ -369,7 +347,6 @@ final class SampleBufferRenderer: @unchecked Sendable {
     /// Discard all buffered frames. `removingDisplayedImage: true` (stop/teardown) also clears the visible
     /// frame; `false` (seek) holds the last frame on screen until the post-seek frame is enqueued, so a seek
     /// doesn't flash black between the old and new positions (matches the hardware path's hold-last-frame).
-    @MainActor
     func flush(removingDisplayedImage: Bool = true) {
         reorderLock.lock()
         reorderBuffer.removeAll()
@@ -393,18 +370,7 @@ final class SampleBufferRenderer: @unchecked Sendable {
             capturedFrameLock.unlock()
         }
 
-        let modern: Bool
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) { modern = true } else { modern = false }
-        switch DisplayFlushOp.resolve(removingDisplayedImage: removingDisplayedImage, modernRenderer: modern) {
-        case .rendererFlush(let remove):
-            if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-                displayLayer.sampleBufferRenderer.flush(removingDisplayedImage: remove) { }
-            }
-        case .removeImage:
-            displayLayer.flushAndRemoveImage()
-        case .holdImage:
-            displayLayer.flush()
-        }
+        videoRenderer.flush(removingDisplayedImage: removingDisplayedImage) { }
     }
 
     /// Send all buffered frames to the display layer (call at EOF).
@@ -455,13 +421,18 @@ final class SampleBufferRenderer: @unchecked Sendable {
                 EngineLog.emit("[Renderer] HDR10+ attachment count: \(hdr10PlusAttachedCount) (last payload \(hdr10PlusData.count) bytes)", category: .swPlayback)
             }
         }
+        // Recover from failed queue target (Synchronizer/controlTimebase handoff races can push it here; flush recovers it).
         let target = queueTarget
+        if queueStatus == .failed {
+            if !loggedLayerFailed {
+                loggedLayerFailed = true
+                EngineLog.emit("[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(queueError?.localizedDescription ?? "nil"), attempting recovery via flush()", category: .swPlayback)
+            }
+            target.flush()
+        }
         if !target.isReadyForMoreMediaData, !loggedNotReady {
             loggedNotReady = true
             EngineLog.emit("[Renderer] isReadyForMoreMediaData=false at enqueue #\(enqueueCount + 1) status=\(statusName)", category: .swPlayback)
-        }
-        if !target.isReadyForMoreMediaData {
-            scheduleQueueDiagnosticsRefresh()
         }
         target.enqueue(sampleBuffer)
 
@@ -489,101 +460,17 @@ final class SampleBufferRenderer: @unchecked Sendable {
         reorderLock.unlock()
         // Sparse milestones so a stall is distinguishable from "logging stopped at #30"; bounded to 4 lines/hour at 60 fps.
         if handed == 1 || handed == 30 || handed == 100 || handed == 1000 || handed == 5000 {
-            scheduleQueueDiagnosticsRefresh()
-            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueErrorDescription ?? "nil")", category: .swPlayback)
+            EngineLog.emit("[Renderer] enqueue #\(handed): status=\(statusName) ready=\(queueTarget.isReadyForMoreMediaData) error=\(queueError?.localizedDescription ?? "nil")", category: .swPlayback)
         }
-    }
-
-    /// Captures the most recently decoded video frame directly from the presentation buffer.
-    /// Scaled to `maxWidth` via CoreImage Metal pipeline with 0 extra HTTP reads or decoders.
-    func captureCurrentFrame(maxWidth: Int = 320) -> CGImage? {
-        capturedFrameLock.lock()
-        guard let buffer = _currentPixelBuffer else {
-            capturedFrameLock.unlock()
-            return nil
-        }
-        capturedFrameLock.unlock()
-
-        let ciImage = CIImage(cvPixelBuffer: buffer)
-        let extent = ciImage.extent
-        guard extent.width > 0, extent.height > 0 else { return nil }
-
-        let scale = min(1.0, CGFloat(maxWidth) / extent.width)
-        let scaledImage: CIImage
-        if scale < 1.0 {
-            scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
-        } else {
-            scaledImage = ciImage
-        }
-
-        return ciContext.createCGImage(scaledImage, from: scaledImage.extent)
     }
 
     private var statusName: String {
-        diagnosticsLock.lock()
-        defer { diagnosticsLock.unlock() }
-        return cachedQueueStatusName
-    }
-
-    private var queueErrorDescription: String? {
-        diagnosticsLock.lock()
-        defer { diagnosticsLock.unlock() }
-        return cachedQueueErrorDescription
-    }
-
-    private func scheduleQueueDiagnosticsRefresh() {
-        diagnosticsLock.lock()
-        guard !diagnosticsRefreshPending else {
-            diagnosticsLock.unlock()
-            return
+        switch queueStatus {
+        case .unknown: "unknown"
+        case .rendering: "rendering"
+        case .failed: "failed"
+        @unknown default: "?"
         }
-        diagnosticsRefreshPending = true
-        diagnosticsLock.unlock()
-
-        Task { @MainActor [weak self] in
-            self?.refreshQueueDiagnostics()
-        }
-    }
-
-    /// Status/error are UI-object diagnostics in Xcode 27 even though enqueueing is explicitly
-    /// background-safe. Sample them on the main actor and keep only Sendable values off-actor.
-    @MainActor
-    private func refreshQueueDiagnostics() {
-        let status: AVQueuedSampleBufferRenderingStatus
-        let errorDescription: String?
-        if #available(tvOS 18.0, iOS 18.0, macOS 15.0, *) {
-            let renderer = displayLayer.sampleBufferRenderer
-            status = renderer.status
-            errorDescription = renderer.error?.localizedDescription
-        } else {
-            status = displayLayer.status
-            errorDescription = displayLayer.error?.localizedDescription
-        }
-
-        let statusText: String
-        switch status {
-        case .unknown: statusText = "unknown"
-        case .rendering: statusText = "rendering"
-        case .failed: statusText = "failed"
-        @unknown default: statusText = "?"
-        }
-
-        diagnosticsLock.lock()
-        cachedQueueStatusName = statusText
-        cachedQueueErrorDescription = errorDescription
-        diagnosticsRefreshPending = false
-        let shouldLogFailure = status == .failed && !loggedLayerFailed
-        if shouldLogFailure { loggedLayerFailed = true }
-        diagnosticsLock.unlock()
-
-        guard status == .failed else { return }
-        if shouldLogFailure {
-            EngineLog.emit(
-                "[Renderer] queue target failed at enqueue #\(enqueueCount + 1): \(errorDescription ?? "nil"), attempting recovery via flush()",
-                category: .swPlayback
-            )
-        }
-        renderingTarget.flush()
     }
 
     /// [SWDiag] surface: current queue-target status for the 1 Hz diagnostic line. A mid-session
@@ -673,5 +560,30 @@ final class SampleBufferRenderer: @unchecked Sendable {
         )
         guard createStatus == noErr else { return nil }
         return sampleBuffer
+    }
+
+    /// Captures the most recently decoded video frame directly from the presentation buffer.
+    /// Scaled to `maxWidth` via CoreImage Metal pipeline with 0 extra HTTP reads or decoders.
+    func captureCurrentFrame(maxWidth: Int = 320) -> CGImage? {
+        capturedFrameLock.lock()
+        guard let buffer = _currentPixelBuffer else {
+            capturedFrameLock.unlock()
+            return nil
+        }
+        capturedFrameLock.unlock()
+
+        let ciImage = CIImage(cvPixelBuffer: buffer)
+        let extent = ciImage.extent
+        guard extent.width > 0, extent.height > 0 else { return nil }
+
+        let scale = min(1.0, CGFloat(maxWidth) / extent.width)
+        let scaledImage: CIImage
+        if scale < 1.0 {
+            scaledImage = ciImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        } else {
+            scaledImage = ciImage
+        }
+
+        return ciContext.createCGImage(scaledImage, from: scaledImage.extent)
     }
 }

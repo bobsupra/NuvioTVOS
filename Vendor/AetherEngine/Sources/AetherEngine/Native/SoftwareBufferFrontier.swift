@@ -21,10 +21,12 @@ enum SoftwareBufferFrontier {
     }
 
     /// `clock.bufferedPosition` for a software session. `liveFrontier` is the newest demuxed source
-    /// PTS in session time, which only live sessions feed (`noteEdge` is gated on `isLive`); on VOD
-    /// it is 0 and the cushion is the only thing that can carry a frontier. AetherEngine#54: the
-    /// result never trails the playhead.
-    static func bufferedPosition(currentTime: Double, liveFrontier: Double, cushion: Double?) -> Double {
-        max(currentTime, liveFrontier, currentTime + (cushion ?? 0))
+    /// PTS in session time, which only live sessions feed (`noteEdge` is gated on `isLive`).
+    /// `cachedVODFrontier` is the compressed A/V packet coverage, not a bitrate estimate or a
+    /// decoded-frame reservoir. Unknown coverage leaves the old cushion fallback intact.
+    /// AetherEngine#54: the result never trails the playhead.
+    static func bufferedPosition(currentTime: Double, liveFrontier: Double, cushion: Double?,
+                                 cachedVODFrontier: Double? = nil) -> Double {
+        max(currentTime, liveFrontier, currentTime + (cushion ?? 0), cachedVODFrontier ?? currentTime)
     }
 }

@@ -17,6 +17,28 @@ extension HLSVideoEngine {
 
     // MARK: - Segment planning
 
+    /// Whether the cue prewarm may run at all (AE#550).
+    ///
+    /// The prewarm exists to make libavformat load a container index by seeking into the middle of the
+    /// file, and it is priced as "one or two byte-range reads, and a seek that fails fast where it
+    /// cannot". On a source the demuxer cannot reposition, the second half of that price is wrong:
+    /// libavformat implements a forward seek on a non-seekable pb by READING and discarding, so the
+    /// prewarm walks to the middle of the source, and on an origin that answers exactly one unranged
+    /// GET there is no second pass for the producer to read.
+    ///
+    /// Measured on a range-less HTTPS origin (a 30.9 MB MKV, `--sequential-origin`): the prewarm
+    /// reported success after 2.5 s having consumed the whole file, and the session died on
+    /// `#126 VOD pump reached eof without producing anything (0 packets written, 0 segments cached)`.
+    /// With the prewarm skipped the same source plans on uniform stride and plays.
+    ///
+    /// The line below this one in the planner already skips its IRAP spacing scan for the same reason
+    /// ("the scan would consume the non-replayable prefix"); this closes the larger hole above it.
+    /// A segmented reader is excluded for the AE#268 reason instead: it has no index to load and every
+    /// reposition refetches a segment.
+    static func cuePrewarmMayRun(hasSegmentedReader: Bool, isSourceSeekable: Bool) -> Bool {
+        !hasSegmentedReader && isSourceSeekable
+    }
+
     /// True when the indexed keyframe list is dense enough AND wide enough to trust for a keyframe-aligned plan (#64, #91).
     ///
     /// MPEG-TS / M2TS have no upfront keyframe table the way MKV Cues / MP4 stss do: the libavformat

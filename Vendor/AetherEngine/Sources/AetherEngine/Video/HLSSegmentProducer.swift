@@ -610,14 +610,28 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// playing, so the source delivering again at +76 s was never seen and the session held its last
     /// frame for the rest of the run. Bounded by the same hold budget, so a consumer that stops
     /// fetching with runway still listed cannot keep a dead source open for the whole session.
+    /// AE#446 round 8: `hasEverProduced` is false while the producer has not cut anything at all,
+    /// which is the window a JOIN is judged on rather than an outage. It decides one thing: a join
+    /// is never classified as a wedge. The wedge reading is "the cutter is being fed and cannot
+    /// cut", and before the first cut there is no evidence for it, because a cutter that has not
+    /// reached its first keyframe reads exactly like one that cannot cut what it is given. Its
+    /// deadline is 10 s, measured on a mid-session SSAI pod, and applying it to a join would retune
+    /// a healthy channel with a long GOP. So a join waits out the 35 s starvation deadline, at any
+    /// read rate, and neither hold applies to it: the #177 hold defers to video PTS that is still
+    /// advancing, and the round-3 hold to a closed window still feeding its consumer, and a join
+    /// that has cut nothing is delivering to nobody either way.
     static func noCutStallAction(
         stalledFor: TimeInterval,
         readRate: Double,
         videoPtsAdvanceSeconds: Double,
         consecutiveHolds: Int,
-        servingOutageRunway: Bool = false
+        servingOutageRunway: Bool = false,
+        hasEverProduced: Bool = true
     ) -> NoCutStallAction {
-        let isWedge = readRate >= liveWedgeProgressRateThreshold
+        let isWedge = hasEverProduced && readRate >= liveWedgeProgressRateThreshold
+        guard hasEverProduced else {
+            return stalledFor > liveSourceStarvationTimeoutSeconds ? .exitForRetune : .keepReading
+        }
         let timeout = isWedge ? liveSegmentStallTimeoutSeconds : liveSourceStarvationTimeoutSeconds
         guard stalledFor > timeout else { return .keepReading }
         if isWedge,
@@ -753,17 +767,6 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// #443 measured the same shape against Jellyfin at a 3.9 s cadence, and 180 x 3.9 s is where his
     /// session froze, three campaigns running.
     private static let liveResidentSegmentCap = 180
-
-    static func qosName(_ c: qos_class_t) -> String {
-        switch c {
-        case QOS_CLASS_USER_INTERACTIVE: return "userInteractive"
-        case QOS_CLASS_USER_INITIATED: return "userInitiated"
-        case QOS_CLASS_DEFAULT: return "default"
-        case QOS_CLASS_UTILITY: return "utility"
-        case QOS_CLASS_BACKGROUND: return "background"
-        default: return "unspecified"
-        }
-    }
 
     /// AE#286: how much produced-but-unfetched content has to sit ahead of the consumer before the
     /// pump's work stops being latency-critical. `HLSLocalServer` answers segment requests from a
@@ -955,12 +958,22 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// beginning at 11.6 s, the restart-witness fixture at 0.083 s). Comparing them raw published
     /// every restarted epoch a whole anchor early, which is what the fixture-backed restart-continuity
     /// tests caught.
+    ///
+    /// AE#509: and never below zero. `tfdt` carries `unsigned int(64)` (ISO/IEC 14496-12), so a
+    /// negative item axis is not expressible at all: movenc writes the value as-is and AVPlayer reads
+    /// `baseMediaDecodeTime = 2^64 - |dts|`, about six million years, against a playlist that starts
+    /// at 0. The item then fetches the whole window and places none of it, with no error and no
+    /// stall of its own. libavformat produces those negative timestamps by design, not by accident:
+    /// an MPEG-TS whose first DTS sits within 60 s of the 33-bit PTS wrap is classified
+    /// `AV_PTS_WRAP_SUB_OFFSET` and every timestamp comes out 2^33 ticks low (demux.c, "correct first
+    /// time stamps to negative values"). That is an ordinary live join, not an early-opening gate,
+    /// and the clamp is what keeps the two apart.
     static func pinnedFirstTfdtPts(
         actualFirstDts: Int64, desiredTfdtPts: Int64, planAnchorPts: Int64
     ) -> Int64 {
         guard actualFirstDts != Int64.min else { return desiredTfdtPts }
         let actualItemPts = actualFirstDts &- planAnchorPts
-        return actualItemPts < desiredTfdtPts ? actualItemPts : desiredTfdtPts
+        return max(0, actualItemPts < desiredTfdtPts ? actualItemPts : desiredTfdtPts)
     }
 
     /// AE#418: the offset the HOST folds, which is not the offset the MUXER applies.
@@ -1119,7 +1132,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// `firstItemTfdtPts` is this producer's planned first tfdt, i.e. the item-axis position (same TB) from which
     /// its shift applies. Everything below it on the item axis was muxed by an earlier producer under an earlier
     /// shift and may still be in AVPlayer's buffer, so a consumer needs the pair, not the shift alone (#260).
-    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64) -> Void)?
+    var onVideoShiftKnown: (@Sendable (_ shiftPts: Int64, _ firstItemTfdtPts: Int64, _ normalizationShiftPts: Int64) -> Void)?
 
     /// Fires at live program boundary with updated videoShiftPts and seamOutputSeconds (AVPlayer clock position of the seam).
     /// Distinct from onVideoShiftKnown: the new shift is at the producer edge, AVPlayer renders it buffer+holdback later.
@@ -1704,6 +1717,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
         defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.backpressureWedgeLogThresholdSeconds
+        // AE#528: the wait below returns on ANY cache broadcast (a consumer GET that moves the fetch
+        // target, a stored segment), not only at its timeout, so one iteration is a wakeup and not a
+        // second. Everything under it is expressed in seconds, so the seconds come from the clock.
+        var parkClock = ParkClock(nowNanos: DispatchTime.now().uptimeNanoseconds)
         // #65 Piece A: a genuine VOD wedge is the consumer fetch target frozen past the break threshold.
         // The detector resets whenever the target advances, so healthy backpressure (slow CDN, cold cache)
         // keeps the target climbing and never trips. Live keeps its own pump watchdogs.
@@ -1728,7 +1745,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
                 return true
             }
-            parked += 1
+            guard let parkedSeconds = parkClock.advance(nowNanos: DispatchTime.now().uptimeNanoseconds)
+            else { continue }
+            parked = parkedSeconds
             let cacheTarget = cache.targetIndex
             // #65 pause false-positive: a paused/backgrounded VOD consumer issues no forward fetch, so its
             // frozen fetch target is not a wedge. Gate the detector on play intent (nil provider = assume
@@ -1736,22 +1755,30 @@ final class HLSSegmentProducer: @unchecked Sendable {
             let wantsToPlay = wantsToPlayProvider?() ?? true
             // #35/#93 cold-startup: before the first frame lands a flat clock is pre-roll, not a wedge.
             let hasStarted = hasStartedRenderingProvider?() ?? true
+            // AE#528: observed BEFORE the log line so `stuck=` names this poll and not the last one.
+            let tripped = !isLive && wedgeDetector.observe(currentTarget: cacheTarget,
+                                                           wantsToPlay: wantsToPlay,
+                                                           renderedPosition: playbackPositionProvider?(),
+                                                           hasStartedRendering: hasStarted)
             if !isLive, parked >= nextLogAt {
                 nextLogAt += 10
                 let suspendReason = !wantsToPlay ? "(consumer paused; wedge detection suspended)"
                     : !hasStarted ? "(pre-first-frame; wedge detection suspended)"
+                    // AE#528: a park is not a stall. What decides is whether the consumer is still
+                    // asking for segments, and stuck= is that number: 0 is a viewer scrubbing through
+                    // resident content, a climbing one is a consumer that went quiet.
+                    : wedgeDetector.secondsSinceTargetMoved == 0 ? "(consumer still fetching)"
                     : "(no playback progress)"
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure PARK (\(context)) head=\(head) "
                     + "target=\(target) cacheTarget=\(cacheTarget) "
                     + "highStored=\(cache.highestStoredIndex) cached=\(cache.count) parked=\(parked)s "
+                    + "stuck=\(wedgeDetector.secondsSinceTargetMoved)s "
                     + suspendReason,
                     category: .session
                 )
             }
-            if !isLive, wedgeDetector.observe(currentTarget: cacheTarget, wantsToPlay: wantsToPlay,
-                                              renderedPosition: playbackPositionProvider?(),
-                                              hasStartedRendering: hasStarted) {
+            if tripped {
                 markBackpressureWedgeBroken()
                 EngineLog.emit(
                     "[HLSSegmentProducer] #65 backpressure WEDGE BROKEN (\(context)) head=\(head) "
@@ -1854,6 +1881,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         defer { sideReaderLinkGate?.videoFetchBegan() }
         var parked = 0
         var nextLogAt = Self.prefetchDiskParkLogThresholdSeconds
+        // AE#528: same wakeup-is-not-a-second correction as the advance park; this loop's own doc
+        // above claims a one second cadence and the headroom wait returns on every cache broadcast.
+        var parkClock = ParkClock(nowNanos: DispatchTime.now().uptimeNanoseconds)
         var wedgeDetector = detectWedge && !isLive
             ? BackpressureWedgeDetector(
                 breakThresholdSeconds: Self.backpressureWedgeBreakThresholdSeconds,
@@ -1875,7 +1905,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
                 }
                 return true
             }
-            parked += 1
+            guard let parkedSeconds = parkClock.advance(nowNanos: DispatchTime.now().uptimeNanoseconds)
+            else { continue }
+            parked = parkedSeconds
             if parked >= nextLogAt {
                 nextLogAt += 30
                 EngineLog.emit(
@@ -2543,8 +2575,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
         // Read the class back: a thread that was opted out of the QoS system silently keeps the old
         // one, and then the whole mechanism is a no-op that still looks configured.
         EngineLog.emit(
-            "[HLSSegmentProducer] pump qos -> \(Self.qosName(desired)) "
-            + "(now=\(Self.qosName(qos_class_self())) epochHead=\(pumpEpochHighestStored) "
+            "[HLSSegmentProducer] pump qos -> \(QoSClass.name(desired)) "
+            + "(now=\(QoSClass.name(qos_class_self())) epochHead=\(pumpEpochHighestStored) "
             + "target=\(target) lead=\(lead))",
             category: .session
         )
@@ -2690,7 +2722,16 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// its own plan and has no live edge to fall behind.
     private func startNoCutWatchdog() {
         let watchdog = NoCutStallWatchdog(videoTimeBaseSeconds: sourceVideoTbSeconds)
-        if let already = lastLiveSegmentFinalizeAt { watchdog.noteFinalize(at: already) }
+        // AE#446 round 8: the window used to begin at the first cut, which is stamped when the video
+        // gate opens. A source that stops before it delivers one video packet therefore had no
+        // deadline at all: nothing to time out, nothing logged, the host never told. Arm the window
+        // here, so "the pump has been reading and nothing was ever cut" is judged like any other
+        // starved source.
+        if let already = lastLiveSegmentFinalizeAt {
+            watchdog.noteFinalize(at: already)
+        } else {
+            watchdog.armForJoin(at: Date())
+        }
         noCutWatchdog = watchdog
         let timer = DispatchSource.makeTimerSource(queue: noCutWatchdogQueue)
         timer.schedule(deadline: .now() + Self.noCutWatchdogTickSeconds,
@@ -2735,11 +2776,13 @@ final class HLSSegmentProducer: @unchecked Sendable {
             )
         case .exitForRetune(let w):
             EngineLog.emit(
-                "[HLSSegmentProducer] no-cut stall: no segment finalized for "
+                (w.everProduced
+                 ? "[HLSSegmentProducer] no-cut stall: no segment finalized for "
+                 : "[HLSSegmentProducer] #446 the join never cut anything: nothing produced in ")
                 + "\(Int(w.stalledFor))s (packetsRead=\(w.packetsRead), "
                 + "sinceFinalize=\(w.progress), "
                 + "rate=\(String(format: "%.1f", w.readRate))pkt/s, "
-                + "\(w.isWedge ? "cutter wedge" : "source starvation")); "
+                + "\(w.everProduced ? (w.isWedge ? "cutter wedge" : "source starvation") : "the video gate never opened, so nothing was ever cut to serve")); "
                 + "window video=\(w.videoPackets) key=\(w.videoKeyframes) "
                 + "audio=\(w.audioPackets) foreign=\(w.foreignPackets)"
                 + (w.synthesizedVideoPackets > 0
@@ -2769,7 +2812,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         pumpEpochHighestStored = Int.min
         pthread_set_qos_class_self_np(pumpQoSCurrent, 0)
         EngineLog.emit(
-            "[HLSSegmentProducer] pump thread qos=\(Self.qosName(qos_class_self()))",
+            "[HLSSegmentProducer] pump thread qos=\(QoSClass.name(qos_class_self()))",
             category: .session
         )
         if restartTargetVideoPts > Int64.min {
@@ -3500,7 +3543,8 @@ final class HLSSegmentProducer: @unchecked Sendable {
                             Self.presentedShiftPts(
                                 actualFirstPts: firstActualVideoPts,
                                 desiredTfdtPts: desiredFirstVideoTfdtPts),
-                            desiredFirstVideoTfdtPts)
+                            desiredFirstVideoTfdtPts,
+                            videoShiftPts)
                         // #133 follow-up: the gating IDR's in-band SPS/PPS back this epoch's muxer avcC. Establish
                         // the baseline so a later same-PID parameter-set change (encoder restart / regional splice)
                         // is detected against it. joinConfig is non-nil only in the liveH264AnnexBJoin scope.

@@ -156,8 +156,13 @@ enum VideoRoutingPolicy {
     static func softwarePathCannotRepresent(
         codecID: AVCodecID,
         dvProfile: Int?,
-        dvBlCompatID: Int?
+        dvBlCompatID: Int?,
+        presentsDolbyVisionBaseLayer: Bool = false
     ) -> Bool {
+        // The base-layer route exists for a record the VUI contradicts, and it is only taken when the
+        // VUI names a YCbCr base (`dolbyVisionBaseLayerIsPresentable`), so the IPT class this guard
+        // exists for never reaches it.
+        if presentsDolbyVisionBaseLayer { return false }
         switch codecID {
         case AV_CODEC_ID_HEVC:
             return dvProfile == 5
@@ -166,5 +171,76 @@ enum VideoRoutingPolicy {
         default:
             return false
         }
+    }
+
+    /// Whether a Dolby Vision source carries a base layer that can be presented on its own as HDR10 /
+    /// HLG, i.e. what `LoadOptions.dolbyVisionHandling = .baseLayerOnly` can act on.
+    ///
+    /// For HEVC Profile 7 / 8.1 / 8.4 and AV1 Profile 10.1 / 10.4 the record says so (a compatibility
+    /// id of 1 or 4, or the dual-layer profile whose base layer is HDR10 by definition); 8.2 and 10.2
+    /// declare an SDR base and are admitted with them, though there the option moves nothing but the
+    /// display criteria, the engine already serving that base layer as plain `hvc1` / `av01` (the
+    /// predicate table in `DolbyVisionBaseLayerTests` pins that). Profile 5 and AV1 Profile 10.0 say the
+    /// opposite: compatibility 0 is IPT-PQ-c2, a signal no YCbCr pipeline can show, which is why the
+    /// software path refuses them (#176). The VUI is the tie-breaker for that class. A genuine Profile 5
+    /// leaves `matrix_coeffs` and `transfer_characteristics` unspecified because IPT has no VUI code
+    /// point, so a Profile 5 record over a VUI that declares BT.2020 YCbCr with a PQ or HLG transfer is
+    /// a container contradicting its own bitstream, and the bitstream is the half a decoder consumes.
+    /// The measured shape is a Profile 7 remux whose record was rewritten to Profile 5: the RPU still
+    /// carries the NLQ and residual fields only Profile 7 has, the mapping is the identity, and the base
+    /// layer is plain HDR10 with its own static metadata. Presenting that base layer is what every
+    /// player that ignores the record does with it, and what this predicate admits.
+    static func dolbyVisionBaseLayerIsPresentable(
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dvBlCompatID: Int?,
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace
+    ) -> Bool {
+        guard let dvProfile else { return false }
+        switch codecID {
+        case AV_CODEC_ID_HEVC:
+            switch dvProfile {
+            case 7: return true
+            case 8: return true
+            case 5: return vuiDeclaresYCbCrHDRBase(colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+            default: return false
+            }
+        case AV_CODEC_ID_AV1:
+            guard dvProfile == 10 else { return false }
+            if let dvBlCompatID, dvBlCompatID != 0 { return true }
+            return vuiDeclaresYCbCrHDRBase(colorTransfer: colorTransfer, colorMatrix: colorMatrix)
+        default:
+            return false
+        }
+    }
+
+    /// A VUI that names a BT.2020 YCbCr base with an HDR transfer: what an HDR10 or HLG base layer
+    /// declares, and what IPT-PQ-c2 cannot (its matrix has no code point, so a genuine Profile 5 leaves
+    /// both unspecified).
+    static func vuiDeclaresYCbCrHDRBase(
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace
+    ) -> Bool {
+        let hdrTransfer = colorTransfer == AVCOL_TRC_SMPTE2084 || colorTransfer == AVCOL_TRC_ARIB_STD_B67
+        let ycbcrMatrix = colorMatrix == AVCOL_SPC_BT2020_NCL || colorMatrix == AVCOL_SPC_BT2020_CL
+        return hdrTransfer && ycbcrMatrix
+    }
+
+    /// `LoadOptions.dolbyVisionHandling` resolved against the source: true when the host asked for the
+    /// base layer AND the source has one to present. Both halves are here so the format clamp, the
+    /// criteria request, the codec route and the software-path guard read one answer.
+    static func presentsDolbyVisionBaseLayer(
+        handling: DolbyVisionHandling,
+        codecID: AVCodecID,
+        dvProfile: Int?,
+        dvBlCompatID: Int?,
+        colorTransfer: AVColorTransferCharacteristic,
+        colorMatrix: AVColorSpace
+    ) -> Bool {
+        guard handling == .baseLayerOnly else { return false }
+        return dolbyVisionBaseLayerIsPresentable(
+            codecID: codecID, dvProfile: dvProfile, dvBlCompatID: dvBlCompatID,
+            colorTransfer: colorTransfer, colorMatrix: colorMatrix)
     }
 }

@@ -315,8 +315,15 @@ extension HLSVideoEngine {
             return
         case .segmentStall:
             // SSAI ad pod the cutter can't cut through; URL reopen would re-enter it. Delegate to host for server-muxed fallback.
+            //
+            // AE#446 round 8: unless the gate never opened, in which case there was no cutter to
+            // stall and no pod to blame. Same delegation, but the line has to say which of the two
+            // it saw, because the two send a reader looking in different places.
             EngineLog.emit(
-                "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
+                (prod.videoGateOpened
+                 ? "[HLSVideoEngine] live segment cutter stalled (likely SSAI ad pod); "
+                 : "[HLSVideoEngine] live join produced nothing at all (no video packet ever "
+                   + "reached the cutter, so the source is not delivering the video it declares); ")
                 + "requesting host retune to the server route",
                 category: .session
             )
@@ -713,7 +720,7 @@ extension HLSVideoEngine {
                 liveReopenOutputEndSeconds: outputEnd
             )
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd
@@ -998,6 +1005,7 @@ extension HLSVideoEngine {
         // reporting a transport that no longer exists for the rest of the session.
         oldDem?.onNetworkPhaseChanged = nil
         dem.onNetworkPhaseChanged = onNetworkPhaseChanged
+        dem.playIntentProvider = playIntentProvider   // #377: the reopened held connection is bounded by a pause, not by a parked producer
         let (nextIndex, outputEnd) = prov.liveContinuationPoint()
         do {
             let newProd = try makeProducer(
@@ -1006,7 +1014,7 @@ extension HLSVideoEngine {
             )
             // Fresh connection joins the broadcast at "now"; source clock jumps, so the seam carries #EXT-X-DISCONTINUITY. Shift handoff deferred to seam to avoid jumping the host clock while pre-loss content is on screen.
             newProd.firstSegmentDiscontinuous = true
-            newProd.onVideoShiftKnown = { [weak self] shiftPts, _ in
+            newProd.onVideoShiftKnown = { [weak self] shiftPts, _, _ in
                 self?.handleLiveTimelineRebase(shiftPts, seamOutputSeconds: outputEnd)
             }
             producer = newProd

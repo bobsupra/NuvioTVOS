@@ -501,6 +501,35 @@ final class SegmentCache: @unchecked Sendable {
         return initSegment
     }
 
+    /// Wait until `init.mp4` has been captured and stored.
+    func awaitInit(timeout: TimeInterval = 10.0) -> Bool {
+        condition.lock()
+        defer { condition.unlock() }
+        if initSegment != nil { return true }
+        if closed { return false }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !closed, initSegment == nil {
+            if !condition.wait(until: deadline) { break }
+        }
+        return initSegment != nil
+    }
+
+    /// Wait until segment `index` is stored on disk and verified to exist.
+    func awaitSegment(index: Int, timeout: TimeInterval = 10.0) -> Bool {
+        if peekURL(index: index) != nil { return true }
+        condition.lock()
+        if closed {
+            condition.unlock()
+            return false
+        }
+        let deadline = Date().addingTimeInterval(timeout)
+        while !closed, entries[index] == nil {
+            if !condition.wait(until: deadline) { break }
+        }
+        condition.unlock()
+        return peekURL(index: index) != nil
+    }
+
     /// Pump-side backpressure: one-shot wait for target or any broadcast. Returns true if target met.
     func awaitFetchHighWater(reaching target: Int, timeout: TimeInterval = 1.0) -> Bool {
         condition.lock()

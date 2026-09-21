@@ -3,24 +3,20 @@ import AetherLibavcodec
 import AetherLibavutil
 import Dovi
 
-/// In-place DV P7 -> P8.1 rewrite: drops unspec63 EL NALs, rewrites unspec62 RPU via libdovi mode 2. The packet's NAL framing is preserved; libdovi handles emulation-prevention bytes internally.
+/// In-place DV P7 -> P8.1 rewrite: drops unspec63 EL NALs, rewrites unspec62 RPU via libdovi mode 2. AVCC layout (4-byte BE length prefix); libdovi handles emulation-prevention bytes internally.
 public enum DoviRpuConverter {
 
     private static let nalTypeRPU: UInt8 = 62   // unspec62: Dolby Vision RPU
     private static let nalTypeEL: UInt8  = 63   // unspec63: enhancement layer
-    /// Return the number of bytes used by the packet's output delimiter. Annex-B accepts either
-    /// three- or four-byte start codes; use the four-byte form consistently when rebuilding.
-    private static func outputDelimiterSize(_ framing: VideoNALFraming) -> Int? {
-        switch framing {
-        case .annexB: return 4
-        case .lengthPrefixed(let size): return (1...4).contains(size) ? size : nil
-        }
-    }
+    private static let lengthPrefixSize = 4
 
-    private static func writeLength(_ length: Int, to dst: UnsafeMutablePointer<UInt8>, width: Int) {
-        for i in 0..<width {
-            let shift = (width - i - 1) * 8
-            dst[i] = UInt8((length >> shift) & 0xFF)
+    /// Both framings this rewrite can emit use a 4-byte prefix, so the packet keeps its layout maths.
+    /// A 1/2/3-byte length prefix would need the hvcC's `lengthSizeMinusOne` to agree with whatever we
+    /// wrote; rather than write a framing the sample entry does not declare, leave the packet alone.
+    private static func canRebuild(_ framing: VideoNALFraming) -> Bool {
+        switch framing {
+        case .annexB: return true
+        case .lengthPrefixed(let size): return size == lengthPrefixSize
         }
     }
 
@@ -39,7 +35,8 @@ public enum DoviRpuConverter {
         framing: VideoNALFraming = .lengthPrefixed(size: 4)
     ) -> Bool {
         guard let data = packet.pointee.data, packet.pointee.size > 0 else { return true }
-        guard let delimiterSize = Self.outputDelimiterSize(framing) else { return false }
+        guard packet.pointee.size > 4 else { return true }
+        guard Self.canRebuild(framing) else { return true }
         let size = Int(packet.pointee.size)
 
         var outputNALs: [[UInt8]] = []
@@ -94,24 +91,9 @@ public enum DoviRpuConverter {
             return true
         }
 
-        // A length-prefixed sample cannot represent a NAL larger than its declared prefix. A
-        // converted RPU can grow, so drop only that RPU and degrade to the clean base-layer
-        // packet; retaining it would put P7 metadata into a P8.1-signalled track. A malformed
-        // oversized non-RPU NAL is left untouched and reported as unsupported.
-        if case .lengthPrefixed(let width) = framing, width < 4 {
-            let maximum = (1 << (width * 8)) - 1
-            for nal in outputNALs where nal.count > maximum {
-                guard nal.count >= 2, ((nal[0] >> 1) & 0x3F) == nalTypeRPU else { return false }
-                degraded = true
-            }
-            outputNALs.removeAll { nal in
-                nal.count > maximum && nal.count >= 2 && ((nal[0] >> 1) & 0x3F) == nalTypeRPU
-            }
-        }
-
         var total = 0
         for nal in outputNALs {
-            total += delimiterSize + nal.count
+            total += lengthPrefixSize + nal.count
         }
         // Degenerate: all NALs were RPU/EL. Leave the packet untouched rather than emit a zero-length video packet.
         guard total > 0 else { return true }
@@ -133,9 +115,12 @@ public enum DoviRpuConverter {
             if emitsStartCodes {
                 dst[w + 0] = 0; dst[w + 1] = 0; dst[w + 2] = 0; dst[w + 3] = 1
             } else {
-                Self.writeLength(n, to: dst + w, width: delimiterSize)
+                dst[w + 0] = UInt8((n >> 24) & 0xFF)
+                dst[w + 1] = UInt8((n >> 16) & 0xFF)
+                dst[w + 2] = UInt8((n >> 8) & 0xFF)
+                dst[w + 3] = UInt8(n & 0xFF)
             }
-            w += delimiterSize
+            w += lengthPrefixSize
             nal.withUnsafeBufferPointer { src in
                 if let base = src.baseAddress, n > 0 {
                     memcpy(dst + w, base, n)
@@ -161,7 +146,7 @@ public enum DoviRpuConverter {
         _ packet: UnsafePointer<AVPacket>,
         framing: VideoNALFraming = .lengthPrefixed(size: 4)
     ) -> String? {
-        guard let data = packet.pointee.data, packet.pointee.size > 0 else { return nil }
+        guard let data = packet.pointee.data, packet.pointee.size > 4 else { return nil }
         let size = Int(packet.pointee.size)
 
         var result: String?

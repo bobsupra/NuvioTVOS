@@ -12,6 +12,21 @@ extension HLSVideoEngine {
         case vorbis, pcm, mp2
         /// LATM/LOAS-framed AAC (DVB-T2/IPTV, typically HE-AAC); no ADTS headers, no ASC in extradata, always bridges via aac_latm decoder.
         case aacLatm
+        /// Every Windows Media audio flavour (Standard, Pro, Lossless, Voice), which arrives with the
+        /// native .wmv / .asf support of FFmpegBuild 3.1.0. None is fMP4-legal, so all bridge. One case
+        /// rather than five: nothing downstream distinguishes them.
+        case wma
+        /// The Flash era's own audio, which arrives with the native `.flv` decoders of FFmpegBuild
+        /// 3.2.0. Three cases rather than one family, unlike `wma` above: these are unrelated codecs
+        /// that only share a container, and the routing log prints this name, so an operator reading
+        /// `codec=nellymoser` learns what the file carries. None is fMP4-legal, so all three bridge.
+        case nellymoser, adpcmSwf, speex
+        /// What this case costs is the STREAM-COPY decision, not the audio. Since the bridge cascade
+        /// was rewired (2026-05-13) it asks libavcodec for a decoder by id and never consults this
+        /// table, so a codec that lands here still plays if the build carries its decoder; measured
+        /// 2026-09-10 on Nellymoser-in-FLV before its entry existed. Silence has one cause and it is
+        /// the FFmpeg build: no decoder, `AudioBridge` init fails, and the cascade ends in
+        /// `droppedNoPipeline`. That is why a format chain ships whole, decoders and all.
         case unsupported
 
         static func from(_ codecID: AVCodecID) -> AudioCodecCompat {
@@ -28,12 +43,26 @@ extension HLSVideoEngine {
             case AV_CODEC_ID_DTS:    return .dts
             case AV_CODEC_ID_VORBIS: return .vorbis
             case AV_CODEC_ID_MP2:    return .mp2
+            case AV_CODEC_ID_WMAV1,
+                 AV_CODEC_ID_WMAV2,
+                 AV_CODEC_ID_WMAPRO,
+                 AV_CODEC_ID_WMALOSSLESS,
+                 AV_CODEC_ID_WMAVOICE:
+                return .wma
+            case AV_CODEC_ID_NELLYMOSER: return .nellymoser
+            case AV_CODEC_ID_ADPCM_SWF:  return .adpcmSwf
+            case AV_CODEC_ID_SPEEX:      return .speex
+            // G.711 A-law / mu-law sit here rather than in a case of their own: libavcodec spells
+            // them pcm_alaw / pcm_mulaw, they decode to the same S16 the raw shapes do, and nothing
+            // downstream of the bridge tells them apart. FLV is where they turn up.
             case AV_CODEC_ID_PCM_S16LE,
                  AV_CODEC_ID_PCM_S24LE,
                  AV_CODEC_ID_PCM_F32LE,
                  AV_CODEC_ID_PCM_S16BE,
                  AV_CODEC_ID_PCM_S32LE,
-                 AV_CODEC_ID_PCM_U8:
+                 AV_CODEC_ID_PCM_U8,
+                 AV_CODEC_ID_PCM_ALAW,
+                 AV_CODEC_ID_PCM_MULAW:
                 return .pcm
             default: return .unsupported
             }
@@ -47,7 +76,8 @@ extension HLSVideoEngine {
             case .eac3:   return "ec-3"
             case .flac:   return "fLaC"
             case .alac:   return "alac"
-            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .unsupported:
+            case .mp3, .opus, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
+                 .nellymoser, .adpcmSwf, .speex, .unsupported:
                 // mp3: theoretically mp4a.40.34, but AVPlayer treats any mp4a as AAC and fails; bridge to FLAC.
                 return ""
             }
@@ -56,7 +86,8 @@ extension HLSVideoEngine {
         /// Codecs that must go through AudioBridge. Opus is fMP4-spec-legal but AVPlayer rejects it in HLS-fMP4 in practice (only CAF/WebM paths work). MP3 writes `mp4a.40.34` but AVPlayer treats any mp4a as AAC, failing with -11829/-12848.
         var requiresBridge: Bool {
             switch self {
-            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm: return true
+            case .opus, .mp3, .truehd, .dts, .vorbis, .pcm, .mp2, .aacLatm, .wma,
+                 .nellymoser, .adpcmSwf, .speex: return true
             default: return false
             }
         }

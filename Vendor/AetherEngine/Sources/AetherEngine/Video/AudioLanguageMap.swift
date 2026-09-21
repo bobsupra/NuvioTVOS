@@ -53,7 +53,7 @@ enum AudioLanguageMap {
     ///
     /// **The display name is the validity gate that canonicalization is not.** `canonicalLanguageIdentifier`
     /// echoes its input for ANYTHING it does not know, so "cnr" -> "cnr" and "dub" -> "dub" are the same
-    /// answer and pass-through on that signal alone would label a track tagged `dub` or `com` as a language.
+    /// answer and pass-through on that signal alone would label a track tagged `dub` or `sfx` as a language.
     /// `localizedString(forLanguageCode:)` returns nil for those and "Montenegrin" for `cnr`.
     ///
     /// The reference locale is FIXED, not `Locale.current`: `cnr` has an English display name and no German
