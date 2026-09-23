@@ -85,7 +85,7 @@ enum ContinueWatchingBuilder {
     /// Coalesces rebuild requests; the newest request wins.
     static func scheduleRebuild(reason: String) {
         rebuildTask?.cancel()
-        rebuildTask = Task { @MainActor in
+        rebuildTask = Task.detached(priority: .utility) {
             await rebuild(reason: reason)
         }
     }
@@ -97,12 +97,16 @@ enum ContinueWatchingBuilder {
         // and this derived one is never shown. Keep syncing rows into the ledger,
         // but do not spend metadata requests rendering something invisible.
         guard !RemoteTrackingState.isProgressSourceAuthenticated else {
-            diagnostic = "\(reason): skipped, remote progress source active"
+            await MainActor.run {
+                diagnostic = "\(reason): skipped, remote progress source active"
+            }
             return
         }
 
-        generation &+= 1
-        let currentGeneration = generation
+        let currentGeneration = await MainActor.run { () -> UInt in
+            generation &+= 1
+            return generation
+        }
         let profileId = WatchProgressLedger.activeProfileId
         // Metadata resolution below suspends. Keep the exact ledger input so a
         // playback save that lands while it is in flight cannot be overwritten
@@ -117,24 +121,29 @@ enum ContinueWatchingBuilder {
             )
             : []
         guard !candidates.isEmpty || !seeds.isEmpty else {
-            diagnostic = "\(reason): ledger empty"
-            plan = []
-            materialized = []
-            consumedEntries = 0
-            materializedProfileId = profileId
+            await MainActor.run {
+                diagnostic = "\(reason): ledger empty"
+                plan = []
+                materialized = []
+                consumedEntries = 0
+                materializedProfileId = profileId
+            }
             return
         }
 
-        plan = planEntries(candidates: candidates, seeds: seeds)
-        materialized = []
-        consumedEntries = 0
-        materializedProfileId = profileId
+        let currentPlan = planEntries(candidates: candidates, seeds: seeds)
+        let existingItems = ContinueWatchingStore.items()
+        let slice = Array(currentPlan.prefix(pageSize))
 
-        let page = await materializeNextPage(
+        let page = await materializeSlice(
+            slice: slice,
+            existingItems: existingItems,
             generation: currentGeneration,
             profileId: profileId
         )
-        guard !Task.isCancelled, currentGeneration == generation else { return }
+        guard !Task.isCancelled else { return }
+        let isCurrentGen = await MainActor.run { currentGeneration == generation }
+        guard isCurrentGen else { return }
 
         // Finishing an episode writes its completed ledger row and then saves a
         // display-only Next Up card. A rebuild that began before those writes
@@ -142,19 +151,31 @@ enum ContinueWatchingBuilder {
         // replace the freshly saved card with an empty page. Leave the newer
         // store untouched and derive it again from the completed ledger row.
         guard rebuildInputIsCurrent(ledgerSnapshot) else {
-            diagnostic = "\(reason): ledger changed while building, retrying"
-            scheduleRebuild(reason: "\(reason) (ledger changed)")
+            await MainActor.run {
+                diagnostic = "\(reason): ledger changed while building, retrying"
+                scheduleRebuild(reason: "\(reason) (ledger changed)")
+            }
             return
         }
 
         // Only the first page is persisted; it is what a cold start renders.
         ContinueWatchingStore.replaceAll(page.items)
-        diagnostic = "\(reason): ledger \(WatchProgressLedger.records().count), "
-            + "candidates \(candidates.count), seeds \(seeds.count), plan \(plan.count), "
+        let diagText = "\(reason): ledger \(WatchProgressLedger.records().count), "
+            + "candidates \(candidates.count), seeds \(seeds.count), plan \(currentPlan.count), "
             + "page 1 built \(page.items.count), showing \(ContinueWatchingStore.items().count), "
             + "lookups failed \(page.failedLookups)"
+
+        await MainActor.run {
+            guard currentGeneration == generation else { return }
+            plan = currentPlan
+            materialized = page.items
+            consumedEntries = slice.count
+            materializedProfileId = profileId
+            diagnostic = diagText
+        }
+
         TVHomeDebugTrace.log(
-            "cw.builder.rebuild.end page=\(page.items.count) plan=\(plan.count) "
+            "cw.builder.rebuild.end page=\(page.items.count) plan=\(currentPlan.count) "
                 + "failed=\(page.failedLookups) "
                 + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: rebuildStarted))"
         )
@@ -175,32 +196,49 @@ enum ContinueWatchingBuilder {
 
         let currentGeneration = generation
         let profileId = WatchProgressLedger.activeProfileId
-        _ = await materializeNextPage(generation: currentGeneration, profileId: profileId)
+        let currentConsumed = consumedEntries
+        let slice = Array(plan.dropFirst(currentConsumed).prefix(pageSize))
+        guard !slice.isEmpty else { return materialized }
+
+        let existingItems = ContinueWatchingStore.items() + materialized
+
+        let page = await materializeSlice(
+            slice: slice,
+            existingItems: existingItems,
+            generation: currentGeneration,
+            profileId: profileId
+        )
+        guard !Task.isCancelled, currentGeneration == generation,
+              profileId == WatchProgressLedger.activeProfileId else {
+            return materialized
+        }
+
+        consumedEntries += slice.count
+        materialized = retainingUnwatched(materialized + page.items)
         return materialized
     }
 
-    private struct PageResult {
+    private struct PageResult: Sendable {
         let items: [ContinueWatchingItem]
         let failedLookups: Int
     }
 
-    /// Resolves metadata for the next `pageSize` planned titles and appends the
-    /// ones that could be rendered. A title whose metadata cannot be fetched is
-    /// skipped for this pass and retried on the next rebuild — it stays in the
-    /// ledger regardless.
-    private static func materializeNextPage(
+    /// Resolves metadata for the slice of planned titles and appends the
+    /// ones that could be rendered. TMDB episode enrichments are fetched concurrently.
+    private static func materializeSlice(
+        slice: [PlanEntry],
+        existingItems: [ContinueWatchingItem],
         generation currentGeneration: UInt,
         profileId: String?
     ) async -> PageResult {
         let pageStarted = TVHomeDebugTrace.now()
-        let slice = Array(plan.dropFirst(consumedEntries).prefix(pageSize))
-        guard !slice.isEmpty else { return PageResult(items: materialized, failedLookups: 0) }
+        guard !slice.isEmpty else { return PageResult(items: [], failedLookups: 0) }
 
         // Already-rendered rows double as the metadata cache — they persist full
         // metadata including the episode guide.
         var metaById: [String: NuvioMeta] = [:]
         var existingById: [String: ContinueWatchingItem] = [:]
-        for item in ContinueWatchingStore.items() + materialized {
+        for item in existingItems {
             metaById[item.meta.id] = item.meta
             existingById[item.meta.id] = item
         }
@@ -226,21 +264,48 @@ enum ContinueWatchingBuilder {
                 + "resolved=\(fetched.count) "
                 + "fetchMs=\(TVHomeDebugTrace.elapsedMilliseconds(since: pageStarted))"
         )
-        guard !Task.isCancelled, currentGeneration == generation,
-              profileId == WatchProgressLedger.activeProfileId else {
-            return PageResult(items: materialized, failedLookups: 0)
+        guard !Task.isCancelled, profileId == WatchProgressLedger.activeProfileId else {
+            return PageResult(items: [], failedLookups: 0)
         }
         metaById.merge(fetched) { _, new in new }
 
-        var page: [ContinueWatchingItem] = []
+        struct ItemSpec {
+            let entry: PlanEntry
+            let meta: NuvioMeta?
+            let existing: ContinueWatchingItem?
+            let season: Int?
+            let episode: Int?
+            let video: NuvioVideo?
+            let isSeed: Bool
+            let currentSeedSeason: Int?
+        }
+
+        var specs: [ItemSpec] = []
         var failedLookups = 0
+
+        struct EnrichmentRequest {
+            let specIndex: Int
+            let meta: NuvioMeta
+            let season: Int
+            let episode: Int
+        }
+        var enrichmentRequests: [EnrichmentRequest] = []
 
         for entry in slice {
             let record = entry.record
             let existing = existingById[record.contentId]
             guard let meta = metaById[record.contentId] else {
                 failedLookups += 1
-                if let existing { page.append(existing) }
+                specs.append(ItemSpec(
+                    entry: entry,
+                    meta: nil,
+                    existing: existing,
+                    season: nil,
+                    episode: nil,
+                    video: nil,
+                    isSeed: entry.isSeed,
+                    currentSeedSeason: nil
+                ))
                 continue
             }
 
@@ -262,74 +327,157 @@ enum ContinueWatchingBuilder {
                     next = firstReleasedEpisode(in: meta)
                 }
                 guard let next else {
-                    // Caught up, or the guide could not be loaded this pass. A
-                    // card already on screen must not disappear for the latter.
-                    if let existing, existing.isUpNextEntry { page.append(existing) }
+                    specs.append(ItemSpec(
+                        entry: entry,
+                        meta: meta,
+                        existing: (existing?.isUpNextEntry == true) ? existing : nil,
+                        season: nil,
+                        episode: nil,
+                        video: nil,
+                        isSeed: true,
+                        currentSeedSeason: nil
+                    ))
                     continue
                 }
-                let tmdbEpisode = await EpisodeMetadataEnrichment.fetch(
+
+                let specIndex = specs.count
+                specs.append(ItemSpec(
+                    entry: entry,
+                    meta: meta,
+                    existing: existing,
+                    season: next.season,
+                    episode: next.episode,
+                    video: next,
+                    isSeed: true,
+                    currentSeedSeason: current?.season ?? next.season
+                ))
+                enrichmentRequests.append(EnrichmentRequest(
+                    specIndex: specIndex,
                     meta: meta,
                     season: next.season,
                     episode: next.episode
-                )
+                ))
+                continue
+            }
+
+            let video = episode(in: meta, season: record.season, episode: record.episode)
+            let specIndex = specs.count
+            specs.append(ItemSpec(
+                entry: entry,
+                meta: meta,
+                existing: existing,
+                season: record.season,
+                episode: record.episode,
+                video: video,
+                isSeed: false,
+                currentSeedSeason: nil
+            ))
+            if let season = record.season, let ep = record.episode {
+                enrichmentRequests.append(EnrichmentRequest(
+                    specIndex: specIndex,
+                    meta: meta,
+                    season: season,
+                    episode: ep
+                ))
+            }
+        }
+
+        // Concurrent TMDB Episode enrichment
+        var tmdbEpisodesBySpecIndex: [Int: EpisodeMetadataEnrichment.Episode] = [:]
+        if !enrichmentRequests.isEmpty {
+            await withTaskGroup(of: (Int, EpisodeMetadataEnrichment.Episode?).self) { group in
+                var index = 0
+                var inFlight = 0
+                func addNext() {
+                    guard index < enrichmentRequests.count else { return }
+                    let req = enrichmentRequests[index]
+                    index += 1
+                    inFlight += 1
+                    group.addTask {
+                        let ep = await EpisodeMetadataEnrichment.fetch(
+                            meta: req.meta,
+                            season: req.season,
+                            episode: req.episode
+                        )
+                        return (req.specIndex, ep)
+                    }
+                }
+                for _ in 0..<min(6, enrichmentRequests.count) { addNext() }
+                while inFlight > 0 {
+                    guard let (idx, ep) = await group.next() else { break }
+                    inFlight -= 1
+                    if let ep { tmdbEpisodesBySpecIndex[idx] = ep }
+                    addNext()
+                }
+            }
+        }
+
+        // Assemble page items
+        var page: [ContinueWatchingItem] = []
+        for (idx, spec) in specs.enumerated() {
+            guard let meta = spec.meta else {
+                if let existing = spec.existing { page.append(existing) }
+                continue
+            }
+            let tmdbEpisode = tmdbEpisodesBySpecIndex[idx]
+            let existing = spec.existing
+            let record = spec.entry.record
+
+            if spec.isSeed {
+                guard let season = spec.season, let ep = spec.episode, let next = spec.video else {
+                    if let existing, existing.isUpNextEntry { page.append(existing) }
+                    continue
+                }
                 page.append(
                     ContinueWatchingItem(
                         meta: meta,
                         streamUrl: "",
                         position: 1,
-                        // Reuse the finished episode's runtime as the estimate.
                         duration: max(record.duration, 120),
                         lastWatchedAt: record.lastWatchedAt,
-                        season: next.season,
-                        episode: next.episode,
+                        season: season,
+                        episode: ep,
                         released: tmdbEpisode?.released ?? next.released,
                         episodeTitleOverride: tmdbEpisode?.title ?? nonPlaceholder(next.title),
                         episodeOverviewOverride: tmdbEpisode?.overview ?? nonEmpty(next.overview),
                         episodeThumbnailOverride: tmdbEpisode?.thumbnail ?? next.thumbnail,
                         isUpNext: true,
-                        upNextSeedSeason: current?.season ?? next.season
+                        upNextSeedSeason: spec.currentSeedSeason ?? season
                     )
                 )
-                continue
-            }
-
-            let sameEpisode = existing?.season == record.season && existing?.episode == record.episode
-            let video = episode(in: meta, season: record.season, episode: record.episode)
-            let tmdbEpisode = await EpisodeMetadataEnrichment.fetch(
-                meta: meta,
-                season: record.season,
-                episode: record.episode
-            )
-            page.append(
-                ContinueWatchingItem(
-                    meta: meta,
-                    streamUrl: sameEpisode ? (existing?.streamUrl ?? "") : "",
-                    position: record.position,
-                    duration: record.duration,
-                    lastWatchedAt: record.lastWatchedAt,
-                    season: record.season,
-                    episode: record.episode,
-                    released: tmdbEpisode?.released ?? video?.released ?? (sameEpisode ? existing?.released : nil),
-                    episodeTitleOverride: tmdbEpisode?.title
-                        ?? nonPlaceholder(video?.title)
-                        ?? (sameEpisode ? existing?.episodeTitleOverride : nil),
-                    episodeOverviewOverride: tmdbEpisode?.overview
-                        ?? nonEmpty(video?.overview)
-                        ?? (sameEpisode ? existing?.episodeOverviewOverride : nil),
-                    episodeThumbnailOverride: tmdbEpisode?.thumbnail
-                        ?? video?.thumbnail
-                        ?? (sameEpisode ? existing?.episodeThumbnailOverride : nil)
+            } else {
+                let sameEpisode = existing?.season == record.season && existing?.episode == record.episode
+                let video = spec.video
+                page.append(
+                    ContinueWatchingItem(
+                        meta: meta,
+                        streamUrl: sameEpisode ? (existing?.streamUrl ?? "") : "",
+                        position: record.position,
+                        duration: record.duration,
+                        lastWatchedAt: record.lastWatchedAt,
+                        season: record.season,
+                        episode: record.episode,
+                        released: tmdbEpisode?.released ?? video?.released ?? (sameEpisode ? existing?.released : nil),
+                        episodeTitleOverride: tmdbEpisode?.title
+                            ?? nonPlaceholder(video?.title)
+                            ?? (sameEpisode ? existing?.episodeTitleOverride : nil),
+                        episodeOverviewOverride: tmdbEpisode?.overview
+                            ?? nonEmpty(video?.overview)
+                            ?? (sameEpisode ? existing?.episodeOverviewOverride : nil),
+                        episodeThumbnailOverride: tmdbEpisode?.thumbnail
+                            ?? video?.thumbnail
+                            ?? (sameEpisode ? existing?.episodeThumbnailOverride : nil)
+                    )
                 )
-            )
+            }
         }
 
-        consumedEntries += slice.count
-        materialized = retainingUnwatched(materialized + page)
+        let filtered = retainingUnwatched(page)
         TVHomeDebugTrace.log(
-            "cw.builder.page.end rendered=\(page.count) total=\(materialized.count) "
+            "cw.builder.page.end rendered=\(filtered.count) total=\(filtered.count) "
                 + "ms=\(TVHomeDebugTrace.elapsedMilliseconds(since: pageStarted))"
         )
-        return PageResult(items: materialized, failedLookups: failedLookups)
+        return PageResult(items: filtered, failedLookups: failedLookups)
     }
 
     // MARK: - Metadata

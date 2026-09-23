@@ -90,16 +90,21 @@ enum WatchProgressLedger {
     /// and each one would otherwise decode and re-encode the whole ledger.
     private static var cachedRecords: [WatchProgressRecord]?
     private static var cachedKey: String?
+    private static let cacheLock = NSRecursiveLock()
 
     static func setActiveProfile(_ profileId: String?) {
+        cacheLock.lock()
         activeProfileId = profileId
         invalidateCache()
+        cacheLock.unlock()
         NotificationCenter.default.post(name: changedNotification, object: nil)
     }
 
     private static func invalidateCache() {
+        cacheLock.lock()
         cachedRecords = nil
         cachedKey = nil
+        cacheLock.unlock()
     }
 
     private static var storageKey: String {
@@ -117,6 +122,8 @@ enum WatchProgressLedger {
     // MARK: - Storage
 
     static func records() -> [WatchProgressRecord] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let key = storageKey
         if cachedKey == key, let cachedRecords {
             return cachedRecords
@@ -420,10 +427,9 @@ enum WatchProgressLedger {
                 .prefix(maxRecords)
         )
         guard let data = try? JSONEncoder().encode(trimmed) else { return false }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let key = storageKey
-        if cachedKey == key, let cachedRecords, cachedRecords == trimmed {
-            return true
-        }
         guard LargePayloadStore.write(data, key: key, directory: storageDirectoryName) else {
             // No preferences fallback: the ledger shares its budget with every
             // other key in the plist, and an oversized write aborts the process.

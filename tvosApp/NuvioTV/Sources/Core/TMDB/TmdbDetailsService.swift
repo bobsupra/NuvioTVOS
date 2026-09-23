@@ -53,11 +53,13 @@ struct TmdbCreditMetadata {
             writer: writers.isEmpty ? meta.writer : writers,
             certification: meta.certification,
             country: meta.country,
+            language: meta.language,
             released: meta.released,
             status: meta.status,
             videos: meta.videos,
             trailerYtIds: meta.trailerYtIds,
-            externalRatings: meta.externalRatings
+            externalRatings: meta.externalRatings,
+            posterShape: meta.posterShape
         )
     }
 }
@@ -606,10 +608,13 @@ enum TmdbDetailsService {
             writer: meta.writer,
             certification: meta.certification,
             country: meta.country,
+            language: nonEmpty(details.originalLanguage) ?? meta.language,
             released: meta.released,
             status: meta.status,
             videos: meta.videos,
-            trailerYtIds: meta.trailerYtIds
+            trailerYtIds: meta.trailerYtIds,
+            externalRatings: meta.externalRatings,
+            posterShape: meta.posterShape
         )
     }
 

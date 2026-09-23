@@ -93,6 +93,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
     let writer: [String]?
     let certification: String?
     let country: String?
+    let language: String?
     let released: String?
     /// Series release status from Cinemeta ("Ended", "Continuing"). nil for movies.
     let status: String?
@@ -122,6 +123,55 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
 
     var isSeries: Bool {
         Self.isSeriesType(type) || videos?.isEmpty == false
+    }
+
+    /// Whether this item represents anime based on content type, ID prefix, genres, or country/language metadata.
+    var isAnime: Bool {
+        let typeLower = type.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if typeLower == "anime" {
+            return true
+        }
+        let idLower = id.lowercased()
+        if idLower.hasPrefix("kitsu:") || idLower.hasPrefix("mal:") || idLower.hasPrefix("anilist:") || idLower.hasPrefix("anidb:") || idLower.hasPrefix("anime:") {
+            return true
+        }
+        if let genres {
+            for g in genres {
+                let gl = g.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+                if gl == "anime" || gl == "japanese animation" {
+                    return true
+                }
+                if gl == "animation" {
+                    if let country = country?.lowercased(), country.contains("japan") || country.contains("jp") {
+                        return true
+                    }
+                    if let language = language?.lowercased(), language.contains("ja") || language.contains("japanese") {
+                        return true
+                    }
+                }
+            }
+        }
+        return false
+    }
+
+    /// Identifies anime streams by release groups, file naming conventions, or stream description tags.
+    static func isAnimeStream(filename: String?, streamName: String?, streamDescription: String?) -> Bool {
+        let text = [filename, streamName, streamDescription].compactMap { $0 }.joined(separator: " ").lowercased()
+        guard !text.isEmpty else { return false }
+        let animeTags = [
+            "[subsplease]", "[erai-raws]", "[judas]", "[horriblesubs]", "[asw]", "[emg]",
+            "[anime time]", "[vivid]", "[commie]", "[coalgirls]", "[dame-desu-yo]", "[tsundere]",
+            "[mtbb]", "[golumpa]", "[ember]", "[cleo]", "[beatrice-raws]", "[nandesuka]",
+            "[kaleido]", "[moozzi2]", "[ctr]", "[bluraydesu]", "[yameii]", "[bakedfish]",
+            "[lostyears]", "[pas]", "[dkb]", "[kametsu]", "[sallysubs]", "[underwater]",
+            "subsplease", "erai-raws", "horriblesubs"
+        ]
+        for tag in animeTags {
+            if text.contains(tag) {
+                return true
+            }
+        }
+        return false
     }
 
     /// Canonical type used for persisted and watched-state identity. Providers
@@ -184,6 +234,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             writer: writer,
             certification: certification,
             country: country,
+            language: language,
             released: released,
             status: status,
             videos: nil,
@@ -193,14 +244,20 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
         )
     }
 
-    /// Series status badge text ("ONGOING" / "ENDED"); nil for movies or
-    /// when Cinemeta didn't provide a status. Shared by the details header
+    /// Release status badge text ("ONGOING" / "ENDED" / "RELEASED"); shared by the details header
     /// and the Home hero.
     var statusBadgeLabel: String? {
-        guard isSeries,
-              let status = status?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !status.isEmpty else { return nil }
-        return status.caseInsensitiveCompare("Continuing") == .orderedSame ? "ONGOING" : status.uppercased()
+        if let status = status?.trimmingCharacters(in: .whitespacesAndNewlines), !status.isEmpty {
+            let lower = status.lowercased()
+            if lower == "continuing" || lower == "returning series" {
+                return "ONGOING"
+            }
+            return status.uppercased()
+        }
+        if !isSeries && (released != nil || year != nil || releaseInfo != nil) {
+            return "RELEASED"
+        }
+        return nil
     }
 
     /// Add-on catalog cards commonly omit fields that are available from their
@@ -256,9 +313,10 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             cast: cast,
             director: director,
             writer: writer,
-            certification: certification,
-            country: country,
-            released: released,
+            certification: certification ?? fullMeta.certification,
+            country: country ?? fullMeta.country,
+            language: language ?? fullMeta.language,
+            released: released ?? fullMeta.released,
             status: resolvedStatus,
             videos: videos,
             trailerYtIds: trailerYtIds,
@@ -296,9 +354,10 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             cast: cast,
             director: director,
             writer: writer,
-            certification: certification,
-            country: country,
-            released: released,
+            certification: certification ?? fullMeta.certification,
+            country: country ?? fullMeta.country,
+            language: language ?? fullMeta.language,
+            released: released ?? fullMeta.released,
             status: heroMerged.status,
             // Search cards start with compact catalog records, which often
             // have no guide at all. Keep the refreshed guide so a watched
@@ -332,6 +391,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             writer: writer,
             certification: certification,
             country: country,
+            language: language,
             released: released,
             status: status,
             videos: videos,
@@ -365,6 +425,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
             writer: writer,
             certification: certification,
             country: country,
+            language: language,
             released: released,
             status: status,
             videos: videosToUse,
@@ -394,6 +455,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
         writer: [String]? = nil,
         certification: String? = nil,
         country: String? = nil,
+        language: String? = nil,
         released: String? = nil,
         status: String? = nil,
         videos: [NuvioVideo]? = nil,
@@ -420,6 +482,7 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
         self.writer = writer
         self.certification = certification
         self.country = country
+        self.language = language
         self.released = released
         self.status = status
         self.videos = videos

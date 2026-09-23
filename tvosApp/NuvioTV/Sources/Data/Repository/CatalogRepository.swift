@@ -1523,11 +1523,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
                         writer: existing.writer ?? item.writer,
                         certification: existing.certification ?? item.certification,
                         country: existing.country ?? item.country,
+                        language: existing.language ?? item.language,
                         released: existing.released ?? item.released,
                         status: existing.status ?? item.status,
                         videos: existing.videos ?? item.videos,
                         trailerYtIds: existing.trailerYtIds ?? item.trailerYtIds,
-                        externalRatings: existing.externalRatings ?? item.externalRatings
+                        externalRatings: existing.externalRatings ?? item.externalRatings,
+                        posterShape: existing.posterShape ?? item.posterShape
                     )
                 }
 
@@ -2467,7 +2469,9 @@ struct CinemetaMeta: Decodable {
     let cast: FlexibleStringArray?
     let director: FlexibleStringArray?
     let writer: FlexibleStringArray?
+    let certification: String?
     let country: String?
+    let language: String?
     let released: String?
     let moviedbId: Int?
     let status: String?
@@ -2479,7 +2483,7 @@ struct CinemetaMeta: Decodable {
 
     enum CodingKeys: String, CodingKey {
         case id, name, type, description, poster, background, logo, imdbRating
-        case genres, genre, releaseInfo, year, runtime, cast, director, writer, country, released
+        case genres, genre, releaseInfo, year, runtime, cast, director, writer, certification, country, language, released
         case status, videos, trailers, trailerStreams
         case moviedbId = "moviedb_id"
         case imdbId = "imdb_id"
@@ -2505,7 +2509,9 @@ struct CinemetaMeta: Decodable {
         cast = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .cast)
         director = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .director)
         writer = try? container.decodeIfPresent(FlexibleStringArray.self, forKey: .writer)
+        certification = try? container.decodeIfPresent(String.self, forKey: .certification)
         country = try? container.decodeIfPresent(String.self, forKey: .country)
+        language = try? container.decodeIfPresent(String.self, forKey: .language)
         released = try? container.decodeIfPresent(String.self, forKey: .released)
         moviedbId = try? container.decodeIfPresent(Int.self, forKey: .moviedbId)
         status = try? container.decodeIfPresent(String.self, forKey: .status)
@@ -2536,8 +2542,9 @@ struct CinemetaMeta: Decodable {
             cast: cast?.values,
             director: director?.values,
             writer: writer?.values,
-            certification: nil,
+            certification: certification,
             country: country,
+            language: language,
             released: released,
             status: status,
             videos: videos?.compactMap { $0.toVideo() },

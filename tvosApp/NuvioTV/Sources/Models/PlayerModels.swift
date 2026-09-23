@@ -62,20 +62,21 @@ enum PlayerSeekSettings {
     }
 }
 
-/// How the video fills the screen. Applied as a SwiftUI transform on the video
-/// host (mpv always letterboxes into the Metal layer; we scale that surface).
+/// How the video fills the screen across AetherEngine and MPV.
 enum PlayerAspectMode: String, CaseIterable, Identifiable {
     case fit
     case fill
+    case zoom
     case stretch
 
     var id: String { rawValue }
 
     var label: String {
         switch self {
-        case .fit: return "Fit"
-        case .fill: return "Fill"
-        case .stretch: return "Stretch"
+        case .fit: return L10n.string("player_aspect_fit", fallback: "Fit")
+        case .fill: return L10n.string("player_aspect_crop", fallback: "Fill")
+        case .zoom: return L10n.string("player_aspect_mode_slight_zoom", fallback: "Zoom")
+        case .stretch: return L10n.string("player_aspect_stretch", fallback: "Stretch")
         }
     }
 
@@ -83,6 +84,7 @@ enum PlayerAspectMode: String, CaseIterable, Identifiable {
         switch self {
         case .fit: return "Letterbox — show entire frame"
         case .fill: return "Crop edges to fill the screen"
+        case .zoom: return "Zoom to reduce black bars"
         case .stretch: return "Stretch to fill (may distort)"
         }
     }
@@ -100,7 +102,6 @@ enum PlayerAspectMode: String, CaseIterable, Identifiable {
     }
 
     /// Scale factors for the video host relative to a FITTED presentation.
-    /// Matches Infuse/NuvioTVAppleTV: zoom crops bars, stretch distorts.
     func scale(video: CGSize, container: CGSize) -> CGSize {
         guard video.width > 1, video.height > 1,
               container.width > 1, container.height > 1 else {
@@ -113,6 +114,10 @@ enum PlayerAspectMode: String, CaseIterable, Identifiable {
             return CGSize(width: 1, height: 1)
         case .fill:
             let factor = max(containerAspect / videoAspect, videoAspect / containerAspect)
+            return CGSize(width: factor, height: factor)
+        case .zoom:
+            let fillFactor = max(containerAspect / videoAspect, videoAspect / containerAspect)
+            let factor = 1.0 + (fillFactor - 1.0) * 0.5
             return CGSize(width: factor, height: factor)
         case .stretch:
             if videoAspect > containerAspect {
