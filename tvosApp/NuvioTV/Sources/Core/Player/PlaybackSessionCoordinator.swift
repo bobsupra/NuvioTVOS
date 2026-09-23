@@ -97,7 +97,8 @@ final class PlaybackSessionCoordinator: ObservableObject {
                 filename: request.filename,
                 engineSetting: migratedEngine,
                 requiresMPVAudioControls: requiresMPVAudioControls,
-                assMode: request.assMode
+                assMode: request.assMode,
+                isAnime: request.isAnime
             )
         )
         lastPolicyReason = policy.reason
@@ -331,12 +332,13 @@ final class PlaybackSessionCoordinator: ObservableObject {
         case .mpv:
             _ = mpvController.view
             mpvController.load(request)
-            mpvController.setAspectMode(.fit)
+            mpvController.setAspectMode(request.aspectMode)
         }
     }
 
     func setExternalTrickplayProvider(_ provider: (any TrickplayProviding)?) {
         aetherController?.setExternalTrickplayProvider(provider)
+        mpvController.setExternalTrickplayProvider(provider)
     }
 }
 

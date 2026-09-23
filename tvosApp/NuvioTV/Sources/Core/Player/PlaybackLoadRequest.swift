@@ -31,9 +31,11 @@ struct PlaybackLoadRequest: Equatable {
     var matchContentEnabled: Bool
     var cacheProfile: PlaybackCacheProfile
     var assMode: PlaybackASSMode
+    var isAnime: Bool
     var autoplay: Bool
     /// Runtime controls that must survive an Aether → MPV handoff.
     var playbackRate: Float
+    var aspectMode: PlayerAspectMode
     var subtitleDelaySeconds: Double
     var audioDelaySeconds: Double
     var audioGainDB: Double
@@ -61,8 +63,10 @@ struct PlaybackLoadRequest: Equatable {
         matchContentEnabled: Bool = true,
         cacheProfile: PlaybackCacheProfile = .auto,
         assMode: PlaybackASSMode = .off,
+        isAnime: Bool = false,
         autoplay: Bool = true,
         playbackRate: Float = 1,
+        aspectMode: PlayerAspectMode = .fit,
         subtitleDelaySeconds: Double = 0,
         audioDelaySeconds: Double = 0,
         audioGainDB: Double = 0,
@@ -84,8 +88,10 @@ struct PlaybackLoadRequest: Equatable {
         self.matchContentEnabled = matchContentEnabled
         self.cacheProfile = cacheProfile
         self.assMode = assMode
+        self.isAnime = isAnime
         self.autoplay = autoplay
         self.playbackRate = playbackRate
+        self.aspectMode = aspectMode
         self.subtitleDelaySeconds = subtitleDelaySeconds
         self.audioDelaySeconds = audioDelaySeconds
         self.audioGainDB = audioGainDB

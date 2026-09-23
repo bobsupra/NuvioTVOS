@@ -184,6 +184,11 @@ final class PictureInPictureManager: NSObject, ObservableObject {
             possibleObservation?.invalidate()
             let pip = AVPictureInPictureController(playerLayer: nativeLayer)
             pip?.delegate = self
+            #if os(iOS)
+            if #available(iOS 14.2, *) {
+                pip?.canStartPictureInPictureAutomaticallyFromInline = true
+            }
+            #endif
             self.pipController = pip
             bindPossibleObservation(pip)
         } else if #available(tvOS 15.0, *), let swSource = engine.softwarePiPSource {
@@ -197,6 +202,11 @@ final class PictureInPictureManager: NSObject, ObservableObject {
             )
             let pip = AVPictureInPictureController(contentSource: contentSource)
             pip.delegate = self
+            #if os(iOS)
+            if #available(iOS 15.0, *) {
+                pip.canStartPictureInPictureAutomaticallyFromInline = true
+            }
+            #endif
             self.pipController = pip
             configuredSoftwareDisplayLayer = swSource.layer
             bindPossibleObservation(pip)
@@ -283,6 +293,7 @@ extension PictureInPictureManager: @preconcurrency AVPictureInPictureControllerD
     func pictureInPictureControllerWillStartPictureInPicture(_ pictureInPictureController: AVPictureInPictureController) {
         guard pipController === pictureInPictureController else { return }
         print("[PictureInPicture] willStartPictureInPicture")
+        isPictureInPictureActive = true
         activeAetherController?.engine.pictureInPictureActive = true
     }
 

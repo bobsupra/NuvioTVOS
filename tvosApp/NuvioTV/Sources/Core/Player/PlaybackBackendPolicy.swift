@@ -52,6 +52,7 @@ enum PlaybackBackendPolicy {
         /// Non-zero audio amplification forces MPV for the session (audio delay is supported on Aether).
         var requiresMPVAudioControls: Bool
         var assMode: PlaybackASSMode
+        var isAnime: Bool = false
     }
 
     struct Result: Equatable {
@@ -98,20 +99,17 @@ enum PlaybackBackendPolicy {
                 statusMessage: "Compatibility player (audio amplification)"
             )
         }
-        // Authored ASS Scale is not yet rendered by Nuvio's host overlay.
-        if input.assMode == .scale {
-            if isRemoteHTTP(input.urlString) && !PlaybackEngineCapabilities.mpv.supportsDirectHTTPS {
-                return Result(
-                    backend: .aether,
-                    allowAutomaticFallback: false,
-                    reason: "ASS Scale uses MPV, but remote HTTPS streams use AetherEngine",
-                    statusMessage: nil
-                )
-            }
+
+        let isAnime = input.isAnime
+            || NuvioMeta.isAnimeStream(filename: input.filename, streamName: input.streamName, streamDescription: input.streamDescription)
+            || input.urlString.lowercased().contains("anime")
+
+        // Authored ASS Scale uses MPV for anime content where complex ASS typesetting is present.
+        if input.assMode == .scale && isAnime {
             return Result(
                 backend: .mpv,
                 allowAutomaticFallback: false,
-                reason: "ASS Scale uses MPV until host ASS renderer ships",
+                reason: "ASS Scale uses MPV for anime content",
                 statusMessage: nil
             )
         }
@@ -140,12 +138,20 @@ enum PlaybackBackendPolicy {
                 statusMessage: nil
             )
         case .auto:
+            if isAnime {
+                return Result(
+                    backend: .mpv,
+                    allowAutomaticFallback: true,
+                    reason: "Auto: Anime content detected, routing to MPVKit for ASS/typesetting support",
+                    statusMessage: nil
+                )
+            }
             let allowFallback = PlaybackEngineCapabilities.mpv.supportsDirectHTTPS || !isRemoteHTTP(input.urlString)
             return Result(
                 backend: .aether,
                 allowAutomaticFallback: allowFallback,
                 reason: allowFallback
-                    ? "Auto: AetherEngine primary with MPVKit one-way fallback"
+                    ? "Auto: AetherEngine primary for movies/shows with MPVKit fallback"
                     : "Auto: AetherEngine primary (remote HTTPS disables MPVKit fallback)",
                 statusMessage: nil
             )
@@ -158,7 +164,8 @@ enum PlaybackBackendPolicy {
         streamName: String? = nil,
         streamDescription: String? = nil,
         filename: String? = nil,
-        requiresMPVAudioControls: Bool = false
+        requiresMPVAudioControls: Bool = false,
+        isAnime: Bool = false
     ) -> Result {
         let setting = PlayerEngineSetting.migrated(
             from: ProfileSettings.current.string(forKey: SettingsKey.playerEngine)
@@ -166,6 +173,8 @@ enum PlaybackBackendPolicy {
         let ass = PlaybackASSMode.fromSettings(
             ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode)
         )
+        let detectedAnime = isAnime
+            || NuvioMeta.isAnimeStream(filename: filename, streamName: streamName, streamDescription: streamDescription)
         return resolve(
             Input(
                 urlString: url.absoluteString,
@@ -175,7 +184,8 @@ enum PlaybackBackendPolicy {
                 filename: filename,
                 engineSetting: setting,
                 requiresMPVAudioControls: requiresMPVAudioControls,
-                assMode: ass
+                assMode: ass,
+                isAnime: detectedAnime
             )
         )
     }

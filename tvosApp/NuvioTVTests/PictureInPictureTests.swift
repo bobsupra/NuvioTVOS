@@ -206,4 +206,29 @@ final class PictureInPictureTests: XCTestCase {
 
         manager.invalidateSession()
     }
+
+    func testPictureInPictureWillStartMarksActive() {
+        let manager = PictureInPictureManager.shared
+        guard let aether = AetherPlaybackController() else {
+            XCTFail("AetherEngine should initialize in the test environment")
+            return
+        }
+        let coordinator = PlaybackSessionCoordinator(aetherController: aether)
+        let url = URL(string: "https://example.com/test.mp4")!
+        let meta = makeTestMeta(id: "tt9999999", name: "Test Show", type: "series")
+        let context = ActivePlaybackContext(
+            url: url,
+            meta: meta,
+            subtitle: "S1 E1",
+            playbackOrigin: .details
+        )
+        manager.registerSession(coordinator: coordinator, context: context)
+        guard let pip = manager.pipController else { return }
+
+        XCTAssertFalse(manager.isPictureInPictureActive)
+        manager.pictureInPictureControllerWillStartPictureInPicture(pip)
+        XCTAssertTrue(manager.isPictureInPictureActive)
+        XCTAssertTrue(aether.engine.pictureInPictureActive)
+    }
 }
+

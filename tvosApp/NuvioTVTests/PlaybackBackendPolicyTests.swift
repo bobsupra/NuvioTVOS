@@ -140,6 +140,49 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertEqual(coordinator.activeBackend, .mpv)
     }
 
+    @MainActor
+    func testMPVControllerSupportsScrubThumbnailsAndTrickplay() async {
+        let coordinator = PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let request = PlaybackLoadRequest(
+            videoURL: URL(string: "https://example.com/anime.mkv")!,
+            canonicalMediaKey: "canon_anime_s1e1"
+        )
+        coordinator.load(request)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+
+        let mpvVC = coordinator.mpvController
+        XCTAssertTrue(mpvVC.supportsScrubThumbnails)
+
+        final class MockTrickplayProvider: TrickplayProviding, @unchecked Sendable {
+            func thumbnail(at seconds: Double) async -> CGImage? {
+                let colorSpace = CGColorSpaceCreateDeviceRGB()
+                var pixel: UInt32 = 0xFF0000FF
+                let context = CGContext(
+                    data: &pixel,
+                    width: 1,
+                    height: 1,
+                    bitsPerComponent: 8,
+                    bytesPerRow: 4,
+                    space: colorSpace,
+                    bitmapInfo: CGImageAlphaInfo.premultipliedLast.rawValue
+                )
+                return context?.makeImage()
+            }
+        }
+
+        let provider = MockTrickplayProvider()
+        coordinator.setExternalTrickplayProvider(provider)
+
+        let thumb = await mpvVC.cachedScrubThumbnail(atSeconds: 42.0, duration: 1200.0)
+        XCTAssertNotNil(thumb, "MPV controller should look up external trickplay thumbnail")
+
+        let viewModel = PlayerViewModel(sessionCoordinator: coordinator)
+        XCTAssertEqual(viewModel.activeEngineKind, .mpv)
+    }
+
     func testLiveStreamFailoverRetriesCurrentURLOnceBeforeExcludingIt() {
         let url = "https://sports.example/live.m3u8"
         let first = LiveStreamFailoverPolicy.decide(
@@ -859,6 +902,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
 
     @MainActor
     func testMPVReportsFirstSuccessAndFirstLaterFailure() async throws {
+        let uniqueModel = "outcome-test-\(UUID().uuidString)"
         let state = MPVSubtitleTranslationState(
             requestPacer: AISubtitleRequestPacer(minimumSpacing: 0)
         ) { source, _, _ in
@@ -877,9 +921,9 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             }
         }
 
-        state.update(sourceText: "First", settings: aiSettings(model: "outcome-test"))
+        state.update(sourceText: "First", settings: aiSettings(model: uniqueModel))
         await waitForWhile { outcomes.count >= 1 }
-        state.update(sourceText: "Second", settings: aiSettings(model: "outcome-test"))
+        state.update(sourceText: "Second", settings: aiSettings(model: uniqueModel))
         await waitForWhile { outcomes.count >= 2 }
 
         XCTAssertEqual(outcomes, ["success", "failure"])
@@ -1104,36 +1148,179 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         XCTAssertTrue(PlaybackEngineCapabilities.mpv.supportsDirectHTTPS)
     }
 
-    func testASSScaleForcesMPVOnLocalFiles() {
-        let result = PlaybackBackendPolicy.resolve(
+    func testAutoEngineSelectsAetherForNormalMoviesAndShows() {
+        let movieResult = PlaybackBackendPolicy.resolve(
             .init(
-                urlString: "file:///local/anime.mkv",
+                urlString: "https://cdn.example/The.Batman.2022.2160p.mkv",
                 separateAudioURL: nil,
-                streamName: nil,
-                streamDescription: nil,
-                filename: nil,
+                streamName: "The Batman",
+                streamDescription: "2022 4K HDR",
+                filename: "The.Batman.2022.2160p.mkv",
                 engineSetting: .auto,
                 requiresMPVAudioControls: false,
-                assMode: .scale
+                assMode: .off,
+                isAnime: false
             )
         )
-        XCTAssertEqual(result.backend, .mpv)
+        XCTAssertEqual(movieResult.backend, .aether)
+        XCTAssertTrue(movieResult.allowAutomaticFallback)
+
+        let showResult = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "https://cdn.example/Breaking.Bad.S01E01.1080p.mkv",
+                separateAudioURL: nil,
+                streamName: "Breaking Bad S01E01",
+                streamDescription: "Pilot",
+                filename: "Breaking.Bad.S01E01.1080p.mkv",
+                engineSetting: .auto,
+                requiresMPVAudioControls: false,
+                assMode: .off,
+                isAnime: false
+            )
+        )
+        XCTAssertEqual(showResult.backend, .aether)
+        XCTAssertTrue(showResult.allowAutomaticFallback)
     }
 
-    func testASSScaleOnRemoteHTTPSUsesMPV() {
-        let result = PlaybackBackendPolicy.resolve(
+    func testAutoEngineSelectsMPVForAnimeMetadata() {
+        let animeResult = PlaybackBackendPolicy.resolve(
             .init(
-                urlString: "https://cdn.example/anime.mkv",
+                urlString: "https://cdn.example/stream/12345.mkv",
                 separateAudioURL: nil,
-                streamName: nil,
-                streamDescription: nil,
-                filename: nil,
+                streamName: "Jujutsu Kaisen",
+                streamDescription: "Episode 1",
+                filename: "Jujutsu.Kaisen.E01.mkv",
                 engineSetting: .auto,
                 requiresMPVAudioControls: false,
-                assMode: .scale
+                assMode: .off,
+                isAnime: true
             )
         )
-        XCTAssertEqual(result.backend, .mpv)
+        XCTAssertEqual(animeResult.backend, .mpv)
+        XCTAssertTrue(animeResult.reason.contains("Anime content detected"))
+    }
+
+    func testAutoEngineSelectsMPVForAnimeReleaseGroups() {
+        let subsPleaseResult = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "https://cdn.example/stream/play",
+                separateAudioURL: nil,
+                streamName: "[SubsPlease] Frieren - 01 (1080p) [ABCD1234].mkv",
+                streamDescription: nil,
+                filename: "[SubsPlease] Frieren - 01.mkv",
+                engineSetting: .auto,
+                requiresMPVAudioControls: false,
+                assMode: .off,
+                isAnime: false
+            )
+        )
+        XCTAssertEqual(subsPleaseResult.backend, .mpv)
+        XCTAssertTrue(subsPleaseResult.reason.contains("Anime content detected"))
+
+        let eraiRawsResult = PlaybackBackendPolicy.resolve(
+            .init(
+                urlString: "https://cdn.example/stream/play",
+                separateAudioURL: nil,
+                streamName: "[Erai-raws] Demon Slayer - 01 [1080p].mkv",
+                streamDescription: nil,
+                filename: "[Erai-raws] Demon Slayer - 01.mkv",
+                engineSetting: .auto,
+                requiresMPVAudioControls: false,
+                assMode: .off,
+                isAnime: false
+            )
+        )
+        XCTAssertEqual(eraiRawsResult.backend, .mpv)
+        XCTAssertTrue(eraiRawsResult.reason.contains("Anime content detected"))
+    }
+
+    func testNuvioMetaAnimeDetection() {
+        let kitsuMeta = NuvioMeta(
+            id: "kitsu:1234",
+            name: "Anime Show",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: nil,
+            tmdbId: nil,
+            type: "series",
+            year: 2023,
+            genres: ["Action", "Fantasy"],
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        XCTAssertTrue(kitsuMeta.isAnime)
+
+        let animeTypeMeta = NuvioMeta(
+            id: "tt9999999",
+            name: "Anime Movie",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt9999999",
+            tmdbId: nil,
+            type: "anime",
+            year: 2023,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        XCTAssertTrue(animeTypeMeta.isAnime)
+
+        let movieMeta = NuvioMeta(
+            id: "tt1877830",
+            name: "The Batman",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt1877830",
+            tmdbId: 414906,
+            type: "movie",
+            year: 2022,
+            genres: ["Action", "Crime", "Drama"],
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: "USA",
+            language: "en",
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        XCTAssertFalse(movieMeta.isAnime)
     }
 
     @MainActor
@@ -1459,14 +1646,15 @@ private final class RequestCounter: @unchecked Sendable {
     }
 }
 
-/// Waits up to 5 seconds for `condition`, yielding to the main actor so the
+/// Waits up to 10 seconds for `condition`, yielding to the main actor so the
 /// async work under test can complete. The outcome tests used fixed sleeps,
 /// which flaked under full-suite load; polling until a condition is
 /// deterministic instead.
 @MainActor
 private func waitForWhile(_ condition: () -> Bool) async {
-    let deadline = Date().addingTimeInterval(5)
+    let deadline = Date().addingTimeInterval(10)
     while !condition() && Date() < deadline {
+        try? await Task.sleep(nanoseconds: 10_000_000)
         await Task.yield()
     }
 }
@@ -2011,15 +2199,18 @@ final class EpisodeResumeIsolationTests: XCTestCase {
         super.setUp()
         ContinueWatchingStore.setActiveProfile(profileId)
         WatchedStore.setActiveProfile(profileId)
+        WatchProgressLedger.setActiveProfile(profileId)
         // Scoped: these suites run inside the app's own container, so a
         // directory-wide erase would take a real install's history with it.
         ContinueWatchingStore.eraseProfile(profileId)
         WatchedStore.eraseProfile(profileId)
+        WatchProgressLedger.eraseProfile(profileId)
     }
 
     override func tearDown() {
         ContinueWatchingStore.eraseProfile(profileId)
         WatchedStore.eraseProfile(profileId)
+        WatchProgressLedger.eraseProfile(profileId)
         super.tearDown()
     }
 
