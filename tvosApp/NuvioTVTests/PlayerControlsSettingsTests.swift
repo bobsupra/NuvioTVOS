@@ -794,6 +794,77 @@ extension PlayerControlsSettingsTests {
         model.openSidePanel(.episodes)
         XCTAssertEqual(model.sidePanel, .episodes, "Side panel must be active and open")
     }
+
+    func testPlayerAspectModePropertiesAndScaling() {
+        XCTAssertEqual(PlayerAspectMode.allCases, [.fit, .fill, .zoom, .stretch])
+
+        let container = CGSize(width: 1920, height: 1080)
+        let wideVideo = CGSize(width: 2350, height: 1000) // 2.35:1
+        let tallVideo = CGSize(width: 1440, height: 1080) // 4:3
+
+        // Fit
+        XCTAssertEqual(PlayerAspectMode.fit.scale(video: wideVideo, container: container), CGSize(width: 1, height: 1))
+        XCTAssertEqual(PlayerAspectMode.fit.scale(video: tallVideo, container: container), CGSize(width: 1, height: 1))
+
+        // Fill
+        let fillScaleWide = PlayerAspectMode.fill.scale(video: wideVideo, container: container)
+        XCTAssertGreaterThan(fillScaleWide.width, 1.0)
+        XCTAssertEqual(fillScaleWide.width, fillScaleWide.height)
+
+        // Zoom (halfway zoom between fit and fill)
+        let zoomScaleWide = PlayerAspectMode.zoom.scale(video: wideVideo, container: container)
+        XCTAssertGreaterThan(zoomScaleWide.width, 1.0)
+        XCTAssertLessThan(zoomScaleWide.width, fillScaleWide.width)
+        XCTAssertEqual(zoomScaleWide.width, zoomScaleWide.height)
+
+        // Stretch
+        let stretchScaleWide = PlayerAspectMode.stretch.scale(video: wideVideo, container: container)
+        XCTAssertGreaterThan(stretchScaleWide.height, 1.0)
+
+        // Persistence
+        let previous = PlayerAspectMode.current
+        PlayerAspectMode.current = .zoom
+        XCTAssertEqual(PlayerAspectMode.current, .zoom)
+        PlayerAspectMode.current = .fit
+        XCTAssertEqual(PlayerAspectMode.current, .fit)
+        PlayerAspectMode.current = previous
+    }
+
+    func testPlaybackLoadRequestAspectMode() {
+        let defaultRequest = PlaybackLoadRequest(videoURL: URL(string: "https://example.com/video.mp4")!)
+        XCTAssertEqual(defaultRequest.aspectMode, .fit)
+
+        let zoomRequest = PlaybackLoadRequest(
+            videoURL: URL(string: "https://example.com/video.mp4")!,
+            aspectMode: .zoom
+        )
+        XCTAssertEqual(zoomRequest.aspectMode, .zoom)
+    }
+
+    @MainActor
+    func testPlayerViewModelAspectModeSwitching() {
+        let coordinator = PlaybackSessionCoordinator(aetherControllerFactory: { nil })
+        let model = PlayerViewModel(
+            sessionCoordinator: coordinator,
+            scrubThumbnailProvider: nil
+        )
+
+        model.setAspectMode(.fill)
+        XCTAssertEqual(model.aspectMode, .fill)
+        XCTAssertEqual(PlayerAspectMode.current, .fill)
+
+        model.setAspectMode(.zoom)
+        XCTAssertEqual(model.aspectMode, .zoom)
+        XCTAssertEqual(PlayerAspectMode.current, .zoom)
+
+        model.setAspectMode(.stretch)
+        XCTAssertEqual(model.aspectMode, .stretch)
+        XCTAssertEqual(PlayerAspectMode.current, .stretch)
+
+        model.setAspectMode(.fit)
+        XCTAssertEqual(model.aspectMode, .fit)
+        XCTAssertEqual(PlayerAspectMode.current, .fit)
+    }
 }
 
 

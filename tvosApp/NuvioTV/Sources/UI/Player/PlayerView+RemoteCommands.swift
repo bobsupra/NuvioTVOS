@@ -5,14 +5,14 @@ extension PlayerView {
         layersObservingFocus
             .onPlayPauseCommand {
                 guard !isWakingFromBackground else { return }
-                guard viewModel.playbackStartupError == nil else { return }
+                guard viewModel.currentErrorDiagnostic == nil else { return }
                 viewModel.togglePlayPause()
             }
             .onMoveCommand { direction in
                 guard !isWakingFromBackground else { return }
                 // The Episodes/Sources sheet exclusively owns directional input.
                 // Do not let list navigation also seek or reveal player controls.
-                guard viewModel.sidePanel == nil, viewModel.playbackStartupError == nil else { return }
+                guard viewModel.sidePanel == nil, viewModel.currentErrorDiagnostic == nil else { return }
 
                 // Trackpad swipes also emit move commands; the pan recognizer sets
                 // moveSuppressed so a swipe does not double-fire as a skip.
@@ -59,6 +59,10 @@ extension PlayerView {
                 }
                 if viewModel.sidePanel != nil {
                     viewModel.closeSidePanel()
+                    return
+                }
+                if viewModel.currentErrorDiagnostic != nil {
+                    onBack()
                     return
                 }
                 if viewModel.isScrubbing {

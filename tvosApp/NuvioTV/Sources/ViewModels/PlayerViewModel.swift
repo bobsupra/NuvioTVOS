@@ -311,7 +311,13 @@ class PlayerViewModel: ObservableObject {
     private var scrubTimeoutTask: Task<Void, Never>?
     private let suppliedScrubThumbnailProvider: (any ScrubThumbnailProviding)?
     private var scrubThumbnailProvider: (any ScrubThumbnailProviding)? {
-        suppliedScrubThumbnailProvider ?? aetherController
+        if let supplied = suppliedScrubThumbnailProvider { return supplied }
+        switch sessionCoordinator.activeBackend {
+        case .aether:
+            return aetherController
+        case .mpv:
+            return sessionCoordinator.mpvController
+        }
     }
     private var scrubThumbnailTask: Task<Void, Never>?
     private var scrubThumbnailTaskInteractionToken: UInt64?
@@ -368,7 +374,7 @@ class PlayerViewModel: ObservableObject {
     ) async -> PreparedNextStream?)?
     private var reloadAttempts = 0
     @Published private(set) var isReloadingStream = false
-    private static let maxReloadAttempts = 5
+    private static let maxReloadAttempts = 3
 
     // MARK: Load watchdog + source failover
 
@@ -490,6 +496,26 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
+    var currentErrorDiagnostic: PlaybackErrorDiagnostic? {
+        if let startupError = playbackStartupError {
+            return PlaybackErrorDiagnostic.analyze(
+                errorMessage: startupError,
+                streamURL: activeStreamURL.flatMap(URL.init(string:)),
+                addonName: activeAddonName,
+                provider: activeProviderName
+            )
+        }
+        if case .error(let message) = status {
+            return PlaybackErrorDiagnostic.analyze(
+                errorMessage: message,
+                streamURL: activeStreamURL.flatMap(URL.init(string:)),
+                addonName: activeAddonName,
+                provider: activeProviderName
+            )
+        }
+        return nil
+    }
+
     func retryPlaybackStartup() {
         guard !didShutdown else { return }
         playbackStartupError = nil
@@ -502,6 +528,16 @@ class PlayerViewModel: ObservableObject {
         startPolling()
         startLoadWatchdog()
         hdrModeToast = sessionCoordinator.statusToast
+    }
+
+    func retryCurrentPlayback() {
+        if playbackStartupError != nil {
+            retryPlaybackStartup()
+        } else if case .error(let message) = status {
+            reloadAttempts = 0
+            isFailingOver = false
+            attemptFailover(reason: message, toast: "Retrying stream...")
+        }
     }
 
     deinit {
@@ -643,6 +679,9 @@ class PlayerViewModel: ObservableObject {
                             ProfileSettings.current.string(forKey: SettingsKey.networkCache)
                         ),
                         assMode: .strip,
+                        isAnime: meta.isAnime,
+                        playbackRate: 1,
+                        aspectMode: self.aspectMode,
                         streamName: title.isEmpty ? nil : title,
                         streamDescription: PlaybackMarkers.trailerSubtitle,
                         artworkURL: self.resolveArtworkURL(for: meta, episode: nil, isTrailer: true)
@@ -712,6 +751,8 @@ class PlayerViewModel: ObservableObject {
             duration: expectedDurationSeconds,
             fallbackURL: url.absoluteString
         )
+        let isAnime = activeMeta?.isAnime == true
+            || NuvioMeta.isAnimeStream(filename: filename, streamName: streamName, streamDescription: streamDescription)
         let resolvedArtwork = artworkURL ?? resolveArtworkURL(for: activeMeta, episode: currentEpisodeVideo, isTrailer: isTrailerPlaybackSession)
         let request = PlaybackLoadRequest(
             videoURL: url,
@@ -728,8 +769,10 @@ class PlayerViewModel: ObservableObject {
             assMode: PlaybackASSMode.fromSettings(
                 ProfileSettings.current.string(forKey: SettingsKey.assOverrideMode)
             ),
+            isAnime: isAnime,
             autoplay: true,
             playbackRate: playbackSpeed.rawValue,
+            aspectMode: aspectMode,
             subtitleDelaySeconds: Double(subtitleDelayMs) / 1_000,
             audioDelaySeconds: Double(audioDelayMs) / 1_000,
             audioGainDB: Double(audioAmplificationDb),
@@ -1915,15 +1958,14 @@ class PlayerViewModel: ObservableObject {
         if isTimelineFocused,
            pendingSeekDelta == 0,
            isSeekPreviewEnabled,
-           activeEngineKind == .aether,
-           aetherController?.supportsScrubThumbnails == true {
+           scrubThumbnailProvider?.supportsScrubThumbnails == true {
             aetherController?.prepareScrubThumbnailExtractor()
+            sessionCoordinator.mpvController.prepareScrubThumbnailExtractor()
         }
 
         if !isSeekPreviewEnabled {
-            aetherController?.suspendCoarseThumbnailWork()
-        } else if activeEngineKind == .aether,
-           !isScrubbing,
+            suspendCoarseThumbnailWork()
+        } else if !isScrubbing,
            pendingSeekDelta == 0,
            (status == .playing || status == .paused),
            !c.isPlayerLoading,
@@ -1932,6 +1974,7 @@ class PlayerViewModel: ObservableObject {
            c.hasCoherentTimeSample,
            clock.duration >= HybridSeekThumbnailPolicy.coarseIntervalSeconds {
             aetherController?.advanceCoarseThumbnailIfNeeded(duration: clock.duration)
+            sessionCoordinator.mpvController.advanceCoarseThumbnailIfNeeded(duration: clock.duration)
         }
 
         let frameSize = c.videoFrameSize
@@ -2437,7 +2480,7 @@ class PlayerViewModel: ObservableObject {
         seekHoldDirection = base >= 0 ? 1.0 : -1.0
 
         if pendingSeekDelta == 0 {
-            aetherController?.suspendCoarseThumbnailWork()
+            suspendCoarseThumbnailWork()
             scrubThumbnailInteractionToken &+= 1
             scrubThumbnail = nil
             scrubThumbnailTargetSeconds = nil
@@ -2598,11 +2641,17 @@ class PlayerViewModel: ObservableObject {
     func setTimelineFocused(_ focused: Bool) {
         isTimelineFocused = focused
         if focused {
-            guard isSeekPreviewEnabled, activeEngineKind == .aether else { return }
+            guard isSeekPreviewEnabled else { return }
             aetherController?.prepareScrubThumbnailExtractor()
+            sessionCoordinator.mpvController.prepareScrubThumbnailExtractor()
         } else if !isScrubbing, pendingSeekDelta == 0 {
             resetScrubThumbnailState()
         }
+    }
+
+    private func suspendCoarseThumbnailWork() {
+        aetherController?.suspendCoarseThumbnailWork()
+        sessionCoordinator.mpvController.suspendCoarseThumbnailWork()
     }
 
     private func resetScrubThumbnailState() {
@@ -2811,7 +2860,7 @@ class PlayerViewModel: ObservableObject {
         guard !isLiveStream, hasStartedPlayback, !showSettingsPanel else { return }
         guard status == .paused else { return }
         hidePeek()
-        aetherController?.suspendCoarseThumbnailWork()
+        suspendCoarseThumbnailWork()
         commitPendingSeekIfNeeded()
         // Scrubbing replaces the pause sheet for the gesture.
         dismissPauseOverlay()
@@ -3083,7 +3132,7 @@ class PlayerViewModel: ObservableObject {
 
         // A zero-to-nonzero transition starts a new seek interaction.
         if pendingSeekDelta == 0 {
-            aetherController?.suspendCoarseThumbnailWork()
+            suspendCoarseThumbnailWork()
             scrubThumbnailInteractionToken &+= 1
             scrubThumbnail = nil
             scrubThumbnailTargetSeconds = nil
@@ -3965,11 +4014,9 @@ class PlayerViewModel: ObservableObject {
     }
 
     func setAspectMode(_ mode: PlayerAspectMode) {
-        // Aspect modes temporarily disabled — always FIT.
-        aspectMode = .fit
-        PlayerAspectMode.current = .fit
-        engine.setAspectMode(.fit)
-        _ = mode
+        aspectMode = mode
+        PlayerAspectMode.current = mode
+        engine.setAspectMode(mode)
     }
 
     /// Published accessors for the pause overlay (meta is private).
@@ -4047,7 +4094,7 @@ class PlayerViewModel: ObservableObject {
         saveProgress(force: false, isPeriodicHeartbeat: true)
     }
 
-    private func saveProgress(
+    func saveProgress(
         force: Bool,
         eventAction: TraktScrobbleAction? = nil,
         isPeriodicHeartbeat: Bool = false

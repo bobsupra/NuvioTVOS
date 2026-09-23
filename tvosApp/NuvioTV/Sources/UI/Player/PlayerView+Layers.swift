@@ -156,7 +156,7 @@ extension PlayerView {
         RemoteTouchCatcher(
             isActive: {
                 !isWakingFromBackground
-                    && viewModel.playbackStartupError == nil && !viewModel.showSettingsPanel
+                    && viewModel.currentErrorDiagnostic == nil && !viewModel.showSettingsPanel
                     && viewModel.sidePanel == nil
                     && !viewModel.postPlayState.isVisible
                     && !viewModel.isHoldingSeek
@@ -176,7 +176,7 @@ extension PlayerView {
             // Hold left/right continuous seek is active during video playback,
             // whether controls are shown or hidden and regardless of button focus.
             isActive: !isWakingFromBackground
-                && viewModel.playbackStartupError == nil
+                && viewModel.currentErrorDiagnostic == nil
                 && !viewModel.showSettingsPanel
                 && viewModel.sidePanel == nil
                 && !viewModel.isScrubbing
@@ -233,7 +233,7 @@ extension PlayerView {
                 (!viewModel.showControls || !didReportPlaybackStarted || viewModel.isSwitchingSource || viewModel.showPauseOverlay)
                     && !viewModel.isScrubbing
                     && !viewModel.isHoldingSeek
-                    && viewModel.playbackStartupError == nil
+                    && viewModel.currentErrorDiagnostic == nil
                     && !viewModel.showNextEpisodeCard
                     && !viewModel.showSkipSegmentCard
                     && !viewModel.showSettingsPanel

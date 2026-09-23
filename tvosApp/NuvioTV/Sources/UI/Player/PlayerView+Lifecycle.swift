@@ -133,9 +133,11 @@ extension PlayerView {
             }
             .onChange(of: scenePhase) { _, phase in
                 switch phase {
-                case .inactive, .background:
+                case .inactive:
+                    break
+                case .background:
                     if !PictureInPictureManager.shared.isPictureInPictureActive {
-                        viewModel.pause(forBackground: true)
+                        viewModel.saveProgress(force: true, eventAction: .pause)
                     }
                 case .active:
                     lastBecameActiveAt = Date()
@@ -145,9 +147,7 @@ extension PlayerView {
                 }
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-                if !PictureInPictureManager.shared.isPictureInPictureActive {
-                    viewModel.pause(forBackground: true)
-                }
+                // Handled gracefully by PiP and backend lifecycle observers
             }
             .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
                 lastBecameActiveAt = Date()

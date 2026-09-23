@@ -62,11 +62,18 @@ struct PlayerView: View {
     var onBack: () -> Void
 
     @State var didHandleFinished = false
+    enum PlaybackErrorFocusItem: Hashable {
+        case sources
+        case retry
+        case close
+    }
+
     @State var didReportPlaybackStarted = false
     @State var lastBecameActiveAt: Date = Date()
     @State var requestedControlFocus: PlayerControlFocus? = nil
     @FocusState var remoteInputFocused: Bool
     @FocusState var startupRetryFocused: Bool
+    @FocusState var errorFocus: PlaybackErrorFocusItem?
     @FocusState var nextEpisodeFocused: Bool
     @FocusState var cancelAutoPlayFocused: Bool
     @FocusState var skipSegmentFocused: Bool
@@ -99,9 +106,9 @@ struct PlayerView: View {
     }
 
     func focusRemoteInput() {
-        guard !viewModel.postPlayState.isVisible, viewModel.playbackStartupError == nil else { return }
+        guard !viewModel.postPlayState.isVisible, viewModel.currentErrorDiagnostic == nil else { return }
         DispatchQueue.main.async {
-            guard viewModel.playbackStartupError == nil else { return }
+            guard viewModel.currentErrorDiagnostic == nil else { return }
             remoteInputFocused = true
         }
     }

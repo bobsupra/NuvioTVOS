@@ -505,14 +505,17 @@ struct PlayerControls: View {
                 Button {
                     selectSubtitlePickerOption(none)
                 } label: {
-                    subtitleMenuItem(title: "None", isSelected: none.isSelected)
+                        subtitleMenuItem(
+                            title: L10n.string("action_none", fallback: "None"),
+                            isSelected: none.isSelected
+                        )
                 }
             }
 
             ForEach(subtitleLanguageGroups) { group in
                 Menu {
                     if !group.builtInOptions.isEmpty {
-                        Section("Built-In") {
+                        Section(L10n.string("tvos_settings_option_built_in", fallback: "Built-In")) {
                             ForEach(group.builtInOptions) { option in
                                 Button {
                                     selectSubtitlePickerOption(option)
@@ -527,7 +530,7 @@ struct PlayerControls: View {
                     }
 
                     if !group.externalOptions.isEmpty {
-                        Section("External Subtitles") {
+                        Section(L10n.string("player_external_subtitles", fallback: "External Subtitles")) {
                             ForEach(group.externalOptions) { option in
                                 Button {
                                     selectSubtitlePickerOption(option)
@@ -651,7 +654,7 @@ struct PlayerControls: View {
                 .fill(Color.red)
                 .frame(width: 12, height: 12)
                 .shadow(color: .red.opacity(0.65), radius: 7)
-            Text("LIVE")
+            Text(L10n.string("player_live", fallback: "LIVE"))
                 .font(.system(size: 22, weight: .bold))
                 .foregroundColor(.white.opacity(0.9))
             Spacer()
@@ -1248,8 +1251,7 @@ struct PlayerSettingsPanel: View {
         case subtitles = "Subtitles"
         case audio = "Audio"
         case speed = "Speed"
-        // Picture / aspect modes temporarily disabled.
-        // case picture = "Picture"
+        case picture = "Picture"
     }
 
     private enum StyleControl: Hashable {
@@ -1310,6 +1312,7 @@ struct PlayerSettingsPanel: View {
                 case .subtitles: subtitlesPage
                 case .audio: audioPage
                 case .speed: speedPage
+                case .picture: picturePage
                 }
             }
             .padding(.horizontal, 90)
@@ -1615,11 +1618,11 @@ struct PlayerSettingsPanel: View {
 
     private var styleColumn: some View {
         VStack(alignment: .leading, spacing: 18) {
-            columnHeader("Subtitle Style")
+            columnHeader(L10n.string("subtitle_style_title", fallback: "Subtitle Style"))
             ScrollView(showsIndicators: false) {
                 VStack(alignment: .leading, spacing: 30) {
                     stepperRow(
-                        title: "Delay",
+                        title: L10n.string("subtitle_tab_delay", fallback: "Delay"),
                         value: "\(viewModel.subtitleDelayMs)ms",
                         minusKey: .delayMinus,
                         plusKey: .delayPlus,
@@ -1629,7 +1632,7 @@ struct PlayerSettingsPanel: View {
 
                     if viewModel.canManuallyToggleAISubtitleTranslation {
                         toggleRow(
-                            title: "AI Translation",
+                            title: L10n.string("settings_ai_subtitles_action_title", fallback: "AI Subtitle Translation"),
                             isOn: viewModel.isAISubtitleTranslationManuallyEnabled,
                             focusKey: .aiTranslation
                         ) {
@@ -1640,7 +1643,7 @@ struct PlayerSettingsPanel: View {
                     }
 
                     stepperRow(
-                        title: "Font Size",
+                        title: L10n.string("subtitle_style_font_size", fallback: "Font Size"),
                         value: "\(style.textSize)%",
                         minusKey: .sizeMinus,
                         plusKey: .sizePlus,
@@ -1648,14 +1651,14 @@ struct PlayerSettingsPanel: View {
                         onPlus: { updateStyle { $0.textSize = min($0.textSize + 5, 220) } }
                     )
 
-                    toggleRow(title: "Bold", isOn: style.bold, focusKey: .bold) {
+                    toggleRow(title: L10n.string("subtitle_style_bold", fallback: "Bold"), isOn: style.bold, focusKey: .bold) {
                         updateStyle { $0.bold.toggle() }
                     }
 
                     colorRow
 
                     stepperRow(
-                        title: "Text Opacity",
+                        title: L10n.string("subtitle_style_text_opacity", fallback: "Text Opacity"),
                         value: "\(style.textOpacity)%",
                         minusKey: .opacityMinus,
                         plusKey: .opacityPlus,
@@ -1663,11 +1666,11 @@ struct PlayerSettingsPanel: View {
                         onPlus: { updateStyle { $0.textOpacity = min($0.textOpacity + 5, 100) } }
                     )
 
-                    toggleRow(title: "Outline", isOn: style.outlineEnabled, focusKey: .outline) {
+                    toggleRow(title: L10n.string("subtitle_style_outline", fallback: "Outline"), isOn: style.outlineEnabled, focusKey: .outline) {
                         updateStyle { $0.outlineEnabled.toggle() }
                     }
 
-                    toggleRow(title: "Background", isOn: style.backgroundEnabled, focusKey: .background) {
+                    toggleRow(title: L10n.string("subtitle_background", fallback: "Background"), isOn: style.backgroundEnabled, focusKey: .background) {
                         updateStyle { $0.backgroundEnabled.toggle() }
                     }
 
@@ -1676,7 +1679,7 @@ struct PlayerSettingsPanel: View {
                         .disabled(!style.backgroundEnabled)
 
                     stepperRow(
-                        title: "Background Opacity",
+                        title: L10n.string("subtitle_background_opacity", fallback: "Background Opacity"),
                         value: "\(style.backgroundOpacity)%",
                         minusKey: .backgroundOpacityMinus,
                         plusKey: .backgroundOpacityPlus,
@@ -1759,7 +1762,9 @@ struct PlayerSettingsPanel: View {
         return VStack(alignment: .leading, spacing: 14) {
             styleLabel(title)
             Button(action: action) {
-                Text(isOn ? "On" : "Off")
+                Text(isOn
+                     ? L10n.string("subtitle_style_on", fallback: "On")
+                     : L10n.string("subtitle_style_off", fallback: "Off"))
                     .font(.system(size: 22, weight: .semibold))
                     .foregroundColor(isFocused ? .black : .white)
                     .frame(width: 112, height: 52)
@@ -1775,7 +1780,7 @@ struct PlayerSettingsPanel: View {
 
     private var colorRow: some View {
         VStack(alignment: .leading, spacing: 16) {
-            styleLabel("Text Color")
+            styleLabel(L10n.string("subtitle_style_text_color", fallback: "Text Color"))
             HStack(spacing: 20) {
                 ForEach(Self.palette, id: \.self) { hex in
                     colorSwatch(hex)
@@ -1813,7 +1818,7 @@ struct PlayerSettingsPanel: View {
 
     private var backgroundColorRow: some View {
         VStack(alignment: .leading, spacing: 16) {
-            styleLabel("Background Color")
+            styleLabel(L10n.string("subtitle_background_color", fallback: "Background Color"))
             HStack(spacing: 20) {
                 ForEach(Self.backgroundPalette, id: \.self) { hex in
                     backgroundColorSwatch(hex)
@@ -1958,9 +1963,9 @@ struct PlayerSettingsPanel: View {
             audioOutputSection
 
             audioStepper(
-                title: "Audio Delay",
+                title: L10n.string("player_audio_delay", fallback: "Audio Delay"),
                 value: String(format: "%.3fs", Double(viewModel.audioDelayMs) / 1000.0),
-                caption: "Range: -3.00s to 3.00s",
+                caption: L10n.string("player_audio_delay_range", fallback: "Range: -3.00s to 3.00s"),
                 minusKey: .delayMinus,
                 plusKey: .delayPlus,
                 minusDisabled: viewModel.audioDelayMs <= -3000,
@@ -1970,11 +1975,11 @@ struct PlayerSettingsPanel: View {
             )
 
             audioStepper(
-                title: "Amplification (PCM)",
+                title: L10n.string("player_audio_amplification", fallback: "Amplification (PCM)"),
                 value: "\(viewModel.audioAmplificationDb) dB",
                 caption: aetherAmplificationUnavailable
-                    ? "Unavailable with Aether"
-                    : "Range: 0 dB to 10 dB",
+                    ? L10n.string("player_unavailable_with_aether", fallback: "Unavailable with Aether")
+                    : L10n.string("player_amplification_range", fallback: "Range: 0 dB to 10 dB"),
                 minusKey: .ampMinus,
                 plusKey: .ampPlus,
                 minusDisabled: aetherAmplificationUnavailable || viewModel.audioAmplificationDb <= 0,
@@ -1983,7 +1988,7 @@ struct PlayerSettingsPanel: View {
                 onPlus: { viewModel.setAudioAmplificationDb(viewModel.audioAmplificationDb + 1) }
             )
 
-            Text("Persist between sessions: OFF")
+            Text(L10n.string("player_persist_between_sessions_off", fallback: "Persist between sessions: OFF"))
                 .font(.system(size: 18, weight: .semibold))
                 .foregroundColor(.white.opacity(0.42))
                 .padding(.top, 4)
@@ -1996,7 +2001,7 @@ struct PlayerSettingsPanel: View {
 
     private var audioOutputSection: some View {
         VStack(alignment: .leading, spacing: 10) {
-            Text("Audio Output")
+            Text(L10n.string("player_audio_output", fallback: "Audio Output"))
                 .font(.system(size: 27, weight: .semibold))
                 .foregroundColor(.white)
 
@@ -2011,7 +2016,10 @@ struct PlayerSettingsPanel: View {
                         .foregroundColor(.white)
                         .lineLimit(1)
 
-                    Text("Control volume with Siri Remote ± or hold TV button")
+                    Text(L10n.string(
+                        "player_audio_output_hint",
+                        fallback: "Control volume with Siri Remote ± or hold TV button"
+                    ))
                         .font(.system(size: 17, weight: .medium))
                         .foregroundColor(.white.opacity(0.5))
                         .lineLimit(1)
@@ -2124,11 +2132,11 @@ struct PlayerSettingsPanel: View {
             .frame(width: 320, alignment: .leading)
 
             VStack(alignment: .leading, spacing: 18) {
-                columnHeader("Options")
+                columnHeader(L10n.string("player_options", fallback: "Options"))
                 ScrollView(showsIndicators: false) {
                     VStack(spacing: 12) {
                         toggleRow(
-                            title: "Seeking Preview",
+                            title: L10n.string("tvos_settings_seeking_preview", fallback: "Seeking Preview"),
                             isOn: viewModel.isSeekPreviewEnabled,
                             focusKey: .seekPreview
                         ) {
@@ -2136,7 +2144,7 @@ struct PlayerSettingsPanel: View {
                         }
 
                         simpleRow(
-                            title: "Debug Overlay",
+                            title: L10n.string("tvos_settings_playback_debug_overlay", fallback: "Playback Debug Overlay"),
                             isSelected: viewModel.isPlaybackDebugEnabled,
                             focusKey: .debugOverlay
                         ) {

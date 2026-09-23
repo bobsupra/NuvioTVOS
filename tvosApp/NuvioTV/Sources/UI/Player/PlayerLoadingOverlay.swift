@@ -337,7 +337,7 @@ struct PlayerLoadingOverlay: View {
                                     Text("\(stats.connectedSeeds)")
                                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                                         .foregroundColor(.green)
-                                    Text("seeds")
+                                    Text(L10n.string("player_torrent_seeds", fallback: "seeds"))
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundColor(.white.opacity(0.7))
                                 }
@@ -350,7 +350,7 @@ struct PlayerLoadingOverlay: View {
                                     Text("\(stats.connectedPeers)")
                                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                                         .foregroundColor(.blue)
-                                    Text("peers")
+                                    Text(L10n.string("player_torrent_peers", fallback: "peers"))
                                         .font(.system(size: 12, weight: .medium))
                                         .foregroundColor(.white.opacity(0.7))
                                 }
