@@ -301,6 +301,8 @@ actor PlaybackStreamCacheServer {
     private let customHeaders: [String: String]
     private let diskCache: PlaybackStreamDiskCache
     private let urlSession: URLSession
+    private var maxDiskCacheSizeBytes: Int64
+    private let freeSpaceReserveBytes: Int64
 
     private var listener: NWListener?
     private let queue = DispatchQueue(label: "nuvio.stream.cache.server")
@@ -348,27 +350,58 @@ actor PlaybackStreamCacheServer {
     /// Active download offset read by the local HTTP client/socket.
     private var clientReadOffset: Int64? = nil
     private var clientReadGeneration: UInt64 = 0
-    /// An established HTTP playback read is authoritative. Timeline values are only a
-    /// fallback before playback has supplied an actual byte position.
+    /// An established HTTP playback read is authoritative when near the player playhead.
+    /// Auxiliary reads (such as index, moov/cues or subtitle track reads near EOF) do not misanchor forward fill.
     private var effectiveAnchorOffset: Int64 {
-        clientReadOffset ?? playerPlayheadOffset
+        if let clientOffset = clientReadOffset {
+            let diff = clientOffset - playerPlayheadOffset
+            if diff >= 0 && diff < 64 * 1024 * 1024 {
+                return clientOffset
+            }
+            if diff < 0 && abs(diff) < 16 * 1024 * 1024 {
+                return clientOffset
+            }
+        }
+        return playerPlayheadOffset
     }
     private var durationSeconds: Double?
     private var lastMeasuredBps: Double?
     private let targetLeadSeconds: Double
     private let minForwardLeadBytes: Int64 = 80 * 1024 * 1024 // 80 MB minimum
-    private let maxForwardLeadBytes: Int64 = 1500 * 1024 * 1024 // 1.5 GB maximum
-    static let maxBatchChunks = 4 // Batch up to 4 chunks (8 MiB) per sequential upstream request
+    private let burstSeconds: Double = 60.0
+    private let burstFallbackBytes: Int64 = 256 * 1024 * 1024 // 256 MB fallback
+    static let maxBatchChunks = 4 // Batch up to 4 chunks (8 MiB) per upstream request
 
-    /// Adaptive forward buffer lead calculated from video duration and file length.
+    /// Target bytes for the high-priority opening burst (60 seconds of video or 256 MB).
+    var burstTargetBytes: Int64 {
+        let totalLen = diskCache.fileLength
+        if let dur = durationSeconds, dur > 0, totalLen > 0 {
+            let byTime = Int64(Double(totalLen) / dur * burstSeconds)
+            return max(minForwardLeadBytes, byTime)
+        }
+        return burstFallbackBytes
+    }
+
+    /// Whether the cache is in the opening burst phase.
+    var isBursting: Bool {
+        get async {
+            let playhead = effectiveAnchorOffset
+            let leadAhead = await diskCache.contiguousCachedBytesAhead(of: playhead)
+            return leadAhead < burstTargetBytes
+        }
+    }
+
+    /// Adaptive forward buffer lead calculated from video duration and file length,
+    /// bounded by the session's allocated disk budget rather than a rigid 1.5 GB ceiling.
     var adaptiveForwardLeadBytes: Int64 {
         let totalLen = diskCache.fileLength
+        let diskLimit = max(minForwardLeadBytes, maxDiskCacheSizeBytes - freeSpaceReserveBytes)
         if let dur = durationSeconds, dur > 0, totalLen > 0 {
             let estimatedByteRate = Double(totalLen) / dur
             let targetBytes = Int64(estimatedByteRate * targetLeadSeconds)
-            return min(maxForwardLeadBytes, max(minForwardLeadBytes, targetBytes))
+            return min(diskLimit, max(minForwardLeadBytes, targetBytes))
         }
-        return min(maxForwardLeadBytes, max(minForwardLeadBytes, Int64(targetLeadSeconds * (250 * 1024 * 1024 / 150.0))))
+        return min(diskLimit, max(minForwardLeadBytes, Int64(targetLeadSeconds * (250 * 1024 * 1024 / 150.0))))
     }
 
     func updateTimeline(playheadOffset: Int64, durationSeconds: Double? = nil, isSeek: Bool = false) {
@@ -385,16 +418,9 @@ actor PlaybackStreamCacheServer {
 
     private func handleClientReadJump(newOffset: Int64) {
         guard newOffset >= 0 else { return }
-        let oldOffset = clientReadOffset ?? playerPlayheadOffset
-        let diffFromClient = abs(newOffset - oldOffset)
-        let diffFromPlayer = abs(newOffset - playerPlayheadOffset)
-        let seekThreshold: Int64 = 8 * 1024 * 1024 // 8 MiB (4 chunks)
-        // If HTTP read jumps away from both current client read and player playhead, cancel obsolete prefetch
-        if clientReadOffset != nil && diffFromClient > seekThreshold && diffFromPlayer > seekThreshold {
-            cancelObsoletePrefetch()
-        }
-        // Every new playback request retires the old socket's position updates,
-        // including overlapping reconnects inside the seek threshold.
+        // Client read jumps occur during container probing (tail, indexes, audio/subtitle packets).
+        // Forward prefetch is anchored to playerPlayheadOffset / effectiveAnchorOffset, so we do not
+        // cancel forward prefetch here; prefetch is cancelled only on explicit seek (updateTimeline isSeek: true).
         clientReadGeneration &+= 1
         clientReadOffset = newOffset
     }
@@ -429,11 +455,27 @@ actor PlaybackStreamCacheServer {
     }
 
     /// Concurrency throttle and rate-limit backoff state
-    private var maxConcurrentUpstream = 3
+    private var maxConcurrentUpstream = 4
     private let configuredMaxConcurrentUpstream: Int
     private var isThrottled = false
+    private var throttleCeiling: Int?
+    private var rampInterval: TimeInterval = 5.0
+    private static let rampIntervalMin: TimeInterval = 5.0
+    private static let rampIntervalMax: TimeInterval = 60.0
+    private var lastRampAt: Date = .distantPast
     private var lastThrottleTime: Date?
     private let throttleRecoveryInterval: TimeInterval = 300 // 5 minutes
+
+    static func defaultMaxConcurrentUpstream(physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> Int {
+        let gibPhysical = Double(physicalMemoryBytes) / 1_073_741_824.0
+        if gibPhysical > 3.5 {
+            return 8 // Apple TV 4K Gen 3 (4 GB)
+        } else if gibPhysical > 2.5 {
+            return 6 // Apple TV 4K Gen 1/2 (3 GB)
+        } else {
+            return 4 // Apple TV HD (2 GB)
+        }
+    }
 
     init(
         remoteURL: URL,
@@ -442,21 +484,28 @@ actor PlaybackStreamCacheServer {
         sessionID: String = UUID().uuidString,
         maxDiskCacheSizeBytes: Int64 = 20 * 1024 * 1024 * 1024,
         freeSpaceReserveBytes: Int64 = PlaybackStreamDiskCache.defaultFreeSpaceReserveBytes,
-        targetLeadSeconds: Double = 150.0,
+        targetLeadSeconds: Double = 600.0,
         cacheRoot: URL? = nil,
         manifest: PlaybackStreamManifest? = nil,
         sessionConfiguration: URLSessionConfiguration? = nil,
         rateLimitCooldown: TimeInterval = 1,
-        maxConcurrentUpstream: Int = 3,
+        maxConcurrentUpstream: Int? = nil,
         freeSpaceProvider: PlaybackStreamDiskCache.FreeSpaceProvider? = nil
     ) {
         self.remoteURL = remoteURL
         self.customHeaders = customHeaders
         self.token = sessionID
-        self.targetLeadSeconds = targetLeadSeconds.isFinite && targetLeadSeconds > 0 ? targetLeadSeconds : 150.0
+        self.targetLeadSeconds = targetLeadSeconds.isFinite && targetLeadSeconds > 0 ? targetLeadSeconds : 600.0
         self.rateLimitCooldown = rateLimitCooldown.isFinite ? min(max(0.1, rateLimitCooldown), 60) : 1
-        self.configuredMaxConcurrentUpstream = max(1, maxConcurrentUpstream)
-        self.maxConcurrentUpstream = self.configuredMaxConcurrentUpstream
+        let resolvedConcurrency = maxConcurrentUpstream ?? Self.defaultMaxConcurrentUpstream()
+        self.configuredMaxConcurrentUpstream = max(1, resolvedConcurrency)
+        if maxConcurrentUpstream != nil {
+            self.maxConcurrentUpstream = self.configuredMaxConcurrentUpstream
+        } else {
+            self.maxConcurrentUpstream = min(4, self.configuredMaxConcurrentUpstream)
+        }
+        self.maxDiskCacheSizeBytes = maxDiskCacheSizeBytes
+        self.freeSpaceReserveBytes = freeSpaceReserveBytes
         self.diskCache = PlaybackStreamDiskCache(
             sessionID: sessionID,
             fileLength: fileLength,
@@ -471,7 +520,7 @@ actor PlaybackStreamCacheServer {
         let config = sessionConfiguration ?? URLSessionConfiguration.default
         config.timeoutIntervalForRequest = 20
         config.timeoutIntervalForResource = 60
-        config.httpMaximumConnectionsPerHost = 6
+        config.httpMaximumConnectionsPerHost = max(8, self.configuredMaxConcurrentUpstream + 2)
         self.urlSession = URLSession(configuration: config)
     }
 
@@ -574,17 +623,17 @@ actor PlaybackStreamCacheServer {
     // MARK: - Background Workers (Tier 2 & Tier 3)
 
     private func startBackgroundWorkers() {
-        // Tier 2: Forward Fill (~10 minutes ahead of playhead)
+        // Tier 2: Forward Fill (~10+ minutes ahead of playhead, up to disk cache budget)
         forwardFillTask = Task { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                let isUrgent = await self.performForwardFillStep()
-                if isUrgent {
-                    // Low lead ahead: burst fill without artificial sleep delay
-                    await Task.yield()
+                let isBuilding = await self.performForwardFillStep()
+                if isBuilding {
+                    // Actively building or in opening burst: keep loop responsive to sustain concurrent pipeline
+                    try? await Task.sleep(nanoseconds: 10_000_000)
                 } else {
                     // Target lead satisfied: rest before polling playhead progress
-                    try? await Task.sleep(nanoseconds: 300_000_000)
+                    try? await Task.sleep(nanoseconds: 200_000_000)
                 }
             }
         }
@@ -593,42 +642,53 @@ actor PlaybackStreamCacheServer {
         archiveTask = Task(priority: .background) { [weak self] in
             while !Task.isCancelled {
                 guard let self else { return }
-                let didFetch = await self.performArchiveStep()
-                if didFetch {
-                    try? await Task.sleep(nanoseconds: 80_000_000)
+                let didDispatch = await self.performArchiveStep()
+                if didDispatch {
+                    try? await Task.sleep(nanoseconds: 50_000_000)
                 } else {
-                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    try? await Task.sleep(nanoseconds: 500_000_000)
                 }
             }
         }
     }
 
+    /// Dispatches concurrent forward fill batches up to available upstream slots.
     /// Returns `true` if the buffer ahead is still actively building toward the target lead.
     @discardableResult
     private func performForwardFillStep() async -> Bool {
         guard !diskWriteFailed else { return false }
-        guard pendingWrites.count < Self.maxBatchChunks * 2 else { return false }
+        guard pendingWrites.count < Self.maxBatchChunks * 4 else { return false }
         checkThrottleRecovery()
         let playhead = effectiveAnchorOffset
         let totalLen = diskCache.fileLength
         guard totalLen > 0 else { return false }
 
         let leadAhead = await diskCache.contiguousCachedBytesAhead(of: playhead)
-        let targetLead = adaptiveForwardLeadBytes
+        let bursting = leadAhead < burstTargetBytes
+        let targetLead = bursting ? max(burstTargetBytes, adaptiveForwardLeadBytes) : adaptiveForwardLeadBytes
         let isUrgent = leadAhead < targetLead
+
+        guard isUrgent else { return false }
 
         let startChunk = diskCache.chunkIndex(forByteOffset: playhead)
         let endOffset = min(playhead + targetLead, totalLen - 1)
         let endChunk = diskCache.chunkIndex(forByteOffset: endOffset)
 
         guard endChunk >= startChunk else { return false }
+
+        // Determine how many concurrent slots forward fill can use
+        let allowedConcurrency = bursting ? maxConcurrentUpstream : max(1, maxConcurrentUpstream - 1)
+        let availableSlots = max(0, allowedConcurrency - activeUpstreamFetches - queuedDemandWaiters - (maxConcurrentUpstream <= 1 ? activeDemandFetches : 0))
+        guard availableSlots > 0 else { return isUrgent }
+
+        var dispatched = 0
         var chunk = startChunk
-        while chunk <= endChunk {
-            if Task.isCancelled { return false }
+        while chunk <= endChunk && dispatched < availableSlots {
+            if Task.isCancelled { break }
             let isCached = await diskCache.isChunkCached(chunk)
             if !isCached && inFlightDemandFetches[chunk] == nil && inFlightBatchFetches[chunk] == nil {
                 guard await diskCache.canPrefetchChunk(chunk, playheadOffset: playhead, evictBehindPlayhead: true) else {
-                    return false
+                    break
                 }
                 var batchCount = 1
                 while batchCount < Self.maxBatchChunks && (chunk + batchCount) <= endChunk {
@@ -636,55 +696,110 @@ actor PlaybackStreamCacheServer {
                     if await diskCache.isChunkCached(next) || inFlightDemandFetches[next] != nil || inFlightBatchFetches[next] != nil { break }
                     batchCount += 1
                 }
-                let fetched = await fetchAndCacheBatch(startingAt: chunk, count: batchCount, priority: .forward)
-                return isUrgent && fetched != nil
+                dispatchBatchFetch(startingAt: chunk, count: batchCount, priority: .forward)
+                dispatched += 1
+                chunk += batchCount
+            } else {
+                chunk += 1
             }
-            chunk += 1
         }
-        return false
+        return isUrgent
     }
 
-    /// Returns `true` if an archive chunk was fetched, or `false` if yielding/paused.
+    /// Dispatches background archive chunks from 0 to EOF once forward fill is healthy.
     @discardableResult
     private func performArchiveStep() async -> Bool {
         guard !diskWriteFailed else { return false }
         guard pendingWrites.isEmpty, writingChunk == nil else { return false }
         guard !isThrottled else { return false }
-        guard !hasActiveDemand else {
-            // Priority scheduling: player demand takes complete priority over archive
-            return false
-        }
+
         let total = diskCache.totalChunks
         guard total > 0 else { return false }
 
         // Protect Tier 2: Only archive if Forward Fill already satisfies target lead
         let playhead = effectiveAnchorOffset
         let leadAhead = await diskCache.contiguousCachedBytesAhead(of: playhead)
+        let bursting = leadAhead < burstTargetBytes
+        guard !bursting else { return false } // Yield completely to opening burst
+
         let neededLead = adaptiveForwardLeadBytes
         guard leadAhead >= neededLead else {
-            return false // Yield bandwidth completely to Forward Fill
+            return false // Yield bandwidth to Forward Fill until target lead is satisfied
         }
 
+        // Dedicated archive slots (at most 2, leaving room for playback)
+        let archiveSlots = min(2, max(0, maxConcurrentUpstream - activeUpstreamFetches - 1))
+        guard archiveSlots > 0 else { return false }
+
+        var dispatched = 0
         let startChunk = diskCache.chunkIndex(forByteOffset: playhead)
-        guard startChunk < total else { return false }
         var chunk = startChunk
-        while chunk < total {
-            if Task.isCancelled || hasActiveDemand { return false }
+        while chunk < total && dispatched < archiveSlots {
+            if Task.isCancelled { return dispatched > 0 }
             let isCached = await diskCache.isChunkCached(chunk)
-            if !isCached,
+            if !isCached && inFlightDemandFetches[chunk] == nil && inFlightBatchFetches[chunk] == nil,
                await diskCache.canPrefetchChunk(chunk, playheadOffset: playhead, evictBehindPlayhead: false) {
                 var batchCount = 1
                 while batchCount < Self.maxBatchChunks && (chunk + batchCount) < total {
                     let next = chunk + batchCount
-                    if await diskCache.isChunkCached(next) { break }
+                    if await diskCache.isChunkCached(next) || inFlightDemandFetches[next] != nil || inFlightBatchFetches[next] != nil { break }
                     batchCount += 1
                 }
-                let fetched = await fetchAndCacheBatch(startingAt: chunk, count: batchCount, priority: .archive)
-                return fetched != nil
+                dispatchBatchFetch(startingAt: chunk, count: batchCount, priority: .archive)
+                dispatched += 1
+                chunk += batchCount
+            } else {
+                chunk += 1
             }
-            chunk += 1
         }
-        return false
+
+        // If from playhead to end is complete, fill from 0 to playhead as well
+        if chunk >= total && startChunk > 0 && dispatched < archiveSlots {
+            var wrapChunk = 0
+            while wrapChunk < startChunk && dispatched < archiveSlots {
+                if Task.isCancelled { return dispatched > 0 }
+                let isCached = await diskCache.isChunkCached(wrapChunk)
+                if !isCached && inFlightDemandFetches[wrapChunk] == nil && inFlightBatchFetches[wrapChunk] == nil,
+                   await diskCache.canPrefetchChunk(wrapChunk, playheadOffset: playhead, evictBehindPlayhead: false) {
+                    var batchCount = 1
+                    while batchCount < Self.maxBatchChunks && (wrapChunk + batchCount) < startChunk {
+                        let next = wrapChunk + batchCount
+                        if await diskCache.isChunkCached(next) || inFlightDemandFetches[next] != nil || inFlightBatchFetches[next] != nil { break }
+                        batchCount += 1
+                    }
+                    dispatchBatchFetch(startingAt: wrapChunk, count: batchCount, priority: .archive)
+                    dispatched += 1
+                    wrapChunk += batchCount
+                } else {
+                    wrapChunk += 1
+                }
+            }
+        }
+
+        return dispatched > 0
+    }
+
+    private func dispatchBatchFetch(startingAt startChunk: Int, count: Int, priority: FetchPriority) {
+        let total = diskCache.totalChunks
+        guard startChunk >= 0, startChunk < total, count > 0 else { return }
+        let actualCount = min(count, total - startChunk)
+
+        let startByte = diskCache.byteRange(forChunk: startChunk).lowerBound
+        let endByte = diskCache.byteRange(forChunk: startChunk + actualCount - 1).upperBound
+        let batchRange = startByte..<endByte
+        guard !batchRange.isEmpty else { return }
+
+        let batch = PlaybackStreamSharedBatch(priority: priority, startChunk: startChunk, count: actualCount)
+        let task = Task<Bool, Never> { [weak self] in
+            guard let self else { return false }
+            let result = await self.executeBatchFetch(batch: batch, batchRange: batchRange)
+            await self.removeCompletedBatch(batch, count: actualCount)
+            return result
+        }
+
+        for i in 0..<actualCount {
+            inFlightBatchFetches[startChunk + i] = (batch, task)
+        }
     }
 
     // MARK: - Prompt Demand Fetching (Tier 1)
@@ -834,8 +949,12 @@ actor PlaybackStreamCacheServer {
 
         defer { batch.finish() }
         for attempt in 1...3 {
-            if Task.isCancelled { return false }
+            if Task.isCancelled || stopped { return false }
             guard await acquireFetchSlot(priority: priority) else { return false }
+            guard !stopped, !Task.isCancelled else {
+                releaseFetchSlot(priority: priority)
+                return false
+            }
 
             let admissionPlayhead = effectiveAnchorOffset
             if priority == .forward,
@@ -854,6 +973,10 @@ actor PlaybackStreamCacheServer {
                 expectedRange: batchRange, expectedFileLength: diskCache.fileLength
             )
             do {
+                guard !stopped, !Task.isCancelled else {
+                    releaseFetchSlot(priority: priority)
+                    return false
+                }
                 stream.start(in: urlSession, request: req)
                 var assembled = Data()
                 var emitted = 0
@@ -1027,23 +1150,41 @@ actor PlaybackStreamCacheServer {
 
     private func applyRateLimitThrottle(retryAfter: String?) -> TimeInterval {
         isThrottled = true
-        maxConcurrentUpstream = max(1, maxConcurrentUpstream - 1)
+        throttleCeiling = maxConcurrentUpstream
+        maxConcurrentUpstream = max(1, maxConcurrentUpstream / 2)
+        rampInterval = min(Self.rampIntervalMax, max(Self.rampIntervalMin, rampInterval * 2))
         lastThrottleTime = Date()
         let parsedDelay = retryAfter.flatMap(TimeInterval.init)
         let retryAfter = parsedDelay.flatMap { $0.isFinite && $0 >= 0 ? $0 : nil } ?? rateLimitCooldown
         let delay = min(max(0.1, retryAfter), 60)
         let newUntil = Date().addingTimeInterval(delay)
         throttleUntil = max(throttleUntil ?? .distantPast, newUntil)
-        diskCacheLog.warning("Provider rate limit detected. Concurrency lowered to \(self.maxConcurrentUpstream)")
+        diskCacheLog.warning("Provider rate limit detected. Concurrency halved to \(self.maxConcurrentUpstream), ramp interval \(self.rampInterval)s")
         return delay
     }
 
     private func checkThrottleRecovery() {
-        guard isThrottled, let last = lastThrottleTime else { return }
-        if Date().timeIntervalSince(last) >= throttleRecoveryInterval {
+        let now = Date()
+        if isThrottled, let last = lastThrottleTime, now.timeIntervalSince(last) >= throttleRecoveryInterval {
             isThrottled = false
+            throttleCeiling = nil
             maxConcurrentUpstream = configuredMaxConcurrentUpstream
+            rampInterval = Self.rampIntervalMin
             diskCacheLog.notice("Rate limit recovery period elapsed. Concurrency restored to \(self.maxConcurrentUpstream).")
+            return
+        }
+        // Progressive ramp up if running smoothly without errors
+        if maxConcurrentUpstream < configuredMaxConcurrentUpstream,
+           (throttleUntil == nil || throttleUntil! <= now),
+           now.timeIntervalSince(lastRampAt) >= rampInterval {
+            if let ceiling = throttleCeiling, maxConcurrentUpstream >= ceiling {
+                // At known ceiling: wait for full recovery interval before probing again
+                return
+            }
+            maxConcurrentUpstream += 1
+            lastRampAt = now
+            rampInterval = max(Self.rampIntervalMin, rampInterval * 0.9)
+            diskCacheLog.info("Progressive ramp-up: concurrency increased to \(self.maxConcurrentUpstream)")
         }
     }
 

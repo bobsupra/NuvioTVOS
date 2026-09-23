@@ -1908,6 +1908,128 @@ extension PlaybackStreamCacheTests {
 
         await server.stop()
     }
+
+    // MARK: - Orivio Buffering Supercharge Tests
+
+    func testHardwareAwareConcurrencyDefaults() {
+        let concurrency = PlaybackStreamCacheServer.defaultMaxConcurrentUpstream()
+        let memory = ProcessInfo.processInfo.physicalMemory
+        if memory >= 4 * 1024 * 1024 * 1024 {
+            XCTAssertEqual(concurrency, 8, "Apple TV 4K Gen 3 should default to 8 concurrent streams")
+        } else if memory >= 3 * 1024 * 1024 * 1024 {
+            XCTAssertEqual(concurrency, 6, "Apple TV 4K Gen 1/2 should default to 6 concurrent streams")
+        } else {
+            XCTAssertEqual(concurrency, 4, "Apple TV HD should default to 4 concurrent streams")
+        }
+    }
+
+    func testOpeningBurstCalculationAndState() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 10 GB movie, 7200 seconds (2 hours) -> Bitrate = ~11.6 Mbps = 1.45 MB/s -> 60s burst = ~87 MB
+        let tenGigabytes: Int64 = 10 * 1024 * 1024 * 1024
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/burst_movie.mkv")!,
+            fileLength: tenGigabytes,
+            cacheRoot: root
+        )
+
+        // Before timeline is known, burst falls back to 256 MB
+        let fallbackBurst = await server.burstTargetBytes
+        XCTAssertEqual(fallbackBurst, 256 * 1024 * 1024)
+
+        // After timeline is known (7200 seconds)
+        await server.updateTimeline(playheadOffset: 0, durationSeconds: 7200)
+        let calculatedBurst = await server.burstTargetBytes
+        // Expected: (10GB / 7200) * 60 = 89,478,485 bytes (clamped to minForwardLeadBytes of 80MB)
+        let expectedBurst = Int64(Double(tenGigabytes) / 7200.0 * 60.0)
+        XCTAssertEqual(calculatedBurst, expectedBurst)
+        XCTAssertGreaterThan(calculatedBurst, 80 * 1024 * 1024)
+
+        // Initial burst state must be true
+        let isBursting = await server.isBursting
+        XCTAssertTrue(isBursting, "Stream must start in high-priority opening burst mode")
+        await server.stop()
+    }
+
+    func testExpandedForwardBufferHorizonExceedsOnePointFiveGigabytes() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 40 GB high-bitrate remux, 7200 seconds (2 hours) -> Bitrate = ~46.6 Mbps = 5.82 MB/s
+        let fortyGB: Int64 = 40 * 1024 * 1024 * 1024
+        let thirtyGBDisk: Int64 = 30 * 1024 * 1024 * 1024
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/remux_4k.mkv")!,
+            fileLength: fortyGB,
+            maxDiskCacheSizeBytes: thirtyGBDisk,
+            targetLeadSeconds: 600.0, // 10 minutes forward lead = ~3.5 GB lead
+            cacheRoot: root
+        )
+
+        await server.updateTimeline(playheadOffset: 0, durationSeconds: 7200)
+        let leadBytes = await server.adaptiveForwardLeadBytes
+
+        // Verify lead exceeds the old legacy 1.5 GB limit
+        let oldOnePointFiveGBLimit: Int64 = 1536 * 1024 * 1024
+        XCTAssertGreaterThan(leadBytes, oldOnePointFiveGBLimit, "Lead horizon should exceed legacy 1.5 GB cap on high-capacity disk cache")
+        // Expected ~3.49 GB (3744927288 bytes)
+        let expectedBytes = Int64(Double(fortyGB) / 7200.0 * 600.0)
+        XCTAssertEqual(leadBytes, expectedBytes)
+        await server.stop()
+    }
+
+    func testAdaptiveRateLimitHalvingAndProgressiveRamp() async throws {
+        let chunk = Int(PlaybackStreamDiskCache.defaultChunkSize)
+        let fileLength = Int64(chunk * 32)
+        let fullBody = Data((0..<Int(fileLength)).map { UInt8($0 % 256) })
+
+        var requestAttempt = 0
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            requestAttempt += 1
+            if requestAttempt == 1 {
+                // First request triggers HTTP 429 Too Many Requests
+                var resp = PlaybackStreamCacheURLProtocol.response(for: request, body: Data(), total: fileLength)
+                resp.statusCode = 429
+                resp.retryAfter = "0.1"
+                return resp
+            }
+            return PlaybackStreamCacheURLProtocol.response(for: request, body: fullBody, total: fileLength)
+        }
+
+        let session = "test_ratelimit_\(UUID().uuidString)"
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(session)
+        defer {
+            PlaybackStreamCacheURLProtocol.handler = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/ratelimit.mkv")!,
+            fileLength: fileLength,
+            sessionID: session,
+            cacheRoot: root,
+            sessionConfiguration: configuration,
+            rateLimitCooldown: 0.1,
+            maxConcurrentUpstream: 8
+        )
+
+        let localURL = try await server.start()
+
+        // Read first chunk: triggers 429, throttles and halves concurrency (from 8 to 4)
+        var req = URLRequest(url: localURL)
+        req.setValue("bytes=0-\(chunk - 1)", forHTTPHeaderField: "Range")
+        let (data, resp) = try await URLSession.shared.data(for: req)
+        let httpResp = resp as! HTTPURLResponse
+        XCTAssertEqual(httpResp.statusCode, 206)
+        XCTAssertEqual(data.count, chunk)
+
+        await server.stop()
+    }
 }
 
 

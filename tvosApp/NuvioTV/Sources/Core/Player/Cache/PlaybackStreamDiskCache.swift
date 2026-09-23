@@ -225,7 +225,9 @@ actor PlaybackStreamDiskCache {
         guard index >= 0, index < totalChunks else { return false }
         if cachedChunkIndices.contains(index) { return true }
         let playheadChunk = chunkIndex(forByteOffset: max(0, playheadOffset))
-        guard index >= playheadChunk else { return false }
+        if evictBehindPlayhead {
+            guard index >= playheadChunk else { return false }
+        }
 
         // Headroom reserve: do not prefetch if disk free space is below the reserve.
         // Atomic writes require temporary staging space (2 * chunkBytes).
