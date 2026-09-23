@@ -35,7 +35,14 @@ struct PlayerSubtitleOverlay: View {
     private var activeTextCues: [SubtitleCue] {
         activeCues.filter {
             if case .image = $0.body { return false }
-            return true
+            return $0.placement == nil
+        }
+    }
+
+    private var placedTextCues: [SubtitleCue] {
+        activeCues.filter {
+            if case .image = $0.body { return false }
+            return $0.placement != nil
         }
     }
 
@@ -48,7 +55,7 @@ struct PlayerSubtitleOverlay: View {
 
     var body: some View {
         GeometryReader { geo in
-            let videoRect = displayedVideoRect(
+            let videoRect = playback.nativeVideoRect ?? displayedVideoRect(
                 container: geo.size,
                 video: videoNaturalSize,
                 mode: aspectMode
@@ -60,35 +67,79 @@ struct PlayerSubtitleOverlay: View {
                     }
                 }
 
-                // Multiple simultaneous dialogue cues stack above the video
-                // bottom instead of being painted on the same baseline.
-                VStack(spacing: 10) {
-                    ForEach(activeTextCues) { cue in
-                        textBody(cue)
-                    }
-                    if translation.isTranslating(cueIDs: activeTextCues.map(\.id)) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "sparkles")
-                            Text("AI")
-                            ProgressView()
-                                .controlSize(.mini)
+                if let renderer = playback.assRenderer {
+                    ASSRenderedSubtitles(
+                        renderer: renderer,
+                        reloadSignal: playback.assReloadSignal,
+                        sourceTime: evaluationTime,
+                        onCanvasSizeChanged: playback.onASSCanvasSizeChanged
+                    )
+                    .id(ObjectIdentifier(renderer))
+                    .frame(width: videoRect.width, height: videoRect.height)
+                    .position(x: videoRect.midX, y: videoRect.midY)
+                } else if playback.isASSActive {
+                    VStack(spacing: 10) {
+                        ForEach(activeTextCues) { cue in
+                            if let raw = cue.text,
+                               let plain = ASSPlainTextFallback.text(from: raw) {
+                                outlinedText(plain, alignment: .center)
+                            }
                         }
-                        .font(.system(size: 13, weight: .bold))
-                        .foregroundStyle(.white.opacity(0.72))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(.black.opacity(0.36), in: Capsule())
                     }
+                    .frame(
+                        width: max(videoRect.width - horizontalMargin * 2, 1),
+                        height: max(videoRect.height - bottomOffset, 1),
+                        alignment: .bottom
+                    )
+                    .position(
+                        x: videoRect.midX,
+                        y: videoRect.minY + max(videoRect.height - bottomOffset, 1) / 2
+                    )
+                } else {
+                    ForEach(placedTextCues) { cue in
+                        if let placement = cue.placement {
+                            SubtitleCuePlacementLayout(
+                                placement: placement,
+                                horizontalMargin: horizontalMargin,
+                                verticalMargin: bottomOffset
+                            ) {
+                                textBody(cue, alignment: textAlignment(for: placement))
+                            }
+                            .frame(width: videoRect.width, height: videoRect.height)
+                            .position(x: videoRect.midX, y: videoRect.midY)
+                        }
+                    }
+
+                    // Multiple simultaneous dialogue cues stack above the video
+                    // bottom instead of being painted on the same baseline.
+                    VStack(spacing: 10) {
+                        ForEach(activeTextCues) { cue in
+                            textBody(cue)
+                        }
+                        if translation.isTranslating(cueIDs: (activeTextCues + placedTextCues).map(\.id)) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "sparkles")
+                                Text("AI")
+                                ProgressView()
+                                    .controlSize(.mini)
+                            }
+                            .font(.system(size: 13, weight: .bold))
+                            .foregroundStyle(.white.opacity(0.72))
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.black.opacity(0.36), in: Capsule())
+                        }
+                    }
+                    .frame(
+                        width: max(videoRect.width - horizontalMargin * 2, 1),
+                        height: max(videoRect.height - bottomOffset, 1),
+                        alignment: .bottom
+                    )
+                    .position(
+                        x: videoRect.midX,
+                        y: videoRect.minY + max(videoRect.height - bottomOffset, 1) / 2
+                    )
                 }
-                .frame(
-                    width: max(videoRect.width - horizontalMargin * 2, 1),
-                    height: max(videoRect.height - bottomOffset, 1),
-                    alignment: .bottom
-                )
-                .position(
-                    x: videoRect.midX,
-                    y: videoRect.minY + max(videoRect.height - bottomOffset, 1) / 2
-                )
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
@@ -97,41 +148,52 @@ struct PlayerSubtitleOverlay: View {
     }
 
     @ViewBuilder
-    private func textBody(_ cue: SubtitleCue) -> some View {
+    private func textBody(_ cue: SubtitleCue, alignment: TextAlignment = .center) -> some View {
         switch cue.body {
         case .text(let string):
-            outlinedText(translation.translatedText(for: cue) ?? string)
+            outlinedText(translation.translatedText(for: cue) ?? string, alignment: alignment)
         case .richText(let runs):
             if let translated = translation.translatedText(for: cue) {
-                outlinedText(translated)
+                outlinedText(translated, alignment: alignment)
             } else {
-                outlinedRichText(runs)
+                outlinedRichText(runs, alignment: alignment)
             }
         case .image:
             EmptyView()
         }
     }
 
-    private func outlinedText(_ string: String) -> some View {
+    private func outlinedText(_ string: String, alignment: TextAlignment) -> some View {
         Text(string)
             .font(.system(size: textSize, weight: fontWeight))
             .foregroundStyle(textColor.opacity(textOpacity))
             .tracking(CGFloat(style.letterSpacing))
-            .multilineTextAlignment(.center)
+            .multilineTextAlignment(alignment)
             .subtitleOutline(color: outlineColor, width: outlineWidth)
             .subtitleBackground(style: style)
     }
 
-    private func outlinedRichText(_ runs: [SubtitleTextRun]) -> some View {
+    private func outlinedRichText(_ runs: [SubtitleTextRun], alignment: TextAlignment) -> some View {
         runs.reduce(Text("")) { text, run in
-            text + Text(run.text)
-                .font(.system(size: textSize, weight: fontWeight))
-                .foregroundColor(runColor(run).opacity(textOpacity))
-                .tracking(CGFloat(style.letterSpacing))
+            text + styledText(run)
         }
-        .multilineTextAlignment(.center)
+        .multilineTextAlignment(alignment)
         .subtitleOutline(color: outlineColor, width: outlineWidth)
         .subtitleBackground(style: style)
+    }
+
+    private func styledText(_ run: SubtitleTextRun) -> Text {
+        let size = run.fontSize.map { textSize * CGFloat($0) / 16 } ?? textSize
+        let font = run.fontName.map { Font.custom($0, size: size) }
+            ?? Font.system(size: size)
+        var text = Text(run.text)
+            .font(font.weight(run.isBold || style.bold ? .bold : .regular))
+            .foregroundColor(runColor(run).opacity(textOpacity))
+            .tracking(CGFloat(style.letterSpacing))
+        if run.isItalic { text = text.italic() }
+        if run.isUnderlined { text = text.underline() }
+        if run.isStruckThrough { text = text.strikethrough() }
+        return text
     }
 
     private func runColor(_ run: SubtitleTextRun) -> Color {
@@ -141,6 +203,15 @@ struct PlayerSubtitleOverlay: View {
             green: Double(c.g) / 255.0,
             blue: Double(c.b) / 255.0
         )
+    }
+
+    private func textAlignment(for placement: SubtitleTextPlacement) -> TextAlignment {
+        let alignment = (1...9).contains(placement.alignment ?? 2) ? (placement.alignment ?? 2) : 2
+        switch alignment % 3 {
+        case 1: return .leading
+        case 0: return .trailing
+        default: return .center
+        }
     }
 
     private func bitmapCue(_ image: SubtitleImage, videoRect: CGRect) -> some View {
@@ -187,6 +258,20 @@ struct PlayerSubtitleOverlay: View {
             } else {
                 let h = container.width / videoAspect
                 return CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
+            }
+        case .zoom:
+            if videoAspect > containerAspect {
+                let fitH = container.width / videoAspect
+                let fillH = container.height
+                let h = fitH + (fillH - fitH) * 0.5
+                let w = h * videoAspect
+                return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+            } else {
+                let fitW = container.height * videoAspect
+                let fillW = container.width
+                let w = fitW + (fillW - fitW) * 0.5
+                let h = w / videoAspect
+                return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
             }
         }
     }
@@ -283,7 +368,58 @@ struct MPVSubtitleOverlay: View {
                 let h = container.width / videoAspect
                 return CGRect(x: 0, y: (container.height - h) / 2, width: container.width, height: h)
             }
+        case .zoom:
+            if videoAspect > containerAspect {
+                let fitH = container.width / videoAspect
+                let fillH = container.height
+                let h = fitH + (fillH - fitH) * 0.5
+                let w = h * videoAspect
+                return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+            } else {
+                let fitW = container.height * videoAspect
+                let fillW = container.width
+                let w = fitW + (fillW - fitW) * 0.5
+                let h = w / videoAspect
+                return CGRect(x: (container.width - w) / 2, y: (container.height - h) / 2, width: w, height: h)
+            }
         }
+    }
+}
+
+/// Place ASS text at its authored alignment or explicit \pos anchor inside the video frame.
+private struct SubtitleCuePlacementLayout: Layout {
+    let placement: SubtitleTextPlacement
+    let horizontalMargin: CGFloat
+    let verticalMargin: CGFloat
+
+    func sizeThatFits(proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) -> CGSize {
+        CGSize(width: proposal.width ?? 0, height: proposal.height ?? 0)
+    }
+
+    func placeSubviews(in bounds: CGRect, proposal: ProposedViewSize, subviews: Subviews, cache: inout ()) {
+        guard let subview = subviews.first else { return }
+        let alignment = (1...9).contains(placement.alignment ?? 2) ? (placement.alignment ?? 2) : 2
+        let anchorX = CGFloat((alignment - 1) % 3) / 2
+        let anchorY = 1 - CGFloat((alignment - 1) / 3) / 2
+        let point: CGPoint
+        if let position = placement.position {
+            point = CGPoint(
+                x: bounds.minX + position.x * bounds.width,
+                y: bounds.minY + position.y * bounds.height
+            )
+        } else {
+            point = CGPoint(
+                x: bounds.minX + horizontalMargin + anchorX * max(bounds.width - 2 * horizontalMargin, 0),
+                y: bounds.minY + verticalMargin + anchorY * max(bounds.height - 2 * verticalMargin, 0)
+            )
+        }
+        let maxWidth = max(bounds.width - 2 * horizontalMargin, 1)
+        let width = min(subview.sizeThatFits(.unspecified).width, maxWidth)
+        subview.place(
+            at: point,
+            anchor: UnitPoint(x: anchorX, y: anchorY),
+            proposal: ProposedViewSize(width: width, height: nil)
+        )
     }
 }
 

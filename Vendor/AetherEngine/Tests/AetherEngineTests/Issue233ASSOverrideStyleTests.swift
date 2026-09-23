@@ -1,5 +1,6 @@
 import Testing
 import Foundation
+import AetherLibavcodec
 @testable import AetherEngine
 
 /// #233: text subtitle styling was discarded at the parser, not at the source.
@@ -22,6 +23,42 @@ struct Issue233ASSOverrideStyleTests {
 
     private func placement(_ line: String) -> SubtitleTextPlacement? {
         SubtitleRectText.styledRuns(fromASSEventLine: line)?.placement
+    }
+
+    @Test("ASS vector drawings are not displayed as coordinate text")
+    func drawingOnlyCue() {
+        let line = #"0,0,Default,,0,0,0,,{\p1}m -340 117 l -344 88 -296 88{\p0}"#
+        #expect(SubtitleRectText.styledBody(fromASSEventLine: line) == nil)
+        #expect(SubtitleRectText.plainText(fromASSEventLine: line) == nil)
+    }
+
+    @Test("an ASS drawing rect does not fall back to decoder text")
+    func drawingRectFallback() {
+        let line = #"0,0,Default,,0,0,0,,{\p1}m -340 117 l -344 88{\p0}"#
+        line.withCString { ass in
+            "m -340 117 l -344 88".withCString { text in
+                var rect = AVSubtitleRect()
+                rect.ass = UnsafeMutablePointer(mutating: ass)
+                rect.text = UnsafeMutablePointer(mutating: text)
+                withUnsafeMutablePointer(to: &rect) {
+                    #expect(SubtitleRectText.plainText(for: $0) == nil)
+                }
+            }
+        }
+    }
+
+    @Test("text after drawing mode ends remains visible")
+    func drawingThenDialogue() {
+        let line = #"0,0,Default,,0,0,0,,Before {\p2}m 0 0 l 10 10{\p0}after"#
+        #expect(runs(line).map(\.text).joined() == "Before after")
+        #expect(ASSPlainTextFallback.text(from: line) == "Before after")
+        #expect(ASSPlainTextFallback.text(from: #"0,0,Default,,0,0,0,,{\p1}m 0 0"# + "\n" + line) == "Before after")
+    }
+
+    @Test("style reset ends drawing mode, while pbo does not enable it")
+    func drawingResetAndLookalike() {
+        #expect(runs(#"0,0,Default,,0,0,0,,{\p1}m 0 0{\r}spoken"#).map(\.text).joined() == "spoken")
+        #expect(runs(#"0,0,Default,,0,0,0,,{\pbo4}spoken"#).map(\.text).joined() == "spoken")
     }
 
     // MARK: - Inline attributes

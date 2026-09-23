@@ -14,34 +14,25 @@ extension SubtitleTextRun {
 /// Plain-text extraction from FFmpeg subtitle rects, shared by `SubtitleDecoder` (sidecar) and `EmbeddedSubtitleDecoder` (in-container) so ASS parsing fixes live in one place.
 enum SubtitleRectText {
 
-    /// Plain text for a rect: prefers `text` field, falls back to parsing the raw ASS `Dialogue:` line (strip 8 header fields, clean tags + escapes).
+    /// Plain text for a rect: parse ASS first so vector drawings cannot leak
+    /// through a decoder-provided `text` fallback as visible coordinates.
     static func plainText(for rect: UnsafeMutablePointer<AVSubtitleRect>) -> String? {
+        if let assPtr = rect.pointee.ass {
+            let assLine = String(cString: assPtr)
+            if !assLine.isEmpty { return plainText(fromASSEventLine: assLine) }
+        }
         if let textPtr = rect.pointee.text {
             let s = String(cString: textPtr)
             let trimmed = s.trimmingCharacters(in: .whitespacesAndNewlines)
             if !trimmed.isEmpty { return trimmed }
         }
-        if let assPtr = rect.pointee.ass {
-            return plainText(fromASSEventLine: String(cString: assPtr))
-        }
         return nil
     }
 
-    /// Plain text from a raw ASS event line (`ReadOrder,Layer,Style,...,Text`), for surfaces that need
-    /// plain text out of markup-preserving cues (the WebVTT rendition over tap-harvested stores,
-    /// Sodalite#32). Guarded on the first field being the integer ReadOrder so a plain, comma-heavy
-    /// line is never misparsed as an event; non-event lines just get tag/escape cleaning.
+    /// Plain text from a raw ASS event line (`ReadOrder,Layer,Style,...,Text`),
+    /// using the same drawing-mode and escape handling as styled cues.
     static func plainText(fromASSEventLine line: String) -> String? {
-        var l = line
-        if l.hasPrefix("Dialogue: ") {
-            l.removeFirst("Dialogue: ".count)
-        }
-        // ASS dialogue: 9 comma-separated fields; body is the 9th and may contain commas.
-        let parts = l.split(separator: ",", maxSplits: 8, omittingEmptySubsequences: false)
-        if parts.count == 9, Int(parts[0]) != nil {
-            return cleanASSBody(String(parts[8]))
-        }
-        return cleanASSBody(l)
+        styledRuns(fromASSEventLine: line)?.runs.map(\.text).joined()
     }
 
     /// Raw ASS event line exactly as libavcodec hands it over (`ReadOrder,Layer,Style,...,Text`, tags + escapes intact), for the `preserveASSMarkup` path; nil when the rect carries no ASS payload (bitmap or plain-text-only rects).
@@ -138,6 +129,7 @@ enum SubtitleRectText {
         var style = RunStyle()
         var alignment: Int?
         var position: CGPoint?
+        var drawingMode = 0
 
         func flush() {
             guard !current.isEmpty else { return }
@@ -153,22 +145,26 @@ enum SubtitleRectText {
         var i = 0
         while i < chars.count {
             let c = chars[i]
-            if c == "\\", i + 1 < chars.count {
-                let n = chars[i + 1]
-                if n == "N" || n == "n" { current += "\n"; i += 2; continue }
-                if n == "h" { current += " "; i += 2; continue }
-            }
             if c == "{" {
                 var j = i + 1
                 var block = ""
                 while j < chars.count, chars[j] != "}" { block.append(chars[j]); j += 1 }
                 var next = style
+                let previousDrawingMode = drawingMode
                 applyOverrides(block, to: &next, alignment: &alignment,
-                               position: &position, playRes: playRes)
+                               position: &position, drawingMode: &drawingMode, playRes: playRes)
                 // The text collected so far belongs to the style in force before this block.
-                if next != style { flush(); style = next }
+                if next != style || drawingMode != previousDrawingMode { flush(); style = next }
                 i = (j < chars.count) ? j + 1 : j
                 continue
+            }
+            // ASS \p turns the following characters into vector path commands,
+            // not dialogue. Keep parsing override blocks so \p0 can resume text.
+            if drawingMode > 0 { i += 1; continue }
+            if c == "\\", i + 1 < chars.count {
+                let n = chars[i + 1]
+                if n == "N" || n == "n" { current += "\n"; i += 2; continue }
+                if n == "h" { current += " "; i += 2; continue }
             }
             current.append(c)
             i += 1
@@ -202,10 +198,14 @@ enum SubtitleRectText {
     /// cue-level and are lifted out instead, so they never split a run.
     private static func applyOverrides(_ block: String, to style: inout RunStyle,
                                        alignment: inout Int?, position: inout CGPoint?,
+                                       drawingMode: inout Int,
                                        playRes: CGSize) {
         for tag in block.split(separator: "\\").map(String.init) {
             if tag == "r" || (tag.hasPrefix("r") && !tag.hasPrefix("rnd")) {
                 style = RunStyle()
+                drawingMode = 0
+            } else if let value = intValue(tag, after: "p") {
+                drawingMode = value
             } else if let color = parseColorTag("\\" + tag) {
                 style.color = color   // nil means reset
             } else if let v = intValue(tag, after: "b") {
@@ -475,5 +475,14 @@ enum SubtitleRectText {
         let g = UInt8((bgr >> 8) & 0xFF)
         let r = UInt8(bgr & 0xFF)
         return .some(SubtitleColor(r: r, g: g, b: b))
+    }
+}
+
+/// Plain dialogue fallback for hosts while an authored ASS renderer prepares.
+public enum ASSPlainTextFallback {
+    public static func text(from eventLine: String) -> String? {
+        let lines = eventLine.split(separator: "\n", omittingEmptySubsequences: true)
+            .compactMap { SubtitleRectText.plainText(fromASSEventLine: String($0)) }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 }
