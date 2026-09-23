@@ -9,6 +9,7 @@ across all 34 supported languages in tvosApp/NuvioTV/Resources/AppLanguageCatalo
 
 import argparse
 import concurrent.futures
+import collections
 import json
 import os
 import random
@@ -81,6 +82,14 @@ def restore_placeholders(text: str, placeholders: list) -> str:
     return restored
 
 
+def restore_placeholders_safely(text: str, placeholders: list, original: str) -> str:
+    """Restore tokens without accepting a translation that loses arguments."""
+    restored = restore_placeholders(text, placeholders)
+    if collections.Counter(PLACEHOLDER_REGEX.findall(restored)) != collections.Counter(placeholders):
+        return original
+    return restored
+
+
 def translate_single(text: str, target_lang_code: str, source_lang: str = "en", max_retries: int = 4) -> str:
     if not text or not text.strip():
         return text
@@ -101,11 +110,11 @@ def translate_single(text: str, target_lang_code: str, source_lang: str = "en", 
                     raw_data = response.read().decode("utf-8")
                     data = json.loads(raw_data)
                     if isinstance(data, list) and len(data) > 0 and isinstance(data[0], str):
-                        return restore_placeholders(data[0], placeholders)
+                        return restore_placeholders_safely(data[0], placeholders, text)
                     elif isinstance(data, list) and len(data) > 0 and isinstance(data[0], list):
                         translated_segments = [part[0] for part in data[0] if part and part[0]]
                         translated_text = "".join(translated_segments)
-                        return restore_placeholders(translated_text, placeholders)
+                        return restore_placeholders_safely(translated_text, placeholders, text)
         except Exception:
             sleep_time = (2 ** attempt) * 0.4 + random.uniform(0.1, 0.3)
             time.sleep(sleep_time)
@@ -152,7 +161,10 @@ def translate_batch(texts: list, target_lang_code: str, source_lang: str = "en")
             parts = re.split(r"\[\s*\[\s*_\s*X\s*_\s*\d+\s*_\s*X\s*_\s*\]\s*\]", translated)
             parts = [p.strip() for p in parts]
             if len(parts) == len(texts):
-                return [restore_placeholders(parts[i], all_placeholders[i]) for i in range(len(texts))]
+                return [
+                    restore_placeholders_safely(parts[i], all_placeholders[i], texts[i])
+                    for i in range(len(texts))
+                ]
     except Exception:
         pass
 
@@ -167,6 +179,12 @@ def extract_l10n_from_sources(sources_dir: str) -> dict:
         r'L10n\.(?:string|format)\(\s*\"([^\"]+)\"\s*,\s*fallback:\s*\"([^\"]*)\"',
         re.DOTALL
     )
+    nested_pattern = re.compile(
+        r'L10n\.(?:string|format)\(\s*\"([^\"]+)\"\s*,\s*'
+        r'fallback:\s*L10n\.(?:string|format)\(\s*\"[^\"]+\"\s*,\s*'
+        r'fallback:\s*\"([^\"]*)\"',
+        re.DOTALL
+    )
 
     for root, _, files in os.walk(sources_dir):
         for f in files:
@@ -176,6 +194,10 @@ def extract_l10n_from_sources(sources_dir: str) -> dict:
                     content = file.read()
                     matches = pattern.findall(content)
                     for key, fallback in matches:
+                        if key not in extracted:
+                            extracted[key] = fallback
+                    nested_matches = nested_pattern.findall(content)
+                    for key, fallback in nested_matches:
                         if key not in extracted:
                             extracted[key] = fallback
 

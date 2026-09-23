@@ -307,10 +307,11 @@ enum L10n {
     static func format(_ key: String, fallback: String, _ args: CVarArg...) -> String {
         var template = string(key, fallback: fallback)
         for index in 1...9 {
-            template = template
-                .replacingOccurrences(of: "%\(index)$s", with: "%@")
-                .replacingOccurrences(of: "%\(index)$d", with: "%d")
-                .replacingOccurrences(of: "%\(index)$f", with: "%f")
+            // Keep positional indices so translators can reorder arguments for
+            // languages whose grammar requires it. Foundation accepts `%1$@`
+            // for objects, while Android's `%1$s` is not a valid Swift object
+            // conversion specifier.
+            template = template.replacingOccurrences(of: "%\(index)$s", with: "%\(index)$@")
         }
         return String(format: template, locale: AppLocaleManager.shared.locale, arguments: args)
     }
