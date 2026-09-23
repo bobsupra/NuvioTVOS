@@ -7,6 +7,7 @@ import ImageIO
 import CryptoKit
 import AetherEngine
 import AetherEngineSMB
+import SwiftAssRenderer
 
 /// High-frequency state observed only by the subtitle overlay. Keeping it
 /// separate prevents Aether's 10 Hz presentation clock from rebuilding the
@@ -15,6 +16,11 @@ import AetherEngineSMB
 final class AetherSubtitleOverlayState: ObservableObject {
     @Published private(set) var cues: [SubtitleCue] = []
     @Published private(set) var sourceTime: Double = 0
+    @Published private(set) var nativeVideoRect: CGRect?
+    @Published private(set) var assRenderer: AssSubtitlesRenderer?
+    @Published private(set) var isASSActive = false
+    let assReloadSignal = PassthroughSubject<ASSRenderCoordinator.ReloadEvent, Never>()
+    var onASSCanvasSizeChanged: ((AssSubtitlesRenderer) -> Void)?
 
     func updateCues(_ cues: [SubtitleCue]) {
         self.cues = cues
@@ -24,9 +30,23 @@ final class AetherSubtitleOverlayState: ObservableObject {
         sourceTime = seconds.isFinite ? max(0, seconds) : 0
     }
 
+    func updateNativeVideoRect(_ rect: CGRect?) {
+        let validRect = rect.flatMap { $0.width > 1 && $0.height > 1 ? $0 : nil }
+        guard nativeVideoRect != validRect else { return }
+        nativeVideoRect = validRect
+    }
+
+    func updateASS(renderer: AssSubtitlesRenderer?, isActive: Bool) {
+        assRenderer = renderer
+        isASSActive = isActive
+    }
+
     func reset() {
         cues = []
         sourceTime = 0
+        nativeVideoRect = nil
+        assRenderer = nil
+        isASSActive = false
     }
 }
 
@@ -2340,6 +2360,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     let playerView = AetherPlayerView()
     let subtitleOverlayState = AetherSubtitleOverlayState()
     let subtitleTranslationState = AISubtitleTranslationState()
+    private lazy var assCoordinator = ASSRenderCoordinator(player: engine)
+    private var activeASSTrackID: Int?
+    private var activeASSHeader: String?
 
     private var cancellables = Set<AnyCancellable>()
     private var loadGeneration: UInt64 = 0
@@ -2399,6 +2422,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private(set) var currentSpeed: Float = 1
     private(set) var currentErrorMessage = ""
     private(set) var videoFrameSize: CGSize = .zero
+    private(set) var currentAspectMode: PlayerAspectMode = .fit
     /// Subtitle evaluation clock (Aether `sourceTime`).
     private(set) var sourceTimeSeconds: Double = 0
     private(set) var subtitleCues: [SubtitleCue] = []
@@ -2886,6 +2910,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
         self.engine = resolvedEngine
         super.init(nibName: nil, bundle: nil)
+        subtitleOverlayState.onASSCanvasSizeChanged = { [weak self] renderer in
+            self?.assCoordinator.canvasDidChange(for: renderer)
+        }
+        assCoordinator.onRendererChanged = { [weak self] renderer in
+            guard let self else { return }
+            self.subtitleOverlayState.updateASS(renderer: renderer, isActive: self.activeASSTrackID != nil)
+        }
+        assCoordinator.reloadSignal
+            .sink { [weak self] event in self?.subtitleOverlayState.assReloadSignal.send(event) }
+            .store(in: &cancellables)
         #if os(tvOS) || os(iOS)
         self.engine.ownsVideoNowPlayingSession = true
         #endif
@@ -2966,6 +3000,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             foregroundReloadTask?.cancel()
             foregroundReloadTask = nil
         }
+        if engine.state == .playing || (isPlayerPlaying && engine.state != .paused) {
+            playbackWasPlayingBeforeBackground = true
+        }
     }
 
     @objc private func appDidEnterBackground() {
@@ -2979,7 +3016,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         foregroundReloadTask?.cancel()
         foregroundReloadTask = nil
         needsForegroundReload = true
-        playbackWasPlayingBeforeBackground = (engine.state == .playing || (isPlayerPlaying && engine.state != .paused))
+        if engine.state == .playing || (isPlayerPlaying && engine.state != .paused) {
+            playbackWasPlayingBeforeBackground = true
+        }
     }
 
     @objc private func appDidBecomeActive() {
@@ -3088,14 +3127,17 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             .sink { [weak self] sourceTime in
                 guard let self else { return }
                 self.subtitleOverlayState.updateSourceTime(sourceTime)
-                self.subtitleTranslationState.update(
-                    cues: self.subtitleCues,
-                    at: sourceTime - self.subtitleDelaySeconds
-                )
-                self.beginAISubtitleStartupHoldIfNeeded(
-                    cues: self.subtitleCues,
-                    sourceTime: sourceTime - self.subtitleDelaySeconds
-                )
+                self.subtitleOverlayState.updateNativeVideoRect(self.engine.nativePlayerLayer?.videoRect)
+                if self.activeASSTrackID == nil {
+                    self.subtitleTranslationState.update(
+                        cues: self.subtitleCues,
+                        at: sourceTime - self.subtitleDelaySeconds
+                    )
+                    self.beginAISubtitleStartupHoldIfNeeded(
+                        cues: self.subtitleCues,
+                        sourceTime: sourceTime - self.subtitleDelaySeconds
+                    )
+                }
                 self.recordPassivePlaybackThumbnailIfNeeded(atSeconds: sourceTime)
             }
             .store(in: &cancellables)
@@ -3130,20 +3172,30 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
             .store(in: &cancellables)
 
+        engine.$sidecarASSHeader
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] _ in
+                guard let self else { return }
+                self.refreshASSRenderer(for: self.engine.subtitleTracks)
+            }
+            .store(in: &cancellables)
+
         engine.$subtitleCues
             .receive(on: DispatchQueue.main)
             .sink { [weak self] cues in
                 guard let self else { return }
                 self.subtitleCues = cues
                 self.subtitleOverlayState.updateCues(cues)
-                self.subtitleTranslationState.update(
-                    cues: cues,
-                    at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
-                )
-                self.beginAISubtitleStartupHoldIfNeeded(
-                    cues: cues,
-                    sourceTime: self.engine.clock.sourceTime - self.subtitleDelaySeconds
-                )
+                if self.activeASSTrackID == nil {
+                    self.subtitleTranslationState.update(
+                        cues: cues,
+                        at: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+                    )
+                    self.beginAISubtitleStartupHoldIfNeeded(
+                        cues: cues,
+                        sourceTime: self.engine.clock.sourceTime - self.subtitleDelaySeconds
+                    )
+                }
             }
             .store(in: &cancellables)
 
@@ -3335,6 +3387,77 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 detail: t.codec
             )
         }
+        refreshASSRenderer(for: tracks)
+    }
+
+    private func refreshASSRenderer(for tracks: [TrackInfo]) {
+        let selected = tracks.first { $0.id == engine.activeSubtitleTrackIndex }
+        let codec = selected?.codec.lowercased() ?? ""
+        let isASS = codec.hasPrefix("ass") || codec.hasPrefix("ssa")
+            || selected?.assHeader != nil
+            || (selected?.isExternal == true && engine.sidecarASSHeader != nil)
+        guard let selected,
+              !selected.isNativelyRenderedSubtitle,
+              isASS else {
+            if activeASSTrackID != nil {
+                activeASSTrackID = nil
+                activeASSHeader = nil
+                assCoordinator.deactivate()
+                subtitleOverlayState.updateASS(renderer: nil, isActive: false)
+            }
+            return
+        }
+        let rawHeader = selected.isExternal ? engine.sidecarASSHeader : selected.assHeader
+        let header = resolvedASSHeader(rawHeader)
+        if activeASSTrackID != selected.id || activeASSHeader != header {
+            assCoordinator.deactivate()
+            activeASSTrackID = selected.id
+            activeASSHeader = header
+            resetAISubtitleStartupHold()
+            subtitleTranslationState.reset()
+            assCoordinator.activate(header: header, itemID: currentStreamKey)
+        }
+        subtitleOverlayState.updateASS(renderer: assCoordinator.renderer, isActive: true)
+    }
+
+    /// CodecPrivate occasionally omits PlayRes, which leaves libass on its
+    /// legacy 384×288 canvas and scales authored font sizes too large at 1080p.
+    private func resolvedASSHeader(_ header: String?) -> String {
+        let measuredSourceSize = videoFrameSize.width > 1 && videoFrameSize.height > 1
+            ? videoFrameSize
+            : CGSize(width: CGFloat(engine.sourceVideoWidth), height: CGFloat(engine.sourceVideoHeight))
+        let sourceSize = measuredSourceSize.width > 1 && measuredSourceSize.height > 1
+            ? measuredSourceSize
+            : CGSize(width: 1920, height: 1080)
+        let cleanHeader = header?.replacingOccurrences(of: "\0", with: "") ?? ""
+        func declaredPlayRes(_ key: String) -> Double? {
+            for line in cleanHeader.split(whereSeparator: \.isNewline) {
+                let trimmed = line.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard trimmed.lowercased().hasPrefix(key.lowercased() + ":"),
+                      let value = Double(trimmed.dropFirst(key.count + 1).trimmingCharacters(in: .whitespacesAndNewlines)),
+                      value.isFinite, value > 0 else { continue }
+                return value
+            }
+            return nil
+        }
+        let declaredX = declaredPlayRes("PlayResX")
+        let declaredY = declaredPlayRes("PlayResY")
+        let sourceAspect = sourceSize.width / sourceSize.height
+        let playResX = Int((declaredX ?? declaredY.map { $0 * sourceAspect } ?? sourceSize.width).rounded())
+        let playResY = Int((declaredY ?? declaredX.map { $0 / sourceAspect } ?? sourceSize.height).rounded())
+        let needsPlayResX = declaredX == nil
+        let needsPlayResY = declaredY == nil
+        guard needsPlayResX || needsPlayResY else { return cleanHeader }
+
+        var additions = ""
+        if needsPlayResX { additions += "\nPlayResX: \(playResX)" }
+        if needsPlayResY { additions += "\nPlayResY: \(playResY)" }
+        if let marker = cleanHeader.range(of: "[Script Info]", options: .caseInsensitive) {
+            var result = cleanHeader
+            result.insert(contentsOf: additions, at: marker.upperBound)
+            return result
+        }
+        return "[Script Info]\nScriptType: v4.00+\nPlayResX: \(playResX)\nPlayResY: \(playResY)\n\n\(cleanHeader)"
     }
 
     private func audioDetail(_ t: TrackInfo) -> String {
@@ -3382,6 +3505,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             }
         }
         subtitleDelaySeconds = request.subtitleDelaySeconds
+        assCoordinator.setSubtitleDelay(subtitleDelaySeconds)
+        setAspectMode(request.aspectMode)
         didReportTerminalError = false
         isPlayerLoading = true
         isPlayerEnded = false
@@ -3434,6 +3559,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         audioTracks = []
         subtitleTracks = []
         subtitleCues = []
+        activeASSTrackID = nil
+        activeASSHeader = nil
+        assCoordinator.deactivate()
         subtitleOverlayState.reset()
         subtitleTranslationState.reset()
         videoFrameSize = .zero
@@ -3455,7 +3583,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             matchContentEnabled: matchContent,
             panelIsInHDRMode: panelInHDR,
             audioBridgeMode: .surroundCompat,
-            preserveASSMarkup: false,
+            // AetherEngine honors this for ASS/SSA codec tracks only; other text
+            // subtitle decoders keep their normal styled/plain cue path.
+            preserveASSMarkup: true,
             prepareNativeSubtitles: false,
             maxConcurrentSourceRequests: isRemote ? 1 : nil,
             heldSourceConnection: isLocalPlaybackCache,
@@ -3563,12 +3693,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
 
     func setAspectMode(_ mode: PlayerAspectMode) {
+        currentAspectMode = mode
         switch mode {
         case .fit:
+            playerView.transform = .identity
             engine.videoGravity = .resizeAspect
         case .fill:
+            playerView.transform = .identity
             engine.videoGravity = .resizeAspectFill
+        case .zoom:
+            engine.videoGravity = .resizeAspect
+            playerView.transform = CGAffineTransform(scaleX: 1.15, y: 1.15)
         case .stretch:
+            playerView.transform = .identity
             engine.videoGravity = .resize
         }
     }
@@ -3577,10 +3714,13 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // Host overlay evaluates cues at sourceTime - delay; use the same clock
         // for prefetching so negative subtitle delays do not miss their cue.
         subtitleDelaySeconds = seconds
-        subtitleTranslationState.update(
-            cues: subtitleCues,
-            at: engine.clock.sourceTime - subtitleDelaySeconds
-        )
+        assCoordinator.setSubtitleDelay(seconds)
+        if activeASSTrackID == nil {
+            subtitleTranslationState.update(
+                cues: subtitleCues,
+                at: engine.clock.sourceTime - subtitleDelaySeconds
+            )
+        }
     }
 
     func setAudioDelay(_ seconds: Double) {
@@ -3655,6 +3795,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         engine.pictureInPictureActive = false
         engine.stop(resetDisplayCriteria: true)
         subtitleCues = []
+        activeASSTrackID = nil
+        activeASSHeader = nil
+        assCoordinator.deactivate()
         subtitleOverlayState.reset()
         subtitleTranslationState.reset()
         audioTracks = []

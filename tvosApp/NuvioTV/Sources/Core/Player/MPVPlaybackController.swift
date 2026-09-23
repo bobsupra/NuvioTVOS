@@ -371,16 +371,73 @@ struct MPVLoadConfiguration: Equatable {
 // Compose plumbing and iOS-only UIViewController overrides (home indicator,
 // status-bar, screen-edge gestures — none exist on tvOS) removed.
 
-final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling {
+final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling, ScrubThumbnailProviding {
     /// Called after a coherent position is captured but before tvOS suspends
     /// the player. PlayerViewModel uses it for a durable lifecycle save.
     var onPlaybackSuspended: ((Int64, Int64) -> Void)?
 
+    // MARK: - Trickplay & Seek Previews
+    private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
+    private var externalTrickplayProvider: (any TrickplayProviding)?
+    private var loadGeneration: UInt64 = 0
+    private var contentCanonicalKey: String?
+    private var currentStreamKey: String = ""
+
+    var supportsScrubThumbnails: Bool { true }
+
+    func setExternalTrickplayProvider(_ provider: (any TrickplayProviding)?) {
+        self.externalTrickplayProvider = provider
+        Task { await hybridThumbnailIndex.setExternalTrickplayProvider(provider) }
+    }
+
+    func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        if let external = externalTrickplayProvider {
+            if let image = await external.thumbnail(at: seconds) {
+                return image
+            }
+        }
+        return await hybridThumbnailIndex.lookup(
+            seconds: seconds,
+            duration: duration,
+            generation: loadGeneration
+        )
+    }
+
+    func scrubThumbnail(
+        atSeconds seconds: Double,
+        maxWidth: Int = 360,
+        precise: Bool = true
+    ) async -> CGImage? {
+        if let external = externalTrickplayProvider {
+            if let image = await external.thumbnail(at: seconds) {
+                return image
+            }
+        }
+        let dur = Double(durationMs) / 1000.0
+        return await hybridThumbnailIndex.lookup(
+            seconds: seconds,
+            duration: dur > 0 ? dur : 3600.0,
+            generation: loadGeneration
+        )
+    }
+
+    func prepareScrubThumbnailExtractor() {
+        // External storyboards/BIF are resolved asynchronously via TrickplayResolver
+    }
+
+    func suspendCoarseThumbnailWork() {
+        // No heavy background decoding in MPV
+    }
+
+    func advanceCoarseThumbnailIfNeeded(duration: Double) {
+        // Handled via HybridSeekThumbnailIndex disk and storyboard lookup
+    }
 
     private static let defaultAudioOutput = "avfoundation"
 
     private let errorStateLock = NSLock()
     private var metalLayer = MPVMetalLayer()
+    private(set) var currentAspectMode: PlayerAspectMode = .fit
     private var lastAppliedDrawableSize: CGSize = .zero
     private var pendingURL: String?
     private var pendingAudioURL: String?
@@ -511,6 +568,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             return
         }
 
+        MPVStreamProtocolBridge.register(on: mpv)
+
         checkError(mpv_request_log_messages(mpv, "warn"))
 
         var windowID = Int64(bitPattern: UInt64(UInt(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque())))
@@ -544,25 +603,16 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         #else
         let cache = PlaybackCacheSettings.current
         #endif
-        checkError(mpv_set_option_string(mpv, "cache", "yes"))
+        checkError(mpv_set_option_string(mpv, "cache", "yes"), context: "cache")
         // ~2 minutes of readahead intent; demuxer-max-bytes still hard-caps RAM.
-        checkError(mpv_set_option_string(mpv, "cache-secs", "120"))
-        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "120"))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer))
-        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer))
-        checkError(mpv_set_option_string(mpv, "vulkan-swap-mode", "fifo"))
-        checkError(mpv_set_option_string(mpv, "vulkan-queue-count", "1"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-compute", "no"))
-        checkError(mpv_set_option_string(mpv, "vulkan-async-transfer", "no"))
-        #if targetEnvironment(simulator)
-        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "no"))
-        #else
-        checkError(mpv_set_option_string(mpv, "vulkan-disable-interop", "yes"))
-        #endif
-        checkError(mpv_set_option_string(mpv, "video-rotate", "no"))
+        checkError(mpv_set_option_string(mpv, "cache-secs", "120"), context: "cache-secs")
+        checkError(mpv_set_option_string(mpv, "demuxer-readahead-secs", "120"), context: "demuxer-readahead-secs")
+        checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer), context: "demuxer-max-bytes")
+        checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer), context: "demuxer-max-back-bytes")
+        checkError(mpv_set_option_string(mpv, "video-rotate", "no"), context: "video-rotate")
         if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
            let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
-            checkError(mpv_set_option_string(mpv, "alang", alang))
+            checkError(mpv_set_option_string(mpv, "alang", alang), context: "alang")
         }
         let preferredSubtitleLanguages = SubtitleLanguagePreferences.orderedFromDefaults()
         if let slang = SubtitleLanguagePreferences.mpvLanguageList(for: preferredSubtitleLanguages) {
@@ -623,10 +673,20 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     private func setupNotifications() {
+        NotificationCenter.default.addObserver(self, selector: #selector(appWillResignActive),
+                                               name: UIApplication.willResignActiveNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterBackground),
                                                name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterForeground),
                                                name: UIApplication.willEnterForegroundNotification, object: nil)
+    }
+
+    @objc private func appWillResignActive() {
+        guard mpv != nil else { return }
+        let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
+        if mpvStillPlaying || lastVerifiedWasPlaying {
+            wasPlayingBeforeBackground = true
+        }
     }
 
     @objc private func enterBackground() {
@@ -646,7 +706,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let safePositionMs = max(0, jumpedToEnd ? verifiedPositionMs : sampledPositionMs)
 
         let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
-        wasPlayingBeforeBackground = mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)
+        wasPlayingBeforeBackground = wasPlayingBeforeBackground || mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)
         lifecyclePositionMs = safePositionMs
         lifecycleDurationMs = max(referenceDurationMs, durationMs)
         foregroundRestoreTargetMs = nil
@@ -721,7 +781,19 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         pendingURL = request.videoURL.absoluteString
         currentMediaTitle = request.streamName
         currentMediaArtist = request.streamDescription
+        currentAspectMode = request.aspectMode
         PlaybackAudioSession.activateMoviePlayback()
+
+        loadGeneration &+= 1
+        let gen = loadGeneration
+        self.externalTrickplayProvider = nil
+        let key = request.canonicalMediaKey ?? request.cacheFileIdentity?.cacheKey ?? TrickplayDiskCache.streamKey(for: request.videoURL.absoluteString)
+        self.contentCanonicalKey = request.canonicalMediaKey
+        self.currentStreamKey = key
+        Task {
+            await hybridThumbnailIndex.reset(generation: gen, streamKey: key)
+        }
+
         #if os(tvOS) || os(iOS)
         currentMediaArtwork = nil
         artworkLoadTask?.cancel()
@@ -778,7 +850,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         // Commit seek, tracks, controls and autoplay together at FILE_LOADED.
         setFlag("pause", true)
         command("loadfile", args: [url, "replace"])
-        setAspectMode(.fit)
+        setAspectMode(currentAspectMode)
     }
 
     func playPlayback() {
@@ -1095,17 +1167,28 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         scheduleDisplayCriteriaProbe()
     }
 
-    /// Keep mpv in letterbox FIT. Fill/stretch are SwiftUI scaleEffect on the host.
     func setAspectMode(_ mode: PlayerAspectMode) {
+        currentAspectMode = mode
         guard mpv != nil else { return }
         setDoubleProperty("video-zoom", 0)
         setDoubleProperty("video-pan-x", 0)
         setDoubleProperty("video-pan-y", 0)
-        setDoubleProperty("panscan", 0)
-        setFlag("keepaspect", true)
         setStringProperty("video-unscaled", "no")
         metalLayer.contentsGravity = .resize
-        _ = mode
+        switch mode {
+        case .fit:
+            setFlag("keepaspect", true)
+            setDoubleProperty("panscan", 0.0)
+        case .fill:
+            setFlag("keepaspect", true)
+            setDoubleProperty("panscan", 1.0)
+        case .zoom:
+            setFlag("keepaspect", true)
+            setDoubleProperty("panscan", 0.5)
+        case .stretch:
+            setFlag("keepaspect", false)
+            setDoubleProperty("panscan", 0.0)
+        }
     }
 
     func setMuted(_ muted: Bool) {
@@ -1242,6 +1325,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         #endif
         guard let ctx = mpv else { return }
         mpv = nil  // nil first so the event loop stops reading
+        mpv_set_wakeup_callback(ctx, nil, nil)
 
         // libmpv's avfoundation audio output tears down AVAudioSession from
         // inside mpv_terminate_destroy(). That teardown can synchronously
@@ -1251,6 +1335,17 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         // event pump; the nil assignment above makes all later calls no-op.
         eventQueue.async {
             mpv_terminate_destroy(ctx)
+        }
+    }
+
+    deinit {
+        NotificationCenter.default.removeObserver(self)
+        if let ctx = mpv {
+            mpv = nil
+            mpv_set_wakeup_callback(ctx, nil, nil)
+            eventQueue.async {
+                mpv_terminate_destroy(ctx)
+            }
         }
     }
 
@@ -1862,7 +1957,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                         self.attachPendingAudioIfNeeded()
                         self.applyPendingLoadConfiguration()
                         self.applySubtitleStyle()
-                        self.setAspectMode(.fit)
+                        self.setAspectMode(self.currentAspectMode)
                         self.updateState()
                         self.resetDisplayCriteriaProbe()
                         self.scheduleDisplayCriteriaProbe()
@@ -1990,6 +2085,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     }
 
     private func applyHTTPHeaders(_ headers: [String: String]) {
+        MPVStreamProtocolBridge.shared.setHTTPHeaders(headers)
         let options = MPVHTTPHeaderOptions(headers: headers)
         setStringProperty("user-agent", options.userAgent)
         if !options.referrer.isEmpty {
