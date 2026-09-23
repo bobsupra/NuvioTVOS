@@ -170,6 +170,7 @@ let appTarget: Target = .target(
         .package(product: "AetherEngineSMB"),
         .package(product: "LibTorrent"),
         .package(product: "MPVKit"),
+        .package(product: "SwiftAssRenderer"),
     ],
     settings: .settings(
         base: [
@@ -272,6 +273,7 @@ let project = Project(
         .local(path: "../Vendor/AetherEngine"),
         .local(path: "../Vendor/LibTorrent"),
         .local(path: "../MPVKit"),
+        .package(url: "https://github.com/mihai8804858/swift-ass-renderer.git", from: "1.3.1"),
     ],
     settings: .settings(
         base: projectBaseSettings,

@@ -15,7 +15,7 @@ public struct ProfilePinView: View {
                 .ignoresSafeArea()
 
             VStack(spacing: 24) {
-                Text("Enter PIN")
+                Text(L10n.string("profile_pin_enter", fallback: "Enter PIN"))
                     .font(.system(size: 34, weight: .bold))
                     .foregroundColor(.white)
 
@@ -33,7 +33,9 @@ public struct ProfilePinView: View {
                 }
                 .padding(.vertical, 4)
 
-                Text(viewModel.isLoading ? "Verifying…" : (viewModel.pinError ?? " "))
+                Text(viewModel.isLoading
+                     ? L10n.string("profile_pin_verifying", fallback: "Verifying…")
+                     : (viewModel.pinError ?? " "))
                     .font(.system(size: 18, weight: .semibold))
                     .foregroundColor(viewModel.isLoading ? .white.opacity(0.72) : .red)
                     .frame(height: 24)
@@ -60,7 +62,7 @@ public struct ProfilePinView: View {
                 .focusSection()
                 .defaultFocusIfAvailable($focusedPinKey, "pin-1")
 
-                PinSheetActionButton(title: "Cancel") {
+                PinSheetActionButton(title: L10n.string("profile_cancel", fallback: "Cancel")) {
                     guard !viewModel.isLoading else { return }
                     dismiss()
                 }

@@ -208,7 +208,7 @@ struct CollectionFolderBrowseView: View {
                     rowsContent
                 } else if displayedGridItems.isEmpty {
                     Spacer()
-                    Text("No titles found in this folder")
+                    Text(L10n.string("collection_folder_empty", fallback: "No titles found in this folder"))
                         .font(.system(size: 22))
                         .foregroundColor(.white.opacity(0.7))
                         .frame(maxWidth: .infinity)
@@ -242,7 +242,7 @@ struct CollectionFolderBrowseView: View {
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity, minHeight: 260)
                     } else if catalogRows.isEmpty {
-                        Text("No titles found in this folder")
+                        Text(L10n.string("collection_folder_empty", fallback: "No titles found in this folder"))
                             .font(.system(size: 28, weight: .medium))
                             .foregroundColor(.white.opacity(0.7))
                             .frame(maxWidth: .infinity, minHeight: 260)
@@ -363,7 +363,11 @@ struct CollectionFolderBrowseView: View {
                     .foregroundColor(.white)
                     .lineLimit(2)
 
-                Text("Movies and series • \(folder.sources.count) catalogs")
+                Text(L10n.format(
+                    "collection_folder_catalog_summary",
+                    fallback: "Movies and series • %d catalogs",
+                    folder.sources.count
+                ))
                     .font(.system(size: 28, weight: .regular))
                     .foregroundColor(.white.opacity(0.68))
             }
@@ -446,7 +450,7 @@ struct CollectionFolderBrowseView: View {
         Group {
             if catalogRows.isEmpty {
                 Spacer()
-                Text("No titles found in this folder")
+                Text(L10n.string("collection_folder_empty", fallback: "No titles found in this folder"))
                     .font(.system(size: 22))
                     .foregroundColor(.white.opacity(0.7))
                     .frame(maxWidth: .infinity)

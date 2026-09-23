@@ -36,13 +36,13 @@ public struct UserProfileView: View {
             VStack(spacing: 0) {
                 Spacer().frame(height: 162)
 
-                Text("Who's watching?")
+                Text(L10n.string("profile_selection_title", fallback: "Who's watching?"))
                     .font(.custom("Inter-Bold", size: 62))
                     .foregroundColor(.white)
 
                 Spacer().frame(height: 14)
 
-                Text("Select a profile to continue")
+                Text(L10n.string("profile_selection_subtitle", fallback: "Select a profile to continue"))
                     .font(.custom("Inter-Regular", size: 28))
                     .foregroundColor(.white.opacity(0.6))
 
@@ -64,13 +64,16 @@ public struct UserProfileView: View {
                                 .foregroundColor(.orange.opacity(0.9))
                                 .fixedSize(horizontal: false, vertical: true)
 
-                            Text("Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data.")
+                            Text(L10n.string(
+                                "profile_account_sync_compatibility_message",
+                                fallback: "Update all Nuvio clients to their latest versions, then select Retry. Older clients cannot sync account data."
+                            ))
                                 .font(.custom("Inter-Regular", size: 16))
                                 .foregroundColor(.white.opacity(0.72))
                                 .fixedSize(horizontal: false, vertical: true)
                         }
 
-                        Button("Retry", action: onRetryAccountSync)
+                        Button(L10n.string("common_retry", fallback: "Retry"), action: onRetryAccountSync)
                             .buttonStyle(.bordered)
                             .focused($focusedItem, equals: Self.retryFocusId)
                     }
@@ -314,7 +317,7 @@ struct ProfileCard: View {
                         .lineLimit(1)
 
                     if profile.isAdmin {
-                        Text("PRIMARY")
+                        Text(L10n.string("profile_selection_primary_badge", fallback: "PRIMARY"))
                             .font(.custom("Inter-Bold", size: 16))
                             .tracking(1.5)
                             .foregroundColor(ProfileAvatarStyle.accent)
@@ -370,7 +373,7 @@ struct AddProfileButton: View {
                                     lineWidth: isFocused ? AppFocusOutline.width : 2)
                     )
 
-                Text("Add Profile")
+                Text(L10n.string("profile_add", fallback: "Add Profile"))
                     .font(.custom("Inter-Bold", size: 28))
                     .foregroundColor(isFocused ? .white : Color.white.opacity(0.6))
             }
@@ -758,11 +761,14 @@ struct AddProfileView: View {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(alignment: .center, spacing: 24) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Add Profile")
+                        Text(L10n.string("profile_add", fallback: "Add Profile"))
                             .font(.system(size: 42, weight: .bold))
                             .foregroundColor(.white)
 
-                        Text("Create a profile for another viewer")
+                        Text(L10n.string(
+                            "profile_create_for_another_viewer",
+                            fallback: "Create a profile for another viewer"
+                        ))
                             .font(.system(size: 22, weight: .medium))
                             .foregroundColor(.white.opacity(0.62))
                     }
@@ -773,13 +779,13 @@ struct AddProfileView: View {
                 }
 
                 VStack(alignment: .leading, spacing: 14) {
-                    Text("Profile Info")
+                    Text(L10n.string("profile_info", fallback: "Profile Info"))
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundColor(.white.opacity(0.62))
 
                     HStack(spacing: 18) {
                         AddProfileTextField(
-                            placeholder: "Name",
+                            placeholder: L10n.string("library_list_name_label", fallback: "Name"),
                             text: $name,
                             focusedField: $focusedField,
                             field: .name
@@ -791,7 +797,7 @@ struct AddProfileView: View {
                     }
                 }
 
-                Text("Avatar")
+                Text(L10n.string("profile_avatar_title", fallback: "Avatar"))
                     .font(.system(size: 20, weight: .semibold))
                     .foregroundColor(.white.opacity(0.62))
 
@@ -799,12 +805,12 @@ struct AddProfileView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 HStack(spacing: 16) {
-                    ProfileAvatarPickerButton(title: "Cancel", systemImage: "xmark") {
+                    ProfileAvatarPickerButton(title: L10n.string("profile_cancel", fallback: "Cancel"), systemImage: "xmark") {
                         isPresented = false
                     }
 
                     ProfileAvatarPickerButton(
-                        title: "Save",
+                        title: L10n.string("profile_save", fallback: "Save"),
                         systemImage: "checkmark",
                         prominent: true,
                         disabled: !canSave
@@ -1071,7 +1077,7 @@ struct ProfileAvatarPickerSheet: View {
             VStack(alignment: .leading, spacing: 28) {
                 HStack(alignment: .center, spacing: 24) {
                     VStack(alignment: .leading, spacing: 8) {
-                        Text("Choose Avatar")
+                        Text(L10n.string("profile_choose_avatar", fallback: "Choose Avatar"))
                             .font(.system(size: 42, weight: .bold))
                             .foregroundColor(.white)
 
@@ -1086,7 +1092,7 @@ struct ProfileAvatarPickerSheet: View {
                 }
 
                 VStack(alignment: .leading, spacing: 8) {
-                    Text("Custom Avatar URL")
+                    Text(L10n.string("profile_custom_avatar_url_title", fallback: "Custom Avatar URL"))
                         .font(.system(size: 20, weight: .semibold))
                         .foregroundColor(.white.opacity(0.72))
 
@@ -1106,7 +1112,10 @@ struct ProfileAvatarPickerSheet: View {
                     .focused($isCustomAvatarFieldFocused)
                     .focusEffectDisabledIfAvailable()
 
-                    Text("Paste a direct image link, or choose an avatar below.")
+                    Text(L10n.string(
+                        "profile_custom_avatar_url_hint",
+                        fallback: "Paste a direct image link, or choose an avatar below."
+                    ))
                         .font(.system(size: 17, weight: .medium))
                         .foregroundColor(.white.opacity(0.48))
                 }
@@ -1119,12 +1128,12 @@ struct ProfileAvatarPickerSheet: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
 
                 HStack(spacing: 16) {
-                    ProfileAvatarPickerButton(title: "Cancel", systemImage: "xmark") {
+                    ProfileAvatarPickerButton(title: L10n.string("profile_cancel", fallback: "Cancel"), systemImage: "xmark") {
                         isPresented = false
                     }
 
                     ProfileAvatarPickerButton(
-                        title: "Save",
+                        title: L10n.string("profile_save", fallback: "Save"),
                         systemImage: "checkmark",
                         prominent: true,
                         disabled: avatarToSave == nil

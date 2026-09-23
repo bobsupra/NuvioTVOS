@@ -8072,6 +8072,12 @@ private struct LicensesAttributionsSheet: View {
             license: "LGPL-2.1-or-later; dav1d BSD-2; zimg WTFPL"
         ),
         LicenseEntry(
+            id: "swift-ass-renderer",
+            title: "SwiftAssRenderer 1.3.1",
+            body: "Renders authored ASS/SSA subtitles during AetherEngine playback. Source: github.com/mihai8804858/swift-ass-renderer.",
+            license: "MIT (renderer); libass ISC"
+        ),
+        LicenseEntry(
             id: "mpvkit",
             title: L10n.string("tvos_settings_mpvkit_libmpv", fallback: "MPVKit / libmpv"),
             body: "One-way compatibility fallback for dual-URL media, audio controls, ASS Scale, and streams AetherEngine cannot open.",

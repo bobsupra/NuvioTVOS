@@ -213,7 +213,7 @@ struct DetailsScreen: View {
                     submitMdbListRating(rating)
                 }
             }
-            Button("Remove Rating", role: .destructive) {
+            Button(L10n.string("details_remove_rating", fallback: "Remove Rating"), role: .destructive) {
                 submitMdbListRating(nil)
             }
         }
@@ -2409,9 +2409,11 @@ struct TvDetailsContent: View {
                             .frame(height: 0)
                             .id(TvDetailsScrollID.topSection)
 
-                            VStack(alignment: .leading, spacing: 34) {
-                                TvDetailsLogo(meta: meta)
-                                    .padding(.bottom, 10)
+                            VStack(alignment: .leading, spacing: 0) {
+                                VStack(alignment: .leading, spacing: 32) {
+                                    Spacer(minLength: 0)
+
+                                    TvDetailsLogo(meta: meta)
 
                                 TvDetailsActionRow(
                                     isInWatchlist: uiState.isInWatchlist,
@@ -2461,7 +2463,6 @@ struct TvDetailsContent: View {
                                         }
                                     }
                                 )
-                                .padding(.bottom, 6)
                                 // Unfocusable while an episode is being restored
                                 // to, so the engine can't claim these instead.
                                 .disabled(
@@ -2470,36 +2471,39 @@ struct TvDetailsContent: View {
                                     )
 
                                 TvDetailsSummary(meta: meta, simkl: uiState.simklRatings)
+                            }
+                            .padding(.bottom, 52)
+                            .frame(height: max(proxy.size.height, 800), alignment: .bottomLeading)
 
-                                if !episodes.isEmpty {
-                                    TvDetailsEpisodes(
-                                        meta: meta,
-                                        episodes: episodes,
-                                        seriesRating: meta.rating,
-                                        continueItem: continueItem,
-                                        onFocus: {
-                                            cancelPendingFocusHandoff()
-                                            guard focusedDetailsSection != .episodes else { return }
-                                            focusedDetailsSection = .episodes
-                                            withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                                            }
-                                        },
-                                        onSelect: onEpisodeSelected,
-                                        onPlayManually: onEpisodePlayManually,
-                                        onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
-                                        episodeFocus: $episodeFocus,
-                                        restrictFocusToKey: restoreEpisodeKey,
-                                        entryLocked: focusedDetailsSection != .episodes,
-                                        onMoveUpFromSeason: {
-                                            focusPlayFromEpisodes(using: scrollProxy)
-                                        },
-                                        onMoveDownFromEpisode: focusCastHeaderFromEpisodes
-                                    )
-                                    .padding(.top, 24)
-                                    .id(TvDetailsScrollID.episodesSection)
-                                    .disabled(!isDetailsFocusReachable(.episodes))
-                                }
+                            if !episodes.isEmpty {
+                                TvDetailsEpisodes(
+                                    meta: meta,
+                                    episodes: episodes,
+                                    seriesRating: meta.rating,
+                                    continueItem: continueItem,
+                                    onFocus: {
+                                        cancelPendingFocusHandoff()
+                                        guard focusedDetailsSection != .episodes else { return }
+                                        focusedDetailsSection = .episodes
+                                        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                                            scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
+                                        }
+                                    },
+                                    onSelect: onEpisodeSelected,
+                                    onPlayManually: onEpisodePlayManually,
+                                    onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
+                                    episodeFocus: $episodeFocus,
+                                    restrictFocusToKey: restoreEpisodeKey,
+                                    entryLocked: focusedDetailsSection != .episodes,
+                                    onMoveUpFromSeason: {
+                                        focusPlayFromEpisodes(using: scrollProxy)
+                                    },
+                                    onMoveDownFromEpisode: focusCastHeaderFromEpisodes
+                                )
+                                .padding(.top, 40)
+                                .id(TvDetailsScrollID.episodesSection)
+                                .disabled(!isDetailsFocusReachable(.episodes))
+                            }
 
                                 TvDetailsCastAndTrailer(
                                     meta: meta,
@@ -2623,10 +2627,8 @@ struct TvDetailsContent: View {
                                     )
                                 }
                             }
-                            // Match Home's TV row inset so details content
-                            // lines up with the catalog cards.
-                            .padding(.leading, 48)
-                            .padding(.top, 78)
+                            // Inset and layout metrics matching Android TV.
+                            .padding(.leading, 56)
                             .padding(.bottom, 96)
                             .frame(width: detailsWidth(proxy, hasEpisodes: !episodes.isEmpty), alignment: .leading)
                             .frame(maxWidth: .infinity, minHeight: proxy.size.height, alignment: .topLeading)
@@ -3266,15 +3268,17 @@ private struct TvDetailsSummary: View {
     var simkl: SimklTitleRatings? = nil
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 20) {
+        VStack(alignment: .leading, spacing: 0) {
             if let creatorLine {
                 Text(creatorLine)
                     .font(.system(size: 28, weight: .regular))
-                    .foregroundColor(.white.opacity(0.62))
+                    .foregroundColor(.white.opacity(0.65))
+                    .padding(.bottom, 24)
             }
 
             if !externalRatingBadges.isEmpty {
                 TvDetailsRatingsRow(badges: externalRatingBadges)
+                    .padding(.bottom, 28)
             }
 
             if let description = meta.description, !description.isEmpty {
@@ -3282,35 +3286,57 @@ private struct TvDetailsSummary: View {
                     .font(.system(size: 30, weight: .regular))
                     .foregroundColor(.white)
                     .lineSpacing(8)
-                    .frame(maxWidth: 950, alignment: .leading)
+                    .lineLimit(5)
+                    .frame(maxWidth: 960, alignment: .leading)
+                    .padding(.bottom, 24)
             }
 
-            if !primaryMetaItems.isEmpty {
-                Text(primaryMetaItems.joined(separator: "  •  "))
-                    .font(.system(size: 27, weight: .medium))
-                    .foregroundColor(.white.opacity(0.58))
-                    .lineLimit(2)
-            }
-
-            if statusLabel != nil || !secondaryMetaItems.isEmpty {
-                HStack(spacing: 16) {
-                    if let statusLabel {
-                        Text(statusLabel)
-                            .font(.system(size: 22, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.88))
-                            .padding(.horizontal, 16)
-                            .padding(.vertical, 7)
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 9, style: .continuous)
-                                    .stroke(Color.white.opacity(0.45), lineWidth: 2)
-                            )
+            if !primaryMetaItems.isEmpty || certificationLabel != nil || statusLabel != nil || !secondaryMetaItems.isEmpty {
+                VStack(alignment: .leading, spacing: 16) {
+                    if !primaryMetaItems.isEmpty {
+                        Text(primaryMetaItems.joined(separator: "  •  "))
+                            .font(.system(size: 27, weight: .medium))
+                            .foregroundColor(.white.opacity(0.60))
+                            .lineLimit(2)
                     }
 
-                    if !secondaryMetaItems.isEmpty {
-                        Text((statusLabel != nil ? "•  " : "") + secondaryMetaItems.joined(separator: "  •  "))
-                            .font(.system(size: 24, weight: .medium))
-                            .foregroundColor(.white.opacity(0.88))
-                            .lineLimit(1)
+                    if certificationLabel != nil || statusLabel != nil || !secondaryMetaItems.isEmpty {
+                        HStack(spacing: 14) {
+                            if certificationLabel != nil || statusLabel != nil {
+                                HStack(spacing: 10) {
+                                    if let certificationLabel {
+                                        Text(certificationLabel)
+                                            .font(.system(size: 22, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.88))
+                                    }
+
+                                    if certificationLabel != nil && statusLabel != nil {
+                                        Rectangle()
+                                            .fill(Color.white.opacity(0.35))
+                                            .frame(width: 1.5, height: 18)
+                                    }
+
+                                    if let statusLabel {
+                                        Text(statusLabel)
+                                            .font(.system(size: 22, weight: .semibold))
+                                            .foregroundColor(.white.opacity(0.88))
+                                    }
+                                }
+                                .padding(.horizontal, 14)
+                                .padding(.vertical, 6)
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 9, style: .continuous)
+                                        .stroke(Color.white.opacity(0.45), lineWidth: 1.5)
+                                )
+                            }
+
+                            if !secondaryMetaItems.isEmpty {
+                                Text(((certificationLabel != nil || statusLabel != nil) ? "•  " : "") + secondaryMetaItems.joined(separator: "  •  "))
+                                    .font(.system(size: 24, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.88))
+                                    .lineLimit(1)
+                            }
+                        }
                     }
                 }
             }
@@ -3318,13 +3344,33 @@ private struct TvDetailsSummary: View {
     }
 
     private var creatorLine: String? {
-        if let director = meta.director?.first, !director.isEmpty {
-            return "Director: \(director)"
-        }
-        if let writer = meta.writer?.first, !writer.isEmpty {
-            return "Writer: \(writer)"
+        if meta.isSeries {
+            if let writers = meta.writer, !writers.isEmpty {
+                let list = writers.prefix(2).joined(separator: ", ")
+                return "Creator: \(list)"
+            }
+            if let directors = meta.director, !directors.isEmpty {
+                let list = directors.prefix(2).joined(separator: ", ")
+                return "Creator: \(list)"
+            }
+        } else {
+            if let directors = meta.director, !directors.isEmpty {
+                let list = directors.prefix(2).joined(separator: ", ")
+                return directors.count > 1 ? "Directors: \(list)" : "Director: \(list)"
+            }
+            if let writers = meta.writer, !writers.isEmpty {
+                let list = writers.prefix(2).joined(separator: ", ")
+                return writers.count > 1 ? "Writers: \(list)" : "Writer: \(list)"
+            }
         }
         return nil
+    }
+
+    private var certificationLabel: String? {
+        guard let cert = meta.certification?.trimmingCharacters(in: .whitespacesAndNewlines), !cert.isEmpty else {
+            return nil
+        }
+        return cert
     }
 
     /// Series status badge ("ENDED" / "ONGOING"); nil for movies.
@@ -3352,22 +3398,36 @@ private struct TvDetailsSummary: View {
         if let runtime = NuvioRuntimeDisplay.formatted(meta.runtime) {
             items.append(runtime)
         }
-        if let country = meta.country, !country.isEmpty {
+        if let country = normalizedCountry(meta.country) {
             items.append(country)
         }
-        items.append(contentsOf: simklMetaItems)
+        if let language = normalizedLanguage(meta.language) {
+            items.append(language)
+        }
         return items
     }
 
-    /// Simkl's community rating. Rank and drop-rate indicators are intentionally
-    /// omitted from the Details summary.
-    private var simklMetaItems: [String] {
-        guard let simkl else { return [] }
-        var items: [String] = []
-        if let rating = simkl.rating {
-            items.append(String(format: "★ %.1f Simkl", rating))
+    private func normalizedCountry(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
         }
-        return items
+        let firstPart = raw.split(separator: ",").first.map(String.init)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? raw
+        if firstPart.count == 2, firstPart.range(of: "^[A-Za-z]{2}$", options: .regularExpression) != nil {
+            let code = firstPart.uppercased()
+            return Locale.current.localizedString(forRegionCode: code) ?? code
+        }
+        return firstPart
+    }
+
+    private func normalizedLanguage(_ raw: String?) -> String? {
+        guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            return nil
+        }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.count == 2 || trimmed.count == 3 {
+            return trimmed.uppercased()
+        }
+        return trimmed.prefix(2).uppercased()
     }
 
     private var releaseDisplay: String? {
@@ -5714,7 +5774,7 @@ private struct TvStreamCard: View {
         .scaleEffect(isFocused ? 1.025 : 1)
         .animation(.easeOut(duration: 0.14), value: isFocused)
         .contextMenu {
-            Section("Play with") {
+            Section(L10n.string("details_play_with", fallback: "Play with")) {
                 ForEach(ExternalPlayer.allCases) { player in
                     Button {
                         DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {

@@ -55,7 +55,7 @@ struct CloudLibraryView: View {
 
     private var header: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Cloud Library")
+            Text(L10n.string("debrid_cloud_library", fallback: "Cloud Library"))
                 .font(.system(size: 46, weight: .bold))
                 .foregroundColor(.white)
             Text(openItem?.name ?? viewModel.providerName)

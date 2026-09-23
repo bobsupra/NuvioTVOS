@@ -218,7 +218,9 @@ private struct CompanyBrowseContent: View {
     private var hero: some View {
         HStack(alignment: .bottom, spacing: 50) {
             VStack(alignment: .leading, spacing: 12) {
-                Text(company.kind == .network ? "Network" : "Production")
+                Text(company.kind == .network
+                     ? L10n.string("tmdb_entity_kind_network", fallback: "Network")
+                     : L10n.string("details_production", fallback: "Production"))
                     .font(.system(size: 32, weight: .medium))
                     .foregroundColor(.white.opacity(0.72))
 

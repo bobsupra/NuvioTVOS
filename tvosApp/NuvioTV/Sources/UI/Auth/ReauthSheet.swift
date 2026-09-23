@@ -19,6 +19,13 @@ struct ReauthSheet: View {
         case qr = "QR Code"
         case email = "Email"
         var id: String { rawValue }
+
+        var localizedTitle: String {
+            switch self {
+            case .qr: return L10n.string("auth_method_qr", fallback: "QR Code")
+            case .email: return L10n.string("auth_method_email", fallback: "Email")
+            }
+        }
     }
 
     @State private var method: Method = .qr
@@ -138,7 +145,7 @@ struct ReauthSheet: View {
     private var methodToggle: some View {
         HStack(spacing: 12) {
             ForEach(Method.allCases.filter { $0 == .qr ? auth.serverCapabilities.tvLogin : auth.serverCapabilities.emailPasswordAuth }) { m in
-                MethodTab(title: m.rawValue, isSelected: method == m) {
+                MethodTab(title: m.localizedTitle, isSelected: method == m) {
                     if method != m { method = m }
                 }
             }
@@ -163,7 +170,7 @@ struct ReauthSheet: View {
                         .scaleEffect(1.3)
                         .tint(.black)
                 } else {
-                    Text("QR unavailable.\nRefresh to retry.")
+                    Text(L10n.string("auth_qr_unavailable", fallback: "QR unavailable.\nRefresh to retry."))
                         .font(.system(size: 19, weight: .medium))
                         .foregroundColor(.black.opacity(0.6))
                         .multilineTextAlignment(.center)
@@ -171,7 +178,7 @@ struct ReauthSheet: View {
             }
 
             if let code = auth.qrCode, !code.isEmpty {
-                Text("Code: \(code)")
+                Text(L10n.format("auth_qr_code", fallback: "Code: %@", code))
                     .font(.system(size: 24, weight: .bold))
                     .foregroundColor(.white)
             }
@@ -187,7 +194,7 @@ struct ReauthSheet: View {
                     .multilineTextAlignment(.center)
             }
 
-            LoginButton(title: "Refresh QR", systemImage: "arrow.clockwise", disabled: auth.isBusy) {
+            LoginButton(title: L10n.string("auth_refresh_qr", fallback: "Refresh QR"), systemImage: "arrow.clockwise", disabled: auth.isBusy) {
                 auth.startQrLogin(force: true)
             }
         }
@@ -196,14 +203,14 @@ struct ReauthSheet: View {
     private var emailContent: some View {
         VStack(spacing: 16) {
             LoginGlassField(
-                placeholder: "Email",
+                placeholder: L10n.string("account_email", fallback: "Email"),
                 text: $email,
                 keyboardType: .emailAddress,
                 textContentType: .emailAddress
             )
 
             LoginGlassField(
-                placeholder: "Password",
+                placeholder: L10n.string("account_password", fallback: "Password"),
                 text: $password,
                 isSecure: true,
                 textContentType: .password

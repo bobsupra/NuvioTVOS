@@ -17,6 +17,13 @@ struct LoginView: View {
         case qr = "QR Code"
         case email = "Email"
         var id: String { rawValue }
+
+        var localizedTitle: String {
+            switch self {
+            case .qr: return L10n.string("auth_method_qr", fallback: "QR Code")
+            case .email: return L10n.string("auth_method_email", fallback: "Email")
+            }
+        }
     }
 
     @State private var method: Method = .qr
@@ -95,13 +102,21 @@ struct LoginView: View {
                 .scaledToFit()
                 .frame(width: 300)
 
-            Text(auth.isAuthenticated ? "You're signed in" : "Sign in to Nuvio")
+            Text(auth.isAuthenticated
+                 ? L10n.string("auth_signed_in", fallback: "You're signed in")
+                 : L10n.string("auth_sign_in_nuvio", fallback: "Sign in to Nuvio"))
                 .font(.system(size: 40, weight: .bold))
                 .foregroundColor(.white)
 
             Text(auth.isAuthenticated
-                 ? "Your account is connected on this TV. Your library, addons and progress will sync."
-                 : "Scan a QR code with your phone or sign in with your email to sync your library, addons and watch progress.")
+                 ? L10n.string(
+                     "auth_signed_in_description",
+                     fallback: "Your account is connected on this TV. Your library, addons and progress will sync."
+                 )
+                 : L10n.string(
+                     "auth_sign_in_description",
+                     fallback: "Scan a QR code with your phone or sign in with your email to sync your library, addons and watch progress."
+                 ))
                 .font(.system(size: 24, weight: .regular))
                 .foregroundColor(.white.opacity(0.6))
                 .frame(maxWidth: 560, alignment: .leading)
@@ -139,12 +154,12 @@ struct LoginView: View {
             }
 
             if !auth.isBackendConfigured {
-                statusPill("No account server is configured.", isError: false)
+                statusPill(L10n.string("auth_no_account_server", fallback: "No account server is configured."), isError: false)
             }
 
             Divider().background(Color.white.opacity(0.1)).padding(.vertical, 4)
 
-            LoginButton(title: "Continue without account", systemImage: "arrow.right") {
+            LoginButton(title: L10n.string("auth_continue_without_account", fallback: "Continue without account"), systemImage: "arrow.right") {
                 auth.skipLogin()
                 triggerContinue()
             }
@@ -156,7 +171,7 @@ struct LoginView: View {
     private var methodToggle: some View {
         HStack(spacing: 12) {
             ForEach(Method.allCases.filter { $0 == .qr ? auth.serverCapabilities.tvLogin : auth.serverCapabilities.emailPasswordAuth }) { m in
-                MethodTab(title: m.rawValue, isSelected: method == m) {
+                MethodTab(title: m.localizedTitle, isSelected: method == m) {
                     if method != m { method = m }
                 }
             }
@@ -165,18 +180,29 @@ struct LoginView: View {
 
     private var serverOptions: some View {
         VStack(spacing: 12) {
-            LoginButton(title: showingServerOptions ? "Hide Server Options" : "Use a Self-Hosted Server", systemImage: "server.rack") {
+            LoginButton(
+                title: showingServerOptions
+                    ? L10n.string("auth_hide_server_options", fallback: "Hide Server Options")
+                    : L10n.string("auth_use_self_hosted_server", fallback: "Use a Self-Hosted Server"),
+                systemImage: "server.rack"
+            ) {
                 showingServerOptions.toggle()
                 if showingServerOptions { backendInput = AuthConfig.apiBaseURL == AuthConfig.officialAPIBaseURL ? "" : AuthConfig.apiBaseURL }
             }
             if showingServerOptions {
-                LoginGlassField(placeholder: "Backend URL", text: $backendInput, keyboardType: .URL)
+                LoginGlassField(
+                    placeholder: L10n.string("auth_backend_url", fallback: "Backend URL"),
+                    text: $backendInput,
+                    keyboardType: .URL
+                )
                     .onChange(of: backendInput) { _, _ in
                         auth.clearDiscoveredServer()
                         trustServer = false
                     }
                 LoginButton(
-                    title: auth.isDiscoveringServer ? "Checking Server…" : "Check Server",
+                    title: auth.isDiscoveringServer
+                        ? L10n.string("auth_checking_server", fallback: "Checking Server…")
+                        : L10n.string("auth_check_server", fallback: "Check Server"),
                     systemImage: "checkmark.shield",
                     disabled: auth.isDiscoveringServer || backendInput.isEmpty
                 ) {
@@ -185,16 +211,38 @@ struct LoginView: View {
                     Task { await auth.discoverCustomServer(input: backendInput) }
                 }
                 if let discovered = auth.discoveredServer {
-                    Text("Found \(discovered.configuration.backendURL)")
+                    Text(L10n.format(
+                        "auth_found_server",
+                        fallback: "Found %@",
+                        discovered.configuration.backendURL
+                    ))
                         .font(.system(size: 18, weight: .semibold)).foregroundColor(.white)
-                    Text("Sign-in: \(discovered.configuration.capabilities.emailPasswordAuth ? "Email " : "")\(discovered.configuration.capabilities.tvLogin ? "QR" : "")")
+                    let methods = [
+                        discovered.configuration.capabilities.emailPasswordAuth
+                            ? L10n.string("auth_method_email", fallback: "Email")
+                            : nil,
+                        discovered.configuration.capabilities.tvLogin
+                            ? L10n.string("auth_method_qr", fallback: "QR")
+                            : nil
+                    ]
+                    .compactMap { $0 }
+                    .joined(separator: " ")
+                    Text(L10n.format("auth_sign_in_methods", fallback: "Sign-in: %@", methods))
                         .font(.system(size: 17)).foregroundColor(.white.opacity(0.7))
                     ForEach(discovered.securityWarnings, id: \.self) { warning in
                         Text(warning).font(.system(size: 16)).foregroundColor(.orange).multilineTextAlignment(.center)
                     }
-                    Toggle("I trust this server", isOn: $trustServer)
+                    Toggle(
+                        L10n.string("auth_trust_server", fallback: "I trust this server"),
+                        isOn: $trustServer
+                    )
                         .foregroundColor(.white)
-                    LoginButton(title: "Connect", systemImage: "link", prominent: true, disabled: auth.isDiscoveringServer || !trustServer) {
+                    LoginButton(
+                        title: L10n.string("action_connect", fallback: "Connect"),
+                        systemImage: "link",
+                        prominent: true,
+                        disabled: auth.isDiscoveringServer || !trustServer
+                    ) {
                         let configuration = discovered.configuration
                         let selectedMethod: Method = configuration.capabilities.tvLogin ? .qr : .email
                         let shouldStartQR = selectedMethod == .qr && method == .qr
@@ -206,7 +254,7 @@ struct LoginView: View {
                     }
                 }
                 if AuthConfig.isCustom {
-                    LoginButton(title: "Use Official Server", systemImage: "arrow.uturn.backward") {
+                    LoginButton(title: L10n.string("auth_use_official_server", fallback: "Use Official Server"), systemImage: "arrow.uturn.backward") {
                         let shouldStartQR = method == .qr
                         auth.useOfficialServer()
                         method = .qr
@@ -238,7 +286,7 @@ struct LoginView: View {
                         .scaleEffect(1.3)
                         .tint(.black)
                 } else {
-                    Text("QR unavailable.\nRefresh to retry.")
+                    Text(L10n.string("auth_qr_unavailable", fallback: "QR unavailable.\nRefresh to retry."))
                         .font(.system(size: 20, weight: .medium))
                         .foregroundColor(.black.opacity(0.6))
                         .multilineTextAlignment(.center)
@@ -246,7 +294,7 @@ struct LoginView: View {
             }
 
             if let code = auth.qrCode, !code.isEmpty {
-                Text("Code: \(code)")
+                Text(L10n.format("auth_qr_code", fallback: "Code: %@", code))
                     .font(.system(size: 24, weight: .semibold))
                     .foregroundColor(.white)
             }
@@ -262,7 +310,7 @@ struct LoginView: View {
                     .multilineTextAlignment(.center)
             }
 
-            LoginButton(title: "Refresh QR", systemImage: "arrow.clockwise", disabled: auth.isBusy) {
+            LoginButton(title: L10n.string("auth_refresh_qr", fallback: "Refresh QR"), systemImage: "arrow.clockwise", disabled: auth.isBusy) {
                 auth.startQrLogin(force: true)
             }
         }
@@ -272,26 +320,30 @@ struct LoginView: View {
 
     private var emailContent: some View {
         VStack(spacing: 16) {
-            Text(isSignUp ? "Create your account" : "Sign in with email")
+            Text(isSignUp
+                 ? L10n.string("auth_create_account_title", fallback: "Create your account")
+                 : L10n.string("auth_sign_in_email_title", fallback: "Sign in with email"))
                 .font(.system(size: 28, weight: .bold))
                 .foregroundColor(.white)
 
             LoginGlassField(
-                placeholder: "Email",
+                placeholder: L10n.string("account_email", fallback: "Email"),
                 text: $email,
                 keyboardType: .emailAddress,
                 textContentType: .emailAddress
             )
 
             LoginGlassField(
-                placeholder: "Password",
+                placeholder: L10n.string("account_password", fallback: "Password"),
                 text: $password,
                 isSecure: true,
                 textContentType: isSignUp ? .newPassword : .password
             )
 
             LoginButton(
-                title: isSignUp ? "Create Account" : "Sign In",
+                title: isSignUp
+                    ? L10n.string("action_create_account", fallback: "Create Account")
+                    : L10n.string("action_sign_in", fallback: "Sign In"),
                 systemImage: "envelope.fill",
                 prominent: true,
                 disabled: auth.isBusy || email.isEmpty || password.isEmpty
@@ -306,7 +358,9 @@ struct LoginView: View {
             }
 
             LoginLinkButton(
-                title: isSignUp ? "Already have an account? Sign in" : "New to Nuvio? Create an account"
+                title: isSignUp
+                    ? L10n.string("auth_already_have_account", fallback: "Already have an account? Sign in")
+                    : L10n.string("auth_new_to_nuvio", fallback: "New to Nuvio? Create an account")
             ) {
                 isSignUp.toggle()
                 auth.errorMessage = nil
@@ -321,7 +375,7 @@ struct LoginView: View {
             Image(systemName: "checkmark.circle.fill")
                 .font(.system(size: 72))
                 .foregroundColor(Color(red: 0.49, green: 1.0, blue: 0.61))
-            Text(auth.qrStatusMessage ?? "Signed in successfully")
+            Text(auth.qrStatusMessage ?? L10n.string("auth_signed_in_successfully", fallback: "Signed in successfully"))
                 .font(.system(size: 24, weight: .semibold))
                 .foregroundColor(.white)
             ProgressView().tint(.white)
@@ -567,7 +621,12 @@ struct CountdownText: View {
     var body: some View {
         TimelineView(.periodic(from: Date(), by: 1)) { context in
             let remaining = max(0, Int(target.timeIntervalSince(context.date)))
-            Text(String(format: "Expires in %02d:%02d", remaining / 60, remaining % 60))
+            Text(L10n.format(
+                "auth_expires_in",
+                fallback: "Expires in %02d:%02d",
+                remaining / 60,
+                remaining % 60
+            ))
                 .font(.system(size: 19))
                 .foregroundColor(.white.opacity(0.55))
         }

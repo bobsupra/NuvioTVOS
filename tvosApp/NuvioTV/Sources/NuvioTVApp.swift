@@ -2498,11 +2498,14 @@ private struct AccountSyncWaitView: View {
                 .tint(.white)
                 .scaleEffect(1.6)
 
-            Text("Syncing your account")
+            Text(L10n.string("account_sync_loading", fallback: "Syncing your account"))
                 .font(.custom("Inter-Bold", size: 44))
                 .foregroundColor(.white)
 
-            Text("Hang tight while we import your profiles and watch history.")
+            Text(L10n.string(
+                "account_sync_loading_subtitle",
+                fallback: "Hang tight while we import your profiles and watch history."
+            ))
                 .font(.custom("Inter-Regular", size: 28))
                 .foregroundColor(.white.opacity(0.6))
         }
@@ -3051,7 +3054,7 @@ private struct TVSidebarProfileHeader: View {
                     .layoutPriority(1)
 
                 if isFocused {
-                    Text("Change Profile")
+                    Text(L10n.string("profile_change", fallback: "Change Profile"))
                         .font(.system(size: 18, weight: .semibold))
                         .foregroundColor(.white.opacity(0.72))
                         .lineLimit(1)
@@ -8129,12 +8132,12 @@ private struct TVErrorView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 16) {
-            Text("Catalog failed")
+            Text(L10n.string("catalog_load_failed", fallback: "Catalog failed"))
                 .font(.largeTitle.bold())
             Text(message)
                 .font(.title3)
                 .foregroundColor(.white.opacity(0.68))
-            Button("Retry", action: onRetry)
+            Button(L10n.string("action_retry", fallback: "Retry"), action: onRetry)
                 .buttonStyle(.borderedProminent)
         }
         .foregroundColor(.white)
