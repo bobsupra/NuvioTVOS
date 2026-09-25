@@ -37,6 +37,23 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
         XCTAssertTrue(diag.message.contains("HTTP 403"))
     }
 
+    func testRateLimitedHttp429() {
+        let rawError = "Origin answered HTTP 429 for the source"
+        let streamURL = URL(string: "https://nexus-226.nord.tb-cdn.st/dld/token123")!
+
+        let diag = PlaybackErrorDiagnostic.analyze(
+            errorMessage: rawError,
+            streamURL: streamURL
+        )
+
+        XCTAssertEqual(diag.origin, .hostingProvider)
+        XCTAssertTrue(diag.isHostingIssue)
+        XCTAssertEqual(diag.badgeText, "RATE LIMITED (429)")
+        XCTAssertEqual(diag.title, "Stream Host Rate Limited")
+        XCTAssertTrue(diag.message.contains("HTTP 429"))
+        XCTAssertTrue(diag.message.contains("nexus-226.nord.tb-cdn.st"))
+    }
+
     func testFileNotFoundHttp404() {
         let rawError = "HTTP 404 Not Found"
         let streamURL = URL(string: "https://example.com/stream.mkv")!

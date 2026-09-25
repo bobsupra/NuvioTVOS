@@ -109,6 +109,30 @@ struct PlaybackErrorDiagnostic: Equatable {
             )
         }
 
+        // 3b. HTTP 429 Too Many Requests / Rate Limited
+        if lower.contains("429")
+            || lower.contains("too many requests")
+            || lower.contains("rate limited")
+            || lower.contains("rate limit") {
+            let hostLabel = host.map { " (\($0))" } ?? ""
+            return PlaybackErrorDiagnostic(
+                origin: .hostingProvider,
+                badgeText: "RATE LIMITED (429)",
+                badgeIconName: "exclamationmark.triangle.fill",
+                title: L10n.string("error_rate_limited_title", fallback: "Stream Host Rate Limited"),
+                message: L10n.string(
+                    "error_rate_limited_msg",
+                    fallback: "The remote hosting server\(hostLabel) temporarily blocked requests (HTTP 429 Too Many Requests)."
+                ),
+                suggestedAction: L10n.string(
+                    "error_rate_limited_action",
+                    fallback: "Select an alternative stream source or wait 1–2 minutes for the host cooldown to reset."
+                ),
+                technicalDetails: formatTechnicalLine(host: host, code: "HTTP 429 (Too Many Requests)", raw: rawError),
+                host: host
+            )
+        }
+
         // 4. HTTP 404 Not Found
         if lower.contains("404") || lower.contains("not found") {
             return PlaybackErrorDiagnostic(

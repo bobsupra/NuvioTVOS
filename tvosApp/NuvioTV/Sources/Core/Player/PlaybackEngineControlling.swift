@@ -45,6 +45,8 @@ struct PlaybackDebugInfo: Equatable {
     // NETWORK section
     var buffer: String = "0.0 s ahead"
     var bufferSeconds: Double = 0
+    var diskBuffer: String = ""
+    var diskBufferSeconds: Double = 0
     var speed: String = "est -- Mbit/s"
     var ping: String = "7 ms"
     var loaded: String = "0 MB"
@@ -93,6 +95,8 @@ struct PlaybackDebugInfo: Equatable {
         aJitter: String = "drift avg 0 ms/s · max 0 · 0 ev",
         buffer: String = "0.0 s ahead",
         bufferSeconds: Double = 0,
+        diskBuffer: String = "",
+        diskBufferSeconds: Double = 0,
         speed: String = "est -- Mbit/s",
         ping: String = "7 ms",
         loaded: String = "0 MB",
@@ -136,6 +140,8 @@ struct PlaybackDebugInfo: Equatable {
         self.aJitter = aJitter
         self.buffer = buffer
         self.bufferSeconds = bufferSeconds
+        self.diskBuffer = diskBuffer
+        self.diskBufferSeconds = diskBufferSeconds
         self.speed = speed
         self.ping = ping
         self.loaded = loaded

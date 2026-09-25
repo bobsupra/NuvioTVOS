@@ -2815,16 +2815,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // Network buffer
         let bufferSec: Double
         let bufferStr: String
-        if let fwd = telemetry?.forwardBufferSeconds, fwd > 0 {
+        if bufferedMs > positionMs {
+            bufferSec = Double(bufferedMs - positionMs) / 1000.0
+            bufferStr = String(format: "%.1f s ahead", bufferSec)
+        } else if let fwd = telemetry?.forwardBufferSeconds, fwd > 0 {
             bufferSec = fwd
             bufferStr = String(format: "%.1f s ahead", bufferSec)
         } else if engine.playbackBackend == .software {
-            let cushion = telemetry?.displayCushionSeconds ?? (bufferedMs > positionMs ? Double(bufferedMs - positionMs) / 1000.0 : 0.3)
+            let cushion = telemetry?.displayCushionSeconds ?? 0.3
             bufferSec = cushion
             bufferStr = String(format: "%.1f s cushion (Direct queue)", cushion)
-        } else if bufferedMs > positionMs {
-            bufferSec = Double(bufferedMs - positionMs) / 1000.0
-            bufferStr = String(format: "%.1f s ahead", bufferSec)
         } else {
             bufferSec = 0.0
             bufferStr = "0.0 s ahead"
@@ -3490,7 +3490,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // intentionally limited to the cache server's HTTP/1.1 loopback path.
         let isLocalPlaybackCache = request.videoURL.host == "127.0.0.1"
             && request.videoURL.path.hasPrefix("/stream/")
-        self.isRemoteStream = isRemote
+        self.isRemoteStream = isRemote || isLocalPlaybackCache
         let streamKey = request.canonicalMediaKey
             ?? TrickplayDiskCache.streamKey(for: request.videoURL.absoluteString)
         self.currentStreamKey = streamKey
@@ -3793,7 +3793,12 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         loadGeneration += 1
         resetHybridThumbnailState(generation: loadGeneration)
         engine.pictureInPictureActive = false
-        engine.stop(resetDisplayCriteria: true)
+        // Stop audio/video transport immediately without blocking view dismissal for synchronous display criteria handshake
+        engine.stop(resetDisplayCriteria: false)
+        let retainedEngine = engine
+        DispatchQueue.main.async {
+            retainedEngine.stop(resetDisplayCriteria: true)
+        }
         subtitleCues = []
         activeASSTrackID = nil
         activeASSHeader = nil
