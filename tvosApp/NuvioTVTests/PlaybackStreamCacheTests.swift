@@ -278,7 +278,7 @@ final class PlaybackStreamCacheTests: XCTestCase {
             var response = PlaybackStreamCacheURLProtocol.response(
                 for: request, body: Data(repeating: 0x22, count: chunkSize), total: fileLength
             )
-            response.contentRange = "bytes 1-\(chunkSize)/\(fileLength)"
+            response.contentRange = "bytes 0--\(chunkSize - 1)/\(fileLength)"
             return response
         }
         let session = "test_invalid_range_\(UUID().uuidString)"
@@ -554,6 +554,92 @@ extension PlaybackStreamCacheTests {
         await server.stop()
     }
 
+    func testDemandTakesOverStalledForwardBatchOnceForConcurrentReaders() async throws {
+        let chunk = Int(PlaybackStreamDiskCache.defaultChunkSize)
+        let body = Data(repeating: 0x5A, count: chunk * 8)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.delay = 10
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            PlaybackStreamCacheURLProtocol.response(for: request, body: body, total: Int64(body.count))
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            PlaybackStreamCacheURLProtocol.handler = nil
+            PlaybackStreamCacheURLProtocol.delay = 0
+            try? FileManager.default.removeItem(at: root)
+        }
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/stalled_forward")!,
+            fileLength: Int64(body.count), cacheRoot: root,
+            sessionConfiguration: configuration, maxConcurrentUpstream: 1,
+            demandBatchJoinGrace: 0.2
+        )
+        _ = try await server.start()
+        for _ in 0..<100 where PlaybackStreamCacheURLProtocol.requestCount == 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(PlaybackStreamCacheURLProtocol.requestCount, 1)
+        PlaybackStreamCacheURLProtocol.delay = 0
+
+        let started = Date()
+        async let first = server.fetchDemandChunk(0)
+        async let second = server.fetchDemandChunk(0)
+        let received = await (first, second)
+        XCTAssertEqual(received.0, body.prefix(chunk))
+        XCTAssertEqual(received.1, body.prefix(chunk))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        XCTAssertEqual(
+            PlaybackStreamCacheURLProtocol.requestRanges.filter { $0 == "bytes=0-\(chunk - 1)" }.count, 1
+        )
+        XCTAssertGreaterThanOrEqual(PlaybackStreamCacheURLProtocol.cancellationCount, 1)
+        await server.stop()
+    }
+
+    func testDemandTakesOverStalledTailOfDemandBatch() async throws {
+        let chunk = Int(PlaybackStreamDiskCache.defaultChunkSize)
+        let body = Data(repeating: 0x5B, count: chunk * 4)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            var response = PlaybackStreamCacheURLProtocol.response(
+                for: request, body: body, total: Int64(body.count)
+            )
+            if request.value(forHTTPHeaderField: "Range") == "bytes=0-\(body.count - 1)" {
+                response.bodyChunkBytes = chunk
+                response.bodyChunkDelay = 10
+            }
+            return response
+        }
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+        defer {
+            PlaybackStreamCacheURLProtocol.handler = nil
+            try? FileManager.default.removeItem(at: root)
+        }
+        let server = PlaybackStreamCacheServer(
+            remoteURL: URL(string: "https://cache-test.invalid/stalled_demand_tail")!,
+            fileLength: Int64(body.count), cacheRoot: root,
+            sessionConfiguration: configuration, maxConcurrentUpstream: 1,
+            freeSpaceProvider: { _ in 0 }, demandBatchJoinGrace: 0.2
+        )
+        let first = await server.fetchDemandChunk(0)
+        XCTAssertEqual(first, body.prefix(chunk))
+
+        let started = Date()
+        let second = await server.fetchDemandChunk(1)
+        XCTAssertEqual(second, body.prefix(chunk))
+        XCTAssertLessThan(Date().timeIntervalSince(started), 3)
+        XCTAssertEqual(
+            PlaybackStreamCacheURLProtocol.requestRanges.filter {
+                $0 == "bytes=\(chunk)-\(2 * chunk - 1)"
+            }.count, 1
+        )
+        XCTAssertGreaterThanOrEqual(PlaybackStreamCacheURLProtocol.cancellationCount, 1)
+        await server.stop()
+    }
+
     func testJoinedPlaybackBatchIsProtectedFromUnrelatedDemand() async throws {
         let chunk = Int(PlaybackStreamDiskCache.defaultChunkSize)
         let body = Data(repeating: 0x62, count: chunk * 8)
@@ -774,6 +860,17 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
         var bodyChunkBytes: Int? = nil
         var bodyChunkDelay: TimeInterval = 0
         var declaredContentLength: Int? = nil
+        var redirectURL: URL? = nil
+    }
+
+    struct RequestSnapshot {
+        let url: URL?
+        let method: String?
+        let headers: [String: String]
+
+        func value(forHTTPHeaderField field: String) -> String? {
+            headers.first { $0.key.caseInsensitiveCompare(field) == .orderedSame }?.value
+        }
     }
 
     private static let metricsLock = NSLock()
@@ -783,6 +880,8 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
     private static var maximumActive = 0
     private static var starts = [Date]()
     private static var ranges = [String?]()
+    private static var snapshots = [RequestSnapshot]()
+    private static var deliveredBodyBytes = 0
     private static var cancellations = 0
     static var handler: ((URLRequest) -> Response)? {
         get { metricsLock.withLock { storedHandler } }
@@ -796,6 +895,8 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
     static var requestCount: Int { metricsLock.withLock { starts.count } }
     static var requestStarts: [Date] { metricsLock.withLock { starts } }
     static var requestRanges: [String?] { metricsLock.withLock { ranges } }
+    static var requestSnapshots: [RequestSnapshot] { metricsLock.withLock { snapshots } }
+    static var totalDeliveredBodyBytes: Int { metricsLock.withLock { deliveredBodyBytes } }
     static var cancellationCount: Int { metricsLock.withLock { cancellations } }
     private let deliveryLock = NSRecursiveLock()
     private var finished = false
@@ -807,11 +908,15 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
             maximumActive = 0
             starts = []
             ranges = []
+            snapshots = []
+            deliveredBodyBytes = 0
             cancellations = 0
         }
     }
 
-    override class func canInit(with request: URLRequest) -> Bool { request.url?.host == "cache-test.invalid" }
+    override class func canInit(with request: URLRequest) -> Bool {
+        ["cache-test.invalid", "cache-redirect.invalid"].contains(request.url?.host)
+    }
     override class func canonicalRequest(for request: URLRequest) -> URLRequest { request }
 
     override func startLoading() {
@@ -820,6 +925,11 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
         Self.metricsLock.withLock {
             Self.starts.append(Date())
             Self.ranges.append(request.value(forHTTPHeaderField: "Range"))
+            Self.snapshots.append(RequestSnapshot(
+                url: request.url,
+                method: request.httpMethod,
+                headers: request.allHTTPHeaderFields ?? [:]
+            ))
             Self.activeRequests += 1
             Self.maximumActive = max(Self.maximumActive, Self.activeRequests)
         }
@@ -832,6 +942,23 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
                 finished = true
                 Self.metricsLock.withLock { Self.activeRequests -= 1 }
                 client?.urlProtocol(self, didFailWithError: URLError(.badServerResponse))
+                return
+            }
+            if let redirectURL = response.redirectURL {
+                let redirect = HTTPURLResponse(
+                    url: url,
+                    statusCode: response.statusCode,
+                    httpVersion: "HTTP/1.1",
+                    headerFields: ["Location": redirectURL.absoluteString]
+                )!
+                finished = true
+                Self.metricsLock.withLock { Self.activeRequests -= 1 }
+                var redirectRequest = URLRequest(url: redirectURL)
+                redirectRequest.httpMethod = request.httpMethod
+                for (name, value) in request.allHTTPHeaderFields ?? [:] {
+                    redirectRequest.setValue(value, forHTTPHeaderField: name)
+                }
+                client?.urlProtocol(self, wasRedirectedTo: redirectRequest, redirectResponse: redirect)
                 return
             }
             var headers = ["Content-Range": response.contentRange, "Content-Length": "\(response.declaredContentLength ?? response.data.count)", "Accept-Ranges": "bytes"]
@@ -856,6 +983,7 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
         if request.httpMethod != "HEAD", offset < response.data.count {
             let end = min(response.data.count, offset + max(1, response.bodyChunkBytes ?? response.data.count))
             client?.urlProtocol(self, didLoad: response.data.subdata(in: offset..<end))
+            Self.metricsLock.withLock { Self.deliveredBodyBytes += end - offset }
             if end < response.data.count {
                 let work = DispatchWorkItem { [self] in deliverBody(response, offset: end) }
                 delivery = work
@@ -897,6 +1025,205 @@ private final class PlaybackStreamCacheURLProtocol: URLProtocol {
         let end = Int64(range[1])!
         let data = body.isEmpty ? Data() : Data(body[Int(start)...Int(end)])
         return Response(data: data, statusCode: 206, contentRange: "bytes \(start)-\(end)/\(total)", retryAfter: nil, etag: etag, lastModified: lastModified)
+    }
+}
+
+extension PlaybackStreamCacheTests {
+    func testRangeProbeRequiresExactTwoBytePartialResponse() async {
+        let url = URL(string: "https://cache-test.invalid/probe")!
+        let body = Data(repeating: 0x42, count: 64)
+        let cases: [(name: String, status: Int, contentRange: String, data: Data, supportsRange: Bool, bodyChunkBytes: Int?)] = [
+            ("ignored range", 200, "bytes 0-63/64", body, false, 2),
+            ("wrong range", 206, "bytes 1-2/64", Data([0x42, 0x42]), false, nil),
+            ("malformed range separator", 206, "bytes 0--1/64", Data([0x42, 0x42]), false, nil),
+            ("malformed total separator", 206, "bytes 0-1//64", Data([0x42, 0x42]), false, nil),
+            ("short body", 206, "bytes 0-1/64", Data([0x42]), false, nil),
+            ("valid range", 206, "bytes 0-1/64", Data([0x42, 0x42]), true, nil)
+        ]
+
+        for testCase in cases {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+            PlaybackStreamCacheURLProtocol.resetMetrics()
+            PlaybackStreamCacheURLProtocol.handler = { request in
+                if request.httpMethod == "HEAD" {
+                    return PlaybackStreamCacheURLProtocol.response(for: request, body: body, total: 64, etag: "head-tag")
+                }
+                return PlaybackStreamCacheURLProtocol.Response(
+                    data: testCase.data,
+                    statusCode: testCase.status,
+                    contentRange: testCase.contentRange,
+                    retryAfter: nil,
+                    etag: nil,
+                    lastModified: nil,
+                    bodyChunkBytes: testCase.bodyChunkBytes,
+                    bodyChunkDelay: 0.01
+                )
+            }
+
+            let result = await PlaybackStreamCacheManager.shared.probeRangeSupport(
+                url: url,
+                sessionConfiguration: configuration
+            )
+            XCTAssertEqual(result.supportsRange, testCase.supportsRange, testCase.name)
+            if testCase.supportsRange {
+                XCTAssertEqual(result.contentLength, 64)
+                XCTAssertEqual(result.etag, "head-tag")
+            } else {
+                XCTAssertEqual(result.contentLength, 0)
+            }
+            XCTAssertEqual(PlaybackStreamCacheURLProtocol.requestRanges.count, 2)
+            XCTAssertEqual(PlaybackStreamCacheURLProtocol.requestRanges[1], "bytes=0-1")
+            if testCase.name == "ignored range" {
+                XCTAssertLessThanOrEqual(PlaybackStreamCacheURLProtocol.totalDeliveredBodyBytes, testCase.data.count)
+            }
+        }
+        PlaybackStreamCacheURLProtocol.handler = nil
+    }
+
+    func testProbeRedirectScopesHeadersToSameOriginAndPreservesProbeRange() async {
+        let sourceURL = URL(string: "https://cache-test.invalid:8443/source")!
+        let redirectCases: [(target: URL, preservesCustomHeaders: Bool)] = [
+            (URL(string: "https://cache-test.invalid:8443/same-origin")!, true),
+            (URL(string: "https://cache-redirect.invalid:8443/different-host")!, false),
+            (URL(string: "https://cache-test.invalid:9443/different-port")!, false),
+            (URL(string: "http://cache-test.invalid:8443/different-scheme")!, false)
+        ]
+        let body = Data(repeating: 0x53, count: 64)
+
+        for redirectCase in redirectCases {
+            let configuration = URLSessionConfiguration.ephemeral
+            configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+            PlaybackStreamCacheURLProtocol.resetMetrics()
+            PlaybackStreamCacheURLProtocol.handler = { request in
+                if request.url == sourceURL {
+                    return PlaybackStreamCacheURLProtocol.Response(
+                        data: Data(), statusCode: 302, contentRange: "", retryAfter: nil,
+                        etag: nil, lastModified: nil, redirectURL: redirectCase.target
+                    )
+                }
+                return PlaybackStreamCacheURLProtocol.response(for: request, body: body, total: 64)
+            }
+
+            let result = await PlaybackStreamCacheManager.shared.probeRangeSupport(
+                url: sourceURL,
+                headers: ["X-Playback-Secret": "secret", "Range": "bytes=50-60"],
+                sessionConfiguration: configuration
+            )
+            XCTAssertTrue(result.supportsRange)
+            let redirectedRequests = PlaybackStreamCacheURLProtocol.requestSnapshots.filter { $0.url == redirectCase.target }
+            let redirectedGet = redirectedRequests.first { $0.method == "GET" }
+            XCTAssertEqual(redirectedGet?.value(forHTTPHeaderField: "Range"), "bytes=0-1")
+            XCTAssertEqual(
+                redirectedGet?.value(forHTTPHeaderField: "X-Playback-Secret"),
+                redirectCase.preservesCustomHeaders ? "secret" : nil
+            )
+        }
+        PlaybackStreamCacheURLProtocol.handler = nil
+    }
+
+    func testProbeDoesNotRestoreHeadersAfterCrossOriginRedirect() async throws {
+        let sourceURL = URL(string: "https://cache-test.invalid/source")!
+        let intermediateURL = URL(string: "https://cache-redirect.invalid/first-hop")!
+        let finalURL = URL(string: "https://cache-redirect.invalid/second-hop")!
+        let body = Data(repeating: 0x39, count: 64)
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            if request.url == sourceURL {
+                return PlaybackStreamCacheURLProtocol.Response(
+                    data: Data(), statusCode: 302, contentRange: "", retryAfter: nil,
+                    etag: nil, lastModified: nil, redirectURL: intermediateURL
+                )
+            }
+            if request.url == intermediateURL {
+                return PlaybackStreamCacheURLProtocol.Response(
+                    data: Data(), statusCode: 302, contentRange: "", retryAfter: nil,
+                    etag: nil, lastModified: nil, redirectURL: finalURL
+                )
+            }
+            return PlaybackStreamCacheURLProtocol.response(for: request, body: body, total: 64)
+        }
+        defer { PlaybackStreamCacheURLProtocol.handler = nil }
+
+        let result = await PlaybackStreamCacheManager.shared.probeRangeSupport(
+            url: sourceURL,
+            headers: ["X-Playback-Secret": "secret"],
+            sessionConfiguration: configuration
+        )
+        XCTAssertTrue(result.supportsRange)
+
+        let requests = PlaybackStreamCacheURLProtocol.requestSnapshots
+        let intermediateGet = try XCTUnwrap(requests.first { $0.url == intermediateURL && $0.method == "GET" })
+        let finalGet = try XCTUnwrap(requests.first { $0.url == finalURL && $0.method == "GET" })
+        XCTAssertNil(intermediateGet.value(forHTTPHeaderField: "X-Playback-Secret"))
+        XCTAssertNil(finalGet.value(forHTTPHeaderField: "X-Playback-Secret"))
+        XCTAssertEqual(finalGet.value(forHTTPHeaderField: "Range"), "bytes=0-1")
+    }
+
+    func testCacheFetchReusesOriginalRedirectingURLAndStripsCrossOriginHeaders() async throws {
+        let chunkSize = Int(PlaybackStreamDiskCache.defaultChunkSize)
+        let fileLength = Int64(chunkSize * 6)
+        let body = Data(repeating: 0x6A, count: Int(fileLength))
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let sourceURL = URL(string: "https://cache-test.invalid/signed/movie?token=original")!
+        let intermediateURL = URL(string: "https://cache-redirect.invalid/first-hop/movie")!
+        let resolvedURL = URL(string: "https://cache-redirect.invalid/renewed/movie")!
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [PlaybackStreamCacheURLProtocol.self]
+        PlaybackStreamCacheURLProtocol.resetMetrics()
+        PlaybackStreamCacheURLProtocol.handler = { request in
+            if request.url == sourceURL {
+                return PlaybackStreamCacheURLProtocol.Response(
+                    data: Data(), statusCode: 302, contentRange: "", retryAfter: nil,
+                    etag: nil, lastModified: nil, redirectURL: intermediateURL
+                )
+            }
+            if request.url == intermediateURL {
+                return PlaybackStreamCacheURLProtocol.Response(
+                    data: Data(), statusCode: 302, contentRange: "", retryAfter: nil,
+                    etag: nil, lastModified: nil, redirectURL: resolvedURL
+                )
+            }
+            return PlaybackStreamCacheURLProtocol.response(for: request, body: body, total: fileLength)
+        }
+        defer { PlaybackStreamCacheURLProtocol.handler = nil }
+
+        guard let localURL = await PlaybackStreamCacheManager.shared.prepareCacheServer(
+            for: sourceURL,
+            headers: ["X-Playback-Secret": "secret"],
+            targetLeadSeconds: 0,
+            cacheRoot: root,
+            sessionConfiguration: configuration
+        ) else {
+            XCTFail("Expected redirecting range source to prepare a cache server")
+            return
+        }
+
+        let probeRequests = PlaybackStreamCacheURLProtocol.requestSnapshots
+        let probeFinalGet = try XCTUnwrap(probeRequests.first { $0.url == resolvedURL && $0.method == "GET" })
+        XCTAssertEqual(probeFinalGet.value(forHTTPHeaderField: "Range"), "bytes=0-1")
+        XCTAssertNil(probeFinalGet.value(forHTTPHeaderField: "X-Playback-Secret"))
+
+        let requestCountBeforeFetch = PlaybackStreamCacheURLProtocol.requestSnapshots.count
+        var localRequest = URLRequest(url: localURL)
+        localRequest.setValue("bytes=0-\(chunkSize - 1)", forHTTPHeaderField: "Range")
+        let fetched = try await URLSession.shared.data(for: localRequest).0
+        XCTAssertEqual(fetched, body.prefix(chunkSize))
+
+        let fetchRequests = PlaybackStreamCacheURLProtocol.requestSnapshots.dropFirst(requestCountBeforeFetch)
+        let sourceRequest = try XCTUnwrap(fetchRequests.first { $0.url == sourceURL })
+        let intermediateGet = try XCTUnwrap(fetchRequests.first { $0.url == intermediateURL && $0.method == "GET" })
+        let redirectedGet = try XCTUnwrap(fetchRequests.first { $0.url == resolvedURL && $0.method == "GET" })
+        XCTAssertTrue(sourceRequest.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") == true)
+        XCTAssertNil(intermediateGet.value(forHTTPHeaderField: "X-Playback-Secret"))
+        XCTAssertTrue(redirectedGet.value(forHTTPHeaderField: "Range")?.hasPrefix("bytes=0-") == true)
+        XCTAssertNil(redirectedGet.value(forHTTPHeaderField: "X-Playback-Secret"))
+
+        await PlaybackStreamCacheManager.shared.stopActiveSession()
     }
 }
 
@@ -998,7 +1325,11 @@ extension PlaybackStreamCacheTests {
             XCTAssertEqual(chunk0, expected.subdata(in: 0..<chunkSize))
 
             // Wait briefly for chunk to be committed to disk
-            let fraction = await server1.cachedFraction()
+            var fraction = await server1.cachedFraction()
+            for _ in 0..<20 where fraction < 0.5 {
+                try? await Task.sleep(nanoseconds: 50_000_000)
+                fraction = await server1.cachedFraction()
+            }
             XCTAssertGreaterThanOrEqual(fraction, 0.5)
 
             // User quits the player / session stops (RAM buffer discarded)
@@ -2031,5 +2362,3 @@ extension PlaybackStreamCacheTests {
         await server.stop()
     }
 }
-
-

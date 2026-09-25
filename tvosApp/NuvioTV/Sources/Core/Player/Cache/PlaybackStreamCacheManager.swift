@@ -7,6 +7,278 @@ struct StreamProbeResult: Sendable {
     let contentLength: Int64
     let etag: String?
     let lastModified: String?
+    let resolvedURL: URL?
+
+    init(
+        supportsRange: Bool,
+        contentLength: Int64,
+        etag: String?,
+        lastModified: String?,
+        resolvedURL: URL? = nil
+    ) {
+        self.supportsRange = supportsRange
+        self.contentLength = contentLength
+        self.etag = etag
+        self.lastModified = lastModified
+        self.resolvedURL = resolvedURL
+    }
+}
+
+struct PlaybackStreamCacheContentRange: Sendable {
+    let start: Int64
+    let end: Int64
+    let total: Int64?
+
+    static func parse(_ contentRange: String) -> PlaybackStreamCacheContentRange? {
+        let value = contentRange.trimmingCharacters(in: .whitespacesAndNewlines)
+        let components = value.split(separator: " ", omittingEmptySubsequences: false)
+        guard components.count == 2, components[0].lowercased() == "bytes" else { return nil }
+
+        let rangeAndTotal = components[1].split(separator: "/", omittingEmptySubsequences: false)
+        guard rangeAndTotal.count == 2 else { return nil }
+        let bounds = rangeAndTotal[0].split(separator: "-", omittingEmptySubsequences: false)
+        guard bounds.count == 2,
+              let start = decimalInt64(bounds[0]),
+              let end = decimalInt64(bounds[1]),
+              start <= end else { return nil }
+
+        let total: Int64?
+        if rangeAndTotal[1] == "*" {
+            total = nil
+        } else {
+            guard let parsedTotal = decimalInt64(rangeAndTotal[1]), parsedTotal > end else { return nil }
+            total = parsedTotal
+        }
+        return PlaybackStreamCacheContentRange(start: start, end: end, total: total)
+    }
+
+    private static func decimalInt64(_ value: Substring) -> Int64? {
+        guard !value.isEmpty, value.allSatisfy({ $0 >= "0" && $0 <= "9" }) else { return nil }
+        return Int64(value)
+    }
+}
+
+enum PlaybackStreamCacheRedirectPolicy {
+    static func redirectedRequest(
+        _ request: URLRequest,
+        response: HTTPURLResponse,
+        originalURL: URL?,
+        range: String?,
+        customHeaders: [String: String]
+    ) -> URLRequest {
+        var updated = request
+        if response.url != nil, sameOrigin(originalURL, request.url) {
+            for (name, value) in customHeaders {
+                updated.setValue(value, forHTTPHeaderField: name)
+            }
+        } else {
+            for name in customHeaders.keys {
+                updated.setValue(nil, forHTTPHeaderField: name)
+            }
+        }
+        if let range {
+            updated.setValue(range, forHTTPHeaderField: "Range")
+        }
+        return updated
+    }
+
+    private static func sameOrigin(_ source: URL?, _ destination: URL?) -> Bool {
+        guard let source, let destination,
+              let sourceScheme = source.scheme?.lowercased(),
+              let destinationScheme = destination.scheme?.lowercased(),
+              let sourceHost = source.host?.lowercased(),
+              let destinationHost = destination.host?.lowercased(),
+              sourceScheme == destinationScheme,
+              sourceHost == destinationHost,
+              let sourcePort = effectivePort(for: source, scheme: sourceScheme),
+              let destinationPort = effectivePort(for: destination, scheme: destinationScheme) else {
+            return false
+        }
+        return sourcePort == destinationPort
+    }
+
+    private static func effectivePort(for url: URL, scheme: String) -> Int? {
+        if let port = url.port { return port }
+        switch scheme {
+        case "http": return 80
+        case "https": return 443
+        default: return nil
+        }
+    }
+}
+
+private final class RangeProbeDelegate: NSObject, URLSessionDataDelegate, @unchecked Sendable {
+    private let originalURL: URL
+    private let customHeaders: [String: String]
+    private let lock = NSLock()
+    private var storedResolvedURL: URL?
+    private var response: HTTPURLResponse?
+    private var body = Data()
+    private var continuation: CheckedContinuation<(Data, HTTPURLResponse)?, Error>?
+    private var task: URLSessionDataTask?
+    private var finished = false
+
+    var resolvedURL: URL? {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedResolvedURL
+    }
+
+    init(originalURL: URL, customHeaders: [String: String]) {
+        self.originalURL = originalURL
+        self.customHeaders = customHeaders
+    }
+
+    func load(in session: URLSession, request: URLRequest) async throws -> (Data, HTTPURLResponse)? {
+        try await withCheckedThrowingContinuation { continuation in
+            let task = session.dataTask(with: request)
+            task.delegate = self
+            lock.lock()
+            self.continuation = continuation
+            self.task = task
+            lock.unlock()
+            task.resume()
+        }
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        let updated = PlaybackStreamCacheRedirectPolicy.redirectedRequest(
+            request,
+            response: response,
+            originalURL: originalURL,
+            range: "bytes=0-1",
+            customHeaders: customHeaders
+        )
+        lock.lock()
+        storedResolvedURL = updated.url
+        lock.unlock()
+        completionHandler(updated)
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        dataTask: URLSessionDataTask,
+        didReceive response: URLResponse,
+        completionHandler: @escaping (URLSession.ResponseDisposition) -> Void
+    ) {
+        guard let http = response as? HTTPURLResponse,
+              http.statusCode == 206,
+              let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+              let parsedRange = PlaybackStreamCacheContentRange.parse(contentRange),
+              parsedRange.start == 0,
+              parsedRange.end == 1,
+              let total = parsedRange.total,
+              total >= 2,
+              http.expectedContentLength < 0 || http.expectedContentLength == 2 else {
+            completionHandler(.cancel)
+            finish(returning: nil)
+            return
+        }
+
+        lock.lock()
+        self.response = http
+        storedResolvedURL = http.url
+        lock.unlock()
+        completionHandler(.allow)
+    }
+
+    func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        let exceedsExpectedBody = body.count + data.count > 2
+        if !exceedsExpectedBody { body.append(data) }
+        let task = self.task
+        lock.unlock()
+
+        if exceedsExpectedBody {
+            finish(returning: nil)
+            task?.cancel()
+        }
+    }
+
+    func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        if let error {
+            finish(throwing: error)
+            return
+        }
+        lock.lock()
+        let result: (Data, HTTPURLResponse)?
+        if body.count == 2, let response {
+            result = (body, response)
+        } else {
+            result = nil
+        }
+        lock.unlock()
+        finish(returning: result)
+    }
+
+    private func finish(returning result: (Data, HTTPURLResponse)?) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(returning: result)
+    }
+
+    private func finish(throwing error: Error) {
+        lock.lock()
+        guard !finished else {
+            lock.unlock()
+            return
+        }
+        finished = true
+        let continuation = self.continuation
+        self.continuation = nil
+        lock.unlock()
+        continuation?.resume(throwing: error)
+    }
+}
+
+/// A task delegate that preserves caller-supplied Range and headers across HTTP redirect hops
+/// and records the final resolved resource URL.
+private final class ProbeRedirectDelegate: NSObject, URLSessionTaskDelegate, @unchecked Sendable {
+    private(set) var resolvedURL: URL?
+    private let originalRange: String?
+    private let customHeaders: [String: String]
+
+    init(originalRange: String?, customHeaders: [String: String]) {
+        self.originalRange = originalRange
+        self.customHeaders = customHeaders
+    }
+
+    func urlSession(
+        _ session: URLSession,
+        task: URLSessionTask,
+        willPerformHTTPRedirection response: HTTPURLResponse,
+        newRequest request: URLRequest,
+        completionHandler: @escaping (URLRequest?) -> Void
+    ) {
+        if let target = request.url {
+            self.resolvedURL = target
+        }
+        let updated = PlaybackStreamCacheRedirectPolicy.redirectedRequest(
+            request,
+            response: response,
+            originalURL: task.originalRequest?.url,
+            range: originalRange,
+            customHeaders: customHeaders
+        )
+        completionHandler(updated)
+    }
 }
 
 /// Manages active HTTP stream disk cache servers for playback sessions.
@@ -30,20 +302,19 @@ actor PlaybackStreamCacheManager {
 
         let session = sessionConfiguration.map { URLSession(configuration: $0) } ?? URLSession.shared
 
+        // 1. Gather metadata with HEAD, but verify range support with a Range GET below.
+        let headDelegate = ProbeRedirectDelegate(originalRange: nil, customHeaders: headers)
         var req = URLRequest(url: url)
         req.httpMethod = "HEAD"
         for (k, v) in headers { req.setValue(v, forHTTPHeaderField: k) }
 
+        var headETag: String?
+        var headLastModified: String?
         do {
-            let (_, response) = try await session.data(for: req)
-            if let http = response as? HTTPURLResponse, http.statusCode == 200 {
-                let acceptRanges = http.value(forHTTPHeaderField: "Accept-Ranges")?.lowercased() == "bytes"
-                let length = http.expectedContentLength
-                let etag = http.value(forHTTPHeaderField: "ETag")?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let lastMod = http.value(forHTTPHeaderField: "Last-Modified")?.trimmingCharacters(in: .whitespacesAndNewlines)
-                if length > 0 && acceptRanges {
-                    return StreamProbeResult(supportsRange: true, contentLength: length, etag: etag, lastModified: lastMod)
-                }
+            let (_, response) = try await session.data(for: req, delegate: headDelegate)
+            if let http = response as? HTTPURLResponse, (http.statusCode == 200 || http.statusCode == 206) {
+                headETag = http.value(forHTTPHeaderField: "ETag")?.trimmingCharacters(in: .whitespacesAndNewlines)
+                headLastModified = http.value(forHTTPHeaderField: "Last-Modified")?.trimmingCharacters(in: .whitespacesAndNewlines)
             } else if let http = response as? HTTPURLResponse, http.statusCode == 401 || http.statusCode == 403 {
                 return StreamProbeResult(supportsRange: false, contentLength: 0, etag: nil, lastModified: nil)
             }
@@ -51,27 +322,27 @@ actor PlaybackStreamCacheManager {
             diskCacheLog.warning("HEAD probe failed for \(url.absoluteString): \(error.localizedDescription)")
         }
 
-        // Some providers reject HEAD while supporting byte ranges. Keep the
-        // legacy probe, but trust it only when the response is a complete 206
-        // for bytes 0-1 with a numeric total.
+        // 2. Some providers reject HEAD or require byte ranges. Send Range GET with redirect-aware delegate.
+        let rangeDelegate = RangeProbeDelegate(originalURL: url, customHeaders: headers)
         var rangeReq = URLRequest(url: url)
         rangeReq.httpMethod = "GET"
         for (k, v) in headers { rangeReq.setValue(v, forHTTPHeaderField: k) }
         rangeReq.setValue("bytes=0-1", forHTTPHeaderField: "Range")
         do {
-            let (data, response) = try await session.data(for: rangeReq)
-            if let http = response as? HTTPURLResponse, http.statusCode == 206,
-               data.count == 2,
-               let contentRange = http.value(forHTTPHeaderField: "Content-Range") {
-                let bounds = contentRange.split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "/" })
-                if bounds.count == 4, bounds[0].lowercased() == "bytes",
-                   bounds[1] == "0", bounds[2] == "1", let total = Int64(bounds[3]), total > 0 {
-                    return StreamProbeResult(
-                        supportsRange: true, contentLength: total,
-                        etag: http.value(forHTTPHeaderField: "ETag")?.trimmingCharacters(in: .whitespacesAndNewlines),
-                        lastModified: http.value(forHTTPHeaderField: "Last-Modified")?.trimmingCharacters(in: .whitespacesAndNewlines)
-                    )
-                }
+            if let (data, http) = try await rangeDelegate.load(in: session, request: rangeReq),
+               let contentRange = http.value(forHTTPHeaderField: "Content-Range"),
+               let parsedRange = PlaybackStreamCacheContentRange.parse(contentRange),
+               parsedRange.start == 0,
+               parsedRange.end == 1,
+               let total = parsedRange.total,
+               total >= 2,
+               data.count == 2 {
+                return StreamProbeResult(
+                    supportsRange: true, contentLength: total,
+                    etag: http.value(forHTTPHeaderField: "ETag")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? headETag,
+                    lastModified: http.value(forHTTPHeaderField: "Last-Modified")?.trimmingCharacters(in: .whitespacesAndNewlines) ?? headLastModified,
+                    resolvedURL: rangeDelegate.resolvedURL ?? http.url
+                )
             }
         } catch {
             diskCacheLog.warning("Range probe failed for \(url.absoluteString): \(error.localizedDescription)")
@@ -240,7 +511,7 @@ actor PlaybackStreamCacheManager {
             customHeaders: headers,
             sessionID: sessionID,
             maxDiskCacheSizeBytes: limitBytes,
-            targetLeadSeconds: targetLeadSeconds ?? 150.0,
+            targetLeadSeconds: targetLeadSeconds ?? 600.0,
             cacheRoot: root,
             manifest: manifest,
             sessionConfiguration: sessionConfiguration,
@@ -275,6 +546,13 @@ actor PlaybackStreamCacheManager {
             return await server.cachedFraction()
         }
         return 0
+    }
+
+    func activeStreamMetrics() async -> (cachedBytes: Int64, totalBytes: Int64)? {
+        guard let server = activeServer else { return nil }
+        let total = await server.fileLength
+        let cached = await server.currentCachedBytes
+        return (cachedBytes: cached, totalBytes: total)
     }
 
     func currentCachedRanges() async -> [Range<Int64>] {

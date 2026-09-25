@@ -84,12 +84,16 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
     private var dataTask: URLSessionDataTask?
     private var totalSize: Int64 = -1
     private var currentPosition: Int64 = 0
+    private var requestedOffset: Int64 = 0
+    private var requestedEnd: Int64 = 0
     private var buffer = Data()
     private var isEOF = false
     private var isCancelled = false
     private var isClosed = false
     private var isTaskSuspended = false
     private var taskError: Error?
+    private var consecutiveReadFailures = 0
+    private let rangeRequestBytes: Int64 = 16 * 1024 * 1024
 
     private let maxBufferSize = 32 * 1024 * 1024 // 32 MB buffer cap
     private let resumeBufferSize = 16 * 1024 * 1024 // 16 MB resume threshold
@@ -142,6 +146,7 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
         // Restart data task from the new target offset
         isEOF = false
         taskError = nil
+        consecutiveReadFailures = 0
         isTaskSuspended = false
         buffer.removeAll(keepingCapacity: true)
         currentPosition = offset
@@ -171,6 +176,7 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
                 }
                 buffer.removeSubrange(0..<toRead)
                 currentPosition += Int64(toRead)
+                consecutiveReadFailures = 0
 
                 if isTaskSuspended && buffer.count < resumeBufferSize {
                     isTaskSuspended = false
@@ -181,10 +187,25 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
             }
 
             if isEOF {
+                if totalSize >= 0 && currentPosition < totalSize {
+                    isEOF = false
+                    startRangeRequest(from: currentPosition)
+                    continue
+                }
                 return 0 // Clean EOF
             }
 
             if let error = taskError {
+                let nsError = error as NSError
+                if nsError.domain == NSURLErrorDomain,
+                   (nsError.code == NSURLErrorNetworkConnectionLost || nsError.code == NSURLErrorTimedOut),
+                   consecutiveReadFailures < 3,
+                   (totalSize < 0 || currentPosition < totalSize) {
+                    consecutiveReadFailures += 1
+                    taskError = nil
+                    startRangeRequest(from: currentPosition)
+                    continue
+                }
                 print("[MPVStreamBridge] Read failed with error: \(error.localizedDescription)")
                 return -1
             }
@@ -198,12 +219,8 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
             // Wait for incoming data or EOF from URLSession delegate
             condition.wait(until: Date().addingTimeInterval(30))
 
-            // Check if timeout occurred with no data
-            if buffer.isEmpty && !isEOF && taskError == nil && !isClosed && !isCancelled {
-                if dataTask?.state == .completed {
-                    return 0
-                }
-            }
+            // Completion is reported by didCompleteWithError. A completed
+            // URLSessionTask alone does not distinguish EOF from a read error.
         }
     }
 
@@ -251,7 +268,11 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
         if request.value(forHTTPHeaderField: "User-Agent") == nil {
             request.setValue("NuvioTV/MPVKit", forHTTPHeaderField: "User-Agent")
         }
-        request.setValue("bytes=\(offset)-", forHTTPHeaderField: "Range")
+        let rangeEnd = offset > Int64.max - rangeRequestBytes ? Int64.max : offset + rangeRequestBytes - 1
+        let end = min(totalSize > 0 ? totalSize - 1 : Int64.max, rangeEnd)
+        requestedOffset = offset
+        requestedEnd = end
+        request.setValue("bytes=\(offset)-\(end)", forHTTPHeaderField: "Range")
 
         let task = urlSession.dataTask(with: request)
         self.dataTask = task
@@ -267,6 +288,11 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
             condition.unlock()
         }
 
+        guard self.dataTask === dataTask else {
+            completionHandler(.cancel)
+            return
+        }
+
         if let httpResponse = response as? HTTPURLResponse {
             let status = httpResponse.statusCode
             if status >= 400 {
@@ -274,16 +300,31 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
                 completionHandler(.cancel)
                 return
             }
+            if requestedOffset > 0 && status != 206 {
+                taskError = NSError(domain: "HTTPError", code: status,
+                                    userInfo: [NSLocalizedDescriptionKey: "Server ignored the requested byte range"])
+                completionHandler(.cancel)
+                return
+            }
 
-            // Extract total size from Content-Range (e.g. "bytes 0-1000/50000") or Content-Length
-            if let contentRange = httpResponse.allHeaderFields["Content-Range"] as? String ?? httpResponse.allHeaderFields["content-range"] as? String,
-               let slashIndex = contentRange.lastIndex(of: "/") {
-                let totalStr = String(contentRange[contentRange.index(after: slashIndex)...]).trimmingCharacters(in: .whitespaces)
-                if let size = Int64(totalStr), size > 0 {
-                    self.totalSize = size
+            if status == 206 {
+                // A bounded response's Content-Length is only this range's size.
+                // Treating it as the file size would silently stop after 16 MiB.
+                let parts = httpResponse.value(forHTTPHeaderField: "Content-Range")?
+                    .split(whereSeparator: { $0 == " " || $0 == "-" || $0 == "/" })
+                guard let parts, parts.count == 4, parts[0].lowercased() == "bytes",
+                      let start = Int64(parts[1]), let end = Int64(parts[2]),
+                      let size = Int64(parts[3]), size > 0,
+                      start == requestedOffset, end >= start, end <= requestedEnd, end < size,
+                      totalSize < 0 || totalSize == size else {
+                    taskError = NSError(domain: "HTTPError", code: status,
+                                        userInfo: [NSLocalizedDescriptionKey: "Invalid Content-Range response"])
+                    completionHandler(.cancel)
+                    return
                 }
-            } else if httpResponse.expectedContentLength > 0 {
-                self.totalSize = httpResponse.expectedContentLength + currentPosition
+                totalSize = size
+            } else if status == 200 && httpResponse.expectedContentLength > 0 {
+                totalSize = httpResponse.expectedContentLength
             }
         }
 
@@ -292,6 +333,10 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask, didReceive data: Data) {
         condition.lock()
+        guard self.dataTask === dataTask else {
+            condition.unlock()
+            return
+        }
         buffer.append(data)
         if buffer.count >= maxBufferSize && !isTaskSuspended {
             isTaskSuspended = true
@@ -303,6 +348,10 @@ private final class MPVStreamSession: NSObject, URLSessionDataDelegate, @uncheck
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         condition.lock()
+        guard dataTask === task else {
+            condition.unlock()
+            return
+        }
         isTaskSuspended = false
         if let error = error as? NSError, error.code == NSURLErrorCancelled {
             // Explicitly cancelled during seek or close — do not treat as fatal error
