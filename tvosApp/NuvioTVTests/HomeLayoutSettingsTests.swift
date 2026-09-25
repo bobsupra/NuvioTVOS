@@ -454,6 +454,78 @@ final class HomeLayoutSettingsTests: XCTestCase {
         TVHomeCatalogOrder.clearOrder()
     }
 
+    func testWriteSnapshotKeepsFirstLiveRowWhenSectionIDsRepeat() {
+        let profileID = "snapshot-dedup-\(UUID().uuidString)"
+        ProfileSettings.setActiveProfile(profileID, isPrimary: false)
+        defer { TVHomeCatalogOrder.clearOrder() }
+
+        let previous = TVHomeCatalogOrder.SnapshotRow(
+            id: "duplicate",
+            title: "Previous row",
+            addonName: "Previous source",
+            addonId: "previous-source"
+        )
+        let retained = TVHomeCatalogOrder.SnapshotRow(id: "retained", title: "Retained row")
+        TVHomeCatalogOrder.writeSnapshotRows([previous, retained])
+
+        let firstLiveSection = TVHomeSection(
+            id: "duplicate",
+            title: "First live row",
+            items: [],
+            addonId: "current-source",
+            addonName: "Current source"
+        )
+        let duplicateLiveSection = TVHomeSection(
+            id: "duplicate",
+            title: "Second live row",
+            items: [],
+            addonId: "later-source",
+            addonName: "Later source"
+        )
+
+        TVHomeCatalogOrder.writeSnapshot([firstLiveSection, duplicateLiveSection])
+
+        let rows = TVHomeCatalogOrder.snapshotRows()
+        XCTAssertEqual(rows.map(\.id), ["duplicate", "retained"])
+        XCTAssertEqual(rows.first?.title, "First live row")
+        XCTAssertEqual(rows.first?.addonId, "current-source")
+    }
+
+    func testWriteSnapshotRowsKeepsFirstRowForDuplicateIDs() {
+        let profileID = "snapshot-write-dedup-\(UUID().uuidString)"
+        let settings = UserDefaults(suiteName: "HomeCatalogSnapshotTests-\(profileID)")!
+        settings.set(profileID, forKey: "nuvio.tv.profile.settings.profileID")
+
+        let first = TVHomeCatalogOrder.SnapshotRow(id: "duplicate", title: "First row")
+        let duplicate = TVHomeCatalogOrder.SnapshotRow(id: "duplicate", title: "Second row")
+        let next = TVHomeCatalogOrder.SnapshotRow(id: "next", title: "Next row")
+        TVHomeCatalogOrder.writeSnapshotRows([first, duplicate, next], in: settings)
+
+        let rows = TVHomeCatalogOrder.snapshotRows(in: settings)
+        XCTAssertEqual(rows.map(\.id), ["duplicate", "next"])
+        XCTAssertEqual(rows.first?.title, "First row")
+    }
+
+    func testSnapshotRowsKeepsFirstRowWhenReadingLegacyDuplicateIDs() {
+        let profileID = "snapshot-legacy-dedup-\(UUID().uuidString)"
+        let settings = UserDefaults(suiteName: "HomeCatalogSnapshotTests-\(profileID)")!
+        settings.set(profileID, forKey: "nuvio.tv.profile.settings.profileID")
+        let legacyJSON = #"""
+        [
+            {"id":"duplicate","title":"First legacy row"},
+            {"id":"duplicate","title":"Second legacy row"},
+            {"id":"next","title":"Next legacy row"}
+        ]
+        """#
+        settings.set(Data(legacyJSON.utf8), forKey: SettingsKey.homeCatalogTitles)
+
+        let rows = TVHomeCatalogOrder.snapshotRows(in: settings)
+
+        XCTAssertEqual(rows.map(\.id), ["duplicate", "next"])
+        XCTAssertEqual(rows.first?.title, "First legacy row")
+        XCTAssertEqual(TVHomeCatalogOrder.snapshotRows(in: settings), rows)
+    }
+
     func testManifestDrivenCatalogRegistrationReplacesSnapshotWithoutNetworkCall() {
         let manifestCatalog1 = TVHomeCatalogOrder.SnapshotRow(
             id: "addon_org.stremio.movieleaks_movie_movieleaks",
@@ -805,4 +877,3 @@ final class HomeLayoutSettingsTests: XCTestCase {
         ))
     }
 }
-

@@ -17,7 +17,7 @@ private enum NetflixSearchMetrics {
     /// touch the safe-area boundary.
     /// Match Classic Search's outer gutter so every Netflix Search surface —
     /// not only Discover — shares the same centered content column.
-    static let pageInset: CGFloat = 36
+    static let pageInset: CGFloat = 49
     static let posterWidth: CGFloat = 210
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 24

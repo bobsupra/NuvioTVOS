@@ -7,9 +7,9 @@ private enum LibraryGridMetrics {
     static let posterHeight: CGFloat = 315
     static let posterGap: CGFloat = 28
     /// Leading/trailing inset for the whole screen. With the grid's own 12pt
-    /// (which keeps a focused card's 1.06 scale from clipping) this is the 48pt
-    /// gutter Grid Home uses, so posters line up across the two screens.
-    static let pageInset: CGFloat = 36
+    /// (which keeps a focused card's 1.06 scale from clipping) this is the 61pt
+    /// gutter (141pt from screen edge with safe area) to center the 7-column grid symmetrically.
+    static let pageInset: CGFloat = 49
 }
 
 enum LibrarySourceMode: String, CaseIterable, Identifiable {

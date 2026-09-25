@@ -109,7 +109,7 @@ private enum NativeSearchGridMetrics {
     static let keyboardRenderWidth: CGFloat = 840
     static let columnSpacing: CGFloat = 32
     static let gridContentInset: CGFloat = 12
-    static let pageInset: CGFloat = 36
+    static let pageInset: CGFloat = 49
     static let topPadding: CGFloat = 68
     static let contentTopPadding: CGFloat = 210
 }

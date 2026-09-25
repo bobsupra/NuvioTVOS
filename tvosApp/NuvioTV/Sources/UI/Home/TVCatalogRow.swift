@@ -625,6 +625,8 @@ enum TVHomeGridLayout {
     static let sectionSpacing: CGFloat = 54
     static let heroPageLimit = 7
     static let seeAllID = "__see_all__"
+    /// Inset inside tvOS's 80pt safe area (80 + 61 = 141pt from screen edges) to center the 7-column grid symmetrically.
+    static let horizontalPadding: CGFloat = 61
 
     static var gridColumns: [GridItem] {
         Array(
@@ -728,13 +730,17 @@ struct TVHomeCatalogGridSection: View {
                     externalFocus: externalFocus,
                     externalFocusValue: seeAllKey,
                     retainFocusAppearance: restrictFocusToCardKey == seeAllKey,
+                    shouldRequestInitialFocus: seeAllKey == initialFocusCardKey,
+                    onInitialFocusRequested: seeAllKey == initialFocusCardKey
+                        ? onInitialFocusRequested
+                        : nil,
                     onFocus: onSeeAllFocus,
                     action: onSeeAll
                 )
                 .disabled(restrictFocusToCardKey != nil && restrictFocusToCardKey != seeAllKey)
             }
         }
-        .padding(.horizontal, TVLayout.rowLeading)
+        .padding(.horizontal, TVHomeGridLayout.horizontalPadding)
     }
 }
 
@@ -743,10 +749,13 @@ struct TVHomeSeeAllCard: View {
     var externalFocus: FocusState<String?>.Binding? = nil
     let externalFocusValue: String
     var retainFocusAppearance = false
+    var shouldRequestInitialFocus = false
+    var onInitialFocusRequested: (() -> Void)? = nil
     let onFocus: () -> Void
     let action: () -> Void
 
     @FocusState private var isFocused: Bool
+    @State private var didRequestInitialFocus = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.focusHighlighter) private var focusHighlighter = false
     @AppStorage(SettingsKey.cardCornerRadius) private var cardCornerRadiusSetting = AppCardStyle.defaultCornerRadiusRaw
@@ -796,6 +805,22 @@ struct TVHomeSeeAllCard: View {
         .focusEffectDisabledIfAvailable()
         .onChange(of: isFocused) { _, focused in
             if focused { onFocus() }
+        }
+        .onAppear {
+            guard shouldRequestInitialFocus, !didRequestInitialFocus else { return }
+            didRequestInitialFocus = true
+            onInitialFocusRequested?()
+            DispatchQueue.main.async { isFocused = true }
+        }
+        .onChange(of: shouldRequestInitialFocus) { _, shouldRequest in
+            if shouldRequest {
+                guard !didRequestInitialFocus else { return }
+                didRequestInitialFocus = true
+                onInitialFocusRequested?()
+                DispatchQueue.main.async { isFocused = true }
+            } else {
+                didRequestInitialFocus = false
+            }
         }
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
     }
@@ -1507,4 +1532,3 @@ extension TVCollectionFolderCard: Equatable {
         lhs.allowsFocus == rhs.allowsFocus
     }
 }
-
