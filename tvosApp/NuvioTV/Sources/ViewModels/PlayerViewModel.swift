@@ -2236,12 +2236,6 @@ class PlayerViewModel: ObservableObject {
         guard c === engine else { return }
         applyAudioPreferenceIfNeeded()
         applySubtitlePreferenceIfNeeded()
-        guard c === engine else { return }
-        if let selectedNativeTrack = subtitles.first(where: {
-            $0.isSelected && $0.isNativelyRenderedSubtitle
-        }) {
-            handoffForNativelyRenderedSubtitle(selectedNativeTrack, persist: false)
-        }
     }
 
     // MARK: - Transport
@@ -3330,11 +3324,6 @@ class PlayerViewModel: ObservableObject {
 
     func selectSubtitle(_ track: SubtitleTrack, persist: Bool = true) {
         pendingSelectedExternalSubtitleURL = nil
-        if track.isNativelyRenderedSubtitle,
-           handoffForNativelyRenderedSubtitle(track, persist: persist) {
-            subtitles = subtitles.map { var item = $0; item.isSelected = (item.id == track.id); return item }
-            return
-        }
         if track.id == "off" {
             engine.selectSubtitle(-1)
         } else if let id = Int(track.id) {
@@ -3347,37 +3336,6 @@ class PlayerViewModel: ObservableObject {
             didApplySubtitlePreference = true
             hasExplicitSubtitleSelection = true
         }
-    }
-
-    /// The system remote-HLS legible renderer does not expose Nuvio's timing or
-    /// appearance controls. Preserve the requested track metadata and move the
-    /// active session to the renderer that implements those controls.
-    @discardableResult
-    private func handoffForNativelyRenderedSubtitle(
-        _ track: SubtitleTrack,
-        persist: Bool
-    ) -> Bool {
-        guard activeEngineKind == .aether, track.isNativelyRenderedSubtitle else { return false }
-
-        let stagedSubtitle = Self.trackSelection(for: track)
-        var stagedSelection = pendingTrackSelection ?? PlayerTrackSelection()
-        stagedSelection.subtitle = stagedSubtitle
-        pendingTrackSelection = stagedSelection
-        didApplySavedSubtitleSelection = false
-        didApplySubtitlePreference = true
-        if persist {
-            saveSubtitleSelection(track)
-            hasExplicitSubtitleSelection = true
-        }
-
-        sessionCoordinator.handoffToMPV(
-            reason: "Native HLS subtitles require Nuvio's compatibility renderer",
-            resumeSeconds: nil
-        )
-        activeEngineKind = sessionCoordinator.activeBackend
-        hdrModeToast = "Compatibility player (subtitle controls)"
-        showPlayerToast("Compatibility player (subtitle controls)")
-        return true
     }
 
     /// Returns true if an external subtitle is currently active or pending selection.

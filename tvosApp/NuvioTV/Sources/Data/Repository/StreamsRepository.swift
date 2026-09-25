@@ -497,10 +497,18 @@ final class StreamsRepository: ObservableObject {
         return result
     }
 
+    private static let manifestSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 10
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
     private static func fetchManifest(_ url: URL) async -> StreamAddonManifest? {
         var request = URLRequest(url: url)
-        request.timeoutInterval = 10
-        guard let (data, response) = try? await URLSession.shared.data(for: request),
+        request.timeoutInterval = 8
+        guard let (data, response) = try? await manifestSession.data(for: request),
               let http = response as? HTTPURLResponse,
               200..<300 ~= http.statusCode,
               let manifest = try? JSONDecoder().decode(StreamAddonManifest.self, from: data) else {

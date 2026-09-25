@@ -268,9 +268,6 @@ struct CollectionFolderBrowseView: View {
                     }
                 }
                 .padding(.bottom, 70)
-                #if os(tvOS)
-                .background(TVScrollViewFocusConfigurator())
-                #endif
             }
             .focusSection()
             .defaultFocusIfAvailable($focusedItemID, firstFocusID)
@@ -481,9 +478,6 @@ struct CollectionFolderBrowseView: View {
                     }
                     .padding(.top, 8)
                     .padding(.bottom, 60)
-                    #if os(tvOS)
-                    .background(TVScrollViewFocusConfigurator())
-                    #endif
                 }
                 .focusSection()
                 .defaultFocusIfAvailable($focusedItemID, firstFocusID)

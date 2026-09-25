@@ -1528,6 +1528,7 @@ struct ContentView: View {
                     collectionTitle: collectionTitle,
                     repository: CinemetaCatalogRepository(),
                     onSelect: { meta in
+                        CinemetaCatalogRepository.cacheCatalogMetadata(meta)
                         withAnimation(.easeInOut(duration: 0.28)) {
                             openDetailsRoot(
                                 id: meta.id,

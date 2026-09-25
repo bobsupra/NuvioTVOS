@@ -309,9 +309,29 @@ struct TVCatalogRow: View {
     private var step: CGFloat { rowPosterWidth + rowSpacing }
 
     private var effectiveScrollIndex: Int {
+        if let restrictedFocusIndex {
+            return restrictedFocusIndex
+        }
         let raw = scrollIndex ?? initialScrollIndex
         guard !items.isEmpty else { return 0 }
         return min(max(raw, 0), items.count - 1)
+    }
+
+    private var restrictedFocusIndex: Int? {
+        guard let restrictFocusToCardKey,
+              restrictFocusToCardKey.hasPrefix("\(id)\u{1}")
+        else { return nil }
+        return items.firstIndex {
+            TVHomeCardIdentity.key(rowID: id, item: $0) == restrictFocusToCardKey
+        }
+    }
+
+    private func alignScrollIndexToRestrictedFocus() {
+        guard let restrictedFocusIndex else { return }
+        withTransaction(Transaction(animation: nil)) {
+            scrollIndex = restrictedFocusIndex
+            onScrollIndexChange(restrictedFocusIndex)
+        }
     }
 
     private func materializedCardIndices(visibleCardCount: Int) -> [Int] {
@@ -442,7 +462,12 @@ struct TVCatalogRow: View {
                         "focus.begin row=\(id) index=\(itemIndex) items=\(items.count) "
                             + "mounted=\(materializedCards.count) meta=\(focused.id)"
                     )
-                    if effectiveScrollIndex != itemIndex {
+                    if let restrictFocusToCardKey {
+                        guard restrictFocusToCardKey == cardKey else { return }
+                        // Keep the persisted row position current before Home
+                        // releases the restore lock in response to this focus.
+                        alignScrollIndexToRestrictedFocus()
+                    } else if effectiveScrollIndex != itemIndex {
                         let updateScrollPosition = {
                             scrollIndex = itemIndex
                             onScrollIndexChange(itemIndex)
@@ -536,8 +561,13 @@ struct TVCatalogRow: View {
         )
         .clipped()
         .offset(x: -horizontalEdgeInset)
-        .animation(rowCardFocusAnimations ? TVHomeLayout.scrollAnimation : nil, value: landscapeFocusedId)
+        .animation(
+            rowCardFocusAnimations && restrictFocusToCardKey == nil
+                ? TVHomeLayout.scrollAnimation : nil,
+            value: landscapeFocusedId
+        )
         .onAppear {
+            alignScrollIndexToRestrictedFocus()
             #if DEBUG
             if TVHomeDebugTrace.enabled {
                 TVHomeDebugTrace.log(
@@ -545,6 +575,9 @@ struct TVCatalogRow: View {
                 )
             }
             #endif
+        }
+        .onChange(of: restrictedFocusIndex) { _, _ in
+            alignScrollIndexToRestrictedFocus()
         }
         .frame(height: stripHeight)
     }

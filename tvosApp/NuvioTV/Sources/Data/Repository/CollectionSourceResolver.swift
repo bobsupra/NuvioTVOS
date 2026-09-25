@@ -41,13 +41,14 @@ struct CollectionSourceResolver {
     var settings: UserDefaults = ProfileSettings.current
 
     func browse(_ source: NuvioCollectionSource, cursor: Int = 0) async throws -> CatalogPage {
+        let page: CatalogPage
         switch source.normalizedProvider {
         case "addon":
             guard let type = nonEmpty(source.type),
                   let catalogId = nonEmpty(source.catalogId) else {
                 throw CollectionSourceError.invalidAddonSource
             }
-            return try await repository.browseCatalog(
+            page = try await repository.browseCatalog(
                 addonId: nonEmpty(source.addonId),
                 contentType: type,
                 catalogId: catalogId,
@@ -55,12 +56,16 @@ struct CollectionSourceResolver {
                 genre: nonEmpty(source.genre)
             )
         case "tmdb":
-            return try await browseTmdb(source, page: max(cursor, 1))
+            page = try await browseTmdb(source, page: max(cursor, 1))
         case "trakt":
-            return try await browseTrakt(source, page: max(cursor, 1))
+            page = try await browseTrakt(source, page: max(cursor, 1))
         default:
             throw CollectionSourceError.unsupportedProvider(source.provider)
         }
+        for item in page.items {
+            repository.cacheCatalogMetadata(item)
+        }
+        return page
     }
 
     static func label(for source: NuvioCollectionSource) -> String {

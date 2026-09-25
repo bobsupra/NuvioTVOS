@@ -2389,6 +2389,9 @@ struct TvDetailsContent: View {
     /// marking an episode watched cleared the stores but nothing re-read them.
     @State private var progressRevision = 0
     @State private var scrollOffset: CGFloat = 0
+    @State private var hasAppearedBefore = false
+    @State private var reentryProgressRefreshPending = false
+    @StateObject private var episodeCache = TvDetailsEpisodeCache()
 
     private var isScrolledDown: Bool {
         focusedDetailsSection != .actions || episodeFocus != nil || castHeaderFocus != nil || scrollOffset > 30
@@ -2400,9 +2403,22 @@ struct TvDetailsContent: View {
 
     var body: some View {
         if let meta = uiState.meta {
-            let episodes = sortedEpisodes(meta)
-            let continueItem = currentContinueWatchingItem(for: meta, revision: progressRevision)
-            let playTarget = playTarget(for: meta, episodes: episodes, continueItem: continueItem)
+            let episodePresentation = episodeCache.resolve(
+                meta: meta,
+                progressRevision: progressRevision,
+                continueItemProvider: { currentContinueWatchingItem(for: meta) },
+                playTargetBuilder: { episodes, continueItem, watchedKeys in
+                    makePlayTarget(
+                        episodes: episodes,
+                        continueItem: continueItem,
+                        watchedKeys: watchedKeys
+                    )
+                }
+            )
+            let episodeGuide = episodePresentation.guide
+            let episodes = episodeGuide.episodes
+            let continueItem = episodePresentation.continueItem
+            let playTarget = episodePresentation.playTarget
 
             GeometryReader { proxy in
                 ZStack(alignment: .topLeading) {
@@ -2490,7 +2506,9 @@ struct TvDetailsContent: View {
                             if !episodes.isEmpty {
                                 TvDetailsEpisodes(
                                     meta: meta,
-                                    episodes: episodes,
+                                    episodeGuide: episodeGuide,
+                                    initialState: episodePresentation.initialState,
+                                    presentationRevision: episodePresentation.revision,
                                     seriesRating: meta.rating,
                                     continueItem: continueItem,
                                     onFocus: {
@@ -2663,6 +2681,11 @@ struct TvDetailsContent: View {
             // button. Move it onto Play explicitly once the content appears
             // (async so it runs after the focus engine's own first pass).
             .onAppear {
+                if hasAppearedBefore {
+                    refreshProgressAfterReturn()
+                } else {
+                    hasAppearedBefore = true
+                }
                 focusedDetailsSection = .actions
                 DispatchQueue.main.async { actionFocus = .play }
             }
@@ -2676,8 +2699,11 @@ struct TvDetailsContent: View {
                 if !enabled {
                     restoreGeneration &+= 1
                     restoreEpisodeKey = episodeFocus
-                } else if let target = restoreEpisodeKey {
-                    restoreEpisodeFocus(to: target, generation: restoreGeneration)
+                } else {
+                    refreshProgressAfterReturn()
+                    if let target = restoreEpisodeKey {
+                        restoreEpisodeFocus(to: target, generation: restoreGeneration)
+                    }
                 }
             }
             .onChange(of: episodeFocus) { _, newValue in
@@ -2807,12 +2833,6 @@ struct TvDetailsContent: View {
         hasEpisodes ? min(proxy.size.width - 96, 2200) : min(proxy.size.width * 0.64, 1180)
     }
 
-    private func sortedEpisodes(_ meta: NuvioMeta) -> [NuvioVideo] {
-        (meta.videos ?? []).sorted {
-            (seasonSortKey($0.season), $0.episode) < (seasonSortKey($1.season), $1.episode)
-        }
-    }
-
     private func firstPlayableEpisode(_ episodes: [NuvioVideo]) -> NuvioVideo? {
         // Prefer a real season over season 0 specials.
         episodes.first(where: { $0.season > 0 }) ?? episodes.first
@@ -2821,13 +2841,19 @@ struct TvDetailsContent: View {
     /// Primary-button target: resume the in-progress episode, advance to the
     /// next one after a finished episode, or start from the first playable one.
     /// Movies have no episode; the label alone flips between Play and Resume.
-    private func playTarget(
-        for meta: NuvioMeta,
+    private func makePlayTarget(
         episodes: [NuvioVideo],
-        continueItem: ContinueWatchingItem?
-    ) -> (episode: NuvioVideo?, label: String, isPlayable: Bool) {
+        continueItem: ContinueWatchingItem?,
+        watchedKeys: Set<String>
+    ) -> TvDetailsPlayTarget {
         guard !episodes.isEmpty else {
-            return (nil, continueItem == nil ? L10n.string("action_play", fallback: "Play") : L10n.string("action_resume", fallback: "Resume"), true)
+            return TvDetailsPlayTarget(
+                episode: nil,
+                label: continueItem == nil
+                    ? L10n.string("action_play", fallback: "Play")
+                    : L10n.string("action_resume", fallback: "Resume"),
+                isPlayable: true
+            )
         }
 
         if let continueItem,
@@ -2835,15 +2861,19 @@ struct TvDetailsContent: View {
            let target = episodes.first(where: { $0.season == numbers.season && $0.episode == numbers.episode }) {
             if continueItem.isUpNextEntry, !continueItem.hasAired {
                 let label = continueItem.airDateText.map { L10n.format("details_airs_date", fallback: "Airs %@", $0) } ?? L10n.string("details_upcoming", fallback: "Upcoming")
-                return (target, label, false)
+                return TvDetailsPlayTarget(episode: target, label: label, isPlayable: false)
             }
             let verb = continueItem.isUpNextEntry ? L10n.string("details_next", fallback: "Next") : L10n.string("action_resume", fallback: "Resume")
-            return (target, "\(verb) S\(target.season) E\(target.episode)", true)
+            return TvDetailsPlayTarget(
+                episode: target,
+                label: "\(verb) S\(target.season) E\(target.episode)",
+                isPlayable: true
+            )
         }
 
         // No progress entry (e.g. the episode just finished): continue with the
         // episode after the furthest completed/watched episode, ignoring earlier skipped episodes.
-        let watched = WatchedStore.watchedEpisodeKeys(meta: meta)
+        let watched = watchedKeys
         if !watched.isEmpty {
             let watchedPairs: [(season: Int, episode: Int)] = watched.compactMap { key in
                 let parts = key.split(separator: ":").compactMap { Int($0) }
@@ -2857,23 +2887,32 @@ struct TvDetailsContent: View {
                        && !watched.contains("\($0.season):\($0.episode)")
                }) {
                 let verb = EpisodeReleasePolicy.hasAired(next.released) ? L10n.string("details_next", fallback: "Next") : L10n.string("details_upcoming", fallback: "Upcoming")
-                return (next, "\(verb) S\(next.season) E\(next.episode)", EpisodeReleasePolicy.hasAired(next.released))
+                return TvDetailsPlayTarget(
+                    episode: next,
+                    label: "\(verb) S\(next.season) E\(next.episode)",
+                    isPlayable: EpisodeReleasePolicy.hasAired(next.released)
+                )
             }
             if let firstUnwatched = episodes.first(where: { $0.season > 0 && !watched.contains("\($0.season):\($0.episode)") }) {
-                return (firstUnwatched, "\(L10n.string("details_next", fallback: "Next")) S\(firstUnwatched.season) E\(firstUnwatched.episode)", true)
+                return TvDetailsPlayTarget(
+                    episode: firstUnwatched,
+                    label: "\(L10n.string("details_next", fallback: "Next")) S\(firstUnwatched.season) E\(firstUnwatched.episode)",
+                    isPlayable: true
+                )
             }
         }
 
         let first = firstPlayableEpisode(episodes)
-        return (first, first.map { "\(L10n.string("action_play", fallback: "Play")) S\($0.season) E\($0.episode)" } ?? L10n.string("action_play", fallback: "Play"), true)
+        return TvDetailsPlayTarget(
+            episode: first,
+            label: first.map { "\(L10n.string("action_play", fallback: "Play")) S\($0.season) E\($0.episode)" }
+                ?? L10n.string("action_play", fallback: "Play"),
+            isPlayable: true
+        )
     }
 
-    /// `revision` is deliberately unused: taking it forces the lookup to be
-    /// re-run whenever ``progressRevision`` changes, which is what re-reads the
-    /// stores after a watched mark clears an episode's progress.
     private func currentContinueWatchingItem(
-        for meta: NuvioMeta,
-        revision: Int
+        for meta: NuvioMeta
     ) -> ContinueWatchingItem? {
         if RemoteTrackingState.isProgressSourceAuthenticated {
             return TraktProgressService.currentContinueWatchingItem(for: meta)
@@ -2881,9 +2920,15 @@ struct TvDetailsContent: View {
         return ContinueWatchingStore.item(for: meta.id)
     }
 
-    private func seasonSortKey(_ season: Int) -> Int {
-        season <= 0 ? Int.max : season
+    private func refreshProgressAfterReturn() {
+        guard !reentryProgressRefreshPending else { return }
+        reentryProgressRefreshPending = true
+        progressRevision &+= 1
+        DispatchQueue.main.async {
+            reentryProgressRefreshPending = false
+        }
     }
+
 }
 
 private enum TvDetailsScrollTiming {
@@ -4189,9 +4234,199 @@ private struct TvDetailsPersonCard: View {
 
 // MARK: - Series episodes
 
+private struct TvEpisodeGuideInput: Equatable {
+    let metaID: String
+    let videos: [NuvioVideo]
+}
+
+private struct TvEpisodeLookupIdentity: Equatable {
+    let metaID: String
+    let imdbId: String?
+    let tmdbId: Int?
+    let canonicalType: String
+}
+
+/// Sorted once when the metadata episode list changes. Focus-driven Details
+/// updates reuse both the ordered guide and its per-season slices.
+private struct TvEpisodeGuide {
+    let metaID: String
+    let revision: Int
+    let episodes: [NuvioVideo]
+    let seasons: [Int]
+    let episodesBySeason: [Int: [NuvioVideo]]
+
+    init(metaID: String, videos: [NuvioVideo], revision: Int) {
+        self.metaID = metaID
+        self.revision = revision
+
+        let ordered = videos.sorted {
+            (Self.seasonSortKey($0.season), $0.episode)
+                < (Self.seasonSortKey($1.season), $1.episode)
+        }
+        var grouped: [Int: [NuvioVideo]] = [:]
+        for episode in ordered {
+            grouped[episode.season, default: []].append(episode)
+        }
+
+        episodes = ordered
+        episodesBySeason = grouped
+        seasons = grouped.keys.sorted {
+            (Self.seasonSortKey($0), $0) < (Self.seasonSortKey($1), $1)
+        }
+    }
+
+    private static func seasonSortKey(_ season: Int) -> Int {
+        season <= 0 ? Int.max : season
+    }
+
+    func defaultSeason() -> Int {
+        seasons.first(where: { $0 > 0 }) ?? seasons.first ?? 1
+    }
+
+    func initialEpisode(
+        continueItem: ContinueWatchingItem?,
+        watchedKeys: Set<String>
+    ) -> NuvioVideo? {
+        if let numbers = continueItem?.episodeNumbers,
+           let progressEpisode = episodes.first(where: {
+               $0.season == numbers.season && $0.episode == numbers.episode
+           }) {
+            return progressEpisode
+        }
+
+        guard let latestWatchedIndex = episodes.lastIndex(where: {
+            watchedKeys.contains("\($0.season):\($0.episode)")
+        }) else {
+            return nil
+        }
+
+        if latestWatchedIndex + 1 < episodes.count,
+           let nextEpisode = episodes[(latestWatchedIndex + 1)...].first(where: {
+               !watchedKeys.contains("\($0.season):\($0.episode)")
+           }) {
+            return nextEpisode
+        }
+        return episodes[latestWatchedIndex]
+    }
+}
+
+private struct TvDetailsPlayTarget {
+    let episode: NuvioVideo?
+    let label: String
+    let isPlayable: Bool
+}
+
+private struct TvDetailsEpisodeInitialState {
+    let selectedSeason: Int
+    let seasonEpisodes: [NuvioVideo]
+    let seasonEpisodeIndexByID: [String: Int]
+    let episodeScrollIndex: Int
+    let watchedEpisodeKeys: Set<String>
+    let watchedSummary: WatchedEpisodeSummary?
+    let seasonIsWatched: Bool
+}
+
+private struct TvDetailsEpisodePresentation {
+    let guide: TvEpisodeGuide
+    let continueItem: ContinueWatchingItem?
+    let playTarget: TvDetailsPlayTarget
+    let initialState: TvDetailsEpisodeInitialState
+    let revision: TvDetailsEpisodePresentationRevision
+}
+
+private struct TvDetailsEpisodePresentationRevision: Equatable {
+    let watched: Int
+    let selection: Int
+}
+
+/// Builds episode-derived state synchronously on the first Details render and
+/// refreshes it only when episode metadata or watched/progress state changes.
+private final class TvDetailsEpisodeCache: ObservableObject {
+    private var input: TvEpisodeGuideInput?
+    private var lookupIdentity: TvEpisodeLookupIdentity?
+    private var progressRevision: Int?
+    private var presentation: TvDetailsEpisodePresentation?
+
+    func resolve(
+        meta: NuvioMeta,
+        progressRevision: Int,
+        continueItemProvider: () -> ContinueWatchingItem?,
+        playTargetBuilder: ([NuvioVideo], ContinueWatchingItem?, Set<String>) -> TvDetailsPlayTarget
+    ) -> TvDetailsEpisodePresentation {
+        let input = TvEpisodeGuideInput(metaID: meta.id, videos: meta.videos ?? [])
+        let lookupIdentity = TvEpisodeLookupIdentity(
+            metaID: meta.id,
+            imdbId: meta.imdbId,
+            tmdbId: meta.tmdbId,
+            canonicalType: meta.canonicalType
+        )
+        let guideChanged = self.input != input
+        let lookupIdentityChanged = self.lookupIdentity != lookupIdentity
+        let progressChanged = self.progressRevision != progressRevision
+
+        if guideChanged || lookupIdentityChanged || progressChanged {
+            let guideRevision = guideChanged
+                ? (presentation.map { $0.guide.revision &+ 1 } ?? 0)
+                : presentation!.guide.revision
+            let guide = guideChanged
+                ? TvEpisodeGuide(metaID: input.metaID, videos: input.videos, revision: guideRevision)
+                : presentation!.guide
+            let continueItem = continueItemProvider()
+            let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+            let initialEpisode = guide.initialEpisode(
+                continueItem: continueItem,
+                watchedKeys: watchedKeys
+            )
+            let selectedSeason = initialEpisode?.season ?? guide.defaultSeason()
+            let seasonEpisodes = guide.episodesBySeason[selectedSeason] ?? []
+            let episodeScrollIndex = initialEpisode.flatMap { target in
+                seasonEpisodes.firstIndex(where: { $0.id == target.id })
+            } ?? 0
+            let seasonEpisodeIndexByID = seasonEpisodes.enumerated().reduce(into: [:]) { indices, entry in
+                indices[entry.element.id] = entry.offset
+            }
+            let seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
+                watchedKeys.contains("\($0.season):\($0.episode)")
+            }
+            let initialState = TvDetailsEpisodeInitialState(
+                selectedSeason: selectedSeason,
+                seasonEpisodes: seasonEpisodes,
+                seasonEpisodeIndexByID: seasonEpisodeIndexByID,
+                episodeScrollIndex: episodeScrollIndex,
+                watchedEpisodeKeys: watchedKeys,
+                watchedSummary: WatchedEpisodeSummary.make(
+                    videos: guide.episodes,
+                    watchedEpisodeKeys: watchedKeys
+                ),
+                seasonIsWatched: seasonIsWatched
+            )
+            let nextRevision = TvDetailsEpisodePresentationRevision(
+                watched: (presentation?.revision.watched ?? -1) &+ 1,
+                selection: guideChanged || lookupIdentityChanged
+                    ? (presentation?.revision.selection ?? -1) &+ 1
+                    : (presentation?.revision.selection ?? 0)
+            )
+            presentation = TvDetailsEpisodePresentation(
+                guide: guide,
+                continueItem: continueItem,
+                playTarget: playTargetBuilder(guide.episodes, continueItem, watchedKeys),
+                initialState: initialState,
+                revision: nextRevision
+            )
+            self.input = input
+            self.lookupIdentity = lookupIdentity
+            self.progressRevision = progressRevision
+        }
+
+        return presentation!
+    }
+}
+
 private struct TvDetailsEpisodes: View {
     let meta: NuvioMeta
-    let episodes: [NuvioVideo]
+    let episodeGuide: TvEpisodeGuide
+    let initialState: TvDetailsEpisodeInitialState
+    let presentationRevision: TvDetailsEpisodePresentationRevision
     let seriesRating: Double?
     let continueItem: ContinueWatchingItem?
     let onFocus: () -> Void
@@ -4208,15 +4443,20 @@ private struct TvDetailsEpisodes: View {
 
     @State private var selectedSeason: Int
     @State private var seasonEpisodes: [NuvioVideo]
+    @State private var seasonEpisodeIndexByID: [String: Int]
     @State private var episodeScrollIndex: Int
     @State private var watchedEpisodeKeys: Set<String>
+    @State private var watchedSummary: WatchedEpisodeSummary?
+    @State private var seasonIsWatched: Bool
     @State private var userDidSelectSeason = false
     @AppStorage(SettingsKey.smoothFocus) private var smoothFocus = true
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
 
     init(
         meta: NuvioMeta,
-        episodes: [NuvioVideo],
+        episodeGuide: TvEpisodeGuide,
+        initialState: TvDetailsEpisodeInitialState,
+        presentationRevision: TvDetailsEpisodePresentationRevision,
         seriesRating: Double?,
         continueItem: ContinueWatchingItem?,
         onFocus: @escaping () -> Void,
@@ -4230,7 +4470,9 @@ private struct TvDetailsEpisodes: View {
         onMoveDownFromEpisode: @escaping () -> Void
     ) {
         self.meta = meta
-        self.episodes = episodes
+        self.episodeGuide = episodeGuide
+        self.initialState = initialState
+        self.presentationRevision = presentationRevision
         self.seriesRating = seriesRating
         self.continueItem = continueItem
         self.onFocus = onFocus
@@ -4242,23 +4484,13 @@ private struct TvDetailsEpisodes: View {
         self.entryLocked = entryLocked
         self.onMoveUpFromSeason = onMoveUpFromSeason
         self.onMoveDownFromEpisode = onMoveDownFromEpisode
-        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
-        let initialEpisode = Self.initialEpisode(
-            episodes: episodes,
-            continueItem: continueItem,
-            watchedKeys: watchedKeys
-        )
-        let initialSeason = initialEpisode?.season ?? Self.defaultSeason(episodes)
-        let initialSeasonEpisodes = episodes
-            .filter { $0.season == initialSeason }
-            .sorted { $0.episode < $1.episode }
-        let initialIndex = initialEpisode.flatMap { target in
-            initialSeasonEpisodes.firstIndex(where: { $0.id == target.id })
-        } ?? 0
-        _selectedSeason = State(initialValue: initialSeason)
-        _seasonEpisodes = State(initialValue: initialSeasonEpisodes)
-        _episodeScrollIndex = State(initialValue: initialIndex)
-        _watchedEpisodeKeys = State(initialValue: watchedKeys)
+        _selectedSeason = State(initialValue: initialState.selectedSeason)
+        _seasonEpisodes = State(initialValue: initialState.seasonEpisodes)
+        _seasonEpisodeIndexByID = State(initialValue: initialState.seasonEpisodeIndexByID)
+        _episodeScrollIndex = State(initialValue: initialState.episodeScrollIndex)
+        _watchedEpisodeKeys = State(initialValue: initialState.watchedEpisodeKeys)
+        _watchedSummary = State(initialValue: initialState.watchedSummary)
+        _seasonIsWatched = State(initialValue: initialState.seasonIsWatched)
     }
 
     var body: some View {
@@ -4268,53 +4500,77 @@ private struct TvDetailsEpisodes: View {
             episodeCardStrip
         }
         .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+            refreshWatchedState()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
-            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+            refreshWatchedState()
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
-            watchedEpisodeKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+            refreshWatchedState()
         }
-        .onChange(of: episodes) { _, newEpisodes in
-            let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
-            let targetEpisode = Self.initialEpisode(
-                episodes: newEpisodes,
-                continueItem: continueItem,
-                watchedKeys: watchedKeys
-            )
-            let targetSeason = targetEpisode?.season ?? Self.defaultSeason(newEpisodes)
-            let currentSeasons = Array(Set(newEpisodes.map(\.season))).sorted {
-                (seasonSortKey($0), $0) < (seasonSortKey($1), $1)
-            }
-            if !userDidSelectSeason || !currentSeasons.contains(selectedSeason) {
-                selectedSeason = targetSeason
-                let seasonEps = newEpisodes
-                    .filter { $0.season == targetSeason }
-                    .sorted { $0.episode < $1.episode }
-                seasonEpisodes = seasonEps
-                episodeScrollIndex = targetEpisode.flatMap { target in
-                    seasonEps.firstIndex(where: { $0.id == target.id })
-                } ?? 0
+        .onChange(of: presentationRevision) { oldRevision, newRevision in
+            if oldRevision.selection != newRevision.selection {
+                refreshEpisodeGuideState()
             } else {
-                seasonEpisodes = newEpisodes
-                    .filter { $0.season == selectedSeason }
-                    .sorted { $0.episode < $1.episode }
+                refreshWatchedState(using: initialState.watchedEpisodeKeys)
             }
         }
         .onChange(of: selectedSeason) { _, newSeason in
-            seasonEpisodes = episodes
-                .filter { $0.season == newSeason }
-                .sorted { $0.episode < $1.episode }
+            setSeasonEpisodes(episodeGuide.episodesBySeason[newSeason] ?? [])
+        }
+    }
+
+    private func refreshEpisodeGuideState() {
+        let watchedKeys = initialState.watchedEpisodeKeys
+        watchedEpisodeKeys = watchedKeys
+        watchedSummary = initialState.watchedSummary
+        if !userDidSelectSeason || !episodeGuide.seasons.contains(selectedSeason) {
+            selectedSeason = initialState.selectedSeason
+            setSeasonEpisodes(initialState.seasonEpisodes, watchedKeys: watchedKeys)
+            episodeScrollIndex = initialState.episodeScrollIndex
+        } else {
+            setSeasonEpisodes(
+                episodeGuide.episodesBySeason[selectedSeason] ?? [],
+                watchedKeys: watchedKeys
+            )
+        }
+    }
+
+    private func refreshWatchedState() {
+        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+        refreshWatchedState(using: watchedKeys)
+    }
+
+    private func refreshWatchedState(using watchedKeys: Set<String>) {
+        watchedEpisodeKeys = watchedKeys
+        watchedSummary = WatchedEpisodeSummary.make(
+            videos: episodeGuide.episodes,
+            watchedEpisodeKeys: watchedKeys
+        )
+        refreshSeasonWatchedState(for: seasonEpisodes, watchedKeys: watchedKeys)
+    }
+
+    private func setSeasonEpisodes(_ newEpisodes: [NuvioVideo], watchedKeys: Set<String>? = nil) {
+        seasonEpisodes = newEpisodes
+        seasonEpisodeIndexByID = Self.episodeIndexByID(newEpisodes)
+        refreshSeasonWatchedState(for: newEpisodes, watchedKeys: watchedKeys ?? watchedEpisodeKeys)
+    }
+
+    private static func episodeIndexByID(_ episodes: [NuvioVideo]) -> [String: Int] {
+        episodes.enumerated().reduce(into: [:]) { indices, entry in
+            indices[entry.element.id] = entry.offset
+        }
+    }
+
+    private func refreshSeasonWatchedState(for seasonEpisodes: [NuvioVideo], watchedKeys: Set<String>) {
+        seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
+            watchedKeys.contains("\($0.season):\($0.episode)")
         }
     }
 
     @ViewBuilder
     private var watchedProgressSummary: some View {
-        if let summary = WatchedEpisodeSummary.make(
-            videos: episodes,
-            watchedEpisodeKeys: watchedEpisodeKeys
-        ) {
+        if let summary = watchedSummary {
             HStack(spacing: 18) {
                 Label {
                     Text(
@@ -4362,7 +4618,7 @@ private struct TvDetailsEpisodes: View {
             let prefix = "episode-card\u{1}"
             if restriction.hasPrefix(prefix) {
                 let targetID = String(restriction.dropFirst(prefix.count))
-                if let targetIndex = seasonEpisodes.firstIndex(where: { $0.id == targetID }) {
+                if let targetIndex = seasonEpisodeIndexByID[targetID] {
                     lowerBound = min(lowerBound, targetIndex)
                     upperBound = max(upperBound, targetIndex)
                 }
@@ -4382,7 +4638,7 @@ private struct TvDetailsEpisodes: View {
 
             HStack(alignment: .bottom, spacing: TvEpisodeCardLayout.spacing) {
                 ForEach(materializedEpisodes) { video in
-                    let itemIndex = seasonEpisodes.firstIndex(where: { $0.id == video.id }) ?? 0
+                    let itemIndex = seasonEpisodeIndexByID[video.id] ?? 0
                     TvEpisodeCard(
                         video: video,
                         fallbackRating: seriesRating,
@@ -4470,9 +4726,7 @@ private struct TvDetailsEpisodes: View {
     }
 
     private var seasons: [Int] {
-        Array(Set(episodes.map(\.season))).sorted {
-            (seasonSortKey($0), $0) < (seasonSortKey($1), $1)
-        }
+        episodeGuide.seasons
     }
 
     private var effectiveFocusRestriction: String? {
@@ -4485,63 +4739,11 @@ private struct TvDetailsEpisodes: View {
     /// A season counts as watched only when every episode in it is, which is
     /// what makes the menu item a genuine toggle rather than a re-mark.
     private var isSeasonWatched: Bool {
-        !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
-            watchedEpisodeKeys.contains("\(selectedSeason):\($0.episode)")
-        }
-    }
-
-    private static func defaultSeason(_ episodes: [NuvioVideo]) -> Int {
-        let seasons = Array(Set(episodes.map(\.season))).sorted {
-            (seasonSortKey($0), $0) < (seasonSortKey($1), $1)
-        }
-        return seasons.first(where: { $0 > 0 }) ?? seasons.first ?? 1
-    }
-
-    /// Open a series where viewing actually left off. Continue Watching / Up
-    /// Next is authoritative; if it is unavailable, advance one episode beyond
-    /// the latest watched entry (or keep the last entry when the series is done).
-    private static func initialEpisode(
-        episodes: [NuvioVideo],
-        continueItem: ContinueWatchingItem?,
-        watchedKeys: Set<String>
-    ) -> NuvioVideo? {
-        let ordered = episodes.sorted {
-            (seasonSortKey($0.season), $0.episode)
-                < (seasonSortKey($1.season), $1.episode)
-        }
-
-        if let numbers = continueItem?.episodeNumbers,
-           let progressEpisode = ordered.first(where: {
-               $0.season == numbers.season && $0.episode == numbers.episode
-           }) {
-            return progressEpisode
-        }
-
-        guard let latestWatchedIndex = ordered.lastIndex(where: {
-            watchedKeys.contains("\($0.season):\($0.episode)")
-        }) else {
-            return nil
-        }
-
-        if latestWatchedIndex + 1 < ordered.count,
-           let nextEpisode = ordered[(latestWatchedIndex + 1)...].first(where: {
-               !watchedKeys.contains("\($0.season):\($0.episode)")
-           }) {
-            return nextEpisode
-        }
-        return ordered[latestWatchedIndex]
+        seasonIsWatched
     }
 
     private func seasonTitle(_ season: Int) -> String {
         season <= 0 ? "Specials" : "Season \(season)"
-    }
-
-    private static func seasonSortKey(_ season: Int) -> Int {
-        season <= 0 ? Int.max : season
-    }
-
-    private func seasonSortKey(_ season: Int) -> Int {
-        Self.seasonSortKey(season)
     }
 
     private func continueProgress(for video: NuvioVideo) -> Double? {

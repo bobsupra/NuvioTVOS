@@ -104,9 +104,13 @@ protocol CatalogRepository {
     /// Resolve a synced collection folder's add-on catalog sources into items.
     /// Unresolvable sources (unknown add-on ids, TMDB/Trakt) are skipped.
     func getCollectionFolderItems(sources: [NuvioCollectionCatalogSource], limit: Int) async -> [NuvioMeta]
+
+    /// Cache lightweight catalog metadata in memory so details can render immediately.
+    func cacheCatalogMetadata(_ meta: NuvioMeta)
 }
 
 extension CatalogRepository {
+    func cacheCatalogMetadata(_ meta: NuvioMeta) {}
     var homeCatalogLoadWasPartial: Bool { false }
 
     var homeCatalogFailureSignature: String? { nil }
@@ -197,6 +201,13 @@ extension CatalogRepository {
 actor StremioManifestDataCache {
     static let shared = StremioManifestDataCache()
     private static let tracker = SimpleCountTracker()
+    private static let manifestSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 10
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
 
     static func telemetryMetrics() -> (count: Int, totalBytes: Int) {
         tracker.metrics
@@ -212,8 +223,8 @@ actor StremioManifestDataCache {
         let task = Task<Data?, Never> {
             do {
                 var request = URLRequest(url: url)
-                request.timeoutInterval = 15
-                let (data, response) = try await URLSession.shared.data(for: request)
+                request.timeoutInterval = 8
+                let (data, response) = try await Self.manifestSession.data(for: request)
                 guard let http = response as? HTTPURLResponse,
                       200..<300 ~= http.statusCode else { return nil }
                 return data
@@ -331,6 +342,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    private static func hasCanonicalIMDbStreamIdentity(_ meta: NuvioMeta) -> Bool {
+        NuvioMeta.canonicalImdbID(from: meta.streamId) != nil
+    }
+
     static func isFullMetadata(_ meta: NuvioMeta) -> Bool {
         let isMovieOrSeries = meta.isSeries || meta.type
             .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -345,16 +360,24 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
-    private static func hasCanonicalIMDbStreamIdentity(_ meta: NuvioMeta) -> Bool {
-        NuvioMeta.canonicalImdbID(from: meta.streamId) != nil
+    private static let networkSession: URLSession = {
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 8
+        config.timeoutIntervalForResource = 10
+        config.waitsForConnectivity = false
+        return URLSession(configuration: config)
+    }()
+
+    func cacheCatalogMetadata(_ meta: NuvioMeta) {
+        Self.cacheCatalogMetadata(meta)
     }
 
-    private func cacheCatalogMetadata(_ meta: NuvioMeta) {
-        Self.metadataCacheQueue.sync(flags: .barrier) {
-            if Self.cachedFullMetaIds.contains(meta.id) {
+    static func cacheCatalogMetadata(_ meta: NuvioMeta) {
+        metadataCacheQueue.sync(flags: .barrier) {
+            if cachedFullMetaIds.contains(meta.id) {
                 return
             }
-            Self.cachedMetaById[meta.id] = meta
+            cachedMetaById[meta.id] = meta
         }
     }
 
@@ -876,22 +899,42 @@ final class CinemetaCatalogRepository: CatalogRepository {
             typesToTry = [type, metaType]
         }
 
-        // 1. Query configured metadata add-ons first (e.g. Cinemeta - BetterPosters)
+        // 1. Query configured metadata add-ons concurrently if any exist
+        var addonURLs: [(url: URL, candidateType: String)] = []
         for candidateType in typesToTry {
-            for addon in await configuredAddons(supporting: "meta", type: candidateType, id: resolvedId) {
-                guard let metaURL = addon.metaURL(type: candidateType, id: resolvedId) else { continue }
-                do {
-                    let response: CinemetaMetaResponse = try await fetch(metaURL)
-                    let meta = await TmdbDetailsService.localizedMetadata(
-                        for: response.meta.toMeta(fallbackType: candidateType)
-                    )
-                    // Cache under the requested id too in case the addon
-                    // canonicalizes to a different id space.
-                    cacheMetadata(meta, requestedID: id)
-                    return meta
-                } catch {
-                    if lastError == nil { lastError = error }
+            let addons = await configuredAddons(supporting: "meta", type: candidateType, id: resolvedId)
+            for addon in addons {
+                if let metaURL = addon.metaURL(type: candidateType, id: resolvedId) {
+                    addonURLs.append((metaURL, candidateType))
                 }
+            }
+        }
+
+        if !addonURLs.isEmpty {
+            let addonResult: NuvioMeta? = await withTaskGroup(of: NuvioMeta?.self) { group in
+                for (metaURL, candidateType) in addonURLs {
+                    group.addTask { [self] in
+                        do {
+                            let response: CinemetaMetaResponse = try await self.fetch(metaURL)
+                            let meta = await TmdbDetailsService.localizedMetadata(
+                                for: response.meta.toMeta(fallbackType: candidateType)
+                            )
+                            return meta
+                        } catch {
+                            return nil
+                        }
+                    }
+                }
+                for await result in group {
+                    if let result {
+                        return result
+                    }
+                }
+                return nil
+            }
+            if let addonResult {
+                cacheMetadata(addonResult, requestedID: id)
+                return addonResult
             }
         }
 
@@ -995,21 +1038,39 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    private static var tmdbToImdbCache: [String: String] = [:]
+    private static let tmdbToImdbLock = NSLock()
+
+    private static func cachedImdb(forTmdbId tmdbId: Int, type: String) -> String? {
+        tmdbToImdbLock.lock()
+        defer { tmdbToImdbLock.unlock() }
+        return tmdbToImdbCache["\(tmdbId):\(type)"]
+    }
+
+    private static func cacheImdb(_ imdbId: String, forTmdbId tmdbId: Int, type: String) {
+        tmdbToImdbLock.lock()
+        defer { tmdbToImdbLock.unlock() }
+        tmdbToImdbCache["\(tmdbId):\(type)"] = imdbId
+    }
+
     /// Best-effort TMDB external_ids lookup so More Like This / production
     /// browse cards that only have `tmdb:` ids can still open in Cinemeta.
     private static func resolveImdbFromTmdb(tmdbId: Int, type: String) async -> String? {
+        let primaryMedia = isSeriesType(type) ? "tv" : "movie"
+        if let cached = cachedImdb(forTmdbId: tmdbId, type: primaryMedia) {
+            return cached
+        }
         let apiKey = ProfileSettings.current.string(forKey: SettingsKey.tmdbApiKey)?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         // A TMDB-backed collection is an explicit source choice, independent
         // of whether optional Details enrichment is enabled.
         guard !apiKey.isEmpty else { return nil }
-        let primaryMedia = isSeriesType(type) ? "tv" : "movie"
         let fallbackMedia = primaryMedia == "tv" ? "movie" : "tv"
         for media in [primaryMedia, fallbackMedia] {
             var components = URLComponents(string: "https://api.themoviedb.org/3/\(media)/\(tmdbId)/external_ids")!
             components.queryItems = [URLQueryItem(name: "api_key", value: apiKey)]
             guard let url = components.url,
-                  let (data, response) = try? await URLSession.shared.data(from: url),
+                  let (data, response) = try? await Self.networkSession.data(from: url),
                   let http = response as? HTTPURLResponse,
                   (200...299).contains(http.statusCode),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -1017,6 +1078,7 @@ final class CinemetaCatalogRepository: CatalogRepository {
                   imdb.hasPrefix("tt") else {
                 continue
             }
+            cacheImdb(imdb, forTmdbId: tmdbId, type: primaryMedia)
             return imdb
         }
         return nil
@@ -2154,9 +2216,9 @@ final class CinemetaCatalogRepository: CatalogRepository {
 
     private func fetch<T: Decodable>(_ url: URL) async throws -> T {
         var request = URLRequest(url: url)
-        request.timeoutInterval = 15
+        request.timeoutInterval = 8
         request.setValue("Mozilla/5.0 (AppleTV; tvOS 18.0) AppleWebKit/605.1.15", forHTTPHeaderField: "User-Agent")
-        let (data, response) = try await URLSession.shared.data(for: request)
+        let (data, response) = try await Self.networkSession.data(for: request)
         guard let http = response as? HTTPURLResponse, 200..<300 ~= http.statusCode else {
             throw URLError(.badServerResponse)
         }
