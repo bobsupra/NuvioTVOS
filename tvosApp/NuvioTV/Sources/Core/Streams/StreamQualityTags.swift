@@ -100,17 +100,55 @@ struct StreamQualityTags: Equatable, Codable {
         return trimmed
     }
 
+    private final class BoxedStreamQualityTags: @unchecked Sendable {
+        let tags: StreamQualityTags
+        init(_ tags: StreamQualityTags) { self.tags = tags }
+    }
+
+    private static let streamTagsCache: NSCache<NSString, BoxedStreamQualityTags> = {
+        let cache = NSCache<NSString, BoxedStreamQualityTags>()
+        cache.countLimit = 1000
+        return cache
+    }()
+
+    private struct ResolutionRule {
+        let res: Int
+        let regex: NSRegularExpression
+    }
+
+    private static let releaseGroupRegexes: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"(?:^|[\s._\-\[])-(?<group>[A-Za-z0-9]+)(?:\]|\.[a-zA-Z0-9]{2,4}|$)"#, options: .caseInsensitive),
+        try! NSRegularExpression(pattern: #"\[(?<group>[A-Za-z0-9]{2,15})\]"#, options: .caseInsensitive),
+        try! NSRegularExpression(pattern: #"\b(?<group>FLUX|NTb|PSA|MeGusta|ION10|GalaxyTV|QxR|SMURF|KOGi|YTS|EZTV|TGX|EVO|CMRG|ROVERS|DIMENSION|KiNGS|STRONT|EDITH|GLHF|CAKES|SUCCESS|DRACULA|SURF|BAMBOOZLE|TEPES|MiNX|TBS|monkee|CasStudio|T6D|SQUEAK|NOGRP)\b"#, options: .caseInsensitive)
+    ]
+
+    private static let resolutionRegexes: [ResolutionRule] = [
+        ResolutionRule(res: 2160, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:2160p?|4k|uhd)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 1440, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:1440p?|2k)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 1080, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:1080p?|fhd)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 720, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:720p?|hd)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 576, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:576p?)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 480, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:480p?|sd)(?:[^a-z0-9]|$)"#, options: .caseInsensitive)),
+        ResolutionRule(res: 360, regex: try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])(?:360p?)(?:[^a-z0-9]|$)"#, options: .caseInsensitive))
+    ]
+
+    private static let dvWordRegex = try! NSRegularExpression(pattern: #"\bdv\b"#, options: .caseInsensitive)
+    private static let hdrRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:hdr10\+?|hdr|hlg|pq10)(?![a-z0-9])"#, options: .caseInsensitive)
+    private static let av1Regex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:av1|av01)(?![a-z0-9])"#, options: .caseInsensitive)
+    private static let hevcRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:hevc|h\.?265|x265|dvhe|dvh1)(?![a-z0-9])"#, options: .caseInsensitive)
+    private static let avcRegex = try! NSRegularExpression(pattern: #"(?<![a-z0-9])(?:avc1?|h\.?264|x264)(?![a-z0-9])"#, options: .caseInsensitive)
+
+    private static let camRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])cam(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
+    private static let tsRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])ts(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
+    private static let tcRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])tc(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
+    private static let scrRegex = try! NSRegularExpression(pattern: #"(?:^|[^a-z0-9])scr(?:[^a-z0-9]|$)"#, options: .caseInsensitive)
+
     /// Extracts known scene or P2P release group names from release text.
     static func extractReleaseGroup(from text: String?) -> String? {
         guard let text, !text.isEmpty else { return nil }
-        let patterns = [
-            #"(?:^|[\s._\-\[])-(?<group>[A-Za-z0-9]+)(?:\]|\.[a-zA-Z0-9]{2,4}|$)"#,
-            #"\[(?<group>[A-Za-z0-9]{2,15})\]"#,
-            #"\b(?<group>FLUX|NTb|PSA|MeGusta|ION10|GalaxyTV|QxR|SMURF|KOGi|YTS|EZTV|TGX|EVO|CMRG|ROVERS|DIMENSION|KiNGS|STRONT|EDITH|GLHF|CAKES|SUCCESS|DRACULA|SURF|BAMBOOZLE|TEPES|MiNX|TBS|monkee|CasStudio|T6D|SQUEAK|NOGRP)\b"#
-        ]
-        for pattern in patterns {
-            if let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive),
-               let match = regex.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)) {
+        let nsRange = NSRange(text.startIndex..., in: text)
+        for regex in releaseGroupRegexes {
+            if let match = regex.firstMatch(in: text, range: nsRange) {
                 let range = match.range(withName: "group")
                 if range.location != NSNotFound, let swiftRange = Range(range, in: text) {
                     let group = String(text[swiftRange]).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -126,14 +164,14 @@ struct StreamQualityTags: Equatable, Codable {
     }
 
     /// Derives a stable release fingerprint when `behaviorHints.bingeGroup` is missing from the stream.
-    static func syntheticBingeGroup(for stream: NuvioStream) -> String? {
+    static func syntheticBingeGroup(for stream: NuvioStream, existingTags: StreamQualityTags? = nil) -> String? {
         if let bg = stream.bingeGroup?.trimmingCharacters(in: .whitespacesAndNewlines), !bg.isEmpty {
             return bg
         }
         let text = [stream.filename, stream.description, stream.name].compactMap { $0 }.joined(separator: " ")
         guard !text.isEmpty else { return nil }
         let relGroup = extractReleaseGroup(from: text)
-        let tags = StreamQualityTags.parse(
+        let tags = existingTags ?? StreamQualityTags.parse(
             name: stream.name,
             description: stream.description,
             filename: stream.filename,
@@ -179,22 +217,24 @@ struct StreamQualityTags: Equatable, Codable {
         var tags = StreamQualityTags()
         tags.resolution = resolution(in: metadataText)
         tags.quality = quality(in: metadataText)
-        tags.isDolbyVision = textContainsAny(fullText, [
+        let dvNeedles = [
             "dolby vision", "dolbyvision", " dovi", "dovi ", "dvhe", "dvh1",
             " profile 5", "profile 5", " profile 7", "profile 7", " profile 8", "profile 8",
             " dv ", "dv.", ".dv.", "[dv]", "(dv)"
-        ]) || fullText.range(of: #"\bdv\b"#, options: .regularExpression) != nil
+        ]
+        tags.isDolbyVision = textContainsAny(fullText, dvNeedles) || regexMatches(dvWordRegex, in: fullText)
         // Match HDR markers as standalone release tokens. `HDRip` is a common
         // SDR release label (High Definition rip), not an HDR transfer.
         tags.isHDR = tags.isDolbyVision || textContainsHDRToken(fullText)
         tags.isAtmos = textContainsAny(fullText, [
             "atmos", "truehd atmos", "ddp atmos", "eac3 atmos", "dd+ atmos"
         ])
-        tags.isCached = isCachedHint == true || textContainsAny(fullText, [
+        let cachedNeedles = [
             "⚡", "[cached]", "(cached)", " cached", "cached ",
             "[rd+", "rd+", "[pm+", "pm+", "[tb+", "tb+", "torbox+",
             "instant", "debrid +"
-        ])
+        ]
+        tags.isCached = (isCachedHint == true) || textContainsAny(fullText, cachedNeedles)
         tags.isAV1 = textContainsAV1Token(fullText)
         tags.isHEVC = textContainsHEVCToken(fullText)
         tags.isAVC = textContainsAVCToken(fullText)
@@ -211,6 +251,17 @@ struct StreamQualityTags: Equatable, Codable {
     }
 
     static func parse(stream: NuvioStream) -> StreamQualityTags {
+        let streamId = stream.id
+        let streamUrl = stream.url ?? ""
+        let streamName = stream.name ?? ""
+        let streamDesc = stream.description ?? ""
+        let streamFile = stream.filename ?? ""
+        let cachedFlag = stream.isCached == true ? "1" : "0"
+        let cacheKey = "\(streamId)::\(streamUrl)::\(streamName)::\(streamDesc)::\(streamFile)::\(cachedFlag)" as NSString
+        if let cached = streamTagsCache.object(forKey: cacheKey) {
+            return cached.tags
+        }
+
         var tags = parse(
             name: stream.name,
             description: stream.description,
@@ -221,7 +272,8 @@ struct StreamQualityTags: Equatable, Codable {
             isCachedHint: stream.isCached,
             releaseFingerprint: nil
         )
-        tags.releaseFingerprint = syntheticBingeGroup(for: stream)
+        tags.releaseFingerprint = syntheticBingeGroup(for: stream, existingTags: tags)
+        streamTagsCache.setObject(BoxedStreamQualityTags(tags), forKey: cacheKey)
         return tags
     }
 
@@ -280,33 +332,21 @@ struct StreamQualityTags: Equatable, Codable {
 
     /// Canonical token-based resolution parsing matching Android TV's `resolutionValue`.
     static func resolution(in text: String) -> Int {
+        guard !text.isEmpty else { return 0 }
         let lower = text.lowercased()
-        func hasToken(_ pattern: String) -> Bool {
-            lower.range(
-                of: #"(?:^|[^a-z0-9])(?:"# + pattern + #")(?:[^a-z0-9]|$)"#,
-                options: .regularExpression
-            ) != nil
+        let nsRange = NSRange(lower.startIndex..., in: lower)
+        for rule in resolutionRegexes {
+            if rule.regex.firstMatch(in: lower, range: nsRange) != nil {
+                return rule.res
+            }
         }
-
-        if hasToken("2160p?|4k|uhd") { return 2160 }
-        if hasToken("1440p?|2k") { return 1440 }
-        if hasToken("1080p?|fhd") { return 1080 }
-        if hasToken("720p?|hd") { return 720 }
-        if hasToken("576p?") { return 576 }
-        if hasToken("480p?|sd") { return 480 }
-        if hasToken("360p?") { return 360 }
         return 0
     }
 
     /// Canonical release quality classification matching Android TV's `streamQuality`.
     static func quality(in text: String) -> DebridStreamQuality {
+        guard !text.isEmpty else { return .unknown }
         let lower = text.lowercased()
-        func hasToken(_ token: String) -> Bool {
-            lower.range(
-                of: #"(?:^|[^a-z0-9])"# + NSRegularExpression.escapedPattern(for: token) + #"(?:[^a-z0-9]|$)"#,
-                options: .regularExpression
-            ) != nil
-        }
 
         if lower.contains("remux") { return .blurayRemux }
         if lower.contains("blu-ray") || lower.contains("bluray") || lower.contains("bdrip") || lower.contains("brrip") { return .bluray }
@@ -316,10 +356,12 @@ struct StreamQualityTags: Equatable, Codable {
         if lower.contains("hd-rip") || lower.contains("hcrip") { return .hdRip }
         if lower.contains("dvdrip") { return .dvdrip }
         if lower.contains("hdtv") { return .hdtv }
-        if hasToken("cam") { return .cam }
-        if hasToken("ts") { return .ts }
-        if hasToken("tc") { return .tc }
-        if hasToken("scr") { return .scr }
+
+        let nsRange = NSRange(lower.startIndex..., in: lower)
+        if camRegex.firstMatch(in: lower, range: nsRange) != nil { return .cam }
+        if tsRegex.firstMatch(in: lower, range: nsRange) != nil { return .ts }
+        if tcRegex.firstMatch(in: lower, range: nsRange) != nil { return .tc }
+        if scrRegex.firstMatch(in: lower, range: nsRange) != nil { return .scr }
         return .unknown
     }
 
@@ -327,32 +369,26 @@ struct StreamQualityTags: Equatable, Codable {
         needles.contains { text.contains($0) }
     }
 
+    private static func regexMatches(_ regex: NSRegularExpression, in text: String) -> Bool {
+        guard !text.isEmpty else { return false }
+        let nsRange = NSRange(text.startIndex..., in: text)
+        return regex.firstMatch(in: text, range: nsRange) != nil
+    }
+
     private static func textContainsHDRToken(_ text: String) -> Bool {
-        text.range(
-            of: #"(?<![a-z0-9])(?:hdr10\+?|hdr|hlg|pq10)(?![a-z0-9])"#,
-            options: .regularExpression
-        ) != nil
+        regexMatches(hdrRegex, in: text)
     }
 
     private static func textContainsAV1Token(_ text: String) -> Bool {
-        text.range(
-            of: #"(?<![a-z0-9])(?:av1|av01)(?![a-z0-9])"#,
-            options: .regularExpression
-        ) != nil
+        regexMatches(av1Regex, in: text)
     }
 
     private static func textContainsHEVCToken(_ text: String) -> Bool {
-        text.range(
-            of: #"(?<![a-z0-9])(?:hevc|h\.?265|x265|dvhe|dvh1)(?![a-z0-9])"#,
-            options: .regularExpression
-        ) != nil
+        regexMatches(hevcRegex, in: text)
     }
 
     private static func textContainsAVCToken(_ text: String) -> Bool {
-        text.range(
-            of: #"(?<![a-z0-9])(?:avc1?|h\.?264|x264)(?![a-z0-9])"#,
-            options: .regularExpression
-        ) != nil
+        regexMatches(avcRegex, in: text)
     }
 }
 

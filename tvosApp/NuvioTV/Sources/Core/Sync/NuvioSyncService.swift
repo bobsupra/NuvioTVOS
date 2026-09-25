@@ -74,11 +74,15 @@ final class NuvioSyncManager: ObservableObject {
         static let all: SyncPushScope = [.settings, .library, .watched, .progress]
     }
 
+    static let defaultPushDelay: TimeInterval = 1.5
+    static let progressHeartbeatInterval: TimeInterval = 30.0
+
     private var pendingPushScopes: SyncPushScope = []
     private var isPushExecuting = false
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
+    private var pushTaskDeadline: Date?
     private var homeCatalogPushTask: Task<Void, Never>?
     private var profileSelectionRefreshTask: Task<Void, Never>?
     private var completedInitialPullKeys: Set<String> = []
@@ -168,7 +172,7 @@ final class NuvioSyncManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush(scope: .progress, delay: 3.0) }
+            Task { @MainActor in self?.schedulePush(scope: .progress, delay: Self.progressHeartbeatInterval) }
         })
         observers.append(center.addObserver(
             forName: ContinueWatchingDismissStore.changedNotification,
@@ -813,7 +817,7 @@ final class NuvioSyncManager: ObservableObject {
         }
     }
 
-    private func schedulePush(scope: SyncPushScope = .all, delay: TimeInterval = 1.5) {
+    func schedulePush(scope: SyncPushScope = .all, delay: TimeInterval = 1.5) {
         guard !isApplyingRemote else { return }
         guard AuthConfig.isConfigured else { return }
         guard authManager?.isAuthenticated == true else { return }
@@ -826,7 +830,18 @@ final class NuvioSyncManager: ObservableObject {
             return
         }
 
-        pushTask?.cancel()
+        let targetDeadline = Date().addingTimeInterval(delay)
+        if let currentDeadline = pushTaskDeadline, pushTask != nil {
+            if targetDeadline < currentDeadline {
+                // Accelerate schedule because a shorter-delay / higher-priority scope arrived
+                pushTask?.cancel()
+            } else {
+                // Keep the current scheduled countdown running so recurring progress heartbeats fire every interval
+                return
+            }
+        }
+
+        pushTaskDeadline = targetDeadline
         pushTask = Task(priority: .utility) { @MainActor [weak self] in
             do {
                 try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
@@ -837,6 +852,8 @@ final class NuvioSyncManager: ObservableObject {
                   !Task.isCancelled,
                   let key = self.currentSyncKey(),
                   self.completedInitialPullKeys.contains(key) else { return }
+            self.pushTaskDeadline = nil
+            self.pushTask = nil
             await self.executePendingPushes()
         }
     }
@@ -859,6 +876,7 @@ final class NuvioSyncManager: ObservableObject {
         }
         pushTask?.cancel()
         pushTask = nil
+        pushTaskDeadline = nil
         while isPushExecuting {
             try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
         }

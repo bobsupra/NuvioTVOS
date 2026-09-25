@@ -357,5 +357,20 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         await manager.flushPendingPushesNow()
         manager.flushPendingPushes()
     }
+
+    @MainActor
+    func testProgressHeartbeatSyncDebounceAndFlush() async {
+        XCTAssertEqual(NuvioSyncManager.progressHeartbeatInterval, 30.0)
+        XCTAssertEqual(NuvioSyncManager.defaultPushDelay, 1.5)
+
+        let manager = NuvioSyncManager()
+        // Multiple rapid progress schedule calls should not crash or throw
+        manager.schedulePush(scope: .progress, delay: NuvioSyncManager.progressHeartbeatInterval)
+        manager.schedulePush(scope: .progress, delay: NuvioSyncManager.progressHeartbeatInterval)
+        // Shorter delay (e.g. settings or immediate flush) accelerates
+        manager.schedulePush(scope: .settings, delay: NuvioSyncManager.defaultPushDelay)
+        await manager.flushPendingPushesNow()
+    }
 }
+
 
