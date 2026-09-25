@@ -259,6 +259,10 @@ Last verified end-to-end: Beta 3.1.5 on 2026-07-22.
 
 Use this checklist from start to finish for every beta. Replace `X.Y.Z` with
 the release version and `BUILD` with the next integer build number.
+The published Beta 3.3.7 IPA contains `3.3.7 (68)`. Its tagged `Project.swift`
+still says `3.3.4 (65)`, so never assume tagged source metadata or the number
+of GitHub releases equals the build number. Inspect the previous published
+IPA's `Payload/NuvioTV.app/Info.plist` before choosing `BUILD`.
 
 ### 1. Audit before changing anything
 
@@ -296,16 +300,21 @@ the release version and `BUILD` with the next integer build number.
 
 ### 3. Bump every version consistently
 
-1. Increment the build number from the previous release.
-2. Update `CFBundleShortVersionString` in:
-   - `tvosApp/NuvioTV/Info.plist`
-   - `tvosApp/TopShelf/Info.plist`
-3. Update every applicable `MARKETING_VERSION` and
-   `CURRENT_PROJECT_VERSION` in
-   `tvosApp/NuvioTV.xcodeproj/project.pbxproj` (app, Top Shelf, and tests).
-4. Validate both plists with `plutil -lint`.
-5. Search the release-facing files for the old version/build and confirm no
-   stale value remains.
+1. Read `CFBundleVersion` from the previous published IPA's
+   `Payload/NuvioTV.app/Info.plist` and increment that build number. Do not
+   derive it by counting releases. For a downloaded IPA, run
+   `unzip -p previous.ipa Payload/NuvioTV.app/Info.plist | plutil -extract CFBundleVersion raw -`.
+2. Update **both** `marketingVersion` (`X.Y.Z`) and `projectVersion` (`BUILD`)
+   in `tvosApp/Project.swift`. This is the tracked source of truth for the app
+   and Top Shelf version/build settings.
+3. Generate the Xcode project with `cd tvosApp && tuist generate --no-open`.
+   `tvosApp/NuvioTV.xcodeproj/project.pbxproj` is generated and ignored; do
+   not edit or commit it as the only version change.
+4. Confirm the generated `MARKETING_VERSION` and `CURRENT_PROJECT_VERSION`
+   resolve to `X.Y.Z` and `BUILD` for the app and Top Shelf. Both Info.plists
+   use these build settings; validate them with `plutil -lint`.
+5. Search release-facing files for stale version/build values and verify the
+   archived app and final IPA report `X.Y.Z (BUILD)` before publishing.
 
 ### 4. Write structured patch notes and README
 
@@ -356,7 +365,8 @@ the release version and `BUILD` with the next integer build number.
 ### 6. Create the unsigned Release archive
 
 1. Archive from `tvosApp/NuvioTV.xcworkspace`, scheme `NuvioTV`,
-   configuration `Release`, destination `generic/platform=tvOS`.
+   configuration `Release`, destination `generic/platform=tvOS`. Regenerate
+   the workspace from the updated `tvosApp/Project.swift` first.
 2. Disable signing with:
    - `CODE_SIGNING_ALLOWED=NO`
    - `CODE_SIGNING_REQUIRED=NO`
@@ -403,7 +413,7 @@ Always maintain a clean separation between feature development and release metad
    - Stage and commit all pending feature changes, bug fixes, refactorings, and unit/regression test additions.
    - Use a clear, high-density commit message summarizing the changes (e.g., `Feature updates: ...` or `Fix ...`).
 2. **Commit 2 (Release Packaging):**
-   - Stage strictly the release-specific files: `tvosApp/NuvioTV.xcodeproj/project.pbxproj` (version/build bumps), `README.md` (latest beta block & download link), and `release/tvos-beta-X.Y.Z.md` (release notes).
+   - Stage strictly the release-specific files: `tvosApp/Project.swift` (both version and build bumps), `README.md` (latest beta block & download link), and `release/tvos-beta-X.Y.Z.md` (release notes).
    - Commit as `Release tvOS Beta X.Y.Z`.
 3. Confirm the worktree is completely clean (`git status` reports nothing to commit).
 

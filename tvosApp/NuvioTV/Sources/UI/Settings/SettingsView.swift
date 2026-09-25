@@ -477,6 +477,7 @@ enum SubtitleLanguagePreferences {
         "Swedish", "Thai", "Turkish", "Ukrainian", "Vietnamese"
     ]
     static let settingsOptions = ["System"] + supportedLanguages
+    static let audioSettingsOptions = ["System", "Original"] + supportedLanguages
 
     private static let languageCodes: [String: [String]] = [
         "Arabic": ["ara", "ar"],
@@ -622,8 +623,20 @@ enum SubtitleLanguagePreferences {
         return codes.isEmpty ? nil : codes.joined(separator: ",")
     }
 
-    static func preferredAudioLanguage(defaults: UserDefaults = ProfileSettings.current) -> String? {
+    static func preferredAudioLanguage(
+        meta: NuvioMeta? = nil,
+        defaults: UserDefaults = ProfileSettings.current
+    ) -> String? {
         let preferred = defaults.string(forKey: SettingsKey.audioLanguage) ?? "System"
+        if preferred.caseInsensitiveCompare("Original") == .orderedSame {
+            if let metaLanguage = meta?.language?.trimmingCharacters(in: .whitespacesAndNewlines), !metaLanguage.isEmpty {
+                return supportedLanguages.first { matches(metaLanguage, target: $0) } ?? metaLanguage
+            }
+            if meta?.isAnime == true {
+                return "Japanese"
+            }
+            return nil
+        }
         if !disabledValues.contains(preferred) { return preferred }
 
         // App language is stored as a BCP-47 tag (or empty / "System" for device).
@@ -1145,7 +1158,7 @@ struct SettingsView: View {
                     subtitle: languagePickerSubtitle(picker),
                     systemImage: languagePickerSystemImage(picker),
                     selection: languagePickerSelection(picker),
-                    languages: picker == .appLanguage ? appLanguagePickerOptions : pickerLanguages,
+                    languages: picker == .appLanguage ? appLanguagePickerOptions : (picker == .audio ? SubtitleLanguagePreferences.audioSettingsOptions : pickerLanguages),
                     allowsMultiple: picker == .subtitles,
                     accentColor: accentColor
                 ) {
@@ -1195,7 +1208,7 @@ struct SettingsView: View {
     private var audioLanguageSelection: Binding<[String]> {
         Binding(
             get: {
-                SubtitleLanguagePreferences.supportedLanguages.contains(audioLanguage)
+                (SubtitleLanguagePreferences.supportedLanguages.contains(audioLanguage) || audioLanguage.caseInsensitiveCompare("Original") == .orderedSame)
                     ? [audioLanguage]
                     : []
             },
@@ -6956,7 +6969,7 @@ private struct PlaybackSettingsView: View {
     }
 
     private var audioLanguageSummary: String {
-        SubtitleLanguagePreferences.settingsOptions.contains(audioLanguage)
+        SubtitleLanguagePreferences.audioSettingsOptions.contains(audioLanguage)
             ? audioLanguage
             : "System"
     }
