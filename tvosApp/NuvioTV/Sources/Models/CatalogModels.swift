@@ -1724,6 +1724,7 @@ enum ContinueWatchingStore {
     /// detected exactly (same Encoding size, no `Equatable` conformance needed)
     /// without re-decoding or re-encoding the multi-megabyte payload.
     private static var cachedData: Data?
+    private static var writeGeneration: UInt64 = 0
     private static let cacheLock = NSLock()
 
     private static func invalidateCache() {
@@ -1731,6 +1732,7 @@ enum ContinueWatchingStore {
             cachedItems = nil
             cachedKey = nil
             cachedData = nil
+            writeGeneration &+= 1
         }
     }
 
@@ -2491,11 +2493,12 @@ enum ContinueWatchingStore {
                 .filter { shouldKeep(position: $0.position, duration: $0.duration) }
                 .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
 
-            let previousItems = cacheLock.withLock { () -> [ContinueWatchingItem]? in
+            let (previousItems, generation) = cacheLock.withLock { () -> ([ContinueWatchingItem]?, UInt64) in
                 let prev = cachedItems
                 cachedItems = kept
                 cachedKey = key
-                return prev
+                writeGeneration &+= 1
+                return (prev, writeGeneration)
             }
 
             Task.detached(priority: .utility) {
@@ -2504,10 +2507,11 @@ enum ContinueWatchingStore {
                     return
                 }
 
-                let alreadyCached = cacheLock.withLock { () -> Bool in
-                    cachedKey == key && cachedData == data
+                let shouldProceed = cacheLock.withLock { () -> Bool in
+                    guard writeGeneration == generation, cachedKey == key else { return false }
+                    return cachedData != data
                 }
-                guard !alreadyCached else { return }
+                guard shouldProceed else { return }
 
                 guard let url = storageURL(for: key) else {
                     persistenceDiagnostic = "save failed: Caches unavailable"
@@ -2516,6 +2520,18 @@ enum ContinueWatchingStore {
 
                 do {
                     try writeAndVerify(data, to: url)
+
+                    let isStillCurrent = cacheLock.withLock { () -> Bool in
+                        guard writeGeneration == generation, cachedKey == key else {
+                            try? FileManager.default.removeItem(at: url)
+                            return false
+                        }
+                        cachedData = data
+                        persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
+                        return true
+                    }
+                    guard isStillCurrent else { return }
+
                     for legacyURL in legacyStorageURLs(for: key) {
                         try? FileManager.default.removeItem(at: legacyURL)
                     }
@@ -2526,13 +2542,6 @@ enum ContinueWatchingStore {
                     let markerKey = fallbackMarkerKey(for: key)
                     if defaults.object(forKey: markerKey) != nil {
                         defaults.removeObject(forKey: markerKey)
-                    }
-
-                    cacheLock.withLock {
-                        if cachedKey == key {
-                            cachedData = data
-                        }
-                        persistenceDiagnostic = "Caches: \(storedItems.count) item(s), \(data.count) bytes"
                     }
 
                     writeTopShelfFeed()

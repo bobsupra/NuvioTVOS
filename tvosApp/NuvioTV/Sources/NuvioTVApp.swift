@@ -45,7 +45,7 @@ struct NuvioTVApp: App {
 /// Temporary Home performance tracing. Enabled by default in DEBUG so console
 /// output shows main-thread stalls, or via `-TVHomeDebugTrace` argument.
 enum TVHomeDebugTrace {
-    static var enabled = true
+    static var enabled = false
     private static let logger = Logger(
         subsystem: "com.pyksel.nuviotvos",
         category: "TVTrace"
