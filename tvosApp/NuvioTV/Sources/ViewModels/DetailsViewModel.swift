@@ -157,6 +157,17 @@ class DetailsViewModel: ObservableObject {
         uiState.isLoadingEnrichment = false
     }
 
+    private struct EnrichmentPayload: Sendable {
+        var credits: TmdbCreditMetadata? = nil
+        var companies: [MetaCompany] = []
+        var comments: [TraktCommentReview] = []
+        var simklRatings: SimklTitleRatings? = nil
+        var mdbRatings: [NuvioExternalRating] = []
+        var mdblistWatchlistMembership: Bool? = nil
+        var tmdbEpisodes: [NuvioVideo]? = nil
+        var moreLikeThis: [RelatedTitle] = []
+    }
+
     /// Loads More Like This, Production companies, and top Trakt comments
     /// after the primary metadata is on screen.
     private func loadEnrichment(for meta: NuvioMeta, generation: UInt64) {
@@ -173,77 +184,104 @@ class DetailsViewModel: ObservableObject {
                 }
             }
 
-            await withTaskGroup(of: Void.self) { group in
-                // 1. Credits & Cast (TMDB) -> Apply immediately when ready (~200ms)
-                group.addTask {
-                    let credits = await TmdbDetailsService.fetchCredits(for: meta)
-                    await self.applyCredits(credits, for: meta.id, generation: generation)
-                }
+            let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
+            let preferredSource = TraktSettingsStore.moreLikeThisSource
+            let isTraktAuth = TraktAuthStore.isAuthenticated
+            let isSimklConfigured = SimklDetailsService.isConfigured
+            let isMdbListMode = TraktSettingsStore.librarySourceMode == .mdblist && MdbListRuntimeSession.isAuthenticated()
 
-                // 2. Production & Networks (TMDB) -> Apply immediately when ready (~200ms)
-                group.addTask {
-                    let companies = await TmdbDetailsService.fetchCompanies(for: meta)
-                    await self.applyCompanies(companies, for: meta.id, generation: generation)
-                }
+            let payload = await Task.detached(priority: .userInitiated) { () -> EnrichmentPayload in
+                async let creditsTask = TmdbDetailsService.fetchCredits(for: meta)
+                async let companiesTask = TmdbDetailsService.fetchCompanies(for: meta)
+                async let commentsTask = TraktDetailsService.fetchTopComments(for: meta)
+                async let simklTask = SimklDetailsService.fetchDetails(for: meta)
+                async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
+                async let mdbWatchlistTask: Bool? = isMdbListMode ? await MdbListLibraryService.isInWatchlist(meta) : nil
+                async let episodesTask: [NuvioVideo]? = isSeries ? await TmdbDetailsService.fetchEpisodes(for: meta) : nil
+                async let moreLikeThisTask = Self.fetchAndHydrateMoreLikeThis(
+                    for: meta,
+                    preferredSource: preferredSource,
+                    isTraktAuth: isTraktAuth,
+                    isSimklConfigured: isSimklConfigured
+                )
 
-                // 3. More Like This (TMDB / Trakt / Simkl) -> Progressive load & hydrate
-                group.addTask {
-                    await self.loadMoreLikeThis(for: meta, generation: generation)
-                }
+                let (credits, companies, comments, simkl, mdbRatings, mdbWatchlist, episodes, related) = await (
+                    creditsTask,
+                    companiesTask,
+                    commentsTask,
+                    simklTask,
+                    mdbRatingsTask,
+                    mdbWatchlistTask,
+                    episodesTask,
+                    moreLikeThisTask
+                )
 
-                // 4. Trakt Comments -> Apply immediately when ready
-                group.addTask {
-                    let comments = await TraktDetailsService.fetchTopComments(for: meta)
-                    await self.applyComments(comments, for: meta.id, generation: generation)
-                }
+                return EnrichmentPayload(
+                    credits: credits,
+                    companies: companies,
+                    comments: comments,
+                    simklRatings: simkl?.ratings,
+                    mdbRatings: mdbRatings,
+                    mdblistWatchlistMembership: mdbWatchlist,
+                    tmdbEpisodes: episodes,
+                    moreLikeThis: related
+                )
+            }.value
 
-                // 5. Simkl Ratings -> Apply immediately when ready
-                group.addTask {
-                    let simkl = await SimklDetailsService.fetchDetails(for: meta)
-                    await self.applySimklRatings(simkl?.ratings, for: meta.id, generation: generation)
-                }
+            guard !Task.isCancelled,
+                  self.detailsRequestGeneration == generation,
+                  self.uiState.meta?.id == meta.id else { return }
 
-                // 6. External Ratings (MDBList) -> Apply immediately when ready
-                group.addTask {
-                    let mdbRatings = await MdbListDetailsService.fetchRatings(for: meta)
-                    await self.applyMdbRatings(mdbRatings, for: meta.id, generation: generation)
-                }
-
-                // 7. Authenticated MDBList user rating -> Disabled for now
-                // group.addTask {
-                //     guard MdbListRuntimeSession.isAuthenticated() else { return }
-                //     let rating = await MdbListRatingsService.fetchRating(for: meta)
-                //     await self.applyMdbListUserRating(rating, for: meta.id, generation: generation)
-                // }
-
-                // 8. MDBList watchlist membership -> Keep the library action
-                // aligned with the selected remote library owner.
-                group.addTask {
-                    guard TraktSettingsStore.librarySourceMode == .mdblist,
-                          MdbListRuntimeSession.isAuthenticated(),
-                          let membership = await MdbListLibraryService.isInWatchlist(meta)
-                    else { return }
-                    await self.applyMdbListWatchlistMembership(
-                        membership,
-                        for: meta.id,
-                        generation: generation
-                    )
-                }
-
-                // 9. TMDB Episodes (Series only!) -> Runs in background without blocking cast/production
-                let isSeries = meta.isSeries || NuvioMeta.isSeriesType(meta.type)
-                if isSeries {
-                    group.addTask {
-                        let tmdbEpisodes = await TmdbDetailsService.fetchEpisodes(for: meta)
-                        await self.applyTmdbEpisodes(tmdbEpisodes, for: meta.id, generation: generation)
-                }
-                }
-            }
+            self.applyEnrichmentPayload(payload, for: meta.id, generation: generation)
         }
     }
 
     private func isCurrentRequest(metaId: String, generation: UInt64) -> Bool {
         !Task.isCancelled && detailsRequestGeneration == generation && uiState.meta?.id == metaId
+    }
+
+    private func applyEnrichmentPayload(_ payload: EnrichmentPayload, for metaId: String, generation: UInt64) {
+        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
+
+        var nextState = uiState
+        if var currentMeta = nextState.meta {
+            if let credits = payload.credits, !credits.isEmpty {
+                currentMeta = credits.applying(to: currentMeta)
+            }
+            if !payload.mdbRatings.isEmpty {
+                currentMeta = currentMeta.withExternalRatings(payload.mdbRatings)
+            }
+            if let episodes = payload.tmdbEpisodes, !episodes.isEmpty {
+                let mergedVideos = Self.mergeEpisodes(
+                    existing: currentMeta.videos,
+                    fromTmdb: episodes,
+                    parentId: currentMeta.id
+                )
+                currentMeta = currentMeta.withVideos(mergedVideos)
+            }
+            nextState.meta = currentMeta
+        }
+
+        if let credits = payload.credits, !credits.isEmpty {
+            nextState.people = credits.people
+        }
+        if !payload.companies.isEmpty {
+            nextState.companies = payload.companies
+        }
+        if !payload.comments.isEmpty {
+            nextState.comments = payload.comments
+        }
+        if let simkl = payload.simklRatings {
+            nextState.simklRatings = simkl
+        }
+        if let watchlistMembership = payload.mdblistWatchlistMembership {
+            nextState.isInWatchlist = watchlistMembership
+        }
+        if !payload.moreLikeThis.isEmpty {
+            nextState.moreLikeThis = payload.moreLikeThis
+        }
+
+        uiState = nextState
     }
 
     private func applyCredits(_ credits: TmdbCreditMetadata?, for metaId: String, generation: UInt64) {
@@ -315,30 +353,21 @@ class DetailsViewModel: ObservableObject {
         uiState.moreLikeThis = items
     }
 
-    private func applyInitialMoreLikeThisIfEmpty(_ items: [RelatedTitle], preferredSource: TraktMoreLikeThisSource, for metaId: String, generation: UInt64) {
-        guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
-        if uiState.moreLikeThis.isEmpty || preferredSource == .tmdb {
-            uiState.moreLikeThis = items
-        }
-    }
-
-    private func loadMoreLikeThis(for meta: NuvioMeta, generation: UInt64) async {
-        let preferredSource = TraktSettingsStore.moreLikeThisSource
-
+    private static func fetchAndHydrateMoreLikeThis(
+        for meta: NuvioMeta,
+        preferredSource: TraktMoreLikeThisSource,
+        isTraktAuth: Bool,
+        isSimklConfigured: Bool
+    ) async -> [RelatedTitle] {
         async let tmdbTask = TmdbDetailsService.fetchMoreLikeThis(for: meta)
-        async let traktTask: [RelatedTitle] = (preferredSource == .trakt || TraktAuthStore.isAuthenticated)
+        async let traktTask: [RelatedTitle] = (preferredSource == .trakt || isTraktAuth)
             ? TraktDetailsService.fetchRelated(for: meta)
             : []
-        async let simklTask: SimklTitleDetails? = (preferredSource == .simkl || SimklDetailsService.isConfigured)
+        async let simklTask: SimklTitleDetails? = (preferredSource == .simkl || isSimklConfigured)
             ? SimklDetailsService.fetchDetails(for: meta)
             : nil
 
-        // If TMDB returns quickly, populate More Like This immediately:
         let tmdbRelated = await tmdbTask
-        if !tmdbRelated.isEmpty {
-            self.applyInitialMoreLikeThisIfEmpty(tmdbRelated, preferredSource: preferredSource, for: meta.id, generation: generation)
-        }
-
         let traktRelated = await traktTask
         let simklRelated = (await simklTask)?.related ?? []
 
@@ -350,19 +379,12 @@ class DetailsViewModel: ObservableObject {
         }
         let resolved = [preferred, tmdbRelated, traktRelated, simklRelated].first { !$0.isEmpty } ?? []
 
-        guard !resolved.isEmpty else { return }
+        guard !resolved.isEmpty else { return [] }
 
-        self.applyMoreLikeThis(resolved, for: meta.id, generation: generation)
-
-        // Trakt's related endpoint commonly omits usable artwork even with
-        // `extended=images`. Resolve those IMDb ids through Cinemeta so the
-        // row gets the same poster data as Home. Keep the initial titles on
-        // screen while these independent artwork requests finish.
-        let hydrated = await hydrateRelatedArtwork(in: resolved)
-        self.applyMoreLikeThis(hydrated, for: meta.id, generation: generation)
+        return await hydrateRelatedArtwork(in: resolved)
     }
 
-    private func hydrateRelatedArtwork(in items: [RelatedTitle]) async -> [RelatedTitle] {
+    private static func hydrateRelatedArtwork(in items: [RelatedTitle]) async -> [RelatedTitle] {
         var hydrated = items
         await withTaskGroup(of: (Int, RelatedTitle).self) { group in
             for (index, item) in items.enumerated() {

@@ -240,6 +240,9 @@ struct DetailsScreen: View {
                         isPreparingPlayback = true
                         playStream(stream, meta: meta, player: player)
                     },
+                    onRefresh: {
+                        refreshSources()
+                    },
                     onDismiss: {
                         isStreamPickerPresented = false
                     }
@@ -357,6 +360,16 @@ struct DetailsScreen: View {
 
     private func canonicalEpisodeStreamId(for video: NuvioVideo, meta: NuvioMeta?) -> String {
         meta?.canonicalEpisodeStreamId(for: video) ?? video.id
+    }
+
+    private func refreshSources() {
+        guard let meta = viewModel.uiState.meta else { return }
+        if let episode = pendingEpisode {
+            let streamId = canonicalEpisodeStreamId(for: episode, meta: meta)
+            viewModel.prepareStreams(forId: streamId, type: "series", forceRefresh: true)
+        } else {
+            viewModel.prepareStreams(forId: meta.streamId, type: meta.type, forceRefresh: true)
+        }
     }
 
     private func startStreamFlow(streamId: String, type: String, reload: Bool, forceManualPicker: Bool = false) {
@@ -2454,7 +2467,6 @@ struct TvDetailsContent: View {
                                     onTrailerClick: onTrailerClick,
                                     focus: $actionFocus,
                                     entryLocked: focusedDetailsSection != .actions,
-                                    playEntryLocked: focusedDetailsSection == .episodes,
                                     onFocus: {
                                         guard focusedDetailsSection != .actions else { return }
                                         focusedDetailsSection = .actions
@@ -2732,34 +2744,18 @@ struct TvDetailsContent: View {
     private func focusPlayFromEpisodes(using scrollProxy: ScrollViewProxy) {
         detailsFocusMoveGeneration &+= 1
         let generation = detailsFocusMoveGeneration
-        pendingPlayFocusGeneration = generation
-        // Keep the episode section active until the scroll has finished. This
-        // prevents tvOS from disabling the focused card and choosing an early
-        // spatial replacement while the top section is moving into place.
+        pendingPlayFocusGeneration = nil
+        focusedDetailsSection = .actions
+        actionFocus = .play
         withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
             scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
         }
-        DispatchQueue.main.asyncAfter(deadline: .now() + TvDetailsScrollTiming.focusHandoffDelay) {
-            guard detailsFocusMoveGeneration == generation,
-                  pendingPlayFocusGeneration == generation else { return }
-            var transaction = Transaction()
-            transaction.disablesAnimations = true
-            withTransaction(transaction) {
-                pendingPlayFocusGeneration = nil
-                focusedDetailsSection = .actions
-                actionFocus = .play
-            }
 
-            // tvOS may reassert its spatial choice on the next run-loop turn.
-            DispatchQueue.main.async {
-                guard detailsFocusMoveGeneration == generation else { return }
-                if actionFocus != .play {
-                    var transaction = Transaction()
-                    transaction.disablesAnimations = true
-                    withTransaction(transaction) {
-                        actionFocus = .play
-                    }
-                }
+        // tvOS may reassert its spatial choice on the next run-loop turn.
+        DispatchQueue.main.async {
+            guard detailsFocusMoveGeneration == generation else { return }
+            if actionFocus != .play {
+                actionFocus = .play
             }
         }
     }
@@ -2892,10 +2888,6 @@ struct TvDetailsContent: View {
 
 private enum TvDetailsScrollTiming {
     static let duration = 0.3
-    /// The trace shows tvOS needs roughly 35–50 ms to commit programmatic
-    /// focus. Arm the handoff in the scroll's final phase so visible focus and
-    /// the explicit scroll settle together at approximately 300 ms.
-    static let focusHandoffDelay = 0.25
 }
 
 private enum TvDetailsScrollID {
@@ -3068,7 +3060,6 @@ private struct TvDetailsActionRow: View {
     let onTrailerClick: () -> Void
     var focus: FocusState<DetailsActionFocus?>.Binding
     let entryLocked: Bool
-    let playEntryLocked: Bool
     let onFocus: () -> Void
 
     var body: some View {
@@ -3085,7 +3076,6 @@ private struct TvDetailsActionRow: View {
                 onFocus: onFocus,
                 longPressAction: onPlayLongPress
             )
-            .disabled(playEntryLocked)
 
             TvDetailsActionButton(
                 title: nil,
@@ -5004,6 +4994,7 @@ private struct TvStreamPickerOverlay: View {
     /// A torrent stream is being turned into a playable link right now.
     let isResolvingDebrid: Bool
     let onSelect: (NuvioStream, ExternalPlayer?) -> Void
+    var onRefresh: (() -> Void)? = nil
     let onDismiss: () -> Void
 
     /// Filter by stable add-on id (not display name).
@@ -5031,6 +5022,9 @@ private struct TvStreamPickerOverlay: View {
     /// on the All chip; this drives the hand-off once results exist, once.
     @State private var didSeedStreamFocus = false
     @State private var streamBadgeSettings = StreamBadgeSettingsStore.snapshot
+    @State private var showRefreshToast = false
+    @State private var isRefreshing = false
+    @State private var refreshToastTask: Task<Void, Never>?
 
     private let filterAllKey = "filter::all"
     private let sortKey = "filter::sort"
@@ -5103,7 +5097,42 @@ private struct TvStreamPickerOverlay: View {
                     x: canvasWidth - 64 - panelWidth / 2,
                     y: panelCenterY
                 )
+
+                if showRefreshToast {
+                    VStack {
+                        HStack(spacing: 14) {
+                            Image(systemName: "arrow.clockwise")
+                                .font(.system(size: 22, weight: .semibold))
+                                .rotationEffect(.degrees(isRefreshing ? 360 : 0))
+                                .animation(
+                                    isRefreshing
+                                        ? .linear(duration: 0.9).repeatForever(autoreverses: false)
+                                        : .default,
+                                    value: isRefreshing
+                                )
+                            Text(L10n.string("details_refreshing_sources", fallback: "Refreshing sources…"))
+                                .font(.system(size: 22, weight: .semibold))
+                        }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 28)
+                        .padding(.vertical, 14)
+                        .background(.ultraThinMaterial, in: Capsule())
+                        .overlay(
+                            Capsule().stroke(Color.white.opacity(0.15), lineWidth: 1)
+                        )
+                        .padding(.top, 40)
+                        Spacer()
+                    }
+                    .transition(.opacity.combined(with: .move(edge: .top)))
+                    .allowsHitTesting(false)
+                    .zIndex(10)
+                }
             }
+            .background(
+                RemoteUpHoldPressCatcher(isActive: !isResolvingDebrid) {
+                    performRefresh()
+                }
+            )
             // The picker mounts before discovery finishes, so this seed usually
             // lands on the All chip; seedStreamFocusIfNeeded hands focus to the
             // first card once results exist.
@@ -5116,6 +5145,13 @@ private struct TvStreamPickerOverlay: View {
             .onChange(of: listCacheKey) { _, _ in
                 refreshDisplayedStreamsIfNeeded()
                 seedStreamFocusIfNeeded()
+            }
+            .onChange(of: isLoading) { _, loading in
+                if !loading {
+                    withAnimation(.easeInOut(duration: 0.25)) {
+                        isRefreshing = false
+                    }
+                }
             }
             // The focus engine can still reject the seed after grabFocus reads
             // back its own write and stops retrying — e.g. the panel's loading
@@ -5562,6 +5598,111 @@ private struct TvStreamPickerOverlay: View {
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.07) {
             grabFocus(id, attempt: attempt + 1)
         }
+    }
+
+    private func performRefresh() {
+        guard !isResolvingDebrid else { return }
+        didSeedStreamFocus = false
+        isRefreshing = true
+        withAnimation(.easeInOut(duration: 0.25)) {
+            showRefreshToast = true
+        }
+        onRefresh?()
+
+        refreshToastTask?.cancel()
+        refreshToastTask = Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 2_000_000_000)
+            guard !Task.isCancelled else { return }
+            withAnimation(.easeInOut(duration: 0.25)) {
+                isRefreshing = false
+                showRefreshToast = false
+            }
+        }
+    }
+}
+
+private struct RemoteUpHoldPressCatcher: UIViewRepresentable {
+    let isActive: Bool
+    let onHoldUp: () -> Void
+
+    func makeUIView(context: Context) -> UpHoldPressHostView {
+        let view = UpHoldPressHostView()
+        view.configure(isActive: isActive, onHoldUp: onHoldUp)
+        return view
+    }
+
+    func updateUIView(_ uiView: UpHoldPressHostView, context: Context) {
+        uiView.configure(isActive: isActive, onHoldUp: onHoldUp)
+    }
+
+    static func dismantleUIView(_ uiView: UpHoldPressHostView, coordinator: ()) {
+        uiView.removeRecognizers()
+    }
+}
+
+private final class UpHoldPressHostView: UIView, UIGestureRecognizerDelegate {
+    private var onHoldUp: () -> Void = {}
+    private var isActive = true
+    private weak var attachedWindow: UIWindow?
+    private var upHoldRecognizer: UILongPressGestureRecognizer?
+
+    func configure(isActive: Bool, onHoldUp: @escaping () -> Void) {
+        self.isActive = isActive
+        self.onHoldUp = onHoldUp
+        updateRecognizerState()
+    }
+
+    override func didMoveToWindow() {
+        super.didMoveToWindow()
+        removeRecognizers()
+        guard let window else { return }
+
+        let upHold = UILongPressGestureRecognizer(
+            target: self,
+            action: #selector(handleUpHold(_:))
+        )
+        upHold.allowedPressTypes = [NSNumber(value: UIPress.PressType.upArrow.rawValue)]
+        upHold.minimumPressDuration = 0.5
+        upHold.cancelsTouchesInView = false
+        upHold.delegate = self
+        upHold.isEnabled = isActive
+
+        window.addGestureRecognizer(upHold)
+        upHoldRecognizer = upHold
+        attachedWindow = window
+        updateRecognizerState()
+    }
+
+    func removeRecognizers() {
+        if let attachedWindow, let upHoldRecognizer {
+            attachedWindow.removeGestureRecognizer(upHoldRecognizer)
+        }
+        upHoldRecognizer = nil
+        attachedWindow = nil
+    }
+
+    private func updateRecognizerState() {
+        upHoldRecognizer?.isEnabled = isActive
+    }
+
+    @objc private func handleUpHold(_ recognizer: UILongPressGestureRecognizer) {
+        guard isActive else { return }
+        if recognizer.state == .began {
+            onHoldUp()
+        }
+    }
+
+    // MARK: - UIGestureRecognizerDelegate
+
+    func gestureRecognizer(
+        _ gestureRecognizer: UIGestureRecognizer,
+        shouldRecognizeSimultaneouslyWith otherGestureRecognizer: UIGestureRecognizer
+    ) -> Bool {
+        true
+    }
+
+    func gestureRecognizer(_ gestureRecognizer: UIGestureRecognizer, shouldReceive press: UIPress) -> Bool {
+        isActive
     }
 }
 
