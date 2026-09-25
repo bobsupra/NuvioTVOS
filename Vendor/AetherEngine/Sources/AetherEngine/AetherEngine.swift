@@ -4756,6 +4756,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func play() {
+        EngineLog.emit("[AetherEngine] play() state=\(state)", category: .engine)
         // AetherEngine#164: a VOD parked at its final frame (scrubbed to the end, or paused there)
         // cannot advance; AVPlayer.play() would no-op and leave the button frozen. Rewind to the start
         // first, then resume. `.ended` is excluded (see shouldRewindBeforePlay): it stays terminal so a
@@ -4777,6 +4778,7 @@ public final class AetherEngine: ObservableObject {
     }
 
     public func pause() {
+        EngineLog.emit("[AetherEngine] pause() state=\(state)", category: .engine)
         resumeAfterInterruption = false
         activeTransportHost?.pause()
         isBuffering = false

@@ -812,6 +812,7 @@ final class SoftwarePlaybackHost {
             guard self.decodeGeneration == self.seekGeneration else { return }
             // Decoder callback is off-main; SampleBufferRenderer is internally locked.
             self.renderer.enqueue(pixelBuffer: pixelBuffer, pts: pts, hdr10PlusData: hdr10PlusData)
+            self.demuxDiag.noteVideoFrame(generation: self.decodeGeneration)
             // First-frame milestone: demux reached a video packet + decoder produced a pixel buffer.
             if self.bumpFramesEnqueued() == 0 {
                 self.noteFirstFrameEnqueuedForDisplayFallback()
@@ -994,13 +995,20 @@ final class SoftwarePlaybackHost {
         // Resume after pause(): gate on clockArmed, not demuxLoopStarted. A rate change on the
         // un-anchored synchronizer (no media at its clock time yet) wedges the delayed-rate-change
         // machinery permanently frozen; the arming seekClock applies the current lastRate (#107).
-        switch RendererClockResume.onPlay(
+        let resume = SWPlaybackHostResumePolicy.decision(
             hostPaused: pausedByHost,
             clockArmed: clockArmed,
             synchronizerRate: audioOutput?.rate ?? 0,
             rebuffering: demuxDiag.snapshot.rebuffering,
             parkedAtEndOfMedia: didParkClockAtEnd
-        ) {
+        )
+        if resume.clearHostPause {
+            // The user has resumed transport intent, but the clock still belongs to the active
+            // rebuffer hold and waits for media recovery before it can run again.
+            pausedByHost = false
+            _ = takePausedBeforeFirstFrame()
+        }
+        switch resume.clockAction {
         case .resumeHostPause:
             pausedByHost = false
             _ = takePausedBeforeFirstFrame()
@@ -1177,6 +1185,15 @@ final class SoftwarePlaybackHost {
     /// Background-enter (iOS keepalive): keep audio flowing, stop feeding video. The demux loop reads the flag.
     func enterBackgroundAudioOnly() {
         backgroundAudioOnly = true
+        if demuxDiag.snapshot.rebuffering {
+            _ = demuxDiag.setRebuffering(false, generation: seekGeneration)
+            if isPlaying {
+                audioOutput?.setRate(lastRate)
+            } else {
+                // A user pause survives the route change; only the starvation hold is transferred.
+                audioOutput?.pause()
+            }
+        }
     }
 
     /// Foreground return: resume video. Flush the video decoder + renderer (NOT audio) so video resyncs at the
@@ -1204,7 +1221,8 @@ final class SoftwarePlaybackHost {
         // right after load(), before the demux/feeder loop armed the clock, wedged the
         // delayed-rate-change machinery and froze live sessions on the first frame; the arming
         // seekClock picks up lastRate instead (#107).
-        if clockArmed {
+        if SWPlaybackHostResumePolicy.shouldApplyRateChange(
+            clockArmed: clockArmed, rebuffering: demuxDiag.snapshot.rebuffering) {
             audioOutput?.setRate(newRate)
         }
     }
@@ -2346,11 +2364,25 @@ final class SoftwarePlaybackHost {
             }
         }
 
+        func syncRebufferingState() {
+            if let diag { rebuffering = diag.snapshot.rebuffering }
+        }
+
+        func setRebuffering(_ value: Bool) {
+            rebuffering = value
+            _ = diag?.setRebuffering(value, generation: parkedSeekGeneration)
+        }
+
         func releaseRebufferHold(_ why: String) {
+            syncRebufferingState()
             guard rebuffering else { return }
-            rebuffering = false
+            setRebuffering(false)
             EngineLog.emit("[SWHost] releasing rebuffer hold: \(why)", category: .swPlayback)
-            audioOutput?.setRate(currentRate())
+            if isPlaying() {
+                audioOutput?.setRate(currentRate())
+            } else {
+                audioOutput?.pause()
+            }
         }
 
         // #337 on the decoupled path. The lockstep gate arms the clock off the packet it is
@@ -2413,8 +2445,7 @@ final class SoftwarePlaybackHost {
                 armFromParkedVideoIfStuck()
                 drainParkedVideoNonblocking()
                 diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
-                             parked: parkedVideo.count, rebuffering: rebuffering,
-                             generation: parkedSeekGeneration)
+                             parked: parkedVideo.count, generation: parkedSeekGeneration)
                 if stillWaiting() { Thread.sleep(forTimeInterval: 0.005) }
             }
         }
@@ -2425,11 +2456,13 @@ final class SoftwarePlaybackHost {
         // everHadLead latch keeps that from firing on realtime-paced sources that never had
         // a lead to lose.
         func applyAudioClockAction() {
-            guard decoupleAudio, clockArmed(), let aOut = audioOutput else { return }
+            guard decoupleAudio, !backgroundAudioOnly(), clockArmed(), let aOut = audioOutput else { return }
+            syncRebufferingState()
             let lead = lastEnqueuedAudioPtsSec.isFinite
                 ? lastEnqueuedAudioPtsSec - aOut.currentTimeSeconds : 0
             if lead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds { everHadLead = true }
-            guard everHadLead, isPlaying() || rebuffering else { return }
+            guard isPlaying() else { return }
+            guard everHadLead || rebuffering else { return }
             switch AudioLookaheadPolicy.clockAction(
                 rebuffering: rebuffering,
                 lastFedAudioPTS: lastEnqueuedAudioPtsSec,
@@ -2440,7 +2473,7 @@ final class SoftwarePlaybackHost {
                 sourceEnded: false
             ) {
             case .pauseForRebuffer:
-                rebuffering = true
+                setRebuffering(true)
                 EngineLog.emit(
                     "[SWHost] audio lead exhausted (\(String(format: "%.2f", lead))s); "
                     + "pausing clock for rebuffer",
@@ -2448,7 +2481,7 @@ final class SoftwarePlaybackHost {
                 )
                 aOut.pause()
             case .resume:
-                rebuffering = false
+                setRebuffering(false)
                 EngineLog.emit(
                     "[SWHost] rebuffered to \(String(format: "%.2f", lead))s audio lead; "
                     + "resuming clock",
@@ -2513,6 +2546,8 @@ final class SoftwarePlaybackHost {
                     parkedSeekGeneration = gen
                     freeParkedVideo()
                     lastEnqueuedAudioPtsSec = .nan
+                    // audioFlushed already reset the shared state for this generation. Do not
+                    // clear a new-generation hold the independent time tick may have started.
                     rebuffering = false
                     // The lead is zero again after a seek, so the latch has to earn itself back:
                     // keeping it set pauses the clock for a rebuffer on the first post-seek check.
@@ -2792,6 +2827,9 @@ final class SoftwarePlaybackHost {
                     tapSink?(buf)   // #95: mirror before enqueue
                     aOut.enqueue(sampleBuffer: buf)
                 }
+                if !buffers.isEmpty {
+                    diag?.noteAudioProgress(generation: genBeforeRead)
+                }
                 if decoupleAudio, let last = buffers.last {
                     let pts = CMSampleBufferGetPresentationTimeStamp(last)
                     if pts.isValid { lastEnqueuedAudioPtsSec = pts.seconds }
@@ -2828,7 +2866,6 @@ final class SoftwarePlaybackHost {
             }
             diag?.update(lastAudioPts: lastEnqueuedAudioPtsSec,
                          parked: parkedVideo.count,
-                         rebuffering: rebuffering,
                          generation: parkedSeekGeneration)
             if !keepGoing { break }
         }
@@ -2849,6 +2886,7 @@ final class SoftwarePlaybackHost {
                 // still on the pre-seek anchor and would drag the published position backwards.
                 guard !self.seekInFlight else { return }
                 let raw = aOut.currentTimeSeconds
+                self.updateSoftwareClockStarvation(clock: raw)
                 self.emitDiagIfDue(clock: raw)
                 if raw.isFinite, raw >= 0 {
                     self.vodPacketReadAhead?.updatePlayhead(raw)
@@ -2872,6 +2910,49 @@ final class SoftwarePlaybackHost {
                     self.onLiveEdge?(edge)
                 }
             }
+    }
+
+    /// The combined SW demux loop can be asleep inside a source read, so it cannot notice the
+    /// clock outrunning the last decoded media. Sample progress on the host's existing time tick.
+    /// Limit the hold to the decoupled A/V path: a video-only or background-audio renderer can
+    /// depend on its own queue draining to become ready, which a stopped clock would prevent.
+    private func updateSoftwareClockStarvation(clock: Double) {
+        guard !isLive, audioDecoder != nil, !backgroundAudioOnly,
+              clockArmed, isPlaying, !didReachEnd,
+              clock.isFinite, let aOut = audioOutput else { return }
+        let diag = demuxDiag.snapshot
+        let audioLead = diag.lastAudioPts.isFinite ? diag.lastAudioPts - clock : .nan
+        let action = SWSoftwareClockStarvationPolicy.action(
+            clockArmed: clockArmed,
+            isPlaying: isPlaying,
+            seekInFlight: seekInFlight,
+            sourceExhausted: diag.sourceExhausted,
+            hasAudio: audioDecoder != nil,
+            rebuffering: diag.rebuffering,
+            now: ProcessInfo.processInfo.systemUptime,
+            lastMediaProgressAt: diag.lastMediaProgressAt,
+            videoFrameGeneration: diag.videoFrameGeneration,
+            rebufferVideoFrameGeneration: diag.rebufferVideoFrameGeneration,
+            audioLead: audioLead
+        )
+        switch action {
+        case .pauseForRebuffer:
+            guard demuxDiag.setRebuffering(true, generation: seekGeneration) else { return }
+            aOut.pause()
+            EngineLog.emit(
+                "[SWHost] decoded media stalled; pausing clock for rebuffer",
+                category: .swPlayback
+            )
+        case .resume:
+            guard demuxDiag.setRebuffering(false, generation: seekGeneration) else { return }
+            aOut.setRate(lastRate)
+            EngineLog.emit(
+                "[SWHost] decoded media resumed; releasing rebuffer hold",
+                category: .swPlayback
+            )
+        case .none:
+            break
+        }
     }
 
     // MARK: - SW diagnostics (1 Hz)
@@ -3023,6 +3104,9 @@ final class SWPlaybackDiagState: @unchecked Sendable {
     private var _audioFlushGeneration: UInt64 = 0
     private var _parked = 0
     private var _rebuffering = false
+    private var _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
+    private var _videoFrameGeneration: UInt64 = 0
+    private var _rebufferVideoFrameGeneration: UInt64 = 0
     private var _sourceExhausted = false
 
     /// `lastAudioPts` names the newest audio the pump has enqueued, and the pump is the only writer.
@@ -3031,13 +3115,44 @@ final class SWPlaybackDiagState: @unchecked Sendable {
     /// landing parks it until `play()`) republished a PTS the queue no longer held, and the line read
     /// `aLead` as old PTS minus re-anchored clock (475 s in the field). The write carries the
     /// generation the pump produced it under and is refused for the marker when the flush is newer;
-    /// `parked` and `rebuffering` are the pump's own state and stay unconditional.
-    func update(lastAudioPts: Double, parked: Int, rebuffering: Bool, generation: UInt64) {
+    /// `parked` belongs to the pump; clock hold is shared with the host's time-tick monitor.
+    func update(lastAudioPts: Double, parked: Int, generation: UInt64) {
         lock.lock()
         if generation >= _audioFlushGeneration { _lastAudioPts = lastAudioPts }
         _parked = parked
-        _rebuffering = rebuffering
         lock.unlock()
+    }
+
+    /// Audio samples and decoded video frames are usable post-seek progress. The generation check
+    /// rejects callbacks already in flight when a seek flushes the queues.
+    func noteAudioProgress(generation: UInt64) {
+        lock.lock()
+        if generation >= _audioFlushGeneration {
+            _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
+        }
+        lock.unlock()
+    }
+
+    func noteVideoFrame(generation: UInt64) {
+        lock.lock()
+        if generation >= _audioFlushGeneration {
+            _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
+            _videoFrameGeneration &+= 1
+        }
+        lock.unlock()
+    }
+
+    /// The timer and demux loop share the hold. Returns true only for a state transition, so only
+    /// its owner changes the synchronizer rate and duplicate pause/resume calls are avoided.
+    @discardableResult
+    func setRebuffering(_ value: Bool, generation: UInt64? = nil) -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if let generation, generation < _audioFlushGeneration { return false }
+        guard _rebuffering != value else { return false }
+        _rebuffering = value
+        if value { _rebufferVideoFrameGeneration = _videoFrameGeneration }
+        return true
     }
 
     /// The seek path emptied the audio queue: nothing is enqueued, so there is no newest PTS, and
@@ -3047,6 +3162,9 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         if generation >= _audioFlushGeneration {
             _audioFlushGeneration = generation
             _lastAudioPts = .nan
+            _lastMediaProgressAt = ProcessInfo.processInfo.systemUptime
+            _rebuffering = false
+            _rebufferVideoFrameGeneration = _videoFrameGeneration
             _sourceExhausted = false
         }
         lock.unlock()
@@ -3060,9 +3178,80 @@ final class SWPlaybackDiagState: @unchecked Sendable {
         lock.unlock()
     }
 
-    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool, sourceExhausted: Bool) {
+    var snapshot: (lastAudioPts: Double, parked: Int, rebuffering: Bool,
+                   lastMediaProgressAt: Double, videoFrameGeneration: UInt64,
+                   rebufferVideoFrameGeneration: UInt64, sourceExhausted: Bool) {
         lock.lock()
         defer { lock.unlock() }
-        return (_lastAudioPts, _parked, _rebuffering, _sourceExhausted)
+        return (_lastAudioPts, _parked, _rebuffering, _lastMediaProgressAt,
+                _videoFrameGeneration, _rebufferVideoFrameGeneration, _sourceExhausted)
+    }
+}
+
+/// Sustained decoded-media starvation policy for the software playback clock. A progress timeout
+/// avoids treating a realtime-paced source's brief low audio lead as a stall. Existing audio lead
+/// protects already-buffered playback; once held, a fresh post-hold video frame or recovered audio
+/// lead releases the clock.
+enum SWSoftwareClockStarvationPolicy {
+    static let noProgressTimeoutSeconds = 0.75
+
+    static func action(
+        clockArmed: Bool,
+        isPlaying: Bool,
+        seekInFlight: Bool,
+        sourceExhausted: Bool,
+        hasAudio: Bool,
+        rebuffering: Bool,
+        now: Double,
+        lastMediaProgressAt: Double,
+        videoFrameGeneration: UInt64,
+        rebufferVideoFrameGeneration: UInt64,
+        audioLead: Double
+    ) -> AudioLookaheadPolicy.ClockAction {
+        guard clockArmed, !seekInFlight, !sourceExhausted, hasAudio else { return .none }
+        if rebuffering {
+            guard isPlaying else { return .none }
+            let audioRecovered = audioLead.isFinite
+                && audioLead >= AudioLookaheadPolicy.rebufferResumeLeadSeconds
+            let videoRecovered = videoFrameGeneration > rebufferVideoFrameGeneration
+            return audioRecovered || videoRecovered ? .resume : .none
+        }
+        let audioLeadExhausted = !audioLead.isFinite || audioLead <= 0
+        guard isPlaying, audioLeadExhausted, now.isFinite, lastMediaProgressAt.isFinite,
+              now - lastMediaProgressAt >= noProgressTimeoutSeconds
+        else { return .none }
+        return .pauseForRebuffer
+    }
+}
+
+/// Resolves the overlap between a user's explicit pause and a starvation hold. A user `play()`
+/// clears their pause intent while the held synchronizer remains stopped until media recovery.
+enum SWPlaybackHostResumePolicy {
+    struct Decision: Equatable {
+        let clockAction: RendererClockResume.Action
+        let clearHostPause: Bool
+    }
+
+    static func shouldApplyRateChange(clockArmed: Bool, rebuffering: Bool) -> Bool {
+        clockArmed && !rebuffering
+    }
+
+    static func decision(
+        hostPaused: Bool,
+        clockArmed: Bool,
+        synchronizerRate: Float,
+        rebuffering: Bool,
+        parkedAtEndOfMedia: Bool
+    ) -> Decision {
+        let hostPauseOwnsClockResume = hostPaused && !rebuffering
+        return Decision(
+            clockAction: RendererClockResume.onPlay(
+                hostPaused: hostPauseOwnsClockResume,
+                clockArmed: clockArmed,
+                synchronizerRate: synchronizerRate,
+                rebuffering: rebuffering,
+                parkedAtEndOfMedia: parkedAtEndOfMedia),
+            clearHostPause: hostPaused && rebuffering
+        )
     }
 }

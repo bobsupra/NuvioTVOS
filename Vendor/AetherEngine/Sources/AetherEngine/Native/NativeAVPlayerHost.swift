@@ -666,6 +666,7 @@ final class NativeAVPlayerHost {
         }
         timeControlObservation = avPlayer.observe(\.timeControlStatus, options: [.new]) { [weak self] player, _ in
             let status = player.timeControlStatus
+            let rate = player.rate
             let statusStr: String
             switch status {
             case .paused:                          statusStr = "paused"
@@ -675,9 +676,9 @@ final class NativeAVPlayerHost {
             }
             let reason = player.reasonForWaitingToPlay?.rawValue ?? "-"
             let elapsed = Double(DispatchTime.now().uptimeNanoseconds - (self?.loadStartTime ?? DispatchTime.now()).uptimeNanoseconds) / 1_000_000_000
-            EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) t+\(String(format: "%.2f", elapsed))s", category: .engine)
             Task { @MainActor in
                 guard let self, self.sessionID == sid else { return }
+                EngineLog.emit("[NativeAVPlayerHost] #\(sid) timeControlStatus=\(statusStr) reason=\(reason) transportIntentIsPlaying=\(self.transportIntentIsPlaying) rate=\(rate) t+\(String(format: "%.2f", elapsed))s", category: .engine)
                 // AE#287: swallow the pause AVPlayer takes while a premature-end recovery re-seeks.
                 if status == .paused, self.prematureEndRecoveryInFlight { return }
                 self.timeControlStatus = status
@@ -1630,12 +1631,14 @@ final class NativeAVPlayerHost {
     func play() {
         // Set intent before play() so readyToPlay observer can re-assert if the replaceCurrentItem swap swallowed it.
         playIntent = true
+        EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) play() transportIntentIsPlaying=true", category: .engine)
         // Call play() immediately (no defer-until-ready): item.status never advances past .unknown until AVPlayer is told to play.
         avPlayer.play()
     }
 
     func pause() {
         playIntent = false
+        EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) pause() transportIntentIsPlaying=false", category: .engine)
         avPlayer.pause()
     }
 
@@ -1881,6 +1884,9 @@ final class NativeAVPlayerHost {
     func setRate(_ value: Float) {
         // Non-zero rate counts as play intent (must survive replaceCurrentItem swap like play() does).
         playIntent = (value != 0)
+        if value == 0 {
+            EngineLog.emit("[NativeAVPlayerHost] #\(sessionID) setRate(0) transportIntentIsPlaying=false", category: .engine)
+        }
         // #436: `play()` is rate 1.0 by definition, and it is re-issued from paths no client can see:
         // the readyToPlay re-assert after an item swap, interruption and background resume, the #287
         // premature-end recovery, plus AVKit's own transport and the remote command centre calling
