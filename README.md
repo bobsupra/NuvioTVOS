@@ -48,22 +48,23 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.3.7** is the latest tvOS release.
+**Beta 3.3.8** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.7/NuvioTV-3.3.7-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.7) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.3.8/NuvioTV-3.3.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.3.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 200+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 200+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.3.7
+### New in Beta 3.3.8
 
-- **High-Throughput Stream Caching:** Integrated local disk and memory proxy server to pre-buffer media segments with customizable cache ceilings.
-- **Direct Jellyfin & SMB Media Indexing:** Enhanced directory traversal, metadata matching, and resume point sync for local SMB shares and Jellyfin servers.
-- **Intro & Outro Auto-Skip:** Automated skip triggers powered by IntroDB integration for seamless series binge-watching.
-- **Playback Engine & Buffering Polish:** Hardened controller lifecycles and seamless recovery from momentary network fluctuations.
-- **AltStore, SideStore & Feather Repository Feed:** Updated `apps.json` multi-source feed with complete release history and verified bundle sizes.
+- **Native ASS/SSA Typeset Subtitles:** Integrated `SwiftAssRenderer` with frame-synchronized rendering of complex stylized typography, karaoke, dialogue styling, and custom font positioning directly over video in AetherEngine.
+- **Dynamic Stream Caching & MPV Bridge:** Forward-lead prefetching with intelligent buffer ceilings and an MPV protocol bridge for unified caching across both playback engines.
+- **Structured Playback Diagnostics & Error Insights:** Clear classification and user-friendly diagnostics on stream failures, plus real-time framerate and buffer telemetry in the debug HUD.
+- **Intelligent Backend Routing & Anime Detection:** Automatic anime categorization and metadata heuristics to route playback seamlessly to optimal rendering pipelines.
+- **Complete App Localization (4,000+ New Strings):** Full translations covering all UI components, settings sections, player controls, dialogs, and error messages.
+- **Details Screen & Navigation Polish:** Asynchronous metadata loading, refined season/episode transitions, fluid 60fps catalog browsing, and instant settings synchronization.
 
 ### Built-in Player
 
