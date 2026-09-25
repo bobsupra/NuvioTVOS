@@ -33,6 +33,7 @@
 
 ### UI, Details & Navigation Polish
 
+- **Hold Up to Refresh Sources:** In the stream/source picker overlay, press and hold the **Up arrow button** on the Siri Remote (≥ 0.5s) to instantly refresh and re-fetch stream sources with an animated feedback toast.
 - **Async Details Screen:** Implemented asynchronous background loading, season/episode tab transitions, and rich cast/crew credits in `DetailsScreen.swift` and `DetailsViewModel.swift`.
 - **Catalog Navigation & Focus Restoration:** Polished horizontal row transitions in `TVCatalogRow.swift`, library views, and native search overlays for fluid 60fps Apple TV navigation.
 - **Continue Watching & Sync Refinements:** Streamlined `ContinueWatchingBuilder.swift` and `NuvioSyncService.swift` with robust merge deduplication and instant settings synchronization.
