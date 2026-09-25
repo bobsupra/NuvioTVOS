@@ -17,11 +17,13 @@ struct PlayerProgressTrack: View {
     /// When true, the track is a frosted glass capsule (one bar, not glassEffect).
     var glassTrack: Bool = false
 
+    @State private var animatedBuffered: Double = 0
+
     var body: some View {
         GeometryReader { geo in
             let w = geo.size.width
             let p = CGFloat(min(max(played, 0), 1))
-            let b = CGFloat(min(max(buffered, 0), 1))
+            let b = CGFloat(min(max(animatedBuffered, 0), 1))
             let h = emphasized ? height + 2 : height
 
             ZStack(alignment: .leading) {
@@ -73,6 +75,28 @@ struct PlayerProgressTrack: View {
         }
         .frame(height: emphasized ? height + 6 : height + 4)
         .animation(.easeOut(duration: 0.16), value: emphasized)
+        .onAppear {
+            animatedBuffered = buffered
+        }
+        .onChange(of: buffered) { newBuffered in
+            updateAnimatedBuffered(to: newBuffered)
+        }
+    }
+
+    private func updateAnimatedBuffered(to target: Double) {
+        // If buffer reset or jumped backwards (e.g. seek / track reload), snap without animation
+        if target < animatedBuffered || animatedBuffered == 0 {
+            var transaction = Transaction()
+            transaction.animation = nil
+            withTransaction(transaction) {
+                animatedBuffered = target
+            }
+        } else {
+            // Smoothly interpolate forward from current presentation position to new target
+            withAnimation(.easeOut(duration: 0.45)) {
+                animatedBuffered = target
+            }
+        }
     }
 }
 

@@ -173,10 +173,16 @@ struct PlaybackDebugHUDView: View {
 
             VStack(alignment: .leading, spacing: 3) {
                 hudRow(
-                    label: "Buffer",
+                    label: "RAM buffer",
                     value: info.buffer.isEmpty ? "--" : info.buffer,
                     hasDot: true,
                     dotColor: (info.buffer.contains("cushion") || info.bufferSeconds >= 1.0) ? .green : (info.bufferSeconds > 0 ? .yellow : .green)
+                )
+                hudRow(
+                    label: "Disk cache",
+                    value: info.diskBuffer.isEmpty ? "--" : info.diskBuffer,
+                    hasDot: true,
+                    dotColor: info.diskBufferSeconds >= 10.0 ? .green : (info.diskBufferSeconds > 0 ? .yellow : .gray)
                 )
                 hudRow(label: "Speed", value: info.speed.isEmpty ? "est 199.0 Mbit/s" : info.speed, hasDot: true, dotColor: .green)
                 hudRow(label: "Ping", value: info.ping.isEmpty ? "7 ms" : info.ping, hasDot: true, dotColor: .green)

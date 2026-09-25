@@ -1892,7 +1892,7 @@ struct PlayerSettingsPanel: View {
     /// alphabetically. Preserve the stream's original order within a language
     /// so commentary/Atmos/stereo variants do not jump around unexpectedly.
     private var orderedAudioTracks: [AudioTrack] {
-        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage()
+        let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: viewModel.activeMeta)
         return viewModel.audioTracks.enumerated().sorted { lhs, rhs in
             let lhsPreferred = preferred.map { audioTrack(lhs.element, matches: $0) } ?? false
             let rhsPreferred = preferred.map { audioTrack(rhs.element, matches: $0) } ?? false

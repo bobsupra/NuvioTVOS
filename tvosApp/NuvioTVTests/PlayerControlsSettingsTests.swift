@@ -865,6 +865,85 @@ extension PlayerControlsSettingsTests {
         XCTAssertEqual(model.aspectMode, .fit)
         XCTAssertEqual(PlayerAspectMode.current, .fit)
     }
+
+    func testPreferredAudioLanguageOriginal() {
+        let defaults = UserDefaults(suiteName: "PreferredAudioLanguageTestsDefaults")!
+        defaults.removePersistentDomain(forName: "PreferredAudioLanguageTestsDefaults")
+
+        // 1. Settings options contains "Original"
+        XCTAssertTrue(SubtitleLanguagePreferences.audioSettingsOptions.contains("Original"))
+        XCTAssertTrue(SubtitleLanguagePreferences.audioSettingsOptions.contains("System"))
+
+        // 2. Setting preferred audio language to "Original"
+        defaults.set("Original", forKey: SettingsKey.audioLanguage)
+
+        // Meta with explicit language "ko" (Korean)
+        let koreanMeta = NuvioMeta(
+            id: "movie-1", name: "Parasite", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil,
+            imdbId: nil, tmdbId: nil, type: "movie", year: 2019,
+            genres: nil, rating: nil, releaseInfo: nil, runtime: nil,
+            cast: nil, director: nil, writer: nil, certification: nil,
+            country: "KR", language: "ko", released: nil
+        )
+        XCTAssertEqual(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: koreanMeta, defaults: defaults),
+            "Korean"
+        )
+
+        // Meta with explicit language "ja" (Japanese)
+        let japaneseMeta = NuvioMeta(
+            id: "movie-2", name: "Spirited Away", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil,
+            imdbId: nil, tmdbId: nil, type: "movie", year: 2001,
+            genres: nil, rating: nil, releaseInfo: nil, runtime: nil,
+            cast: nil, director: nil, writer: nil, certification: nil,
+            country: "JP", language: "ja", released: nil
+        )
+        XCTAssertEqual(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: japaneseMeta, defaults: defaults),
+            "Japanese"
+        )
+
+        // Meta with isAnime and no language specified
+        let animeMeta = NuvioMeta(
+            id: "anime-1", name: "Attack on Titan", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil,
+            imdbId: nil, tmdbId: nil, type: "anime", year: 2013,
+            genres: ["Anime"], rating: nil, releaseInfo: nil, runtime: nil,
+            cast: nil, director: nil, writer: nil, certification: nil,
+            country: nil, language: nil, released: nil
+        )
+        XCTAssertEqual(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: animeMeta, defaults: defaults),
+            "Japanese"
+        )
+
+        // Meta without language or anime
+        let unknownMeta = NuvioMeta(
+            id: "other-1", name: "Unknown", description: nil,
+            posterUrl: nil, backgroundUrl: nil, logoUrl: nil,
+            imdbId: nil, tmdbId: nil, type: "movie", year: nil,
+            genres: nil, rating: nil, releaseInfo: nil, runtime: nil,
+            cast: nil, director: nil, writer: nil, certification: nil,
+            country: nil, language: nil, released: nil
+        )
+        XCTAssertNil(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: unknownMeta, defaults: defaults)
+        )
+
+        // Nil meta
+        XCTAssertNil(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: nil, defaults: defaults)
+        )
+
+        // When preferred language is explicit (e.g. "French"), it overrides meta
+        defaults.set("French", forKey: SettingsKey.audioLanguage)
+        XCTAssertEqual(
+            SubtitleLanguagePreferences.preferredAudioLanguage(meta: koreanMeta, defaults: defaults),
+            "French"
+        )
+    }
 }
 
 

@@ -226,7 +226,7 @@ class PlayerViewModel: ObservableObject {
     private var hasLoaded = false
     private var didShutdown = false
     private var isTrailerPlaybackSession = false
-    private var activeMeta: NuvioMeta?
+    var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
     private var activeHTTPHeaders: [String: String] = [:]
     private var activePlaybackOrigin: PlaybackOrigin = .main
@@ -345,6 +345,8 @@ class PlayerViewModel: ObservableObject {
     private var nudgeStreak = 0
     private var didConfigureWheelTracking = false
     private var diskCachedBufferedPosition: Double = 0
+    private var diskCachedBytes: Int64 = 0
+    private var diskCacheTotalBytes: Int64 = 0
     private var diskCachePollTask: Task<Void, Never>?
 
     /// Best estimate of the real title's length, captured at load time from the
@@ -824,7 +826,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func preferredAudioLanguageCodes() -> [String] {
-        SubtitleLanguagePreferences.preferredAudioLanguage().map { [$0] } ?? []
+        SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta).map { [$0] } ?? []
     }
 
     private func preferredSubtitleLanguageCodes() -> [String] {
@@ -1764,7 +1766,20 @@ class PlayerViewModel: ObservableObject {
             let (ext, name) = Self.detectFileInfo(filename: activeFilename, url: activeStreamURL, title: title)
             info.fileExtension = ext
             info.fileName = name
-            info.size = Self.formatFileSize(activeVideoSize)
+            let resolvedSize = activeVideoSize ?? (diskCacheTotalBytes > 0 ? diskCacheTotalBytes : nil)
+            info.size = Self.formatFileSize(resolvedSize)
+            if (info.loaded == "--" || info.loaded == "0 MB" || info.loaded.isEmpty) && diskCachedBytes > 0 {
+                info.loaded = ByteCountFormatter.string(fromByteCount: diskCachedBytes, countStyle: .file)
+            }
+            let diskLeadAhead = max(0, diskCachedBufferedPosition - clock.position)
+            if diskLeadAhead > 0 {
+                if diskLeadAhead >= 60 {
+                    info.diskBuffer = String(format: "%.1f s ahead (%.1f min)", diskLeadAhead, diskLeadAhead / 60.0)
+                } else {
+                    info.diskBuffer = String(format: "%.1f s ahead", diskLeadAhead)
+                }
+                info.diskBufferSeconds = diskLeadAhead
+            }
         }
     }
 
@@ -1919,13 +1934,18 @@ class PlayerViewModel: ObservableObject {
            !isPreSeekSettlingSample,
            latestTime.duration > 0,
            latestTime.current >= 0,
-           latestTime.current < latestTime.duration,
-           (!showSettingsPanel ||
-            Int(latestTime.current) != Int(time.current) ||
-            latestTime.duration != time.duration) {
-            if latestTime != time { time = latestTime }
-            // Keep the high-frequency clock in sync for scrub/seek HUDs even when
-            // the coarser `time` publication is throttled by the settings panel.
+           latestTime.current < latestTime.duration {
+            // The settings panel does not display coarse playback time. Publish at most
+            // once per displayed second while it is open, while the controller is
+            // still polled at 4 Hz for playback/error handling.
+            if !showSettingsPanel ||
+                Int(latestTime.current) != Int(time.current) ||
+                latestTime.duration != time.duration {
+                if latestTime != time { time = latestTime }
+            }
+
+            // High-frequency clock and disk cache polling must ALWAYS update live,
+            // even when paused or when the settings HUD is open.
             if clock.position != latestTime.current { clock.position = latestTime.current }
             if clock.duration != latestTime.duration { clock.duration = latestTime.duration }
             let engineBufferedSeconds = Double(c.bufferedMs) / 1000.0
@@ -1935,15 +1955,28 @@ class PlayerViewModel: ObservableObject {
             if diskCachePollTask == nil, latestTime.duration > 0 {
                 let currentPos = latestTime.current
                 let duration = latestTime.duration
+                let engineBuffered = engineBufferedSeconds
                 diskCachePollTask = Task { @MainActor [weak self] in
                     let forwardSec = await PlaybackStreamCacheManager.shared.contiguousCachedForwardSeconds(
                         playheadSeconds: currentPos, totalDuration: duration
                     )
+                    let metrics = await PlaybackStreamCacheManager.shared.activeStreamMetrics()
                     guard let self else { return }
+                    if let metrics {
+                        self.diskCachedBytes = metrics.cachedBytes
+                        self.diskCacheTotalBytes = metrics.totalBytes
+                        if self.activeVideoSize == nil && metrics.totalBytes > 0 {
+                            self.activeVideoSize = metrics.totalBytes
+                        }
+                    }
                     if forwardSec > 0 {
                         self.diskCachedBufferedPosition = min(duration, currentPos + forwardSec)
                     } else {
                         self.diskCachedBufferedPosition = 0
+                    }
+                    let updatedBuffered = max(engineBuffered, self.diskCachedBufferedPosition)
+                    if self.clock.buffered != updatedBuffered {
+                        self.clock.buffered = updatedBuffered
                     }
                     try? await Task.sleep(nanoseconds: 500_000_000)
                     self.diskCachePollTask = nil
@@ -3483,7 +3516,7 @@ class PlayerViewModel: ObservableObject {
 
     private func applyAudioPreferenceIfNeeded() {
         guard !didApplyAudioPreference, pendingTrackSelection?.audio == nil else { return }
-        guard let preferred = SubtitleLanguagePreferences.preferredAudioLanguage() else {
+        guard let preferred = SubtitleLanguagePreferences.preferredAudioLanguage(meta: activeMeta) else {
             didApplyAudioPreference = true
             return
         }
@@ -4162,6 +4195,7 @@ class PlayerViewModel: ObservableObject {
             }
             lastSavedProgressPosition = progressTime.current
             lastProgressSave = Date()
+            NuvioSyncManager.current?.flushPendingPushes()
             return
         }
 
@@ -4224,6 +4258,10 @@ class PlayerViewModel: ObservableObject {
         // Ending start / 90% — checkmark without sitting through the credits.
         if completesPlayback {
             markWatchedIfNeeded()
+        }
+
+        if force || completesPlayback {
+            NuvioSyncManager.current?.flushPendingPushes()
         }
     }
 
