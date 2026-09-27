@@ -1,7 +1,12 @@
 name: Build IPA
 
 on:
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch (or tag/SHA) to check out and build
+        required: true
+        type: string
 
 jobs:
   build:
@@ -10,6 +15,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.ref }}
           submodules: recursive
 
       - name: Select newest available Xcode
@@ -33,7 +39,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
           "$HOME/.local/bin/mise" install
 
-      - name: Build IPA
+      - name: Build unsigned IPA
         run: bash scripts/build-ipa.sh
 
       - name: Upload IPA
