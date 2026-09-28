@@ -1,0 +1,50 @@
+name: Build IPA
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Branch (or tag/SHA) to check out and build
+        required: true
+        type: string
+
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+          submodules: recursive
+
+      - name: Select newest available Xcode
+        run: |
+          echo "Xcode versions installed on this runner:"
+          ls -d /Applications/Xcode*.app
+          latest="$(ls -d /Applications/Xcode_*.app 2>/dev/null | sort -V | tail -1)"
+          if [ -z "$latest" ]; then
+            echo "No versioned Xcode_*.app found; falling back to /Applications/Xcode.app"
+            latest="/Applications/Xcode.app"
+          fi
+          echo "Selecting: $latest"
+          sudo xcode-select -s "$latest"
+          xcodebuild -version
+
+      - name: Install mise
+        run: curl https://mise.run | sh
+
+      - name: Install pinned tool versions (Tuist)
+        run: |
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+          "$HOME/.local/bin/mise" install
+
+      - name: Build IPA
+        run: bash scripts/build-ipa.sh
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: NuvioTV-unsigned-ipa
+          path: build-ipa/*.ipa
+          if-no-files-found: error
