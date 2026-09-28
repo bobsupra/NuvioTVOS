@@ -509,11 +509,15 @@ final class PlaybackStreamDiskBudget: @unchecked Sendable {
             }
             sessions.append((directory, values.contentModificationDate ?? .distantPast, bytes))
         }
-        let currentBytes = sessions.first { $0.url == current }?.bytes ?? 0
-        var otherBytes = sessions.filter { $0.url != current }.reduce(Int64(0)) { $0 + $1.bytes }
+        let currentPath = current.resolvingSymlinksInPath().standardizedFileURL.path
+        let isCurrentSession: (URL) -> Bool = { url in
+            url.resolvingSymlinksInPath().standardizedFileURL.path == currentPath
+        }
+        let currentBytes = sessions.first { isCurrentSession($0.url) }?.bytes ?? 0
+        var otherBytes = sessions.filter { !isCurrentSession($0.url) }.reduce(Int64(0)) { $0 + $1.bytes }
         let provider = freeSpaceProvider ?? { dir in PlaybackStreamDiskCache.volumeFreeSpace(at: dir) }
 
-        for session in sessions.filter({ $0.url != current }).sorted(by: { $0.date < $1.date }) {
+        for session in sessions.filter({ !isCurrentSession($0.url) }).sorted(by: { $0.date < $1.date }) {
             let volumeFree = provider(root)
             let isOverBudget = currentBytes + otherBytes > limit
             let isUnderReserve = volumeFree >= 0 && volumeFree < freeSpaceReserve
