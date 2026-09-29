@@ -60,7 +60,7 @@ jobs:
               "Policy check",
               "Scope boundaries",
               "Testing",
-              "Screenshots / Video",
+              "Screenshots / Video (UI changes only)",
               "Breaking changes",
               "Linked issues",
             ];
