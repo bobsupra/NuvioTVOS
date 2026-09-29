@@ -167,9 +167,18 @@ extension PlayerView {
                     && !viewModel.isHoldingSeek
                     && viewModel.pendingSeekDelta == 0
             },
-            onBegan: { viewModel.remoteTouchBegan() },
-            onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
-            onEnded: { dx, dy in viewModel.remoteTouchEnded(dx: dx, dy: dy) }
+            onBegan: {
+                print("[ScreensaverDebug][Input] RemoteTouchCatcher onBegan: isWaking=\(isWakingFromBackground), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                viewModel.remoteTouchBegan()
+            },
+            onMoved: { dx, dy in
+                print("[ScreensaverDebug][Input] RemoteTouchCatcher onMoved dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
+                viewModel.remoteTouchMoved(dx: dx, dy: dy)
+            },
+            onEnded: { dx, dy in
+                print("[ScreensaverDebug][Input] RemoteTouchCatcher onEnded dx=\(dx) dy=\(dy): isWaking=\(isWakingFromBackground), status=\(viewModel.status)")
+                viewModel.remoteTouchEnded(dx: dx, dy: dy)
+            }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
@@ -186,9 +195,18 @@ extension PlayerView {
                 && viewModel.sidePanel == nil
                 && !viewModel.isScrubbing
                 && !viewModel.postPlayState.isVisible,
-            onBeginBackward: { viewModel.beginRepeatingSkipBackward() },
-            onBeginForward: { viewModel.beginRepeatingSkipForward() },
-            onEnd: { viewModel.stopRepeatingSkip() }
+            onBeginBackward: {
+                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginBackward: isWaking=\(isWakingFromBackground)")
+                viewModel.beginRepeatingSkipBackward()
+            },
+            onBeginForward: {
+                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onBeginForward: isWaking=\(isWakingFromBackground)")
+                viewModel.beginRepeatingSkipForward()
+            },
+            onEnd: {
+                print("[ScreensaverDebug][Input] RemoteSeekPressCatcher onEnd: isWaking=\(isWakingFromBackground)")
+                viewModel.stopRepeatingSkip()
+            }
         )
         .allowsHitTesting(false)
         .frame(width: 0, height: 0)
@@ -248,7 +266,12 @@ extension PlayerView {
             )
             .focused($remoteInputFocused)
             .onTapGesture {
-                guard !isWakingFromBackground else { return }
+                let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
+                print("[ScreensaverDebug][Input] onTapGesture: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), isScrubbing=\(viewModel.isScrubbing), showPauseOverlay=\(viewModel.showPauseOverlay), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                guard !isWakingFromBackground else {
+                    print("[ScreensaverDebug][Input] onTapGesture suppressed by isWakingFromBackground")
+                    return
+                }
                 if viewModel.isScrubbing {
                     viewModel.commitScrub()
                 } else if viewModel.showPauseOverlay {
@@ -258,7 +281,12 @@ extension PlayerView {
                 }
             }
             .onMoveCommand { direction in
-                guard !isWakingFromBackground else { return }
+                let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
+                print("[ScreensaverDebug][Input] onMoveCommand direction=\(direction): isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), showPauseOverlay=\(viewModel.showPauseOverlay), showControls=\(viewModel.showControls), status=\(viewModel.status)")
+                guard !isWakingFromBackground else {
+                    print("[ScreensaverDebug][Input] onMoveCommand suppressed by isWakingFromBackground")
+                    return
+                }
                 if viewModel.moveSuppressed { return }
                 if viewModel.showPauseOverlay {
                     viewModel.revealControls()

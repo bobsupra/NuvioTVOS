@@ -421,6 +421,205 @@ final class MdbListScrobbleTests: XCTestCase {
         )
     }
 
+    func testPreservingEnrichmentRetainsRatingsAndCredits() {
+        let ratings = [
+            NuvioExternalRating(source: "imdb", value: 8.4),
+            NuvioExternalRating(source: "tomatoes", value: 92.0)
+        ]
+        let enriched = NuvioMeta(
+            id: "tt1234567",
+            name: "Test Movie",
+            description: "Initial description",
+            posterUrl: "https://example.com/poster.jpg",
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt1234567",
+            tmdbId: 100,
+            type: "movie",
+            year: 2024,
+            genres: ["Action"],
+            rating: 8.4,
+            releaseInfo: "2024",
+            runtime: "120 min",
+            cast: ["Actor A", "Actor B"],
+            director: ["Director A"],
+            writer: ["Writer A"],
+            certification: "PG-13",
+            country: "US",
+            language: "en",
+            released: "2024-01-01",
+            status: "Released",
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: ratings
+        )
+
+        let freshRaw = NuvioMeta(
+            id: "tt1234567",
+            name: "Test Movie Full",
+            description: "Full description",
+            posterUrl: "https://example.com/poster.jpg",
+            backgroundUrl: "https://example.com/bg.jpg",
+            logoUrl: "https://example.com/logo.png",
+            imdbId: "tt1234567",
+            tmdbId: 100,
+            type: "movie",
+            year: 2024,
+            genres: ["Action", "Adventure"],
+            rating: 8.4,
+            releaseInfo: "2024",
+            runtime: "120 min",
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: "PG-13",
+            country: "US",
+            language: "en",
+            released: "2024-01-01",
+            status: "Released",
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+
+        let resolved = freshRaw.preservingEnrichment(from: enriched)
+        XCTAssertEqual(resolved.id, "tt1234567")
+        XCTAssertEqual(resolved.name, "Test Movie Full")
+        XCTAssertEqual(resolved.description, "Full description")
+        XCTAssertEqual(resolved.externalRatings, ratings, "MDBList external ratings must be preserved")
+        XCTAssertEqual(resolved.cast, ["Actor A", "Actor B"], "Cast credits must be preserved when raw has nil")
+        XCTAssertEqual(resolved.director, ["Director A"], "Director credits must be preserved when raw has nil")
+        XCTAssertEqual(resolved.writer, ["Writer A"], "Writer credits must be preserved when raw has nil")
+    }
+
+    func testPreservingEnrichmentIgnoresDifferentID() {
+        let ratings = [NuvioExternalRating(source: "imdb", value: 8.4)]
+        let itemA = NuvioMeta(
+            id: "tt0000001",
+            name: "Movie A",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0000001",
+            tmdbId: 1,
+            type: "movie",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: ["Actor A"],
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: ratings
+        )
+
+        let itemB = NuvioMeta(
+            id: "tt0000002",
+            name: "Movie B",
+            description: nil,
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt0000002",
+            tmdbId: 2,
+            type: "movie",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+
+        let resolved = itemB.preservingEnrichment(from: itemA)
+        XCTAssertNil(resolved.externalRatings)
+        XCTAssertNil(resolved.cast)
+    }
+
+    func testDetailsViewModelPreservesMdbListRatingsDuringMetadataLoad() async {
+        let repository = MdbListControlledDetailsRepo()
+        let ratings = [
+            NuvioExternalRating(source: "imdb", value: 7.9),
+            NuvioExternalRating(source: "tomatoes", value: 88.0)
+        ]
+
+        let viewModel = DetailsViewModel(
+            repository: repository,
+            streamDiscoveryMode: .repository,
+            deferredPreparationDelay: { },
+            enrichmentStarter: { meta, gen in }
+        )
+
+        // Seed initial cached metadata
+        let initialMeta = NuvioMeta(
+            id: "tt9999999",
+            name: "Initial Cached Title",
+            description: "Cached description",
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: "tt9999999",
+            tmdbId: 999,
+            type: "movie",
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        )
+        repository.cacheCatalogMetadata(initialMeta)
+
+        let waiter = expectation(description: "metadata waiter")
+        repository.metadataWaiterEntered = { _ in waiter.fulfill() }
+
+        let loadTask = viewModel.loadDetails(id: "tt9999999", type: "movie")
+        await fulfillment(of: [waiter], timeout: 2)
+
+        // Simulate MDBList rating enrichment finishing while getMetadata is still in-flight
+        if let currentMeta = viewModel.uiState.meta {
+            viewModel.applyMdbRatingsForTesting(ratings, for: "tt9999999")
+        }
+        XCTAssertEqual(viewModel.uiState.meta?.externalRatings, ratings, "Ratings should appear in UI state")
+
+        // Now full metadata finishes loading and returns raw metadata without externalRatings
+        repository.release(id: "tt9999999")
+        await loadTask.value
+
+        // External ratings must NOT have disappeared
+        XCTAssertEqual(viewModel.uiState.meta?.externalRatings, ratings, "MDBList ratings must NOT disappear after getMetadata finishes")
+        XCTAssertEqual(viewModel.uiState.meta?.name, "tt9999999-full", "Full metadata name should update")
+    }
+
     private static func meta(id: String, type: String) -> NuvioMeta {
         mdbListTestMetadata(id: id, type: type, runtime: nil)
     }
@@ -505,6 +704,58 @@ private final class MdbListCatalogRepository: MockCatalogRepository {
             type: type,
             runtime: id == "tmdb:1399" ? "45 min" : "100 min"
         )
+    }
+}
+
+private final class MdbListControlledDetailsRepo: MockCatalogRepository {
+    var metadataWaiterEntered: ((String) -> Void)?
+    private let waiterLock = NSLock()
+    private var waiters: [String: [CheckedContinuation<NuvioMeta, Never>]] = [:]
+
+    override func getMetadata(id: String, type: String) async throws -> NuvioMeta {
+        await withCheckedContinuation { (continuation: CheckedContinuation<NuvioMeta, Never>) in
+            waiterLock.lock()
+            waiters[id, default: []].append(continuation)
+            waiterLock.unlock()
+            metadataWaiterEntered?(id)
+        }
+    }
+
+    override func getStreams(id: String, type: String) async throws -> [NuvioStream] {
+        []
+    }
+
+    func release(id: String, type: String = "movie") {
+        waiterLock.lock()
+        let waiter = waiters[id]?.popLast()
+        waiterLock.unlock()
+        waiter?.resume(returning: NuvioMeta(
+            id: id,
+            name: "\(id)-full",
+            description: "Full metadata",
+            posterUrl: nil,
+            backgroundUrl: nil,
+            logoUrl: nil,
+            imdbId: id,
+            tmdbId: 100,
+            type: type,
+            year: 2024,
+            genres: nil,
+            rating: nil,
+            releaseInfo: nil,
+            runtime: nil,
+            cast: nil,
+            director: nil,
+            writer: nil,
+            certification: nil,
+            country: nil,
+            language: nil,
+            released: nil,
+            status: nil,
+            videos: nil,
+            trailerYtIds: nil,
+            externalRatings: nil
+        ))
     }
 }
 

@@ -264,6 +264,7 @@ enum SettingsKey {
     static let streamAutoPlayReuseBingeGroup = "nuvio.tv.settings.playback.streamAutoPlayReuseBingeGroup"
     static let postPlayRecommendationsEnabled = "nuvio.tv.settings.playback.postPlayRecommendationsEnabled"
     static let trailersEnabled = "nuvio.tv.settings.playback.trailersEnabled"
+    static let backgroundTrailersEnabled = "nuvio.tv.settings.playback.backgroundTrailersEnabled"
     static let trailerPreviewSound = "nuvio.tv.settings.playback.trailerPreviewSound"
     static let trailerDelay = "nuvio.tv.settings.playback.trailerDelay"
     static let focusedPosterBackdropEnabled = "nuvio.tv.settings.playback.focusedPosterBackdropEnabled"
@@ -341,7 +342,7 @@ enum SettingsKey {
         jellyfinServers, jellyfinLibraryIndex, jellyfinLocalRowEnabled,
         playerEngine, trickplayServer, externalPlayer, smartStreamSelection, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         cachedOnlyStreams, preferHardwareDecodedStreams, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        autoPlayNext, autoPlayNextCountdown, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, trailerPreviewSound, trailerDelay,
+        autoPlayNext, autoPlayNextCountdown, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections,
@@ -6626,6 +6627,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
+    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = false
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
     @AppStorage(SettingsKey.audioLanguage) private var audioLanguage = "System"
@@ -6969,6 +6971,15 @@ private struct PlaybackSettingsView: View {
                 )
 
                 SettingsToggleRow(
+                    title: L10n.string("tvos_settings_background_trailers", fallback: "Background Trailers"),
+                    subtitle: L10n.string("tvos_settings_background_trailers_subtitle", fallback: "Play automatic trailers in the background on detail pages"),
+                    isOn: $backgroundTrailersEnabled,
+                    accentColor: accentColor
+                )
+                .opacity(trailersEnabled ? 1 : 0.46)
+                .disabled(!trailersEnabled)
+
+                SettingsToggleRow(
                     title: L10n.string("tvos_settings_trailer_preview_sound", fallback: "Trailer Preview Sound"),
                     subtitle: L10n.string("tvos_settings_play_sound_for_focused_card_trailers", fallback: "Play sound for focused-card trailers"),
                     isOn: $trailerPreviewSound,
@@ -6981,7 +6992,7 @@ private struct PlaybackSettingsView: View {
                     title: L10n.string("tvos_settings_trailer_delay", fallback: "Trailer Delay"),
                     subtitle: L10n.string("tvos_settings_seconds_before_autoplay_starts", fallback: "Seconds before autoplay starts"),
                     value: $trailerDelay,
-                    range: 0...10,
+                    range: 0...15,
                     step: 1,
                     suffix: "s",
                     accentColor: accentColor

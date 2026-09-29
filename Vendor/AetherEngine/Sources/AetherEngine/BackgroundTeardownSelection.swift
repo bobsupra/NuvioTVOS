@@ -25,12 +25,15 @@ extension AetherEngine {
     /// Park the current selection for the reload that follows this teardown. Called by both #127
     /// teardown paths (grace expiry and the synchronous assertion backstop) BEFORE `stopInternal`.
     func captureBackgroundTeardownSelection() {
+        let resumePos = positionForSessionRebuild
+        let resumePlay = sessionRebuildResumesPlaying
+        print("[ScreensaverDebug][AetherEngine] captureBackgroundTeardownSelection: resumePosition=\(resumePos), resumesPlaying=\(resumePlay), clock=\(currentTime), state=\(state)")
         backgroundTeardownSelection = BackgroundTeardownSelection(
             subtitles: captureSubtitleSessionCarryover(),
             audioTrackIndex: activeAudioTrackIndex,
             discTitleID: activeDiscTitleID,
-            resumePosition: positionForSessionRebuild,
-            resumesPlaying: sessionRebuildResumesPlaying
+            resumePosition: resumePos,
+            resumesPlaying: resumePlay
         )
     }
 
@@ -39,7 +42,7 @@ extension AetherEngine {
     func consumeReloadSelection() -> BackgroundTeardownSelection {
         let parked = backgroundTeardownSelection
         backgroundTeardownSelection = nil
-        return BackgroundTeardownSelection(
+        let consumed = BackgroundTeardownSelection(
             subtitles: Self.mergedSubtitleCarryover(
                 live: captureSubtitleSessionCarryover(), snapshot: parked?.subtitles),
             audioTrackIndex: activeAudioTrackIndex ?? parked?.audioTrackIndex,
@@ -47,6 +50,8 @@ extension AetherEngine {
             resumePosition: parked?.resumePosition,
             resumesPlaying: parked?.resumesPlaying ?? sessionRebuildResumesPlaying
         )
+        print("[ScreensaverDebug][AetherEngine] consumeReloadSelection: parkedResumePos=\(String(describing: parked?.resumePosition)), consumedResumePos=\(String(describing: consumed.resumePosition)), resumesPlaying=\(consumed.resumesPlaying)")
+        return consumed
     }
 
     /// Merge rule for a reload that follows a teardown. `stopInternal` keeps the external registry,

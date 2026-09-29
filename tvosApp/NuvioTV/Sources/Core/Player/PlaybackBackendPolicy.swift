@@ -83,6 +83,18 @@ enum PlaybackBackendPolicy {
                 statusMessage: nil
             )
         }
+
+        let isTrailer = input.streamDescription == PlaybackMarkers.trailerSubtitle
+            || input.urlString.contains("manifest.googlevideo.com")
+            || input.urlString.contains("googlevideo.com")
+        if isTrailer {
+            return Result(
+                backend: .aether,
+                allowAutomaticFallback: false,
+                reason: "Trailers use native AetherEngine AVPlayer pipeline",
+                statusMessage: nil
+            )
+        }
         if input.requiresMPVAudioControls {
             if isRemoteHTTP(input.urlString) && !PlaybackEngineCapabilities.mpv.supportsDirectHTTPS {
                 return Result(

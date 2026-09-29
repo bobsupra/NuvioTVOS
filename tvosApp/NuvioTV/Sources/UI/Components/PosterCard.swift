@@ -966,6 +966,8 @@ struct TrailerPlayerSurface: UIViewRepresentable {
         if uiView.playerLayer.player !== player {
             uiView.playerLayer.player = player
             context.coordinator.observe(layer: uiView.playerLayer, player: player)
+        } else {
+            context.coordinator.checkReadiness(layer: uiView.playerLayer, player: player)
         }
     }
 
@@ -973,7 +975,10 @@ struct TrailerPlayerSurface: UIViewRepresentable {
         private let onReadyForDisplay: () -> Void
         private var readyObserver: NSKeyValueObservation?
         private var timeObserver: Any?
+        private var currentItemObserver: NSKeyValueObservation?
+        private var itemStatusObserver: NSKeyValueObservation?
         private weak var observedPlayer: AVPlayer?
+        private weak var observedLayer: AVPlayerLayer?
         private var didNotify = false
 
         init(onReadyForDisplay: @escaping () -> Void) {
@@ -981,11 +986,9 @@ struct TrailerPlayerSurface: UIViewRepresentable {
         }
 
         func observe(layer: AVPlayerLayer, player: AVPlayer) {
-            readyObserver?.invalidate()
-            if let timeObserver, let observedPlayer {
-                observedPlayer.removeTimeObserver(timeObserver)
-            }
+            cleanup()
             self.observedPlayer = player
+            self.observedLayer = layer
             self.didNotify = false
 
             if layer.isReadyForDisplay {
@@ -999,11 +1002,37 @@ struct TrailerPlayerSurface: UIViewRepresentable {
                 }
             }
 
+            currentItemObserver = player.observe(\.currentItem, options: [.new, .initial]) { [weak self] player, _ in
+                guard let self else { return }
+                self.observeCurrentItem(player.currentItem)
+            }
+
             timeObserver = player.addPeriodicTimeObserver(
                 forInterval: CMTime(value: 1, timescale: 30),
                 queue: .main
             ) { [weak self] time in
                 if time.seconds > 0 {
+                    self?.notifyReady()
+                }
+            }
+        }
+
+        func checkReadiness(layer: AVPlayerLayer, player: AVPlayer) {
+            if layer.isReadyForDisplay || (player.currentItem?.status == .readyToPlay && player.currentTime().seconds > 0) {
+                notifyReady()
+            }
+        }
+
+        private func observeCurrentItem(_ item: AVPlayerItem?) {
+            itemStatusObserver?.invalidate()
+            itemStatusObserver = nil
+            guard let item else { return }
+            if item.status == .readyToPlay {
+                notifyReady()
+                return
+            }
+            itemStatusObserver = item.observe(\.status, options: [.new]) { [weak self] item, _ in
+                if item.status == .readyToPlay {
                     self?.notifyReady()
                 }
             }
@@ -1017,11 +1046,21 @@ struct TrailerPlayerSurface: UIViewRepresentable {
             }
         }
 
-        deinit {
+        private func cleanup() {
             readyObserver?.invalidate()
+            readyObserver = nil
+            itemStatusObserver?.invalidate()
+            itemStatusObserver = nil
+            currentItemObserver?.invalidate()
+            currentItemObserver = nil
             if let timeObserver, let observedPlayer {
                 observedPlayer.removeTimeObserver(timeObserver)
             }
+            timeObserver = nil
+        }
+
+        deinit {
+            cleanup()
         }
     }
 }
@@ -1039,6 +1078,8 @@ private struct TrailerPreviewPlayer: View {
 
     @State private var player = AVPlayer()
     @State private var isRenderReady = false
+    @State private var currentPlaybackSource: TrailerPlaybackSource?
+    @State private var timeObserverToken: Any?
     @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
     private let resolver = YouTubeTrailerResolver.shared
 
@@ -1080,6 +1121,15 @@ private struct TrailerPreviewPlayer: View {
         }
         .onDisappear {
             isRenderReady = false
+            cleanupTimeObserver()
+            let seconds = player.currentTime().seconds
+            if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                TrailerPlaybackHandoff.shared.recordHandoff(
+                    metaId: meta.id,
+                    time: seconds,
+                    playbackSource: currentPlaybackSource
+                )
+            }
             player.pause()
             player.replaceCurrentItem(with: nil)
         }
@@ -1102,6 +1152,8 @@ private struct TrailerPreviewPlayer: View {
             return
         }
 
+        currentPlaybackSource = playbackSource
+
         let asset: AVURLAsset
         if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
             asset = AVURLAsset(
@@ -1117,8 +1169,33 @@ private struct TrailerPreviewPlayer: View {
         item.preferredMaximumResolution = .zero
         player.replaceCurrentItem(with: item)
         applySoundPreference(trailerPreviewSound)
+        setupTimeObserver()
         if isActive {
             player.play()
+        }
+    }
+
+    private func setupTimeObserver() {
+        cleanupTimeObserver()
+        timeObserverToken = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+            queue: .main
+        ) { [weak player] time in
+            let seconds = time.seconds
+            if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                TrailerPlaybackHandoff.shared.recordHandoff(
+                    metaId: meta.id,
+                    time: seconds,
+                    playbackSource: currentPlaybackSource
+                )
+            }
+        }
+    }
+
+    private func cleanupTimeObserver() {
+        if let token = timeObserverToken {
+            player.removeTimeObserver(token)
+            timeObserverToken = nil
         }
     }
 

@@ -926,7 +926,7 @@ public final class AetherEngine: ObservableObject {
     #if os(iOS) || os(tvOS)
     /// True between didEnterBackground and didBecomeActive; gates the pause-while-backgrounded teardown
     /// (iOS) and the PiP-closed-while-backgrounded teardown (tvOS).
-    private var isBackgrounded = false
+    var isBackgrounded = false
     #endif
     #if os(iOS)
     /// #127: pending grace-window teardown (sleep task + the background-task assertion holding it).
@@ -2413,6 +2413,14 @@ public final class AetherEngine: ObservableObject {
             publishError(PlaybackErrorInfo(kind: .masterPlaylistRejected, message: rejection.message, underlyingDomain: rejection.domain, underlyingCode: rejection.code))
             return
         }
+        #if os(iOS) || os(tvOS)
+        if UIApplication.shared.applicationState != .active || isBackgrounded {
+            EngineLog.emit(
+                "[AetherEngine] fallBackToMediaPlaylist held because application is inactive/backgrounded",
+                category: .session)
+            return
+        }
+        #endif
         masterFallbackUsed = true
         // AE#459: the display answered. Display-rejection codes only, never the -1002 parse failure.
         if MasterFallbackDecision.isDisplayRejectionCode(rejection.code), !Self.panelRefusedHDRMaster {
@@ -2431,8 +2439,17 @@ public final class AetherEngine: ObservableObject {
         // #130: a live fallback is a REJOIN of the running ingest (the window may have slid since
         // the failed master attempt); a stale explicit position can wedge AVPlayer against the
         // backlog, so skip the initial seek and let it pick edge-minus-holdback (LiveReloadPolicy).
-        // VOD keeps the explicit pre-failure position.
-        let position = lastNativeVideoStartPosition
+        // VOD keeps the explicit pre-failure position:
+        let livePos = renderedPositionMirror.get()
+        let hostPos = host.renderedTime
+        let position: Double
+        if livePos > 0 {
+            position = livePos
+        } else if hostPos > 0 {
+            position = hostPos
+        } else {
+            position = lastNativeVideoStartPosition
+        }
         EngineLog.emit(
             "[AetherEngine] AVPlayer rejected the master (code=\(rejection.code)); falling back to "
             + "media playlist (no CC/subtitle renditions) at "
@@ -2441,7 +2458,11 @@ public final class AetherEngine: ObservableObject {
         host.swapItem(url: fallbackURL,
                       startPosition: isLive ? nil : position,
                       skipInitialSeek: LiveReloadPolicy.skipInitialSeek(isLive: isLive, isRejoin: true))
-        host.play()
+        if sessionRebuildResumesPlaying {
+            host.play()
+        } else {
+            host.pause()
+        }
     }
 
     /// #35 readiness-gate settle windows. Generous enough that a slow-but-healthy cold start reads as
@@ -2775,6 +2796,14 @@ public final class AetherEngine: ObservableObject {
                                    liveRejoinOverride: Double? = nil) {
         guard let host = nativeHost, let player = currentAVPlayer,
               let url = (player.currentItem?.asset as? AVURLAsset)?.url else { return }
+        #if os(iOS) || os(tvOS)
+        if UIApplication.shared.applicationState != .active || isBackgrounded {
+            EngineLog.emit(
+                "[AetherEngine] reloadStalledConsumerItem held because application is inactive/backgrounded",
+                category: .engine)
+            return
+        }
+        #endif
         // Item death parks tcs at .paused; only that trigger may bypass the user-pause guard.
         guard Self.stalledConsumerRecoveryAllowed(
             consumerIsPaused: player.timeControlStatus == .paused,
@@ -2854,7 +2883,11 @@ public final class AetherEngine: ObservableObject {
         // AE#454 round 2: the item that is about to load is the one the placement was armed for, and
         // the only one whose axis the playlist will state.
         if didArmPlacement { liveRejoinPlacementGeneration = host.itemGeneration }
-        host.play()
+        if sessionRebuildResumesPlaying {
+            host.play()
+        } else {
+            host.pause()
+        }
         if let rejoinPosition {
             // Stashed rather than seeked: the pre-readiness seek IS the wedge LiveReloadPolicy exists
             // to avoid, and a live seek does not defer itself (`shouldDeferHostSeek` excludes live), so
@@ -4832,6 +4865,7 @@ public final class AetherEngine: ObservableObject {
         // nothing was parked this is exactly the pre-#357 live read.
         let resumesTornDownSession = backgroundTeardownSelection != nil
         let selection = consumeReloadSelection()
+        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition() start: resumesTornDownSession=\(resumesTornDownSession), selection.resumesPlaying=\(selection.resumesPlaying), selection.resumePosition=\(String(describing: selection.resumePosition)), clock=\(currentTime), state=\(state)")
         // AE#464 round 2: come back in the transport state the session is IN, not the one its first
         // mount was given. Written before the branch because only the URL branch below carries a
         // struct into `load`; the custom-source branch reads `loadedOptions` field by field.
@@ -4883,6 +4917,7 @@ public final class AetherEngine: ObservableObject {
         // AE#464 round 2: not `currentTime`. A reload stacked behind one still in flight reads a clock
         // that load already zeroed, and rebuilds the session at its head. See `rebuildPosition`.
         let pos = selection.resumePosition ?? positionForSessionRebuild
+        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition() calculated resume pos=\(pos) (selectionPos=\(String(describing: selection.resumePosition)), clock=\(currentTime))")
         // Snapshot the disc title before load()'s stopInternal wipes it, so a background-resumed disc image
         // keeps the title the user selected instead of reverting to the main title (#67).
         let titleID = selection.discTitleID
@@ -4907,6 +4942,7 @@ public final class AetherEngine: ObservableObject {
         var options = loadedOptions
         options.isLiveRejoin = options.isLive
         options.subtitleSessionCarryover = carryover
+        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition() calling load with startPosition=\(String(describing: resume))")
         try await load(url: url, startPosition: resume, options: options,
                        audioSourceStreamIndex: audioToRestore.map { Int32($0) }, discTitleID: titleID)
         restoreSubtitleSelection(from: carryover, resumeAnchor: resume)
@@ -6906,6 +6942,7 @@ public final class AetherEngine: ObservableObject {
                     default: stateEligible = true
                     }
                     self.resumeAfterInterruption = intent && stateEligible
+                    print("[ScreensaverDebug][AetherEngine] AVAudioSession interruption BEGAN: reason=\(reason), resumeArmed=\(self.resumeAfterInterruption), intent=\(intent), state=\(self.state)")
                     EngineLog.emit("[AetherEngine] AVAudioSession interruption BEGAN reason=\(reason) resumeArmed=\(self.resumeAfterInterruption) otherAudio=\(session.isOtherAudioPlaying) silenceHint=\(session.secondaryAudioShouldBeSilencedHint)", category: .engine)
                 } else {
                     let shouldResume = AVAudioSession.InterruptionOptions(rawValue: optionsRaw).contains(.shouldResume)
@@ -6917,6 +6954,7 @@ public final class AetherEngine: ObservableObject {
                     let backgroundSafe = true
                     #endif
                     let firing = self.resumeAfterInterruption && backgroundSafe && shouldResume
+                    print("[ScreensaverDebug][AetherEngine] AVAudioSession interruption ENDED: shouldResume=\(shouldResume), resumeArmed=\(self.resumeAfterInterruption), backgroundSafe=\(backgroundSafe), autoResume=\(firing)")
                     EngineLog.emit("[AetherEngine] AVAudioSession interruption ENDED shouldResume=\(shouldResume) otherAudio=\(session.isOtherAudioPlaying) resumeArmed=\(self.resumeAfterInterruption) autoResume=\(firing)", category: .engine)
                     if firing {
                         self.resumeAfterInterruption = false
@@ -6952,6 +6990,7 @@ public final class AetherEngine: ObservableObject {
     /// socket close (HLSVideoEngine.stop drains the producer up to 3 s) completes before suspension.
     @MainActor
     private func teardownVideoForBackground() async {
+        print("[ScreensaverDebug][AetherEngine] teardownVideoForBackground() called: state=\(state), clock=\(currentTime)")
         let app = UIApplication.shared
         let bgTask = app.beginBackgroundTask(withName: "AetherEngine.bgVideoTeardown")
         // #357: park the selection first. The foreground reload snapshots at reload time, which on
@@ -6963,6 +7002,7 @@ public final class AetherEngine: ObservableObject {
         // Wait for the loopback server's detached cleanup (<=3 s producer drain + socket shutdown) before releasing.
         try? await Task.sleep(nanoseconds: 3_500_000_000)
         if bgTask != .invalid { app.endBackgroundTask(bgTask) }
+        print("[ScreensaverDebug][AetherEngine] teardownVideoForBackground() finished, state=\(state)")
     }
 
     #if os(iOS)

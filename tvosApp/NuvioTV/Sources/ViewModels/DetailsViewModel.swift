@@ -67,9 +67,11 @@ class DetailsViewModel: ObservableObject {
         // Check if metadata is already in memory so we can render frame 0 instantly without showing a spinner.
         // Any cached catalog entry already has the title, artwork, rating, and description needed for frame 0,
         // allowing the details screen to appear immediately while full details and episode guides load in the background.
-        if let cinemetaRepo = repository as? CinemetaCatalogRepository,
-           let cached = cinemetaRepo.cachedMetadata(for: id),
+        var cachedHadImdbId = false
+        if let cached = repository.cachedMetadata(for: id),
            !cached.name.isEmpty {
+            cachedHadImdbId = NuvioMeta.canonicalImdbID(from: cached.imdbId ?? "") != nil
+                || NuvioMeta.canonicalImdbID(from: cached.id) != nil
             uiState = DetailsUiState(
                 isLoading: false,
                 meta: cached,
@@ -93,13 +95,14 @@ class DetailsViewModel: ObservableObject {
                 guard !Task.isCancelled,
                       self.detailsRequestGeneration == requestGeneration else { return }
                 
-                var primaryState = uiState
-                primaryState.meta = meta
-                primaryState.isInWatchlist = LibraryStore.contains(metaId: meta.id, type: meta.type)
-                primaryState.isWatched = WatchedStore.contains(meta: meta)
+                let resolvedMeta = meta.preservingEnrichment(from: self.uiState.meta)
+                var primaryState = self.uiState
+                primaryState.meta = resolvedMeta
+                primaryState.isInWatchlist = LibraryStore.contains(metaId: resolvedMeta.id, type: resolvedMeta.type)
+                primaryState.isWatched = WatchedStore.contains(meta: resolvedMeta)
                 primaryState.isLoading = false
                 primaryState.error = nil
-                uiState = primaryState
+                self.uiState = primaryState
 
                 // Present primary metadata immediately for instant smooth transition.
                 // Defer streams & heavy secondary enrichment until the screen transition
@@ -120,7 +123,10 @@ class DetailsViewModel: ObservableObject {
                     if !meta.isSeries {
                         self.prepareStreams(forId: meta.streamId, type: meta.type)
                     }
-                    if self.enrichmentTask == nil {
+                    let metaHasImdbId = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? "") != nil
+                        || NuvioMeta.canonicalImdbID(from: meta.id) != nil
+                    let needsEnrichmentRetry = !cachedHadImdbId && metaHasImdbId
+                    if self.enrichmentTask == nil || needsEnrichmentRetry {
                         if let enrichmentStarter = self.injectedEnrichmentStarter {
                             enrichmentStarter(meta, requestGeneration)
                         } else {
@@ -559,6 +565,10 @@ class DetailsViewModel: ObservableObject {
 
     func setMdbListUserRating(_ rating: Int?) {
         uiState.mdbListUserRating = rating
+    }
+
+    func applyMdbRatingsForTesting(_ ratings: [NuvioExternalRating], for metaId: String) {
+        applyMdbRatings(ratings, for: metaId, generation: detailsRequestGeneration)
     }
 
     static func mergeEpisodes(

@@ -240,14 +240,15 @@ actor PlaybackStreamDiskCache {
             }
         }
 
-        if currentCachedBytes + chunkBytes <= maxCacheSizeBytes {
+        let needed = currentCachedBytes.addingReportingOverflow(chunkBytes)
+        if !needed.overflow && needed.partialValue <= maxCacheSizeBytes {
             return true
         }
 
         let reclaimable = evictBehindPlayhead ? cachedChunkIndices.reduce(Int64(0)) { bytes, chunk in
             bytes + (chunk < playheadChunk ? Int64(byteRange(forChunk: chunk).count) : 0)
         } : 0
-        return currentCachedBytes + chunkBytes - reclaimable <= maxCacheSizeBytes
+        return !needed.overflow && (needed.partialValue - reclaimable <= maxCacheSizeBytes)
     }
 
     @discardableResult
@@ -519,7 +520,8 @@ final class PlaybackStreamDiskBudget: @unchecked Sendable {
 
         for session in sessions.filter({ $0.url != current }).sorted(by: { $0.date < $1.date }) {
             let volumeFree = provider(root)
-            let isOverBudget = currentBytes + otherBytes > limit
+            let totalCached = currentBytes.addingReportingOverflow(otherBytes)
+            let isOverBudget = totalCached.overflow || totalCached.partialValue > limit
             let isUnderReserve = volumeFree >= 0 && volumeFree < freeSpaceReserve
             guard isOverBudget || isUnderReserve else { break }
             do {
@@ -532,7 +534,23 @@ final class PlaybackStreamDiskBudget: @unchecked Sendable {
         }
         let volumeFree = provider(root)
         let budgetAllowance = max(0, limit - otherBytes)
-        let headroomAllowance = volumeFree >= 0 ? max(0, volumeFree + currentBytes - freeSpaceReserve) : limit
+        let headroomAllowance: Int64
+        if volumeFree >= 0 {
+            if volumeFree >= freeSpaceReserve {
+                let excessFree = volumeFree - freeSpaceReserve
+                if excessFree >= limit {
+                    headroomAllowance = limit
+                } else {
+                    let sum = excessFree.addingReportingOverflow(currentBytes)
+                    headroomAllowance = sum.overflow ? limit : sum.partialValue
+                }
+            } else {
+                let deficit = freeSpaceReserve - volumeFree
+                headroomAllowance = max(0, currentBytes - deficit)
+            }
+        } else {
+            headroomAllowance = limit
+        }
         return max(0, min(budgetAllowance, headroomAllowance))
     }
 }

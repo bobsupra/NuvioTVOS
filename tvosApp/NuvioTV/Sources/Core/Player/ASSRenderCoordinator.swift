@@ -330,6 +330,15 @@ final class ASSRenderCoordinator {
         flushIfDue()
     }
 
+    private func hasActiveCue(at time: Double) -> Bool {
+        if let renderer, !renderer.dialogues(at: time).isEmpty {
+            return true
+        }
+        return player.subtitleCues.contains { cue in
+            time >= cue.startTime && time <= cue.endTime
+        }
+    }
+
     private func flushIfDue() {
         guard pendingReload, let builder, let renderer else { return }
         guard reloadInFlightRevision == nil else { return }
@@ -348,6 +357,28 @@ final class ASSRenderCoordinator {
         // multi-second entry delays without letting full-track reparses flood the renderer.
         let sourceTime = currentPlaybackTime() - subtitleDelaySeconds
         let isImminent = earliestPendingStart <= sourceTime + 1.0
+
+        // If a subtitle is currently active on screen and newly arrived cues are not imminent
+        // (i.e. buffered well ahead), defer reloading until the active subtitle window ends.
+        // Reloading mid-dialogue causes libass to reparse and drop frames, causing visible cues
+        // to vanish prematurely.
+        if hasActiveCue(at: sourceTime) && !isImminent {
+            let retryInterval: TimeInterval = 0.25
+            let deadline = Date().addingTimeInterval(retryInterval)
+            if let scheduledReloadDeadline, scheduledReloadDeadline <= deadline { return }
+            scheduledReload?.cancel()
+            let work = DispatchWorkItem { [weak self] in
+                guard let self else { return }
+                self.scheduledReload = nil
+                self.scheduledReloadDeadline = nil
+                self.flushIfDue()
+            }
+            scheduledReloadDeadline = deadline
+            scheduledReload = work
+            DispatchQueue.main.asyncAfter(deadline: .now() + retryInterval, execute: work)
+            return
+        }
+
         let minInterval: TimeInterval = isImminent ? 0.1 : 0.5
         guard elapsed >= minInterval else {
             let deadline = Date().addingTimeInterval(minInterval - elapsed)

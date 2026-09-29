@@ -1,6 +1,7 @@
 import Foundation
 import Combine
 import XCTest
+import SwiftAssRenderer
 @testable import NuvioTV
 
 final class PlaybackBackendPolicyTests: XCTestCase {
@@ -1514,7 +1515,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         let mb300: size_t = 300 * 1024 * 1024
         let mb100: size_t = 100 * 1024 * 1024
 
-        // High-RAM tier (Apple TV 4K Gen 3 with 4GB RAM + >=1000MB headroom) -> 256MiB / 25 segments
+        // High-RAM tier (Apple TV 4K Gen 3 with 4GB RAM + >=350MB headroom) -> 256MiB / 25 segments
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: fourGB, availableMemoryBytes: mb1500),
             PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
@@ -1533,32 +1534,40 @@ final class PlaybackBackendPolicyTests: XCTestCase {
         )
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: fourGB, availableMemoryBytes: mb900),
-            PlaybackCacheSettings(forwardBuffer: "192MiB", backBuffer: "48MiB")
+            PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
         )
         XCTAssertEqual(
             PlaybackCacheProfile.resolveAutoSegments(physicalMemoryBytes: fourGB, availableMemoryBytes: mb900),
-            18
+            25
+        )
+        XCTAssertEqual(
+            PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: fourGB, availableMemoryBytes: mb500),
+            PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
+        )
+        XCTAssertEqual(
+            PlaybackCacheProfile.resolveAutoSegments(physicalMemoryBytes: fourGB, availableMemoryBytes: mb500),
+            25
         )
 
-        // Mid-RAM tier (Apple TV 4K Gen 1/2 with 3GB RAM + >=450MB headroom) -> 192MiB / 18 segments
+        // Mid-RAM tier (Apple TV 4K Gen 1/2 with 3GB RAM + >=250MB headroom) -> 256MiB / 25 segments
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: threeGB, availableMemoryBytes: mb1900),
-            PlaybackCacheSettings(forwardBuffer: "192MiB", backBuffer: "48MiB")
+            PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
         )
         XCTAssertEqual(
             PlaybackCacheProfile.resolveAutoSegments(physicalMemoryBytes: threeGB, availableMemoryBytes: mb1900),
-            18
+            25
         )
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: threeGB, availableMemoryBytes: mb500),
-            PlaybackCacheSettings(forwardBuffer: "192MiB", backBuffer: "48MiB")
+            PlaybackCacheSettings(forwardBuffer: "256MiB", backBuffer: "64MiB")
         )
         XCTAssertEqual(
             PlaybackCacheProfile.resolveAutoSegments(physicalMemoryBytes: threeGB, availableMemoryBytes: mb500),
-            18
+            25
         )
 
-        // Constrained memory tier (>=250MB headroom) -> 128MiB / 10 segments
+        // Constrained memory tier (>=180MB headroom) -> 128MiB / 10 segments
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: twoGB, availableMemoryBytes: mb300),
             PlaybackCacheSettings(forwardBuffer: "128MiB", backBuffer: "32MiB")
@@ -1568,7 +1577,7 @@ final class PlaybackBackendPolicyTests: XCTestCase {
             10
         )
 
-        // Low memory / emergency tier (<250MB headroom) -> 64MiB / 4 segments
+        // Low memory / emergency tier (<180MB headroom) -> 64MiB / 4 segments
         XCTAssertEqual(
             PlaybackCacheSettings.resolveAuto(physicalMemoryBytes: twoGB, availableMemoryBytes: mb100),
             PlaybackCacheSettings(forwardBuffer: "64MiB", backBuffer: "16MiB")
@@ -1637,6 +1646,65 @@ final class PlaybackBackendPolicyTests: XCTestCase {
 
         XCTAssertEqual(size.width, 1024, accuracy: 0.001)
         XCTAssertEqual(size.height, 576, accuracy: 0.001)
+    }
+
+    @MainActor
+    func testASSFrameHostViewPreservesFrameDuringReloadWhenDialogueIsActive() {
+        let renderer = AssSubtitlesRenderer(fontConfig: FontConfig(fontsPath: URL(fileURLWithPath: NSTemporaryDirectory())))
+        let script = """
+        [Script Info]
+        ScriptType: v4.00+
+        PlayResX: 1920
+        PlayResY: 1080
+
+        [V4+ Styles]
+        Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+        Style: Default,Arial,20,&H00FFFFFF,&H000000FF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,2,2,2,10,10,10,1
+
+        [Events]
+        Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+        Dialogue: 0,0:00:01.00,0:00:05.00,Default,,0,0,0,,Hello world
+        """
+        renderer.loadTrack(content: script)
+        let loadedExpectation = expectation(description: "track loaded")
+        renderer.loadFrame(offset: 0) { _ in
+            loadedExpectation.fulfill()
+        }
+        wait(for: [loadedExpectation], timeout: 2.0)
+
+        let reloadSignal = PassthroughSubject<ASSRenderCoordinator.ReloadEvent, Never>()
+        let hostView = ASSFrameHostView(
+            renderer: renderer,
+            reloadSignal: reloadSignal,
+            onCanvasSizeChanged: nil
+        )
+
+        // Give hostView an image to represent an active subtitle
+        let dummyImage = UIGraphicsImageRenderer(size: CGSize(width: 100, height: 40)).image { _ in }
+        let subview = hostView.subviews.first(where: { $0 is UIImageView }) as? UIImageView
+        XCTAssertNotNil(subview)
+        subview?.image = dummyImage
+        subview?.isHidden = false
+
+        // 1. Within active dialogue window (1s - 5s)
+        hostView.sourceTime = 3.0
+        XCTAssertFalse(renderer.dialogues(at: 3.0).isEmpty)
+
+        // Reload begins and finishes with nil (simulating progressive cue arrival & unchanged frame)
+        reloadSignal.send(.began)
+        reloadSignal.send(.finished(nil))
+
+        // Image MUST be preserved and not wiped
+        XCTAssertNotNil(subview?.image)
+        XCTAssertFalse(subview?.isHidden ?? true)
+
+        // 2. Playback advances past the end of the dialogue window (> 5.0s)
+        hostView.sourceTime = 5.5
+        XCTAssertTrue(renderer.dialogues(at: 5.5).isEmpty)
+
+        // Image MUST be hidden when dialogue window expires
+        XCTAssertNil(subview?.image)
+        XCTAssertTrue(subview?.isHidden ?? false)
     }
 }
 
@@ -3210,6 +3278,48 @@ final class ContinueWatchingDismissStoreTests: XCTestCase {
                 watchedSeason: 1,
                 candidateSeason: 1,
                 released: isoDay(daysAgo: 0)
+            )
+        )
+    }
+
+    func testContinueWatchingSeasonRolloverSurfacesAiredEpisodeWithMissingReleaseDate() {
+        XCTAssertTrue(
+            EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1,
+                candidateSeason: 2,
+                released: nil
+            )
+        )
+    }
+
+    func testContinueWatchingSeasonRolloverSurfacesAiredEpisodeWithDateOnlyReleaseDate() {
+        XCTAssertTrue(
+            EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1,
+                candidateSeason: 2,
+                released: isoDay(daysAgo: 30)
+            )
+        )
+    }
+
+    func testContinueWatchingSeasonRolloverWithUnknownReleaseDateHonorsSetting() {
+        let settings = ProfileSettings.current
+        let previousValue = settings.object(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        settings.set(false, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+        defer {
+            if let previousValue {
+                settings.set(previousValue, forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            } else {
+                settings.removeObject(forKey: EpisodeReleasePolicy.showUnairedNextUpKey)
+            }
+        }
+
+        // Even when unaired suggestions are hidden, an episode that has already aired (nil release date treated as available) surfaces
+        XCTAssertTrue(
+            EpisodeReleasePolicy.shouldSurfaceNextEpisode(
+                watchedSeason: 1,
+                candidateSeason: 2,
+                released: nil
             )
         )
     }

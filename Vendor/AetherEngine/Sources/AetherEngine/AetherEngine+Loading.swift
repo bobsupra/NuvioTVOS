@@ -1,6 +1,9 @@
 import Foundation
 import AVFoundation
 import Combine
+#if canImport(UIKit)
+import UIKit
+#endif
 import AetherLibavformat
 import AetherLibavcodec
 import AetherLibavutil
@@ -1543,6 +1546,14 @@ extension AetherEngine {
                         nanoseconds: UInt64(Self.itemDeathConfirmSeconds * 1_000_000_000))
                     guard !Task.isCancelled, let self, let host,
                           host.endFailureCount == count else { return }
+                    #if os(iOS) || os(tvOS)
+                    if UIApplication.shared.applicationState != .active || self.isBackgrounded {
+                        EngineLog.emit(
+                            "[AetherEngine] #93 item death (failedToPlayToEndTime) held because application is inactive/backgrounded",
+                            category: .engine)
+                        return
+                    }
+                    #endif
                     guard NativeAVPlayerHost.shouldSurfaceDeferredFailure(
                         isPlaying: host.timeControlStatus == .playing,
                         clockAtFailure: clockAtFailure,

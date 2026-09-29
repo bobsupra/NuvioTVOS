@@ -26,7 +26,14 @@ struct ASSRenderedSubtitles: UIViewRepresentable {
 /// while reparsing even when a visible cue has not ended.
 @MainActor
 final class ASSFrameHostView: UIView {
-    var sourceTime: Double = 0
+    var sourceTime: Double = 0 {
+        didSet {
+            guard imageView.image != nil, !isReloading else { return }
+            if renderer.dialogues(at: sourceTime).isEmpty {
+                hide()
+            }
+        }
+    }
 
     private let renderer: AssSubtitlesRenderer
     private let onCanvasSizeChanged: ((AssSubtitlesRenderer) -> Void)?
@@ -63,12 +70,23 @@ final class ASSFrameHostView: UIView {
                     self.isReloading = true
                 case .finished(let image):
                     self.isReloading = false
-                    self.display(image)
+                    if let image {
+                        self.display(image)
+                    } else if self.renderer.dialogues(at: self.sourceTime).isEmpty {
+                        self.hide()
+                    }
                 }
             }
             .store(in: &cancellables)
         renderer.framesPublisher()
-            .sink { [weak self] image in self?.display(image) }
+            .sink { [weak self] image in
+                guard let self else { return }
+                if let image {
+                    self.display(image)
+                } else if !self.isReloading && self.renderer.dialogues(at: self.sourceTime).isEmpty {
+                    self.hide()
+                }
+            }
             .store(in: &cancellables)
     }
 
@@ -110,7 +128,9 @@ final class ASSFrameHostView: UIView {
         }
 
         guard !isReloading else { return }
-        hide()
+        if renderer.dialogues(at: sourceTime).isEmpty {
+            hide()
+        }
     }
 
     private func hide() {

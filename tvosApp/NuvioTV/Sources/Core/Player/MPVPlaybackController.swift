@@ -623,6 +623,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         checkError(mpv_set_option_string(mpv, "demuxer-max-bytes", cache.forwardBuffer), context: "demuxer-max-bytes")
         checkError(mpv_set_option_string(mpv, "demuxer-max-back-bytes", cache.backBuffer), context: "demuxer-max-back-bytes")
         checkError(mpv_set_option_string(mpv, "video-rotate", "no"), context: "video-rotate")
+        checkError(mpv_set_option_string(mpv, "demuxer-mkv-subtitle-preroll", "yes"), context: "demuxer-mkv-subtitle-preroll")
+        checkError(mpv_set_option_string(mpv, "sub-fix-timing", "no"), context: "sub-fix-timing")
         if let audioLanguage = SubtitleLanguagePreferences.preferredAudioLanguage(),
            let alang = SubtitleLanguagePreferences.mpvLanguageList(for: [audioLanguage]) {
             checkError(mpv_set_option_string(mpv, "alang", alang), context: "alang")
@@ -692,18 +694,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
                                                name: UIApplication.didEnterBackgroundNotification, object: nil)
         NotificationCenter.default.addObserver(self, selector: #selector(enterForeground),
                                                name: UIApplication.willEnterForegroundNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(appDidBecomeActive),
+                                               name: UIApplication.didBecomeActiveNotification, object: nil)
     }
 
-    @objc private func appWillResignActive() {
+    private func suspendPlaybackForBackgroundOrInactive() {
         guard mpv != nil else { return }
-        let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
-        if mpvStillPlaying || lastVerifiedWasPlaying {
-            wasPlayingBeforeBackground = true
-        }
-    }
+        guard !isApplicationBackgrounded else { return }
 
-    @objc private func enterBackground() {
-        guard mpv != nil else { return }
         let sampledDurationMs = milliseconds(from: readDoubleProperty("duration")) ?? durationMs
         let sampledPositionMs = milliseconds(from: readDoubleProperty("time-pos")) ?? positionMs
         let verifiedPositionMs = lastVerifiedPositionMs ?? positionMs
@@ -716,16 +714,19 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             && sampledPositionMs >= referenceDurationMs - 5_000
             && verifiedPositionMs < referenceDurationMs * 85 / 100
             && sampledPositionMs - verifiedPositionMs > 30_000
-        let safePositionMs = max(0, jumpedToEnd ? verifiedPositionMs : sampledPositionMs)
+        let jumpedToZero = verifiedPositionMs > 5_000 && sampledPositionMs == 0
+        let candidatePositionMs = (jumpedToEnd || jumpedToZero) ? verifiedPositionMs : sampledPositionMs
+        let safePositionMs = max(0, candidatePositionMs)
 
         let mpvStillPlaying = !getFlag("pause") && !getFlag("eof-reached")
-        wasPlayingBeforeBackground = wasPlayingBeforeBackground || mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)
+        wasPlayingBeforeBackground = (mpvStillPlaying || (jumpedToEnd && lastVerifiedWasPlaying)) && (lastVerifiedWasPlaying || isPlayerPlaying)
         lifecyclePositionMs = safePositionMs
         lifecycleDurationMs = max(referenceDurationMs, durationMs)
         foregroundRestoreTargetMs = nil
         foregroundRestoreDeadline = nil
         lifecycleRestoreFailed = false
         isApplicationBackgrounded = true
+        print("[ScreensaverDebug][MPVController] suspendPlayback: sampledPos=\(sampledPositionMs)ms, safePos=\(safePositionMs)ms, wasPlaying=\(wasPlayingBeforeBackground)")
         clearCleanEndState()
         pausePlayback()
         setStringProperty("vid", "no")
@@ -733,9 +734,14 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         onPlaybackSuspended?(safePositionMs, lifecycleDurationMs ?? 0)
     }
 
-    @objc private func enterForeground() {
+    private func restorePlaybackFromBackgroundOrInactive() {
         guard mpv != nil else { return }
+        guard isApplicationBackgrounded else { return }
+
         let shouldResume = wasPlayingBeforeBackground
+        wasPlayingBeforeBackground = false
+        isApplicationBackgrounded = false
+        print("[ScreensaverDebug][MPVController] restorePlayback: shouldResume=\(shouldResume), lifecyclePos=\(String(describing: lifecyclePositionMs))ms")
         setStringProperty("vid", "auto")
         clearCleanEndState()
 
@@ -743,6 +749,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             foregroundRestoreTargetMs = target
             foregroundRestoreDeadline = Date().addingTimeInterval(4)
             let rawPositionMs = milliseconds(from: readDoubleProperty("time-pos"))
+            print("[ScreensaverDebug][MPVController] restorePlayback restoring pos: target=\(target)ms, rawPos=\(String(describing: rawPositionMs))ms")
             if rawPositionMs == nil
                 || abs((rawPositionMs ?? target) - target) > 1_500
                 || getFlag("eof-reached") {
@@ -750,13 +757,34 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             }
         }
 
-        isApplicationBackgrounded = false
         if shouldResume {
+            print("[ScreensaverDebug][MPVController] restorePlayback resuming playback")
             playPlayback()
         } else {
-            // Preserve an explicit user pause across app switching.
+            // Preserve an explicit user pause across app switching and screensaver.
+            print("[ScreensaverDebug][MPVController] restorePlayback preserving pause")
             pausePlayback()
         }
+    }
+
+    @objc private func appWillResignActive() {
+        print("[ScreensaverDebug][MPVController] appWillResignActive")
+        suspendPlaybackForBackgroundOrInactive()
+    }
+
+    @objc private func enterBackground() {
+        print("[ScreensaverDebug][MPVController] enterBackground")
+        suspendPlaybackForBackgroundOrInactive()
+    }
+
+    @objc private func enterForeground() {
+        print("[ScreensaverDebug][MPVController] enterForeground")
+        restorePlaybackFromBackgroundOrInactive()
+    }
+
+    @objc private func appDidBecomeActive() {
+        print("[ScreensaverDebug][MPVController] appDidBecomeActive")
+        restorePlaybackFromBackgroundOrInactive()
     }
 
     private func publishLifecycleSnapshot() {
@@ -868,18 +896,21 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func playPlayback() {
         guard mpv != nil else { return }
+        print("[ScreensaverDebug][MPVController] playPlayback() called: pos=\(positionMs)ms")
         lastVerifiedWasPlaying = true
         setFlag("pause", false)
     }
 
     func pausePlayback() {
         guard mpv != nil else { return }
+        print("[ScreensaverDebug][MPVController] pausePlayback() called: pos=\(positionMs)ms")
         lastVerifiedWasPlaying = false
         setFlag("pause", true)
     }
 
     func seekToMs(_ ms: Int64) {
         guard mpv != nil else { return }
+        print("[ScreensaverDebug][MPVController] seekToMs(\(ms)) called: currentPos=\(positionMs)ms")
         subtitleTranslationState.cancelPendingTranslations()
         rememberExplicitSeek(to: ms)
         command("seek", args: [String(format: "%.3f", Double(ms) / 1000.0), "absolute"])

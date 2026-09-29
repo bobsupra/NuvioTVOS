@@ -9,12 +9,16 @@ import Foundation
 import SwiftUI
 import UIKit
 import ImageIO
+import AVFoundation
+import AVKit
 
 struct DetailsScreen: View {
     let id: String
     let type: String
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes).
     /// The last two carry series context for the player's next-episode auto-play;
+    /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes, player, cacheFileIdentity, filename, videoSize, videoHash, resumeFrom).
+    /// The episode fields carry series context for the player's next-episode auto-play;
     /// both are empty/nil for movies and trailers.
     let onPlayClick: (
         _ streamUrl: String,
@@ -28,7 +32,8 @@ struct DetailsScreen: View {
         _ cacheFileIdentity: PlaybackCacheFileIdentity?,
         _ filename: String?,
         _ videoSize: Int64?,
-        _ videoHash: String?
+        _ videoHash: String?,
+        _ resumeFrom: Double?
     ) -> Void
     let onBack: () -> Void
     /// Open another title (More Like This / production catalog).
@@ -103,7 +108,8 @@ struct DetailsScreen: View {
             _ cacheFileIdentity: PlaybackCacheFileIdentity?,
             _ filename: String?,
             _ videoSize: Int64?,
-            _ videoHash: String?
+            _ videoHash: String?,
+            _ resumeFrom: Double?
         ) -> Void,
         onBack: @escaping () -> Void,
         onOpenTitle: ((String, String) -> Void)? = nil,
@@ -179,7 +185,7 @@ struct DetailsScreen: View {
                     showMdbListRating: false,
                     onRateClick: { showingMdbListRating = true },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
-                    onTrailerClick: { openTrailer(for: viewModel.uiState.meta!) },
+                    onTrailerClick: { resumeFrom in openTrailer(for: viewModel.uiState.meta!, resumeFrom: resumeFrom) },
                     onOpenTitle: { contentId, contentType in
                         onOpenTitle?(contentId, contentType)
                     },
@@ -204,7 +210,7 @@ struct DetailsScreen: View {
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
-                            onPlayClick(url, [:], meta, "", [], nil, [], nil, nil, nil, nil, nil)
+                            onPlayClick(url, [:], meta, "", [], nil, [], nil, nil, nil, nil, nil, nil)
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
@@ -553,7 +559,8 @@ struct DetailsScreen: View {
                 PlaybackCacheFileIdentity(infoHash: stream.effectiveInfoHash, fileIndex: stream.effectiveFileIdx),
                 stream.filename,
                 stream.videoSize,
-                stream.videoHash
+                stream.videoHash,
+                nil
             )
             return
         }
@@ -618,7 +625,8 @@ struct DetailsScreen: View {
                         nil,
                         debridFilename ?? stream.filename,
                         debridVideoSize ?? stream.videoSize,
-                        stream.videoHash
+                        stream.videoHash,
+                        nil
                     )
                 } else {
                     PlaybackStartupBenchmark.shared.cancel()
@@ -692,16 +700,16 @@ struct DetailsScreen: View {
         #endif
     }
 
-    private func openTrailer(for meta: NuvioMeta) {
+    private func openTrailer(for meta: NuvioMeta, resumeFrom: Double? = nil) {
         Task {
             if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
                 await MainActor.run {
-                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil)
+                    onPlayClick(source.videoUrl, source.requestHeaders, meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom)
                 }
             } else if let ytId = await preferredTrailerYouTubeId(for: meta) {
                 let youtubeUrl = "https://www.youtube.com/watch?v=\(ytId)"
                 await MainActor.run {
-                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil)
+                    onPlayClick(youtubeUrl, [:], meta, PlaybackMarkers.trailerSubtitle, [], nil, [], nil, nil, nil, nil, nil, resumeFrom)
                 }
             }
         }
@@ -2425,7 +2433,7 @@ struct TvDetailsContent: View {
     var showMdbListRating: Bool = false
     var onRateClick: (() -> Void)? = nil
     let onShareClick: () -> Void
-    let onTrailerClick: () -> Void
+    let onTrailerClick: (Double?) -> Void
     var onOpenTitle: ((String, String) -> Void)? = nil
     var onOpenProduction: ((MetaCompany) -> Void)? = nil
     var onOpenPerson: ((TmdbPersonMetadata) -> Void)? = nil
@@ -2448,7 +2456,17 @@ struct TvDetailsContent: View {
     @State private var restoreEpisodeKey: String?
     @State private var restoreGeneration = 0
     @Environment(\.isEnabled) private var isEnabled
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage(SettingsKey.smartStreamSelection) private var smartStreamSelection = false
+    @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
+    @AppStorage(SettingsKey.backgroundTrailersEnabled) private var backgroundTrailersEnabled = false
+    @AppStorage(SettingsKey.trailerPreviewSound) private var trailerPreviewSound = false
+    @AppStorage(SettingsKey.trailerDelay) private var trailerDelay = 7
+    @State private var trailerPlayer = AVPlayer()
+    @State private var isTrailerPlaying = false
+    @State private var isTrailerRenderReady = false
+    @State private var didStopTrailerManually = false
+    @State private var trailerTask: Task<Void, Never>? = nil
     /// Bumped whenever a watched mark or a progress write lands. Resume progress
     /// is read straight from the stores below rather than from `uiState`, so
     /// without this the episode strip keeps drawing the bar it rendered with —
@@ -2459,12 +2477,204 @@ struct TvDetailsContent: View {
     @State private var reentryProgressRefreshPending = false
     @StateObject private var episodeCache = TvDetailsEpisodeCache()
 
+    private func isBackgroundTrailerAllowed(hasHandoff: Bool) -> Bool {
+        guard trailersEnabled && !didStopTrailerManually && isEnabled else { return false }
+        return backgroundTrailersEnabled || hasHandoff
+    }
+
+    private func scheduleBackgroundTrailer(for meta: NuvioMeta) {
+        trailerTask?.cancel()
+        let handoff = TrailerPlaybackHandoff.shared.takeHandoff(for: meta.id)
+        let hasHandoff = handoff != nil
+        guard isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
+
+        trailerTask = Task { @MainActor in
+            if !hasHandoff {
+                let delaySeconds = max(0, trailerDelay)
+                if delaySeconds > 0 {
+                    try? await Task.sleep(nanoseconds: UInt64(delaySeconds) * 1_000_000_000)
+                }
+            }
+            guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
+
+            let playbackSource: TrailerPlaybackSource?
+            if let source = handoff?.playbackSource {
+                playbackSource = source
+            } else {
+                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
+            }
+
+            guard let playbackSource,
+                  let url = URL(string: playbackSource.videoUrl),
+                  !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else {
+                return
+            }
+
+            let asset: AVURLAsset
+            if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
+                asset = AVURLAsset(
+                    url: url,
+                    options: [AVURLAssetHTTPUserAgentKey: userAgent]
+                )
+            } else {
+                asset = AVURLAsset(url: url)
+            }
+
+            let item = AVPlayerItem(asset: asset)
+            item.preferredForwardBufferDuration = 2.0
+            item.preferredPeakBitRate = 0
+            item.preferredMaximumResolution = .zero
+            trailerPlayer.replaceCurrentItem(with: item)
+
+            if let handoffTime = handoff?.time, handoffTime > 0.1 {
+                await trailerPlayer.seek(
+                    to: CMTime(seconds: handoffTime, preferredTimescale: 600),
+                    toleranceBefore: .zero,
+                    toleranceAfter: .zero
+                )
+            }
+            applySoundPreference(trailerPreviewSound)
+            isTrailerPlaying = true
+            trailerPlayer.play()
+        }
+    }
+
+    private func stopBackgroundTrailer(manual: Bool) {
+        trailerTask?.cancel()
+        trailerTask = nil
+        if manual {
+            didStopTrailerManually = true
+        }
+        isTrailerPlaying = false
+        isTrailerRenderReady = false
+        trailerPlayer.pause()
+        trailerPlayer.replaceCurrentItem(with: nil)
+    }
+
+    private func applySoundPreference(_ soundEnabled: Bool) {
+        trailerPlayer.isMuted = !soundEnabled
+        trailerPlayer.volume = soundEnabled ? 1 : 0
+        guard soundEnabled else { return }
+        PlaybackAudioSession.activateMoviePlayback()
+    }
+
+    private func handleDetailsBack() {
+        if isTrailerPlaying {
+            if let metaId = uiState.meta?.id {
+                let seconds = trailerPlayer.currentTime().seconds
+                if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                    TrailerPlaybackHandoff.shared.recordHandoff(metaId: metaId, time: seconds)
+                }
+            }
+            stopBackgroundTrailer(manual: true)
+            return
+        }
+        stopBackgroundTrailer(manual: false)
+        onBack()
+    }
+
     private var isScrolledDown: Bool {
         focusedDetailsSection != .actions || episodeFocus != nil || castHeaderFocus != nil || scrollOffset > 30
     }
 
     private var backdropBlurRadius: CGFloat {
         isScrolledDown ? 22 : 0
+    }
+
+    @ViewBuilder
+    private func backdropView(for meta: NuvioMeta) -> some View {
+        TvDetailsBackdrop(
+            meta: meta,
+            blurRadius: backdropBlurRadius,
+            player: trailerPlayer,
+            isTrailerVisible: isTrailerPlaying && isTrailerRenderReady,
+            onTrailerReadyForDisplay: handleTrailerReady
+        )
+    }
+
+    private func handleTrailerReady() {
+        guard isTrailerPlaying, !isTrailerRenderReady else { return }
+        isTrailerRenderReady = true
+    }
+
+    @ViewBuilder
+    private func actionRowView(
+        meta: NuvioMeta,
+        playTarget: TvDetailsPlayTarget,
+        scrollProxy: ScrollViewProxy
+    ) -> some View {
+        TvDetailsActionRow(
+            isInWatchlist: uiState.isInWatchlist,
+            isWatched: WatchedStore.isWatchedForDisplay(meta: meta),
+            playTitle: playTarget.label,
+            playHint: smartStreamSelection
+                ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
+                : L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources"),
+            onPlayClick: {
+                handlePlayClick(playTarget: playTarget)
+            },
+            onPlayLongPress: smartStreamSelection ? {
+                handlePlayLongPress(playTarget: playTarget)
+            } : nil,
+            onWatchlistClick: onWatchlistClick,
+            onWatchedClick: onWatchedClick,
+            onRateClick: onRateClick != nil ? {
+                stopBackgroundTrailer(manual: false)
+                onRateClick?()
+            } : nil,
+            onTrailerClick: {
+                let currentTrailerTime: Double? = {
+                    if isTrailerPlaying {
+                        let seconds = trailerPlayer.currentTime().seconds
+                        if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                            return seconds
+                        }
+                    }
+                    return nil
+                }()
+                stopBackgroundTrailer(manual: false)
+                onTrailerClick(currentTrailerTime)
+            },
+            focus: $actionFocus,
+            entryLocked: focusedDetailsSection != .actions,
+            onFocus: {
+                guard focusedDetailsSection != .actions else { return }
+                focusedDetailsSection = .actions
+                withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
+                    scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
+                }
+            }
+        )
+        .disabled(
+            restoreEpisodeKey != nil
+                || !isDetailsFocusReachable(.actions)
+        )
+    }
+
+    private func handlePlayClick(playTarget: TvDetailsPlayTarget) {
+        stopBackgroundTrailer(manual: false)
+        guard playTarget.isPlayable else { return }
+        if let episode = playTarget.episode {
+            onEpisodeSelected(episode)
+        } else {
+            onPlayClick()
+        }
+    }
+
+    private func handlePlayLongPress(playTarget: TvDetailsPlayTarget) {
+        stopBackgroundTrailer(manual: false)
+        guard playTarget.isPlayable else { return }
+        if let episode = playTarget.episode {
+            if let onEpisodePlayManually {
+                onEpisodePlayManually(episode)
+            } else {
+                onEpisodeSelected(episode)
+            }
+        } else if let onPlayManually {
+            onPlayManually()
+        } else {
+            onPlayClick()
+        }
     }
 
     var body: some View {
@@ -2488,7 +2698,7 @@ struct TvDetailsContent: View {
 
             GeometryReader { proxy in
                 ZStack(alignment: .topLeading) {
-                    TvDetailsBackdrop(meta: meta, blurRadius: backdropBlurRadius)
+                    backdropView(for: meta)
 
                     TvDetailsScrolledBackdropDimmer(isScrolledDown: isScrolledDown)
 
@@ -2510,62 +2720,15 @@ struct TvDetailsContent: View {
 
                                     TvDetailsLogo(meta: meta)
 
-                                TvDetailsActionRow(
-                                    isInWatchlist: uiState.isInWatchlist,
-                                    isWatched: WatchedStore.isWatchedForDisplay(meta: meta),
-                                    playTitle: playTarget.label,
-                                    playHint: smartStreamSelection
-                                        ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
-                                        : L10n.string("details_play_hint", fallback: "Starts playback or opens stream sources"),
-                                    onPlayClick: {
-                                        guard playTarget.isPlayable else { return }
-                                        // Series: play the resume/next-up episode; movies
-                                        // fall through to the stream picker.
-                                        if let episode = playTarget.episode {
-                                            onEpisodeSelected(episode)
-                                        } else {
-                                            onPlayClick()
-                                        }
-                                    },
-                                    onPlayLongPress: smartStreamSelection ? {
-                                        guard playTarget.isPlayable else { return }
-                                        if let episode = playTarget.episode {
-                                            if let onEpisodePlayManually {
-                                                onEpisodePlayManually(episode)
-                                            } else {
-                                                onEpisodeSelected(episode)
-                                            }
-                                        } else if let onPlayManually {
-                                            onPlayManually()
-                                        } else {
-                                            onPlayClick()
-                                        }
-                                    } : nil,
-                                    onWatchlistClick: onWatchlistClick,
-                                    onWatchedClick: onWatchedClick,
-                                    mdbListUserRating: mdbListUserRating,
-                                    showMdbListRating: showMdbListRating,
-                                    onRateClick: onRateClick,
-                                    onTrailerClick: onTrailerClick,
-                                    focus: $actionFocus,
-                                    entryLocked: focusedDetailsSection != .actions,
-                                    onFocus: {
-                                        guard focusedDetailsSection != .actions else { return }
-                                        focusedDetailsSection = .actions
-                                        withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                            scrollProxy.scrollTo(TvDetailsScrollID.topSection, anchor: .top)
-                                        }
-                                    }
-                                )
-                                // Unfocusable while an episode is being restored
-                                // to, so the engine can't claim these instead.
-                                .disabled(
-                                    restoreEpisodeKey != nil
-                                        || !isDetailsFocusReachable(.actions)
-                                    )
+                                    actionRowView(meta: meta, playTarget: playTarget, scrollProxy: scrollProxy)
 
-                                TvDetailsSummary(meta: meta, simkl: uiState.simklRatings)
-                            }
+                                    TvDetailsSummary(
+                                        meta: meta,
+                                        simkl: uiState.simklRatings,
+                                        isBackgroundTrailerPlaying: isTrailerPlaying && isTrailerRenderReady,
+                                        isSynopsisFocused: false
+                                    )
+                                }
                             .padding(.bottom, 52)
                             .frame(height: max(proxy.size.height, 800), alignment: .bottomLeading)
 
@@ -2585,8 +2748,14 @@ struct TvDetailsContent: View {
                                             scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                                         }
                                     },
-                                    onSelect: onEpisodeSelected,
-                                    onPlayManually: onEpisodePlayManually,
+                                    onSelect: { video in
+                                        stopBackgroundTrailer(manual: false)
+                                        onEpisodeSelected(video)
+                                    },
+                                    onPlayManually: onEpisodePlayManually != nil ? { video in
+                                        stopBackgroundTrailer(manual: false)
+                                        onEpisodePlayManually?(video)
+                                    } : nil,
                                     onEpisodeMenuPresented: { onEpisodeMenuPresented?($0) },
                                     episodeFocus: $episodeFocus,
                                     restrictFocusToKey: restoreEpisodeKey,
@@ -2605,9 +2774,22 @@ struct TvDetailsContent: View {
                                     meta: meta,
                                     people: uiState.people,
                                     onPersonClick: { person in
+                                        stopBackgroundTrailer(manual: false)
                                         onOpenPerson?(person)
                                     },
-                                    onTrailerClick: onTrailerClick,
+                                    onTrailerClick: {
+                                        let currentTrailerTime: Double? = {
+                                            if isTrailerPlaying {
+                                                let seconds = trailerPlayer.currentTime().seconds
+                                                if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                                                    return seconds
+                                                }
+                                            }
+                                            return nil
+                                        }()
+                                        stopBackgroundTrailer(manual: false)
+                                        onTrailerClick(currentTrailerTime)
+                                    },
                                     headerFocus: $castHeaderFocus,
                                     entryLocked: focusedDetailsSection != .cast,
                                     onFocus: {
@@ -2631,6 +2813,7 @@ struct TvDetailsContent: View {
                                         items: uiState.moreLikeThis,
                                         entryLocked: focusedDetailsSection != .related,
                                         onSelect: { item in
+                                            stopBackgroundTrailer(manual: false)
                                             onOpenTitle?(item.id, item.type)
                                         },
                                         onFocus: {
@@ -2741,7 +2924,7 @@ struct TvDetailsContent: View {
                 }
             }
             .background(Color.black.ignoresSafeArea())
-            .onExitCommand(perform: onBack)
+            .onExitCommand(perform: handleDetailsBack)
             // tvOS doesn't re-run default-focus when this content swaps in after
             // the async load finishes, so focus lands nowhere / off the Play
             // button. Move it onto Play explicitly once the content appears
@@ -2754,6 +2937,58 @@ struct TvDetailsContent: View {
                 }
                 focusedDetailsSection = .actions
                 DispatchQueue.main.async { actionFocus = .play }
+                scheduleBackgroundTrailer(for: meta)
+            }
+            .onDisappear {
+                let seconds = trailerPlayer.currentTime().seconds
+                if seconds > 0.1 && !seconds.isNaN && !seconds.isInfinite {
+                    TrailerPlaybackHandoff.shared.recordHandoff(metaId: meta.id, time: seconds)
+                }
+                stopBackgroundTrailer(manual: false)
+            }
+            .onChange(of: meta.id) { _, _ in
+                didStopTrailerManually = false
+                stopBackgroundTrailer(manual: false)
+                scheduleBackgroundTrailer(for: meta)
+            }
+            .onChange(of: backgroundTrailersEnabled) { _, enabled in
+                if !enabled {
+                    stopBackgroundTrailer(manual: false)
+                } else {
+                    scheduleBackgroundTrailer(for: meta)
+                }
+            }
+            .onChange(of: trailersEnabled) { _, enabled in
+                if !enabled {
+                    stopBackgroundTrailer(manual: false)
+                } else {
+                    scheduleBackgroundTrailer(for: meta)
+                }
+            }
+            .onChange(of: trailerDelay) { _, _ in
+                if isTrailerPlaying || trailerTask != nil {
+                    stopBackgroundTrailer(manual: false)
+                    scheduleBackgroundTrailer(for: meta)
+                }
+            }
+            .onChange(of: trailerPreviewSound) { _, soundEnabled in
+                applySoundPreference(soundEnabled)
+            }
+            .onChange(of: scenePhase) { _, phase in
+                if phase != .active {
+                    trailerPlayer.pause()
+                } else if isTrailerPlaying {
+                    trailerPlayer.play()
+                }
+            }
+            .onReceive(
+                NotificationCenter.default.publisher(for: AVPlayerItem.didPlayToEndTimeNotification).receive(on: RunLoop.main)
+            ) { notification in
+                guard let item = notification.object as? AVPlayerItem,
+                      item == trailerPlayer.currentItem else {
+                    return
+                }
+                stopBackgroundTrailer(manual: false)
             }
             // Opening the stream picker disables this content, and on the way
             // back tvOS re-places focus geometrically — which is how leaving an
@@ -2765,6 +3000,7 @@ struct TvDetailsContent: View {
                 if !enabled {
                     restoreGeneration &+= 1
                     restoreEpisodeKey = episodeFocus
+                    stopBackgroundTrailer(manual: false)
                 } else {
                     refreshProgressAfterReturn()
                     if let target = restoreEpisodeKey {
@@ -3062,6 +3298,9 @@ private struct TvDetailsScrollTransitionShadow: View {
 private struct TvDetailsBackdrop: View {
     let meta: NuvioMeta
     var blurRadius: CGFloat = 0
+    var player: AVPlayer? = nil
+    var isTrailerVisible: Bool = false
+    var onTrailerReadyForDisplay: (() -> Void)? = nil
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
@@ -3085,6 +3324,19 @@ private struct TvDetailsBackdrop: View {
                 .ignoresSafeArea()
             } else {
                 backdropColor.ignoresSafeArea()
+            }
+
+            if let player {
+                TrailerPlayerSurface(player: player) {
+                    onTrailerReadyForDisplay?()
+                }
+                .scaleEffect(1.35)
+                .blur(radius: blurRadius, opaque: true)
+                .opacity(isTrailerVisible ? 1 : 0)
+                .animation(.easeInOut(duration: 0.35), value: isTrailerVisible)
+                .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                .ignoresSafeArea()
+                .allowsHitTesting(false)
             }
 
             GeometryReader { proxy in
@@ -3367,6 +3619,15 @@ private struct OptionalAccessibilityHint: ViewModifier {
 private struct TvDetailsSummary: View {
     let meta: NuvioMeta
     var simkl: SimklTitleRatings? = nil
+    var isBackgroundTrailerPlaying: Bool = false
+    var isSynopsisFocused: Bool = false
+
+    private var textOpacity: Double {
+        if isBackgroundTrailerPlaying && !isSynopsisFocused {
+            return 0.85
+        }
+        return 1.0
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -3442,6 +3703,8 @@ private struct TvDetailsSummary: View {
                 }
             }
         }
+        .opacity(textOpacity)
+        .animation(.easeInOut(duration: 0.35), value: textOpacity)
     }
 
     private var creatorLine: String? {

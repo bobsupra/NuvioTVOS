@@ -114,10 +114,16 @@ protocol CatalogRepository {
 
     /// Cache lightweight catalog metadata in memory so details can render immediately.
     func cacheCatalogMetadata(_ meta: NuvioMeta)
+
+    /// Returns previously cached metadata for the given content id, if present.
+    func cachedMetadata(for id: String) -> NuvioMeta?
 }
 
 extension CatalogRepository {
     func cacheCatalogMetadata(_ meta: NuvioMeta) {}
+    func cachedMetadata(for id: String) -> NuvioMeta? {
+        (self as? CinemetaCatalogRepository)?.cachedMetadata(for: id)
+    }
     var homeCatalogLoadWasPartial: Bool { false }
 
     var homeCatalogFailureSignature: String? { nil }
@@ -2801,6 +2807,16 @@ struct FlexibleString: Decodable {
 
 /// In-memory mock catalog for unit tests and SwiftUI previews
 class MockCatalogRepository: CatalogRepository {
+    private var mockCachedMetadata: [String: NuvioMeta] = [:]
+
+    func cacheCatalogMetadata(_ meta: NuvioMeta) {
+        mockCachedMetadata[meta.id] = meta
+    }
+
+    func cachedMetadata(for id: String) -> NuvioMeta? {
+        mockCachedMetadata[id]
+    }
+
     func getCollectionFolderItems(sources: [NuvioCollectionCatalogSource], limit: Int) async -> [NuvioMeta] {
         []
     }

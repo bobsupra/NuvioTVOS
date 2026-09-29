@@ -123,8 +123,10 @@ extension AetherEngine {
         // naming it in the applied line was the last way left for a correction to read as done when
         // it was not. The transport is the session's own unless a background teardown left it none
         // to read, which is the condition `reloadAtCurrentPosition` makes the same call on.
+        let hasBgTeardownSelection = backgroundTeardownSelection != nil
         let (applied, sessionOwned) = SessionOptionCorrection.partitionChanges(
-            changed, sessionOwnsTransport: backgroundTeardownSelection == nil)
+            changed, sessionOwnsTransport: !hasBgTeardownSelection)
+        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition(applying:): changed=\(changed), hasBgTeardownSelection=\(hasBgTeardownSelection), applied=\(applied), sessionOwned=\(sessionOwned)")
         if !applied.isEmpty || sessionOwned.isEmpty {
             EngineLog.emit(
                 applied.isEmpty
@@ -157,6 +159,7 @@ extension AetherEngine {
         // here. `changed.isEmpty` is NOT this case and keeps rebuilding: a correction that changed
         // nothing is a documented way to ask for the rebuild itself.
         if applied.isEmpty, !sessionOwned.isEmpty {
+            print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition(applying:) RETURNING WITHOUT REBUILD (rebuilt: false) because applied is empty and sessionOwned has \(sessionOwned)")
             EngineLog.emit(
                 "[AetherEngine] #460: correction complete without a rebuild, every field it changed "
                 + "is the session's own (AE#464 round 4)",
@@ -171,6 +174,7 @@ extension AetherEngine {
         // `loadedOptions` field by field at reload time and never takes a struct. One write covers
         // both, and the didSet's route recompute cannot move (`nativeRemoteHLS` is refused above).
         applySessionOptionCorrection(proposed)
+        print("[ScreensaverDebug][AetherEngine] reloadAtCurrentPosition(applying:) proceeding to reloadAtCurrentPosition()")
         try await reloadAtCurrentPosition()
         return SessionOptionCorrectionOutcome(
             applied: applied, sessionOwned: sessionOwned, rebuilt: true)

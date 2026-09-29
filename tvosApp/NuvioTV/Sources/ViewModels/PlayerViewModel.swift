@@ -212,6 +212,8 @@ class PlayerViewModel: ObservableObject {
         return !seriesEpisodes.isEmpty || currentEpisodeVideo != nil
     }
     private var isAdvanceInFlight: Bool = false
+    private var advanceGeneration: UInt64 = 0
+    private var lastAdvancedEpisodeId: String? = nil
     private var autoHiddenNextEpisodeCard = false
     private var nextEpisodeAutoHideDeadline: Date?
     private var nextEpisodeAutoPlayDeadline: Date?
@@ -755,6 +757,7 @@ class PlayerViewModel: ObservableObject {
                     let request = PlaybackLoadRequest(
                         videoURL: videoURL,
                         audioURL: audioURL,
+                        resumePositionSeconds: self.pendingResumeSeconds,
                         httpHeaders: playbackSource.requestHeaders,
                         externalSubtitles: [],
                         matchContentEnabled: true,
@@ -1039,6 +1042,9 @@ class PlayerViewModel: ObservableObject {
         self.hidePeek()
         self.activeMeta = meta
         if let currentEpisode {
+            if self.currentEpisodeVideo?.id != currentEpisode.id {
+                self.lastAdvancedEpisodeId = nil
+            }
             self.currentEpisodeVideo = currentEpisode
         }
         self.activeStreamURL = url.absoluteString
@@ -1073,7 +1079,7 @@ class PlayerViewModel: ObservableObject {
         )
         self.activeTrackSelectionKey = selectionKey
         self.pendingTrackSelection = effectiveSelection
-        self.pendingResumeSeconds = (isTrailerPlayback || isLiveStream) ? nil : resumeFrom
+        self.pendingResumeSeconds = isLiveStream ? nil : resumeFrom
         self.didApplyResume = false
         self.lastStablePlaybackTime = nil
         self.explicitSeekProgressCheckpoint = nil
@@ -1223,6 +1229,9 @@ class PlayerViewModel: ObservableObject {
         resolver: @escaping (NuvioVideo) async -> PreparedNextStream?
     ) {
         seriesEpisodes = episodes
+        if currentEpisodeVideo?.id != current?.id {
+            lastAdvancedEpisodeId = nil
+        }
         currentEpisodeVideo = current
         autoPlayNextEnabled = autoPlayEnabled
         autoPlayNextCountdownSeconds = max(1, autoPlayCountdownSeconds)
@@ -1501,6 +1510,7 @@ class PlayerViewModel: ObservableObject {
 
     /// Play the next episode now (the card's Play button).
     func playNextEpisode() {
+        guard !isAdvanceInFlight, !isAwaitingStreamStart else { return }
         advance()
     }
 
@@ -1522,13 +1532,24 @@ class PlayerViewModel: ObservableObject {
     private func advance() {
         guard !isAdvanceInFlight,
               let next = nextEpisode,
+              currentEpisodeVideo?.id != next.id,
+              lastAdvancedEpisodeId != next.id,
               EpisodeReleasePolicy.hasAired(next.released),
               let resolver = resolveNextStream else { return }
+        lastAdvancedEpisodeId = next.id
+        advanceGeneration &+= 1
+        let gen = advanceGeneration
         isAdvanceInFlight = true
         isAdvancingEpisode = true
         nextEpisodeCountdown = nil
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
+        autoHiddenNextEpisodeCard = false
+        showNextEpisodeCard = false
+
+        // Pause/stop active playback so the finishing episode doesn't produce
+        // lingering playback phase or EOF events while resolving the next stream.
+        engine.pausePlayback()
 
         // Mark the finishing episode watched. With Trakt selected its scrobble
         // history produces the remote Next Up entry; Nuvio Sync keeps the
@@ -1554,18 +1575,21 @@ class PlayerViewModel: ObservableObject {
             }
         }
 
-        Task { @MainActor in
+        Task { @MainActor [weak self] in
+            guard let self, self.advanceGeneration == gen else { return }
             let prepared = await resolver(next)
+            guard self.advanceGeneration == gen else { return }
             guard let prepared else {
                 // Couldn't resolve a stream for the next episode: disarm so the
                 // ended handler doesn't retry, and fall back to the normal
                 // end-of-playback flow (which returns to the details screen).
-                isAdvanceInFlight = false
-                isAdvancingEpisode = false
-                status = .ended
+                self.isAdvanceInFlight = false
+                self.isAdvancingEpisode = false
+                self.lastAdvancedEpisodeId = nil
+                self.status = .ended
                 return
             }
-            replaceStream(prepared: prepared, episode: next, resumeFrom: nil)
+            self.replaceStream(prepared: prepared, episode: next, resumeFrom: nil)
         }
     }
 
@@ -1624,7 +1648,6 @@ class PlayerViewModel: ObservableObject {
         nextEpisodeCountdown = nil
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
-        isAdvanceInFlight = false
         isAdvancingEpisode = false
         isReloadingStream = false
         isSwitchingSource = false
@@ -1664,6 +1687,9 @@ class PlayerViewModel: ObservableObject {
         isFailingOver = false
         isSwitchingSource = false
         isAwaitingStreamStart = false
+        isAdvanceInFlight = false
+        isAdvancingEpisode = false
+        lastAdvancedEpisodeId = nil
         showNextEpisodeCard = false
         nextEpisodeCountdown = nil
         autoHiddenNextEpisodeCard = false
@@ -1778,6 +1804,8 @@ class PlayerViewModel: ObservableObject {
         isFailingOver = true
         isReloadingStream = true
         isSwitchingSource = true
+        isAdvanceInFlight = false
+        isAdvancingEpisode = false
         switchingSourceMessage = "Starting stream"
         isAwaitingStreamStart = true
         reloadAttempts += 1
@@ -2256,86 +2284,22 @@ class PlayerViewModel: ObservableObject {
             videoNaturalSize = frameSize
         }
 
-        // An expired stream link is often answered with a short "slate" clip
-        // (e.g. ElfHosted's "Link expired" video) that decodes cleanly, so it
-        // never trips the mpv-error guard. Bail before any Continue Watching
-        // write/clear so it can't overwrite or delete the real resume point.
-        // While a next-episode advance is resolving/loading, ignore the old
-        // stream's transient ended/loading state so nothing flickers or re-fires.
-        if isAdvanceInFlight { return }
-
-        if subtitle != PlaybackMarkers.trailerSubtitle,
-           detectReplacementStream(c) { return }
-
-        addPendingExternalSubtitlesIfNeeded()
-        if !isLiveStream {
-            applyPendingResumeIfNeeded()
-            updateSkipIntervalState()
-        }
-
-        if c.isPlayerEnded {
-            // Only a genuine watch-through counts. A stream that dies early
-            // (expired link, decode error) also reports "ended", and that must
-            // neither mark the title watched nor wipe the resume point.
-            if !isLiveStream,
-               let activeMeta, isTrackablePlayback,
-               time.duration >= 60, time.current / time.duration >= 0.85 {
-                markWatchedIfNeeded()
-                if usesTraktProgress {
-                    reportTraktProgress(
-                        meta: activeMeta,
-                        playbackTime: time,
-                        action: .stop,
-                        force: true
-                    )
-                } else {
-                    // Retire the episode that just finished. This keeps a
-                    // completed row in the ledger, which is what produces the
-                    // Next Up card below — and what lets a later season still
-                    // surface one for a series that had no follow-up today.
-                    ContinueWatchingStore.markPlaybackCompleted(
-                        meta: activeMeta,
-                        duration: time.duration,
-                        season: resolvedEpisodeNumbers?.season,
-                        episode: resolvedEpisodeNumbers?.episode
-                    )
-                    if let next = nextEpisode {
-                        // Series with a follow-up: show it as "Next Up" instead
-                        // of letting the title vanish from Continue Watching.
-                        ContinueWatchingStore.saveUpNext(
-                            meta: activeMeta,
-                            duration: max(time.duration, 120),
-                            season: next.season,
-                            episode: next.episode,
-                            released: next.released,
-                            seedSeason: resolvedEpisodeNumbers?.season
-                        )
-                    }
-                }
-                if autoPlayNextEnabled && !isAutoPlayCancelled {
-                    advance()
-                    return
-                }
+        let isRecoverableAetherLoading = sampledEngineKind == .aether && c.isPlayerLoading
+        // mpv hard-failed this source — try the next one before surfacing UI.
+        if !c.currentErrorMessage.isEmpty,
+           !isRecoverableAetherLoading,
+           !isFailingOver,
+           !isReloadingStream {
+            if let url = activeStreamURL { failedStreamURLs.insert(url) }
+            if let meta = activeMeta {
+                let numbers = resolvedEpisodeNumbers
+                LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
             }
-        } else if !isLiveStream {
-            saveProgressIfNeeded()
-            updateNextEpisodeState()
-        }
-
-        if !isLiveStream {
-            let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
-            let hasBlockingOverlay = showSettingsPanel || sidePanel != nil || isScrubbing || showPauseOverlay
-            let endingStartTime = skipIntervals.first(where: \.isEnding)?.startTime
-            postPlayController.updateTimeline(
-                position: time.current,
-                duration: time.duration,
-                isEnded: c.isPlayerEnded || status == .ended,
-                isNextEpisodeResolved: isNextEpisodeMetadataResolved,
-                nextEpisodeHasAired: nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) },
-                endingStartTime: endingStartTime,
-                hasBlockingOverlay: hasBlockingOverlay,
-                enabled: postPlayEnabled
+            attemptFailover(
+                reason: c.currentErrorMessage,
+                toast: nil
             )
+            return
         }
 
         if case .error(let vmErrorMessage) = status {
@@ -2355,24 +2319,6 @@ class PlayerViewModel: ObservableObject {
             vmOnlyErrorRecoveryProbe = nil
         }
 
-        let isRecoverableAetherLoading = sampledEngineKind == .aether && c.isPlayerLoading
-        // mpv hard-failed this source — try the next one before surfacing UI.
-        if !c.currentErrorMessage.isEmpty,
-           !isRecoverableAetherLoading,
-           !isFailingOver,
-           !isReloadingStream {
-            if let url = activeStreamURL { failedStreamURLs.insert(url) }
-            if let meta = activeMeta {
-                let numbers = resolvedEpisodeNumbers
-                LastPlaybackStreamStore.remove(metaId: meta.id, season: numbers?.season, episode: numbers?.episode)
-            }
-            attemptFailover(
-                reason: c.currentErrorMessage,
-                toast: nil
-            )
-            return
-        }
-
         let previousStatus = status
 
         if isLiveStream {
@@ -2390,6 +2336,7 @@ class PlayerViewModel: ObservableObject {
                 hasRenderedFirstFrame = true
             }
             isAwaitingStreamStart = false
+            isAdvanceInFlight = false
             markLoadStarted()
         }
 
@@ -2455,6 +2402,92 @@ class PlayerViewModel: ObservableObject {
             scheduleControlsHide()
         }
 
+        // An expired stream link is often answered with a short "slate" clip
+        // (e.g. ElfHosted's "Link expired" video) that decodes cleanly, so it
+        // never trips the mpv-error guard. Bail before any Continue Watching
+        // write/clear so it can't overwrite or delete the real resume point.
+        // While a next-episode advance is resolving/loading, ignore the old
+        // stream's transient ended/loading state so nothing flickers or re-fires.
+        if isAdvanceInFlight || isAwaitingStreamStart { return }
+
+        if subtitle != PlaybackMarkers.trailerSubtitle,
+           detectReplacementStream(c) { return }
+
+        addPendingExternalSubtitlesIfNeeded()
+        if !isLiveStream {
+            applyPendingResumeIfNeeded()
+            updateSkipIntervalState()
+        }
+
+        if c.isPlayerEnded {
+            // Only a genuine watch-through counts. A stream that dies early
+            // (expired link, decode error) also reports "ended", and that must
+            // neither mark the title watched nor wipe the resume point.
+            if !isLiveStream,
+               let activeMeta, isTrackablePlayback,
+               hasRenderedFirstFrame,
+               !isAwaitingStreamStart,
+               !isAdvanceInFlight,
+               !isSwitchingSource, !isReloadingStream, !isFailingOver,
+               time.duration >= 60, time.current / time.duration >= 0.85 {
+                markWatchedIfNeeded()
+                if usesTraktProgress {
+                    reportTraktProgress(
+                        meta: activeMeta,
+                        playbackTime: time,
+                        action: .stop,
+                        force: true
+                    )
+                } else {
+                    // Retire the episode that just finished. This keeps a
+                    // completed row in the ledger, which is what produces the
+                    // Next Up card below — and what lets a later season still
+                    // surface one for a series that had no follow-up today.
+                    ContinueWatchingStore.markPlaybackCompleted(
+                        meta: activeMeta,
+                        duration: time.duration,
+                        season: resolvedEpisodeNumbers?.season,
+                        episode: resolvedEpisodeNumbers?.episode
+                    )
+                    if let next = nextEpisode {
+                        // Series with a follow-up: show it as "Next Up" instead
+                        // of letting the title vanish from Continue Watching.
+                        ContinueWatchingStore.saveUpNext(
+                            meta: activeMeta,
+                            duration: max(time.duration, 120),
+                            season: next.season,
+                            episode: next.episode,
+                            released: next.released,
+                            seedSeason: resolvedEpisodeNumbers?.season
+                        )
+                    }
+                }
+                if autoPlayNextEnabled && !isAutoPlayCancelled {
+                    advance()
+                    return
+                }
+            }
+        } else if !isLiveStream {
+            saveProgressIfNeeded()
+            updateNextEpisodeState()
+        }
+
+        if !isLiveStream {
+            let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
+            let hasBlockingOverlay = showSettingsPanel || sidePanel != nil || isScrubbing || showPauseOverlay
+            let endingStartTime = skipIntervals.first(where: \.isEnding)?.startTime
+            postPlayController.updateTimeline(
+                position: time.current,
+                duration: time.duration,
+                isEnded: c.isPlayerEnded || status == .ended,
+                isNextEpisodeResolved: isNextEpisodeMetadataResolved,
+                nextEpisodeHasAired: nextEpisode.map { EpisodeReleasePolicy.hasAired($0.released) },
+                endingStartTime: endingStartTime,
+                hasBlockingOverlay: hasBlockingOverlay,
+                enabled: postPlayEnabled
+            )
+        }
+
         // A genuine stream is playing: reset failover budget for the next
         // independent failure later in the session.
         if status == .playing,
@@ -2509,6 +2542,7 @@ class PlayerViewModel: ObservableObject {
     // MARK: - Transport
 
     func play() {
+        print("[ScreensaverDebug][PlayerVM] play() called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
         if status == .ended { seek(to: 0) }
         engine.playPlayback()
         status = .playing
@@ -2538,6 +2572,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func pause(forBackground: Bool = false) {
+        print("[ScreensaverDebug][PlayerVM] pause(forBackground=\(forBackground)) called: currentStatus=\(status), time=\(time.current)/\(time.duration)")
         cancelControlsHideTimer()
         engine.pausePlayback()
         status = .paused
@@ -2569,6 +2604,7 @@ class PlayerViewModel: ObservableObject {
                   self.sidePanel == nil,
                   self.subtitle != PlaybackMarkers.trailerSubtitle
             else { return }
+            print("[ScreensaverDebug][PlayerVM] schedulePauseOverlay fired: showing pause overlay")
             self.showControls = false
             self.showPauseOverlay = true
             self.updateSkipIntervalState()
@@ -2666,7 +2702,9 @@ class PlayerViewModel: ObservableObject {
             commitScrub(andPlay: true)
             return
         }
-        switch PlaybackToggleDirection(isTransportPlaying: engine.isTransportPlaying) {
+        let dir = PlaybackToggleDirection(isTransportPlaying: engine.isTransportPlaying)
+        print("[ScreensaverDebug][PlayerVM] togglePlayPause() called: isTransportPlaying=\(engine.isTransportPlaying), direction=\(dir), status=\(status), time=\(time.current)")
+        switch dir {
         case .pause: pause()
         case .play: play()
         }
@@ -2678,6 +2716,7 @@ class PlayerViewModel: ObservableObject {
         let target = duration > 0
             ? min(max(seconds, 0), max(duration - 0.25, 0))
             : max(seconds, 0)
+        print("[ScreensaverDebug][PlayerVM] seek(to: \(seconds)) called: target=\(target), prevCurrent=\(time.current), duration=\(duration)")
         engine.seekToMs(Int64(target * 1000))
         if let source = activeStreamURL.flatMap(URL.init(string:)) {
             let generation = sessionCoordinator.loadGeneration
@@ -2712,12 +2751,24 @@ class PlayerViewModel: ObservableObject {
         guard !isLiveStream else { return }
         let sourcePositionMs = positionMs
         let sourceDurationMs = durationMs
+        print("[ScreensaverDebug][PlayerVM] playbackDidSuspend(pos=\(positionMs)ms, dur=\(durationMs)ms): currentTime=\(time.current), lastStable=\(lastStablePlaybackTime?.current ?? -1), clock=\(clock.position)")
         guard !didShutdown,
               sourceDurationMs > 0,
               sourcePositionMs >= 0,
-              sourcePositionMs < sourceDurationMs else { return }
+              sourcePositionMs < sourceDurationMs else {
+            print("[ScreensaverDebug][PlayerVM] playbackDidSuspend dropped: shutdown=\(didShutdown), dur=\(sourceDurationMs), pos=\(sourcePositionMs)")
+            return
+        }
+        let existingPositionSeconds = lastStablePlaybackTime?.current ?? time.current
+        let targetPositionSeconds: Double
+        if sourcePositionMs == 0 && existingPositionSeconds > 5.0 {
+            print("[ScreensaverDebug][PlayerVM] playbackDidSuspend preserving existing position \(existingPositionSeconds)s against zero-clock sample")
+            targetPositionSeconds = existingPositionSeconds
+        } else {
+            targetPositionSeconds = Double(sourcePositionMs) / 1000.0
+        }
         let snapshot = PlayerTime(
-            current: Double(sourcePositionMs) / 1000.0,
+            current: targetPositionSeconds,
             duration: Double(sourceDurationMs) / 1000.0
         )
         time = snapshot
@@ -4326,6 +4377,8 @@ class PlayerViewModel: ObservableObject {
             closeSidePanel()
             return
         }
+        isAdvanceInFlight = false
+        lastAdvancedEpisodeId = nil
         beginSourceSwitch(message: "Loading episode…")
         closeSidePanel()
 
@@ -4525,16 +4578,20 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func applyPendingResumeIfNeeded() {
+        let minResumeThreshold = isTrailerPlaybackSession ? 0.5 : 5.0
         guard !didApplyResume,
               let pendingResumeSeconds,
-              pendingResumeSeconds > 5,
+              pendingResumeSeconds > minResumeThreshold,
               time.duration > 0 else {
             return
         }
         guard !loadedStreamLooksLikeReplacement() else { return }
 
         didApplyResume = true
-        seek(to: min(pendingResumeSeconds, max(time.duration - 5, 0)))
+        let target = isTrailerPlaybackSession
+            ? min(pendingResumeSeconds, max(time.duration - 1, 0))
+            : min(pendingResumeSeconds, max(time.duration - 5, 0))
+        seek(to: target)
     }
 
     private func saveProgressIfNeeded() {

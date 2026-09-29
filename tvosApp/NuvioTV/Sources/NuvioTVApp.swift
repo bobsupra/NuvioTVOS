@@ -506,8 +506,7 @@ struct ContentView: View {
         // no `.onExitCommand` handler and tvOS quits the app. This root handler
         // catches those stray presses and dismisses the overlay instead. When
         // focus is settled inside Details/Player their own handler fires first,
-        // so this only kicks in for the in-between frames. No handler is attached
-        // on Home, so Menu there keeps its normal tab-level behaviour.
+        // so this only kicks in for the in-between frames.
         .onExitCommand(perform: isOverlayPresented ? dismissOverlay : nil)
         .onOpenURL(perform: handleDeepLink)
         .onAppear {
@@ -1535,6 +1534,9 @@ struct ContentView: View {
                     resumeFrom: resumeFrom
                 )
                 .transition(.opacity)
+                .onDisappear {
+                    detailsDidDisappearGeneration &+= 1
+                }
                 .zIndex(2)
             }
 
@@ -1678,6 +1680,9 @@ struct ContentView: View {
                     message: continueWatchingLoadingMessage
                 )
                 .transition(.opacity)
+                .onDisappear {
+                    detailsDidDisappearGeneration &+= 1
+                }
                 .zIndex(3)
             }
 
@@ -1862,7 +1867,7 @@ struct ContentView: View {
                 reopenStreamPickerOnDetails = false
                 reopenStreamPickerEpisode = nil
             },
-            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player, cacheFileIdentity, filename, videoSize, videoHash in
+            onPlayClick: { streamUrlString, httpHeaders, meta, subtitle, externalSubtitles, currentEpisode, episodes, player, cacheFileIdentity, filename, videoSize, videoHash, resumeFrom in
                 if let url = URL(string: streamUrlString) {
                     let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
                     reopenStreamPickerOnDetails = false
@@ -1874,7 +1879,7 @@ struct ContentView: View {
                         meta: meta,
                         subtitle: subtitle,
                         externalSubtitles: externalSubtitles,
-                        resumeFrom: isTrailer ? nil : Self.resumePosition(for: meta, episode: currentEpisode),
+                        resumeFrom: isTrailer ? resumeFrom : (resumeFrom ?? Self.resumePosition(for: meta, episode: currentEpisode)),
                         httpHeaders: httpHeaders,
                         origin: .details,
                         customPlayer: player,
@@ -3525,6 +3530,7 @@ struct TVHomeView: View {
     /// Fast-scroll tracking (matching Android DpadFastScrollModifier):
     /// suppresses intermediate card focus oscillations during continuous remote holding or rapid swiping.
     @State private var isFastScrolling = false
+    @State private var scrollToTopGeneration = 0
 
     private var activeFocusRestrictionCardID: String? {
         overlayRestoreCardID
@@ -3774,6 +3780,16 @@ struct TVHomeView: View {
                                                 for: sections,
                                                 using: verticalScrollProxy
                                             )
+                                        }
+                                    }
+                                    .onChange(of: scrollToTopGeneration) { _, _ in
+                                        let animation = (isFastScrolling || fastNavigation)
+                                            ? TVHomeLayout.fastVerticalScrollAnimation
+                                            : TVHomeLayout.verticalScrollAnimation
+                                        withAnimation(animation) {
+                                            if let firstId = firstFocusableSectionId {
+                                                verticalScrollProxy.scrollTo(firstId, anchor: .top)
+                                            }
                                         }
                                     }
 
@@ -4123,8 +4139,7 @@ struct TVHomeView: View {
                     if isActive {
                         releaseReturnFocusAnimationSuppression()
                     }
-                    if isEnabled,
-                       newValue == overlayRestoreCardID {
+                    if isEnabled, overlayRestoreCardID != nil {
                         completeOverlayFocusRestore(for: newValue)
                     }
                 }
@@ -4150,16 +4165,25 @@ struct TVHomeView: View {
             handleHomeOverlayStateChange(isPresented: presented)
         }
         .onChange(of: detailsDidDisappearGeneration) { _, generation in
-            guard !isFullScreenOverlayPresented else { return }
-            guard let target = overlayRestoreCardID,
-                  focusWork.restoringOverlayCardID == target else { return }
+            guard !isFullScreenOverlayPresented, isActive else { return }
+            let savedTarget = overlayRestoreCardID
+                ?? focusWork.pendingOverlayRestoreCardID
+                ?? store.lastFocusedCardID
+            guard let rawTarget = savedTarget,
+                  let target = validRestoreTarget(rawTarget) else { return }
             TVHomeDebugTrace.log(
                 "home.details.disappeared generation=\(generation) restoring target=\(target)"
             )
-            // Details is now out of the hierarchy, so this is the first focus
-            // request that tvOS can actually commit. The card's focus callback
-            // will release the one-card lock on the next run-loop turn.
+            if let rowIndex = visibleSections.firstIndex(where: { target.hasPrefix("\($0.id)\u{1}") }) {
+                focusedRowIndex = rowIndex
+                focusedSectionId = visibleSections[rowIndex].id
+            }
             focusedCardID = target
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                if overlayRestoreCardID != nil {
+                    completeOverlayFocusRestore(for: target)
+                }
+            }
         }
         .onChange(of: focusRows) { _, _ in
             retargetMissingFocusIfNeeded()
@@ -4179,6 +4203,7 @@ struct TVHomeView: View {
                 onLongPress: onLongPressCard
             )
         }
+        .onExitCommand(perform: canHandleExitCommand ? scrollHomeToTop : nil)
     }
 
     /// - Parameter heroBleed: Horizontal safe-area inset this grid sits inside.
@@ -4219,6 +4244,7 @@ struct TVHomeView: View {
                         ) { selectedMeta in
                             navigateToDetailsFromHome(id: selectedMeta.id, type: selectedMeta.type)
                         }
+                        .id("home-grid-hero-top")
                     }
 
                     ForEach(Array(sections.enumerated()), id: \.element.id) { index, section in
@@ -4289,19 +4315,19 @@ struct TVHomeView: View {
                                 onBlur: { _ in },
                                 onApproachEnd: { _ in },
                                 onSelect: { meta in
+                                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                                     if let item = continueWatchingByMetaId[meta.id] {
                                         if item.isUpNextEntry && !item.hasAired && !item.isAiringToday {
-                                            let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                                             navigateToDetailsFromHome(
                                                 id: meta.id,
                                                 type: meta.type,
                                                 restoreCardID: cardKey
                                             )
                                         } else {
+                                            prepareForOverlayPresentation(restoreCardID: cardKey)
                                             onResumePlayback(item)
                                         }
                                     } else {
-                                        let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                                         navigateToDetailsFromHome(
                                             id: meta.id,
                                             type: meta.type,
@@ -4318,8 +4344,16 @@ struct TVHomeView: View {
                                         restoreCardID: cardKey
                                     )
                                 },
-                                onPlayContinueWatchingManually: onPlayContinueWatchingManually,
-                                onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
+                                onPlayContinueWatchingManually: { item in
+                                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: item.meta)
+                                    prepareForOverlayPresentation(restoreCardID: cardKey)
+                                    onPlayContinueWatchingManually?(item)
+                                },
+                                onStartContinueWatchingFromBeginning: { item in
+                                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: item.meta)
+                                    prepareForOverlayPresentation(restoreCardID: cardKey)
+                                    onStartContinueWatchingFromBeginning?(item)
+                                },
                                 onRemoveFromContinueWatching: onRemoveFromContinueWatching
                             )
                             .id(section.id)
@@ -4386,6 +4420,18 @@ struct TVHomeView: View {
                             for: sections,
                             using: verticalScrollProxy
                         )
+                    }
+                }
+                .onChange(of: scrollToTopGeneration) { _, _ in
+                    let animation = (isFastScrolling || fastNavigation)
+                        ? TVHomeLayout.fastVerticalScrollAnimation
+                        : TVHomeLayout.verticalScrollAnimation
+                    withAnimation(animation) {
+                        if heroEnabled && !heroItems.isEmpty {
+                            verticalScrollProxy.scrollTo("home-grid-hero-top", anchor: .top)
+                        } else if let firstId = firstFocusableSectionId {
+                            verticalScrollProxy.scrollTo(firstId, anchor: .top)
+                        }
                     }
                 }
             }
@@ -4492,7 +4538,7 @@ struct TVHomeView: View {
             TVHomeDebugTrace.log("home.overlay.presentation setting target=\(target ?? "nil")")
             overlayRestoreCardID = target
         } else if focusWork.defersOverlayPreparation {
-            let target = focusWork.pendingOverlayRestoreCardID.flatMap(validRestoreTarget)
+            let target = (focusWork.pendingOverlayRestoreCardID ?? store.lastFocusedCardID).flatMap(validRestoreTarget)
             focusWork.defersOverlayPreparation = false
             focusWork.pendingOverlayRestoreCardID = nil
             guard let target else {
@@ -4514,7 +4560,7 @@ struct TVHomeView: View {
                 to: target,
                 generation: overlayRestoreGeneration
             )
-        } else if let saved = overlayRestoreCardID {
+        } else if let saved = overlayRestoreCardID ?? store.lastFocusedCardID {
             guard let target = validRestoreTarget(saved) else {
                 overlayRestoreCardID = nil
                 focusWork.restoringOverlayCardID = nil
@@ -4565,13 +4611,13 @@ struct TVHomeView: View {
         // Safety fallback if the lifecycle callback is lost. Normally the
         // target card's focus callback clears the lock much earlier.
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.45) {
-            if overlayRestoreGeneration == generation, overlayRestoreCardID == target {
+            if overlayRestoreGeneration == generation {
                 TVHomeDebugTrace.log("home.restoreOverlayFocus safety cleanup target=\(target)")
-                focusedCardID = target
-                overlayRestoreCardID = nil
-                if focusWork.restoringOverlayCardID == target {
-                    focusWork.restoringOverlayCardID = nil
+                if focusedCardID == nil {
+                    focusedCardID = target
                 }
+                overlayRestoreCardID = nil
+                focusWork.restoringOverlayCardID = nil
             }
         }
     }
@@ -4582,13 +4628,12 @@ struct TVHomeView: View {
     /// eligible; unlocking inside the callback let tvOS jump to the first row
     /// in the six-row focus window (two rows above).
     private func completeOverlayFocusRestore(for cardKey: String) {
-        guard focusWork.restoringOverlayCardID == cardKey || overlayRestoreCardID == cardKey else { return }
+        guard focusWork.restoringOverlayCardID == cardKey || overlayRestoreCardID == cardKey || overlayRestoreCardID != nil else { return }
         focusWork.restoringOverlayCardID = nil
         let generation = overlayRestoreGeneration
         TVHomeDebugTrace.log("home.completeOverlayFocusRestore start cardKey=\(cardKey) gen=\(generation)")
         DispatchQueue.main.async {
-            guard overlayRestoreGeneration == generation,
-                  overlayRestoreCardID == cardKey else { return }
+            guard overlayRestoreGeneration == generation else { return }
 
             TVHomeDebugTrace.log("home.completeOverlayFocusRestore done cardKey=\(cardKey)")
             var transaction = Transaction()
@@ -4612,6 +4657,89 @@ struct TVHomeView: View {
         // finish. Do not cover a ready Continue Watching row with the global
         // spinner while BetterPosters (or another large add-on) is loading.
         return isLoading && store.sections.isEmpty && continueWatching.isEmpty
+    }
+
+    // MARK: - Back Navigation (Exit Command)
+
+    private var firstFocusableCardKey: String? {
+        guard let section = visibleSections.first(where: {
+            $0.hasContent && !$0.isLoadingPlaceholder
+        }) else { return nil }
+        if let folder = section.collectionFolders.first {
+            return TVHomeCardIdentity.folderKey(rowID: section.id, folder: folder)
+        }
+        guard let first = section.items.first else { return nil }
+        return TVHomeCardIdentity.key(rowID: section.id, item: first)
+    }
+
+    /// Consume Menu / Back button while Home has scrolled down or is not at the top item.
+    /// Once the top item is focused at the top edge of Home, leaving the handler nil lets the
+    /// enclosing TabView reveal its sidebar on the next Back / Menu press (matching Search & Discover).
+    private var canHandleExitCommand: Bool {
+        guard isActive,
+              isEnabled,
+              !isFullScreenOverlayPresented,
+              overlayRestoreCardID == nil,
+              focusWork.restoringOverlayCardID == nil,
+              !showsLoading,
+              browsingSection == nil
+        else { return false }
+
+        if homeLayout == "Grid View" {
+            if heroEnabled && !gridHeroItems.isEmpty {
+                return !isGridHeroFocused
+            }
+            guard let firstKey = firstFocusableCardKey else { return false }
+            return focusedCardID != firstKey || focusedRowIndex != 0
+        } else {
+            guard let firstKey = firstFocusableCardKey else { return false }
+            return focusedCardID != firstKey || focusedRowIndex != 0
+        }
+    }
+
+    /// Back on Home smoothly returns the vertical scroll position and card focus to the top.
+    private func scrollHomeToTop() {
+        TVHomeDebugTrace.log("home.scrollHomeToTop triggered; resetting focus and scroll to top")
+        focusWork.upwardFocusTask?.cancel()
+        focusWork.landscapeFocusTask?.cancel()
+        focusWork.pendingLandscapeFocusedId = nil
+        landscapeFocusedId = nil
+        pendingInitialFocusCardKey = nil
+
+        scrollToTopGeneration &+= 1
+
+        if homeLayout == "Grid View" {
+            if heroEnabled && !gridHeroItems.isEmpty {
+                focusedRowIndex = 0
+                focusedSectionId = nil
+                focusedCardID = nil
+                store.lastFocusedCardID = nil
+                gridHeroIndex = 0
+                isGridHeroFocused = true
+                return
+            }
+        }
+
+        guard let firstSection = visibleSections.first(where: {
+            $0.hasContent && !$0.isLoadingPlaceholder
+        }) else { return }
+
+        focusedRowIndex = 0
+        focusedSectionId = firstSection.id
+        rowScrollStore.setIndex(0, for: firstSection.id)
+
+        if let folder = firstSection.collectionFolders.first {
+            let cardKey = TVHomeCardIdentity.folderKey(rowID: firstSection.id, folder: folder)
+            focusedCardID = cardKey
+            store.lastFocusedCardID = cardKey
+            settleFolderFocus(folder, in: firstSection.id)
+        } else if let meta = firstSection.items.first {
+            let cardKey = TVHomeCardIdentity.key(rowID: firstSection.id, item: meta)
+            focusedCardID = cardKey
+            store.lastFocusedCardID = cardKey
+            settleCatalogFocus(on: meta, in: firstSection.id)
+            scheduleLandscapeFocus(cardKey: cardKey)
+        }
     }
 
     private var firstFocusableSectionId: String? {
@@ -4940,21 +5068,21 @@ struct TVHomeView: View {
                         sectionId: section.id, currentItem: meta)
                 },
                 onSelect: { meta in
+                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                     if (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId),
                         let item = continueWatchingByMetaId[meta.id]
                     {
                         if item.isUpNextEntry && !item.hasAired && !item.isAiringToday {
-                            let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                             navigateToDetailsFromHome(
                                 id: meta.id,
                                 type: meta.type,
                                 restoreCardID: cardKey
                             )
                         } else {
+                            prepareForOverlayPresentation(restoreCardID: cardKey)
                             onResumePlayback(item)
                         }
                     } else {
-                        let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: meta)
                         navigateToDetailsFromHome(
                             id: meta.id,
                             type: meta.type,
@@ -4971,8 +5099,16 @@ struct TVHomeView: View {
                         restoreCardID: cardKey
                     )
                 },
-                onPlayContinueWatchingManually: onPlayContinueWatchingManually,
-                onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
+                onPlayContinueWatchingManually: { item in
+                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: item.meta)
+                    prepareForOverlayPresentation(restoreCardID: cardKey)
+                    onPlayContinueWatchingManually?(item)
+                },
+                onStartContinueWatchingFromBeginning: { item in
+                    let cardKey = TVHomeCardIdentity.key(rowID: section.id, item: item.meta)
+                    prepareForOverlayPresentation(restoreCardID: cardKey)
+                    onStartContinueWatchingFromBeginning?(item)
+                },
                 onRemoveFromContinueWatching: onRemoveFromContinueWatching,
             )
             .equatable()
@@ -5177,6 +5313,13 @@ struct TVHomeView: View {
             : estimatedCollectionRowHeight(for: section)
     }
 
+    private func prepareForOverlayPresentation(restoreCardID: String? = nil) {
+        focusWork.defersOverlayPreparation = true
+        focusWork.pendingOverlayRestoreCardID = restoreCardID
+            ?? focusedCardID
+            ?? store.lastFocusedCardID
+    }
+
     /// Captures return identity without publishing SwiftUI state. Publishing
     /// `overlayRestoreCardID` here invalidates the entire Home tree on the same
     /// frame that Details is trying to mount, which is why Search felt faster.
@@ -5185,10 +5328,7 @@ struct TVHomeView: View {
         type: String,
         restoreCardID: String? = nil
     ) {
-        focusWork.defersOverlayPreparation = true
-        focusWork.pendingOverlayRestoreCardID = restoreCardID
-            ?? focusedCardID
-            ?? store.lastFocusedCardID
+        prepareForOverlayPresentation(restoreCardID: restoreCardID)
         onNavigateToDetails(id, type)
     }
 
@@ -5197,10 +5337,7 @@ struct TVHomeView: View {
         sectionTitle: String,
         restoreCardID: String? = nil
     ) {
-        focusWork.defersOverlayPreparation = true
-        focusWork.pendingOverlayRestoreCardID = restoreCardID
-            ?? focusedCardID
-            ?? store.lastFocusedCardID
+        prepareForOverlayPresentation(restoreCardID: restoreCardID)
         onOpenCollectionFolder(folder, sectionTitle)
     }
 

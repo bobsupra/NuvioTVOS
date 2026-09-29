@@ -1,5 +1,6 @@
 import Foundation
 import Darwin
+import AVFoundation
 
 struct PlaybackCacheFileIdentity: Equatable, Sendable {
     let infoHash: String
@@ -178,11 +179,11 @@ enum PlaybackCacheProfile: String, Equatable {
         let gibPhysical = Double(physicalMemoryBytes) / 1_073_741_824.0
         let mbAvailable = Double(availableMemoryBytes) / (1024.0 * 1024.0)
 
-        if gibPhysical > 3.5 && mbAvailable >= 1000 {
-            return 25 // Max/Ultra: ~100s readahead
-        } else if gibPhysical > 2.5 && mbAvailable >= 450 {
-            return 18 // Large: ~72s readahead
-        } else if mbAvailable >= 250 {
+        if gibPhysical > 3.5 && mbAvailable >= 350 {
+            return 25 // Ultra: ~100s readahead (Gen 3)
+        } else if gibPhysical > 2.5 && mbAvailable >= 250 {
+            return 25 // Max: ~100s readahead (Gen 1/2)
+        } else if mbAvailable >= 150 {
             return 10 // Medium: ~40s readahead
         } else {
             return 4  // Conservative: ~16s readahead
@@ -194,11 +195,11 @@ enum PlaybackCacheProfile: String, Equatable {
         let gibPhysical = Double(physicalMemoryBytes) / 1_073_741_824.0
         let mbAvailable = Double(availableMemoryBytes) / (1024.0 * 1024.0)
 
-        if gibPhysical > 3.5 && mbAvailable >= 1000 {
-            return 240.0 // 4 minutes ahead
-        } else if gibPhysical > 2.5 && mbAvailable >= 450 {
-            return 180.0 // 3 minutes ahead
-        } else if mbAvailable >= 250 {
+        if gibPhysical > 3.5 && mbAvailable >= 350 {
+            return 360.0 // Ultra: 6 minutes ahead (Gen 3)
+        } else if gibPhysical > 2.5 && mbAvailable >= 250 {
+            return 240.0 // Max: 4 minutes ahead (Gen 1/2)
+        } else if mbAvailable >= 150 {
             return 120.0 // 2 minutes ahead
         } else {
             return 60.0  // 1 minute ahead
@@ -220,5 +221,65 @@ enum PlaybackASSMode: String, Equatable {
         case "off", "no", "disabled", "native", "authored", "none": return .off
         default: return .off
         }
+    }
+}
+
+/// Coordinates seamless trailer playback handoffs across Home cards,
+/// Details backdrop video, and the full-screen player.
+@MainActor
+final class TrailerPlaybackHandoff {
+    static let shared = TrailerPlaybackHandoff()
+
+    struct Session {
+        let metaId: String
+        let time: Double
+        let playbackSource: TrailerPlaybackSource?
+        let timestamp: Date
+    }
+
+    private var currentSession: Session?
+
+    private init() {}
+
+    func recordHandoff(
+        metaId: String,
+        time: Double,
+        playbackSource: TrailerPlaybackSource? = nil
+    ) {
+        guard time >= 0, !time.isNaN, !time.isInfinite else { return }
+        currentSession = Session(
+            metaId: metaId,
+            time: time,
+            playbackSource: playbackSource ?? (currentSession?.metaId == metaId ? currentSession?.playbackSource : nil),
+            timestamp: Date()
+        )
+    }
+
+    func takeHandoff(for metaId: String, maxAge: TimeInterval = 15.0) -> Session? {
+        guard let session = currentSession, session.metaId == metaId else {
+            return nil
+        }
+        if Date().timeIntervalSince(session.timestamp) > maxAge {
+            currentSession = nil
+            return nil
+        }
+        let taken = session
+        currentSession = nil
+        return taken
+    }
+
+    func peekHandoff(for metaId: String, maxAge: TimeInterval = 15.0) -> Session? {
+        guard let session = currentSession, session.metaId == metaId else {
+            return nil
+        }
+        if Date().timeIntervalSince(session.timestamp) > maxAge {
+            currentSession = nil
+            return nil
+        }
+        return session
+    }
+
+    func clear() {
+        currentSession = nil
     }
 }

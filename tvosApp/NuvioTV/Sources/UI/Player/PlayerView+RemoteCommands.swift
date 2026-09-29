@@ -4,7 +4,12 @@ extension PlayerView {
     var layersWithRemoteCommands: some View {
         layersObservingFocus
             .onPlayPauseCommand {
-                guard !isWakingFromBackground else { return }
+                let elapsedWake = Date().timeIntervalSince(lastBecameActiveAt)
+                print("[ScreensaverDebug][Input] onPlayPauseCommand: isWakingFromBg=\(isWakingFromBackground) (elapsedWake=\(String(format: "%.3f", elapsedWake))s), status=\(viewModel.status), pos=\(viewModel.time.current)")
+                guard !isWakingFromBackground else {
+                    print("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
+                    return
+                }
                 guard viewModel.currentErrorDiagnostic == nil else { return }
                 viewModel.togglePlayPause()
             }

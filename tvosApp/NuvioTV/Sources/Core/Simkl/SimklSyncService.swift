@@ -229,6 +229,37 @@ struct SimklAllItemsResponse: Codable {
     var movies: [SimklSyncItem]?
     var anime: [SimklSyncItem]?
 
+    init(
+        shows: [SimklSyncItem]? = nil,
+        movies: [SimklSyncItem]? = nil,
+        anime: [SimklSyncItem]? = nil
+    ) {
+        self.shows = shows
+        self.movies = movies
+        self.anime = anime
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case shows, movies, anime
+    }
+
+    init(from decoder: Decoder) throws {
+        if let container = try? decoder.container(keyedBy: CodingKeys.self) {
+            shows = try container.decodeIfPresent([SimklSyncItem].self, forKey: .shows)
+            movies = try container.decodeIfPresent([SimklSyncItem].self, forKey: .movies)
+            anime = try container.decodeIfPresent([SimklSyncItem].self, forKey: .anime)
+        } else if let single = try? decoder.singleValueContainer(),
+                  let items = try? single.decode([SimklSyncItem].self) {
+            shows = items.filter { $0.seasons != nil }
+            movies = items.filter { $0.seasons == nil }
+            anime = nil
+        } else {
+            shows = nil
+            movies = nil
+            anime = nil
+        }
+    }
+
     mutating func merge(_ delta: SimklAllItemsResponse) {
         shows = Self.merged(shows, delta.shows)
         movies = Self.merged(movies, delta.movies)
@@ -660,6 +691,28 @@ private struct SimklAuthorizedClient {
         return try result.valueOrThrow()
     }
 
+    func getOptional<T: Decodable>(
+        _ type: T.Type,
+        path: String,
+        query: [URLQueryItem] = []
+    ) async -> T? {
+        guard let result: SimklHTTPResult<T> = try? await client.get(
+            path: path,
+            clientID: clientID,
+            accessToken: token,
+            queryItems: query
+        ) else { return nil }
+        if result.statusCode == 401 {
+            SimklAuthStore.clearAuth(
+                profileScope: profileScope,
+                store: store,
+                tokenStorage: tokenStorage
+            )
+        }
+        guard (200..<300).contains(result.statusCode) else { return nil }
+        return result.value
+    }
+
     func post<B: Encodable>(
         path: String,
         query: [URLQueryItem] = [],
@@ -720,9 +773,17 @@ private enum SimklSyncLoader {
 
     static func libraryItems(
         store: UserDefaults,
-        force: Bool = false
+        force: Bool = false,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
     ) async -> SimklAllItemsResponse? {
-        guard let service = SimklAuthorizedClient(store: store),
+        guard let service = SimklAuthorizedClient(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ),
               let activities = try? await activities(using: service) else { return nil }
 
         let cached = SimklSyncCache.items(in: store)
@@ -737,19 +798,21 @@ private enum SimklSyncLoader {
         if shouldBootstrap {
             result = SimklAllItemsResponse()
             for type in ["shows", "movies", "anime"] {
-                guard let response = try? await service.get(
+                if let response = await service.getOptional(
                     SimklAllItemsResponse.self,
                     path: "sync/all-items/\(type)"
-                ) else { return nil }
-                result.merge(response)
+                ) {
+                    result.merge(response)
+                }
             }
         } else if let watermark = previousActivities?.all, !watermark.isEmpty {
-            guard let delta = try? await service.get(
+            if let delta = await service.getOptional(
                 SimklAllItemsResponse.self,
                 path: "sync/all-items",
                 query: [URLQueryItem(name: "date_from", value: watermark)]
-            ) else { return nil }
-            result.merge(delta)
+            ) {
+                result.merge(delta)
+            }
         }
 
         SimklSyncCache.saveItems(result, activities: activities, store: store)
@@ -768,11 +831,19 @@ struct SimklHistoryService {
     @MainActor
     static func syncWatchedHistory(
         store: UserDefaults = ProfileSettings.current,
-        force: Bool = false
+        force: Bool = false,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
     ) async -> Bool {
         guard ProfileSettings.isActiveStore(store) else { return false }
         let syncStartedAt = Date()
-        guard let service = SimklAuthorizedClient(store: store),
+        guard let service = SimklAuthorizedClient(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ),
               let activities = try? await SimklSyncLoader.activities(using: service) else {
             return false
         }
@@ -793,23 +864,28 @@ struct SimklHistoryService {
         var records = previousRecords
         if previousRecords.isEmpty || oldWatermark == nil || hadRemovals {
             records = []
+            var anySucceeded = false
             for type in ["shows", "movies", "anime"] {
-                guard let response = try? await service.get(
+                if let response = await service.getOptional(
                     SimklAllItemsResponse.self,
                     path: "sync/all-items/\(type)",
                     query: historyQuery()
-                ) else { return false }
-                records = mergeHistory(records, response: response)
+                ) {
+                    records = mergeHistory(records, response: response)
+                    anySucceeded = true
+                }
             }
+            guard anySucceeded || previousRecords.isEmpty else { return false }
         } else {
             var query = historyQuery()
             query.append(URLQueryItem(name: "date_from", value: oldWatermark))
-            guard let delta = try? await service.get(
+            if let delta = await service.getOptional(
                 SimklAllItemsResponse.self,
                 path: "sync/all-items",
                 query: query
-            ) else { return false }
-            records = mergeHistory(records, response: delta)
+            ) {
+                records = mergeHistory(records, response: delta)
+            }
         }
 
         guard ProfileSettings.isActiveStore(store) else { return false }
@@ -935,7 +1011,7 @@ struct SimklHistoryService {
         return records
     }
 
-    private static func watchedItems(
+    static func watchedItems(
         from item: SimklSyncItem,
         type: String
     ) -> [WatchedStoreItem] {
@@ -953,14 +1029,18 @@ struct SimklHistoryService {
             return [WatchedStoreItem(meta: meta, watchedAt: watchedAt)]
         }
 
+        let fallbackWatchedAt = parseDate(item.lastWatchedAt)
+            ?? parseDate(item.addedToWatchlistAt)
+            ?? .distantPast
+
         return (item.seasons ?? []).flatMap { season -> [WatchedStoreItem] in
             guard let seasonNumber = season.number else { return [] }
             return (season.episodes ?? []).compactMap { episode in
-                guard let episodeNumber = episode.resolvedNumber,
-                      let watchedAt = episode.watchedAt else { return nil }
+                guard let episodeNumber = episode.resolvedNumber else { return nil }
+                let watchedAt = episode.watchedAt.flatMap(parseDate) ?? fallbackWatchedAt
                 return WatchedStoreItem(
                     meta: meta,
-                    watchedAt: parseDate(watchedAt) ?? .distantPast,
+                    watchedAt: watchedAt,
                     season: seasonNumber,
                     episode: episodeNumber
                 )
@@ -1438,11 +1518,25 @@ struct SimklLibraryService {
     static func fetchLibrary(
         repository: CatalogRepository,
         store: UserDefaults = ProfileSettings.current,
-        force: Bool = false
+        force: Bool = false,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
     ) async -> [LibraryStoreItem]? {
+        let resolvedProfile = profileScope ?? SimklRuntimeSession.profileScope()
         guard TraktSettingsStore.librarySourceMode(in: store) == .simkl,
-              SimklRuntimeSession.authenticatedState(store: store) != nil,
-              let response = await SimklSyncLoader.libraryItems(store: store, force: force) else {
+              SimklRuntimeSession.authenticatedState(
+                  store: store,
+                  tokenStorage: tokenStorage,
+                  profileScope: resolvedProfile
+              ) != nil,
+              let response = await SimklSyncLoader.libraryItems(
+                  store: store,
+                  force: force,
+                  client: client,
+                  tokenStorage: tokenStorage,
+                  profileScope: resolvedProfile
+              ) else {
             return []
         }
 
@@ -1797,9 +1891,17 @@ struct SimklProgressService {
 
     static func fetchContinueWatching(
         repository: CatalogRepository,
-        store: UserDefaults = ProfileSettings.current
+        store: UserDefaults = ProfileSettings.current,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
     ) async -> [ContinueWatchingItem]? {
-        guard let service = SimklAuthorizedClient(store: store),
+        guard let service = SimklAuthorizedClient(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        ),
               let activities = try? await SimklSyncLoader.activities(using: service) else {
             return nil
         }
@@ -1811,20 +1913,26 @@ struct SimklProgressService {
            let cached = SimklSyncCache.playbacks(in: store) {
             playbacks = cached
         } else {
-            guard let fetched = try? await service.get(
+            let fetched = await service.getOptional(
                 [SimklPlaybackDTO].self,
                 path: "sync/playback"
-            ) else { return nil }
-            playbacks = fetched
-            SimklSyncCache.savePlaybacks(fetched, watermark: watermark, store: store)
+            )
+            playbacks = fetched ?? []
+            SimklSyncCache.savePlaybacks(playbacks, watermark: watermark, store: store)
         }
 
         // Simkl has no separate "next up" playback feed. Build the same
         // display-only suggestions Nuvio Sync builds from the provider's
         // watched episode history. Refresh that history before reading the
         // cache so a first Home load is not one refresh behind.
-        if SimklSyncCache.historyWatermark(in: store) != activities.all {
-            _ = await SimklHistoryService.syncWatchedHistory(store: store)
+        if SimklSyncCache.historyWatermark(in: store) != activities.all
+            || SimklSyncCache.history(in: store).isEmpty {
+            _ = await SimklHistoryService.syncWatchedHistory(
+                store: store,
+                client: client,
+                tokenStorage: tokenStorage,
+                profileScope: profileScope
+            )
         }
         let watchedItems = SimklSyncCache.history(in: store).flatMap(\.items)
         let upNextSeeds = nextUpSeeds(

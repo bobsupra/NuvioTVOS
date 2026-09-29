@@ -2058,6 +2058,27 @@ extension PlaybackStreamCacheTests {
         XCTAssertEqual(available, expectedHeadroom)
     }
 
+    func testHeadroomAllowanceDoesNotOverflowWhenVolumeFreeIsMax() async throws {
+        let root = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let currentSessionDir = root.appendingPathComponent("current_session", isDirectory: true)
+        try FileManager.default.createDirectory(at: currentSessionDir, withIntermediateDirectories: true)
+        let dummyChunk = currentSessionDir.appendingPathComponent("chunk_0.dat")
+        try Data(repeating: 0x01, count: 2 * 1024 * 1024).write(to: dummyChunk)
+
+        let limit: Int64 = 20 * 1024 * 1024 * 1024
+        let available = PlaybackStreamDiskBudget.shared.availableBytes(
+            in: root,
+            limit: limit,
+            preserving: currentSessionDir,
+            freeSpaceReserve: 0,
+            freeSpaceProvider: { _ in Int64.max }
+        )
+
+        XCTAssertEqual(available, limit)
+    }
+
     func testNormalBufferingDoesNotTriggerFalseSeek() async throws {
         let chunkSize = Int(PlaybackStreamDiskCache.defaultChunkSize)
         let fileLength = Int64(chunkSize * 20) // 40 MiB
@@ -2301,10 +2322,10 @@ extension PlaybackStreamCacheTests {
         let autoHighRAM = PlaybackCacheProfile.resolveAutoLeadSeconds(
             physicalMemoryBytes: 4 * 1024 * 1024 * 1024, availableMemoryBytes: 1200 * 1024 * 1024
         )
-        XCTAssertEqual(autoHighRAM, 240.0)
+        XCTAssertEqual(autoHighRAM, 360.0)
 
         let autoLowRAM = PlaybackCacheProfile.resolveAutoLeadSeconds(
-            physicalMemoryBytes: 2 * 1024 * 1024 * 1024, availableMemoryBytes: 200 * 1024 * 1024
+            physicalMemoryBytes: 2 * 1024 * 1024 * 1024, availableMemoryBytes: 100 * 1024 * 1024
         )
         XCTAssertEqual(autoLowRAM, 60.0)
 

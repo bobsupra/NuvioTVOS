@@ -370,6 +370,52 @@ struct NuvioMeta: Identifiable, Codable, Equatable, Hashable {
         )
     }
 
+    /// Preserves existing transient enrichment fields (external ratings badges,
+    /// cast/director/writer credits) from a previously resolved `NuvioMeta` instance
+    /// when merging with a newly fetched full `/meta` record that does not provide them.
+    func preservingEnrichment(from existing: NuvioMeta?) -> NuvioMeta {
+        guard let existing, existing.id == id else { return self }
+        var resolved = self
+        if resolved.externalRatings == nil, let existingRatings = existing.externalRatings {
+            resolved = resolved.withExternalRatings(existingRatings)
+        }
+        let castToUse = (resolved.cast == nil || resolved.cast?.isEmpty == true) ? existing.cast : resolved.cast
+        let directorToUse = (resolved.director == nil || resolved.director?.isEmpty == true) ? existing.director : resolved.director
+        let writerToUse = (resolved.writer == nil || resolved.writer?.isEmpty == true) ? existing.writer : resolved.writer
+
+        if castToUse != resolved.cast || directorToUse != resolved.director || writerToUse != resolved.writer {
+            resolved = NuvioMeta(
+                id: resolved.id,
+                name: resolved.name,
+                description: resolved.description,
+                posterUrl: resolved.posterUrl,
+                backgroundUrl: resolved.backgroundUrl,
+                logoUrl: resolved.logoUrl,
+                imdbId: resolved.imdbId,
+                tmdbId: resolved.tmdbId,
+                type: resolved.type,
+                year: resolved.year,
+                genres: resolved.genres,
+                rating: resolved.rating,
+                releaseInfo: resolved.releaseInfo,
+                runtime: resolved.runtime,
+                cast: castToUse,
+                director: directorToUse,
+                writer: writerToUse,
+                certification: resolved.certification,
+                country: resolved.country,
+                language: resolved.language,
+                released: resolved.released,
+                status: resolved.status,
+                videos: resolved.videos,
+                trailerYtIds: resolved.trailerYtIds,
+                externalRatings: resolved.externalRatings,
+                posterShape: resolved.posterShape
+            )
+        }
+        return resolved
+    }
+
     func withExternalRatings(_ ratings: [NuvioExternalRating]) -> NuvioMeta {
         NuvioMeta(
             id: id,
@@ -603,15 +649,17 @@ enum EpisodeReleasePolicy {
         if !isSeasonRollover {
             return showUnairedNextUp || isAiringToday(released) || hasAired(released)
         }
-        if hasAired(released), releaseDate(for: released) != nil {
+        if hasAired(released) {
             return true
         }
         if isAiringToday(released) {
             return true
         }
-        guard showUnairedNextUp,
-              let releaseDate = calendarDayDate(for: released) else {
+        guard showUnairedNextUp else {
             return false
+        }
+        guard let releaseDate = calendarDayDate(for: released) else {
+            return true
         }
         let days = Calendar.current.dateComponents([.day], from: today(), to: releaseDate).day
         return days.map { (0...upcomingNextSeasonWindowDays).contains($0) } ?? false
