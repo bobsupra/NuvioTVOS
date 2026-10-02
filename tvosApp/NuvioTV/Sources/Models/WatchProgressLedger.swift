@@ -178,6 +178,9 @@ enum WatchProgressLedger {
         var current = records().filter { $0.progressKey != record.progressKey }
         current.append(record)
         print("[WatchProgressLedger] upsert: key=\(record.progressKey), id=\(record.contentId), S\(record.season.map(String.init) ?? "nil")E\(record.episode.map(String.init) ?? "nil"), pos=\(record.position)/\(record.duration), isPendingPush=\(record.isPendingPush), totalRecords=\(current.count)")
+        if record.isSeries {
+            ContinueWatchingDismissStore.clear(contentId: record.contentId)
+        }
         return persist(current)
     }
 
@@ -503,12 +506,14 @@ enum WatchProgressLedger {
             // An episode or movie already marked watched in WatchedStore has been completed
             // and should not be offered as an in-progress resume row.
             if record.isEpisode, let season = record.season, let episode = record.episode {
-                if WatchedStore.containsEpisode(metaId: record.contentId, season: season, episode: episode) {
+                if let watchedAt = WatchedStore.watchedAt(metaId: record.contentId, season: season, episode: episode),
+                   watchedAt >= record.lastWatchedAt {
                     print("[WatchProgressLedger] continueWatchingCandidates: rejected episode \(record.progressKey) - already in WatchedStore")
                     return false
                 }
             } else if !record.isEpisode {
-                if WatchedStore.contains(metaId: record.contentId, type: record.contentType) {
+                if let watchedAt = WatchedStore.watchedAt(metaId: record.contentId),
+                   watchedAt >= record.lastWatchedAt {
                     print("[WatchProgressLedger] continueWatchingCandidates: rejected movie \(record.progressKey) - already in WatchedStore")
                     return false
                 }
