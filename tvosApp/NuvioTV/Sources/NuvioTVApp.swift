@@ -1290,7 +1290,6 @@ struct ContentView: View {
     private func removeFromContinueWatching(_ item: ContinueWatchingItem) {
         print("[ContinueWatching][Home] removeFromContinueWatching called: metaId=\(item.meta.id), S\(item.season.map(String.init) ?? "nil")E\(item.episode.map(String.init) ?? "nil")")
         var keysToDelete = Set<String>()
-        keysToDelete.insert(item.meta.id)
         let itemProgressKey = WatchProgressLedger.progressKey(
             contentId: item.meta.id,
             season: item.episodeNumbers?.season,
@@ -1298,17 +1297,23 @@ struct ContentView: View {
         )
         keysToDelete.insert(itemProgressKey)
 
-        let ledgerKeys = WatchProgressLedger.records()
-            .filter { $0.contentId == item.meta.id }
-            .map(\.progressKey)
-        for key in ledgerKeys {
-            keysToDelete.insert(key)
+        if item.episodeNumbers == nil {
+            keysToDelete.insert(item.meta.id)
+            let ledgerKeys = WatchProgressLedger.records()
+                .filter { $0.contentId == item.meta.id }
+                .map(\.progressKey)
+            for key in ledgerKeys {
+                keysToDelete.insert(key)
+            }
         }
 
         ContinueWatchingDismissStore.dismiss(item)
-        ContinueWatchingDismissStore.dismiss(contentId: item.meta.id)
 
-        _ = WatchProgressLedger.removeContent(id: item.meta.id)
+        if item.episodeNumbers != nil {
+            _ = WatchProgressLedger.remove(keys: [itemProgressKey])
+        } else {
+            _ = WatchProgressLedger.removeContent(id: item.meta.id)
+        }
         ContinueWatchingStore.remove(metaId: item.meta.id)
         TraktProgressService.forgetLocalPlayback(meta: item.meta)
         // Simkl owns its paused rows, so the local dismiss only hides the card
