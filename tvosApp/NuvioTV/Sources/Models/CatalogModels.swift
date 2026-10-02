@@ -1743,7 +1743,7 @@ enum ContinueWatchingStore {
     /// suffixed with the active profile id for per-profile watch history.
     private static let baseKey = "nuvio.tv.continueWatching.items"
     private static let storageDirectoryName = "nuvio-continue-watching"
-    private static let maxItems = 20
+    private static let maxItems = 200
     private static let maxEpisodeResumePoints = 200
 
     /// Continue Watching intentionally keeps one visible row per show. Resume
@@ -5398,6 +5398,22 @@ enum WatchedStore {
         currentSnapshot().containsEpisode(meta: meta, season: season, episode: episode)
     }
 
+    static func watchedAt(metaId: String, season: Int, episode: Int) -> Date? {
+        let lowerId = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return items().first {
+            $0.meta.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == lowerId
+                && $0.season == season && $0.episode == episode
+        }?.watchedAt
+    }
+
+    static func watchedAt(metaId: String) -> Date? {
+        let lowerId = metaId.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        return items().first {
+            $0.meta.id.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == lowerId
+                && $0.season == nil && $0.episode == nil
+        }?.watchedAt
+    }
+
     /// "season:episode" keys of every watched episode of a series, for the
     /// Details episode strip.
     static func watchedEpisodeKeys(metaId: String) -> Set<String> {
@@ -5506,6 +5522,7 @@ enum WatchedStore {
             ContinueWatchingStore.markLedgerWatched(meta: meta, season: season, episode: episode)
         }
         ContinueWatchingStore.removeWatched(episodeItems)
+        ContinueWatchingDismissStore.clear(contentId: meta.id)
         syncSeriesWatchedEpisodes(meta, episodesBySeason: episodesBySeason, isWatched: true)
         return true
     }
@@ -5674,6 +5691,7 @@ enum WatchedStore {
             // Same ordering rule as the single-episode path: resume progress is
             // only dropped once the marks it is being replaced by are durable.
             ContinueWatchingStore.removeWatched(written)
+            ContinueWatchingDismissStore.clear(contentId: meta.id)
         }
 
         let traktStore = ProfileSettings.current
@@ -5788,6 +5806,10 @@ enum WatchedStore {
         // The mark is durable now, so it is safe to cancel any pending remote
         // delete. A failed watched-list write must leave that protection intact.
         clearTombstone(meta: meta, season: season, episode: episode)
+
+        if meta.isSeries {
+            ContinueWatchingDismissStore.clear(contentId: meta.id)
+        }
 
         // Only clear Continue Watching after the watched mark is durable, so a
         // failed write does not drop resume progress with nothing to replace it.
