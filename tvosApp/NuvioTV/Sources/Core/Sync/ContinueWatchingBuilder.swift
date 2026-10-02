@@ -22,7 +22,7 @@ enum ContinueWatchingBuilder {
 
     /// Matches the persisted row cap, so the first page is exactly what a cold
     /// start shows before any scrolling.
-    static let pageSize = 20
+    static let pageSize = 200
     private static let metadataConcurrency = 4
 
     private static var rebuildTask: Task<Void, Never>?
@@ -116,12 +116,13 @@ enum ContinueWatchingBuilder {
         let ledgerSnapshot = WatchProgressLedger.records()
 
         let candidates = WatchProgressLedger.continueWatchingCandidates()
-        let seeds = ContinueWatchingFeatureFlags.nextUpCardsEnabled
+        let rawSeeds = ContinueWatchingFeatureFlags.nextUpCardsEnabled
             ? mergedSeedRecords(
                 WatchProgressLedger.upNextSeeds(),
                 watchedHistorySeeds()
             )
             : []
+        let seeds = await resolveViableSeeds(rawSeeds)
         print("[ContinueWatchingBuilder] rebuild: profile=\(profileId ?? "nil"), ledger records=\(ledgerSnapshot.count), candidates=\(candidates.count) (\(candidates.map(\.progressKey))), seeds=\(seeds.count) (\(seeds.map(\.progressKey)))")
         guard !candidates.isEmpty || !seeds.isEmpty else {
             print("[ContinueWatchingBuilder] rebuild: ledger empty -> setting empty CW store")
@@ -336,9 +337,9 @@ enum ContinueWatchingBuilder {
                 }
                 let next: NuvioVideo?
                 if let current {
-                    next = nextEpisode(after: current, in: meta)
+                    next = nextEpisode(after: current, in: meta, seedWatchedAt: record.lastWatchedAt)
                 } else {
-                    next = firstReleasedEpisode(in: meta)
+                    next = firstReleasedEpisode(in: meta, seedWatchedAt: record.lastWatchedAt)
                 }
                 guard let next else {
                     specs.append(ItemSpec(
@@ -494,6 +495,29 @@ enum ContinueWatchingBuilder {
         return PageResult(items: filtered, failedLookups: failedLookups)
     }
 
+    private static func resolveViableSeeds(_ seeds: [WatchProgressRecord]) async -> [WatchProgressRecord] {
+        guard !seeds.isEmpty else { return [] }
+        let requests = seeds.map { (id: $0.contentId, type: $0.contentType, needsVideos: true) }
+        let metaById = await fetchMetadata(requests)
+        return seeds.filter { record in
+            guard let meta = metaById[record.contentId] else { return false }
+            guard meta.isSeries else { return false }
+            let current: (season: Int, episode: Int)?
+            if let season = record.season, let episode = record.episode {
+                current = (season, episode)
+            } else {
+                current = latestEpisodeForTitleSeed(in: meta, watchedAt: record.lastWatchedAt)
+            }
+            let next: NuvioVideo?
+            if let current {
+                next = nextEpisode(after: current, in: meta, seedWatchedAt: record.lastWatchedAt)
+            } else {
+                next = firstReleasedEpisode(in: meta, seedWatchedAt: record.lastWatchedAt)
+            }
+            return next != nil
+        }
+    }
+
     // MARK: - Metadata
 
     private static func fetchMetadata(
@@ -574,17 +598,21 @@ enum ContinueWatchingBuilder {
     /// leaving far fewer visible entries than the account actually had.
     private static func nextEpisode(
         after current: (season: Int, episode: Int),
-        in meta: NuvioMeta
+        in meta: NuvioMeta,
+        seedWatchedAt: Date
     ) -> NuvioVideo? {
-        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
         let allVideos = (meta.videos ?? []).sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
         let mainSeasonVideos = allVideos.filter { $0.season > 0 }
         let videos = mainSeasonVideos.isEmpty ? allVideos : mainSeasonVideos
 
         return videos
             .filter { candidate in
-                // Skip episodes that have already been marked watched in WatchedStore
-                !watchedKeys.contains("\(candidate.season):\(candidate.episode)")
+                guard let watchedAt = WatchedStore.watchedAt(
+                    metaId: meta.id,
+                    season: candidate.season,
+                    episode: candidate.episode
+                ) else { return true }
+                return watchedAt < seedWatchedAt
             }
             .first { candidate in
                 guard (candidate.season, candidate.episode) > (current.season, current.episode) else {
@@ -737,14 +765,20 @@ enum ContinueWatchingBuilder {
         return meta.videos?.first { $0.season == season && $0.episode == episode }
     }
 
-    private static func firstReleasedEpisode(in meta: NuvioMeta) -> NuvioVideo? {
-        let watchedKeys = WatchedStore.watchedEpisodeKeys(meta: meta)
+    private static func firstReleasedEpisode(in meta: NuvioMeta, seedWatchedAt: Date) -> NuvioVideo? {
         let allVideos = (meta.videos ?? []).sorted { ($0.season, $0.episode) < ($1.season, $1.episode) }
         let mainSeasonVideos = allVideos.filter { $0.season > 0 }
         let videos = mainSeasonVideos.isEmpty ? allVideos : mainSeasonVideos
 
         return videos
-            .filter { !watchedKeys.contains("\($0.season):\($0.episode)") }
+            .filter { candidate in
+                guard let watchedAt = WatchedStore.watchedAt(
+                    metaId: meta.id,
+                    season: candidate.season,
+                    episode: candidate.episode
+                ) else { return true }
+                return watchedAt < seedWatchedAt
+            }
             .first { video in
                 EpisodeReleasePolicy.hasAired(video.released)
                     || EpisodeReleasePolicy.isAiringToday(video.released)
