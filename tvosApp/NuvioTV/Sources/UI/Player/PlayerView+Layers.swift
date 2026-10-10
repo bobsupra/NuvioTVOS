@@ -1,5 +1,19 @@
 import SwiftUI
 
+enum PlayerWindowInputCapturePolicy {
+    static func allowsCapture(
+        existingConditions: Bool,
+        isNextEpisodeFocused: Bool,
+        isCancelAutoPlayFocused: Bool,
+        isSkipSegmentFocused: Bool
+    ) -> Bool {
+        existingConditions
+            && !isNextEpisodeFocused
+            && !isCancelAutoPlayFocused
+            && !isSkipSegmentFocused
+    }
+}
+
 // The ZStack children of PlayerView.body, one property per original child so
 // the stack's arity and child order — and therefore SwiftUI's view identity and
 // transitions — are exactly as before.
@@ -161,7 +175,8 @@ extension PlayerView {
         // never while transport controls or native menus are active so the Focus Engine can navigate.
         RemoteTouchCatcher(
             isActive: {
-                !isWakingFromBackground
+                PlayerWindowInputCapturePolicy.allowsCapture(
+                    existingConditions: !isWakingFromBackground
                     && viewModel.currentErrorDiagnostic == nil && !viewModel.showSettingsPanel
                     && !viewModel.showScenePanel
                     && !viewModel.isSceneDetailVisible
@@ -170,7 +185,11 @@ extension PlayerView {
                     && !viewModel.isHoldingSeek
                     && viewModel.pendingSeekDelta == 0
                     && (!viewModel.showControls || viewModel.isScrubbing || viewModel.isTimelineFocused)
-                    && !viewModel.controlsAutoHideSuspended
+                    && !viewModel.controlsAutoHideSuspended,
+                    isNextEpisodeFocused: nextEpisodeFocused,
+                    isCancelAutoPlayFocused: cancelAutoPlayFocused,
+                    isSkipSegmentFocused: skipSegmentFocused
+                )
             },
             onBegan: { viewModel.remoteTouchBegan() },
             onMoved: { dx, dy in viewModel.remoteTouchMoved(dx: dx, dy: dy) },
@@ -185,7 +204,8 @@ extension PlayerView {
         RemoteSeekPressCatcher(
             // Tap or hold left/right seek is active during video playback,
             // when controls are hidden or when the timeline is focused.
-            isActive: !isWakingFromBackground
+            isActive: PlayerWindowInputCapturePolicy.allowsCapture(
+                existingConditions: !isWakingFromBackground
                 && viewModel.currentErrorDiagnostic == nil
                 && !viewModel.showSettingsPanel
                 && !viewModel.showScenePanel
@@ -194,6 +214,10 @@ extension PlayerView {
                 && !viewModel.isScrubbing
                 && !viewModel.postPlayState.isVisible
                 && (!viewModel.showControls || viewModel.isTimelineFocused),
+                isNextEpisodeFocused: nextEpisodeFocused,
+                isCancelAutoPlayFocused: cancelAutoPlayFocused,
+                isSkipSegmentFocused: skipSegmentFocused
+            ),
             onTapBackward: {
                 screensaverDebugLog("[ScreensaverDebug][Input] RemoteSeekPressCatcher onTapBackward: isWaking=\(isWakingFromBackground)")
                 viewModel.handleMoveSeek(direction: .left)
@@ -426,7 +450,7 @@ extension PlayerView {
                 case .right:
                     if viewModel.showNextEpisodeCard {
                         skipSegmentFocused = false
-                        focusNextEpisode()
+                        focusNextEpisode(allowWhenControlsVisible: true)
                     } else {
                         skipSegmentFocused = false
                         requestedControlFocus = .pip
@@ -534,7 +558,7 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode() }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(

@@ -21,6 +21,34 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.showLoadingStatus))
     }
 
+    func testPromptFocusBlocksWindowInputCaptureButTimelineCaptureRemainsAllowed() {
+        XCTAssertTrue(PlayerWindowInputCapturePolicy.allowsCapture(
+            existingConditions: true, // Existing timeline/hidden-controls condition allows capture.
+            isNextEpisodeFocused: false,
+            isCancelAutoPlayFocused: false,
+            isSkipSegmentFocused: false
+        ))
+
+        XCTAssertFalse(PlayerWindowInputCapturePolicy.allowsCapture(
+            existingConditions: true,
+            isNextEpisodeFocused: true,
+            isCancelAutoPlayFocused: false,
+            isSkipSegmentFocused: false
+        ), "The next-episode prompt must keep the window catcher from consuming input")
+        XCTAssertFalse(PlayerWindowInputCapturePolicy.allowsCapture(
+            existingConditions: true,
+            isNextEpisodeFocused: false,
+            isCancelAutoPlayFocused: true,
+            isSkipSegmentFocused: false
+        ), "The cancel auto-play button must keep the window catcher from consuming input")
+        XCTAssertFalse(PlayerWindowInputCapturePolicy.allowsCapture(
+            existingConditions: true,
+            isNextEpisodeFocused: false,
+            isCancelAutoPlayFocused: false,
+            isSkipSegmentFocused: true
+        ), "The skip-segment prompt must keep the window catcher from consuming input")
+    }
+
     func testPlayerControlsSettingsSyncMappings() {
         let localMappings = Dictionary(uniqueKeysWithValues: PlayerSettingsSyncMapper.localToRemoteKeyMappings)
         XCTAssertEqual(localMappings[SettingsKey.playerShowPiP], "player_show_pip")

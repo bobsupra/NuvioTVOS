@@ -108,8 +108,23 @@ struct PlayerView: View {
         }
     }
 
-    func focusNextEpisode() {
+    func focusNextEpisode(allowWhenControlsVisible: Bool = false) {
         DispatchQueue.main.async {
+            guard viewModel.showNextEpisodeCard,
+                  !viewModel.isScrubbing,
+                  !viewModel.isHoldingSeek,
+                  !viewModel.isSwitchingSource,
+                  !viewModel.showSettingsPanel,
+                  !viewModel.showScenePanel,
+                  !viewModel.isSceneDetailVisible,
+                  viewModel.sidePanel == nil,
+                  !viewModel.postPlayState.isVisible,
+                  !viewModel.showPauseOverlay,
+                  viewModel.currentErrorDiagnostic == nil,
+                  !isWakingFromBackground,
+                  !skipSegmentFocused,
+                  !cancelAutoPlayFocused,
+                  allowWhenControlsVisible || !viewModel.showControls else { return }
             nextEpisodeFocused = true
         }
     }

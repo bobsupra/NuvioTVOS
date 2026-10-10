@@ -529,20 +529,53 @@ class PlayerViewModel: ObservableObject {
         playerController.subtitleTranslationState.onFirstOutcome = { [weak self] outcome in
             self?.handleAISubtitleTranslationOutcome(outcome)
         }
+        sessionCoordinator.prepareForHandoff = { [weak self] req in
+            guard let self else { return }
+            if let currentAudio = self.audioTracks.first(where: { $0.isSelected }) {
+                let saved = PlayerTrackSelection.Audio(
+                    id: currentAudio.id,
+                    name: currentAudio.name,
+                    language: currentAudio.language,
+                    languageName: currentAudio.languageName
+                )
+                self.rememberSessionAudio(saved)
+            }
+            if let currentSubtitle = self.subtitles.first(where: { $0.isSelected }) {
+                let saved = Self.trackSelection(for: currentSubtitle)
+                self.rememberSessionSubtitle(saved)
+            }
+
+            var seen = Set<String>()
+            var allSubs: [NuvioSubtitle] = []
+            for sub in (req.externalSubtitles + self.availableExternalSubtitles) {
+                if seen.insert(sub.url).inserted {
+                    allSubs.append(sub)
+                }
+            }
+            req.externalSubtitles = allSubs
+        }
         sessionCoordinator.onHandoffToast = { [weak self] message in
-            if let self {
-                self.bindSessionCoordinatorCallbacks()
-                PictureInPictureManager.shared.refreshController(for: self.sessionCoordinator)
+            guard let self else { return }
+            self.bindSessionCoordinatorCallbacks()
+            PictureInPictureManager.shared.refreshController(for: self.sessionCoordinator)
+            self.hdrModeToast = message
+            self.showPlayerToast(message)
+            self.activeEngineKind = self.sessionCoordinator.activeBackend
+            self.resetScrubThumbnailState()
+            self.updateLoadingStepMessage()
+            if self.isPlaybackDebugEnabled == true {
+                self.playbackDebugHUDBackend = nil
+                self.isPlaybackDebugHUDVisible = true
             }
-            self?.hdrModeToast = message
-            self?.showPlayerToast(message)
-            self?.activeEngineKind = self?.sessionCoordinator.activeBackend ?? .mpv
-            self?.resetScrubThumbnailState()
-            self?.updateLoadingStepMessage()
-            if self?.isPlaybackDebugEnabled == true {
-                self?.playbackDebugHUDBackend = nil
-                self?.isPlaybackDebugHUDVisible = true
-            }
+
+            self.didApplySavedAudioSelection = false
+            self.didApplySavedSubtitleSelection = false
+            self.didApplyAudioPreference = false
+            self.didApplySubtitlePreference = false
+            self.addedExternalSubtitleURLs = Set(self.sessionCoordinator.lastRequest?.externalSubtitles.map(\.url) ?? [])
+            self.didAddExternalSubtitles = true
+            self.audioTracks = []
+            self.subtitles = []
         }
     }
 
@@ -1250,8 +1283,18 @@ class PlayerViewModel: ObservableObject {
 
         guard hasChanges else { return }
 
+        sessionCoordinator.updateExternalSubtitles(availableExternalSubtitles)
+
         if isSceneEnabled {
             sceneCoordinator.updateAvailableSubtitles(availableExternalSubtitles)
+        }
+
+        if let targetURL = pendingSelectedExternalSubtitleURL ?? pendingTrackSelection?.subtitle?.externalURL,
+           let matchingSub = availableExternalSubtitles.first(where: { $0.url == targetURL }),
+           !addedExternalSubtitleURLs.contains(matchingSub.url) {
+            engine.addSubtitle(matchingSub, select: true)
+            addedExternalSubtitleURLs.insert(matchingSub.url)
+            didAddExternalSubtitles = true
         }
 
         // Never eagerly auto-download external subtitles if:
@@ -2584,7 +2627,7 @@ class PlayerViewModel: ObservableObject {
         syncTracks()
     }
 
-    private func syncTracks() {
+    func syncTracks() {
         let c = engine
 
         let latestAudioTracks = c.audioTracks.map {
@@ -3952,6 +3995,12 @@ class PlayerViewModel: ObservableObject {
             if let matchingTrack = subtitles.first(where: { $0.externalFilename == url }) {
                 didApplySavedSubtitleSelection = true
                 selectSubtitle(matchingTrack, persist: false)
+            } else if let available = availableExternalSubtitles.first(where: { $0.url == url }) {
+                if !addedExternalSubtitleURLs.contains(available.url) {
+                    engine.addSubtitle(available, select: true)
+                    addedExternalSubtitleURLs.insert(available.url)
+                }
+                pendingSelectedExternalSubtitleURL = available.url
             }
         }
     }
@@ -4167,51 +4216,66 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func matchingAudioTrack(for saved: PlayerTrackSelection.Audio) -> AudioTrack? {
-        if let track = audioTracks.first(where: { track in
-            guard track.id == saved.id else { return false }
-            let hasMetadata = !saved.name.isEmpty || !saved.language.isEmpty || !saved.languageName.isEmpty
-            return !hasMetadata ||
-                Self.sameTrackText(track.name, saved.name) ||
-                Self.sameTrackText(track.language, saved.language) ||
-                Self.sameTrackText(track.languageName, saved.languageName)
-        }) { return track }
         if let track = audioTracks.first(where: {
             Self.sameTrackText($0.name, saved.name) &&
-            Self.sameTrackText($0.language, saved.language)
+            (Self.sameTrackText($0.language, saved.language) ||
+             SubtitleLanguagePreferences.matches($0.language, target: saved.language) ||
+             Self.sameTrackText($0.languageName, saved.languageName))
         }) { return track }
-        if let track = audioTracks.first(where: {
-            Self.sameTrackText($0.name, saved.name) &&
-            Self.sameTrackText($0.languageName, saved.languageName)
-        }) { return track }
+        if !saved.name.isEmpty,
+           let track = audioTracks.first(where: { Self.sameTrackText($0.name, saved.name) }) {
+            return track
+        }
         if !saved.language.isEmpty,
-           let track = audioTracks.first(where: { Self.sameTrackText($0.language, saved.language) }) {
+           let track = audioTracks.first(where: {
+               Self.sameTrackText($0.language, saved.language) ||
+               SubtitleLanguagePreferences.matches($0.language, target: saved.language) ||
+               SubtitleLanguagePreferences.matches($0.name, target: saved.language)
+           }) {
             return track
         }
         if !saved.languageName.isEmpty,
            let track = audioTracks.first(where: { Self.sameTrackText($0.languageName, saved.languageName) }) {
             return track
         }
+        let hasMetadata = !saved.name.isEmpty || !saved.language.isEmpty || !saved.languageName.isEmpty
+        if let track = audioTracks.first(where: { track in
+            guard track.id == saved.id else { return false }
+            return !hasMetadata ||
+                Self.sameTrackText(track.name, saved.name) ||
+                Self.sameTrackText(track.language, saved.language) ||
+                Self.sameTrackText(track.languageName, saved.languageName)
+        }) { return track }
         return nil
     }
 
     private func matchingEmbeddedSubtitleTrack(for saved: PlayerTrackSelection.Subtitle) -> SubtitleTrack? {
         let candidates = subtitles.filter { $0.id != "off" && $0.externalFilename.isEmpty }
+        if let track = candidates.first(where: {
+            Self.sameTrackText($0.name, saved.name) &&
+            (Self.sameTrackText($0.language, saved.language) ||
+             (saved.language != nil && SubtitleLanguagePreferences.matches($0.language, target: saved.language!)))
+        }) { return track }
+        if let name = saved.name, !name.isEmpty,
+           let track = candidates.first(where: { Self.sameTrackText($0.name, name) }) {
+            return track
+        }
+        if let language = saved.language, !language.isEmpty,
+           let track = candidates.first(where: {
+               Self.sameTrackText($0.language, language) ||
+               SubtitleLanguagePreferences.matches($0.language, target: language) ||
+               SubtitleLanguagePreferences.matches($0.name, target: language)
+           }) {
+            return track
+        }
+        let hasMetadata = !(saved.name ?? "").isEmpty || !(saved.language ?? "").isEmpty
         if let id = saved.id,
            let track = candidates.first(where: { track in
                guard track.id == id else { return false }
-               let hasMetadata = !(saved.name ?? "").isEmpty || !(saved.language ?? "").isEmpty
                return !hasMetadata ||
                    Self.sameTrackText(track.name, saved.name) ||
                    Self.sameTrackText(track.language, saved.language)
            }) {
-            return track
-        }
-        if let track = candidates.first(where: {
-            Self.sameTrackText($0.name, saved.name) &&
-            Self.sameTrackText($0.language, saved.language)
-        }) { return track }
-        if let language = saved.language, !language.isEmpty,
-           let track = candidates.first(where: { Self.sameTrackText($0.language, language) }) {
             return track
         }
         return nil

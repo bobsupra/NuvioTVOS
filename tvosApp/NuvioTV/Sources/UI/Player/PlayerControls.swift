@@ -134,7 +134,16 @@ struct PlayerControls: View {
             if isFocused { focusedControl = nil }
         }
         .onChange(of: isNextEpisodeFocused) { _, isFocused in
-            if isFocused { focusedControl = nil }
+            if isFocused {
+                focusedControl = nil
+            } else if canRestoreFocusAfterNextEpisode {
+                DispatchQueue.main.async {
+                    guard canRestoreFocusAfterNextEpisode else { return }
+                    focusedControl = viewModel.isLiveStream
+                        ? (transportFocusOrder.first ?? .settings)
+                        : .timeline
+                }
+            }
         }
         .onChange(of: viewModel.isHoldingSeek) { _, isHolding in
             guard !viewModel.controlsAutoHideSuspended else { return }
@@ -195,6 +204,15 @@ struct PlayerControls: View {
             && !viewModel.isSceneDetailVisible
             && !viewModel.postPlayState.isVisible
             && viewModel.sidePanel == nil
+    }
+
+    private var canRestoreFocusAfterNextEpisode: Bool {
+        controlsInteractable
+            && focusedControl == nil
+            && requestedFocus == nil
+            && !viewModel.controlsAutoHideSuspended
+            && !isSkipSegmentFocused
+            && !isNextEpisodeFocused
     }
 
     /// Left-to-right order of currently visible transport buttons.
