@@ -4887,4 +4887,143 @@ final class LibraryStoreSyncTests: XCTestCase {
     private func makeMeta(_ id: String, name: String? = nil) -> NuvioMeta {
         NuvioMeta(id: id, name: name ?? id, type: "movie")
     }
+
+    @MainActor
+    func testFallbackPreservesAlternateAudioAndSubtitlesOff() throws {
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+
+        let request = PlaybackLoadRequest(videoURL: URL(string: "https://example.test/stream.mkv")!)
+        coordinator.load(request)
+
+        model.audioTracks = [
+            AudioTrack(id: "0", name: "English", language: "en", isSelected: false),
+            AudioTrack(id: "1", name: "Japanese", language: "ja", isSelected: true)
+        ]
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: true),
+            SubtitleTrack(id: "0", name: "English", language: "en", isSelected: false)
+        ]
+
+        model.selectAudio(model.audioTracks[1])
+        model.selectSubtitle(model.subtitles[0])
+
+        coordinator.handoffToMPV(reason: "Aether failed", resumeSeconds: 15.0)
+        XCTAssertEqual(coordinator.activeBackend, .mpv)
+
+        coordinator.mpvController.audioTracks = [
+            PlaybackTrackInfo(index: 1, id: 1, type: "audio", title: "English", lang: "en", selected: true, externalFilename: ""),
+            PlaybackTrackInfo(index: 2, id: 2, type: "audio", title: "Japanese", lang: "ja", selected: false, externalFilename: "")
+        ]
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 1, id: 10, type: "sub", title: "English", lang: "en", selected: true, externalFilename: "")
+        ]
+
+        model.syncTracks()
+
+        let selectedAudio = model.audioTracks.first(where: { $0.isSelected })
+        XCTAssertEqual(selectedAudio?.name, "Japanese")
+        XCTAssertEqual(selectedAudio?.id, "2")
+
+        let selectedSubtitle = model.subtitles.first(where: { $0.isSelected })
+        XCTAssertEqual(selectedSubtitle?.id, "off")
+    }
+
+    @MainActor
+    func testFallbackPreservesEmbeddedAndLateExternalSubtitlesWithoutDuplicates() throws {
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+
+        let initialSub = NuvioSubtitle(url: "https://example.test/initial.srt", language: "en", label: "English Initial")
+        let request = PlaybackLoadRequest(
+            videoURL: URL(string: "https://example.test/stream.mkv")!,
+            externalSubtitles: [initialSub]
+        )
+        coordinator.load(request)
+
+        let lateSub = NuvioSubtitle(url: "https://example.test/late_spanish.srt", language: "es", label: "Spanish Late")
+        model.mergeExternalSubtitles([initialSub, lateSub])
+
+        XCTAssertTrue(model.availableExternalSubtitles.contains(where: { $0.url == lateSub.url }))
+
+        model.selectExternalSubtitle(lateSub)
+
+        coordinator.handoffToMPV(reason: "Fallback test", resumeSeconds: 30.0)
+
+        let handoffRequest = try XCTUnwrap(coordinator.lastRequest)
+        let subURLs = handoffRequest.externalSubtitles.map(\.url)
+        XCTAssertEqual(Set(subURLs).count, subURLs.count, "External subtitles must not have duplicates")
+        XCTAssertTrue(subURLs.contains(lateSub.url), "External subtitles fetched after loading must be included")
+        XCTAssertTrue(subURLs.contains(initialSub.url))
+
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 1, id: 5, type: "sub", title: "Spanish (Embedded)", lang: "es", selected: false, externalFilename: ""),
+            PlaybackTrackInfo(index: 2, id: 6, type: "sub", title: "Spanish Late", lang: "es", selected: false, externalFilename: lateSub.url)
+        ]
+
+        model.syncTracks()
+
+        let selectedSub = model.subtitles.first(where: { $0.isSelected })
+        XCTAssertEqual(selectedSub?.externalFilename, lateSub.url)
+        XCTAssertEqual(selectedSub?.id, "6")
+    }
+
+    @MainActor
+    func testFallbackPreservesEmbeddedSubtitlesWithDifferentTrackIDs() throws {
+        let aether = try XCTUnwrap(AetherPlaybackController())
+        let coordinator = PlaybackSessionCoordinator(
+            aetherController: aether,
+            aetherControllerFactory: { aether },
+            engineSettingProvider: { "Auto" },
+            loadDispatcher: { _, _, _ in }
+        )
+        let model = PlayerViewModel(sessionCoordinator: coordinator)
+        defer {
+            model.shutdown()
+            coordinator.stopAll()
+        }
+
+        let request = PlaybackLoadRequest(videoURL: URL(string: "https://example.test/stream.mkv")!)
+        coordinator.load(request)
+
+        model.subtitles = [
+            SubtitleTrack(id: "off", name: "Off", language: "", isSelected: false),
+            SubtitleTrack(id: "0", name: "English", language: "en", isSelected: false),
+            SubtitleTrack(id: "1", name: "Spanish", language: "es", isSelected: true)
+        ]
+        model.selectSubtitle(model.subtitles[2])
+
+        coordinator.handoffToMPV(reason: "Fallback", resumeSeconds: 10.0)
+
+        coordinator.mpvController.subtitleTracks = [
+            PlaybackTrackInfo(index: 1, id: 1, type: "sub", title: "French", lang: "fr", selected: true, externalFilename: ""),
+            PlaybackTrackInfo(index: 2, id: 7, type: "sub", title: "Spanish", lang: "es", selected: false, externalFilename: "")
+        ]
+
+        model.syncTracks()
+
+        let selectedSub = model.subtitles.first(where: { $0.isSelected })
+        XCTAssertEqual(selectedSub?.name, "Spanish")
+        XCTAssertEqual(selectedSub?.id, "7")
+    }
 }

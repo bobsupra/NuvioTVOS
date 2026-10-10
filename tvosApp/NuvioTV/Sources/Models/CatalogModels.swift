@@ -6203,28 +6203,40 @@ enum WatchedStore {
     static func items() -> [WatchedStoreItem] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        return itemsLocked()
+        return itemsLocked(profileId: activeProfileId)
     }
 
-    private static func itemsLocked() -> [WatchedStoreItem] {
-        let key = storageKey
+    /// Reads the specified profile. Passing nil explicitly accesses the legacy
+    /// unscoped store; omitting profileId follows the active profile above.
+    static func items(profileId: String?) -> [WatchedStoreItem] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return itemsLocked(profileId: profileId)
+    }
+
+    private static func itemsLocked(profileId: String?) -> [WatchedStoreItem] {
+        let key = storageKey(for: profileId)
         if cachedKey == key, let cachedItems {
             return cachedItems
         }
         guard let data = readData(forKey: key) else {
-            cachedItems = []
-            cachedKey = key
-            cachedData = nil
-            cachedSnapshot = nil
+            if profileId == activeProfileId {
+                cachedItems = []
+                cachedKey = key
+                cachedData = nil
+                cachedSnapshot = nil
+            }
             return []
         }
         do {
             let decoded = try makeDecoder().decode([WatchedStoreItem].self, from: data)
                 .sorted { $0.watchedAt > $1.watchedAt }
-            cachedItems = decoded
-            cachedKey = key
-            cachedData = data
-            cachedSnapshot = nil
+            if profileId == activeProfileId {
+                cachedItems = decoded
+                cachedKey = key
+                cachedData = data
+                cachedSnapshot = nil
+            }
             return decoded
         } catch {
             // Keep the payload intact so a later successful write can replace
@@ -6240,7 +6252,8 @@ enum WatchedStore {
         cacheLock.lock()
         defer { cacheLock.unlock() }
 
-        let key = storageKey
+        let profileId = activeProfileId
+        let key = storageKey(for: profileId)
         let currentSource = TraktSettingsStore.watchProgressSource(in: ProfileSettings.current)
         let shouldShowConnectedTraktHistory = currentSource != .trakt
             && RemoteTrackingState.shouldMirrorWatchedHistoryToTrakt(in: ProfileSettings.current)
@@ -6252,7 +6265,7 @@ enum WatchedStore {
             return snapshot
         }
 
-        let allItems = itemsLocked()
+        let allItems = itemsLocked(profileId: profileId)
         let snapshot = WatchedSnapshot(
             items: allItems,
             source: currentSource,
@@ -7008,12 +7021,27 @@ enum WatchedStore {
         season: Int? = nil,
         episodes: [Int]? = nil
     ) {
+        let profileId = cacheLock.withLock { activeProfileId }
+        retireCompletedLedgerRows(
+            meta: meta,
+            season: season,
+            episodes: episodes,
+            profileId: profileId
+        )
+    }
+
+    static func retireCompletedLedgerRows(
+        meta: NuvioMeta,
+        season: Int? = nil,
+        episodes: [Int]? = nil,
+        profileId: String?
+    ) {
         var contentKeys = contentIdentityKeys(for: meta)
         contentKeys.insert(meta.id.lowercased())
         if let imdbId = meta.imdbId?.lowercased() {
             contentKeys.insert(imdbId)
         }
-        let allRecords = WatchProgressLedger.records()
+        let allRecords = WatchProgressLedger.records(profileId: profileId)
         let matchingRecords = allRecords.filter { record in
             let recordKeys = contentIdentityKeys(metaId: record.contentId, imdbId: nil, tmdbId: nil)
             guard !contentKeys.isDisjoint(with: recordKeys)
@@ -7038,15 +7066,23 @@ enum WatchedStore {
         let keysToRemove = completedRecords.map(\.progressKey)
 
         if !keysToRemove.isEmpty {
-            WatchProgressLedger.remove(keys: keysToRemove)
+            WatchProgressLedger.remove(keys: keysToRemove, profileId: profileId)
             Task { @MainActor in
-                await NuvioSyncManager.current?.deleteRemoteWatchProgress(keys: keysToRemove)
+                await NuvioSyncManager.current?.deleteRemoteWatchProgress(keys: keysToRemove, profileId: profileId)
             }
         }
 
-        ContinueWatchingStore.remove(metaId: meta.id, retainingLedger: true)
-        Task { @MainActor in
-            ContinueWatchingBuilder.scheduleRebuild(reason: "unmarked watched")
+        if profileId == activeProfileId {
+            let removeContinueWatchingRow: @MainActor () -> Void = {
+                guard ContinueWatchingStore.activeProfileId == profileId else { return }
+                ContinueWatchingStore.remove(metaId: meta.id, retainingLedger: true)
+                ContinueWatchingBuilder.scheduleRebuild(reason: "unmarked watched")
+            }
+            if Thread.isMainThread {
+                MainActor.assumeIsolated { removeContinueWatchingRow() }
+            } else {
+                Task { @MainActor in removeContinueWatchingRow() }
+            }
         }
     }
 
@@ -7119,7 +7155,36 @@ enum WatchedStore {
         _ remoteItems: [WatchedStoreItem],
         confirmsTombstoneDeletions: Bool = true
     ) -> Bool {
-        let removedMarks = tombstones()
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return mergeRemoteLocked(
+            remoteItems,
+            confirmsTombstoneDeletions: confirmsTombstoneDeletions,
+            profileId: activeProfileId
+        )
+    }
+
+    @discardableResult
+    static func mergeRemote(
+        _ remoteItems: [WatchedStoreItem],
+        confirmsTombstoneDeletions: Bool = true,
+        profileId: String?
+    ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return mergeRemoteLocked(
+            remoteItems,
+            confirmsTombstoneDeletions: confirmsTombstoneDeletions,
+            profileId: profileId
+        )
+    }
+
+    private static func mergeRemoteLocked(
+        _ remoteItems: [WatchedStoreItem],
+        confirmsTombstoneDeletions: Bool,
+        profileId: String?
+    ) -> Bool {
+        let removedMarks = tombstonesLocked(profileId: profileId)
         guard !remoteItems.isEmpty || !removedMarks.isEmpty else { return true }
 
         let stillBlocking = removedMarks.filter { tombstone in
@@ -7136,20 +7201,25 @@ enum WatchedStore {
             return matchingRemote == nil || matchingRemote!.watchedAt <= tombstone.removedAt
         }
         if stillBlocking.count != removedMarks.count {
-            _ = persistTombstones(stillBlocking)
+            _ = persistTombstonesLocked(stillBlocking, profileId: profileId)
         }
 
         let accepted = remoteItems.filter { item in
             !stillBlocking.contains { tombstoneMatches($0, item: item) }
         }
 
-        let current = items()
+        let current = itemsLocked(profileId: profileId)
         let merged = mergedByIdentity(current + accepted)
         if merged == current {
             return true
         }
-        guard persist(merged) else { return false }
-        ContinueWatchingStore.removeWatched(merged)
+        guard persistLocked(merged, profileId: profileId) else { return false }
+        if profileId == activeProfileId {
+            Task { @MainActor in
+                guard ContinueWatchingStore.activeProfileId == profileId else { return }
+                ContinueWatchingStore.removeWatched(merged)
+            }
+        }
         return true
     }
 
@@ -7162,39 +7232,65 @@ enum WatchedStore {
         _ remoteItems: [WatchedStoreItem],
         syncStartedAt: Date
     ) -> Bool {
-        let remoteItems = remoteItems.map { $0.adding(source: .nuvioSync) }
-        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: true) else { return false }
+        let profileId = cacheLock.withLock { activeProfileId }
+        return reconcileNuvioSnapshot(
+            remoteItems,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
+    }
 
-        let remoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
-        let current = items()
-        let obsolete = current.filter { item in
-            guard item.watchedAt <= syncStartedAt,
-                  item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.nuvioSync.rawValue) else {
+    @discardableResult
+    static func reconcileNuvioSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        syncStartedAt: Date,
+        profileId: String?
+    ) -> Bool {
+        var obsoleteItemsToRetire: [WatchedStoreItem] = []
+        let didReconcile: Bool = cacheLock.withLock {
+            let preparedRemote = remoteItems.map { $0.adding(source: .nuvioSync) }
+            guard mergeRemoteLocked(preparedRemote, confirmsTombstoneDeletions: true, profileId: profileId) else {
                 return false
             }
-            let keys = watchedIdentityKeys(item)
-            return keys.isDisjoint(with: remoteKeys)
-        }
-        guard !obsolete.isEmpty else { return true }
 
-        let obsoleteIDs = Set(obsolete.map(\.id))
-        let updated = current.compactMap { item -> WatchedStoreItem? in
-            guard obsoleteIDs.contains(item.id) else { return item }
-            guard !item.sources.isEmpty else { return nil }
-            var retained = item
-            retained.sources.remove(TraktWatchProgressSource.nuvioSync.rawValue)
-            return retained.sources.isEmpty ? nil : retained
-        }
-        let changed = updated.count != current.count || zip(updated, current).contains {
-            $0.id != $1.id || $0.sources != $1.sources
-        }
-        guard !changed || persist(updated) else { return false }
+            let remoteKeys = Set(preparedRemote.flatMap(watchedIdentityKeys))
+            let current = itemsLocked(profileId: profileId)
+            let obsolete = current.filter { item in
+                guard item.watchedAt <= syncStartedAt,
+                      item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.nuvioSync.rawValue) else {
+                    return false
+                }
+                let keys = watchedIdentityKeys(item)
+                return keys.isDisjoint(with: remoteKeys)
+            }
+            guard !obsolete.isEmpty else { return true }
 
-        for item in obsolete {
+            let obsoleteIDs = Set(obsolete.map(\.id))
+            let updated = current.compactMap { item -> WatchedStoreItem? in
+                guard obsoleteIDs.contains(item.id) else { return item }
+                guard !item.sources.isEmpty else { return nil }
+                var retained = item
+                retained.sources.remove(TraktWatchProgressSource.nuvioSync.rawValue)
+                return retained.sources.isEmpty ? nil : retained
+            }
+            let changed = updated.count != current.count || zip(updated, current).contains {
+                $0.id != $1.id || $0.sources != $1.sources
+            }
+            guard !changed || persistLocked(updated, profileId: profileId) else { return false }
+
+            obsoleteItemsToRetire = obsolete
+            return true
+        }
+
+        guard didReconcile else { return false }
+
+        // Perform ledger row retirement outside cacheLock to prevent nested store locks / deadlock!
+        for item in obsoleteItemsToRetire {
             retireCompletedLedgerRows(
                 meta: item.meta,
                 season: item.season,
-                episodes: item.episode.map { [$0] }
+                episodes: item.episode.map { [$0] },
+                profileId: profileId
             )
         }
         return true
@@ -7671,7 +7767,19 @@ enum WatchedStore {
     }
 
     static func tombstones() -> [Tombstone] {
-        guard let data = readData(forKey: tombstoneStorageKey),
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return tombstonesLocked(profileId: activeProfileId)
+    }
+
+    static func tombstones(profileId: String?) -> [Tombstone] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return tombstonesLocked(profileId: profileId)
+    }
+
+    private static func tombstonesLocked(profileId: String?) -> [Tombstone] {
+        guard let data = readData(forKey: tombstoneStorageKey(for: profileId)),
               let decoded = try? JSONDecoder().decode([Tombstone].self, from: data) else {
             return []
         }
@@ -7679,6 +7787,18 @@ enum WatchedStore {
     }
 
     private static func addTombstone(meta: NuvioMeta, season: Int?, episode: Int?) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        addTombstoneLocked(meta: meta, season: season, episode: episode, profileId: activeProfileId)
+    }
+
+    private static func addTombstone(meta: NuvioMeta, season: Int?, episode: Int?, profileId: String?) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        addTombstoneLocked(meta: meta, season: season, episode: episode, profileId: profileId)
+    }
+
+    private static func addTombstoneLocked(meta: NuvioMeta, season: Int?, episode: Int?, profileId: String?) {
         let entry = Tombstone(
             metaId: meta.id,
             contentType: meta.canonicalType,
@@ -7688,18 +7808,31 @@ enum WatchedStore {
             episode: episode,
             removedAt: Date()
         )
-        let updated = tombstones().filter {
+        let updated = tombstonesLocked(profileId: profileId).filter {
             !(tombstoneContentMatches($0, meta: meta)
                 && $0.season == season && $0.episode == episode)
         } + [entry]
-        _ = persistTombstones(updated)
+        _ = persistTombstonesLocked(updated, profileId: profileId)
     }
 
     private static func clearTombstone(meta: NuvioMeta, season: Int?, episode: Int?) {
-        _ = persistTombstones(tombstones().filter {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        clearTombstoneLocked(meta: meta, season: season, episode: episode, profileId: activeProfileId)
+    }
+
+    private static func clearTombstone(meta: NuvioMeta, season: Int?, episode: Int?, profileId: String?) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        clearTombstoneLocked(meta: meta, season: season, episode: episode, profileId: profileId)
+    }
+
+    private static func clearTombstoneLocked(meta: NuvioMeta, season: Int?, episode: Int?, profileId: String?) {
+        let updated = tombstonesLocked(profileId: profileId).filter {
             !(tombstoneContentMatches($0, meta: meta)
                 && $0.season == season && $0.episode == episode)
-        })
+        }
+        _ = persistTombstonesLocked(updated, profileId: profileId)
     }
 
     private static func tombstoneMatches(_ tombstone: Tombstone, item: WatchedStoreItem) -> Bool {
@@ -7730,19 +7863,51 @@ enum WatchedStore {
 
     /// Called after the remote rows were deleted successfully.
     static func clearTombstones(_ cleared: [Tombstone]) {
-        _ = persistTombstones(tombstones().filter { !cleared.contains($0) })
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let remaining = tombstonesLocked(profileId: activeProfileId).filter { !cleared.contains($0) }
+        _ = persistTombstonesLocked(remaining, profileId: activeProfileId)
+    }
+
+    static func clearTombstones(_ cleared: [Tombstone], profileId: String?) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let remaining = tombstonesLocked(profileId: profileId).filter { !cleared.contains($0) }
+        _ = persistTombstonesLocked(remaining, profileId: profileId)
     }
 
     @discardableResult
     private static func persistTombstones(_ entries: [Tombstone]) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return persistTombstonesLocked(entries, profileId: activeProfileId)
+    }
+
+    @discardableResult
+    private static func persistTombstones(_ entries: [Tombstone], profileId: String?) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return persistTombstonesLocked(entries, profileId: profileId)
+    }
+
+    @discardableResult
+    private static func persistTombstonesLocked(_ entries: [Tombstone], profileId: String?) -> Bool {
         guard let data = try? JSONEncoder().encode(entries) else { return false }
-        return writeData(data, forKey: tombstoneStorageKey)
+        return writeData(data, forKey: tombstoneStorageKey(for: profileId))
     }
 
     static func replaceAll(_ newItems: [WatchedStoreItem]) {
+        _ = persist(sanitizedSnapshot(newItems))
+    }
+
+    static func replaceAll(_ newItems: [WatchedStoreItem], profileId: String?) {
+        _ = persist(sanitizedSnapshot(newItems), profileId: profileId)
+    }
+
+    private static func sanitizedSnapshot(_ newItems: [WatchedStoreItem]) -> [WatchedStoreItem] {
         // Re-snapshot so older rows with non-finite ratings or bloated guides
         // cannot poison a later encode of the full list.
-        let sanitized = newItems.map {
+        newItems.map {
             WatchedStoreItem(
                 meta: $0.meta.persistenceSnapshot,
                 watchedAt: $0.watchedAt,
@@ -7751,43 +7916,47 @@ enum WatchedStore {
                 sources: $0.sources
             )
         }
-        _ = persist(sanitized.sorted { $0.watchedAt > $1.watchedAt })
+        .sorted { $0.watchedAt > $1.watchedAt }
     }
 
     @discardableResult
     private static func persist(_ items: [WatchedStoreItem]) -> Bool {
-        let sorted = items.sorted { $0.watchedAt > $1.watchedAt }
-        let key = storageKey
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return persistLocked(items, profileId: activeProfileId)
+    }
 
-        let previousItems = cacheLock.withLock { () -> [WatchedStoreItem]? in
-            let prev = cachedItems
+    @discardableResult
+    private static func persist(_ items: [WatchedStoreItem], profileId: String?) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return persistLocked(items, profileId: profileId)
+    }
+
+    @discardableResult
+    private static func persistLocked(_ items: [WatchedStoreItem], profileId: String?) -> Bool {
+        let sorted = items.sorted { $0.watchedAt > $1.watchedAt }
+        let key = storageKey(for: profileId)
+
+        guard let data = try? makeEncoder().encode(sorted) else {
+            persistenceDiagnostic = "encode failed"
+            return false
+        }
+
+        let saved = writeData(data, forKey: key)
+        guard saved else {
+            persistenceDiagnostic = "write failed"
+            return false
+        }
+
+        let previousItems = profileId == activeProfileId ? cachedItems : nil
+        if profileId == activeProfileId {
             cacheGeneration &+= 1
             cachedItems = sorted
             cachedKey = key
+            cachedData = data
             cachedSnapshot = nil
-            return prev
-        }
-
-        Task.detached(priority: .utility) {
-            guard let data = try? makeEncoder().encode(items) else {
-                persistenceDiagnostic = "encode failed"
-                return
-            }
-
-            let alreadyCached = cacheLock.withLock { () -> Bool in
-                cachedKey == key && cachedData == data
-            }
-            guard !alreadyCached else { return }
-
-            let saved = writeData(data, forKey: key)
-            if saved {
-                cacheLock.withLock {
-                    if cachedKey == key {
-                        cachedData = data
-                    }
-                    persistenceDiagnostic = "\(items.count) item(s), \(data.count) bytes"
-                }
-            }
+            persistenceDiagnostic = "\(sorted.count) item(s), \(data.count) bytes"
         }
 
         let isUnchanged: Bool
@@ -7800,7 +7969,9 @@ enum WatchedStore {
         }
 
         if !isUnchanged {
-            NotificationCenter.default.post(name: changedNotification, object: nil)
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+            }
         }
         return true
     }
