@@ -29,9 +29,9 @@ struct NuvioTVApp: App {
         }
 
         #if canImport(AetherEngine)
-        // Asynchronously prewarm AetherEngine so hardware deinterlace pipeline setup (~800ms)
-        // completes in the background before player appearance.
-        Task.detached(priority: .utility) {
+        // Schedule AetherEngine prewarming on its required main actor before
+        // player appearance.
+        Task(priority: .utility) { @MainActor in
             _ = try? AetherEngine()
         }
         #endif
@@ -247,6 +247,11 @@ enum TVScreen: Equatable, CustomStringConvertible {
         case let .productionBrowse(company): return "productionBrowse(\(company.name))"
         case let .personBrowse(person): return "personBrowse(\(person.name))"
         }
+    }
+
+    var isPlayer: Bool {
+        if case .player = self { return true }
+        return false
     }
 }
 
@@ -1619,8 +1624,15 @@ struct ContentView: View {
                 .zIndex(2)
             }
 
-            if case .cloudLibrary = activeScreen {
+            let showCloudLibrary = {
+                if case .cloudLibrary = activeScreen { return true }
+                if activeScreen.isPlayer, playbackOrigin == .cloudLibrary { return true }
+                return false
+            }()
+
+            if showCloudLibrary {
                 cloudLibraryScreen()
+                    .disabled(activeScreen.isPlayer)
                     .transition(.opacity)
                     .onDisappear {
                         detailsDidDisappearGeneration &+= 1
@@ -1981,9 +1993,14 @@ struct ContentView: View {
     }
 
     private func cloudLibraryScreen() -> some View {
-        CloudLibraryView(
-            store: ProfileSettings.store(for: profileViewModel.activeProfile?.id),
-            onPlay: { url, meta in
+        let activeProfileId = profileViewModel.activeProfile?.id
+        return CloudLibraryView(
+            store: ProfileSettings.store(for: activeProfileId),
+            onPlay: { [weak profileViewModel] url, meta in
+                guard activeScreen == .cloudLibrary,
+                      profileViewModel?.activeProfile?.id == activeProfileId else {
+                    return
+                }
                 playbackEpisodes = []
                 playbackCurrentEpisode = nil
                 presentPlayback(
@@ -2596,7 +2613,7 @@ struct ContentView: View {
                 reopenStreamPickerEpisode = reopenStreamPickerOnDetails ? playbackCurrentEpisode : nil
                 activeScreen = .details(id: meta.id, type: meta.type)
             case .cloudLibrary:
-                activeScreen = .main
+                activeScreen = .cloudLibrary
             case .main:
                 activeScreen = (isTrailer || meta.isSeries)
                     ? .details(id: meta.id, type: meta.type)
@@ -4273,6 +4290,7 @@ struct TVHomeView: View {
                     scheduleContinueWatchingRefresh()
                     scheduleTraktWatchedHistorySync()
                 } else {
+                    ContinueWatchingBuilder.scheduleRebuild(reason: "full-screen overlay dismissed")
                     refreshContinueWatching()
                     refreshWatchedTitles()
                 }
@@ -4449,10 +4467,20 @@ struct TVHomeView: View {
                                 didRequestInitialCardFocus = true
                             },
                             backdropBleed: heroBleed,
-                            onFocusChange: {
-                                isGridHeroFocused = $0
+                            onFocusChange: { isFocused in
+                                isGridHeroFocused = isFocused
+                                if isFocused {
+                                    focusedCardID = nil
+                                    focusedSectionId = nil
+                                    let animation = (isFastScrolling || fastNavigation)
+                                        ? TVHomeLayout.fastVerticalScrollAnimation
+                                        : TVHomeLayout.verticalScrollAnimation
+                                    withAnimation(animation) {
+                                        verticalScrollProxy.scrollTo("home-grid-hero-top", anchor: .top)
+                                    }
+                                }
                                 let wasHeroFocused = didNativeFocusGridHero
-                                didNativeFocusGridHero = isProfileFocusPending && $0
+                                didNativeFocusGridHero = isProfileFocusPending && isFocused
                                 if isProfileFocusPending && didNativeFocusGridHero != wasHeroFocused {
                                     TVHomeDebugTrace.log("home.profileGate.nativeGridHeroFocus isFocused=\(didNativeFocusGridHero)")
                                     reportProfileGateReadiness()
@@ -4659,6 +4687,16 @@ struct TVHomeView: View {
                             for: sections,
                             using: verticalScrollProxy
                         )
+                    }
+                }
+                .onChange(of: isGridHeroFocused) { wasFocused, isFocused in
+                    if isFocused {
+                        let animation = (isFastScrolling || fastNavigation)
+                            ? TVHomeLayout.fastVerticalScrollAnimation
+                            : TVHomeLayout.verticalScrollAnimation
+                        withAnimation(animation) {
+                            verticalScrollProxy.scrollTo("home-grid-hero-top", anchor: .top)
+                        }
                     }
                 }
                 .task(id: profileGateFocusRequestSignature) {
@@ -5253,6 +5291,7 @@ struct TVHomeView: View {
         store.lastFocusedCardID = nil
         gridHeroIndex = 0
         isGridHeroFocused = true
+        gridHeroFocusRequestGeneration &+= 1
         scrollToTopGeneration &+= 1
     }
 
@@ -7177,15 +7216,15 @@ struct TVHomeView: View {
                 return
             }
             // The store holds the persisted first page and is authoritative — a save
-            // during playback lands there immediately. Pages scrolled in beyond it
-            // live only in the builder, so merge them back, letting the store win on
-            // any title present in both.
+            // during playback lands there immediately. Later pages live only in the
+            // builder, so merge those back while letting the current store win.
             var byId: [String: ContinueWatchingItem] = [:]
-            for item in ContinueWatchingBuilder.pagedItems {
-                byId[item.meta.id] = item
-            }
             let storedItems = TVHomeDebugTrace.measure("cw.snapshot.read") { ContinueWatchingStore.items() }
-            for item in storedItems {
+            let mergedItems = ContinueWatchingBuilder.mergeMemoryOnlyItems(
+                ContinueWatchingBuilder.memoryOnlyPagedItems,
+                with: storedItems
+            )
+            for item in mergedItems {
                 byId[item.meta.id] = item
             }
             // `recencySortDate`, not `lastWatchedAt`: this pass is what the "Default"
@@ -8972,37 +9011,126 @@ extension TVHeroView: Equatable {
     }
 }
 
-/// Grid View's featured carousel, matching Android TV's `HeroCarousel`: a
-/// large near-full-screen banner, local backdrop/gradients, remote paging, Select to
-/// open details, and auto-advance only while the hero is not focused.
+private enum GridHeroFocusTarget: Hashable {
+    case leadingTrap
+    case play
+    case watchlist
+    case info
+    case next
+    case trailingTrap
+}
+
+private struct TvHeroActionButtonStyle: ButtonStyle {
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            #if os(tvOS)
+            .scaleEffect(configuration.isPressed ? 0.985 : 1.0)
+            #else
+            .scaleEffect(configuration.isPressed ? 0.95 : 1.0)
+            #endif
+            .animation(.easeInOut(duration: 0.2), value: configuration.isPressed)
+    }
+}
+
+/// Apple TV native page slider pill matching the tvOS system carousel indicator:
+/// dark frosted capsule container with proportional dots and an elongated
+/// active track with a bright white indicator.
+private struct AppleTvPageSlider: View {
+    let totalCount: Int
+    let selectedIndex: Int
+    var isFocused: Bool = false
+
+    var body: some View {
+        HStack(spacing: 10) {
+            ForEach(0..<totalCount, id: \.self) { dotIndex in
+                if dotIndex == selectedIndex {
+                    // Active indicator track with bright white sliding thumb
+                    ZStack(alignment: .leading) {
+                        Capsule()
+                            .fill(Color.white.opacity(0.28))
+                            .frame(width: isFocused ? 46 : 40, height: 8)
+
+                        Capsule()
+                            .fill(Color.white)
+                            .frame(width: 14, height: 8)
+                    }
+                    .transition(.opacity)
+                } else {
+                    Circle()
+                        .fill(Color.white.opacity(dotOpacity(for: dotIndex)))
+                        .frame(width: dotSize(for: dotIndex), height: dotSize(for: dotIndex))
+                }
+            }
+        }
+        .padding(.horizontal, 18)
+        .padding(.vertical, 9)
+        .background(
+            Capsule()
+                .fill(Color(red: 0.16, green: 0.17, blue: 0.20).opacity(0.88))
+        )
+        .overlay(
+            Capsule()
+                .stroke(Color.white.opacity(0.16), lineWidth: 1)
+        )
+        .shadow(color: .black.opacity(0.45), radius: 10, y: 5)
+        .animation(.spring(response: 0.35, dampingFraction: 0.75), value: selectedIndex)
+        .animation(.easeOut(duration: 0.15), value: isFocused)
+    }
+
+    private func dotSize(for dotIndex: Int) -> CGFloat {
+        let distance = abs(dotIndex - selectedIndex)
+        if distance >= 3 {
+            return 5.0
+        } else if distance == 2 {
+            return 6.5
+        }
+        return 7.5
+    }
+
+    private func dotOpacity(for dotIndex: Int) -> Double {
+        let distance = abs(dotIndex - selectedIndex)
+        if distance >= 3 {
+            return 0.30
+        } else if distance == 2 {
+            return 0.40
+        }
+        return 0.55
+    }
+}
+
+/// Grid View's featured carousel matching Apple TV's home page design:
+/// full-width cinematic artwork, rich logo/typography, metadata badges,
+/// prominent Play/Watch pill button, circular Watchlist/Info/Next buttons,
+/// and native Apple TV page slider pill.
 private struct TVGridHeroSlideshowView: View {
     let items: [NuvioMeta]
     @Binding var selectedIndex: Int
     let focusRequestGeneration: Int
     let shouldRequestInitialFocus: Bool
     let onInitialFocusRequested: () -> Void
-    /// Safe-area inset the artwork bleeds past on each side. Only the backdrop
-    /// widens — the hero's frame, its text, and the focus geometry stay inside
-    /// the safe area.
     var backdropBleed: CGFloat = 0
     var onFocusChange: ((Bool) -> Void)? = nil
     let onSelect: (NuvioMeta) -> Void
 
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
-    @FocusState private var isFocused: Bool
+    @FocusState private var focusedTarget: GridHeroFocusTarget?
+    @State private var isInLibraryCache = false
+    @State private var lastFocusChangeTime: CFTimeInterval = 0
 
     private var index: Int {
         guard !items.isEmpty else { return 0 }
         return min(max(selectedIndex, 0), items.count - 1)
     }
 
-    private var activeItem: NuvioMeta? { items.indices.contains(index) ? items[index] : nil }
+    private var activeItem: NuvioMeta? {
+        items.indices.contains(index) ? items[index] : nil
+    }
 
-    /// Backdrop + scrims. Drawn as a `background` so it can be widened past the
-    /// hero without changing the hero's own frame — the focus engine routes a
-    /// left press off that frame, and a hero reaching x=0 sits under the
-    /// collapsed sidebar.
+    private var isAnyFocused: Bool {
+        focusedTarget != nil
+    }
+
     @ViewBuilder
     private func artLayer(_ item: NuvioMeta) -> some View {
         let background = Color.nuvioBackground(amoled: amoled, body: bodyColor)
@@ -9014,24 +9142,35 @@ private struct TVGridHeroSlideshowView: View {
                 alignment: .top
             )
 
+            // Leading horizontal gradient for text legibility (soft, focused behind text)
             LinearGradient(
                 stops: [
-                    .init(color: background.opacity(0.98), location: 0),
-                    .init(color: background.opacity(0.88), location: 0.16),
-                    .init(color: background.opacity(0.56), location: 0.34),
-                    .init(color: background.opacity(0.20), location: 0.56),
-                    .init(color: .clear, location: 0.72)
+                    .init(color: background.opacity(0.75), location: 0),
+                    .init(color: background.opacity(0.45), location: 0.22),
+                    .init(color: background.opacity(0.12), location: 0.40),
+                    .init(color: .clear, location: 0.58)
                 ],
                 startPoint: .leading,
                 endPoint: .trailing
             )
 
+            // Bottom vertical gradient dissolving softly right at the continue watching shelf
             LinearGradient(
                 stops: [
-                    .init(color: .clear, location: 0.30),
-                    .init(color: background.opacity(0.50), location: 0.60),
-                    .init(color: background.opacity(0.85), location: 0.80),
-                    .init(color: background, location: 1)
+                    .init(color: .clear, location: 0.70),
+                    .init(color: background.opacity(0.35), location: 0.82),
+                    .init(color: background.opacity(0.85), location: 0.93),
+                    .init(color: background, location: 1.0)
+                ],
+                startPoint: .top,
+                endPoint: .bottom
+            )
+
+            // Subtle top vignette for status / navigation bar
+            LinearGradient(
+                stops: [
+                    .init(color: background.opacity(0.30), location: 0),
+                    .init(color: .clear, location: 0.14)
                 ],
                 startPoint: .top,
                 endPoint: .bottom
@@ -9044,81 +9183,79 @@ private struct TVGridHeroSlideshowView: View {
         ZStack(alignment: .bottom) {
             if let activeItem {
                 gridHeroContent(activeItem)
-                    .id(activeItem.id)
-                    .transition(.opacity)
             }
 
+            // Apple TV native slider pill
             if items.count > 1 {
-                HStack(spacing: 12) {
-                    ForEach(items.indices, id: \.self) { dotIndex in
-                        Capsule()
-                            .fill(indicatorColor(for: dotIndex))
-                            .frame(
-                                width: dotIndex == index ? (isFocused ? 48 : 36) : 18,
-                                height: isFocused && dotIndex == index ? 6 : 4
-                            )
-                    }
-                }
-                .animation(.easeInOut(duration: 0.30), value: index)
-                .padding(.bottom, 24)
+                AppleTvPageSlider(
+                    totalCount: items.count,
+                    selectedIndex: index,
+                    isFocused: isAnyFocused
+                )
+                .offset(y: 20)
             }
         }
         .frame(maxWidth: .infinity)
-        // Match the tall Android Grid hero. Besides giving the design the same
-        // visual weight, this keeps 16:9 artwork from being vertically cropped
-        // into an ultra-wide 5:1 strip where the subject disappears.
-        .frame(height: 820)
-        .clipped()
-        // After `clipped()`, so the widened artwork isn't trimmed back to the
-        // hero's frame.
-        .background {
-            if let activeItem { artLayer(activeItem) }
-        }
-        .contentShape(Rectangle())
-        .background {
-            TVNativeFocusObserver(onFocusChange: { focused in
-                onFocusChange?(focused)
-            })
-        }
-        .focusable(true)
-        .focusEffectDisabledIfAvailable()
-        .focused($isFocused)
-        .onAppear {
-            guard shouldRequestInitialFocus else { return }
-            onInitialFocusRequested()
-            DispatchQueue.main.async { isFocused = true }
-        }
-        .onChange(of: focusRequestGeneration) { _, _ in
-            isFocused = true
-        }
-        .onTapGesture {
-            if let activeItem { onSelect(activeItem) }
-        }
-        .onMoveCommand { direction in
-            switch direction {
-            case .left where index > 0:
-                setIndex(index - 1)
-                // The sidebar sits to our left and the focus engine acts on this
-                // same press, so paging back would also open the menu. Claim
-                // focus again to keep the press here. At index 0 it is left
-                // alone, so the first slide still exits to the menu.
-                isFocused = true
-                DispatchQueue.main.async { isFocused = true }
-            case .right where index < items.count - 1:
-                setIndex(index + 1)
-            default:
-                break
+        .frame(height: 830)
+        .background(alignment: .top) {
+            if let activeItem {
+                artLayer(activeItem)
+                    .frame(height: 1080, alignment: .top)
             }
         }
-        .task(id: "\(items.map(\.id).joined(separator: "|"))|\(isFocused)") {
+        .onAppear {
+            updateLibraryStatus()
+            guard shouldRequestInitialFocus else { return }
+            onInitialFocusRequested()
+            DispatchQueue.main.async {
+                focusedTarget = .play
+                lastFocusChangeTime = CACurrentMediaTime()
+            }
+        }
+        .onChange(of: focusRequestGeneration) { _, _ in
+            focusedTarget = .play
+            lastFocusChangeTime = CACurrentMediaTime()
+        }
+        .onChange(of: focusedTarget) { _, newFocus in
+            if newFocus == .leadingTrap {
+                if items.count > 1 {
+                    let prevIndex = (index - 1 + items.count) % items.count
+                    setIndex(prevIndex)
+                }
+                DispatchQueue.main.async {
+                    focusedTarget = .play
+                }
+                return
+            }
+
+            if newFocus == .trailingTrap {
+                if items.count > 1 {
+                    let nextIndex = (index + 1) % items.count
+                    setIndex(nextIndex)
+                }
+                DispatchQueue.main.async {
+                    focusedTarget = .next
+                }
+                return
+            }
+
+            let isFocused = newFocus != nil
+            onFocusChange?(isFocused)
+        }
+        .onChange(of: index) { _, _ in
+            updateLibraryStatus()
+        }
+        .onReceive(NotificationCenter.default.publisher(for: LibraryStore.changedNotification)) { _ in
+            updateLibraryStatus()
+        }
+        .focusSection()
+        .task(id: "\(items.map(\.id).joined(separator: "|"))|\(isAnyFocused)") {
             guard items.count > 1 else { return }
-            // Android lets the initial GPU/image work settle for 20 seconds,
-            // then checks for the next unfocused advance every 10 seconds.
             try? await Task.sleep(nanoseconds: 20_000_000_000)
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 10_000_000_000)
                 guard !Task.isCancelled else { return }
-                if !isFocused { setIndex((index + 1) % items.count) }
+                if !isAnyFocused { setIndex((index + 1) % items.count) }
             }
         }
         .onChange(of: items.count) { _, count in
@@ -9129,59 +9266,273 @@ private struct TVGridHeroSlideshowView: View {
 
     @ViewBuilder
     private func gridHeroContent(_ item: NuvioMeta) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            if let logoURL = item.logoUrl, !logoURL.isEmpty {
-                CachedHeroLogo(url: logoURL, title: item.name)
-                    .frame(maxHeight: 88, alignment: .leading)
-            } else {
-                Text(item.name)
-                    .font(.custom("Inter-Bold", size: 46))
-                    .foregroundColor(.white)
-                    .lineLimit(2)
-            }
-
-            HStack(spacing: 18) {
-                if let rating = item.rating {
-                    Text(String(format: "IMDb %.1f", rating))
-                }
-                if let year = item.year {
-                    Text(String(year))
+        VStack(alignment: .leading, spacing: 14) {
+            // 1. Logo or Title
+            Group {
+                if let logoURL = item.logoUrl, !logoURL.isEmpty {
+                    CachedHeroLogo(url: logoURL, title: item.name)
+                        .frame(maxWidth: 540, maxHeight: 110, alignment: .bottomLeading)
+                } else {
+                    Text(item.name)
+                        .font(.custom("Inter-Bold", size: 48))
+                        .foregroundColor(.white)
+                        .lineLimit(2)
+                        .shadow(color: .black.opacity(0.6), radius: 6, y: 3)
                 }
             }
-            .font(.custom("Inter-SemiBold", size: 21))
-            .foregroundColor(.white.opacity(0.80))
+            .id("hero-title-\(item.id)")
+            .transition(.opacity)
 
-            if let genres = item.genres, !genres.isEmpty {
-                HStack(spacing: 10) {
-                    ForEach(Array(genres.prefix(3)), id: \.self) { genre in
-                        Text(genre)
-                            .font(.custom("Inter-Medium", size: 18))
-                            .foregroundColor(.white.opacity(0.72))
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .background(Color.white.opacity(0.10), in: RoundedRectangle(cornerRadius: 6))
-                    }
-                }
-            }
+            // 2. Metadata Row (Apple TV style: Type • Genres • Year • Badge)
+            heroMetadataRow(item)
+                .id("hero-meta-\(item.id)")
+                .transition(.opacity)
 
+            // 3. Description (2 lines, clean Apple TV typography)
             if let description = item.description, !description.isEmpty {
                 Text(description)
                     .font(.custom("Inter-Regular", size: 21))
-                    .foregroundColor(.white.opacity(0.72))
+                    .foregroundColor(.white.opacity(0.82))
                     .lineLimit(2)
-                    .lineSpacing(2)
+                    .lineSpacing(4)
+                    .frame(maxWidth: 820, alignment: .leading)
+                    .shadow(color: .black.opacity(0.7), radius: 4, y: 2)
+                    .id("hero-desc-\(item.id)")
+                    .transition(.opacity)
+            }
+
+            // 4. Apple TV Action Buttons Row (Mounted without dynamic ID so focus is preserved)
+            heroActionButtons(item)
+                .padding(.top, 4)
+
+            // 5. Subtitle info under primary button
+            if let subtitle = heroSubtitleText(item) {
+                Text(subtitle)
+                    .font(.custom("Inter-Medium", size: 15))
+                    .foregroundColor(.white.opacity(0.58))
+                    .padding(.top, 2)
+                    .shadow(color: .black.opacity(0.6), radius: 3, y: 1)
+                    .id("hero-sub-\(item.id)")
+                    .transition(.opacity)
             }
         }
-        .frame(maxWidth: 860, alignment: .leading)
+        .animation(.easeInOut(duration: 0.28), value: item.id)
+        .frame(maxWidth: 960, alignment: .leading)
         .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
         .padding(.leading, TVLayout.rowLeading)
         .padding(.trailing, TVLayout.rowLeading)
-        .padding(.bottom, 58)
+        .padding(.bottom, 64)
     }
 
-    private func indicatorColor(for dotIndex: Int) -> Color {
-        if dotIndex == index { return AppFocusOutline.color }
-        return isFocused ? AppFocusOutline.color.opacity(0.40) : Color.white.opacity(0.30)
+    private func metadataStrings(for item: NuvioMeta) -> [String] {
+        let typeLabel = item.isSeries
+            ? L10n.string("type_series", fallback: "Series")
+            : L10n.string("type_movie", fallback: "Movie")
+        let genres = Array((item.genres ?? []).prefix(2))
+        var list: [String] = [typeLabel]
+        list.append(contentsOf: genres)
+        if let year = item.year {
+            list.append(String(year))
+        } else if let runtime = NuvioRuntimeDisplay.formatted(item.runtime) {
+            list.append(runtime)
+        }
+        return list
+    }
+
+    @ViewBuilder
+    private func heroMetadataRow(_ item: NuvioMeta) -> some View {
+        let metadataItems = metadataStrings(for: item)
+
+        HStack(spacing: 8) {
+            Image(systemName: item.isSeries ? "tv" : "film")
+                .font(.system(size: 16, weight: .bold))
+                .foregroundColor(.white.opacity(0.9))
+
+            Text(metadataItems.joined(separator: "  •  "))
+                .font(.custom("Inter-SemiBold", size: 19))
+                .foregroundColor(.white.opacity(0.85))
+
+            if let cert = item.certification, !cert.isEmpty {
+                heroBadge(cert)
+            } else if let badge = item.statusBadgeLabel, !badge.isEmpty {
+                heroBadge(badge)
+            } else if let rating = item.rating {
+                heroBadge(String(format: "IMDb %.1f", rating))
+            }
+        }
+        .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
+    }
+
+    @ViewBuilder
+    private func heroBadge(_ text: String) -> some View {
+        Text(text)
+            .font(.custom("Inter-Bold", size: 13))
+            .foregroundColor(.white.opacity(0.95))
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(Color.white.opacity(0.18), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+            .overlay(
+                RoundedRectangle(cornerRadius: 4, style: .continuous)
+                    .stroke(Color.white.opacity(0.35), lineWidth: 1)
+            )
+    }
+
+    @ViewBuilder
+    private func heroActionButtons(_ item: NuvioMeta) -> some View {
+        HStack(spacing: 26) {
+            // Primary Button (Watch Now / Play)
+            Button {
+                onSelect(item)
+            } label: {
+                HStack(spacing: 16) {
+                    Image(systemName: "play.fill")
+                        .font(.system(size: 30, weight: .bold))
+                        .accessibilityHidden(true)
+
+                    Text(L10n.string("details_watch_now", fallback: "Watch Now"))
+                        .font(.system(size: 32, weight: .medium))
+                        .lineLimit(1)
+                        .accessibilityHidden(true)
+                }
+                .foregroundColor(.black)
+                .padding(.horizontal, 44)
+                .frame(minWidth: 228, minHeight: 98)
+                .frame(height: 98)
+                .modifier(TvDetailsGlassBackground(filled: true, shape: Capsule()))
+                .shadow(
+                    color: .black.opacity(focusedTarget == .play ? 0.35 : 0.18),
+                    radius: focusedTarget == .play ? 18 : 7,
+                    y: 8
+                )
+            }
+            .buttonStyle(TvHeroActionButtonStyle())
+            .focused($focusedTarget, equals: .play)
+            .focusEffectDisabledIfAvailable()
+            .scaleEffect(focusedTarget == .play ? 1.08 : 1)
+            .animation(.easeOut(duration: 0.14), value: focusedTarget == .play)
+            .overlay(alignment: .leading) {
+                // Invisible leading focus trap: catches Left press on Play to navigate to previous slide without shifting button layout
+                if items.count > 1 {
+                    Color.clear
+                        .frame(width: 2, height: 98)
+                        .offset(x: -16)
+                        .focusable()
+                        .focused($focusedTarget, equals: .leadingTrap)
+                        .focusEffectDisabledIfAvailable()
+                        .accessibilityHidden(true)
+                }
+            }
+
+            // Watchlist / Library Button (+)
+            Button {
+                toggleLibraryAction(for: item)
+            } label: {
+                Image(systemName: isInLibraryCache ? "checkmark" : "plus")
+                    .font(.system(size: 36, weight: .bold))
+                    .foregroundColor(focusedTarget == .watchlist ? .black : .white)
+                    .frame(width: 98, height: 98)
+                    .modifier(TvDetailsGlassBackground(filled: focusedTarget == .watchlist, shape: Capsule()))
+                    .shadow(
+                        color: .black.opacity(focusedTarget == .watchlist ? 0.35 : 0.18),
+                        radius: focusedTarget == .watchlist ? 18 : 7,
+                        y: 8
+                    )
+            }
+            .buttonStyle(TvHeroActionButtonStyle())
+            .focused($focusedTarget, equals: .watchlist)
+            .focusEffectDisabledIfAvailable()
+            .scaleEffect(focusedTarget == .watchlist ? 1.08 : 1)
+            .animation(.easeOut(duration: 0.14), value: focusedTarget == .watchlist)
+
+            // Details / Info Button (ℹ)
+            Button {
+                onSelect(item)
+            } label: {
+                Image(systemName: "info")
+                    .font(.system(size: 36, weight: .bold))
+                    .foregroundColor(focusedTarget == .info ? .black : .white)
+                    .frame(width: 98, height: 98)
+                    .modifier(TvDetailsGlassBackground(filled: focusedTarget == .info, shape: Capsule()))
+                    .shadow(
+                        color: .black.opacity(focusedTarget == .info ? 0.35 : 0.18),
+                        radius: focusedTarget == .info ? 18 : 7,
+                        y: 8
+                    )
+            }
+            .buttonStyle(TvHeroActionButtonStyle())
+            .focused($focusedTarget, equals: .info)
+            .focusEffectDisabledIfAvailable()
+            .scaleEffect(focusedTarget == .info ? 1.08 : 1)
+            .animation(.easeOut(duration: 0.14), value: focusedTarget == .info)
+
+            // Next Slide Button (>)
+            if items.count > 1 {
+                Button {
+                    setIndex((index + 1) % items.count)
+                } label: {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(focusedTarget == .next ? .black : .white)
+                        .frame(width: 98, height: 98)
+                        .modifier(TvDetailsGlassBackground(filled: focusedTarget == .next, shape: Capsule()))
+                        .shadow(
+                            color: .black.opacity(focusedTarget == .next ? 0.35 : 0.18),
+                            radius: focusedTarget == .next ? 18 : 7,
+                            y: 8
+                        )
+                }
+                .buttonStyle(TvHeroActionButtonStyle())
+                .focused($focusedTarget, equals: .next)
+                .focusEffectDisabledIfAvailable()
+                .scaleEffect(focusedTarget == .next ? 1.08 : 1)
+                .animation(.easeOut(duration: 0.14), value: focusedTarget == .next)
+                .overlay(alignment: .trailing) {
+                    // Invisible trailing focus trap: catches Right press on Next button to advance slide
+                    Color.clear
+                        .frame(width: 2, height: 98)
+                        .offset(x: 16)
+                        .focusable()
+                        .focused($focusedTarget, equals: .trailingTrap)
+                        .focusEffectDisabledIfAvailable()
+                        .accessibilityHidden(true)
+                }
+            }
+        }
+        .focusSection()
+    }
+
+    private func heroSubtitleText(_ item: NuvioMeta) -> String? {
+        if isInLibraryCache {
+            return L10n.string("details_in_library", fallback: "In your library")
+        }
+        if let rating = item.rating {
+            return String(format: "IMDb %.1f • 4K Ultra HD • HDR", rating)
+        }
+        return "4K Ultra HD • HDR • Dolby Atmos"
+    }
+
+    private func updateLibraryStatus() {
+        guard let item = activeItem else {
+            isInLibraryCache = false
+            return
+        }
+        isInLibraryCache = LibraryStore.contains(metaId: item.id, type: item.type)
+    }
+
+    private func toggleLibraryAction(for item: NuvioMeta) {
+        let currentlyInLibrary = LibraryStore.contains(metaId: item.id, type: item.type)
+        if TraktSettingsStore.librarySourceMode != .local && SelectedLibraryService.isSelectedAndAuthenticated {
+            let desiredMembership = !currentlyInLibrary
+            Task {
+                _ = await SelectedLibraryService.setWatchlist(item, isInWatchlist: desiredMembership)
+                await MainActor.run {
+                    updateLibraryStatus()
+                }
+            }
+        } else {
+            _ = LibraryStore.toggle(meta: item)
+            updateLibraryStatus()
+        }
     }
 
     private func setIndex(_ newIndex: Int) {
