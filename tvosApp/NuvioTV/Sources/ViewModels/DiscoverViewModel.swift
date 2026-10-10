@@ -89,10 +89,12 @@ final class DiscoverViewModel: ObservableObject {
     }
 
     private let repository: CatalogRepository
-    private var page = 1
-    private var hasMore = true
+    private(set) var page = 1
+    private(set) var hasMore = true
     private var loadTask: Task<Void, Never>?
+    private var paginationTask: Task<Void, Never>?
     private var sourcesTask: Task<Void, Never>?
+    private var requestGeneration: UInt64 = 0
 
     init(repository: CatalogRepository = CinemetaCatalogRepository()) {
         self.repository = repository
@@ -192,13 +194,16 @@ final class DiscoverViewModel: ObservableObject {
     }
 
     func reload() {
+        requestGeneration &+= 1
+        let generation = requestGeneration
         loadTask?.cancel()
+        paginationTask?.cancel()
         page = 1
         hasMore = true
         isLoading = true
         isLoadingMore = false
         error = nil
-        loadTask = Task { await load(reset: true) }
+        loadTask = Task { await load(reset: true, generation: generation) }
     }
 
     /// Loads the next page when the grid scrolls near its end.
@@ -206,10 +211,11 @@ final class DiscoverViewModel: ObservableObject {
         guard hasMore, !isLoading, !isLoadingMore else { return }
         guard items.suffix(8).contains(where: { $0.id == currentItem.id }) else { return }
         isLoadingMore = true
-        Task { await load(reset: false) }
+        let generation = requestGeneration
+        paginationTask = Task { await load(reset: false, generation: generation) }
     }
 
-    private func load(reset: Bool) async {
+    private func load(reset: Bool, generation: UInt64) async {
         guard let catalog = selectedCatalog else {
             // Fallback load if sources haven't resolved yet
             do {
@@ -221,7 +227,7 @@ final class DiscoverViewModel: ObservableObject {
                     year: nil,
                     sort: nil
                 )
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, self.requestGeneration == generation else { return }
                 if reset {
                     items = result.items
                 } else {
@@ -233,7 +239,7 @@ final class DiscoverViewModel: ObservableObject {
                 isLoading = false
                 isLoadingMore = false
             } catch {
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, self.requestGeneration == generation else { return }
                 self.error = "Couldn’t load Discover. Check your connection and try again."
                 isLoading = false
                 isLoadingMore = false
@@ -247,7 +253,7 @@ final class DiscoverViewModel: ObservableObject {
                 page: page,
                 genre: selectedGenre
             )
-            if Task.isCancelled { return }
+            guard !Task.isCancelled, self.requestGeneration == generation else { return }
             if reset {
                 items = result.items
             } else {
@@ -259,7 +265,7 @@ final class DiscoverViewModel: ObservableObject {
             isLoading = false
             isLoadingMore = false
         } catch {
-            if Task.isCancelled { return }
+            guard !Task.isCancelled, self.requestGeneration == generation else { return }
             self.error = "Couldn’t load Discover. Check your connection and try again."
             isLoading = false
             isLoadingMore = false

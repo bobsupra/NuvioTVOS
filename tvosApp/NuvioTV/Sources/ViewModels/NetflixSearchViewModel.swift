@@ -18,6 +18,7 @@ class NetflixSearchViewModel: ObservableObject {
     private var allResults: [NuvioMeta] = []
     private var cancellables = Set<AnyCancellable>()
     private var searchTask: Task<Void, Never>?
+    private var searchGeneration: UInt64 = 0
     /// Runs after the raw search grid is visible: refreshes the top results'
     /// full `/meta` records so artwork and watched state match Discovery.
     /// Cancelled on every new query so stale enrichment can never be applied.
@@ -42,8 +43,8 @@ class NetflixSearchViewModel: ObservableObject {
             .store(in: &cancellables)
 
         $searchText
-            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
             .removeDuplicates()
+            .debounce(for: .milliseconds(500), scheduler: DispatchQueue.main)
             .sink { [weak self] text in
                 self?.performSearch(query: text)
             }
@@ -57,6 +58,7 @@ class NetflixSearchViewModel: ObservableObject {
     private func handleQueryChange(_ query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
+            searchGeneration &+= 1
             sessionCommittedQuery = nil
             searchTask?.cancel()
             enrichmentTask?.cancel()
@@ -69,6 +71,9 @@ class NetflixSearchViewModel: ObservableObject {
 
         let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         if let cached = cachedResults[cacheKey] {
+            searchGeneration &+= 1
+            searchTask?.cancel()
+            enrichmentTask?.cancel()
             allResults = cached
             applyFilter()
             error = nil
@@ -78,6 +83,7 @@ class NetflixSearchViewModel: ObservableObject {
 
         // Cancel pending tasks and immediately enter loading state while debouncing
         // so the UI does not flash "No Results" before the search runs.
+        searchGeneration &+= 1
         searchTask?.cancel()
         enrichmentTask?.cancel()
         isLoading = true
@@ -87,6 +93,8 @@ class NetflixSearchViewModel: ObservableObject {
     func performSearch(query: String) {
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
+        searchGeneration &+= 1
+        let generation = searchGeneration
         searchTask?.cancel()
         enrichmentTask?.cancel()
 
@@ -105,7 +113,7 @@ class NetflixSearchViewModel: ObservableObject {
             isLoading = false
             if !cached.isEmpty { commitRecentSearch(trimmed) }
             if SearchResultEnrichment.hasIncompleteLeadingResults(cached) {
-                enrich(cached, cacheKey: cacheKey)
+                enrich(cached, cacheKey: cacheKey, generation: generation)
             }
             return
         }
@@ -117,17 +125,17 @@ class NetflixSearchViewModel: ObservableObject {
             guard let self else { return }
             do {
                 let found = try await self.repository.search(query: trimmed)
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, self.searchGeneration == generation else { return }
                 self.allResults = found
                 self.cache(found, for: cacheKey)
                 self.applyFilter()
                 if !found.isEmpty { self.commitRecentSearch(trimmed) }
                 self.isLoading = false
                 if SearchResultEnrichment.hasIncompleteLeadingResults(found) {
-                    self.enrich(found, cacheKey: cacheKey)
+                    self.enrich(found, cacheKey: cacheKey, generation: generation)
                 }
             } catch {
-                if Task.isCancelled { return }
+                guard !Task.isCancelled, self.searchGeneration == generation else { return }
                 self.error = "Couldn’t complete search. Check your connection and try again."
                 self.isLoading = false
             }
@@ -140,7 +148,7 @@ class NetflixSearchViewModel: ObservableObject {
     /// changes; the query-key guard is a second line of defense against a
     /// stale enrichment landing on a newer result list.
     @MainActor
-    private func enrich(_ found: [NuvioMeta], cacheKey: String) {
+    private func enrich(_ found: [NuvioMeta], cacheKey: String, generation: UInt64) {
         enrichmentTask?.cancel()
         enrichmentTask = Task { [weak self] in
             guard let self else { return }
@@ -149,6 +157,7 @@ class NetflixSearchViewModel: ObservableObject {
                 repository: self.repository
             )
             guard !Task.isCancelled,
+                  self.searchGeneration == generation,
                   self.normalizedQuery() == cacheKey else { return }
             self.allResults = enriched
             self.cache(enriched, for: cacheKey)
