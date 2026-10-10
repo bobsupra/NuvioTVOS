@@ -285,14 +285,23 @@ private final class ProbeRedirectDelegate: NSObject, URLSessionTaskDelegate, @un
 actor PlaybackStreamCacheManager {
     static let shared = PlaybackStreamCacheManager()
 
+    private let serverStopper: @Sendable (PlaybackStreamCacheServer) async -> Void
     private var activeServer: PlaybackStreamCacheServer?
     private var activeSessionURL: URL?
+    private(set) var activeSessionToken: String?
+    private var pendingSessionToken: String?
 
     var hasActiveServer: Bool {
         activeServer != nil
     }
 
-    private init() {}
+    init(
+        serverStopper: @escaping @Sendable (PlaybackStreamCacheServer) async -> Void = { server in
+            await server.stop()
+        }
+    ) {
+        self.serverStopper = serverStopper
+    }
 
     /// Checks if a remote stream supports HTTP Range requests and resolves its total file length and HTTP validators.
     func probeRangeSupport(
@@ -473,6 +482,7 @@ actor PlaybackStreamCacheManager {
     func prepareCacheServer(
         for remoteURL: URL,
         headers: [String: String] = [:],
+        sessionToken: String = UUID().uuidString,
         canonicalMediaKey: String? = nil,
         cacheFileIdentity: PlaybackCacheFileIdentity? = nil,
         filename: String? = nil,
@@ -483,11 +493,16 @@ actor PlaybackStreamCacheManager {
         sessionConfiguration: URLSessionConfiguration? = nil,
         freeSpaceProvider: PlaybackStreamDiskCache.FreeSpaceProvider? = nil
     ) async -> URL? {
-        await stopActiveSession()
+        pendingSessionToken = sessionToken
 
         let probe = await probeRangeSupport(url: remoteURL, headers: headers, sessionConfiguration: sessionConfiguration)
+        guard pendingSessionToken == sessionToken else {
+            diskCacheLog.info("Cache session token changed during probe for \(remoteURL.lastPathComponent). Aborting.")
+            return nil
+        }
         guard probe.supportsRange, (probe.contentLength > 10 * 1024 * 1024 || cacheRoot != nil) else {
             diskCacheLog.info("Stream does not support range requests or length is unknown. Bypassing disk cache proxy.")
+            pendingSessionToken = nil
             return nil
         }
 
@@ -523,25 +538,76 @@ actor PlaybackStreamCacheManager {
         )
         if let durationSeconds, durationSeconds > 0 {
             await server.updateTimeline(playheadOffset: 0, durationSeconds: durationSeconds)
+            guard pendingSessionToken == sessionToken else {
+                diskCacheLog.info("Cache session token changed during timeline update for \(remoteURL.lastPathComponent). Aborting.")
+                await serverStopper(server)
+                return nil
+            }
         }
 
         do {
             let localURL = try await server.start()
+            guard pendingSessionToken == sessionToken else {
+                diskCacheLog.info("Cache session token changed during server start for \(remoteURL.lastPathComponent). Cleaning up abandoned server.")
+                await serverStopper(server)
+                return nil
+            }
+
+            // Publish the new owner before awaiting old-server cleanup. stop() can suspend
+            // while pending writes flush, so no manager state can be mutated after that await.
+            let oldServer = activeServer
             activeServer = server
             activeSessionURL = remoteURL
+            activeSessionToken = sessionToken
+            pendingSessionToken = nil
+
+            if let oldServer, oldServer !== server {
+                await serverStopper(oldServer)
+                guard activeServer === server, activeSessionToken == sessionToken else {
+                    diskCacheLog.info("Cache session token changed during previous server shutdown for \(remoteURL.lastPathComponent). Aborting.")
+                    return nil
+                }
+            }
             diskCacheLog.notice("Hybrid Disk Cache engaged for \(remoteURL.lastPathComponent) [session=\(sessionID)] -> \(localURL.absoluteString)")
             return localURL
         } catch {
+            if pendingSessionToken == sessionToken {
+                pendingSessionToken = nil
+            }
+            await serverStopper(server)
             diskCacheLog.error("Failed to start PlaybackStreamCacheServer: \(error.localizedDescription)")
             return nil
         }
     }
 
-    func stopActiveSession() async {
-        if let server = activeServer {
-            await server.stop()
+    func stopSession(token: String?) async {
+        await stopActiveSession(token: token)
+    }
+
+    func stopActiveSession(token: String? = nil) async {
+        if let token,
+           pendingSessionToken != token,
+           activeSessionToken != token {
+            diskCacheLog.info("Ignoring stop request for non-active cache session token \(token) (active is \(self.activeSessionToken ?? "nil"), pending is \(self.pendingSessionToken ?? "nil"))")
+            return
+        }
+
+        if token == nil || pendingSessionToken == token {
+            pendingSessionToken = nil
+        }
+
+        let serverToStop: PlaybackStreamCacheServer?
+        if token == nil || activeSessionToken == token {
+            serverToStop = activeServer
             activeServer = nil
             activeSessionURL = nil
+            activeSessionToken = nil
+        } else {
+            serverToStop = nil
+        }
+
+        if let serverToStop {
+            await serverStopper(serverToStop)
         }
     }
 

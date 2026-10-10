@@ -22,7 +22,7 @@ final class PlaybackSessionCoordinator: ObservableObject {
     private var allowAutomaticFallback = true
     private var didFallbackForCurrentURL = false
     private var currentURLString: String?
-    private var lastRequest: PlaybackLoadRequest?
+    private(set) var lastRequest: PlaybackLoadRequest?
     private var lastRequiresMPVAudioControls = false
     private var isHandoffInProgress = false
     private var handoffTargetSeconds: Double?
@@ -32,6 +32,9 @@ final class PlaybackSessionCoordinator: ObservableObject {
 
     var onHandoffToast: ((String) -> Void)?
     var onAetherControllerChanged: ((AetherPlaybackController?) -> Void)?
+    var prepareForHandoff: ((inout PlaybackLoadRequest) -> Void)?
+    var onBackendHandoff: ((PlaybackLoadRequest) -> Void)?
+    private(set) var currentCacheSessionToken: String?
 
     var activeEngine: PlaybackEngineControlling {
         switch activeBackend {
@@ -200,13 +203,23 @@ final class PlaybackSessionCoordinator: ObservableObject {
         if captured > 1 {
             mpvRequest.resumePositionSeconds = captured
         }
+        prepareForHandoff?(&mpvRequest)
         lastRequest = mpvRequest
         handoffTargetSeconds = mpvRequest.resumePositionSeconds
+
+        let outgoingCacheToken = currentCacheSessionToken
+        currentCacheSessionToken = nil
+        if let outgoingCacheToken {
+            Task {
+                await PlaybackStreamCacheManager.shared.stopSession(token: outgoingCacheToken)
+            }
+        }
 
         loadGeneration += 1
         let generation = loadGeneration
         selectBackend(.mpv, toast: "Compatibility player enabled", pauseOutgoing: false)
         onHandoffToast?("Compatibility player enabled")
+        onBackendHandoff?(mpvRequest)
         startLoad(mpvRequest, on: .mpv, generation: generation)
     }
 
@@ -222,6 +235,10 @@ final class PlaybackSessionCoordinator: ObservableObject {
         isHandoffInProgress = false
         isProgressSaveSuspended = false
         handoffTargetSeconds = nil
+    }
+
+    func updateExternalSubtitles(_ subtitles: [NuvioSubtitle]) {
+        lastRequest?.externalSubtitles = subtitles
     }
 
     func updatePlaybackRate(_ value: Float) {
@@ -249,8 +266,12 @@ final class PlaybackSessionCoordinator: ObservableObject {
         statusToast = nil
         aetherController?.destroyPlayer()
         mpvController.destroyPlayer()
-        Task {
-            await PlaybackStreamCacheManager.shared.stopActiveSession()
+        let tokenToStop = currentCacheSessionToken
+        currentCacheSessionToken = nil
+        if let tokenToStop {
+            Task {
+                await PlaybackStreamCacheManager.shared.stopSession(token: tokenToStop)
+            }
         }
     }
 
@@ -319,12 +340,25 @@ final class PlaybackSessionCoordinator: ObservableObject {
         let isHLS = request.videoURL.pathExtension.lowercased() == "m3u8"
 
         if isDiskCacheEnabled && isHTTP && !isHLS {
+            let sessionToken = UUID().uuidString
+            let previousToken = currentCacheSessionToken
+            currentCacheSessionToken = sessionToken
+            if let previousToken {
+                Task {
+                    await PlaybackStreamCacheManager.shared.stopSession(token: previousToken)
+                }
+            }
+
             Task { @MainActor [weak self] in
-                guard let self, !self.userStopped, self.loadGeneration == generation else { return }
+                guard let self, !self.userStopped, self.loadGeneration == generation else {
+                    await PlaybackStreamCacheManager.shared.stopSession(token: sessionToken)
+                    return
+                }
                 var effectiveRequest = request
                 if let localURL = await PlaybackStreamCacheManager.shared.prepareCacheServer(
                     for: request.videoURL,
                     headers: request.httpHeaders,
+                    sessionToken: sessionToken,
                     canonicalMediaKey: request.canonicalMediaKey,
                     cacheFileIdentity: request.cacheFileIdentity,
                     filename: request.filename,
@@ -333,12 +367,19 @@ final class PlaybackSessionCoordinator: ObservableObject {
                     effectiveRequest.videoURL = localURL
                 }
                 guard !self.userStopped, self.loadGeneration == generation else {
-                    await PlaybackStreamCacheManager.shared.stopActiveSession()
+                    await PlaybackStreamCacheManager.shared.stopSession(token: sessionToken)
                     return
                 }
                 self.dispatchToEngine(effectiveRequest, on: backend, generation: generation)
             }
         } else {
+            let previousToken = currentCacheSessionToken
+            currentCacheSessionToken = nil
+            if let previousToken {
+                Task {
+                    await PlaybackStreamCacheManager.shared.stopSession(token: previousToken)
+                }
+            }
             dispatchToEngine(request, on: backend, generation: generation)
         }
     }
