@@ -10,10 +10,15 @@ final class CloudLibraryViewModel: ObservableObject {
     @Published var selectedType: CloudItemType? = nil
     @Published private(set) var isLoading = false
     @Published private(set) var errorMessage: String?
+    @Published var playbackErrorMessage: String?
     /// `stableKey`+file id currently being resolved, so its row can show a spinner.
     @Published private(set) var resolvingKey: String?
+    @Published var openItem: CloudItem?
+    @Published var focusedKey: String?
 
     private let service: CloudLibraryService
+    private var resolveTask: Task<Void, Never>?
+    private var resolutionGeneration: UInt64 = 0
 
     init(store: UserDefaults) {
         self.service = CloudLibraryService(store: store)
@@ -63,19 +68,41 @@ final class CloudLibraryViewModel: ObservableObject {
         let key = "\(item.stableKey):\(file.id)"
         guard resolvingKey == nil else { return }
         resolvingKey = key
-        Task {
-            let result = await service.resolve(item: item, file: file)
-            resolvingKey = nil
+        resolutionGeneration &+= 1
+        let generation = resolutionGeneration
+        resolveTask?.cancel()
+        resolveTask = Task { [weak self] in
+            guard let self else { return }
+            let result = await self.service.resolve(item: item, file: file)
+            guard !Task.isCancelled, self.resolutionGeneration == generation else { return }
+            self.resolvingKey = nil
             switch result {
             case let .success(url, filename, _):
                 onResolved(url, .cloudPlaceholder(id: "cloud:\(file.id)", name: filename ?? file.name))
             case .missingCredentials:
-                errorMessage = L10n.string("cloud_library_play_not_connected", fallback: "Add your \(providerName) API key in Settings.")
+                let msg = L10n.string("cloud_library_play_not_connected", fallback: "Add your \(self.providerName) API key in Settings.")
+                self.errorMessage = msg
+                self.playbackErrorMessage = msg
             case .notPlayable:
-                errorMessage = L10n.string("cloud_library_no_playable_files", fallback: "That file can't be played.")
+                let msg = L10n.string("cloud_library_no_playable_files", fallback: "That file can't be played.")
+                self.errorMessage = msg
+                self.playbackErrorMessage = msg
             case let .failed(message):
-                errorMessage = message ?? L10n.string("cloud_library_play_failed", fallback: "Couldn't get a link for that file.")
+                let msg = message ?? L10n.string("cloud_library_play_failed", fallback: "Couldn't get a link for that file.")
+                self.errorMessage = msg
+                self.playbackErrorMessage = msg
             }
         }
+    }
+
+    func cancelResolving() {
+        resolutionGeneration &+= 1
+        resolveTask?.cancel()
+        resolveTask = nil
+        resolvingKey = nil
+    }
+
+    func clearPlaybackError() {
+        playbackErrorMessage = nil
     }
 }

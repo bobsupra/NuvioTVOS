@@ -51,9 +51,35 @@ struct CloudLibraryView: View {
                     .focused($isLoadingFocusActive)
             }
         }
-        .onExitCommand { openItem == nil ? onBack() : closeItem() }
+        .alert(
+            L10n.string("cloud_library_play_failed_title", fallback: "Playback Error"),
+            isPresented: Binding(
+                get: { viewModel.playbackErrorMessage != nil },
+                set: { if !$0 { viewModel.clearPlaybackError() } }
+            )
+        ) {
+            Button(L10n.string("common_ok", fallback: "OK"), role: .cancel) {
+                viewModel.clearPlaybackError()
+            }
+        } message: {
+            Text(viewModel.playbackErrorMessage ?? "")
+        }
+        .onExitCommand {
+            viewModel.cancelResolving()
+            if openItem == nil {
+                onBack()
+            } else {
+                closeItem()
+            }
+        }
         .onAppear {
             TVHomeDebugTrace.log("cloudLibrary.appear")
+            if let saved = viewModel.openItem {
+                openItem = saved
+            }
+            if let savedKey = viewModel.focusedKey {
+                focused = savedKey
+            }
             if viewModel.isLoading {
                 DispatchQueue.main.async {
                     isLoadingFocusActive = true
@@ -62,6 +88,12 @@ struct CloudLibraryView: View {
         }
         .onDisappear {
             TVHomeDebugTrace.log("cloudLibrary.disappear")
+            viewModel.cancelResolving()
+        }
+        .onChange(of: focused) { _, newFocus in
+            if let newFocus {
+                viewModel.focusedKey = newFocus
+            }
         }
         .task { await viewModel.load() }
     }
@@ -88,7 +120,11 @@ struct CloudLibraryView: View {
                         externalFocus: $focused,
                         focusId: item.stableKey,
                         isBusy: false
-                    ) { open(item) }
+                    ) {
+                        viewModel.focusedKey = item.stableKey
+                        focused = item.stableKey
+                        open(item)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -97,6 +133,7 @@ struct CloudLibraryView: View {
         }
         .scrollClipDisabledIfAvailable()
         .focusSection()
+        .defaultFocusIfAvailable($focused, viewModel.focusedKey ?? viewModel.items.first?.stableKey)
     }
 
     private func fileList(for item: CloudItem) -> some View {
@@ -110,7 +147,11 @@ struct CloudLibraryView: View {
                         externalFocus: $focused,
                         focusId: key,
                         isBusy: viewModel.resolvingKey == key
-                    ) { viewModel.play(item: item, file: file, onResolved: onPlay) }
+                    ) {
+                        viewModel.focusedKey = key
+                        focused = key
+                        viewModel.play(item: item, file: file, onResolved: onPlay)
+                    }
                 }
             }
             .padding(.horizontal, 12)
@@ -119,6 +160,7 @@ struct CloudLibraryView: View {
         }
         .scrollClipDisabledIfAvailable()
         .focusSection()
+        .defaultFocusIfAvailable($focused, viewModel.focusedKey ?? item.playableFiles.first.map { "\(item.stableKey):\($0.id)" })
     }
 
     private func centeredMessage<Content: View>(@ViewBuilder _ content: () -> Content) -> some View {
@@ -132,17 +174,24 @@ struct CloudLibraryView: View {
         let playable = item.playableFiles
         // A single playable file plays straight away; otherwise drill in.
         if playable.count == 1 {
+            viewModel.focusedKey = item.stableKey
+            focused = item.stableKey
             viewModel.play(item: item, file: playable[0], onResolved: onPlay)
         } else if !playable.isEmpty {
             openItem = item
-            focused = "\(item.stableKey):\(playable[0].id)"
+            viewModel.openItem = item
+            let firstKey = "\(item.stableKey):\(playable[0].id)"
+            focused = firstKey
+            viewModel.focusedKey = firstKey
         }
     }
 
     private func closeItem() {
         let key = openItem?.stableKey
         openItem = nil
+        viewModel.openItem = nil
         focused = key
+        viewModel.focusedKey = key
     }
 
     // MARK: - Formatting

@@ -615,7 +615,13 @@ struct CollectionFolderBrowseView: View {
                 }
                 continue
             }
-            let rawBatch = pageItems(page, source: source)
+            let pagination = Self.calculatePagination(
+                page: page,
+                source: source,
+                requestedCursor: 0,
+                pageSize: pageSize
+            )
+            let rawBatch = pagination.displayItems
             let batch = await TmdbDetailsService.localizedMetadata(for: rawBatch)
             var sourceIds = Set<String>()
             let resolved = batch.filter { sourceIds.insert($0.id).inserted }
@@ -624,13 +630,8 @@ struct CollectionFolderBrowseView: View {
                     id: Self.sourceKey(source),
                     source: source,
                     items: resolved,
-                    nextSkip: nextCursor(
-                        page,
-                        source: source,
-                        requestedCursor: 0,
-                        receivedCount: batch.count
-                    ),
-                    hasMore: page.hasMore && !batch.isEmpty
+                    nextSkip: pagination.nextCursor,
+                    hasMore: pagination.hasMore
                 )
             )
             for meta in resolved where seen.insert(meta.id).inserted {
@@ -719,18 +720,19 @@ struct CollectionFolderBrowseView: View {
                     .browse(source, cursor: requestedSkip)
                 guard let latestIndex = catalogRows.firstIndex(where: { $0.id == rowId }) else { return }
 
-                let rawBatch = pageItems(page, source: source)
+                let pagination = Self.calculatePagination(
+                    page: page,
+                    source: source,
+                    requestedCursor: requestedSkip,
+                    pageSize: pageSize
+                )
+                let rawBatch = pagination.displayItems
                 let batch = await TmdbDetailsService.localizedMetadata(for: rawBatch)
                 var existingRowIds = Set(catalogRows[latestIndex].items.map(\.id))
                 let newItems = batch.filter { existingRowIds.insert($0.id).inserted }
                 catalogRows[latestIndex].items.append(contentsOf: newItems)
-                catalogRows[latestIndex].nextSkip = nextCursor(
-                    page,
-                    source: source,
-                    requestedCursor: requestedSkip,
-                    receivedCount: batch.count
-                )
-                catalogRows[latestIndex].hasMore = page.hasMore && !newItems.isEmpty
+                catalogRows[latestIndex].nextSkip = pagination.nextCursor
+                catalogRows[latestIndex].hasMore = pagination.hasMore
                 catalogRows[latestIndex].isLoadingMore = false
 
                 var existingAllIds = Set(items.map(\.id))
@@ -785,25 +787,35 @@ struct CollectionFolderBrowseView: View {
         }
     }
 
-    private func pageItems(
-        _ page: CatalogPage,
-        source: NuvioCollectionSource
-    ) -> [NuvioMeta] {
-        source.normalizedProvider == "addon"
-            ? Array(page.items.prefix(pageSize))
-            : page.items
+    struct PaginationResult: Equatable {
+        let displayItems: [NuvioMeta]
+        let nextCursor: Int
+        let hasMore: Bool
     }
 
-    private func nextCursor(
-        _ page: CatalogPage,
+    static func calculatePagination(
+        page: CatalogPage,
         source: NuvioCollectionSource,
         requestedCursor: Int,
-        receivedCount: Int
-    ) -> Int {
+        pageSize: Int = 40
+    ) -> PaginationResult {
         if source.normalizedProvider == "addon" {
-            return requestedCursor + receivedCount
+            let consumedCount = min(page.items.count, pageSize)
+            let displayItems = Array(page.items.prefix(pageSize))
+            let nextCursor = requestedCursor + consumedCount
+            let hasMore = !page.items.isEmpty && (page.hasMore || page.items.count > pageSize)
+            return PaginationResult(
+                displayItems: displayItems,
+                nextCursor: nextCursor,
+                hasMore: hasMore
+            )
+        } else {
+            return PaginationResult(
+                displayItems: page.items,
+                nextCursor: page.nextSkip ?? requestedCursor,
+                hasMore: !page.items.isEmpty && page.hasMore
+            )
         }
-        return page.nextSkip ?? requestedCursor
     }
 
     private static func sourceKey(_ source: NuvioCollectionSource) -> String {
