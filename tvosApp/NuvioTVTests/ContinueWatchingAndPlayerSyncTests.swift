@@ -1,6 +1,45 @@
 import XCTest
 @testable import NuvioTV
 
+private final class WatchedStoreReconciliationProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storedReentryCompleted = true
+    private var storedReconciliationSucceeded = false
+    private var observerDeliveryStarted = false
+
+    func recordReentryCompleted(_ completed: Bool) {
+        lock.lock()
+        storedReentryCompleted = storedReentryCompleted && completed
+        lock.unlock()
+    }
+
+    func beginObserverDelivery() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !observerDeliveryStarted else { return false }
+        observerDeliveryStarted = true
+        return true
+    }
+
+    func recordReconciliationSucceeded(_ succeeded: Bool) {
+        lock.lock()
+        storedReconciliationSucceeded = succeeded
+        lock.unlock()
+    }
+
+    var reentryCompleted: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReentryCompleted
+    }
+
+    var reconciliationSucceeded: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return storedReconciliationSucceeded
+    }
+}
+
 final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
     private let dismissalTestProfileId = "continue-watching-sync-\(UUID().uuidString)"
     private var previousDismissalProfileId: String?
@@ -28,6 +67,59 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
             season: 1,
             episode: 1
         )
+    }
+
+    private func makeEpisodeProgress(
+        contentId: String,
+        season: Int,
+        episode: Int,
+        position: Double,
+        duration: Double = 1_000,
+        lastWatchedAt: Date
+    ) -> WatchProgressRecord {
+        WatchProgressRecord(
+            progressKey: WatchProgressLedger.progressKey(
+                contentId: contentId,
+                season: season,
+                episode: episode
+            ),
+            contentId: contentId,
+            contentType: "series",
+            videoId: WatchProgressLedger.videoId(
+                contentId: contentId,
+                season: season,
+                episode: episode
+            ),
+            season: season,
+            episode: episode,
+            position: position,
+            duration: duration,
+            lastWatchedAt: lastWatchedAt
+        )
+    }
+
+    private func disableRemoteWatchedSyncForTest() -> () -> Void {
+        let defaults = ProfileSettings.current
+        let keys = [
+            "nuvio.tv.trakt.auth.accessToken",
+            "nuvio.tv.trakt.auth.refreshToken",
+            SettingsKey.traktConnected,
+            SettingsKey.traktWatchProgressSource
+        ]
+        let previousValues = keys.map { ($0, defaults.object(forKey: $0)) }
+        defaults.removeObject(forKey: keys[0])
+        defaults.removeObject(forKey: keys[1])
+        defaults.removeObject(forKey: keys[2])
+        defaults.set(TraktWatchProgressSource.nuvioSync.rawValue, forKey: keys[3])
+        return {
+            for (key, value) in previousValues {
+                if let value {
+                    defaults.set(value, forKey: key)
+                } else {
+                    defaults.removeObject(forKey: key)
+                }
+            }
+        }
     }
 
     // MARK: - Continue Watching Sync Tests
@@ -690,6 +782,161 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         await manager.flushPendingPushesNow()
     }
 
+    @MainActor
+    func testRemovalDuringUploadWithDelayedSettingsResponsePreservesDismissalAndSyncs() async {
+        let meta = NuvioMeta(id: "tt-dismiss-race-\(UUID().uuidString)", name: "Race Item", type: "series")
+        let item = ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 120,
+            duration: 1_800,
+            lastWatchedAt: Date(),
+            season: 1,
+            episode: 1
+        )
+        let profileId = dismissalTestProfileId
+
+        // Initial setup: title is saved and visible in Continue Watching
+        ContinueWatchingStore.save(meta: meta, streamUrl: "", position: 120, duration: 1_800)
+        XCTAssertFalse(ContinueWatchingDismissStore.isDismissed(item))
+
+        let manager = NuvioSyncManager()
+
+        // 1. Simulate an upload in-flight
+        manager.isPushExecuting = true
+
+        // User removes the title while upload is running
+        ContinueWatchingDismissStore.dismiss(item)
+        ContinueWatchingDismissStore.dismiss(contentId: meta.id)
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+
+        // Removal records settings scope for push
+        manager.pendingPushScopes.insert(.settings)
+
+        // Active upload finishes
+        manager.isPushExecuting = false
+
+        // 2. Simulate settings pull becoming active (isApplyingRemote = true)
+        manager.isApplyingRemote = true
+
+        // While pull is active, uploads must not execute and must stay queued
+        await manager.executePendingPushes()
+        XCTAssertTrue(manager.isApplyingRemote)
+        XCTAssertEqual(manager.pendingPushScopes, [.settings], "Upload must remain queued while a pull is applying")
+
+        // 3. Delayed stale settings pull response arrives without the newly removed marker
+        ContinueWatchingDismissStore.reconcileRemoteKeys([], profileId: profileId)
+
+        // Verify the title REMAINS dismissed despite the stale response
+        XCTAssertTrue(
+            ContinueWatchingDismissStore.isDismissed(item),
+            "Title must remain dismissed after receiving a delayed stale settings response"
+        )
+        let dismissedKeys = ContinueWatchingDismissStore.keys(profileId: profileId)
+        XCTAssertFalse(dismissedKeys.isEmpty, "Dismissal keys must not be erased by stale remote response")
+
+        // 4. Remote pull finishes, resuming queued uploads
+        manager.isApplyingRemote = false
+        manager.resumeQueuedPushesIfIdle()
+
+        // Verify the dismissal eventually syncs to the server
+        let exportFeature = ContinueWatchingSyncMapper.exportAndroidTraktFeature(
+            existing: nil,
+            dismissedKeys: ContinueWatchingDismissStore.keysForExport(profileId: profileId)
+        )
+        let sentKeys = ContinueWatchingSyncMapper.androidDismissalKeys(from: exportFeature).keys ?? []
+        XCTAssertFalse(sentKeys.isEmpty, "Dismissal keys must be exportable to sync")
+
+        ContinueWatchingDismissStore.acknowledgePushedKeys(sentKeys, profileId: profileId)
+
+        // Title remains dismissed after acknowledging upload
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+
+        // Subsequent reconciliation with the newly synced remote keys keeps it dismissed
+        ContinueWatchingDismissStore.reconcileRemoteKeys(sentKeys, profileId: profileId)
+        XCTAssertTrue(ContinueWatchingDismissStore.isDismissed(item))
+    }
+
+    @MainActor
+    func testFlushPendingPushesDrainsFollowUpWorkQueuedDuringActiveUpload() async {
+        let manager = NuvioSyncManager()
+        manager.isPushExecuting = true
+
+        // Queue follow-up work while upload is executing
+        manager.pendingPushScopes.insert(.settings)
+
+        // In a background task, simulate the running upload finishing shortly
+        Task { @MainActor in
+            try? await Task.sleep(nanoseconds: 60_000_000) // 60ms
+            manager.isPushExecuting = false
+        }
+
+        // flushPendingPushesNow should await the in-flight upload AND drain the queued follow-up work
+        await manager.flushPendingPushesNow()
+
+        XCTAssertFalse(manager.isPushExecuting)
+        XCTAssertTrue(manager.pendingPushScopes.isEmpty, "Follow-up work queued during active upload must be fully drained")
+    }
+
+    @MainActor
+    func testFlushPendingPushesReturnsWhenRemoteApplyStartsDuringUploadWait() async {
+        let manager = NuvioSyncManager()
+        manager.isPushExecuting = true
+        manager.pendingPushScopes.insert(.settings)
+
+        let flushTask = Task { @MainActor in
+            await manager.flushPendingPushesNow()
+        }
+        defer {
+            flushTask.cancel()
+            manager.isApplyingRemote = false
+            manager.isPushExecuting = false
+            manager.pendingPushScopes = []
+        }
+
+        // Let the flush enter its active-upload wait before a pull takes over.
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        manager.isApplyingRemote = true
+        manager.isPushExecuting = false
+
+        let completed = expectation(description: "flush returns after remote apply begins")
+        Task { @MainActor in
+            await flushTask.value
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 1.0)
+        XCTAssertEqual(manager.pendingPushScopes, [.settings], "The pull must leave queued scopes for its normal finish path")
+    }
+
+    @MainActor
+    func testCancelledFlushReturnsWhileUploadRemainsActive() async {
+        let manager = NuvioSyncManager()
+        manager.isPushExecuting = true
+        manager.pendingPushScopes.insert(.settings)
+
+        let flushTask = Task { @MainActor in
+            await manager.flushPendingPushesNow()
+        }
+        defer {
+            flushTask.cancel()
+            manager.isPushExecuting = false
+            manager.pendingPushScopes = []
+        }
+
+        // Allow the flush to suspend in its active-upload wait, then cancel it.
+        try? await Task.sleep(nanoseconds: 20_000_000)
+        flushTask.cancel()
+
+        let completed = expectation(description: "cancelled flush returns")
+        Task { @MainActor in
+            await flushTask.value
+            completed.fulfill()
+        }
+        await fulfillment(of: [completed], timeout: 1.0)
+        XCTAssertTrue(manager.isPushExecuting, "Cancellation must not modify the active upload state")
+        XCTAssertEqual(manager.pendingPushScopes, [.settings], "Cancellation must preserve queued scopes")
+    }
+
     // MARK: - WatchedStore & Re-watch Tests
 
     func testWatchedSnapshotWatchedAtWithAliasing() {
@@ -905,6 +1152,297 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertTrue(WatchProgressLedger.continueWatchingCandidates().contains { $0.contentId == seriesMeta.id })
     }
 
+    func testContinueWatchingCandidatesDropOlderEpisodeAfterNewerCompletion() {
+        let contentId = "tt-cw-completed-latest-\(UUID().uuidString)"
+        let profileId = "cw-completed-latest-\(UUID().uuidString)"
+        let previousProfileId = WatchProgressLedger.activeProfileId
+        WatchProgressLedger.setActiveProfile(profileId)
+        defer {
+            WatchProgressLedger.eraseProfile(profileId)
+            WatchProgressLedger.setActiveProfile(previousProfileId)
+        }
+
+        let now = Date()
+        let olderPartial = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 8,
+            position: 300,
+            lastWatchedAt: now.addingTimeInterval(-120)
+        )
+        let latestCompleted = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 10,
+            position: 950,
+            lastWatchedAt: now.addingTimeInterval(-60)
+        )
+        _ = WatchProgressLedger.upsert(olderPartial)
+        _ = WatchProgressLedger.upsert(latestCompleted)
+
+        XCTAssertTrue(WatchProgressLedger.isComplete(latestCompleted))
+        XCTAssertFalse(
+            WatchProgressLedger.continueWatchingCandidates().contains { $0.contentId == contentId },
+            "A completed later episode must prevent an older partial episode from resurfacing"
+        )
+    }
+
+    func testContinueWatchingCandidatesKeepNewerEarlierEpisodeRewatch() {
+        let contentId = "tt-cw-earlier-rewatch-\(UUID().uuidString)"
+        let profileId = "cw-earlier-rewatch-\(UUID().uuidString)"
+        let previousProfileId = WatchProgressLedger.activeProfileId
+        WatchProgressLedger.setActiveProfile(profileId)
+        defer {
+            WatchProgressLedger.eraseProfile(profileId)
+            WatchProgressLedger.setActiveProfile(previousProfileId)
+        }
+
+        let now = Date()
+        let completedEpisode10 = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 10,
+            position: 950,
+            lastWatchedAt: now.addingTimeInterval(-120)
+        )
+        let rewatchedEpisode8 = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 8,
+            position: 300,
+            lastWatchedAt: now.addingTimeInterval(-30)
+        )
+        _ = WatchProgressLedger.upsert(completedEpisode10)
+        _ = WatchProgressLedger.upsert(rewatchedEpisode8)
+
+        let candidate = WatchProgressLedger.continueWatchingCandidates()
+            .first { $0.contentId == contentId }
+        XCTAssertEqual(candidate?.progressKey, rewatchedEpisode8.progressKey)
+    }
+
+    func testOlderWatchedMarkDoesNotTurnNewerPartialRewatchIntoSeed() {
+        let contentId = "tt-cw-rewatch-seed-\(UUID().uuidString)"
+        let profileId = "cw-rewatch-seed-\(UUID().uuidString)"
+        let previousWatchedProfileId = WatchedStore.activeProfileId
+        let previousProgressProfileId = WatchProgressLedger.activeProfileId
+        WatchedStore.setActiveProfile(profileId)
+        WatchProgressLedger.setActiveProfile(profileId)
+        defer {
+            WatchedStore.eraseProfile(profileId)
+            WatchProgressLedger.eraseProfile(profileId)
+            WatchedStore.setActiveProfile(previousWatchedProfileId)
+            WatchProgressLedger.setActiveProfile(previousProgressProfileId)
+        }
+
+        let meta = NuvioMeta(id: contentId, name: "Rewatch seed", type: "series")
+        let watchedAt = Date().addingTimeInterval(-60)
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: watchedAt,
+                season: 1,
+                episode: 8
+            )
+        ])
+        guard let persistedWatchedAt = WatchedStore.watchedAt(
+            metaId: contentId,
+            season: 1,
+            episode: 8
+        ) else {
+            XCTFail("The watched episode should be readable from the isolated profile")
+            return
+        }
+        let rewatch = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 8,
+            position: 300,
+            lastWatchedAt: persistedWatchedAt.addingTimeInterval(30)
+        )
+        _ = WatchProgressLedger.upsert(rewatch)
+
+        let candidates = WatchProgressLedger.continueWatchingCandidates()
+        XCTAssertEqual(candidates.first { $0.contentId == contentId }?.progressKey, rewatch.progressKey)
+        XCTAssertFalse(WatchProgressLedger.upNextSeeds().contains { $0.progressKey == rewatch.progressKey })
+        let plan = ContinueWatchingBuilder.planEntries(
+            candidates: candidates,
+            seeds: WatchProgressLedger.upNextSeeds()
+        )
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertEqual(plan.first?.record.progressKey, rewatch.progressKey)
+        XCTAssertEqual(plan.first?.isSeed, false)
+
+        let equalTimestampProgress = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 8,
+            position: 300,
+            lastWatchedAt: persistedWatchedAt
+        )
+        _ = WatchProgressLedger.upsert(equalTimestampProgress)
+        XCTAssertTrue(
+            WatchProgressLedger.upNextSeeds().contains { $0.progressKey == equalTimestampProgress.progressKey },
+            "A watched mark at the same timestamp still seeds the completed episode"
+        )
+    }
+
+    func testPlanEntriesPreferNewerWatchedOnlySeedOverOlderEpisodeResume() {
+        let contentId = "tt-cw-watched-only-seed-\(UUID().uuidString)"
+        let profileId = "cw-watched-only-seed-\(UUID().uuidString)"
+        let previousProfileId = WatchedStore.activeProfileId
+        defer {
+            WatchedStore.eraseProfile(profileId)
+            WatchedStore.setActiveProfile(previousProfileId)
+        }
+
+        let meta = NuvioMeta(id: contentId, name: "Watched only seed", type: "series")
+        let watchedAt = Date()
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: watchedAt,
+                season: 1,
+                episode: 10
+            )
+        ], profileId: profileId)
+        WatchedStore.setActiveProfile(profileId)
+
+        let olderResume = makeEpisodeProgress(
+            contentId: contentId,
+            season: 1,
+            episode: 8,
+            position: 300,
+            lastWatchedAt: watchedAt.addingTimeInterval(-60)
+        )
+        let watchedOnlySeed = ContinueWatchingBuilder.watchedHistorySeeds()
+            .first { $0.contentId == contentId }
+        XCTAssertEqual(watchedOnlySeed?.episode, 10)
+        guard let watchedOnlySeed else {
+            XCTFail("The WatchedStore-only episode should produce a history seed")
+            return
+        }
+
+        let plan = ContinueWatchingBuilder.planEntries(
+            candidates: [olderResume],
+            seeds: [watchedOnlySeed]
+        )
+        XCTAssertEqual(plan.count, 1)
+        XCTAssertEqual(plan.first?.record.episode, 10)
+        XCTAssertEqual(plan.first?.isSeed, true)
+
+        let equalTimestampPlan = ContinueWatchingBuilder.planEntries(
+            candidates: [makeEpisodeProgress(
+                contentId: contentId,
+                season: 1,
+                episode: 8,
+                position: 300,
+                lastWatchedAt: watchedAt
+            )],
+            seeds: [watchedOnlySeed]
+        )
+        XCTAssertEqual(equalTimestampPlan.first?.isSeed, true)
+    }
+
+    func testResolvedSeedKeepsCachedUpNextOnlyWhenItIsAfterCurrentEpisode() {
+        let meta = NuvioMeta(id: "tt-cw-cached-up-next-\(UUID().uuidString)", name: "Cached Up Next", type: "series")
+        let staleCachedFinale = ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: Date(),
+            season: 1,
+            episode: 8,
+            isUpNext: true
+        )
+        let futureCachedEpisode = ContinueWatchingItem(
+            meta: meta,
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: Date(),
+            season: 1,
+            episode: 11,
+            isUpNext: true
+        )
+
+        XCTAssertFalse(
+            ContinueWatchingBuilder.shouldKeepCachedUpNext(staleCachedFinale, after: (season: 1, episode: 10)),
+            "A cached suggestion at or before the resolved seed must be discarded"
+        )
+        XCTAssertTrue(
+            ContinueWatchingBuilder.shouldKeepCachedUpNext(futureCachedEpisode, after: (season: 1, episode: 10)),
+            "A cached episode beyond the resolved seed remains a valid fallback"
+        )
+        XCTAssertFalse(ContinueWatchingBuilder.shouldKeepCachedUpNext(futureCachedEpisode, after: nil))
+    }
+
+    func testHomeMergeExcludesRemovedPersistedItemAndLetsStoreWin() {
+        let now = Date()
+        let persistedMeta = NuvioMeta(id: "tt-cw-persisted-\(UUID().uuidString)", name: "Persisted", type: "series")
+        let updatedMeta = NuvioMeta(id: "tt-cw-updated-\(UUID().uuidString)", name: "Updated", type: "series")
+        let memoryOnlyMeta = NuvioMeta(id: "tt-cw-memory-only-\(UUID().uuidString)", name: "Memory only", type: "series")
+        let originallyPersisted = ContinueWatchingItem(
+            meta: persistedMeta,
+            streamUrl: "",
+            position: 300,
+            duration: 1_000,
+            lastWatchedAt: now.addingTimeInterval(-10 * 24 * 60 * 60),
+            season: 1,
+            episode: 8
+        )
+        let staleMemoryOnlyValue = ContinueWatchingItem(
+            meta: updatedMeta,
+            streamUrl: "",
+            position: 300,
+            duration: 1_000,
+            lastWatchedAt: now.addingTimeInterval(-3 * 24 * 60 * 60),
+            season: 1,
+            episode: 8
+        )
+        let currentStoreValue = ContinueWatchingItem(
+            meta: updatedMeta,
+            streamUrl: "",
+            position: 400,
+            duration: 1_000,
+            lastWatchedAt: now,
+            season: 1,
+            episode: 9
+        )
+        let releaseFormatter = DateFormatter()
+        releaseFormatter.calendar = Calendar(identifier: .gregorian)
+        releaseFormatter.timeZone = .current
+        releaseFormatter.dateFormat = "yyyy-MM-dd"
+        let recentRelease = Calendar.current.date(byAdding: .day, value: -1, to: now)!
+        let highRecencyMemoryOnly = ContinueWatchingItem(
+            meta: memoryOnlyMeta,
+            streamUrl: "",
+            position: 1,
+            duration: 1_800,
+            lastWatchedAt: now.addingTimeInterval(-30 * 24 * 60 * 60),
+            season: 1,
+            episode: 2,
+            released: releaseFormatter.string(from: recentRelease),
+            isUpNext: true,
+            upNextSeedSeason: 1
+        )
+
+        let memoryOnlyItems = ContinueWatchingBuilder.memoryOnlyItems(
+            from: [originallyPersisted, staleMemoryOnlyValue, highRecencyMemoryOnly],
+            persistedItemIDs: [persistedMeta.id]
+        )
+        XCTAssertFalse(memoryOnlyItems.contains { $0.meta.id == persistedMeta.id })
+        XCTAssertGreaterThan(highRecencyMemoryOnly.recencySortDate, originallyPersisted.recencySortDate)
+
+        let merged = ContinueWatchingBuilder.mergeMemoryOnlyItems(
+            memoryOnlyItems,
+            with: [currentStoreValue]
+        )
+        XCTAssertFalse(merged.contains { $0.meta.id == persistedMeta.id }, "A removed first-page card must not reappear from memory")
+        XCTAssertEqual(merged.first { $0.meta.id == updatedMeta.id }?.episode, 9, "The current store value must override a stale memory-only card")
+        XCTAssertTrue(merged.contains { $0.meta.id == memoryOnlyMeta.id }, "A later page remains visible even when recency sorting changes its position")
+    }
+
     // MARK: - Issue #138 Autoplay and Unmark Regressions
 
     func testUnmarkingEpisodeRetiresCompletedLedgerRowsAndPreservesPartialResume() {
@@ -1034,5 +1572,318 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
         XCTAssertFalse(controller.isPlayerEnded)
         XCTAssertFalse(controller.hasFirstFrameReadyForDisplay)
         XCTAssertEqual(controller.positionMs, 0)
+    }
+
+    func testDelayedSyncForProfileACannotModifyProfileBAfterProfileSwitch() {
+        let restoreRemoteSettings = disableRemoteWatchedSyncForTest()
+        let profileA = "profile-a-\(UUID().uuidString)"
+        let profileB = "profile-b-\(UUID().uuidString)"
+        let previousWatchedProfile = WatchedStore.activeProfileId
+        let previousProgressProfile = WatchProgressLedger.activeProfileId
+        let unscopedWatchedBefore = WatchedStore.items(profileId: nil)
+        defer {
+            WatchedStore.eraseProfile(profileA)
+            WatchedStore.eraseProfile(profileB)
+            WatchProgressLedger.eraseProfile(profileA)
+            WatchProgressLedger.eraseProfile(profileB)
+            WatchedStore.setActiveProfile(previousWatchedProfile)
+            WatchedStore.replaceAll(unscopedWatchedBefore, profileId: nil)
+            WatchProgressLedger.setActiveProfile(previousProgressProfile)
+            restoreRemoteSettings()
+        }
+
+        // Set up Profile B as active
+        WatchedStore.setActiveProfile(profileB)
+        WatchProgressLedger.setActiveProfile(profileB)
+
+        let metaB = NuvioMeta(id: "tt_item_b_\(UUID().uuidString)", name: "Movie B", type: "movie")
+        _ = WatchedStore.markWatched(metaB)
+
+        let recordB = WatchProgressRecord(
+            progressKey: metaB.id,
+            contentId: metaB.id,
+            contentType: "movie",
+            videoId: metaB.id,
+            season: nil,
+            episode: nil,
+            position: 500,
+            duration: 1000,
+            lastWatchedAt: Date(),
+            isPendingPush: false
+        )
+        _ = WatchProgressLedger.upsert(recordB)
+
+        XCTAssertEqual(WatchedStore.items().map(\.meta.id), [metaB.id])
+        XCTAssertEqual(WatchedStore.items(profileId: profileB).map(\.meta.id), [metaB.id])
+        XCTAssertEqual(WatchProgressLedger.records().map(\.contentId), [metaB.id])
+
+        // Simulate delayed sync for Profile A finishing while Profile B is active
+        let syncStartedAt = Date().addingTimeInterval(-10)
+        let metaA = NuvioMeta(id: "tt_item_a_\(UUID().uuidString)", name: "Movie A", type: "movie")
+        let itemA = WatchedStoreItem(
+            meta: metaA,
+            watchedAt: syncStartedAt,
+            sources: [TraktWatchProgressSource.nuvioSync.rawValue]
+        )
+        let recordA = WatchProgressRecord(
+            progressKey: metaA.id,
+            contentId: metaA.id,
+            contentType: "movie",
+            videoId: metaA.id,
+            season: nil,
+            episode: nil,
+            position: 250,
+            duration: 1000,
+            lastWatchedAt: syncStartedAt,
+            isPendingPush: false
+        )
+
+        // Perform reconcile with profileId: profileA
+        let watchedResult = WatchedStore.reconcileNuvioSnapshot([itemA], syncStartedAt: syncStartedAt, profileId: profileA)
+        XCTAssertTrue(watchedResult)
+
+        let progressResult = WatchProgressLedger.reconcileRemote([recordA], syncStartedAt: syncStartedAt, profileId: profileA)
+        XCTAssertTrue(progressResult.saved)
+
+        // Verify Profile B remains completely untouched
+        XCTAssertEqual(WatchedStore.items().map(\.meta.id), [metaB.id])
+        XCTAssertEqual(WatchedStore.items(profileId: profileB).map(\.meta.id), [metaB.id])
+        XCTAssertEqual(WatchProgressLedger.records().map(\.contentId), [metaB.id])
+
+        // Verify Profile A received its synced items
+        XCTAssertEqual(WatchedStore.items(profileId: profileA).map(\.meta.id), [metaA.id])
+        XCTAssertEqual(WatchProgressLedger.records(profileId: profileA).map(\.contentId), [metaA.id])
+    }
+
+    func testImplicitWatchedOperationsUseActiveProfileAndKeepExplicitNilUnscoped() {
+        let restoreRemoteSettings = disableRemoteWatchedSyncForTest()
+        let profileA = "watched-implicit-a-\(UUID().uuidString)"
+        let profileB = "watched-implicit-b-\(UUID().uuidString)"
+        let previousProfile = WatchedStore.activeProfileId
+        let unscopedItemsBefore = WatchedStore.items(profileId: nil)
+        let unscopedTombstonesBefore = WatchedStore.tombstones(profileId: nil)
+        defer {
+            WatchedStore.eraseProfile(profileA)
+            WatchedStore.eraseProfile(profileB)
+            WatchedStore.setActiveProfile(previousProfile)
+            WatchedStore.replaceAll(unscopedItemsBefore, profileId: nil)
+            restoreRemoteSettings()
+        }
+
+        let existingB = NuvioMeta(id: "tt_existing_b_\(UUID().uuidString)", name: "Existing B", type: "movie")
+        WatchedStore.replaceAll([
+            WatchedStoreItem(meta: existingB, watchedAt: Date(), sources: [])
+        ], profileId: profileB)
+        WatchedStore.setActiveProfile(profileA)
+
+        let markedA = NuvioMeta(id: "tt_marked_a_\(UUID().uuidString)", name: "Marked A", type: "movie")
+        XCTAssertTrue(WatchedStore.markWatched(markedA))
+        XCTAssertEqual(WatchedStore.items().map(\.meta.id), [markedA.id])
+        XCTAssertEqual(WatchedStore.items(profileId: profileA).map(\.meta.id), [markedA.id])
+        XCTAssertEqual(WatchedStore.items(profileId: profileB).map(\.meta.id), [existingB.id])
+        XCTAssertEqual(WatchedStore.items(profileId: nil), unscopedItemsBefore)
+        XCTAssertTrue(WatchedStore.currentSnapshot().contains(metaId: markedA.id, type: markedA.canonicalType))
+
+        let removedA = NuvioMeta(id: "tt_removed_a_\(UUID().uuidString)", name: "Removed A", type: "movie")
+        XCTAssertTrue(WatchedStore.markWatched(removedA))
+        XCTAssertTrue(WatchedStore.remove(meta: removedA))
+        XCTAssertTrue(WatchedStore.tombstones().contains { $0.metaId == removedA.id })
+        XCTAssertTrue(WatchedStore.tombstones(profileId: profileA).contains { $0.metaId == removedA.id })
+        XCTAssertEqual(WatchedStore.tombstones(profileId: nil), unscopedTombstonesBefore)
+        XCTAssertEqual(WatchedStore.items(profileId: profileB).map(\.meta.id), [existingB.id])
+    }
+
+    func testBackgroundWatchedReconciliationAllowsMainQueueObserverReentry() async {
+        let profile = "watched-observer-\(UUID().uuidString)"
+        let previousProfile = WatchedStore.activeProfileId
+        WatchedStore.eraseProfile(profile)
+        WatchedStore.setActiveProfile(profile)
+        let probe = WatchedStoreReconciliationProbe()
+        let reconciliationCompleted = expectation(description: "watched reconciliation completes")
+        let observerCompleted = expectation(description: "main queue observer reenters WatchedStore")
+        let observer = NotificationCenter.default.addObserver(
+            forName: WatchedStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { _ in
+            guard probe.beginObserverDelivery() else { return }
+            let reentryCompleted = DispatchSemaphore(value: 0)
+            DispatchQueue.global(qos: .userInitiated).async {
+                _ = WatchedStore.items()
+                reentryCompleted.signal()
+            }
+            // Bound the observer wait: on a lock inversion this lets the
+            // notification return, releasing the store lock for the reentry.
+            let completed = reentryCompleted.wait(timeout: .now() + .milliseconds(250)) == .success
+            probe.recordReentryCompleted(completed)
+            observerCompleted.fulfill()
+        }
+        defer {
+            NotificationCenter.default.removeObserver(observer)
+            WatchedStore.eraseProfile(profile)
+            WatchedStore.setActiveProfile(previousProfile)
+        }
+
+        let item = WatchedStoreItem(
+            meta: NuvioMeta(id: "tt_observer_\(UUID().uuidString)", name: "Observer", type: "movie"),
+            watchedAt: Date(),
+            sources: []
+        )
+        DispatchQueue.global(qos: .userInitiated).async {
+            probe.recordReconciliationSucceeded(
+                WatchedStore.reconcileNuvioSnapshot([item], syncStartedAt: Date())
+            )
+            reconciliationCompleted.fulfill()
+        }
+
+        await fulfillment(of: [reconciliationCompleted, observerCompleted], timeout: 2.0)
+        XCTAssertTrue(probe.reconciliationSucceeded)
+        XCTAssertTrue(probe.reentryCompleted, "The observer should read the store after reconciliation releases its cache lock")
+    }
+
+    @MainActor
+    func testWatchedProfileAReconciliationCannotRemoveProfileBContinueWatching() async throws {
+        let restoreRemoteSettings = disableRemoteWatchedSyncForTest()
+        let profileA = "watched-cw-a-\(UUID().uuidString)"
+        let profileB = "watched-cw-b-\(UUID().uuidString)"
+        let previousWatchedProfile = WatchedStore.activeProfileId
+        let previousContinueWatchingProfile = ContinueWatchingStore.activeProfileId
+        let previousProgressProfile = WatchProgressLedger.activeProfileId
+        defer {
+            ContinueWatchingStore.eraseProfile(profileA)
+            ContinueWatchingStore.eraseProfile(profileB)
+            WatchedStore.eraseProfile(profileA)
+            WatchedStore.eraseProfile(profileB)
+            ContinueWatchingStore.setActiveProfile(previousContinueWatchingProfile)
+            WatchedStore.setActiveProfile(previousWatchedProfile)
+            WatchProgressLedger.setActiveProfile(previousProgressProfile)
+            restoreRemoteSettings()
+        }
+
+        // Profile switching updates Continue Watching before WatchedStore.
+        ContinueWatchingStore.setActiveProfile(profileB)
+        WatchedStore.setActiveProfile(profileA)
+        let sharedTitle = NuvioMeta(
+            id: "tt_shared_cw_\(UUID().uuidString)",
+            name: "Shared title",
+            type: "movie"
+        )
+        ContinueWatchingStore.save(
+            meta: sharedTitle,
+            streamUrl: "test://profile-b",
+            position: 120,
+            duration: 1_800
+        )
+        let profileBLedgerBefore = WatchProgressLedger.records(profileId: profileB)
+            .filter { $0.contentId == sharedTitle.id }
+        XCTAssertEqual(ContinueWatchingStore.items().map(\.meta.id), [sharedTitle.id])
+        XCTAssertEqual(profileBLedgerBefore.count, 1)
+
+        let remoteA = WatchedStoreItem(
+            meta: sharedTitle,
+            watchedAt: Date().addingTimeInterval(30),
+            sources: [TraktWatchProgressSource.nuvioSync.rawValue]
+        )
+        XCTAssertTrue(WatchedStore.reconcileNuvioSnapshot(
+            [remoteA],
+            syncStartedAt: Date().addingTimeInterval(60),
+            profileId: profileA
+        ))
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(WatchedStore.items(profileId: profileA).map(\.meta.id), [sharedTitle.id])
+        XCTAssertEqual(ContinueWatchingStore.activeProfileId, profileB)
+        XCTAssertEqual(ContinueWatchingStore.items().map(\.meta.id), [sharedTitle.id])
+        XCTAssertEqual(
+            WatchProgressLedger.records(profileId: profileB).filter { $0.contentId == sharedTitle.id },
+            profileBLedgerBefore
+        )
+
+        // The removal/retirement path has the same split active-profile window.
+        // No completed Profile A ledger row is needed to exercise its CW cleanup.
+        WatchedStore.retireCompletedLedgerRows(meta: sharedTitle, profileId: profileA)
+        try await Task.sleep(nanoseconds: 50_000_000)
+        XCTAssertEqual(ContinueWatchingStore.items().map(\.meta.id), [sharedTitle.id])
+        XCTAssertEqual(
+            WatchProgressLedger.records(profileId: profileB).filter { $0.contentId == sharedTitle.id },
+            profileBLedgerBefore
+        )
+    }
+
+    func testConcurrentPlaybackSavesSurviveReconciliation() async {
+        let testProfile = "profile-concurrent-\(UUID().uuidString)"
+        defer {
+            WatchedStore.eraseProfile(testProfile)
+            WatchProgressLedger.eraseProfile(testProfile)
+            WatchedStore.setActiveProfile(previousDismissalProfileId)
+            WatchProgressLedger.setActiveProfile(previousDismissalProfileId)
+        }
+
+        WatchedStore.setActiveProfile(testProfile)
+        WatchProgressLedger.setActiveProfile(testProfile)
+
+        // Seed initial progress
+        let initialRecord = WatchProgressRecord(
+            progressKey: "tt_base",
+            contentId: "tt_base",
+            contentType: "movie",
+            videoId: "tt_base",
+            season: nil,
+            episode: nil,
+            position: 100,
+            duration: 1000,
+            lastWatchedAt: Date().addingTimeInterval(-60),
+            isPendingPush: false
+        )
+        _ = WatchProgressLedger.upsert(initialRecord, profileId: testProfile)
+
+        let syncStartedAt = Date()
+
+        // Run concurrent reconciliation and playback saves
+        await withTaskGroup(of: Void.self) { group in
+            // Reconcile task
+            group.addTask {
+                for i in 0..<10 {
+                    let remoteItem = WatchProgressRecord(
+                        progressKey: "tt_remote_\(i)",
+                        contentId: "tt_remote_\(i)",
+                        contentType: "movie",
+                        videoId: "tt_remote_\(i)",
+                        season: nil,
+                        episode: nil,
+                        position: 300,
+                        duration: 1000,
+                        lastWatchedAt: syncStartedAt.addingTimeInterval(Double(-i)),
+                        isPendingPush: false
+                    )
+                    _ = WatchProgressLedger.reconcileRemote([remoteItem], syncStartedAt: syncStartedAt, profileId: testProfile)
+                }
+            }
+
+            // Playback save task (newer progress)
+            group.addTask {
+                for i in 0..<10 {
+                    let playbackRecord = WatchProgressRecord(
+                        progressKey: "tt_playback_\(i)",
+                        contentId: "tt_playback_\(i)",
+                        contentType: "movie",
+                        videoId: "tt_playback_\(i)",
+                        season: nil,
+                        episode: nil,
+                        position: 800,
+                        duration: 1000,
+                        lastWatchedAt: Date(),
+                        isPendingPush: true
+                    )
+                    _ = WatchProgressLedger.upsert(playbackRecord, profileId: testProfile)
+                }
+            }
+        }
+
+        let finalRecords = WatchProgressLedger.records(profileId: testProfile)
+        // All playback records must survive
+        for i in 0..<10 {
+            let key = "tt_playback_\(i)"
+            XCTAssertTrue(finalRecords.contains { $0.progressKey == key }, "Playback record \(key) must survive concurrent reconciliation")
+        }
     }
 }

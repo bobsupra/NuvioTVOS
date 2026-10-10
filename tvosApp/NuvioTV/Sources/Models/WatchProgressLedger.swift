@@ -118,7 +118,11 @@ enum WatchProgressLedger {
     }
 
     private static var storageKey: String {
-        guard let id = activeProfileId, !id.isEmpty else { return baseKey }
+        storageKey(for: activeProfileId)
+    }
+
+    private static func storageKey(for profileId: String?) -> String {
+        guard let id = profileId ?? activeProfileId, !id.isEmpty else { return baseKey }
         return "\(baseKey).\(id)"
     }
 
@@ -131,26 +135,36 @@ enum WatchProgressLedger {
 
     // MARK: - Storage
 
-    static func records() -> [WatchProgressRecord] {
+    static func records(profileId: String? = nil) -> [WatchProgressRecord] {
         cacheLock.lock()
         defer { cacheLock.unlock() }
-        let key = storageKey
+        return recordsLocked(profileId: profileId)
+    }
+
+    private static func recordsLocked(profileId: String? = nil) -> [WatchProgressRecord] {
+        let key = storageKey(for: profileId)
         if cachedKey == key, let cachedRecords {
             return cachedRecords
         }
         guard let data = storedData(forKey: key) else {
-            cachedRecords = []
-            cachedKey = key
+            if profileId == nil || profileId == activeProfileId {
+                cachedRecords = []
+                cachedKey = key
+            }
             return []
         }
         guard let decoded = try? JSONDecoder().decode([WatchProgressRecord].self, from: data) else {
             LargePayloadStore.remove(key: key, directory: storageDirectoryName)
-            cachedRecords = []
-            cachedKey = key
+            if profileId == nil || profileId == activeProfileId {
+                cachedRecords = []
+                cachedKey = key
+            }
             return []
         }
-        cachedRecords = decoded
-        cachedKey = key
+        if profileId == nil || profileId == activeProfileId {
+            cachedRecords = decoded
+            cachedKey = key
+        }
         return decoded
     }
 
@@ -168,46 +182,53 @@ enum WatchProgressLedger {
         return legacy
     }
 
-    static func record(forKey key: String) -> WatchProgressRecord? {
-        records().first { $0.progressKey == key }
+    static func record(forKey key: String, profileId: String? = nil) -> WatchProgressRecord? {
+        records(profileId: profileId).first { $0.progressKey == key }
     }
 
-    static func record(contentId: String, season: Int?, episode: Int?) -> WatchProgressRecord? {
-        record(forKey: progressKey(contentId: contentId, season: season, episode: episode))
+    static func record(contentId: String, season: Int?, episode: Int?, profileId: String? = nil) -> WatchProgressRecord? {
+        record(forKey: progressKey(contentId: contentId, season: season, episode: episode), profileId: profileId)
     }
 
     /// Newest row for a title, regardless of which episode it belongs to.
-    static func latestRecord(contentId: String) -> WatchProgressRecord? {
-        records()
+    static func latestRecord(contentId: String, profileId: String? = nil) -> WatchProgressRecord? {
+        records(profileId: profileId)
             .filter { $0.contentId == contentId }
             .max { $0.lastWatchedAt < $1.lastWatchedAt }
     }
 
     @discardableResult
-    static func upsert(_ record: WatchProgressRecord) -> Bool {
-        var current = records().filter { $0.progressKey != record.progressKey }
+    static func upsert(_ record: WatchProgressRecord, profileId: String? = nil) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        var current = recordsLocked(profileId: profileId).filter { $0.progressKey != record.progressKey }
         current.append(record)
         print("[WatchProgressLedger] upsert: key=\(record.progressKey), id=\(record.contentId), S\(record.season.map(String.init) ?? "nil")E\(record.episode.map(String.init) ?? "nil"), pos=\(record.position)/\(record.duration), isPendingPush=\(record.isPendingPush), totalRecords=\(current.count)")
-        return persist(current)
+        return persistLocked(current, profileId: profileId)
     }
 
     @discardableResult
-    static func remove(keys: [String]) -> Bool {
+    static func remove(keys: [String], profileId: String? = nil) -> Bool {
         guard !keys.isEmpty else { return true }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let removing = Set(keys)
-        let remaining = records().filter { !removing.contains($0.progressKey) }
-        guard remaining.count != records().count else { return true }
+        let current = recordsLocked(profileId: profileId)
+        let remaining = current.filter { !removing.contains($0.progressKey) }
+        guard remaining.count != current.count else { return true }
         print("[WatchProgressLedger] remove: keys=\(keys), remainingRecords=\(remaining.count)")
-        return persist(remaining)
+        return persistLocked(remaining, profileId: profileId)
     }
 
     /// Retires every row for a title — used when the user clears a card or the
     /// title is marked watched outright.
     @discardableResult
-    static func removeContent(id: String) -> Bool {
-        let remaining = records().filter { $0.contentId != id }
+    static func removeContent(id: String, profileId: String? = nil) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let remaining = recordsLocked(profileId: profileId).filter { $0.contentId != id }
         print("[WatchProgressLedger] removeContent: id=\(id), remainingRecords=\(remaining.count)")
-        return persist(remaining)
+        return persistLocked(remaining, profileId: profileId)
     }
 
     /// Applies a server snapshot without ever discarding a row.
@@ -219,11 +240,13 @@ enum WatchProgressLedger {
     /// history (a backfill from an older install, say) overwrite progress the
     /// user has since made on their phone.
     @discardableResult
-    static func mergeRemote(_ remote: [WatchProgressRecord]) -> Bool {
+    static func mergeRemote(_ remote: [WatchProgressRecord], profileId: String? = nil) -> Bool {
         guard !remote.isEmpty else { return true }
-        let mergedResult = Array(merged(remote, into: records()).values)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let mergedResult = Array(merged(remote, into: recordsLocked(profileId: profileId)).values)
         print("[WatchProgressLedger] mergeRemote: received \(remote.count) remote records -> total \(mergedResult.count) records")
-        return persist(mergedResult)
+        return persistLocked(mergedResult, profileId: profileId)
     }
 
     /// Applies an account snapshot as authoritative, deletions included.
@@ -244,9 +267,13 @@ enum WatchProgressLedger {
     /// the card for the title that was just deleted.
     static func reconcileRemote(
         _ remote: [WatchProgressRecord],
-        syncStartedAt: Date
+        syncStartedAt: Date,
+        profileId: String? = nil
     ) -> (saved: Bool, removedKeys: [String], didChange: Bool) {
-        let byKey = merged(remote, into: records())
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let current = recordsLocked(profileId: profileId)
+        let byKey = merged(remote, into: current)
         let remoteKeys = Set(remote.map(\.progressKey))
 
         var survivors: [WatchProgressRecord] = []
@@ -262,7 +289,7 @@ enum WatchProgressLedger {
             }
         }
 
-        print("[WatchProgressLedger] reconcileRemote: remote=\(remote.count), local=\(records().count), survivors=\(survivors.count), removed=\(removedKeys.count)")
+        print("[WatchProgressLedger] reconcileRemote: remote=\(remote.count), local=\(current.count), survivors=\(survivors.count), removed=\(removedKeys.count)")
 
         // A refresh that did not change the merged ledger (the common case on
         // a background pull of an account that has been quiet) must not
@@ -271,7 +298,7 @@ enum WatchProgressLedger {
         // so its order is unspecified, while `records()` is in stored file
         // order, and a same-key new row must still persist.
         let currentByKey = Dictionary(
-            records().map { ($0.progressKey, $0) },
+            current.map { ($0.progressKey, $0) },
             uniquingKeysWith: { _, newer in newer }
         )
         let survivorByKey = Dictionary(
@@ -281,7 +308,7 @@ enum WatchProgressLedger {
         if currentByKey == survivorByKey {
             return (true, removedKeys, false)
         }
-        return (persist(survivors), removedKeys, true)
+        return (persistLocked(survivors, profileId: profileId), removedKeys, true)
     }
 
     /// Remote rows layered onto local ones by `progressKey`, newer wins. A local
@@ -312,11 +339,13 @@ enum WatchProgressLedger {
 
     /// Clears the pending flag after a push confirms those rows reached the
     /// server, so a later pull is allowed to update them again.
-    static func markPushed(keys: [String]) {
+    static func markPushed(keys: [String], profileId: String? = nil) {
         guard !keys.isEmpty else { return }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let pushed = Set(keys)
         var changed = false
-        let updated = records().map { record -> WatchProgressRecord in
+        let updated = recordsLocked(profileId: profileId).map { record -> WatchProgressRecord in
             guard pushed.contains(record.progressKey), record.isPendingPush else { return record }
             changed = true
             var copy = record
@@ -325,7 +354,7 @@ enum WatchProgressLedger {
         }
         guard changed else { return }
         print("[WatchProgressLedger] markPushed: cleared isPendingPush for \(keys.count) keys: \(keys)")
-        _ = persist(updated)
+        _ = persistLocked(updated, profileId: profileId)
     }
 
     /// Seeds the ledger from a previously rendered Continue Watching list.
@@ -334,8 +363,10 @@ enum WatchProgressLedger {
     /// upgrading user (or one who never signed in to Nuvio Sync) would otherwise
     /// start with no raw rows at all. Runs once per profile — afterwards the
     /// ledger is authoritative and this must not overwrite it.
-    static func backfillIfEmpty(from items: [ContinueWatchingItem]) {
-        guard !items.isEmpty, records().isEmpty else { return }
+    static func backfillIfEmpty(from items: [ContinueWatchingItem], profileId: String? = nil) {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        guard !items.isEmpty, recordsLocked(profileId: profileId).isEmpty else { return }
         let seeded = items.compactMap { item -> WatchProgressRecord? in
             // Next Up cards are presentation, not playback; the finished episode
             // that produced them is what belongs in a ledger.
@@ -429,7 +460,14 @@ enum WatchProgressLedger {
     }
 
     @discardableResult
-    private static func persist(_ records: [WatchProgressRecord]) -> Bool {
+    private static func persist(_ records: [WatchProgressRecord], profileId: String? = nil) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        return persistLocked(records, profileId: profileId)
+    }
+
+    @discardableResult
+    private static func persistLocked(_ records: [WatchProgressRecord], profileId: String? = nil) -> Bool {
         // Keep the newest rows when trimming; the oldest are the least likely to
         // be needed for either Continue Watching or a resume lookup.
         let trimmed = Array(
@@ -438,9 +476,7 @@ enum WatchProgressLedger {
                 .prefix(maxRecords)
         )
         guard let data = try? JSONEncoder().encode(trimmed) else { return false }
-        cacheLock.lock()
-        defer { cacheLock.unlock() }
-        let key = storageKey
+        let key = storageKey(for: profileId)
         guard LargePayloadStore.write(data, key: key, directory: storageDirectoryName) else {
             // No preferences fallback: the ledger shares its budget with every
             // other key in the plist, and an oversized write aborts the process.
@@ -451,8 +487,10 @@ enum WatchProgressLedger {
         if UserDefaults.standard.object(forKey: key) != nil {
             UserDefaults.standard.removeObject(forKey: key)
         }
-        cachedRecords = trimmed
-        cachedKey = key
+        if profileId == nil || profileId == activeProfileId {
+            cachedRecords = trimmed
+            cachedKey = key
+        }
         postChangedNotification()
         return true
     }
@@ -492,7 +530,21 @@ enum WatchProgressLedger {
     /// one per series. Mirrors `continueWatchingProgressEntries`.
     static func continueWatchingCandidates() -> [WatchProgressRecord] {
         let allRecords = records()
+        // Pick the latest raw episode for each series before filtering out
+        // completions and watched rows. Otherwise a newer completed episode
+        // can expose an older partial episode as if it were still the resume
+        // point. A later playback save for an earlier episode still wins here,
+        // which preserves intentional rewatches.
+        var seenSeries: Set<String> = []
+        let latestEpisodeBySeries = allRecords
+            .filter(\.isEpisode)
+            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+            .filter { seenSeries.insert($0.contentId).inserted }
+        let latestEpisodeKeys = Set(latestEpisodeBySeries.map(\.progressKey))
         let inProgress = allRecords.filter { record in
+            guard !record.isEpisode || latestEpisodeKeys.contains(record.progressKey) else {
+                return false
+            }
             guard hasStarted(record) else {
                 print("[WatchProgressLedger] continueWatchingCandidates: rejected \(record.progressKey) - hasStarted=false (pos=\(record.position))")
                 return false
@@ -521,12 +573,7 @@ enum WatchProgressLedger {
         let episodes = inProgress.filter(\.isEpisode)
         let others = inProgress.filter { !$0.isEpisode }
 
-        var seenSeries: Set<String> = []
-        let latestPerSeries = episodes
-            .sorted { $0.lastWatchedAt > $1.lastWatchedAt }
-            .filter { seenSeries.insert($0.contentId).inserted }
-
-        let result = (others + latestPerSeries).sorted { $0.lastWatchedAt > $1.lastWatchedAt }
+        let result = (others + episodes).sorted { $0.lastWatchedAt > $1.lastWatchedAt }
         print("[WatchProgressLedger] continueWatchingCandidates: from \(allRecords.count) ledger records -> \(result.count) candidates: \(result.map(\.progressKey))")
         return result
     }
@@ -541,7 +588,12 @@ enum WatchProgressLedger {
             .filter { record in
                 if isComplete(record) { return true }
                 if let season = record.season, let episode = record.episode,
-                   WatchedStore.containsEpisode(metaId: record.contentId, season: season, episode: episode) {
+                   let watchedAt = WatchedStore.watchedAt(
+                       metaId: record.contentId,
+                       season: season,
+                       episode: episode
+                   ),
+                   watchedAt >= record.lastWatchedAt {
                     return true
                 }
                 return false

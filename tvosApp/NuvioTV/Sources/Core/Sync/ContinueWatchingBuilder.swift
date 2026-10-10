@@ -59,27 +59,62 @@ enum ContinueWatchingBuilder {
 
     /// Orders the row and the metadata spend that feeds it.
     ///
-    /// Real playback outranks a Next Up suggestion for the same title, so a seed
-    /// whose show already has progress is dropped rather than rendered twice.
-    /// The result is newest-first, which is also the order pages are filled in —
-    /// so the first page is always the most recent activity.
+    /// A title with both a resume and a completion seed appears once, using the
+    /// newer activity. Equal timestamps favor the seed that represents a
+    /// just-finished episode. The result is newest-first, which is also the
+    /// order pages are filled in — so the first page is always most recent.
     static func planEntries(
         candidates: [WatchProgressRecord],
         seeds: [WatchProgressRecord]
     ) -> [PlanEntry] {
-        let candidateIds = Set(candidates.map(\.contentId))
-        return (
-            candidates.map { PlanEntry(record: $0, isSeed: false) }
-                + seeds
-                .filter { !candidateIds.contains($0.contentId) }
-                .map { PlanEntry(record: $0, isSeed: true) }
-        ).sorted { $0.record.lastWatchedAt > $1.record.lastWatchedAt }
+        var candidateById: [String: WatchProgressRecord] = [:]
+        for candidate in candidates {
+            if let current = candidateById[candidate.contentId],
+               current.lastWatchedAt >= candidate.lastWatchedAt {
+                continue
+            }
+            candidateById[candidate.contentId] = candidate
+        }
+
+        var seedById: [String: WatchProgressRecord] = [:]
+        for seed in seeds {
+            if let current = seedById[seed.contentId],
+               current.lastWatchedAt >= seed.lastWatchedAt {
+                continue
+            }
+            seedById[seed.contentId] = seed
+        }
+
+        let contentIds = Set(candidateById.keys).union(seedById.keys)
+        let entries = contentIds.compactMap { contentId -> PlanEntry? in
+            switch (candidateById[contentId], seedById[contentId]) {
+            case let (candidate?, seed?):
+                // A genuinely newer resume remains the visible card. At equal
+                // timestamps the completion seed wins, since it represents the
+                // episode that was just finished.
+                return PlanEntry(
+                    record: candidate.lastWatchedAt > seed.lastWatchedAt ? candidate : seed,
+                    isSeed: candidate.lastWatchedAt <= seed.lastWatchedAt
+                )
+            case let (candidate?, nil):
+                return PlanEntry(record: candidate, isSeed: false)
+            case let (nil, seed?):
+                return PlanEntry(record: seed, isSeed: true)
+            case (nil, nil):
+                return nil
+            }
+        }
+        return entries.sorted { $0.record.lastWatchedAt > $1.record.lastWatchedAt }
     }
 
     @MainActor private static var plan: [PlanEntry] = []
     @MainActor private static var materialized: [ContinueWatchingItem] = []
     @MainActor private static var consumedEntries = 0
     @MainActor private static var isLoadingPage = false
+    /// Exact identities written by the initial `replaceAll(page.items)` call.
+    /// `ContinueWatchingStore` can reorder those items by release recency, so
+    /// their membership cannot be recovered by slicing `materialized`.
+    @MainActor private static var persistedFirstPageIDs: Set<String> = []
     /// Whose history `plan` and `materialized` describe.
     ///
     /// This state is static while the profile it belongs to is not, and Home
@@ -94,6 +129,41 @@ enum ContinueWatchingBuilder {
     @MainActor
     static var pagedItems: [ContinueWatchingItem] {
         materializedProfileId == WatchProgressLedger.activeProfileId ? materialized : []
+    }
+
+    /// Items materialized after the persisted page. Home merges these with the
+    /// current store snapshot, which remains authoritative for titles that were
+    /// updated or removed after materialization.
+    @MainActor
+    static var memoryOnlyPagedItems: [ContinueWatchingItem] {
+        guard materializedProfileId == WatchProgressLedger.activeProfileId else { return [] }
+        return memoryOnlyItems(from: materialized, persistedItemIDs: persistedFirstPageIDs)
+    }
+
+    /// Pure membership filter kept separate from view state so page membership
+    /// remains stable even when the store's recency ordering differs.
+    static func memoryOnlyItems(
+        from items: [ContinueWatchingItem],
+        persistedItemIDs: Set<String>
+    ) -> [ContinueWatchingItem] {
+        items.filter { !persistedItemIDs.contains($0.meta.id) }
+    }
+
+    /// Merge later in-memory pages first and the current persisted snapshot
+    /// second, so a newer store value wins and a removed first-page title cannot
+    /// be resurrected from the builder cache.
+    static func mergeMemoryOnlyItems(
+        _ memoryOnlyItems: [ContinueWatchingItem],
+        with storedItems: [ContinueWatchingItem]
+    ) -> [ContinueWatchingItem] {
+        var byId: [String: ContinueWatchingItem] = [:]
+        for item in memoryOnlyItems {
+            byId[item.meta.id] = item
+        }
+        for item in storedItems {
+            byId[item.meta.id] = item
+        }
+        return Array(byId.values)
     }
 
     /// True while the ledger still holds titles that have not been rendered.
@@ -179,6 +249,7 @@ enum ContinueWatchingBuilder {
                 plan = []
                 materialized = []
                 consumedEntries = 0
+                persistedFirstPageIDs = []
                 materializedProfileId = profileId
                 ContinueWatchingStore.replaceAll([])
             }
@@ -233,6 +304,7 @@ enum ContinueWatchingBuilder {
             diagnostic = diagText
             // Only the first page is persisted; it is what a cold start renders.
             ContinueWatchingStore.replaceAll(page.items)
+            persistedFirstPageIDs = Set(ContinueWatchingStore.items().map(\.meta.id))
         }
 
         TVHomeDebugTrace.log(
@@ -467,7 +539,7 @@ enum ContinueWatchingBuilder {
                     specs.append(ItemSpec(
                         entry: entry,
                         meta: meta,
-                        existing: (existing?.isUpNextEntry == true) ? existing : nil,
+                        existing: shouldKeepCachedUpNext(existing, after: current) ? existing : nil,
                         season: nil,
                         episode: nil,
                         video: nil,
@@ -909,6 +981,23 @@ enum ContinueWatchingBuilder {
                     || EpisodeReleasePolicy.isAiringToday(video.released)
                     || EpisodeReleasePolicy.showUnairedNextUp
             }
+    }
+
+    /// A resolved seed can invalidate a previously cached Up Next episode when
+    /// watched history advances. Keep that cache only when it still points
+    /// strictly beyond the seed; metadata failures use their separate fallback.
+    static func shouldKeepCachedUpNext(
+        _ existing: ContinueWatchingItem?,
+        after current: (season: Int, episode: Int)?
+    ) -> Bool {
+        guard let existing,
+              existing.isUpNextEntry,
+              let current,
+              let season = existing.season,
+              let episode = existing.episode else {
+            return false
+        }
+        return (season, episode) > (current.season, current.episode)
     }
 
     private static func nonPlaceholder(_ value: String?) -> String? {

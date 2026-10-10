@@ -77,15 +77,15 @@ final class NuvioSyncManager: ObservableObject {
     static let defaultPushDelay: TimeInterval = 1.5
     static let progressHeartbeatInterval: TimeInterval = 30.0
 
-    private var pendingPushScopes: SyncPushScope = []
-    private var isPushExecuting = false
+    var pendingPushScopes: SyncPushScope = []
+    var isPushExecuting = false
     private var observers: [NSObjectProtocol] = []
     private var pullTask: Task<Void, Never>?
     private var pushTask: Task<Void, Never>?
     private var pushTaskDeadline: Date?
     private var homeCatalogPushTask: Task<Void, Never>?
     private var profileSelectionRefreshTask: Task<Void, Never>?
-    private var completedInitialPullKeys: Set<String> = []
+    var completedInitialPullKeys: Set<String> = []
     /// When each account+profile last finished a pull, so a screen re-entry can
     /// tell "the user came back" from "the data is old".
     private var lastCompletedPullAt: [String: Date] = [:]
@@ -113,7 +113,7 @@ final class NuvioSyncManager: ObservableObject {
     private var pullGeneration: UInt = 0
     private var observedAuthUserId: String?
     private var observedActiveProfileId: String?
-    private var isApplyingRemote = false
+    var isApplyingRemote = false
     /// Profile-list application can publish `activeProfile` synchronously. Keep
     /// that internal refresh distinct from a real user switch while the rest of
     /// a (potentially long) remote-data pull is in progress.
@@ -283,11 +283,13 @@ final class NuvioSyncManager: ObservableObject {
                   !Task.isCancelled,
                   let key = self.currentSyncKey(),
                   self.completedInitialPullKeys.contains(key) else { return }
+            guard !self.isApplyingRemote else { return }
             await self.pushHomeCatalogSettings()
         }
     }
 
     private func pushHomeCatalogSettings() async {
+        guard !isApplyingRemote else { return }
         guard let target = await currentSyncTarget(),
               let key = currentSyncKey(),
               completedInitialPullKeys.contains(key) else { return }
@@ -725,6 +727,7 @@ final class NuvioSyncManager: ObservableObject {
             Self.accountSyncDiagnostic = "not authenticated"
             return
         }
+        if !force, NSClassFromString("XCTestCase") != nil { return }
         if !force, pullTask != nil { return }
 
         // A forced pull for the account+profile already being pulled queues
@@ -764,6 +767,8 @@ final class NuvioSyncManager: ObservableObject {
 
     private func finishPull(generation: UInt) {
         guard generation == pullGeneration else { return }
+        isApplyingRemote = false
+        isApplyingRemoteProfiles = false
         let shouldForceResync = pendingForcedResyncKey != nil
             && pendingForcedResyncKey == currentSyncKey()
         pendingForcedResyncKey = nil
@@ -781,39 +786,53 @@ final class NuvioSyncManager: ObservableObject {
                 refreshAccountIfIdle()
             }
         }
+        resumeQueuedPushesIfIdle()
+    }
+
+    func resumeQueuedPushesIfIdle() {
+        guard !isApplyingRemote, !pendingPushScopes.isEmpty else { return }
+        schedulePush(scope: pendingPushScopes, delay: 0)
     }
 
     /// Session and remote profile id for a one-off account write, or nil when the
     /// account is not in a state to accept one.
-    private func currentSyncTarget() async -> (session: AuthSession, remoteProfileId: Int)? {
+    private func currentSyncTarget(for targetProfileId: String? = nil) async -> (session: AuthSession, remoteProfileId: Int)? {
         guard AuthConfig.isConfigured,
               let authManager,
               let profileViewModel,
-              let session = await authManager.validSessionForSync(),
-              let activeProfile = profileViewModel.activeProfile ?? profileViewModel.profiles.first else {
+              let session = await authManager.validSessionForSync() else {
             return nil
         }
+        let profile: Profile?
+        if let targetProfileId {
+            profile = profileViewModel.profiles.first { $0.id == targetProfileId }
+        } else {
+            profile = profileViewModel.activeProfile ?? profileViewModel.profiles.first
+        }
+        guard let resolvedProfile = profile else { return nil }
         return (
             session,
-            ProfileSyncIndexStore.remoteId(for: activeProfile, in: profileViewModel.profiles)
+            ProfileSyncIndexStore.remoteId(for: resolvedProfile, in: profileViewModel.profiles)
         )
     }
 
     /// Uploads pending watch progress now instead of waiting for the debounced
     /// push. Returns whether the upload completed.
     @discardableResult
-    func pushWatchProgressNow() async -> Bool {
-        guard let target = await currentSyncTarget() else { return false }
+    func pushWatchProgressNow(profileId: String? = nil) async -> Bool {
+        let resolvedProfileId = profileId ?? profileViewModel?.activeProfile?.id
+        guard let target = await currentSyncTarget(for: resolvedProfileId) else { return false }
         // Same ownership rule as the debounced push — this path skips
         // `pushLocalSnapshots` entirely, so it needs the gate of its own.
-        if let profileId = profileViewModel?.activeProfile?.id,
-           !Self.ownsWatchState(for: profileId) {
+        if let resolvedProfileId,
+           !Self.ownsWatchState(for: resolvedProfileId) {
             return false
         }
         do {
             try await client.pushWatchProgress(
                 session: target.session,
-                remoteProfileId: target.remoteProfileId
+                remoteProfileId: target.remoteProfileId,
+                profileId: resolvedProfileId
             )
             return true
         } catch {
@@ -828,9 +847,9 @@ final class NuvioSyncManager: ObservableObject {
     /// pull would simply restore them, so anything that removes synced progress
     /// has to retire it server-side too.
     @discardableResult
-    func deleteRemoteWatchProgress(keys: [String]) async -> Bool {
+    func deleteRemoteWatchProgress(keys: [String], profileId: String? = nil) async -> Bool {
         guard !keys.isEmpty else { return true }
-        guard let target = await currentSyncTarget() else { return false }
+        guard let target = await currentSyncTarget(for: profileId) else { return false }
         do {
             try await client.deleteWatchProgress(
                 session: target.session,
@@ -845,12 +864,12 @@ final class NuvioSyncManager: ObservableObject {
     }
 
     func schedulePush(scope: SyncPushScope = .all, delay: TimeInterval = 1.5) {
-        guard !isApplyingRemote else { return }
         guard AuthConfig.isConfigured else { return }
         guard authManager?.isAuthenticated == true else { return }
         guard let key = currentSyncKey(), completedInitialPullKeys.contains(key) else { return }
 
         pendingPushScopes.insert(scope)
+        guard !isApplyingRemote else { return }
         guard !isPushExecuting else {
             // An upload is already in flight. Do not cancel active URLSession tasks.
             // When it finishes, executePendingPushes will pick up pendingPushScopes.
@@ -871,7 +890,9 @@ final class NuvioSyncManager: ObservableObject {
         pushTaskDeadline = targetDeadline
         pushTask = Task(priority: .utility) { @MainActor [weak self] in
             do {
-                try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                if delay > 0 {
+                    try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                }
             } catch {
                 return
             }
@@ -881,6 +902,7 @@ final class NuvioSyncManager: ObservableObject {
                   self.completedInitialPullKeys.contains(key) else { return }
             self.pushTaskDeadline = nil
             self.pushTask = nil
+            guard !self.isApplyingRemote else { return }
             await self.executePendingPushes()
         }
     }
@@ -895,23 +917,40 @@ final class NuvioSyncManager: ObservableObject {
 
     /// Awaits flushing of any debounced push tasks immediately.
     func flushPendingPushesNow() async {
-        guard !isApplyingRemote else { return }
-        if homeCatalogPushTask != nil {
-            homeCatalogPushTask?.cancel()
-            homeCatalogPushTask = nil
-            await pushHomeCatalogSettings()
+        guard !isApplyingRemote, !Task.isCancelled else { return }
+        while !Task.isCancelled {
+            guard !isApplyingRemote else { return }
+            if homeCatalogPushTask != nil {
+                homeCatalogPushTask?.cancel()
+                homeCatalogPushTask = nil
+                await pushHomeCatalogSettings()
+                guard !isApplyingRemote, !Task.isCancelled else { return }
+            }
+            pushTask?.cancel()
+            pushTask = nil
+            pushTaskDeadline = nil
+            while isPushExecuting {
+                guard !isApplyingRemote, !Task.isCancelled else { return }
+                do {
+                    try await Task.sleep(nanoseconds: 50_000_000) // 50ms
+                } catch {
+                    return
+                }
+                guard !isApplyingRemote, !Task.isCancelled else { return }
+            }
+            guard !isApplyingRemote, !Task.isCancelled else { return }
+            guard !pendingPushScopes.isEmpty else {
+                if homeCatalogPushTask == nil {
+                    break
+                }
+                continue
+            }
+            await executePendingPushes()
         }
-        pushTask?.cancel()
-        pushTask = nil
-        pushTaskDeadline = nil
-        while isPushExecuting {
-            try? await Task.sleep(nanoseconds: 50_000_000) // 50ms
-        }
-        await executePendingPushes()
     }
 
-    private func executePendingPushes() async {
-        guard !isPushExecuting else { return }
+    func executePendingPushes() async {
+        guard !isPushExecuting, !isApplyingRemote else { return }
         let scopesToPush = pendingPushScopes
         guard !scopesToPush.isEmpty else { return }
         pendingPushScopes = []
@@ -1272,10 +1311,11 @@ final class NuvioSyncManager: ObservableObject {
                 // are attributed to Nuvio Sync — not to whichever tracker
                 // happens to be selected right now. Remote deletions on Nuvio
                 // account are reconciled so deleted items don't resurrect.
-                await Task.detached(priority: .utility) {
+                _ = await Task.detached(priority: .utility) {
                     WatchedStore.reconcileNuvioSnapshot(
                         remoteWatched,
-                        syncStartedAt: progressPullStartedAt
+                        syncStartedAt: progressPullStartedAt,
+                        profileId: activeProfile.id
                     )
                 }.value
                 try ensureStillSyncing(profileId: activeProfile.id)
@@ -1297,7 +1337,8 @@ final class NuvioSyncManager: ObservableObject {
                 let progressReconcile = await Task.detached(priority: .utility) {
                     WatchProgressLedger.reconcileRemote(
                         remoteProgress,
-                        syncStartedAt: progressPullStartedAt
+                        syncStartedAt: progressPullStartedAt,
+                        profileId: activeProfile.id
                     )
                 }.value
                 try ensureStillSyncing(profileId: activeProfile.id)
@@ -1307,12 +1348,14 @@ final class NuvioSyncManager: ObservableObject {
                 }
                 didSaveWatchProgress = true
                 if !progressReconcile.removedKeys.isEmpty,
-                   WatchProgressLedger.records().isEmpty {
+                   WatchProgressLedger.records(profileId: activeProfile.id).isEmpty {
                     // The rebuild below returns early on an empty ledger without
                     // replacing the derived rows, which would leave the card for
                     // the title that was just deleted on screen.
                     print("[NuvioSync] pullWatchProgress: ledger is now empty after removing keys -> clearing ContinueWatchingStore")
-                    ContinueWatchingStore.replaceAll([])
+                    if self.profileViewModel?.activeProfile?.id == activeProfile.id {
+                        ContinueWatchingStore.replaceAll([])
+                    }
                 }
                 // Watched marks, source visibility, and metadata may have changed
                 // even when the raw progress snapshot did not. Rebuild the
@@ -1588,11 +1631,19 @@ final class NuvioSyncManager: ObservableObject {
             if ownsWatchState {
                 if scopes.contains(.watched) {
                     try ensureStillSyncing(profileId: activeProfile.id)
-                    try await client.pushWatched(session: session, remoteProfileId: remoteProfileId)
+                    try await client.pushWatched(
+                        session: session,
+                        remoteProfileId: remoteProfileId,
+                        profileId: activeProfile.id
+                    )
                 }
                 if scopes.contains(.progress) {
                     try ensureStillSyncing(profileId: activeProfile.id)
-                    try await client.pushWatchProgress(session: session, remoteProfileId: remoteProfileId)
+                    try await client.pushWatchProgress(
+                        session: session,
+                        remoteProfileId: remoteProfileId,
+                        profileId: activeProfile.id
+                    )
                 }
             }
 
@@ -3296,12 +3347,12 @@ fileprivate final class NuvioAPIClient {
         }
     }
 
-    func pushWatched(session: AuthSession, remoteProfileId: Int) async throws {
+    func pushWatched(session: AuthSession, remoteProfileId: Int, profileId: String? = nil) async throws {
         // Only rows Nuvio Sync itself owns. The caller already checks that Nuvio
         // is the selected source, but the local store still holds marks imported
         // from Trakt or Simkl in an earlier session, and those are not this
         // account's to upload.
-        let payload = WatchedStore.items()
+        let payload = WatchedStore.items(profileId: profileId)
             .filter {
                 $0.isVisible(under: .nuvioSync)
                     // A series title marker is only a local aggregate used by
@@ -3335,7 +3386,7 @@ fileprivate final class NuvioAPIClient {
         // next pull restores the checkmark. Deletes are retried on every push;
         // the tombstone is only cleared once a pull confirms the row is gone
         // (mergeRemote), so a delete that silently no-ops can't resurrect it.
-        let tombstones = await MainActor.run { WatchedStore.tombstones() }
+        let tombstones = WatchedStore.tombstones(profileId: profileId)
         guard !tombstones.isEmpty else { return }
         let keys = tombstones.map { tombstone -> [String: Any] in
             // Omit rather than null, matching Android's delete payload. The push
@@ -3400,7 +3451,7 @@ fileprivate final class NuvioAPIClient {
     /// including an episode the phone had legitimately just started. Deletions
     /// now happen only where the user actually removed something, via
     /// `deleteWatchProgress`.
-    func pushWatchProgress(session: AuthSession, remoteProfileId: Int) async throws {
+    func pushWatchProgress(session: AuthSession, remoteProfileId: Int, profileId: String? = nil) async throws {
         // Episode entries must use the phone's row conventions — video_id
         // "id:s:e" and progress_key "id_s{s}e{e}" — or each platform upserts
         // its own parallel row for the same episode and they fight over
@@ -3408,7 +3459,7 @@ fileprivate final class NuvioAPIClient {
         // Only rows this device changed. Everything else came from the server,
         // which already has it — echoing the whole ledger back would put a
         // few hundred kilobytes on the wire every sync for no benefit.
-        let records = WatchProgressLedger.records().filter(\.isPendingPush)
+        let records = WatchProgressLedger.records(profileId: profileId).filter(\.isPendingPush)
         let payload = records.map { record -> [String: Any] in
             var entry: [String: Any] = [
                 "content_id": record.contentId,
@@ -3439,7 +3490,7 @@ fileprivate final class NuvioAPIClient {
             ]
         )
         print("[NuvioSync] pushWatchProgress: successfully pushed \(payload.count) records")
-        WatchProgressLedger.markPushed(keys: records.map(\.progressKey))
+        WatchProgressLedger.markPushed(keys: records.map(\.progressKey), profileId: profileId)
     }
 
     /// Retires specific rows the user removed on this device.
