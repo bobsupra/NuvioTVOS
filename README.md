@@ -1,8 +1,15 @@
-# First PR batch: visual validation
+# First PR batch validation
 
-Baseline: 35704ed75. Integration: 6fdfe67df95531bc994664a0ffc40804b62ffd81.
+Final integration: `b2f59f6ff8b064943ce38dc1f6feb05417a25d23`, based on latest main `35704ed75`. All ten original PR heads are preserved, including updated PR 240 at `f0caaf23`. A focused follow-up adds a stable identifier to existing native poster buttons and uses it in the navigation smoke test.
 
-Xcode 27.0; Apple TV 4K (3rd generation), tvOS 27.0 simulator. The integration passed 246 tests across StreamsDiscoveryTests, PlaybackBackendPolicyTests, PlayerControlsSettingsTests, HomeLayoutSettingsTests, and PosterCardStyleSyncTests.
+Xcode 27.0; isolated Apple TV 4K (3rd generation), tvOS 27.0 simulator.
+
+- Final focused unit suites: **246 passed, 0 failed**.
+- Final UI launch and Home-to-Details remote navigation: **2 passed, 0 failed**.
+- Initial UI smoke also verified that content-type toggle and pull-to-refresh report their **2 expected skips**.
+- The new UI scheme generates and compiles. The earlier unavailable-touch-API blocker is resolved.
+
+The full legacy UI suite was not run; many flows still require explicit account/catalog fixtures and reliable selectors. Physical-device playback, memory pressure, and delayed Jellyfin authentication were not exercised.
 
 ## PR 243
 
@@ -13,9 +20,13 @@ Before: Match Subtitle Language is grayed out with Auto Select Stream off. After
 
 ## PR 251
 
-Before/after Home Layout previews use the shared card modifier with AMOLED Mode and Pure Black Surfaces enabled. The preview remains legible with focused and unfocused cards. Artwork/gradient fills mask much of the underlying surface in this preview; these images do not establish physical-TV power savings or validate every shared-surface call site.
+Before/after Home Layout previews use the shared card modifier with AMOLED Mode and Pure Black Surfaces enabled. Focused and unfocused cards remain legible. Artwork/gradient fills mask much of the underlying surface in this preview; these images do not establish physical-TV power savings or validate every shared-surface call site. Screenshots compare baseline 35704ed75 and candidate6fdfe67; the subsequent testability-only identifier change does not change rendering.
 
 ![Before](251-before.png)
 ![After](251-after.png)
 
-These are simulator screenshots; physical-device playback, memory pressure, and delayed Jellyfin authentication flows were not exercised. UI test sources from PR 240 were syntax-checked but remain unregistered; PR 241 is held for tvOS-unavailable interactions.
+## Results
+
+[Final unit-test summary](unit-final-summary.json)
+
+[Final UI navigation summary](ui-final-summary.json)
