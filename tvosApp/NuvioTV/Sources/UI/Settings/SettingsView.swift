@@ -11374,6 +11374,7 @@ private struct CollectionsSettingsSection: View {
                         name: (collection["title"] as? String) ?? "Untitled",
                         detail: detailText(for: collection),
                         isPinned: (collection["pinToTop"] as? Bool) ?? false,
+                        canTogglePin: !usesSidebar(collection),
                         accentColor: accentColor,
                         onEdit: { activeSheet = .editor(index) },
                         onTogglePin: { togglePin(index) },
@@ -11536,8 +11537,13 @@ private struct CollectionsSettingsSection: View {
         showToast("Imported \(imported.count) collection\(imported.count == 1 ? "" : "s")")
     }
 
+    private func usesSidebar(_ collection: [String: Any]) -> Bool {
+        guard #available(tvOS 18.0, *), let id = collection["id"] as? String else { return false }
+        return sidebarCollectionIDs.contains(id)
+    }
+
     private func togglePin(_ index: Int) {
-        guard collections.indices.contains(index) else { return }
+        guard collections.indices.contains(index), !usesSidebar(collections[index]) else { return }
         let pinned = (collections[index]["pinToTop"] as? Bool) ?? false
         collections[index]["pinToTop"] = !pinned
         CollectionsStore.saveLocalEdit(collections)
@@ -12829,6 +12835,7 @@ private struct CollectionSettingsRow: View {
     let name: String
     let detail: String
     let isPinned: Bool
+    var canTogglePin = true
     let accentColor: Color
     let onEdit: () -> Void
     let onTogglePin: () -> Void
@@ -12877,7 +12884,7 @@ private struct CollectionSettingsRow: View {
             .focusEffectDisabledIfAvailable()
             .entryLockable()
 
-            AddonReorderButton(systemImage: isPinned ? "pin.slash" : "pin", disabled: false, action: onTogglePin)
+            AddonReorderButton(systemImage: isPinned ? "pin.slash" : "pin", disabled: !canTogglePin, action: onTogglePin)
             AddonReorderButton(systemImage: "trash", disabled: false, action: onDelete)
         }
     }
@@ -12899,6 +12906,7 @@ private struct CollectionEditorSheet: View {
     @State private var focusGlowEnabled = true
     @State private var viewMode = "TABBED_GRID"
     @State private var showAllTab = true
+    @State private var sidebarLayoutLocked = false
     @State private var folders: [[String: Any]] = []
     @State private var sourcePicker: FolderSourcePicker?
 
@@ -12986,21 +12994,24 @@ private struct CollectionEditorSheet: View {
                             title: L10n.string("tvos_settings_pin_above_catalogs", fallback: "Pin above catalogs"),
                             subtitle: L10n.string("tvos_settings_show_this_collection_above_standard_home_rows", fallback: "Show this collection above standard Home rows"),
                             isOn: $pinToTop,
-                            accentColor: accentColor
+                            accentColor: accentColor,
+                            enabled: !sidebarLayoutLocked
                         )
 
                         SettingsToggleRow(
                             title: L10n.string("tvos_settings_focus_glow", fallback: "Focus glow"),
                             subtitle: L10n.string("tvos_settings_soft_glow_around_focused_folder_cards_android", fallback: "Soft glow around focused folder cards (Android)"),
                             isOn: $focusGlowEnabled,
-                            accentColor: accentColor
+                            accentColor: accentColor,
+                            enabled: !sidebarLayoutLocked
                         )
 
                         SettingsToggleRow(
                             title: L10n.string("tvos_settings_show_all_tab", fallback: "Show All tab"),
                             subtitle: L10n.string("tvos_settings_include_an_all_tab_when_browsing_folder_tabs", fallback: "Include an All tab when browsing folder tabs"),
                             isOn: $showAllTab,
-                            accentColor: accentColor
+                            accentColor: accentColor,
+                            enabled: !sidebarLayoutLocked
                         )
 
                         VStack(alignment: .leading, spacing: 12) {
@@ -13017,6 +13028,18 @@ private struct CollectionEditorSheet: View {
                                     }
                                 }
                             }
+                        }
+                        .disabled(sidebarLayoutLocked)
+                        .opacity(sidebarLayoutLocked ? 0.45 : 1)
+
+                        if sidebarLayoutLocked {
+                            Text(L10n.string(
+                                "collection_sidebar_layout_locked",
+                                fallback: "Turn off collection pages in sidebar to change these options. Sidebar pages use your Home layout."
+                            ))
+                            .font(.system(size: 17, weight: .medium))
+                            .foregroundColor(.white.opacity(0.6))
+                            .fixedSize(horizontal: false, vertical: true)
                         }
 
                         Divider().background(Color.white.opacity(0.1)).padding(.vertical, 2)
@@ -13098,6 +13121,9 @@ private struct CollectionEditorSheet: View {
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onAppear(perform: loadExisting)
+        .onReceive(NotificationCenter.default.publisher(for: CollectionSidebarPreferences.changedNotification).receive(on: RunLoop.main)) { _ in
+            refreshSidebarLayoutLock()
+        }
         .sheet(item: $sourcePicker) { picker in
             switch picker {
             case .catalogs(let index):
@@ -13123,6 +13149,7 @@ private struct CollectionEditorSheet: View {
     }
 
     private func loadExisting() {
+        refreshSidebarLayoutLock()
         guard let existing else {
             // Seed one empty folder (title is placeholder-only until the user types).
             folders = [Self.makeEmptyFolder(title: "")]
@@ -13137,6 +13164,17 @@ private struct CollectionEditorSheet: View {
         if folders.isEmpty {
             folders = [Self.makeEmptyFolder(title: "")]
         }
+    }
+
+    private func refreshSidebarLayoutLock() {
+        guard #available(tvOS 18.0, *), !isNew,
+              let id = existing?["id"] as? String else {
+            sidebarLayoutLocked = false
+            return
+        }
+        sidebarLayoutLocked = CollectionSidebarPreferences.collectionIDs(
+            profileID: CollectionsStore.activeProfileId
+        ).contains(id)
     }
 
     private static func makeEmptyFolder(title: String) -> [String: Any] {
