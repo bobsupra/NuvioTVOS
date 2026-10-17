@@ -7036,7 +7036,10 @@ struct TVHomeView: View {
     /// Catalog title focus: card strip + row offset are immediate; hero/backdrop
     /// publish only after the settle delay (and cancel if focus moves again).
     private func settleCatalogFocus(on meta: NuvioMeta, in sectionId: String) {
-        focusWork.pendingFocusedMeta = meta
+        if isActive && !isFullScreenOverlayPresented {
+            collectionHome?.prefetchHeroLogos(rowID: sectionId, near: meta)
+        }
+        focusWork.pendingFocusedMeta = collectionHome?.preparedHero(for: meta) ?? meta
         focusWork.pendingFocusedFolder = nil
         focusWork.pendingSectionId = sectionId
         scheduleHeroSettle()
@@ -7093,10 +7096,13 @@ struct TVHomeView: View {
                 return
             }
 
-            guard let settledMeta = focusWork.pendingFocusedMeta,
-                  settledMeta.id == targetMetaId,
+            guard let pendingMeta = focusWork.pendingFocusedMeta,
+                  pendingMeta.id == targetMetaId,
                   let targetSectionId,
                   focusWork.pendingSectionId == targetSectionId else { return }
+
+            let settledMeta = collectionHome?.preparedHero(for: pendingMeta) ?? pendingMeta
+            focusWork.pendingFocusedMeta = settledMeta
 
             // Leaving a folder hero: clear only after settle so backdrop stays frozen.
             focusedSectionId = targetSectionId
