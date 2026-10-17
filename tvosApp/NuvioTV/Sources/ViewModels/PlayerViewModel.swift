@@ -327,6 +327,7 @@ class PlayerViewModel: ObservableObject {
     private var hasLoaded = false
     private var didShutdown = false
     private var isTrailerPlaybackSession = false
+    private var trailerEndConfirmation = TrailerEndConfirmation()
     private var hasClearedDismissalsForCurrentPlaybackSession = false
     var activeMeta: NuvioMeta?
     private var activeStreamURL: String?
@@ -1183,6 +1184,7 @@ class PlayerViewModel: ObservableObject {
     ) {
         let isTrailerPlayback = subtitle == PlaybackMarkers.trailerSubtitle
         isTrailerPlaybackSession = isTrailerPlayback
+        trailerEndConfirmation.reset()
         isPlaybackDebugEnabled = ProfileSettings.current.bool(forKey: SettingsKey.playbackDebug)
         if isPlaybackDebugEnabled {
             var info = PlaybackDebugInfo(
@@ -2547,8 +2549,12 @@ class PlayerViewModel: ObservableObject {
         updateLoadingStepMessage()
         // A backend handoff may occur while state is refreshed. Discard a stale sample.
         guard activeEngineKind == sampledEngineKind,
-              sessionCoordinator.loadGeneration == sampledLoadGeneration else { return }
+              sessionCoordinator.loadGeneration == sampledLoadGeneration else {
+            trailerEndConfirmation.reset()
+            return
+        }
         if pendingAdvanceResolutionGeneration != nil {
+            trailerEndConfirmation.reset()
             if status != .buffering { status = .buffering }
             return
         }
@@ -2556,6 +2562,23 @@ class PlayerViewModel: ObservableObject {
         let hasPresentedCurrentLoad = currentLoadPresentationIsConfirmed(
             engineKind: sampledEngineKind,
             generation: sampledLoadGeneration
+        )
+
+        let confirmedTrailerEnd = trailerEndConfirmation.observe(
+            isTrailer: isTrailerPlaybackSession,
+            usesMPV: sampledEngineKind == .mpv,
+            reachedEOF: c.isAtEndOfFile,
+            isStable: hasPresentedCurrentLoad && hasRenderedFirstFrame
+                && c.hasCoherentTimeSample && !c.isPlayerLoading
+                && c.currentErrorMessage.isEmpty && sessionCoordinator.lastLoadError == nil
+                && !isAwaitingStreamStart && !isAdvanceInFlight
+                && !isSwitchingSource && !isReloadingStream && !isFailingOver
+                && !isScrubbing && !isHoldingSeek && pendingSeekDelta == 0
+                && seekDebounceTask == nil && !didShutdown,
+            position: Double(c.positionMs) / 1000,
+            duration: Double(c.durationMs) / 1000,
+            loadGeneration: sampledLoadGeneration,
+            uptime: ProcessInfo.processInfo.systemUptime
         )
 
         if let startupError = sessionCoordinator.lastLoadError {
@@ -2822,7 +2845,7 @@ class PlayerViewModel: ObservableObject {
             } else {
                 engineStatus = .error(c.currentErrorMessage)
             }
-        } else if c.isPlayerEnded {
+        } else if c.isPlayerEnded || confirmedTrailerEnd {
             engineStatus = .ended
         } else if c.isPlayerLoading && !c.isPlayerPlaying && !c.hasFirstFrameReadyForDisplay {
             if isLiveStream, livePlaybackHasStarted {
