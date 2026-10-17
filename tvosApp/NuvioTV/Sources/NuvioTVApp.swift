@@ -3330,7 +3330,9 @@ private struct TVMainTabView: View {
     @available(tvOS 18.0, *)
     private var groupedCollectionTabs: some View {
         TabView(selection: $selectedTab) {
-            Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
+            if #unavailable(tvOS 27.0) {
+                Tab(value: TVTab.profile) { Color.clear } label: { profileTabLabel }
+            }
             Tab(TVTab.home.title, systemImage: TVTab.home.symbol, value: TVTab.home) {
                 homeTabContent
             }
@@ -3359,7 +3361,17 @@ private struct TVMainTabView: View {
 
     @ViewBuilder
     private var tabShell: some View {
-        if #available(tvOS 18.0, *) {
+        if #available(tvOS 27.0, *) {
+            groupedCollectionTabs
+                .tabViewSidebarHeader {
+                    TVSidebarProfileHeader(profile: displayedProfile) {
+                        guard !isProfileFocusPending else { return }
+                        if selectedTab == .settings { syncManager.flushPendingPushes() }
+                        onSwitchProfile()
+                    }
+                    .disabled(isProfileFocusPending)
+                }
+        } else if #available(tvOS 18.0, *) {
             groupedCollectionTabs
         } else {
             standardTabs
@@ -3433,6 +3445,16 @@ private struct TVSidebarProfileHeader: View {
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
 
     var body: some View {
+        Button(action: action) {
+            headerContent
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($isFocused)
+        .focusEffectDisabled()
+        .animation(.easeInOut(duration: 0.2), value: isFocused)
+    }
+
+    private var headerContent: some View {
         HStack(spacing: 12) {
             TVSidebarAvatar(profile: profile, isFocused: isFocused)
 
@@ -3455,24 +3477,14 @@ private struct TVSidebarProfileHeader: View {
 
             Spacer(minLength: 8)
 
-            if !isFocused {
-                TimelineView(.periodic(from: Date(), by: 30)) { context in
-                    Text(context.date, format: .dateTime.hour().minute())
-                        .font(.system(size: 23, weight: .medium))
-                        .foregroundColor(.white.opacity(0.68))
-                        .lineLimit(1)
-                }
-                .transition(.opacity)
-            }
+            TVSidebarClock()
+                .font(.system(size: 23, weight: .medium))
+                .foregroundColor(.white.opacity(0.68))
+                .frame(width: 140, alignment: .trailing)
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 14)
         .contentShape(Rectangle())
-        .focusable(true)
-        .focused($isFocused)
-        .focusEffectDisabled()
-        .onTapGesture(perform: action)
-        .animation(.easeInOut(duration: 0.2), value: isFocused)
     }
 
     private var displayName: String {

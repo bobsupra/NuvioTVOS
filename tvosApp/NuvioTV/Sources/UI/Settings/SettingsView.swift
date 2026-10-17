@@ -122,6 +122,7 @@ enum SettingsKey {
     static let reduceMotion = "nuvio.tv.settings.appearance.reduceMotion"
 
     static let homeLayout = "nuvio.tv.settings.layout.homeLayout"
+    static let sidebarClockFormat = "nuvio.tv.settings.layout.sidebarClockFormat"
     static let gridRows = "nuvio.tv.settings.layout.gridRows"
     static let catalogAutoRefreshInterval = "nuvio.tv.settings.layout.catalogAutoRefreshInterval"
     /// JSON `[String]` of home section ids in the user's preferred order.
@@ -344,7 +345,7 @@ enum SettingsKey {
         profileName, profilePinEnabled, profileAutoSelectLast, profileRequireSelectionAfterBackground,
         accountSyncWatchState,
         theme, bodyColor, font, language, amoled, amoledSurfaces, reduceMotion,
-        homeLayout, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
+        homeLayout, sidebarClockFormat, gridRows, catalogAutoRefreshInterval, homeCatalogShowType, heroEnabled, heroCatalogs, fullscreenHeroBackdrop, posterLabels, catalogAddonNames, landscapePosters, customPosterURLPattern, customPosterEnabledScreens, discoverLocation,
         searchStyle, preferAddonArtworkInSearch,
         continueWatchingVisible, continueWatchingLandscape, continueWatchingSort, upNextFromFurthestEpisode, showUnairedNextUp,
         cardCornerRadius, cardSize, liquidGlassCards,
@@ -3042,6 +3043,7 @@ private struct LayoutDiscoverySettingsView: View {
     let accentColor: Color
 
     @AppStorage(SettingsKey.homeLayout) private var homeLayout = "Modern"
+    @AppStorage(SettingsKey.sidebarClockFormat) private var sidebarClockFormat = SidebarClockFormat.automatic.rawValue
     @AppStorage(SettingsKey.gridRows) private var gridRows = TVHomeGridLayout.defaultRows
     @AppStorage(SettingsKey.heroEnabled) private var heroEnabled = true
     @AppStorage(SettingsKey.heroCatalogs) private var heroCatalogsData = Data()
@@ -3104,6 +3106,20 @@ private struct LayoutDiscoverySettingsView: View {
                 .settingsEntryAnchor()
                 .onAppear {
                     if homeLayout == "Classic" { homeLayout = "Modern" }
+                }
+
+                if #available(tvOS 27.0, *) {
+                    SettingsOptionRow(
+                        title: L10n.string("sidebar_clock_format_title", fallback: "Sidebar Clock"),
+                        subtitle: L10n.string(
+                            "sidebar_clock_format_subtitle",
+                            fallback: "Time format beside your profile"
+                        ),
+                        selection: $sidebarClockFormat,
+                        options: SidebarClockFormat.allCases.map(\.rawValue),
+                        accentColor: accentColor,
+                        optionLabel: { SidebarClockFormat.fromStored($0).title }
+                    )
                 }
 
                 SettingsToggleRow(
@@ -14513,6 +14529,7 @@ private struct SettingsOptionRow: View {
     @Binding var selection: String
     let options: [String]
     let accentColor: Color
+    var optionLabel: (String) -> String = { L10n.optionLabel($0) }
 
     @FocusState private var isFocused: Bool
 
@@ -14524,7 +14541,7 @@ private struct SettingsOptionRow: View {
                 Spacer(minLength: 24)
 
                 HStack(spacing: 10) {
-                    Text(L10n.optionLabel(currentStored))
+                    Text(optionLabel(currentStored))
                         .font(.system(size: 19, weight: .bold))
                         .foregroundColor(.white)
                         .lineLimit(1)
