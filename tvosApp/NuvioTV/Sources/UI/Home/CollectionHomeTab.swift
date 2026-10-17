@@ -9,6 +9,7 @@ struct CollectionHomeTab: View {
     let isActive: Bool
     let isFullScreenOverlayPresented: Bool
     let detailsDidDisappearGeneration: UInt
+    let collectionArtwork: UIImage?
     let onNavigateToDetails: (String, String) -> Void
     let onPlayTitle: (String, String) -> Void
     let onLongPressCard: (NuvioMeta) -> Void
@@ -21,6 +22,7 @@ struct CollectionHomeTab: View {
         isActive: Bool,
         isFullScreenOverlayPresented: Bool,
         detailsDidDisappearGeneration: UInt,
+        collectionArtwork: UIImage? = nil,
         onNavigateToDetails: @escaping (String, String) -> Void,
         onPlayTitle: @escaping (String, String) -> Void,
         onLongPressCard: @escaping (NuvioMeta) -> Void
@@ -30,6 +32,7 @@ struct CollectionHomeTab: View {
         self.isActive = isActive
         self.isFullScreenOverlayPresented = isFullScreenOverlayPresented
         self.detailsDidDisappearGeneration = detailsDidDisappearGeneration
+        self.collectionArtwork = collectionArtwork
         self.onNavigateToDetails = onNavigateToDetails
         self.onPlayTitle = onPlayTitle
         self.onLongPressCard = onLongPressCard
@@ -81,15 +84,44 @@ struct CollectionHomeTab: View {
             }
         }
         .overlay(alignment: .topTrailing) {
-            if !hasPartialFailures {
-                Text(destination.folder.title)
-                    .font(.system(size: 24, weight: .semibold))
-                    .foregroundStyle(.white.opacity(0.75))
-                    .padding(.top, 18)
+            if !isFullScreenOverlayPresented {
+                collectionIdentity
+                    .padding(.top, hasPartialFailures ? 112 : 18)
                     .padding(.trailing, 48)
-                    .allowsHitTesting(false)
             }
         }
+    }
+
+    /// Outside Home's ScrollView so the current collection remains identifiable
+    /// while browsing lower rows. It never uses the focused movie's metadata.
+    private var collectionIdentity: some View {
+        HStack(spacing: 10) {
+            Group {
+                if let collectionArtwork {
+                    Image(uiImage: collectionArtwork)
+                        .renderingMode(.original)
+                        .resizable()
+                        .scaledToFit()
+                } else if let emoji = destination.folder.coverEmoji,
+                          !emoji.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    Text(emoji).font(.system(size: 22))
+                } else {
+                    Image(systemName: "folder.fill")
+                        .font(.system(size: 18, weight: .semibold))
+                }
+            }
+            .frame(width: 32, height: 32)
+            .background(.white.opacity(0.12), in: Circle())
+            .clipShape(Circle())
+            .accessibilityHidden(true)
+            Text(destination.folder.title)
+                .font(.system(size: 24, weight: .semibold))
+                .lineLimit(1)
+                .truncationMode(.tail)
+        }
+        .foregroundStyle(.white.opacity(0.85))
+        .frame(maxWidth: 360, alignment: .trailing)
+        .allowsHitTesting(false)
     }
 
     private var failureActions: some View {

@@ -3113,6 +3113,8 @@ private struct TVMainTabView: View {
     @AppStorage("nuvio.keyboard.detectedLayout") private var detectedKeyboardMode: TVOSKeyboardLayoutMode = .linear
     @AppStorage(SettingsKey.profileName) private var settingsProfileName = "Nuvio User"
     @State private var collectionDestinations: [CollectionHomeDestination] = []
+    @State private var directCollectionDestinations: [CollectionHomeDestination] = []
+    @State private var genreCollectionDestinations: [CollectionHomeDestination] = []
     @StateObject private var collectionSidebarArtwork = CollectionSidebarArtwork()
     @StateObject private var profileTabAvatar = ProfileTabAvatarRenderer()
     @State private var showingReauthSheet = false
@@ -3193,6 +3195,8 @@ private struct TVMainTabView: View {
         collectionDestinations = CollectionHomeDestination.configured(
             profileID: activeProfile?.id ?? "none"
         )
+        directCollectionDestinations = collectionDestinations.filter { !$0.isGenreDestination }
+        genreCollectionDestinations = collectionDestinations.filter(\.isGenreDestination)
         if case .collection(let id) = selectedTab,
            !collectionDestinations.contains(where: { $0.id == id }) {
             selectedTab = .home
@@ -3284,6 +3288,7 @@ private struct TVMainTabView: View {
             isActive: selectedTab == .collection(destination.id),
             isFullScreenOverlayPresented: isFullScreenOverlayPresented,
             detailsDidDisappearGeneration: detailsDidDisappearGeneration,
+            collectionArtwork: collectionSidebarArtwork.images[destination.id],
             onNavigateToDetails: onNavigateToDetails,
             onPlayTitle: onPlayTitle,
             onLongPressCard: onLongPressCard
@@ -3341,9 +3346,9 @@ private struct TVMainTabView: View {
                 libraryTabContent
             }
             Tab(value: TVTab.settings) { settingsTabContent } label: { settingsTabLabel }
-            if !collectionDestinations.isEmpty {
+            if !directCollectionDestinations.isEmpty {
                 TabSection {
-                    ForEach(collectionDestinations) { destination in
+                    ForEach(directCollectionDestinations) { destination in
                         Tab(value: TVTab.collection(destination.id)) {
                             collectionTabContent(destination)
                         } label: {
@@ -3354,6 +3359,32 @@ private struct TVMainTabView: View {
                     Text(L10n.string("tmdb_collections_title", fallback: "Collections"))
                 }
             }
+            if !genreCollectionDestinations.isEmpty {
+                if #available(tvOS 27.0, *) {
+                    // tvOS supports the automatic policy, but not an explicit
+                    // collapsed default. Keep the system's native behavior;
+                    // header interaction still needs verification on Apple TV.
+                    genreTabSection.defaultSectionExpansion(.automatic)
+                } else {
+                    // Earlier systems retain a usable, expanded native section.
+                    genreTabSection
+                }
+            }
+        }
+    }
+
+    @available(tvOS 18.0, *)
+    private var genreTabSection: some TabContent<TVTab> {
+        TabSection {
+            ForEach(genreCollectionDestinations) { destination in
+                Tab(value: TVTab.collection(destination.id)) {
+                    collectionTabContent(destination)
+                } label: {
+                    collectionTabLabel(destination)
+                }
+            }
+        } header: {
+            Label(L10n.string("sidebar_genres_title", fallback: "Genres"), systemImage: "square.grid.2x2.fill")
         }
     }
 

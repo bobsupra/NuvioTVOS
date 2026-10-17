@@ -19,6 +19,41 @@ struct CollectionHomeDestination: Identifiable, Equatable {
     let collectionTitle: String
     let folder: TVCollectionFolderItem
 
+    /// Classify the folder's configured sources, never the genres attached to
+    /// its movie metadata or its editable/localized display name.
+    var isGenreDestination: Bool {
+        let style = folder.presentationStyle?.uppercased()
+        guard style != "STREAMING_SERVICE", style != "STUDIO_FRANCHISE",
+              !folder.sources.isEmpty else { return false }
+        var hasGenreFilter = false
+        for source in folder.sources {
+            if source.normalizedProvider == "addon" {
+                guard let genre = source.genre,
+                      !genre.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return false }
+                hasGenreFilter = true
+                continue
+            }
+            guard source.normalizedProvider == "tmdb",
+                  source.tmdbSourceType?.uppercased() == "DISCOVER",
+                  let filters = source.filters else { return false }
+            // A provider/company/network collection can also constrain genres;
+            // those destinations must remain direct service/studio entries.
+            let providerFilters = [filters.withWatchProviders, filters.withCompanies, filters.withNetworks]
+            guard providerFilters.allSatisfy({
+                $0?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty != false
+            }) else { return false }
+            if let genres = filters.withGenres,
+               !genres.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                hasGenreFilter = true
+            } else if !["315058", "9840"].contains(filters.withKeywords ?? "") {
+                // Horror and Romance use keyword-based TV discovery in the
+                // built-in template, alongside their movie genre filters.
+                return false
+            }
+        }
+        return hasGenreFilter
+    }
+
     /// Preserve source and presentation edits when the tab shell is rebuilt.
     /// This value is used as a SwiftUI identity, never a persisted setting.
     var revision: CollectionHomeRevision {
