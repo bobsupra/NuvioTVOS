@@ -1676,6 +1676,12 @@ final class NuvioSyncManager: ObservableObject {
                 lastCompletedPullAt[key] = Date()
             }
             pendingPushScopes.formUnion(.all)
+            // Collection visibility can be edited while isApplyingRemote blocks
+            // scheduling, or before the first Home snapshot/initial pull exists.
+            let configuredCollectionIds = Set(CollectionsStore.collections().map(\.id))
+            if TVHomeCatalogOrder.pendingCollectionVisibility().keys.contains(where: { configuredCollectionIds.contains($0) }) {
+                scheduleHomeCatalogPush()
+            }
             await flushPendingPushesNow()
         } catch is CancellationError {
             guard generation == pullGeneration else { return }
@@ -3224,10 +3230,10 @@ final class NuvioAPIClient {
         let disabledKeys = catalogItems
             .filter { !$0.enabled }
             .map { "\($0.addonId)_\($0.type)_\($0.catalogId)" }
-        let disabledCollectionIds = collectionItems
+        var disabledCollectionIds = Set(collectionItems
             .filter { !$0.enabled }
             .map(\.collectionId)
-            .filter { !$0.isEmpty }
+            .filter { !$0.isEmpty })
 
         var customTitles: [String: String] = [:]
         for item in catalogItems where !item.customTitle.isEmpty {
@@ -3240,6 +3246,11 @@ final class NuvioAPIClient {
         }
 
         let defaults = ProfileSettings.store(for: localProfileId)
+        // Do not let a missing/stale remote item undo a user's local choice.
+        // Keep it pending until a later pull explicitly confirms that value.
+        for (id, enabled) in TVHomeCatalogOrder.pendingCollectionVisibility(in: defaults) {
+            if enabled { disabledCollectionIds.remove(id) } else { disabledCollectionIds.insert(id) }
+        }
         let currentOrderData = HomeCatalogPayloadStore.data(
             forKey: SettingsKey.homeCatalogSyncedOrder,
             in: defaults,
@@ -3266,7 +3277,7 @@ final class NuvioAPIClient {
         encoder.outputFormatting = [.sortedKeys]
         let newOrderData = try? encoder.encode(orderKeys)
         let newDisabledData = try? encoder.encode(disabledKeys)
-        let newDisabledColData = try? encoder.encode(disabledCollectionIds)
+        let newDisabledColData = try? encoder.encode(disabledCollectionIds.sorted())
         let newCustomTitlesData = try? encoder.encode(customTitles)
         let newShowType = payload.showCatalogType
         guard let newOrderData, let newDisabledData, let newDisabledColData, let newCustomTitlesData else {
@@ -3279,22 +3290,25 @@ final class NuvioAPIClient {
             || (currentCustomTitlesData != newCustomTitlesData)
             || (currentShowType ?? true) != newShowType
 
-        guard didChange else { return false }
-
-        let didPersist = HomeCatalogPayloadStore.writeBatch(
-            [
-                SettingsKey.homeCatalogSyncedOrder: newOrderData,
-                SettingsKey.homeCatalogDisabled: newDisabledData,
-                SettingsKey.homeCollectionDisabled: newDisabledColData,
-                SettingsKey.homeCatalogCustomTitles: newCustomTitlesData
-            ],
-            in: defaults,
-            profileID: localProfileId
+        if didChange {
+            let didPersist = HomeCatalogPayloadStore.writeBatch(
+                [
+                    SettingsKey.homeCatalogSyncedOrder: newOrderData,
+                    SettingsKey.homeCatalogDisabled: newDisabledData,
+                    SettingsKey.homeCollectionDisabled: newDisabledColData,
+                    SettingsKey.homeCatalogCustomTitles: newCustomTitlesData
+                ],
+                in: defaults,
+                profileID: localProfileId
+            )
+            guard didPersist else { return false }
+            defaults.set(newShowType, forKey: SettingsKey.homeCatalogShowType)
+        }
+        TVHomeCatalogOrder.acknowledgeCollectionVisibility(
+            collectionItems.map { (id: $0.collectionId, enabled: $0.enabled) },
+            in: defaults
         )
-        guard didPersist else { return false }
-
-        defaults.set(newShowType, forKey: SettingsKey.homeCatalogShowType)
-        return true
+        return didChange
     }
 
     /// Replaces the profile's collections blob (`sync_push_collections`).

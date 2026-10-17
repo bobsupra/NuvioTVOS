@@ -1847,7 +1847,16 @@ final class HomeLayoutSettingsTests: XCTestCase {
 
         XCTAssertTrue(TVHomeCatalogOrder.explicitHomeCatalogKeys().isEmpty)
         XCTAssertFalse(TVHomeCatalogOrder.isRowEnabled(row))
-        XCTAssertTrue(TVHomeCatalogOrder.syncItems().isEmpty)
+        // Folder-backed catalogs remain implicit, but configured collections
+        // must sync their own visibility even before Home records their rows.
+        let implicitItems = TVHomeCatalogOrder.syncItems()
+        XCTAssertFalse(implicitItems.contains { ($0["is_collection"] as? Bool) == false })
+        let collectionItem = try XCTUnwrap(implicitItems.first {
+            ($0["is_collection"] as? Bool) == true
+                && ($0["collection_id"] as? String) == "folder-parent"
+        })
+        XCTAssertEqual(implicitItems.count, 1)
+        XCTAssertEqual(collectionItem["enabled"] as? Bool, true)
 
         let accountOrder = try JSONEncoder().encode([key, unrelatedAccountKey])
         XCTAssertTrue(HomeCatalogPayloadStore.write(accountOrder, forKey: SettingsKey.homeCatalogSyncedOrder))
@@ -1878,6 +1887,56 @@ final class HomeLayoutSettingsTests: XCTestCase {
 
         TVHomeCatalogOrder.clearOrder()
         XCTAssertTrue(TVHomeCatalogOrder.explicitHomeCatalogKeys().isEmpty)
+    }
+
+    func testHiddenCollectionSyncsWithoutHomeSnapshotAndKeepsPendingLocalChoice() throws {
+        let profile = activateHomeVisibilityProfile()
+        defer { clearHomeVisibilityProfile(profile) }
+
+        try applyFolderSource(
+            parentID: "hidden-parent",
+            addonIdentifier: "example.addon",
+            contentType: "movie",
+            catalogID: "popular"
+        )
+        TVHomeCatalogOrder.setCollectionEnabled("hidden-parent", isEnabled: false)
+        XCTAssertTrue(TVHomeCatalogOrder.snapshotRows().isEmpty)
+
+        let items = TVHomeCatalogOrder.syncItems()
+        let item = try XCTUnwrap(items.first {
+            ($0["is_collection"] as? Bool) == true
+                && ($0["collection_id"] as? String) == "hidden-parent"
+        })
+        XCTAssertEqual(items.count, 1)
+        XCTAssertEqual(item["enabled"] as? Bool, false)
+
+        // A stale remote enabled value must not override the explicit choice.
+        XCTAssertTrue(HomeCatalogPayloadStore.write(
+            try JSONEncoder().encode([String]()),
+            forKey: SettingsKey.homeCollectionDisabled
+        ))
+        TVHomeCatalogOrder.acknowledgeCollectionVisibility([], in: profile.suite)
+        TVHomeCatalogOrder.acknowledgeCollectionVisibility(
+            [(id: "hidden-parent", enabled: true)], in: profile.suite
+        )
+        XCTAssertEqual(TVHomeCatalogOrder.pendingCollectionVisibility()["hidden-parent"], false)
+        XCTAssertTrue(TVHomeCatalogOrder.disabledCollectionIds().contains("hidden-parent"))
+
+        // A matching item only acknowledges the edit when every duplicate agrees.
+        TVHomeCatalogOrder.acknowledgeCollectionVisibility(
+            [(id: "hidden-parent", enabled: false), (id: "hidden-parent", enabled: true)],
+            in: profile.suite
+        )
+        XCTAssertEqual(TVHomeCatalogOrder.pendingCollectionVisibility()["hidden-parent"], false)
+        XCTAssertTrue(HomeCatalogPayloadStore.write(
+            try JSONEncoder().encode(["hidden-parent"]),
+            forKey: SettingsKey.homeCollectionDisabled
+        ))
+        TVHomeCatalogOrder.acknowledgeCollectionVisibility(
+            [(id: "hidden-parent", enabled: false)], in: profile.suite
+        )
+        XCTAssertNil(TVHomeCatalogOrder.pendingCollectionVisibility()["hidden-parent"])
+        XCTAssertTrue(TVHomeCatalogOrder.disabledCollectionIds().contains("hidden-parent"))
     }
 
     func testManifestSnapshotMetadataRoundTripsAndLegacyRowsRemainReadable() throws {

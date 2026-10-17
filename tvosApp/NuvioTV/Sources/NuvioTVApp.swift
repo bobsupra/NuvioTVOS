@@ -8267,11 +8267,54 @@ enum TVHomeCatalogOrder {
         )
     }
 
-    /// Collection ids the user has hidden from Home on another device.
+    private static let pendingCollectionVisibilityKey = "nuvio.tv.homeCollectionVisibility.pending"
+
+    /// Local choices remain authoritative until an explicit remote item confirms
+    /// them. This small profile-scoped journal also survives a failed push/restart.
+    static func pendingCollectionVisibility(in settings: UserDefaults = ProfileSettings.current) -> [String: Bool] {
+        guard let data = settings.data(forKey: pendingCollectionVisibilityKey),
+              let values = try? JSONDecoder().decode([String: Bool].self, from: data) else { return [:] }
+        return values
+    }
+
+    private static func savePendingCollectionVisibility(_ values: [String: Bool], in settings: UserDefaults) {
+        if values.isEmpty {
+            settings.removeObject(forKey: pendingCollectionVisibilityKey)
+        } else if let data = try? JSONEncoder().encode(values) {
+            settings.set(data, forKey: pendingCollectionVisibilityKey)
+        }
+    }
+
+    private static func recordCollectionVisibility(_ id: String, isEnabled: Bool) {
+        let settings = ProfileSettings.current
+        var pending = pendingCollectionVisibility(in: settings)
+        pending[id] = isEnabled
+        savePendingCollectionVisibility(pending, in: settings)
+    }
+
+    /// A missing remote item is not an acknowledgement. Conflicting duplicate
+    /// items are also left pending rather than discarding the user's choice.
+    static func acknowledgeCollectionVisibility(_ remote: [(id: String, enabled: Bool)], in settings: UserDefaults) {
+        var pending = pendingCollectionVisibility(in: settings)
+        let original = pending
+        for (id, enabled) in original {
+            let matches = remote.filter { $0.id == id }
+            if !matches.isEmpty, matches.allSatisfy({ $0.enabled == enabled }) {
+                pending.removeValue(forKey: id)
+            }
+        }
+        if pending != original { savePendingCollectionVisibility(pending, in: settings) }
+    }
+
+    /// Remote visibility plus local choices not yet acknowledged by the account.
     static func disabledCollectionIds() -> Set<String> {
-        guard let data = HomeCatalogPayloadStore.data(forKey: SettingsKey.homeCollectionDisabled),
-              let keys = try? JSONDecoder().decode([String].self, from: data) else { return [] }
-        return Set(keys)
+        let data = HomeCatalogPayloadStore.data(forKey: SettingsKey.homeCollectionDisabled)
+        let keys = data.flatMap { try? JSONDecoder().decode([String].self, from: $0) } ?? []
+        var disabled = Set(keys)
+        for (id, enabled) in pendingCollectionVisibility() {
+            if enabled { disabled.remove(id) } else { disabled.insert(id) }
+        }
+        return disabled
     }
 
     /// Account catalog keys in the account's Home order → position, used by the
@@ -8638,13 +8681,14 @@ enum TVHomeCatalogOrder {
     /// media type, catalog id, enabled state, and saved row order.
     static func syncItems() -> [[String: Any]] {
         var items: [[String: Any]] = []
+        var seenCollectionIds = Set<String>()
         let visibility = homeVisibilityContext()
         for row in snapshotRows() {
             guard let settingsKey = row.settingsKey else { continue }
 
             if settingsKey.hasPrefix(TVHomeSection.collectionIdPrefix) {
                 let collectionId = String(settingsKey.dropFirst(TVHomeSection.collectionIdPrefix.count))
-                guard !collectionId.isEmpty else { continue }
+                guard !collectionId.isEmpty, seenCollectionIds.insert(collectionId).inserted else { continue }
                 let customTitle = customTitle(forCatalogKey: settingsKey) ?? ""
                 items.append([
                     "addon_id": "",
@@ -8688,6 +8732,25 @@ enum TVHomeCatalogOrder {
                 "is_collection": false,
                 "collection_id": ""
             ])
+        }
+        // Hidden/new collections may never have appeared in a rendered Home
+        // snapshot. Still send their visibility, otherwise the remote merge
+        // preserves an old enabled item and the next pull turns them back on.
+        if CollectionsStore.activeProfileId == ProfileSettings.activeProfileID {
+            let disabled = disabledCollectionIds()
+            let deleted = deletedCatalogKeys()
+            for collection in CollectionsStore.collections() {
+                guard !collection.id.isEmpty, seenCollectionIds.insert(collection.id).inserted else { continue }
+                let key = TVHomeSection.collectionIdPrefix + collection.id
+                items.append([
+                    "addon_id": "", "type": "", "catalog_id": "",
+                    "enabled": !disabled.contains(collection.id) && !deleted.contains(key),
+                    "order": items.count,
+                    "custom_title": customTitle(forCatalogKey: key) ?? "",
+                    "is_collection": true,
+                    "collection_id": collection.id
+                ])
+            }
         }
         return items
     }
@@ -8797,6 +8860,7 @@ enum TVHomeCatalogOrder {
     /// Also used before Home has recorded a snapshot for a newly added collection.
     static func setCollectionEnabled(_ id: String, isEnabled: Bool) {
         guard !id.isEmpty else { return }
+        recordCollectionVisibility(id, isEnabled: isEnabled)
         var ids = disabledCollectionIds()
         if isEnabled { ids.remove(id) } else { ids.insert(id) }
         if isEnabled {
@@ -8829,6 +8893,7 @@ enum TVHomeCatalogOrder {
         if let key = row.settingsKey {
             if key.hasPrefix(TVHomeSection.collectionIdPrefix) {
                 let id = String(key.dropFirst(TVHomeSection.collectionIdPrefix.count))
+                recordCollectionVisibility(id, isEnabled: false)
                 var ids = disabledCollectionIds()
                 ids.insert(id)
                 persist(ids, forKey: SettingsKey.homeCollectionDisabled)
