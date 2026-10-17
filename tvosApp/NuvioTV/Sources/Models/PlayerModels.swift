@@ -497,6 +497,7 @@ struct ExternalPlaybackSession: Codable, Equatable {
     let episode: Int?
     let duration: Double?
     let profileID: String?
+    var collectionContext: CollectionPlaybackContext? = nil
 }
 
 enum ExternalPlaybackSessionStore {
@@ -513,7 +514,8 @@ enum ExternalPlaybackSessionStore {
             season: session.season,
             episode: session.episode,
             duration: session.duration,
-            profileID: session.profileID
+            profileID: session.profileID,
+            collectionContext: session.collectionContext
         )
         guard let data = try? JSONEncoder().encode(compactSession) else { return }
         defaults.set(data, forKey: key)

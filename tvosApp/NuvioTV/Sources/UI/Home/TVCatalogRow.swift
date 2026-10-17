@@ -350,6 +350,8 @@ struct TVCatalogRow: View {
     let horizontalEdgeInset: CGFloat
     let items: [NuvioMeta]
     var progressByItemId: [String: ContinueWatchingItem] = [:]
+    /// Supplied only by the main Home's Continue Watching row.
+    var collectionOriginsByItemId: [String: CollectionOriginPresentation] = [:]
     var watchedTitleKeys: Set<String> = []
     var initialScrollIndex: Int = 0
     var onScrollIndexChange: (Int) -> Void = { _ in }
@@ -601,6 +603,8 @@ struct TVCatalogRow: View {
                     continueEpisodeArtworkURL: progressItem?.episodeArtworkURL,
                     continueIsUpNext: progressItem?.isUpNextEntry == true,
                     continueUpNextBadgeText: progressItem?.upNextBadgeText,
+                    collectionOrigin: id == TVHomeSection.continueWatchingId && progressItem?.isUpNextEntry == false
+                        ? collectionOriginsByItemId[item.id] : nil,
                     showsWatchedBadge: id != TVHomeSection.continueWatchingId && id != TVHomeSection.upcomingId,
                     shouldRequestInitialFocus: shouldRequestInitialFocus,
                     onInitialFocusRequested: shouldRequestInitialFocus ? onInitialFocusRequested : nil,
@@ -722,7 +726,8 @@ extension TVCatalogRow: Equatable {
             return false
         }
 
-        guard lhs.progressByItemId == rhs.progressByItemId
+        guard lhs.progressByItemId == rhs.progressByItemId,
+              lhs.collectionOriginsByItemId == rhs.collectionOriginsByItemId
         else {
             return false
         }

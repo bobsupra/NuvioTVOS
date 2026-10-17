@@ -185,6 +185,7 @@ struct PosterCard: View {
     /// no real playback position yet.
     var continueIsUpNext: Bool = false
     var continueUpNextBadgeText: String? = nil
+    var collectionOrigin: CollectionOriginPresentation? = nil
     var showsWatchedBadge: Bool = true
     var shouldRequestInitialFocus: Bool = false
     var onInitialFocusRequested: (() -> Void)? = nil
@@ -421,6 +422,12 @@ struct PosterCard: View {
             }
             .overlay(alignment: effectiveLandscape ? .topTrailing : .top) {
                 continueBadge
+            }
+            .overlay(alignment: .topTrailing) {
+                if let collectionOrigin, !continueIsUpNext {
+                    CollectionOriginBadge(origin: collectionOrigin)
+                        .padding(10)
+                }
             }
             .overlay(alignment: .topTrailing) {
                 if showsWatchedBadge {

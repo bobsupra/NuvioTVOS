@@ -3259,6 +3259,7 @@ enum ContinueWatchingStore {
         invalidateCache()
         WatchProgressLedger.eraseProfile(profileId)
         ContinueWatchingDismissStore.eraseProfile(profileId)
+        CollectionPlaybackOriginStore.eraseProfile(profileId)
         LargePayloadStore.remove(key: episodeResumeStorageKey(for: profileId), directory: episodeResumeDirectoryName)
         for key in [storageKey(for: profileId), episodeResumeStorageKey(for: profileId)] {
             UserDefaults.standard.removeObject(forKey: key)
@@ -3275,6 +3276,7 @@ enum ContinueWatchingStore {
         invalidateCache()
         WatchProgressLedger.eraseAllProfiles()
         ContinueWatchingDismissStore.eraseAllProfiles()
+        CollectionPlaybackOriginStore.eraseAllProfiles()
         LargePayloadStore.removeDirectory(episodeResumeDirectoryName)
         let defaults = UserDefaults.standard
         defaults.dictionaryRepresentation().keys

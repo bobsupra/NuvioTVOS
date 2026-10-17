@@ -356,6 +356,8 @@ struct ContentView: View {
     @State private var playbackStartupBenchmarkToken: UUID?
     @State private var continueWatchingStartupBenchmarkToken: UUID?
     @State private var playbackDidStart = false
+    @State private var playbackCollectionContext: CollectionPlaybackContext?
+    @State private var detailsCollectionContext: CollectionPlaybackContext?
     @State private var reopenStreamPickerOnDetails = false
     @State private var reopenStreamPickerEpisode: NuvioVideo?
     /// Title whose liquid-glass quick-actions menu is showing (long-press on a
@@ -835,12 +837,14 @@ struct ContentView: View {
         id: String,
         type: String,
         returnDestination: DetailsReturnDestination = .main,
-        startPlayback: Bool = false
+        startPlayback: Bool = false,
+        collectionContext: CollectionPlaybackContext? = nil
     ) {
         TVHomeDebugTrace.log(
             "details.open.root id=\(id) type=\(type) returnDest=\(returnDestination)"
         )
         detailsBackStack.removeAll()
+        detailsCollectionContext = collectionContext
         detailsReturnDestination = returnDestination
         if startPlayback {
             nextDetailsPlaybackRequestID &+= 1
@@ -851,6 +855,25 @@ struct ContentView: View {
             pendingDetailsPlaybackRequestID = nil
         }
         activeScreen = .details(id: id, type: type)
+    }
+
+    private func collectionContext(
+        id: String, type: String, folder: TVCollectionFolderItem? = nil,
+        resuming: Bool = false
+    ) -> CollectionPlaybackContext {
+        CollectionPlaybackContext(
+            profileID: profileViewModel.activeProfile?.id ?? "none",
+            contentID: id, type: type,
+            origin: folder.flatMap { CollectionOriginPresentation.service(folder: $0)?.reference },
+            preservesStoredOrigin: resuming
+        )
+    }
+
+    private var selectedCollectionFolder: TVCollectionFolderItem? {
+        guard case .collection(let id) = selectedTab,
+              id.profileID == profileViewModel.activeProfile?.id else { return nil }
+        return CollectionHomeDestination.configured(profileID: id.profileID)
+            .first { $0.id == id }?.folder
     }
 
     /// Handles Top Shelf, `nuvio://` / `nuvio-tv://` title open, and
@@ -943,6 +966,13 @@ struct ContentView: View {
 
         let isEpisode = session.meta.isSeries && session.season != nil && session.episode != nil
         guard !session.meta.isSeries || isEpisode else { return }
+
+        if progress > 0, let context = session.collectionContext {
+            CollectionPlaybackOriginStore.recordStarted(
+                meta: session.meta, context: context,
+                activeProfileID: profileID
+            )
+        }
 
         if RemoteTrackingState.isProgressSourceAuthenticated {
             // Keep the provider-backed path aligned with built-in playback:
@@ -1267,6 +1297,7 @@ struct ContentView: View {
         }
 
         let context = Self.episodeContext(for: item)
+        let provenance = collectionContext(id: item.meta.id, type: item.meta.type, resuming: true)
         playbackEpisodes = context.episodes
         playbackCurrentEpisode = context.current
 
@@ -1287,7 +1318,8 @@ struct ContentView: View {
                 subtitle: item.episodeSubtitle ?? "",
                 externalSubtitles: [],
                 resumeFrom: startFromBeginning ? nil : Self.resumePosition(for: item),
-                httpHeaders: httpHeaders
+                httpHeaders: httpHeaders,
+                collectionContext: provenance
             )
             return
         }
@@ -1352,7 +1384,8 @@ struct ContentView: View {
                     videoSize: prepared.videoSize,
                     videoHash: prepared.videoHash,
                     startupBenchmarkToken: startupToken,
-                    sourceID: prepared.sourceID
+                    sourceID: prepared.sourceID,
+                    collectionContext: provenance
                 )
                 if continueWatchingStartupBenchmarkToken == startupToken {
                     continueWatchingStartupBenchmarkToken = nil
@@ -1370,7 +1403,7 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     isResolvingContinueWatchingStream = false
                     resolvingContinueWatchingItem = nil
-                    openDetailsRoot(id: item.meta.id, type: item.meta.type)
+                    openDetailsRoot(id: item.meta.id, type: item.meta.type, collectionContext: provenance)
                 }
             }
         }
@@ -1386,7 +1419,10 @@ struct ContentView: View {
             continueWatchingMenuItem = nil
             reopenStreamPickerOnDetails = true
             reopenStreamPickerEpisode = episode
-            openDetailsRoot(id: item.meta.id, type: item.meta.type)
+            openDetailsRoot(
+                id: item.meta.id, type: item.meta.type,
+                collectionContext: collectionContext(id: item.meta.id, type: item.meta.type, resuming: true)
+            )
         }
     }
 
@@ -1466,9 +1502,11 @@ struct ContentView: View {
         videoSize: Int64? = nil,
         videoHash: String? = nil,
         startupBenchmarkToken: UUID? = nil,
-        sourceID: String? = nil
+        sourceID: String? = nil,
+        collectionContext: CollectionPlaybackContext? = nil
     ) {
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
+        let provenance = collectionContext ?? self.collectionContext(id: meta.id, type: meta.type)
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
         let defaultPlayer = ExternalPlayer.from(store.string(forKey: SettingsKey.externalPlayer))
         let player = customPlayer ?? defaultPlayer
@@ -1509,7 +1547,8 @@ struct ContentView: View {
                 season: meta.isSeries ? numbers?.season : nil,
                 episode: meta.isSeries ? numbers?.episode : nil,
                 duration: Self.runtimeSeconds(meta.runtime),
-                profileID: profileID
+                profileID: profileID,
+                collectionContext: provenance
             )
             successCallback = URL(string: "nuvio-tv://external-playback/\(id)")
             errorCallback = URL(string: "nuvio-tv://external-playback/error/\(id)")
@@ -1562,7 +1601,8 @@ struct ContentView: View {
             videoSize: videoSize,
             videoHash: videoHash,
             startupBenchmarkToken: startupBenchmarkToken,
-            sourceID: sourceID
+            sourceID: sourceID,
+            collectionContext: provenance
         )
     }
 
@@ -1579,13 +1619,20 @@ struct ContentView: View {
         videoSize: Int64? = nil,
         videoHash: String? = nil,
         startupBenchmarkToken: UUID? = nil,
-        sourceID: String? = nil
+        sourceID: String? = nil,
+        collectionContext: CollectionPlaybackContext? = nil
     ) {
         if PictureInPictureManager.shared.isPictureInPictureActive,
            PictureInPictureManager.shared.activeContext?.url != url {
             PictureInPictureManager.shared.invalidateSession()
         }
         playbackOrigin = origin
+        playbackCollectionContext = collectionContext
+        if origin == .main {
+            // Direct Continue Watching playback can return to Details for a
+            // series, without calling openDetailsRoot first.
+            detailsCollectionContext = collectionContext
+        }
         playbackFilename = filename
         playbackSourceID = sourceID
         playbackVideoSize = videoSize
@@ -1609,6 +1656,9 @@ struct ContentView: View {
         PictureInPictureManager.shared.onRestoreUI = { [self] context, completion in
             withAnimation(.easeInOut(duration: 0.24)) {
                 self.playbackOrigin = context.playbackOrigin
+                self.playbackCollectionContext = self.collectionContext(
+                    id: context.meta.id, type: context.meta.type, resuming: true
+                )
                 self.playbackFilename = context.filename
                 self.playbackSourceID = context.sourceID
                 self.playbackVideoSize = context.videoSize
@@ -1720,7 +1770,8 @@ struct ContentView: View {
                                 returnDestination: .collectionFolder(
                                     folder,
                                     collectionTitle: collectionTitle
-                                )
+                                ),
+                                collectionContext: self.collectionContext(id: meta.id, type: meta.type, folder: folder)
                             )
                         }
                     },
@@ -1929,12 +1980,18 @@ struct ContentView: View {
                 // Home defers its focus-restoration render until Details closes,
                 // so every tab can now use the same presentation transaction.
                 withAnimation(.easeInOut(duration: 0.28)) {
-                    openDetailsRoot(id: contentId, type: contentType)
+                    openDetailsRoot(
+                        id: contentId, type: contentType,
+                        collectionContext: collectionContext(id: contentId, type: contentType, folder: selectedCollectionFolder)
+                    )
                 }
             },
             onPlayTitle: { contentId, contentType in
                 withAnimation(.easeInOut(duration: 0.28)) {
-                    openDetailsRoot(id: contentId, type: contentType, startPlayback: true)
+                    openDetailsRoot(
+                        id: contentId, type: contentType, startPlayback: true,
+                        collectionContext: collectionContext(id: contentId, type: contentType, folder: selectedCollectionFolder)
+                    )
                 }
             },
             onRequestAccountRefresh: { force in
@@ -1964,6 +2021,14 @@ struct ContentView: View {
             },
             onResumePlayback: { item in
                 resumePlayback(item)
+            },
+            onNavigateToContinueWatchingDetails: { id, type in
+                withAnimation(.easeInOut(duration: 0.28)) {
+                    openDetailsRoot(
+                        id: id, type: type,
+                        collectionContext: collectionContext(id: id, type: type, resuming: true)
+                    )
+                }
             },
             onPlayContinueWatchingManually: { item in
                 playContinueWatchingManually(item)
@@ -2006,7 +2071,8 @@ struct ContentView: View {
     }
 
     private func detailsScreen(contentId: String, contentType: String) -> some View {
-        DetailsScreen(
+        let provenance = detailsCollectionContext
+        return DetailsScreen(
             id: contentId,
             type: contentType,
             repository: CinemetaCatalogRepository(),
@@ -2042,7 +2108,8 @@ struct ContentView: View {
                         videoSize: videoSize,
                         videoHash: videoHash,
                         startupBenchmarkToken: startupToken,
-                        sourceID: sourceID
+                        sourceID: sourceID,
+                        collectionContext: provenance
                     )
                 } else {
                     PlaybackStartupTiming.cancel(token: startupToken)
@@ -2555,6 +2622,7 @@ struct ContentView: View {
         let store = ProfileSettings.store(for: profileViewModel.activeProfile?.id)
         let autoPlayNext = store.object(forKey: SettingsKey.autoPlayNext) as? Bool ?? true
         let autoPlayNextCountdown = store.object(forKey: SettingsKey.autoPlayNextCountdown) as? Int ?? 10
+        let provenance = playbackCollectionContext
         PlayerView(
             url: url,
             meta: meta,
@@ -2632,7 +2700,7 @@ struct ContentView: View {
                 withAnimation(.easeInOut(duration: 0.28)) {
                     reopenStreamPickerOnDetails = true
                     reopenStreamPickerEpisode = playbackCurrentEpisode
-                    openDetailsRoot(id: meta.id, type: meta.type)
+                    openDetailsRoot(id: meta.id, type: meta.type, collectionContext: provenance)
                 }
             },
             onFinished: isTrailer ? {
@@ -2642,6 +2710,13 @@ struct ContentView: View {
             } : nil,
             onPlaybackStarted: {
                 playbackDidStart = true
+                if !isTrailer, let provenance,
+                   ProfileSettings.activeProfileID == provenance.profileID {
+                    CollectionPlaybackOriginStore.recordStarted(
+                        meta: meta, context: provenance,
+                        activeProfileID: profileViewModel.activeProfile?.id
+                    )
+                }
             },
             onPlayRecommendation: { recMeta, playManually in
                 dismissPlayer(meta: meta, subtitle: subtitle)
@@ -3097,6 +3172,7 @@ private struct TVMainTabView: View {
     let onRequestAccountRefresh: (Bool) -> Void
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
+    var onNavigateToContinueWatchingDetails: ((String, String) -> Void)? = nil
     var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
     var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
     var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
@@ -3233,6 +3309,7 @@ private struct TVMainTabView: View {
             onPlayTitle: onPlayTitle,
             onOpenCollectionFolder: onOpenCollectionFolder,
             onResumePlayback: onResumePlayback,
+            onNavigateToContinueWatchingDetails: onNavigateToContinueWatchingDetails,
             onPlayContinueWatchingManually: onPlayContinueWatchingManually,
             onStartContinueWatchingFromBeginning: onStartContinueWatchingFromBeginning,
             onRemoveFromContinueWatching: onRemoveFromContinueWatching,
@@ -3763,6 +3840,7 @@ struct TVHomeView: View {
     let onOpenCollectionFolder: (TVCollectionFolderItem, String) -> Void
     let onResumePlayback: (ContinueWatchingItem) -> Void
     var collectionHome: CollectionHomeModel? = nil
+    var onNavigateToContinueWatchingDetails: ((String, String) -> Void)? = nil
     var onPlayContinueWatchingManually: ((ContinueWatchingItem) -> Void)? = nil
     var onStartContinueWatchingFromBeginning: ((ContinueWatchingItem) -> Void)? = nil
     var onRemoveFromContinueWatching: ((ContinueWatchingItem) -> Void)? = nil
@@ -3836,6 +3914,7 @@ struct TVHomeView: View {
     @State private var continueWatchingMetas: [NuvioMeta] = []
     @State private var upcomingMetas: [NuvioMeta] = []
     @State private var continueWatchingByMetaId: [String: ContinueWatchingItem] = [:]
+    @State private var continueWatchingOrigins: [String: CollectionOriginPresentation] = [:]
     @State private var continueWatchingIndexByMetaId: [String: Int] = [:]
     @State private var continueWatchingIDs: [String] = []
     @State private var displayedProgressSource: TraktWatchProgressSource?
@@ -4298,6 +4377,12 @@ struct TVHomeView: View {
             if remaining.count != all.count {
                 setContinueWatching(remaining)
             }
+        }
+        .onReceive(NotificationCenter.default.publisher(for: CollectionPlaybackOriginStore.changedNotification)
+            .merge(with: NotificationCenter.default.publisher(for: CollectionsStore.changedNotification))
+            .receive(on: RunLoop.main)) { _ in
+            guard collectionHome == nil else { return }
+            refreshContinueWatchingOrigins(rawContinueWatchingItems)
         }
         .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
             guard isActive && !isFullScreenOverlayPresented else { return }
@@ -4846,6 +4931,8 @@ struct TVHomeView: View {
                                 horizontalEdgeInset: heroBleed,
                                 items: section.items,
                                 progressByItemId: continueWatchingByMetaId,
+                                collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
+                                    ? continueWatchingOrigins : [:],
                                 watchedTitleKeys: watchedTitleKeys,
                                 initialScrollIndex: rowScrollStore.index(for: section.id),
                                 onScrollIndexChange: { rowScrollStore.setIndex($0, for: section.id) },
@@ -4898,7 +4985,8 @@ struct TVHomeView: View {
                                     navigateToDetailsFromHome(
                                         id: meta.id,
                                         type: meta.type,
-                                        restoreCardID: cardKey
+                                        restoreCardID: cardKey,
+                                        preserveCollectionOrigin: section.id == TVHomeSection.continueWatchingId
                                     )
                                 },
                                 onPlayContinueWatchingManually: { item in
@@ -5876,6 +5964,8 @@ struct TVHomeView: View {
                 items: section.items,
                 progressByItemId: (section.id == TVHomeSection.continueWatchingId || section.id == TVHomeSection.upcomingId)
                     ? continueWatchingByMetaId : [:],
+                collectionOriginsByItemId: collectionHome == nil && section.id == TVHomeSection.continueWatchingId
+                    ? continueWatchingOrigins : [:],
                 watchedTitleKeys: watchedTitleKeys,
                 initialScrollIndex: rowScrollStore.index(for: section.id),
                 onScrollIndexChange: { newIndex in
@@ -5984,7 +6074,8 @@ struct TVHomeView: View {
                     navigateToDetailsFromHome(
                         id: meta.id,
                         type: meta.type,
-                        restoreCardID: cardKey
+                        restoreCardID: cardKey,
+                        preserveCollectionOrigin: section.id == TVHomeSection.continueWatchingId
                     )
                 },
                 onPlayContinueWatchingManually: { item in
@@ -6215,10 +6306,15 @@ struct TVHomeView: View {
     private func navigateToDetailsFromHome(
         id: String,
         type: String,
-        restoreCardID: String? = nil
+        restoreCardID: String? = nil,
+        preserveCollectionOrigin: Bool = false
     ) {
         prepareForOverlayPresentation(restoreCardID: restoreCardID)
-        onNavigateToDetails(id, type)
+        if preserveCollectionOrigin, let onNavigateToContinueWatchingDetails {
+            onNavigateToContinueWatchingDetails(id, type)
+        } else {
+            onNavigateToDetails(id, type)
+        }
     }
 
     private func playTitleFromHome(id: String, type: String) {
@@ -7513,12 +7609,25 @@ struct TVHomeView: View {
         }
     }
 
-    /// Publishes Continue Watching and its derived lookup data together. The
-    /// row is updated from notifications and source refreshes, while Home can
-    /// re-evaluate its body dozens of times during focus movement; keeping the
-    /// metadata array and progress index out of those body computations is the
-    /// important part of this helper.
+    /// Prepare annotations outside focus-driven body evaluation. Resolve the
+    /// current collection definition so deletes and artwork edits are honored.
+    private func refreshContinueWatchingOrigins(_ items: [ContinueWatchingItem]) {
+        guard collectionHome == nil,
+              ProfileSettings.activeProfileID == contentIdentity.profileId else {
+            continueWatchingOrigins = [:]
+            return
+        }
+        let services = CollectionOriginPresentation.configured(profileID: contentIdentity.profileId)
+        let origins = CollectionPlaybackOriginStore.presentations(
+            for: items.filter { !$0.isUpNextEntry }.map(\.meta),
+            profileID: contentIdentity.profileId, services: services
+        )
+        if origins != continueWatchingOrigins { continueWatchingOrigins = origins }
+    }
+
+    /// Publish Continue Watching and derived lookups together, outside body.
     private func setContinueWatching(_ rawItems: [ContinueWatchingItem]) {
+        refreshContinueWatchingOrigins(rawItems)
         if appliedContinueWatchingSort == continueWatchingSort,
            rawContinueWatchingItems.count == rawItems.count {
             let isIdentical = zip(rawContinueWatchingItems, rawItems).allSatisfy { $0.isContentEqual(to: $1) }
