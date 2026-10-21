@@ -333,6 +333,18 @@ struct ContentView: View {
         let destination: PartyDetailsDestination
     }
 
+    private struct PendingWatchPartySetup: Identifiable {
+        let id = UUID()
+        let media: WatchPartyMedia
+        let fromDetails: Bool
+        let screen: TVScreen
+    }
+
+    private struct PendingWatchPartyPermission {
+        let roomID: String
+        let hostOnly: Bool
+    }
+
     @Environment(\.scenePhase) private var scenePhase
     @State private var activeScreen: TVScreen = .login
     @State private var playbackPartyID: UUID?
@@ -342,6 +354,10 @@ struct ContentView: View {
     @State private var partyLaunchTask: Task<Void, Never>?
     @State private var partyLaunchID = UUID()
     @State private var partyDetailsOrigin: PartyDetailsOrigin?
+    @State private var pendingWatchPartySetup: PendingWatchPartySetup?
+    // A room accepted by the backend must not expose its invitation until the
+    // chosen host-only policy is confirmed by an authoritative room snapshot.
+    @State private var pendingWatchPartyPermission: PendingWatchPartyPermission?
     @State private var resolvedInitialScreen = false
     /// `nil` until tvOS has actually backgrounded the app, so the initial
     /// `.active` callback is never treated as a resume.
@@ -590,6 +606,33 @@ struct ContentView: View {
             }
         }
         .background(Color.black.ignoresSafeArea())
+        .sheet(item: $pendingWatchPartySetup, onDismiss: {
+            // The sidebar's choose-a-title flow is cancelled if Menu dismisses
+            // this sheet without confirming; do not auto-create a room.
+            if creatingParty && partyLaunchTask == nil { creatingParty = false; choosingPartySource = false }
+        }) { request in
+            WatchPartyRoomSetupSheet(
+                media: request.media,
+                onCreate: { hostOnly, shareSourceLater in
+                    pendingWatchPartySetup = nil
+                    guard activeScreen == request.screen, partyLaunchTask == nil else { return }
+                    if request.fromDetails {
+                        startWatchPartyFromDetails(
+                            media: request.media, hostOnly: hostOnly, shareSourceLater: shareSourceLater
+                        )
+                    } else {
+                        startWatchPartyRoom(
+                            media: request.media, hostOnly: hostOnly, shareSourceLater: shareSourceLater
+                        )
+                    }
+                },
+                onCancel: {
+                    pendingWatchPartySetup = nil
+                    if !request.fromDetails { creatingParty = false; choosingPartySource = false }
+                }
+            )
+            .id(request.id)
+        }
         // Safety net for the Menu button while an overlay is up. During the
         // overlay's insert animation focus is briefly in limbo (the tab view is
         // disabled, the overlay hasn't taken focus yet); a Menu press then finds
@@ -616,6 +659,8 @@ struct ContentView: View {
             partyLaunchID = UUID()
             partyLaunchTask?.cancel(); partyLaunchTask = nil
             creatingParty = false; choosingPartySource = false
+            pendingWatchPartySetup = nil
+            pendingWatchPartyPermission = nil
         }
         .onOpenURL(perform: handleDeepLink)
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
@@ -1711,7 +1756,8 @@ struct ContentView: View {
     /// generation; membership and uncertain outcomes stay in WatchPartyService.
     private func createWatchPartyFromDetails(meta: NuvioMeta, episode: NuvioVideo?) {
         guard WatchPartyConfiguration.isEnabled, case .details = activeScreen else { return }
-        guard let service = watchPartyOwner.service, partyLaunchTask == nil else { return }
+        guard let service = watchPartyOwner.service, partyLaunchTask == nil,
+              pendingWatchPartySetup == nil else { return }
         guard authManager.isAuthenticated, !authManager.sessionNeedsReauthentication,
               profileViewModel.activeProfile != nil else {
             selectedTab = .party
@@ -1729,31 +1775,52 @@ struct ContentView: View {
             activeScreen = .main
             return
         }
-        let media: WatchPartyMedia
         do {
-            media = try WatchPartyLaunchPolicy.mediaForDetails(meta, episode: episode)
+            let media = try WatchPartyLaunchPolicy.mediaForDetails(meta, episode: episode)
+            pendingWatchPartySetup = PendingWatchPartySetup(
+                media: media, fromDetails: true, screen: activeScreen
+            )
         } catch {
             watchPartyOwner.message = "Choose a valid movie or a specific episode to host a room."
-            return
         }
-        watchPartyOwner.message = nil
+    }
+
+    /// The dialog has been confirmed. Keep the room hidden from our invite UI
+    /// until the server acknowledges the chosen permissions. This is NOT atomic
+    /// with watch_party_create; backend support is needed for that guarantee.
+    private func startWatchPartyFromDetails(
+        media: WatchPartyMedia, hostOnly: Bool, shareSourceLater: Bool
+    ) {
+        guard WatchPartyConfiguration.isEnabled, case .details = activeScreen,
+              let service = watchPartyOwner.service, partyLaunchTask == nil,
+              service.session?.party == nil, !service.busy,
+              !service.membershipOutcomeUncertain else { return }
         let destination = PartyDetailsDestination(
             screen: activeScreen, tab: selectedTab, backStack: detailsBackStack,
             returnDestination: detailsReturnDestination, collectionContext: detailsCollectionContext
         )
         let detailsGeneration = detailsDidDisappearGeneration
         partyDetailsOrigin = nil
+        pendingWatchPartyPermission = nil
+        watchPartyOwner.message = nil
         let mark = UUID()
         partyLaunchID = mark
         partyLaunchTask = Task { @MainActor in
             defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            var roomWasCreated = false
             do {
+                try WatchPartyLaunchPolicy.validate(media)
                 try await service.create(media: media, playback: nil)
+                roomWasCreated = true
+                try await confirmWatchPartyHostOnly(hostOnly, service: service)
                 guard !Task.isCancelled, partyLaunchID == mark,
                       watchPartyOwner.service === service,
                       activeScreen == destination.screen,
                       detailsDidDisappearGeneration == detailsGeneration else { return }
                 rememberPartyDetailsOrigin(destination, media: media, service: service)
+                watchPartyOwner.message = shareSourceLater
+                    ? "Choose your own source, start playback, then explicitly approve Share my stream in the player. No link was sent."
+                    : nil
                 creatingParty = false
                 choosingPartySource = false
                 partyLaunchTask = nil
@@ -1761,14 +1828,50 @@ struct ContentView: View {
                 activeScreen = .main
             } catch {
                 guard !Task.isCancelled, partyLaunchID == mark,
-                      watchPartyOwner.service === service,
-                      activeScreen == destination.screen,
-                      detailsDidDisappearGeneration == detailsGeneration else { return }
+                      watchPartyOwner.service === service else { return }
                 rememberPartyDetailsOrigin(destination, media: media, service: service)
-                watchPartyOwner.message = "Watch Party could not create the room. Check the room status before retrying."
+                watchPartyOwner.message = roomWasCreated
+                    ? "Room created, but host-only playback could not be confirmed. Invitations are blocked. Retry the setting or end this room."
+                    : "Watch Party could not create the room. Check the room status before retrying."
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
+            }
+        }
+    }
+
+    /// The RPC is separate from create today. Do not clear the invitation gate
+    /// on an error, uncertain result or stale session; the lobby offers retry.
+    private func confirmWatchPartyHostOnly(
+        _ hostOnly: Bool, service: WatchPartyService
+    ) async throws {
+        guard let room = service.session, let party = room.party,
+              party.hostMemberID == room.memberID else { throw WatchPartySessionError.notReady }
+        pendingWatchPartyPermission = PendingWatchPartyPermission(roomID: party.id, hostOnly: hostOnly)
+        if party.hostOnly != hostOnly {
+            try await service.setHostOnly(enabled: hostOnly)
+        }
+        guard service.session === room, room.party?.id == party.id,
+              room.party?.hostOnly == hostOnly else { throw WatchPartySessionError.notReady }
+        pendingWatchPartyPermission = nil
+    }
+
+    private func retryWatchPartyHostOnly() {
+        guard let pending = pendingWatchPartyPermission,
+              let service = watchPartyOwner.service,
+              service.session?.party?.id == pending.roomID,
+              partyLaunchTask == nil else { return }
+        let mark = UUID()
+        partyLaunchID = mark
+        partyLaunchTask = Task { @MainActor in
+            defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            do {
+                try await confirmWatchPartyHostOnly(pending.hostOnly, service: service)
+                guard !Task.isCancelled, partyLaunchID == mark else { return }
+                watchPartyOwner.message = "Playback permissions confirmed. You can now invite friends."
+            } catch {
+                guard !Task.isCancelled, partyLaunchID == mark else { return }
+                watchPartyOwner.message = "Permissions still unconfirmed. Do not invite guests; retry or end the room."
             }
         }
     }
@@ -1889,21 +1992,40 @@ struct ContentView: View {
             creatingParty = false
             return
         }
-        guard creatingParty, partyLaunchTask == nil else { return }
-        guard let service = watchPartyOwner.service else {
+        guard creatingParty, partyLaunchTask == nil, pendingWatchPartySetup == nil else { return }
+        guard watchPartyOwner.service != nil else {
             creatingParty = false
             watchPartyOwner.message = "Watch Party is unavailable on this server."
             selectedTab = .party; activeScreen = .main
             return
         }
+        do {
+            try WatchPartyLaunchPolicy.validate(media)
+            pendingWatchPartySetup = PendingWatchPartySetup(
+                media: media, fromDetails: false, screen: activeScreen
+            )
+        } catch {
+            watchPartyOwner.message = "That title or episode isn't supported for a Watch Party."
+        }
+    }
 
+    private func startWatchPartyRoom(
+        media: WatchPartyMedia, hostOnly: Bool, shareSourceLater: Bool
+    ) {
+        guard WatchPartyConfiguration.isEnabled, creatingParty, partyLaunchTask == nil,
+              let service = watchPartyOwner.service, service.session?.party == nil,
+              !service.busy, !service.membershipOutcomeUncertain else { return }
+        pendingWatchPartyPermission = nil
         let mark = UUID()
         partyLaunchID = mark
         partyLaunchTask = Task { @MainActor in
             defer { if partyLaunchID == mark { partyLaunchTask = nil } }
+            var roomWasCreated = false
             do {
                 try WatchPartyLaunchPolicy.validate(media)
                 try await service.create(media: media)
+                roomWasCreated = true
+                try await confirmWatchPartyHostOnly(hostOnly, service: service)
                 try Task.checkCancellation()
                 guard partyLaunchID == mark, watchPartyOwner.service === service,
                       let roomMedia = service.session?.party?.media else {
@@ -1913,7 +2035,9 @@ struct ContentView: View {
 
                 creatingParty = false
                 choosingPartySource = false
-                watchPartyOwner.message = nil
+                watchPartyOwner.message = shareSourceLater
+                    ? "Choose your own source, start playback, then explicitly approve Share my stream in the player. No link was sent."
+                    : nil
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
@@ -1921,9 +2045,11 @@ struct ContentView: View {
                 guard partyLaunchID == mark, !Task.isCancelled else { return }
                 creatingParty = false
                 choosingPartySource = false
-                watchPartyOwner.message = error is WatchPartyLaunchError
-                    ? "That title or episode isn't supported for a Watch Party."
-                    : "Watch Party could not be created. Check the room status and try again."
+                watchPartyOwner.message = roomWasCreated
+                    ? "Room created, but playback permissions could not be confirmed. Invitations are blocked. Retry or end the room."
+                    : error is WatchPartyLaunchError
+                        ? "That title or episode isn't supported for a Watch Party."
+                        : "Watch Party could not be created. Check the room status and try again."
                 partyLaunchTask = nil
                 selectedTab = .party
                 activeScreen = .main
@@ -2348,6 +2474,9 @@ struct ContentView: View {
             syncManager: syncManager,
             watchPartyOwner: watchPartyOwner,
             partyDetailsMedia: partyDetailsBackdrop,
+            invitationSetupBlocked: pendingWatchPartyPermission != nil
+                && pendingWatchPartyPermission?.roomID == watchPartyOwner.service?.session?.party?.id,
+            onRetryInviteSetup: retryWatchPartyHostOnly,
             onPartyRoomExited: didExitWatchPartyRoom,
             onCreateParty: {
                 partyDetailsOrigin = nil
@@ -3653,6 +3782,75 @@ final class ProfileTabAvatarRenderer: ObservableObject {
     }
 }
 
+/// TV-native setup shown before either Details or sidebar creates a room.
+/// Sharing is only an intent here: never capture or send a stream URL at create time.
+private struct WatchPartyRoomSetupSheet: View {
+    let media: WatchPartyMedia
+    let onCreate: (Bool, Bool) -> Void
+    let onCancel: () -> Void
+
+    @State private var hostOnly = true
+    @State private var shareSourceLater = false
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 24) {
+            Text("Create Watch Party")
+                .font(.system(size: 34, weight: .bold))
+            Text(media.episodeTitle ?? media.title)
+                .font(.system(size: 22, weight: .medium))
+                .foregroundStyle(.white.opacity(0.7))
+                .lineLimit(2)
+
+            Toggle(isOn: $hostOnly) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Host-only playback", systemImage: hostOnly ? "lock.fill" : "lock.open")
+                        .font(.system(size: 22, weight: .semibold))
+                    Text("Only the host can control synchronized playback when enabled.")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+            }
+            .padding(18)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+
+            Toggle(isOn: $shareSourceLater) {
+                VStack(alignment: .leading, spacing: 6) {
+                    Label("Share my source after choosing it", systemImage: "antenna.radiowaves.left.and.right")
+                        .font(.system(size: 22, weight: .semibold))
+                    Text("You'll select a compatible source and approve the exact link later in the player.")
+                        .font(.system(size: 16))
+                        .foregroundStyle(.white.opacity(0.65))
+                }
+            }
+            .padding(18)
+            .background(.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 18))
+
+            Text(shareSourceLater
+                ? "No link is sent now. Sharing a playback link may reveal Debrid tokens or private headers."
+                : "Every guest will choose their own playback source.")
+                .font(.system(size: 17))
+                .foregroundStyle(.white.opacity(0.7))
+                .fixedSize(horizontal: false, vertical: true)
+
+            HStack(spacing: 24) {
+                Button("Cancel", action: onCancel)
+                    .buttonStyle(.bordered)
+                Button {
+                    onCreate(hostOnly, shareSourceLater)
+                } label: {
+                    Label("Create room", systemImage: "plus.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(46)
+        .frame(maxWidth: 920)
+        .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 28))
+        .padding(35)
+        .onExitCommand(perform: onCancel)
+    }
+}
+
 private struct TVMainTabView: View {
     @Binding var selectedTab: TVTab
     let activeProfile: Profile?
@@ -3674,6 +3872,8 @@ private struct TVMainTabView: View {
     let syncManager: NuvioSyncManager
     @ObservedObject var watchPartyOwner: WatchPartyAppOwner
     var partyDetailsMedia: WatchPartyMedia? = nil
+    var invitationSetupBlocked = false
+    var onRetryInviteSetup: () -> Void = {}
     var onPartyRoomExited: (WatchPartyPlaybackContext) -> Void = { _ in }
     let onCreateParty: () -> Void
     let onChoosePartySource: (WatchPartyMedia) -> Void
@@ -3943,6 +4143,8 @@ private struct TVMainTabView: View {
                 isChoosing: partyIsChoosing, onCreate: onCreateParty,
                 onChooseSource: onChoosePartySource, onCancelSelection: onCancelPartySelection,
                 onOpenProfile: onSwitchProfile,
+                invitationSetupBlocked: invitationSetupBlocked,
+                onRetryInviteSetup: onRetryInviteSetup,
                 detailsMedia: partyDetailsMedia, onRoomExited: onPartyRoomExited)
         } else {
             Text("Sign in and choose a profile to use Watch Party.")
