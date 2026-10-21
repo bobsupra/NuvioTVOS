@@ -60,8 +60,20 @@ struct ScenePanelView: View {
             onDismiss()
         }
         .onAppear {
+            if viewModel.selectedTab == .watchParty && watchPartyContent == nil {
+                viewModel.selectTab(.info)
+            }
             if focusedTab == nil {
                 focusedTab = viewModel.selectedTab
+            }
+        }
+        .onChange(of: watchPartyContent != nil) { _, available in
+            // The room can end while InSight is open. Remove the stale tab
+            // and give focus back to Info without dismissing the player.
+            if !available && viewModel.selectedTab == .watchParty {
+                focusedCardID = nil
+                viewModel.selectTab(.info)
+                focusedTab = .info
             }
         }
         .onChange(of: focusedTab) { _, newTab in
@@ -478,8 +490,9 @@ struct ScenePanelView: View {
         case .info:
             focusedTab = viewModel.selectedTab
         case .watchParty:
-            focusedTab = nil
-            focusedCardID = watchPartyFocusTarget
+            // Room status is intentionally read-only; keep focus on its tab.
+            focusedCardID = nil
+            focusedTab = .watchParty
         }
     }
 }

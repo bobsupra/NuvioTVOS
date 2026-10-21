@@ -1,27 +1,13 @@
 import SwiftUI
 import UIKit
 
-/// Watch Party controls embedded in the player's InSight panel.
+/// Read-only room status for InSight. Management belongs to the dedicated
+/// player transport button, not to this fixed-height bottom panel.
 @MainActor
 struct PlayerWatchPartyPanel: View {
-    @ObservedObject var viewModel: PlayerViewModel
     @ObservedObject var owner: WatchPartyAppOwner
     @ObservedObject var service: WatchPartyService
-    @FocusState.Binding var focusedControlID: String?
-    @FocusState.Binding var focusedTab: SceneTab?
-    let isCurrentPlayerSurface: @MainActor () -> Bool
-    let onOpenLobby: () -> Void
-
-    @State private var operation: Task<Void, Never>?
-    @State private var message: String?
-    @State private var endingRoom = false
-    @State private var showingStreamWarning = false
-    @State private var pendingStreamShare: WatchPartyStream?
-    @State private var hasSharedStream = false
-    @State private var showingMemberRemovalConfirmation = false
-    @State private var memberToRemove: WatchPartyMember?
     @State private var roomCodeQR: UIImage?
-    @State private var tabFocusRequestID = UUID()
 
     var body: some View {
         ScrollView(.horizontal, showsIndicators: false) {
@@ -29,9 +15,7 @@ struct PlayerWatchPartyPanel: View {
                 if let room = service.session, let party = room.party {
                     invitationCard(room: room, party: party)
                     membersCard(room: room, party: party)
-                    controlsCard(room: room, party: party)
-                } else {
-                    lobbyCard
+                    statusCard(room: room, party: party)
                 }
             }
             .padding(.horizontal, 60)
@@ -39,609 +23,538 @@ struct PlayerWatchPartyPanel: View {
             .padding(.bottom, 24)
         }
         .scrollClipDisabled()
-        .onDisappear {
-            tabFocusRequestID = UUID()
-            pendingStreamShare = nil
-            showingStreamWarning = false
-        }
-        .sheet(isPresented: $showingStreamWarning, onDismiss: {
-            pendingStreamShare = nil
-        }) {
-            WatchPartyStreamRiskSheet { skipFutureWarning in
-                guard let pending = pendingStreamShare else { return }
-                showingStreamWarning = false
-                if skipFutureWarning {
-                    ProfileSettings.current.set(true, forKey: "nuvio.tv.party.hideStreamSharingWarning")
-                }
-                sendApprovedStream(pending)
-            }
-        }
-        .onAppear {
-            if let code = service.session?.party?.code { roomCodeQR = QRCode.image(from: code) }
-        }
-        .onChange(of: service.session?.party?.id) { oldID, newID in
-            pendingStreamShare = nil
-            showingStreamWarning = false
-            hasSharedStream = false
-            if oldID == nil, newID != nil {
-                focusWatchPartyTabAfterRoomCreation()
-            } else if oldID != nil, newID == nil {
-                focusedControlID = "party.create"
-            }
-        }
-        .onChange(of: owner.presentation?.id) { _, presentationID in
-            guard presentationID != nil,
-                  service.session?.party != nil else { return }
-            focusWatchPartyTabAfterRoomCreation()
-        }
-        .onChange(of: service.session?.party?.code) { _, code in
-            roomCodeQR = code.flatMap { QRCode.image(from: $0) }
-        }
-        .confirmationDialog("End this room for everyone?", isPresented: $endingRoom) {
-            Button("End room", role: .destructive) {
-                run { try await owner.leaveRoomPreservingPlayback(endForEveryone: true) }
-            }
-            Button("Cancel", role: .cancel) {}
-        }
+        .onAppear { updateQR() }
+        .onChange(of: service.session?.party?.code) { _, _ in updateQR() }
+        .onChange(of: owner.pendingHostOnlyRoomID) { _, _ in updateQR() }
     }
 
-    private var lobbyCard: some View {
-        glassCard(title: "WATCH PARTY", width: 380) {
-            VStack(alignment: .leading, spacing: 14) {
-                Text(service.membershipOutcomeUncertain
-                     ? "Check the room status before trying again."
-                     : "Create a room for this title. To join a room, use Watch Party in the sidebar.")
-                    .font(.system(size: 18, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.72))
-                    .fixedSize(horizontal: false, vertical: true)
-                createRoomButton
-                inlineStatus
-            }
+    private func updateQR() {
+        guard let party = service.session?.party,
+              owner.pendingHostOnlyRoomID != party.id else {
+            roomCodeQR = nil
+            return
         }
-    }
-
-    private var createRoomButton: some View {
-        let isFocused = focusedControlID == "party.create"
-        return Button {
-            run {
-                await owner.createRoomForCurrentPlayback(
-                    using: viewModel,
-                    isCurrentPlayerSurface: isCurrentPlayerSurface
-                )
-            }
-        } label: {
-            actionLabel(
-                title: "Create room for this title",
-                subtitle: "Share the current playback state",
-                symbol: "person.3.sequence.fill",
-                isFocused: isFocused
-            )
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .focused($focusedControlID, equals: "party.create")
-        .onMoveCommand(perform: handleFocusMove)
-        .disabled(service.busy || operation != nil || service.membershipOutcomeUncertain)
-    }
-
-    @ViewBuilder
-    private func openLobbyButton(isTopRow: Bool) -> some View {
-        let isFocused = focusedControlID == "party.lobby"
-        let button = Button(action: onOpenLobby) {
-            actionLabel(
-                title: "Open Watch Party lobby",
-                subtitle: "Create or join a room",
-                symbol: "person.3.sequence.fill",
-                isFocused: isFocused
-            )
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .focused($focusedControlID, equals: "party.lobby")
-        .disabled(operation != nil)
-
-        if isTopRow {
-            button.onMoveCommand(perform: handleFocusMove)
-        } else {
-            button
-        }
+        roomCodeQR = QRCode.image(from: party.code)
     }
 
     private func invitationCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
-        return glassCard(title: "ROOM INVITATION", width: 390) {
-            HStack(spacing: 18) {
-                VStack(alignment: .leading, spacing: 10) {
-                    Text(party.code)
-                        .font(.system(size: 32, weight: .bold, design: .rounded))
-                        .tracking(2.5)
-                        .foregroundStyle(.white)
-                        .lineLimit(1)
-                        .minimumScaleFactor(0.75)
-                    Text(connectionText(room.connection))
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.7))
-                    if !party.media.title.isEmpty {
+        statusCardShell("ROOM INVITATION", width: 390) {
+            if owner.pendingHostOnlyRoomID == party.id {
+                Label("Confirming host permissions", systemImage: "lock.shield")
+                    .font(.system(size: 20, weight: .semibold))
+                    .foregroundStyle(.orange)
+                Text("Room code hidden until setup succeeds.")
+                    .font(.system(size: 15))
+                    .foregroundStyle(.white.opacity(0.76))
+            } else {
+                HStack(alignment: .top, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text(party.code)
+                            .font(.system(size: 31, weight: .bold, design: .rounded))
+                            .tracking(2)
+                            .lineLimit(1)
+                            .minimumScaleFactor(0.75)
+                        Text(connectionText(room.connection))
+                            .font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white.opacity(0.8))
                         Text(party.media.title)
-                            .font(.system(size: 17, weight: .semibold))
-                            .foregroundStyle(.white.opacity(0.88))
+                            .font(.system(size: 15))
                             .lineLimit(2)
+                            .foregroundStyle(.white.opacity(0.85))
                     }
-                }
-                Spacer(minLength: 0)
-                if let roomCodeQR {
-                    Image(uiImage: roomCodeQR)
-                        .resizable()
-                        .interpolation(.none)
-                        .frame(width: 104, height: 104)
-                        .padding(8)
-                        .background(.white, in: RoundedRectangle(cornerRadius: 14, style: .continuous))
-                        .accessibilityLabel("QR code for room \(party.code)")
+                    Spacer(minLength: 0)
+                    if let roomCodeQR {
+                        Image(uiImage: roomCodeQR)
+                            .resizable()
+                            .interpolation(.none)
+                            .frame(width: 94, height: 94)
+                            .padding(8)
+                            .background(.white, in: RoundedRectangle(cornerRadius: 12))
+                            .accessibilityLabel("Invitation QR code")
+                    }
                 }
             }
         }
     }
 
     private func membersCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
-        let isHost = party.hostMemberID == room.memberID
-        return glassCard(title: "MEMBERS", trailingHeader: "\(room.members.count) in this room", width: 540) {
-            ScrollView(.horizontal, showsIndicators: room.members.count > 3) {
-                HStack(alignment: .top, spacing: 18) {
-                    ForEach(room.members, id: \.id) { member in
-                        let isYou = member.id == room.memberID
-                        let isRoomHost = member.id == party.hostMemberID
-                        let canRemove = isHost && !isYou
-                        let isFocused = focusedControlID == "party.member.\(member.id)"
-                        Button {
-                            guard canRemove else { return }
-                            memberToRemove = member
-                            showingMemberRemovalConfirmation = true
-                        } label: {
-                            VStack(spacing: 7) {
-                                ZStack(alignment: .topTrailing) {
-                                    memberAvatar(member)
-                                    if canRemove {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 18, weight: .bold))
-                                            .foregroundStyle(isFocused ? Color.red : Color.white.opacity(0.78))
-                                            .offset(x: 4, y: -3)
-                                    }
-                                }
-                                Text(member.displayName)
-                                    .font(.system(size: 17, weight: .semibold))
-                                    .foregroundStyle(isFocused ? .black : .white)
-                                    .lineLimit(1)
-                                    .frame(maxWidth: 112)
-                                Text(memberStatus(room.presence[member.id]?.status))
-                                    .font(.system(size: 14, weight: .medium))
-                                    .foregroundStyle(isFocused ? Color.black.opacity(0.65) : Color.white.opacity(0.65))
-                                    .lineLimit(1)
-                                if isYou || isRoomHost {
-                                    Text(isYou && isRoomHost ? "You · Host" : (isYou ? "You" : "Host"))
-                                        .font(.system(size: 13, weight: .bold))
-                                        .foregroundStyle(isFocused ? Color.black.opacity(0.72) : Color.white.opacity(0.8))
-                                        .lineLimit(1)
-                                }
+        statusCardShell("MEMBERS · \(room.members.count)", width: 520) {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(alignment: .top, spacing: 20) {
+                    ForEach(Array(room.members.prefix(3)), id: \.id) { member in
+                        VStack(spacing: 6) {
+                            Text(String(member.displayName.prefix(1)).uppercased())
+                                .font(.system(size: 28, weight: .bold))
+                                .frame(width: 70, height: 70)
+                                .background(.white.opacity(0.13), in: Circle())
+                            Text(member.displayName)
+                                .font(.system(size: 16, weight: .semibold))
+                                .lineLimit(1)
+                            Text(member.id == party.hostMemberID ? "Host" : "Guest")
+                                .font(.system(size: 13))
+                                .foregroundStyle(.white.opacity(0.65))
+                            if member.id == room.memberID {
+                                Text("You")
+                                    .font(.system(size: 12, weight: .bold))
+                                    .foregroundStyle(.white.opacity(0.8))
                             }
-                            .frame(width: 112)
-                            .padding(8)
-                            .background(
-                                isFocused ? Color.white.opacity(0.96) : Color.clear,
-                                in: RoundedRectangle(cornerRadius: 22, style: .continuous)
-                            )
                         }
-                        .buttonStyle(PosterCardButtonStyle())
-                        .focusEffectDisabledIfAvailable()
-                        .focused($focusedControlID, equals: "party.member.\(member.id)")
-                        .disabled(service.busy || operation != nil)
-                        .accessibilityLabel(canRemove
-                            ? "Remove \(member.displayName) from the room"
-                            : "\(member.displayName), \(memberStatus(room.presence[member.id]?.status))")
+                        .frame(width: 112)
+                        .accessibilityElement(children: .combine)
                     }
                 }
-            }
-            .frame(height: 154, alignment: .top)
-            if room.members.count > 3 {
-                Text("← / → to browse members")
-                    .font(.system(size: 12, weight: .medium))
-                    .foregroundStyle(.white.opacity(0.62))
-                    .frame(maxWidth: .infinity, alignment: .trailing)
-            }
-        }
-        .confirmationDialog(
-            "Remove \(memberToRemove?.displayName ?? "member") from this room?",
-            isPresented: $showingMemberRemovalConfirmation,
-            titleVisibility: .visible
-        ) {
-            Button("Remove member", role: .destructive) {
-                guard let memberToRemove else { return }
-                let memberID = memberToRemove.id
-                self.memberToRemove = nil
-                run { try await service.removeMember(memberID: memberID) }
-            }
-            Button("Cancel", role: .cancel) { memberToRemove = nil }
-        }
-    }
-
-    private func controlsCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
-        let isHost = party.hostMemberID == room.memberID
-        let columns = [GridItem(.flexible(), spacing: 10), GridItem(.flexible(), spacing: 10)]
-        return glassCard(title: "PLAYBACK & CONTROLS", width: 650) {
-            VStack(alignment: .leading, spacing: 5) {
-                LazyVGrid(columns: columns, alignment: .leading, spacing: 5) {
-                if isHost {
-                    let focused = focusedControlID == "party.hostOnly"
-                    Button {
-                        run { try await service.setHostOnly(enabled: !party.hostOnly) }
-                    } label: {
-                        actionLabel(
-                            title: "Host-only playback",
-                            subtitle: party.hostOnly ? "Only you control playback" : "Shared room control",
-                            symbol: party.hostOnly ? "lock.fill" : "lock.open",
-                            value: party.hostOnly ? "On" : "Off",
-                            isFocused: focused
-                        )
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-                    .focused($focusedControlID, equals: "party.hostOnly")
-                    .onMoveCommand(perform: handleFocusMove)
-                    .disabled(service.busy || operation != nil || room.connection != .ready)
-
-                    let shareFocused = focusedControlID == "party.shareStream"
-                    Button {
-                        do {
-                            let source = try viewModel.watchPartyShareableStream(for: party.media)
-                            pendingStreamShare = source
-                            if ProfileSettings.current.bool(forKey: "nuvio.tv.party.hideStreamSharingWarning") {
-                                sendApprovedStream(source)
-                                pendingStreamShare = nil
-                            } else {
-                                showingStreamWarning = true
-                            }
-                        } catch {
-                            message = "This source can't be shared. Use a compatible HTTP source or let guests choose their own."
-                        }
-                    } label: {
-                        actionLabel(
-                            title: "Share my stream · BETA",
-                            subtitle: "Share this playback link with guests (may expose Debrid tokens)",
-                            symbol: "antenna.radiowaves.left.and.right",
-                            value: hasSharedStream ? "Sent" : "Off",
-                            isFocused: shareFocused
-                        )
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-                    .focused($focusedControlID, equals: "party.shareStream")
-                    .disabled(service.busy || operation != nil || room.connection != .ready
-                        || owner.presentation?.mount.isCurrent != true)
-                    if hasSharedStream {
-                        Button {
-                            run {
-                                try await room.stopSharingStream()
-                                hasSharedStream = false
-                            }
-                        } label: {
-                            actionLabel(title: "Stop sharing", subtitle: "Does not revoke links already received",
-                                        symbol: "xmark.shield", isFocused: focusedControlID == "party.stopSharing")
-                        }
-                        .buttonStyle(PosterCardButtonStyle())
-                        .focused($focusedControlID, equals: "party.stopSharing")
-                        .disabled(service.busy || operation != nil || room.connection != .ready)
-                    }
-                } else {
-                    if room.sharedStream != nil {
-                        PlayerPanelRow(title: "Host stream available · BETA",
-                                       subtitle: "Return to Watch Party to choose the shared source.")
-                    }
-                    Text(party.hostOnly ? "Playback control is limited to the host." : "Playback control is shared with the room.")
-                        .font(.system(size: 16, weight: .medium))
-                        .foregroundStyle(.white.opacity(0.72))
-                        .padding(.horizontal, 12)
-                        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
-                }
-
-                if owner.presentation?.mount.isCurrent == true {
-                    catchUpButton(room: room, isTopRow: !isHost)
-                } else {
-                    PlayerPanelRow(title: "Choose a source in the Watch Party lobby to start playback.")
-                    openLobbyButton(isTopRow: !isHost)
-                }
-
-                let leaveFocused = focusedControlID == "party.leave"
-                Button {
-                    run { try await owner.leaveRoomPreservingPlayback() }
-                } label: {
-                    actionLabel(
-                        title: "Leave room",
-                        subtitle: "Leave this room",
-                        symbol: "rectangle.portrait.and.arrow.right",
-                        isFocused: leaveFocused
-                    )
-                }
-                .buttonStyle(PosterCardButtonStyle())
-                .focusEffectDisabledIfAvailable()
-                .focused($focusedControlID, equals: "party.leave")
-                .disabled(service.busy || operation != nil)
-
-                if isHost {
-                    let endFocused = focusedControlID == "party.endRoom"
-                    Button(role: .destructive) { endingRoom = true } label: {
-                        actionLabel(
-                            title: "End room for everyone",
-                            subtitle: "Remove all members",
-                            symbol: "xmark.circle.fill",
-                            isFocused: endFocused
-                        )
-                    }
-                    .buttonStyle(PosterCardButtonStyle())
-                    .focusEffectDisabledIfAvailable()
-                    .focused($focusedControlID, equals: "party.endRoom")
-                    .disabled(service.busy || operation != nil)
-                }
-            }
-                inlineStatus
-            }
-        }
-    }
-
-    @ViewBuilder
-    private func catchUpButton(room: WatchPartySession, isTopRow: Bool) -> some View {
-        let button = Button { viewModel.catchUpWithWatchParty() } label: {
-            actionLabel(
-                title: "Catch up with room",
-                subtitle: "Jump to room position",
-                symbol: "backward.end.fill",
-                isFocused: focusedControlID == "party.catchUp"
-            )
-        }
-        .buttonStyle(PosterCardButtonStyle())
-        .focusEffectDisabledIfAvailable()
-        .focused($focusedControlID, equals: "party.catchUp")
-        .disabled(service.busy || room.connection != .ready)
-
-        if isTopRow {
-            button.onMoveCommand(perform: handleFocusMove)
-        } else {
-            button
-        }
-    }
-
-    private func memberAvatar(_ member: WatchPartyMember, size: CGFloat = 72) -> some View {
-        let initials = String(member.displayName.trimmingCharacters(in: .whitespacesAndNewlines).prefix(1)).uppercased()
-        let background = avatarColor(member.avatarColor)
-        return ZStack {
-            Circle().fill(background)
-            if let url = safeAvatarURL(member.avatarURL) {
-                AsyncImage(url: url) { phase in
-                    if let image = phase.image {
-                        image.resizable().scaledToFill()
-                    } else {
-                        Text(initials.isEmpty ? "?" : initials)
-                            .font(.system(size: size * 0.4, weight: .bold))
-                            .foregroundStyle(.white)
-                    }
-                }
-            } else {
-                Text(initials.isEmpty ? "?" : initials)
-                    .font(.system(size: size * 0.4, weight: .bold))
-                    .foregroundStyle(.white)
-            }
-        }
-        .frame(width: size, height: size)
-        .clipShape(Circle())
-        .overlay(Circle().stroke(Color.white.opacity(0.3), lineWidth: 1))
-    }
-
-    private func safeAvatarURL(_ rawValue: String?) -> URL? {
-        guard let rawValue = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines),
-              rawValue.count <= 2048,
-              let url = URL(string: rawValue),
-              let scheme = url.scheme?.lowercased(),
-              scheme == "https" || scheme == "http",
-              url.host != nil else { return nil }
-        return url
-    }
-
-    private func avatarColor(_ value: String?) -> Color {
-        guard let value,
-              value.range(of: "^#[0-9A-Fa-f]{6}$", options: .regularExpression) != nil,
-              let hex = UInt64(String(value.dropFirst()), radix: 16) else {
-            return Color(red: 0.18, green: 0.34, blue: 0.54)
-        }
-        return Color(
-            red: Double((hex >> 16) & 0xff) / 255,
-            green: Double((hex >> 8) & 0xff) / 255,
-            blue: Double(hex & 0xff) / 255
-        )
-    }
-
-    private func glassCard<Content: View>(
-        title: String,
-        trailingHeader: String? = nil,
-        width: CGFloat,
-        @ViewBuilder content: () -> Content
-    ) -> some View {
-        VStack(alignment: .leading, spacing: 9) {
-            HStack(alignment: .firstTextBaseline) {
-                Text(title)
-                    .font(.system(size: 15, weight: .heavy))
-                    .foregroundStyle(.white)
-                    .tracking(1.2)
-                Spacer(minLength: 8)
-                if let trailingHeader {
-                    Text(trailingHeader)
-                        .font(.system(size: 14, weight: .medium))
+                if room.members.count > 3 {
+                    Text("+\(room.members.count - 3) more in the room")
+                        .font(.system(size: 13))
                         .foregroundStyle(.white.opacity(0.65))
-                        .lineLimit(1)
                 }
             }
-            Rectangle()
-                .fill(Color.white.opacity(0.14))
-                .frame(height: 1)
-                .padding(.bottom, 2)
+            .frame(height: 151, alignment: .topLeading)
+        }
+    }
+
+    private func statusCard(room: WatchPartySession, party: WatchPartyInfo) -> some View {
+        statusCardShell("ROOM STATUS", width: 485) {
+            VStack(alignment: .leading, spacing: 14) {
+                statusLine("Connection", value: connectionText(room.connection))
+                statusLine("Playback control", value: party.hostOnly ? "Host only" : "Shared")
+                statusLine("Your role", value:
+                    room.memberID != nil && room.memberID == party.hostMemberID ? "Host" : "Guest")
+                statusLine("Host source", value: owner.locallySharedStreamRoomID == party.id
+                    ? "Sent · BETA" : room.sharedStream == nil ? "Not available" : "Available · BETA")
+            }
+        }
+    }
+
+    private func statusLine(_ title: String, value: String) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 12) {
+            Text(title)
+                .foregroundStyle(.white.opacity(0.67))
+            Spacer(minLength: 8)
+            Text(value)
+                .fontWeight(.semibold)
+                .lineLimit(1)
+                .minimumScaleFactor(0.8)
+        }
+        .font(.system(size: 17))
+    }
+
+    private func statusCardShell<Content: View>(
+        _ title: String, width: CGFloat, @ViewBuilder content: () -> Content
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            Text(title)
+                .font(.system(size: 15, weight: .heavy))
+                .tracking(1.2)
+            Rectangle().fill(Color.white.opacity(0.15)).frame(height: 1)
             content()
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 22)
-        .padding(.vertical, 14)
+        .padding(.vertical, 16)
         .frame(width: width, height: 256, alignment: .topLeading)
-        .modifier(TvCardGlassBackground(isFocused: false, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
+        .modifier(TvCardGlassBackground(
+            isFocused: false, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)
+        ))
     }
 
-    private func actionLabel(
-        title: String,
-        subtitle: String,
-        symbol: String,
-        value: String? = nil,
-        isFocused: Bool,
-        isEnabled: Bool = true
+    private func connectionText(_ value: WatchPartyConnectionState) -> String {
+        switch value {
+        case .ready: return "Connected"
+        case .connecting, .reconciling: return "Synchronizing"
+        case .recovering: return "Reconnecting"
+        case .stopped: return "Disconnected"
+        }
+    }
+}
+
+/// Watches the live service so the InSight tab appears and disappears with
+/// actual room membership, including rooms entered from the sidebar.
+@MainActor
+struct PlayerWatchPartySceneBridge: View {
+    @ObservedObject var sceneViewModel: SceneViewModel
+    @ObservedObject var owner: WatchPartyAppOwner
+    @ObservedObject var service: WatchPartyService
+    let isAdvancing: Bool
+    let onDismiss: () -> Void
+    let onPlayNextEpisode: () -> Void
+
+    private var hasAcceptedMembership: Bool {
+        guard let room = service.session, let party = room.party,
+              room.membershipExit == nil, let memberID = room.memberID else { return false }
+        return !party.id.isEmpty && room.members.contains(where: { $0.id == memberID })
+    }
+
+    var body: some View {
+        ScenePanelView(
+            viewModel: sceneViewModel,
+            isAdvancing: isAdvancing,
+            onDismiss: onDismiss,
+            onPlayNextEpisode: onPlayNextEpisode,
+            watchPartyContent: hasAcceptedMembership
+                ? { _, _ in
+                    AnyView(PlayerWatchPartyPanel(owner: owner, service: service))
+                } : nil
+        )
+    }
+}
+
+/// Full-screen menu mirrors the player's ellipsis Settings panel: same scrim,
+/// native Siri Remote focus, safe-area padding and Menu-to-close behavior.
+/// There is deliberately NO Join action; joining belongs to the sidebar.
+@MainActor
+struct PlayerWatchPartyMenu: View {
+    @ObservedObject var viewModel: PlayerViewModel
+    @ObservedObject var owner: WatchPartyAppOwner
+    @ObservedObject var service: WatchPartyService
+    let isCurrentPlayerSurface: @MainActor () -> Bool
+    let onOpenLobby: () -> Void
+    let onClose: () -> Void
+
+    @State private var hostOnly = true
+    @State private var shareLater = false
+    @State private var operation: Task<Void, Never>?
+    @State private var message: String?
+    @State private var pendingStreamShare: WatchPartyStream?
+    @State private var showingStreamWarning = false
+    @State private var endingRoom = false
+    @State private var memberToRemove: WatchPartyMember?
+    @State private var memberRemovalRoomID: String?
+    @State private var showingMemberRemovalConfirmation = false
+    @FocusState private var focus: String?
+
+    private var initialActionFocus: String {
+        guard let room = service.session, let party = room.party else { return "create" }
+        if room.memberID != party.hostMemberID,
+           owner.presentation?.mount.isCurrent != true {
+            return "leave"
+        }
+        return "firstRoomAction"
+    }
+
+    var body: some View {
+        ZStack(alignment: .topLeading) {
+            LinearGradient(
+                colors: [.black.opacity(0.92), .black.opacity(0.55)],
+                startPoint: .leading, endPoint: .trailing
+            )
+            .ignoresSafeArea()
+
+            ScrollView(.vertical) {
+                VStack(alignment: .leading, spacing: 32) {
+                    Text("Watch Party")
+                        .font(.system(size: 30, weight: .semibold))
+                        .foregroundColor(.black)
+                        .padding(.horizontal, 30)
+                        .frame(height: 70)
+                        .modifier(TvDetailsGlassBackground(filled: true, shape: Capsule()))
+
+                    if let room = service.session, let party = room.party {
+                        activeRoom(room: room, party: party)
+                    } else {
+                        newRoom
+                    }
+                    if operation != nil || service.busy {
+                        HStack(spacing: 14) {
+                            ProgressView()
+                            Text("Updating Watch Party…")
+                        }
+                    }
+                    if let message {
+                        Text(message).foregroundStyle(.orange)
+                    } else if let message = owner.message {
+                        Text(message).foregroundStyle(.orange)
+                    }
+                }
+                .padding(.horizontal, 90)
+                .padding(.top, 64)
+                .padding(.bottom, 55)
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+        }
+        .onAppear {
+            viewModel.setControlsAutoHideSuspended(true)
+            focus = initialActionFocus
+        }
+        .onReceive(owner.$service) { currentService in
+            if currentService !== service { onClose() }
+        }
+        .onDisappear {
+            viewModel.setControlsAutoHideSuspended(false)
+            pendingStreamShare = nil
+        }
+        .onChange(of: service.session?.party?.id) { _, _ in
+            // A confirmation for one private room must not carry into another.
+            pendingStreamShare = nil
+            showingStreamWarning = false
+            memberToRemove = nil
+            memberRemovalRoomID = nil
+            showingMemberRemovalConfirmation = false
+            focus = initialActionFocus
+        }
+        .focusSection()
+        .onExitCommand(perform: onClose)
+        .sheet(isPresented: $showingStreamWarning, onDismiss: {
+            pendingStreamShare = nil
+        }) {
+            WatchPartyStreamRiskSheet { skipFutureWarning in
+                guard let pendingStreamShare else { return }
+                showingStreamWarning = false
+                if skipFutureWarning {
+                    ProfileSettings.current.set(true, forKey: "nuvio.tv.party.hideStreamSharingWarning")
+                }
+                shareApprovedStream(pendingStreamShare)
+            }
+        }
+        .confirmationDialog("End this room for everyone?", isPresented: $endingRoom) {
+            Button("End room", role: .destructive) {
+                run {
+                    try await owner.leaveRoomPreservingPlayback(endForEveryone: true)
+                    onClose()
+                }
+            }
+            Button("Cancel", role: .cancel) {}
+        }
+        .confirmationDialog(
+            "Remove \(memberToRemove?.displayName ?? "member") from this room?",
+            isPresented: $showingMemberRemovalConfirmation
+        ) {
+            Button("Remove member", role: .destructive) {
+                guard let member = memberToRemove,
+                      let expectedRoomID = memberRemovalRoomID else { return }
+                memberToRemove = nil
+                memberRemovalRoomID = nil
+                run {
+                    guard let currentRoom = service.session,
+                          currentRoom.party?.id == expectedRoomID,
+                          currentRoom.party?.hostMemberID == currentRoom.memberID,
+                          currentRoom.memberID != member.id else {
+                        throw WatchPartySessionError.notReady
+                    }
+                    try await service.removeMember(memberID: member.id)
+                }
+            }
+            Button("Cancel", role: .cancel) {
+                memberToRemove = nil
+                memberRemovalRoomID = nil
+            }
+        }
+    }
+
+    private var newRoom: some View {
+        VStack(alignment: .leading, spacing: 22) {
+            Text("CREATE A ROOM FOR THIS TITLE")
+                .font(.system(size: 19, weight: .bold))
+                .foregroundStyle(.white.opacity(0.76))
+
+            Toggle(isOn: $hostOnly) {
+                Label("Host-only playback", systemImage: hostOnly ? "lock.fill" : "lock.open")
+                    .font(.system(size: 23, weight: .semibold))
+            }
+            .frame(maxWidth: 780)
+            .padding(18)
+            .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 20))
+
+            Toggle(isOn: $shareLater) {
+                Label("Share my source later", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.system(size: 23, weight: .semibold))
+            }
+            .frame(maxWidth: 780)
+            .padding(18)
+            .background(.white.opacity(0.1), in: RoundedRectangle(cornerRadius: 20))
+
+            Text("The room is created without sharing your playback URL. If you choose to share, you'll approve the exact source separately. Links can expose provider credentials.")
+                .font(.system(size: 18))
+                .foregroundStyle(.white.opacity(0.76))
+                .frame(maxWidth: 850, alignment: .leading)
+
+            menuButton("Create room", icon: "plus.circle.fill", id: "create") {
+                run {
+                    await owner.createRoomForCurrentPlayback(
+                        using: viewModel, isCurrentPlayerSurface: isCurrentPlayerSurface,
+                        hostOnly: hostOnly
+                    )
+                    if let id = service.session?.party?.id,
+                       owner.pendingHostOnlyRoomID != id, shareLater {
+                        message = "Select Share my stream and approve the exact source when ready."
+                    }
+                }
+            }
+            .disabled(service.busy || operation != nil || service.membershipOutcomeUncertain)
+        }
+    }
+
+    private func activeRoom(room: WatchPartySession, party: WatchPartyInfo) -> some View {
+        let isHost = room.memberID != nil && party.hostMemberID != nil
+            && room.memberID == party.hostMemberID
+        return VStack(alignment: .leading, spacing: 22) {
+            Text("\(isHost ? "HOST" : "GUEST") · \(party.media.title)")
+                .font(.system(size: 22, weight: .semibold))
+                .foregroundStyle(.white.opacity(0.86))
+            Text(owner.pendingHostOnlyRoomID == party.id
+                ? "Permission confirmation pending. Invitation remains hidden in InSight."
+                : "Room connected: \(party.code)")
+                .font(.system(size: 18))
+                .foregroundStyle(.white.opacity(0.73))
+
+            if isHost {
+                if owner.pendingHostOnlyRoomID == party.id {
+                    menuButton("Retry host permissions", icon: "arrow.clockwise", id: "firstRoomAction") {
+                        run { try await owner.confirmPendingHostOnly() }
+                    }
+                } else {
+                    menuButton(
+                        party.hostOnly ? "Host-only playback · On" : "Host-only playback · Off",
+                        icon: party.hostOnly ? "lock.fill" : "lock.open",
+                        id: "firstRoomAction"
+                    ) {
+                        run { try await service.setHostOnly(enabled: !party.hostOnly) }
+                    }
+                }
+                menuButton("Share my stream · BETA", icon: "antenna.radiowaves.left.and.right", id: "share") {
+                    prepareShare(for: room, party: party)
+                }
+                .disabled(owner.pendingHostOnlyRoomID == party.id || service.busy || operation != nil
+                    || room.connection != .ready || owner.presentation?.mount.isCurrent != true)
+                if owner.locallySharedStreamRoomID == party.id {
+                    menuButton("Stop sharing (does not revoke links)", icon: "xmark.shield", id: "stopShare") {
+                        run {
+                            try await room.stopSharingStream()
+                            owner.clearLocalStreamShared(roomID: party.id)
+                        }
+                    }
+                }
+                if owner.presentation?.mount.isCurrent == true {
+                    menuButton("Catch up with room", icon: "backward.end.fill", id: "catchUp") {
+                        viewModel.catchUpWithWatchParty()
+                    }
+                } else {
+                    menuButton("Choose source from Watch Party", icon: "play.rectangle", id: "lobby") {
+                        onClose()
+                        onOpenLobby()
+                    }
+                }
+                if room.members.contains(where: { $0.id != room.memberID }) {
+                    Text("MANAGE MEMBERS")
+                        .font(.system(size: 16, weight: .bold))
+                        .foregroundStyle(.white.opacity(0.67))
+                    ForEach(room.members.filter { $0.id != room.memberID }, id: \.id) { member in
+                        menuButton("Remove \(member.displayName)", icon: "person.crop.circle.badge.xmark",
+                                   id: "remove.\(member.id)") {
+                            memberToRemove = member
+                            memberRemovalRoomID = party.id
+                            showingMemberRemovalConfirmation = true
+                        }
+                    }
+                }
+                menuButton("Leave room", icon: "rectangle.portrait.and.arrow.right", id: "leave") {
+                    run {
+                        try await owner.leaveRoomPreservingPlayback()
+                        onClose()
+                    }
+                }
+                menuButton("End room for everyone", icon: "xmark.circle.fill", id: "end") {
+                    endingRoom = true
+                }
+            } else {
+                if owner.presentation?.mount.isCurrent == true {
+                    menuButton("Catch up with host", icon: "backward.end.fill", id: "firstRoomAction") {
+                        viewModel.catchUpWithWatchParty()
+                    }
+                } else {
+                    menuButton("Choose source from Watch Party", icon: "play.rectangle", id: "lobby") {
+                        onClose()
+                        onOpenLobby()
+                    }
+                }
+                menuButton("Leave room", icon: "rectangle.portrait.and.arrow.right", id: "leave") {
+                    run {
+                        try await owner.leaveRoomPreservingPlayback()
+                        onClose()
+                    }
+                }
+                Text("To choose your own source or join a different room, use Watch Party in the sidebar.")
+                    .font(.system(size: 17))
+                    .foregroundStyle(.white.opacity(0.67))
+            }
+        }
+    }
+
+    private func menuButton(
+        _ title: String, icon: String, id: String,
+        action: @escaping () -> Void
     ) -> some View {
-        HStack(spacing: 11) {
-            Image(systemName: symbol)
-                .font(.system(size: 21, weight: .semibold))
-                .frame(width: 26)
-            VStack(alignment: .leading, spacing: 3) {
+        let isFocused = focus == id
+        return Button(action: action) {
+            HStack(spacing: 16) {
+                Image(systemName: icon).frame(width: 32)
                 Text(title)
-                    .font(.system(size: 16, weight: .semibold))
                     .lineLimit(1)
                     .minimumScaleFactor(0.8)
-                Text(subtitle)
-                    .font(.system(size: 12, weight: .medium))
-                    .lineLimit(1)
+                Spacer(minLength: 0)
             }
-            Spacer(minLength: 2)
-            if let value {
-                Text(value)
-                    .font(.system(size: 13, weight: .bold))
-                    .lineLimit(1)
-                    .padding(.horizontal, 9)
-                    .padding(.vertical, 5)
-                    .background(Capsule().fill(isFocused ? Color.black.opacity(0.08) : Color.white.opacity(0.12)))
-            }
+            .font(.system(size: 23, weight: .medium))
+            .foregroundStyle(isFocused ? .black : .white)
+            .padding(.horizontal, 24)
+            .frame(height: 64)
+            .modifier(TvDetailsGlassBackground(
+                filled: isFocused, shape: RoundedRectangle(cornerRadius: 20)
+            ))
         }
-        .foregroundStyle(isFocused ? Color.black : Color.white.opacity(isEnabled ? 1 : 0.58))
-        .padding(.horizontal, 12)
-        .frame(maxWidth: .infinity, minHeight: 48, alignment: .leading)
-        .modifier(TvDetailsGlassBackground(filled: isFocused, shape: RoundedRectangle(cornerRadius: 20, style: .continuous)))
+        .buttonStyle(PosterCardButtonStyle())
+        .focusEffectDisabledIfAvailable()
+        .focused($focus, equals: id)
+        .frame(maxWidth: 860)
+        .disabled(service.busy || operation != nil)
     }
 
-    @ViewBuilder
-    private var inlineStatus: some View {
-        Group {
-            if service.busy || operation != nil {
-                HStack(spacing: 9) {
-                    ProgressView()
-                    Text("Contacting room…")
-                }
-                .font(.system(size: 14, weight: .medium))
-                .foregroundStyle(.white.opacity(0.82))
-            } else if let message {
-                statusText(message)
-            } else if let message = owner.message {
-                statusText(message)
-            } else if let failure = service.failure {
-                statusText(failureText(failure))
-            } else if service.session?.membershipExit != nil {
-                statusText("Your previous room membership ended. Joining again needs a new request.")
-            } else {
-                Color.clear.accessibilityHidden(true)
-            }
-        }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .frame(height: 34, alignment: .topLeading)
-    }
-
-    private func statusText(_ text: String) -> some View {
-        Text(text)
-            .font(.system(size: 13, weight: .medium))
-            .foregroundStyle(.white.opacity(0.8))
-            .lineLimit(2)
-            .fixedSize(horizontal: false, vertical: true)
-            .frame(maxWidth: .infinity, alignment: .leading)
-    }
-
-    private func sendApprovedStream(_ candidate: WatchPartyStream) {
-        guard let room = service.session, let party = room.party,
-              party.hostMemberID == room.memberID,
+    private func prepareShare(for room: WatchPartySession, party: WatchPartyInfo) {
+        guard room.party?.id == party.id,
               owner.presentation?.mount.isCurrent == true else { return }
-        // A source switch between warning and confirmation must not share the old URL.
         do {
-            guard try viewModel.watchPartyShareableStream(for: party.media) == candidate else {
-                message = "The source changed. Review the new source before sharing."
-                return
-            }
-            let consent = try room.approveStreamSharing(candidate, origin: .directHTTP)
-            run {
-                try await room.shareStream(candidate, consent: consent)
-                hasSharedStream = true
+            let source = try viewModel.watchPartyShareableStream(for: party.media)
+            pendingStreamShare = source
+            if ProfileSettings.current.bool(forKey: "nuvio.tv.party.hideStreamSharingWarning") {
+                shareApprovedStream(source)
+                pendingStreamShare = nil
+            } else {
+                showingStreamWarning = true
             }
         } catch {
-            message = "This playback source is no longer shareable. Choose a compatible source."
+            message = "This source cannot be shared. Guests can select their own source."
+        }
+    }
+
+    private func shareApprovedStream(_ source: WatchPartyStream) {
+        guard let room = service.session, let party = room.party,
+              room.memberID == party.hostMemberID,
+              owner.presentation?.mount.isCurrent == true else { return }
+        do {
+            guard try viewModel.watchPartyShareableStream(for: party.media) == source else {
+                message = "The source changed. Review the current one before sharing."
+                return
+            }
+            let consent = try room.approveStreamSharing(source, origin: .directHTTP)
+            run {
+                try await room.shareStream(source, consent: consent)
+                owner.markLocalStreamShared(roomID: party.id)
+            }
+        } catch {
+            message = "The playback source is no longer shareable."
         }
     }
 
     private func run(_ action: @escaping @MainActor () async throws -> Void) {
-        guard !service.busy, operation == nil else { return }
+        guard operation == nil, !service.busy else { return }
         message = nil
         operation = Task { @MainActor in
             defer { operation = nil }
             do { try await action() }
-            catch { if !Task.isCancelled { message = "Could not complete the room request. Check its status before trying again." } }
-        }
-    }
-
-    private func handleFocusMove(_ direction: MoveCommandDirection) {
-        guard direction == .up else { return }
-        focusedControlID = nil
-        focusedTab = .watchParty
-    }
-
-    private func focusWatchPartyTabAfterRoomCreation() {
-        let requestID = UUID()
-        tabFocusRequestID = requestID
-        focusedControlID = nil
-        focusedTab = nil
-        Task { @MainActor in
-            await Task.yield()
-            await Task.yield()
-            guard tabFocusRequestID == requestID,
-                  service.session?.party != nil else { return }
-            focusedTab = .watchParty
-        }
-    }
-
-    private func connectionText(_ state: WatchPartyConnectionState) -> String {
-        switch state {
-        case .ready: return "Connected"
-        case .connecting, .reconciling: return "Synchronizing room…"
-        case .recovering: return service.busy || operation != nil ? "Updating room…" : "Reconnecting…"
-        case .stopped: return "Room disconnected"
-        }
-    }
-
-    private func memberStatus(_ status: WatchPartyMemberStatus?) -> String {
-        guard let status else { return "Connecting" }
-        switch status {
-        case .browsing: return "Browsing"
-        case .loading: return "Loading"
-        case .buffering: return "Buffering"
-        case .ready: return "Watching"
-        case .behind: return "Behind"
-        }
-    }
-
-    private func failureText(_ failure: WatchPartyFailure) -> String {
-        switch failure {
-        case .invalidCode: return "Enter a valid room code."
-        case .notFound: return "Room not found. Check the invitation code."
-        case .full: return "This room is full."
-        case .removed: return "You were removed from this room."
-        case .ended: return "This room has ended."
-        case .rateLimited: return "Too many requests. Wait before trying again."
-        case .signInRequired: return "Sign in again to use Watch Party."
-        case .unavailable: return "Watch Party is unavailable on this server."
-        case .network: return "The room request failed. Check your connection and room status."
+            catch {
+                if !Task.isCancelled {
+                    message = "Could not update Watch Party. Check the room status and retry."
+                }
+            }
         }
     }
 }

@@ -12,6 +12,10 @@ struct WatchPartyLobbyView: View {
     let onChooseSource: (WatchPartyMedia) -> Void
     let onCancelSelection: () -> Void
     let onOpenProfile: () -> Void
+    // This local gate is necessary because host-only is configured after
+    // watch_party_create. Atomic create+permissions still needs backend support.
+    var invitationSetupBlocked = false
+    var onRetryInviteSetup: () -> Void = {}
     var detailsMedia: WatchPartyMedia? = nil
     var onRoomExited: (WatchPartyPlaybackContext) -> Void = { _ in }
 
@@ -87,9 +91,13 @@ struct WatchPartyLobbyView: View {
             focusedAction = preferredRoomFocus
         }
         .sheet(isPresented: $showingInvitation) {
-            if let party = service.session?.party, WatchPartyCode.isValid(party.code) {
+            if !invitationSetupBlocked, let party = service.session?.party,
+               WatchPartyCode.isValid(party.code) {
                 WatchPartyLobbyInvitation(code: WatchPartyCode.normalize(party.code))
             }
+        }
+        .onChange(of: invitationSetupBlocked) { _, blocked in
+            if blocked { showingInvitation = false }
         }
         .onChange(of: service.session?.party?.id) { _, newID in
             showingInvitation = false
@@ -558,7 +566,15 @@ struct WatchPartyLobbyView: View {
             }
 
             hostSeatSummary(room, party: party)
-            roomCodeDisplay(party.code)
+            if invitationSetupBlocked && party.hostMemberID == room.memberID {
+                statusRow(
+                    symbol: "lock.shield",
+                    title: "Room code is hidden until playback permissions are confirmed.",
+                    tint: .orange
+                )
+            } else {
+                roomCodeDisplay(party.code)
+            }
         }
         .frame(maxWidth: .infinity, alignment: .leading)
     }
@@ -776,6 +792,24 @@ struct WatchPartyLobbyView: View {
                 .focused($focusedAction, equals: "refresh-host-source")
                 .disabled(service.busy || operation != nil)
             }
+            if invitationSetupBlocked, party.hostMemberID == room.memberID {
+                statusRow(
+                    symbol: "exclamationmark.shield.fill",
+                    title: "Playback permissions were not confirmed by the server. Do not invite anyone yet.",
+                    tint: .orange
+                )
+                Button(action: onRetryInviteSetup) {
+                    secondaryActionLabel(
+                        symbol: "arrow.clockwise",
+                        title: "Retry playback permissions",
+                        isFocused: focusedAction == "retry-invite-setup"
+                    )
+                }
+                .buttonStyle(PosterCardButtonStyle())
+                .focusEffectDisabledIfAvailable()
+                .focused($focusedAction, equals: "retry-invite-setup")
+                .disabled(service.busy || operation != nil || room.connection != .ready || room.membershipExit != nil)
+            }
             if needsMediaReview {
                 statusRow(symbol: "exclamationmark.triangle.fill",
                           title: "The room changed to \(party.media.title)\(episodeDescription(party.media).map { " · " + $0 } ?? ""). Confirm before choosing a source.",
@@ -814,7 +848,7 @@ struct WatchPartyLobbyView: View {
             }
             .buttonStyle(PosterCardButtonStyle())
             .focused($focusedAction, equals: "invite")
-            .disabled(service.busy || operation != nil || room.connection != .ready || room.membershipExit != nil || !WatchPartyCode.isValid(party.code))
+            .disabled(invitationSetupBlocked || service.busy || operation != nil || room.connection != .ready || room.membershipExit != nil || !WatchPartyCode.isValid(party.code))
 
             HStack(spacing: 14) {
                 if room.connection != .ready, room.membershipExit == nil {

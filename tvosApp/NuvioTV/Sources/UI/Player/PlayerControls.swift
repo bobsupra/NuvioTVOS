@@ -8,6 +8,7 @@ enum PlayerControlFocus: Hashable {
     case sources
     case subtitles
     case audio
+    case watchParty
     case settings
     case timeline
 }
@@ -19,6 +20,9 @@ struct PlayerControls: View {
     @Binding var requestedFocus: PlayerControlFocus?
     var onFocusSkipSegment: () -> Void = {}
     var onFocusNextEpisode: () -> Void = {}
+    var showWatchPartyButton = false
+    var isWatchPartyMenuPresented = false
+    var onOpenWatchPartyMenu: () -> Void = {}
 
     @FocusState private var focusedControl: PlayerControlFocus?
 
@@ -52,6 +56,13 @@ struct PlayerControls: View {
         .onChange(of: viewModel.showSettingsPanel) { _, isPresented in
             if !isPresented, viewModel.showControls {
                 DispatchQueue.main.async { focusedControl = .settings }
+            }
+        }
+        .onChange(of: isWatchPartyMenuPresented) { _, presented in
+            if !presented && viewModel.showControls {
+                DispatchQueue.main.async {
+                    focusedControl = showWatchPartyButton ? .watchParty : .settings
+                }
             }
         }
         .onAppear {
@@ -217,6 +228,7 @@ struct PlayerControls: View {
             && !viewModel.isSwitchingSource
             && !viewModel.showPauseOverlay
             && !viewModel.showSettingsPanel
+            && !isWatchPartyMenuPresented
             && !viewModel.showScenePanel
             && !viewModel.isSceneDetailVisible
             && !viewModel.postPlayState.isVisible
@@ -236,6 +248,7 @@ struct PlayerControls: View {
     private var transportFocusOrder: [PlayerControlFocus] {
         var order: [PlayerControlFocus] = []
         if viewModel.isPictureInPictureSupported && playerShowPiP { order.append(.pip) }
+        if showWatchPartyButton { order.append(.watchParty) }
         if viewModel.canShowEpisodesPanel && playerShowEpisodes { order.append(.episodes) }
         if viewModel.canShowSourcesPanel && playerShowSources { order.append(.sources) }
         if canShowSubtitlePicker && playerShowSubtitles { order.append(.subtitles) }
@@ -276,7 +289,7 @@ struct PlayerControls: View {
     /// Once any transport button is focused, every visible button is focusable
     /// again so left/right still walks the full row.
     private func isTransportButtonFocusable(_ key: PlayerControlFocus) -> Bool {
-        guard controlsInteractable else { return false }
+        guard controlsInteractable, transportFocusOrder.contains(key) else { return false }
         if focusedControl == .timeline {
             return key == (transportFocusOrder.first ?? .settings)
         }
@@ -420,6 +433,21 @@ struct PlayerControls: View {
                     Image(systemName: "pip.enter")
                 }
                 .id("pip_button")
+            }
+
+            if showWatchPartyButton {
+                glassIconButton(
+                    size: 70,
+                    iconSize: 28,
+                    focusKey: .watchParty,
+                    isFocused: focusedControl == .watchParty
+                ) {
+                    onOpenWatchPartyMenu()
+                } icon: {
+                    Image(systemName: "person.2.fill")
+                }
+                .id("watch_party_button")
+                .accessibilityLabel("Watch Party")
             }
 
             if viewModel.canShowEpisodesPanel && playerShowEpisodes {

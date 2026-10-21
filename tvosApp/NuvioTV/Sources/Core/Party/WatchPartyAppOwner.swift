@@ -14,6 +14,39 @@ final class WatchPartyAppOwner: ObservableObject {
     @Published private(set) var service: WatchPartyService?
     @Published private(set) var presentation: Presentation?
     @Published var message: String?
+    // The backend currently configures host-only after room creation. Hide
+    // invitations while the explicit host choice remains unconfirmed.
+    @Published private(set) var pendingHostOnlyRoomID: String?
+    // Local acknowledgement of one consented broadcast, not a persistent
+    // server source or a guarantee that peers still have a valid link.
+    @Published private(set) var locallySharedStreamRoomID: String?
+    private var requestedHostOnly = true
+
+    func markLocalStreamShared(roomID: String) {
+        guard service?.session?.party?.id == roomID else { return }
+        locallySharedStreamRoomID = roomID
+    }
+
+    func clearLocalStreamShared(roomID: String) {
+        if locallySharedStreamRoomID == roomID { locallySharedStreamRoomID = nil }
+    }
+
+    func confirmPendingHostOnly() async throws {
+        guard let service, let room = service.session, let party = room.party,
+              party.id == pendingHostOnlyRoomID,
+              party.hostMemberID == room.memberID else {
+            throw WatchPartySessionError.notReady
+        }
+        if party.hostOnly != requestedHostOnly {
+            try await service.setHostOnly(enabled: requestedHostOnly)
+        }
+        guard service.session === room, room.party?.id == party.id,
+              room.party?.hostOnly == requestedHostOnly else {
+            throw WatchPartySessionError.notReady
+        }
+        pendingHostOnlyRoomID = nil
+    }
+
     private var preservePlayerAfterRoomExit = false
     private var lease: WatchPartyPlayerRuntime.Lease?
     private var browsingTask: Task<Void, Never>?
@@ -91,7 +124,8 @@ final class WatchPartyAppOwner: ObservableObject {
     /// An accepted room is deliberately retained if the player becomes stale during attachment.
     func createRoomForCurrentPlayback(
         using viewModel: PlayerViewModel,
-        isCurrentPlayerSurface: @escaping @MainActor () -> Bool
+        isCurrentPlayerSurface: @escaping @MainActor () -> Bool,
+        hostOnly: Bool = true
     ) async {
         message = nil
         guard isCurrentPlayerSurface() else { return }
@@ -119,6 +153,10 @@ final class WatchPartyAppOwner: ObservableObject {
         do {
             try await service.create(media: initialSnapshot.media)
             roomWasAccepted = true
+            if let createdRoomID = service.session?.party?.id {
+                requestedHostOnly = hostOnly
+                pendingHostOnlyRoomID = createdRoomID
+            }
 
             guard self.service === service,
                   isCurrentPlayerSurface(),
@@ -135,6 +173,10 @@ final class WatchPartyAppOwner: ObservableObject {
                 message = "Room created, but the connection isn't ready. The room remains open; playback isn't attached."
                 return
             }
+
+            // Do not publish host playback or expose an invitation while a
+            // separate permission RPC has not acknowledged this exact room.
+            try await confirmPendingHostOnly()
 
             // Use the latest transport sample after the room request, while retaining the exact
             // load/media identity captured when the user pressed Create.
@@ -219,7 +261,9 @@ final class WatchPartyAppOwner: ObservableObject {
             }
         } catch {
             if roomWasAccepted {
-                message = "Room created, but playback couldn't attach. The room is still open in Watch Party."
+                message = pendingHostOnlyRoomID != nil
+                    ? "Room created, but host-only permissions are unconfirmed. Retry before inviting anyone."
+                    : "Room created, but playback couldn't attach. The room is still open in Watch Party."
             } else if service.membershipOutcomeUncertain {
                 message = "Room status is uncertain. Check Watch Party before trying again."
             } else if service.failure == nil {
@@ -284,6 +328,8 @@ final class WatchPartyAppOwner: ObservableObject {
             finishPlayback(reportBrowsing: false)
         }
         try await service.leave(endForEveryone: endForEveryone)
+        locallySharedStreamRoomID = nil
+        pendingHostOnlyRoomID = nil
     }
 
     /// Root consumes this when the presentation disappears after an explicit leave/end.
@@ -299,6 +345,8 @@ final class WatchPartyAppOwner: ObservableObject {
         finishPlayback(reportBrowsing: false)
         let oldRuntime = runtime
         let oldService = service
+        pendingHostOnlyRoomID = nil
+        locallySharedStreamRoomID = nil
         runtime = nil
         service = nil
         authManager = nil
@@ -327,6 +375,12 @@ final class WatchPartyAppOwner: ObservableObject {
         service.$session.dropFirst().sink { [weak self, weak service] next in
             MainActor.assumeIsolated {
                 if service?.session !== next { self?.finishPlayback(reportBrowsing: false) }
+                if next?.party?.id != self?.pendingHostOnlyRoomID {
+                    self?.pendingHostOnlyRoomID = nil
+                }
+                if next?.party?.id != self?.locallySharedStreamRoomID {
+                    self?.locallySharedStreamRoomID = nil
+                }
                 self?.observeRoom(next)
             }
         }.store(in: &subscriptions)

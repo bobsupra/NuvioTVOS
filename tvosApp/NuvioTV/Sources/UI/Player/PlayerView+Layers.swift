@@ -421,41 +421,49 @@ extension PlayerView {
     @ViewBuilder
     var scenePanelLayer: some View {
         if viewModel.showScenePanel {
-            ScenePanelView(
-                viewModel: viewModel.sceneViewModel,
-                isAdvancing: viewModel.isAdvancingEpisode,
-                onDismiss: {
-                    withAnimation(.playerControls) {
-                        viewModel.closeScene()
-                        focusRemoteInput()
-                    }
-                },
-                onPlayNextEpisode: {
-                    guard !isWakingFromBackground else { return }
-                    withAnimation(.playerControls) {
-                        viewModel.closeScene()
-                        viewModel.playNextEpisode()
-                    }
-                },
-                watchPartyContent: WatchPartyConfiguration.isEnabled && watchPartyOwner?.service != nil && !isStandalonePlaybackSession
-                    ? { focus, tabFocus in
-                        guard let owner = watchPartyOwner, let service = owner.service else {
-                            return AnyView(EmptyView())
+            Group {
+                if canShowWatchPartyButton, let owner = watchPartyOwner,
+                   let service = owner.service {
+                    PlayerWatchPartySceneBridge(
+                        sceneViewModel: viewModel.sceneViewModel,
+                        playerViewModel: viewModel,
+                        owner: owner,
+                        service: service,
+                        isAdvancing: viewModel.isAdvancingEpisode,
+                        onDismiss: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        },
+                        onPlayNextEpisode: {
+                            guard !isWakingFromBackground else { return }
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                viewModel.playNextEpisode()
+                            }
                         }
-                        return AnyView(PlayerWatchPartyPanel(
-                            viewModel: viewModel, owner: owner, service: service,
-                            focusedControlID: focus, focusedTab: tabFocus,
-                            isCurrentPlayerSurface: isCurrentPlayerSurface,
-                            onOpenLobby: onOpenWatchPartyLobby
-                        ))
-                    }
-                    : nil,
-                watchPartyFocusTarget: {
-                    if watchPartyOwner?.presentation?.mount.isCurrent == true { return "party.catchUp" }
-                    guard let room = watchPartyOwner?.service?.session, let party = room.party else { return "party.create" }
-                    return party.hostMemberID == room.memberID ? "party.hostOnly" : "party.lobby"
-                }()
-            )
+                    )
+                } else {
+                    ScenePanelView(
+                        viewModel: viewModel.sceneViewModel,
+                        isAdvancing: viewModel.isAdvancingEpisode,
+                        onDismiss: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        },
+                        onPlayNextEpisode: {
+                            guard !isWakingFromBackground else { return }
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                viewModel.playNextEpisode()
+                            }
+                        }
+                    )
+                }
+            }
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(15)
         }
@@ -703,7 +711,14 @@ extension PlayerView {
                 isNextEpisodeFocused: nextEpisodeFocused || cancelAutoPlayFocused,
                 requestedFocus: $requestedControlFocus,
                 onFocusSkipSegment: { focusSkipSegment() },
-                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
+                onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) },
+                showWatchPartyButton: canShowWatchPartyButton,
+                isWatchPartyMenuPresented: showingWatchPartyMenu,
+                onOpenWatchPartyMenu: {
+                    guard canShowWatchPartyButton, !viewModel.showSettingsPanel,
+                          !viewModel.showScenePanel, !viewModel.isSwitchingSource else { return }
+                    showingWatchPartyMenu = true
+                }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
             .opacity(
@@ -711,6 +726,7 @@ extension PlayerView {
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
+                    && !showingWatchPartyMenu
                     && !viewModel.showPauseOverlay
                 ? 1 : 0
             )
@@ -719,6 +735,7 @@ extension PlayerView {
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
+                    && !showingWatchPartyMenu
                     && !viewModel.showPauseOverlay
                 ? 1 : 0.95
             )
@@ -727,6 +744,7 @@ extension PlayerView {
                     && didReportPlaybackStarted
                     && !viewModel.isSwitchingSource
                     && !viewModel.showSettingsPanel
+                    && !showingWatchPartyMenu
                     && !viewModel.showPauseOverlay
             )
             .disabled(!isSeekingOrControlsVisible || viewModel.showScenePanel || viewModel.isSceneDetailVisible)
@@ -735,6 +753,7 @@ extension PlayerView {
             .animation(.playerControls, value: viewModel.isSwitchingSource)
             .animation(.playerControls, value: viewModel.isAdvancingEpisode)
             .animation(.playerControls, value: viewModel.showSettingsPanel)
+            .animation(.playerControls, value: showingWatchPartyMenu)
             .animation(.playerControls, value: viewModel.isScrubbing)
             .animation(.playerControls, value: viewModel.isHoldingSeek)
             .animation(.playerControls, value: viewModel.pendingSeekDelta)
@@ -752,6 +771,22 @@ extension PlayerView {
             PlayerSettingsPanel(viewModel: viewModel) {
                 viewModel.showSettingsPanel = false
             }
+            .transition(.opacity)
+            .zIndex(15)
+        } else if showingWatchPartyMenu,
+                  canShowWatchPartyButton,
+                  let owner = watchPartyOwner,
+                  let service = owner.service {
+            PlayerWatchPartyMenu(
+                viewModel: viewModel, owner: owner, service: service,
+                isCurrentPlayerSurface: isCurrentPlayerSurface,
+                onOpenLobby: onOpenWatchPartyLobby,
+                onClose: {
+                    showingWatchPartyMenu = false
+                    viewModel.revealControls()
+                    requestedControlFocus = canShowWatchPartyButton ? .watchParty : .settings
+                }
+            )
             .transition(.opacity)
             .zIndex(15)
         }

@@ -161,6 +161,7 @@ struct PlayerView: View {
     @State var didReportPlaybackStarted = false
     @State var lastBecameActiveAt: Date = Date()
     @State var requestedControlFocus: PlayerControlFocus? = nil
+    @State var showingWatchPartyMenu = false
     @FocusState var remoteInputFocused: Bool
     @FocusState var nextEpisodeFocused: Bool
     @FocusState var cancelAutoPlayFocused: Bool
@@ -177,6 +178,11 @@ struct PlayerView: View {
 
     var isStandalonePlaybackSession: Bool {
         isActionPlaybackSession || subtitle == PlaybackMarkers.trailerSubtitle
+    }
+
+    var canShowWatchPartyButton: Bool {
+        WatchPartyConfiguration.isEnabled
+            && watchPartyOwner?.service != nil && !isStandalonePlaybackSession
     }
 
     var subtitleContentId: String {

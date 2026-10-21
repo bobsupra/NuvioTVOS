@@ -10,11 +10,19 @@ extension PlayerView {
                     screensaverDebugLog("[ScreensaverDebug][Input] onPlayPauseCommand suppressed by isWakingFromBackground")
                     return
                 }
-                guard viewModel.currentErrorDiagnostic == nil else { return }
+                guard viewModel.currentErrorDiagnostic == nil,
+                      !showingWatchPartyMenu else { return }
                 viewModel.togglePlayPause()
             }
             .onExitCommand {
                 PlaybackTimelineRecorder.record(.backPressed, engine: viewModel.activeEngineKind)
+                // Root fallback while tvOS hands focus to the modal's first action.
+                if showingWatchPartyMenu {
+                    showingWatchPartyMenu = false
+                    viewModel.revealControls()
+                    requestedControlFocus = canShowWatchPartyButton ? .watchParty : .settings
+                    return
+                }
                 if viewModel.isSceneDetailVisible {
                     withAnimation(.easeInOut(duration: 0.2)) {
                         viewModel.closeSceneDetail()
