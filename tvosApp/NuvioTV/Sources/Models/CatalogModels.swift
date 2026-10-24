@@ -3518,38 +3518,49 @@ enum ContinueWatchingStore {
     }
 
     /// Mirrors the active profile's Continue Watching list into the App Group so
-    /// the Top Shelf extension can render the Apple TV home row. No-op when the
-    /// shared container isn't available.
+    /// the Top Shelf extension can render the Apple TV home rows: in-progress
+    /// titles, and aired next-episode suggestions as their own Up Next row.
+    /// No-op when the shared container isn't available.
     private static func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
-        let currentItems = Array(items().prefix(10))
-        // Register this snapshot before any detached work can reorder it.
-        // Mapping at most ten cards is cheap; disk/network/artwork stay async.
-        let entries = currentItems.map { item -> TopShelfEntry in
-            let fraction = item.duration > 0 ? min(max(item.position / item.duration, 0), 1) : nil
-            var subtitleParts: [String] = []
-            if let season = item.season, let episode = item.episode {
-                subtitleParts.append("S\(season) · E\(episode)")
-            } else if let year = item.meta.year {
-                subtitleParts.append(String(year))
-            }
-            if let remaining = remainingTimeText(
-                seconds: max(0, item.duration - item.position)
-            ) {
-                subtitleParts.append("\(remaining) left")
-            }
-            return TopShelfEntry(
-                contentId: item.meta.id,
-                contentType: item.meta.type,
-                title: item.meta.name,
-                subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
-                imageURL: item.meta.posterUrl,
-                progress: item.isUpNextEntry ? nil : fraction
-            )
+        let allItems = items()
+        let inProgress = allItems.filter { !$0.isUpNextEntry }.prefix(10)
+        // Unaired suggestions can't be played yet, so they stay off the shelf.
+        let upNext = allItems
+            .filter { $0.isUpNextEntry && ($0.hasAired || $0.isAiringToday) }
+            .prefix(10)
+        // Register these snapshots before any detached work can reorder them.
+        // Mapping at most twenty cards is cheap; disk/network/artwork stay async.
+        TopShelfFeedStore.write(inProgress.map(topShelfEntry(for:)), section: .continueWatching,
+                                title: L10n.string("home_continue_watching", fallback: "Continue Watching"))
+        TopShelfFeedStore.write(upNext.map(topShelfEntry(for:)), section: .upNext,
+                                title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized)
+    }
+
+    private static func topShelfEntry(for item: ContinueWatchingItem) -> TopShelfEntry {
+        let fraction = item.duration > 0 ? min(max(item.position / item.duration, 0), 1) : nil
+        var subtitleParts: [String] = []
+        if let season = item.season, let episode = item.episode {
+            subtitleParts.append("S\(season) · E\(episode)")
+        } else if let year = item.meta.year {
+            subtitleParts.append(String(year))
         }
-        TopShelfFeedStore.write(entries)
+        if let remaining = remainingTimeText(
+            seconds: max(0, item.duration - item.position)
+        ) {
+            subtitleParts.append("\(remaining) left")
+        }
+        return TopShelfEntry(
+            contentId: item.meta.id,
+            contentType: item.meta.type,
+            title: item.meta.name,
+            subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
+            imageURL: item.meta.posterUrl,
+            backdropURL: item.meta.backdropUrl,
+            progress: item.isUpNextEntry ? nil : fraction
+        )
     }
 
     private static func remainingTimeText(seconds: Double) -> String? {
@@ -4266,6 +4277,7 @@ enum LibraryStore {
     }
 
     private static func postChangedNotification() {
+        writeTopShelfFeed()
         if Thread.isMainThread {
             NotificationCenter.default.post(name: changedNotification, object: nil)
         } else {
@@ -4273,6 +4285,33 @@ enum LibraryStore {
                 NotificationCenter.default.post(name: changedNotification, object: nil)
             }
         }
+    }
+
+    private static let topShelfSnapshotLock = NSLock()
+
+    /// Mirrors the most recently added library titles into the App Group for
+    /// the Top Shelf Library row. No-op when the shared container isn't available.
+    private static func writeTopShelfFeed() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        topShelfSnapshotLock.lock()
+        defer { topShelfSnapshotLock.unlock() }
+        let entries = items()
+            .sorted { $0.addedAt > $1.addedAt }
+            .prefix(15)
+            .map { item in
+                TopShelfEntry(
+                    contentId: item.meta.id,
+                    contentType: item.meta.type,
+                    title: item.meta.name,
+                    subtitle: nil,
+                    imageURL: item.meta.posterUrl,
+                    backdropURL: item.meta.backdropUrl,
+                    progress: nil,
+                    action: .details
+                )
+            }
+        TopShelfFeedStore.write(Array(entries), section: .library,
+                                title: L10n.string("nav_library", fallback: "Library"))
     }
 
     private static var storageKey: String {

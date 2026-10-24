@@ -28,6 +28,29 @@ public let topShelfAppGroupID: String = {
     return "group.\(mainAppBundleID)"
 }()
 
+/// One Top Shelf row. Each section is mirrored to its own file so the stores
+/// that own them (Continue Watching, Library, Home) write independently.
+public enum TopShelfSection: String, Codable, CaseIterable {
+    case continueWatching
+    case upNext
+    case library
+    case catalog
+
+    /// Continue Watching keeps the original filename so a feed written by an
+    /// earlier build is still read until the app rewrites it.
+    var feedFileName: String {
+        self == .continueWatching ? "feed.json" : "feed-\(rawValue).json"
+    }
+}
+
+/// What selecting a card does.
+public enum TopShelfEntryAction: String, Codable {
+    /// Resume (or start the suggested episode) straight from the shelf.
+    case resume
+    /// Open the title's details page.
+    case details
+}
+
 /// One card on the Top Shelf row.
 public struct TopShelfEntry: Codable, Equatable {
     public let contentId: String
@@ -35,22 +58,35 @@ public struct TopShelfEntry: Codable, Equatable {
     public let title: String
     public let subtitle: String?
     public let imageURL: String?
-    /// Filename of the locally rendered poster with its episode/time overlay.
+    /// Landscape artwork preferred for the 16:9 shelf cards. Optional so feeds
+    /// written by earlier versions remain readable.
+    public let backdropURL: String?
+    /// Filename of the locally rendered card with its episode/time overlay.
     /// Optional so feeds written by earlier versions remain readable.
     public let artworkFileName: String?
     /// Fractional progress 0...1, drawn as the card's progress bar.
     public let progress: Double?
+    /// Nil in feeds written before actions existed, which were all resumable.
+    public let action: TopShelfEntryAction?
 
     public init(contentId: String, contentType: String, title: String,
-                subtitle: String?, imageURL: String?, progress: Double?,
+                subtitle: String?, imageURL: String?, backdropURL: String? = nil,
+                progress: Double?, action: TopShelfEntryAction = .resume,
                 artworkFileName: String? = nil) {
         self.contentId = contentId
         self.contentType = contentType
         self.title = title
         self.subtitle = subtitle
         self.imageURL = imageURL
+        self.backdropURL = backdropURL
         self.progress = progress
+        self.action = action
         self.artworkFileName = artworkFileName
+    }
+
+    /// Artwork the card is rendered from: the backdrop, else the poster.
+    var artworkSourceURL: String? {
+        backdropURL ?? imageURL
     }
 
     fileprivate func withArtworkFileName(_ artworkFileName: String?) -> TopShelfEntry {
@@ -60,17 +96,20 @@ public struct TopShelfEntry: Codable, Equatable {
             title: title,
             subtitle: subtitle,
             imageURL: imageURL,
+            backdropURL: backdropURL,
             progress: progress,
+            action: action ?? .resume,
             artworkFileName: artworkFileName
         )
     }
 
-    /// Deep link back into the app for direct Continue Watching playback.
-    /// The app resolves URL-less synced and Next Up entries after opening.
+    /// Deep link back into the app. Resumable entries go straight to
+    /// Continue Watching playback (the app resolves URL-less synced and Next Up
+    /// entries after opening); the rest open the details page.
     public var deepLinkURL: URL? {
         var components = URLComponents()
         components.scheme = "nuvio-tv"
-        components.host = "continue-watching"
+        components.host = (action ?? .resume) == .resume ? "continue-watching" : "details"
         components.queryItems = [
             URLQueryItem(name: "id", value: contentId),
             URLQueryItem(name: "type", value: contentType)
@@ -82,9 +121,13 @@ public struct TopShelfEntry: Codable, Equatable {
 public struct TopShelfFeed: Codable, Equatable {
     public let entries: [TopShelfEntry]
     public let updatedAt: Date
+    /// Row heading. Nil for the fixed sections, whose titles the extension owns
+    /// unless the app supplies a localized one.
+    public let title: String?
 
-    public init(entries: [TopShelfEntry], updatedAt: Date = Date()) {
+    public init(entries: [TopShelfEntry], title: String? = nil, updatedAt: Date = Date()) {
         self.entries = entries
+        self.title = title
         self.updatedAt = updatedAt
     }
 }
@@ -116,44 +159,62 @@ final class TopShelfWriteCoordinator: @unchecked Sendable {
 /// group container isn't available (e.g. entitlement not provisioned), so the
 /// app never crashes or blocks on it.
 public enum TopShelfFeedStore {
-    private static let feedFileName = "feed.json"
-    private static let artworkRenderVersion = 2
-    private static let writeCoordinator = TopShelfWriteCoordinator()
+    private static let artworkRenderVersion = 3
+    /// Rendered card size. 16:9, large enough for the 2x shelf scale.
+    private static let artworkSize = CGSize(width: 1_280, height: 720)
+    private static let writeCoordinators: [TopShelfSection: TopShelfWriteCoordinator] =
+        Dictionary(uniqueKeysWithValues: TopShelfSection.allCases.map { ($0, TopShelfWriteCoordinator()) })
 
     /// True when the shared App Group directory actually exists on this device.
     /// Accessing `UserDefaults(suiteName:)` on an unprovisioned App Group causes
     /// cfprefsd to detach and hang on subsequent IPC locks. Using direct container
     /// files completely bypasses cfprefsd and avoids IPC stalls.
     public static var isAvailable: Bool {
+        groupContainerURL != nil
+    }
+
+    private static var groupContainerURL: URL? {
         FileManager.default.containerURL(
             forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-        ) != nil
+        )
     }
 
-    private static var feedFileURL: URL? {
-        guard let container = FileManager.default.containerURL(
-            forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-        ) else { return nil }
-        return container.appendingPathComponent(feedFileName)
+    /// Where the feeds and artwork live. tvOS only allows writes under
+    /// Library/Caches, App Group containers included: a write to the
+    /// container root fails on device (the simulator allows it).
+    private static var containerURL: URL? {
+        guard let base = groupContainerURL else { return nil }
+        let directory = base.appendingPathComponent("Library/Caches/TopShelf", isDirectory: true)
+        try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        return directory
     }
 
-    /// Called by the app whenever Continue Watching changes.
-    public static func write(_ entries: [TopShelfEntry]) {
-        guard isAvailable else { return }
+    private static func feedFileURL(for section: TopShelfSection) -> URL? {
+        containerURL?.appendingPathComponent(section.feedFileName)
+    }
+
+    /// Called by the app whenever a mirrored section changes. Writes for one
+    /// section are ordered; sections never block or reorder each other.
+    public static func write(
+        _ entries: [TopShelfEntry],
+        section: TopShelfSection = .continueWatching,
+        title: String? = nil
+    ) {
+        guard isAvailable, let writeCoordinator = writeCoordinators[section] else { return }
         let generation = writeCoordinator.beginWrite()
         Task.detached(priority: .utility) {
             let decoratedEntries = entries.map { entry in
-                guard entry.imageURL != nil, entry.subtitle != nil else { return entry }
+                guard entry.artworkSourceURL != nil else { return entry }
                 return entry.withArtworkFileName(artworkFileName(for: entry))
             }
             guard writeCoordinator.commitIfCurrent(generation, commit: {
-                writeFeed(decoratedEntries)
+                writeFeed(decoratedEntries, title: title, section: section)
             }) else { return }
 
             #if canImport(UIKit)
             await cacheArtwork(for: decoratedEntries)
             #endif
-            if let container = feedFileURL?.deletingLastPathComponent() {
+            if let container = containerURL {
                 TopShelfArtworkPruner.prune(in: container)
             }
             notifyTopShelfContentChanged()
@@ -164,16 +225,14 @@ public enum TopShelfFeedStore {
     /// read from their shared App Group.
     public static func artworkURL(for entry: TopShelfEntry) -> URL? {
         guard let artworkFileName = entry.artworkFileName,
-              let container = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-              ) else { return nil }
+              let container = containerURL else { return nil }
         let url = container.appendingPathComponent(artworkFileName)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    private static func writeFeed(_ entries: [TopShelfEntry]) {
-        guard let url = feedFileURL else { return }
-        let feed = TopShelfFeed(entries: entries)
+    private static func writeFeed(_ entries: [TopShelfEntry], title: String?, section: TopShelfSection) {
+        guard let url = feedFileURL(for: section) else { return }
+        let feed = TopShelfFeed(entries: entries, title: title)
         guard let data = try? JSONEncoder().encode(feed) else { return }
         TopShelfArtworkPruner.withFeedLock {
             try? data.write(to: url, options: .atomic)
@@ -184,7 +243,7 @@ public enum TopShelfFeedStore {
         let source = [
             String(artworkRenderVersion),
             entry.contentId,
-            entry.imageURL ?? "",
+            entry.artworkSourceURL ?? "",
             entry.subtitle ?? ""
         ]
             .joined(separator: "\u{1F}")
@@ -211,9 +270,8 @@ public enum TopShelfFeedStore {
         for entry in entries {
             guard let destination = artworkURLDestination(for: entry),
                   !FileManager.default.fileExists(atPath: destination.path),
-                  let sourceText = entry.imageURL,
-                  let sourceURL = URL(string: sourceText),
-                  let subtitle = entry.subtitle else { continue }
+                  let sourceText = entry.artworkSourceURL,
+                  let sourceURL = URL(string: sourceText) else { continue }
             #if DEBUG
             let itemStart = DispatchTime.now().uptimeNanoseconds
             print("[TVTrace] topShelf.cacheArtwork rendering entry=\(entry.contentId)")
@@ -221,7 +279,7 @@ public enum TopShelfFeedStore {
             do {
                 let (data, _) = try await URLSession.shared.data(from: sourceURL)
                 guard let image = UIImage(data: data),
-                      let rendered = renderedArtwork(from: image, subtitle: subtitle) else { continue }
+                      let rendered = renderedArtwork(from: image, subtitle: entry.subtitle) else { continue }
                 try rendered.write(to: destination, options: .atomic)
                 #if DEBUG
                 let elapsed = Double(DispatchTime.now().uptimeNanoseconds - itemStart) / 1_000_000
@@ -240,30 +298,31 @@ public enum TopShelfFeedStore {
 
     private static func artworkURLDestination(for entry: TopShelfEntry) -> URL? {
         guard let artworkFileName = entry.artworkFileName,
-              let container = FileManager.default.containerURL(
-                forSecurityApplicationGroupIdentifier: topShelfAppGroupID
-              ) else { return nil }
+              let container = containerURL else { return nil }
         return container.appendingPathComponent(artworkFileName)
     }
 
-    private static func renderedArtwork(from image: UIImage, subtitle: String) -> Data? {
-        let size = CGSize(width: 1_000, height: 1_500)
+    /// Renders a 16:9 card. Landscape art fills it; portrait art (a poster used
+    /// when no backdrop exists) sits centered over a dimmed, filled copy of
+    /// itself rather than being cropped to a sliver.
+    private static func renderedArtwork(from image: UIImage, subtitle: String?) -> Data? {
+        let size = artworkSize
         let renderer = UIGraphicsImageRenderer(size: size)
         let rendered = renderer.image { context in
             UIColor.black.setFill()
             context.fill(CGRect(origin: .zero, size: size))
 
-            let scale = max(size.width / image.size.width, size.height / image.size.height)
-            let imageSize = CGSize(width: image.size.width * scale, height: image.size.height * scale)
-            let imageRect = CGRect(
-                x: (size.width - imageSize.width) / 2,
-                y: (size.height - imageSize.height) / 2,
-                width: imageSize.width,
-                height: imageSize.height
-            )
-            image.draw(in: imageRect)
+            let fillRect = aspectRect(for: image.size, in: size, fill: true)
+            let isLandscape = image.size.width >= image.size.height * 1.2
+            if isLandscape {
+                image.draw(in: fillRect)
+            } else {
+                image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)
+                image.draw(in: aspectRect(for: image.size, in: size, fill: false))
+            }
 
-            let font = UIFont.systemFont(ofSize: 44, weight: .bold)
+            guard let subtitle else { return }
+            let font = UIFont.systemFont(ofSize: 40, weight: .bold)
             let style = NSMutableParagraphStyle()
             style.alignment = .center
             let attributes: [NSAttributedString.Key: Any] = [
@@ -272,13 +331,13 @@ public enum TopShelfFeedStore {
                 .paragraphStyle: style
             ]
             let textSize = (subtitle as NSString).size(withAttributes: attributes)
-            let horizontalPadding: CGFloat = 72
-            let maximumPillWidth = size.width - 88
+            let horizontalPadding: CGFloat = 64
+            let maximumPillWidth = size.width - 80
             let pillWidth = min(maximumPillWidth, ceil(textSize.width) + horizontalPadding)
-            let pillHeight = max(108, ceil(textSize.height) + 36)
+            let pillHeight = max(88, ceil(textSize.height) + 32)
             let pillRect = CGRect(
                 x: (size.width - pillWidth) / 2,
-                y: 44,
+                y: size.height - pillHeight - 40,
                 width: pillWidth,
                 height: pillHeight
             )
@@ -297,13 +356,26 @@ public enum TopShelfFeedStore {
                 withAttributes: attributes
             )
         }
-        return rendered.jpegData(compressionQuality: 0.9)
+        return rendered.jpegData(compressionQuality: 0.85)
+    }
+
+    private static func aspectRect(for imageSize: CGSize, in size: CGSize, fill: Bool) -> CGRect {
+        let widthScale = size.width / imageSize.width
+        let heightScale = size.height / imageSize.height
+        let scale = fill ? max(widthScale, heightScale) : min(widthScale, heightScale)
+        let scaled = CGSize(width: imageSize.width * scale, height: imageSize.height * scale)
+        return CGRect(
+            x: (size.width - scaled.width) / 2,
+            y: (size.height - scaled.height) / 2,
+            width: scaled.width,
+            height: scaled.height
+        )
     }
     #endif
 
-    /// Called by the Top Shelf extension to build the row.
-    public static func read() -> TopShelfFeed? {
-        guard let url = feedFileURL,
+    /// Called by the Top Shelf extension to build a row.
+    public static func read(_ section: TopShelfSection = .continueWatching) -> TopShelfFeed? {
+        guard let url = feedFileURL(for: section),
               let data = try? Data(contentsOf: url),
               let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else {
             return nil
@@ -325,10 +397,21 @@ enum TopShelfArtworkPruner {
 
     static func prune(in container: URL) {
         withFeedLock {
-            let feedURL = container.appendingPathComponent("feed.json")
-            guard let data = try? Data(contentsOf: feedURL),
-                  let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else { return }
-            let keep = Set(feed.entries.compactMap(\.artworkFileName))
+            // Every section's feed references artwork; keep anything any of
+            // them still points at. A section that was never written is
+            // skipped, but an unreadable one (or none at all) stops cleanup
+            // rather than risk deleting artwork it still uses.
+            var keep = Set<String>()
+            var readAnyFeed = false
+            for section in TopShelfSection.allCases {
+                let feedURL = container.appendingPathComponent(section.feedFileName)
+                guard FileManager.default.fileExists(atPath: feedURL.path) else { continue }
+                guard let data = try? Data(contentsOf: feedURL),
+                      let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else { return }
+                keep.formUnion(feed.entries.compactMap(\.artworkFileName))
+                readAnyFeed = true
+            }
+            guard readAnyFeed else { return }
             guard let files = try? FileManager.default.contentsOfDirectory(
                 at: container,
                 includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]

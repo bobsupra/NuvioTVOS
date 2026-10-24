@@ -80,19 +80,51 @@ final class TopShelfArtworkPrunerTests: XCTestCase {
         XCTAssertTrue(exists("unrelated.txt", in: directory))
     }
 
+    func testKeepsArtworkReferencedByAnySection() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let watching = "top-shelf-a1.jpg"
+        let library = "top-shelf-b2.jpg"
+        let obsolete = "top-shelf-c3.jpg"
+        for name in [watching, library, obsolete] { try Data([1]).write(to: directory.appendingPathComponent(name)) }
+        try writeFeed(artwork: [watching], to: directory)
+        try writeFeed(artwork: [library], to: directory, section: .library)
+
+        TopShelfArtworkPruner.prune(in: directory)
+
+        XCTAssertTrue(exists(watching, in: directory))
+        XCTAssertTrue(exists(library, in: directory))
+        XCTAssertFalse(exists(obsolete, in: directory))
+    }
+
+    func testUnreadableSectionFeedDoesNotDeleteArtwork() throws {
+        let directory = try makeDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let name = "top-shelf-a1.jpg"
+        try Data([1]).write(to: directory.appendingPathComponent(name))
+        try writeFeed(artwork: [], to: directory)
+        try Data("invalid json".utf8)
+            .write(to: directory.appendingPathComponent(TopShelfSection.library.feedFileName))
+
+        TopShelfArtworkPruner.prune(in: directory)
+
+        XCTAssertTrue(exists(name, in: directory))
+    }
+
     private func makeDirectory() throws -> URL {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("topshelf-pruner-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
         return directory
     }
 
-    private func writeFeed(artwork: [String], to directory: URL) throws {
+    private func writeFeed(artwork: [String], to directory: URL,
+                           section: TopShelfSection = .continueWatching) throws {
         let entries = artwork.map { name in
             TopShelfEntry(contentId: name, contentType: "movie", title: name,
                           subtitle: nil, imageURL: nil, progress: nil, artworkFileName: name)
         }
         try JSONEncoder().encode(TopShelfFeed(entries: entries))
-            .write(to: directory.appendingPathComponent("feed.json"), options: .atomic)
+            .write(to: directory.appendingPathComponent(section.feedFileName), options: .atomic)
     }
 
     private func exists(_ name: String, in directory: URL) -> Bool {

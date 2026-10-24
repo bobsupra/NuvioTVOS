@@ -10330,6 +10330,40 @@ final class TVHomeStore: ObservableObject {
         loadingContentIdentity = nil
         hasLoaded = true
         lastLoadedAt = Date()
+        // Collection tabs reuse this store; only the main Home feeds the shelf.
+        if identity.collectionScope == nil {
+            writeTopShelfFeed()
+        }
+    }
+
+    /// Mirrors the first populated catalog row on Home into the App Group for
+    /// the Top Shelf. Rows the shelf already covers (Continue Watching) and
+    /// rows that aren't plain title lists are skipped.
+    private func writeTopShelfFeed() {
+        guard TopShelfFeedStore.isAvailable else { return }
+        let skippedIds: Set<String> = [
+            TVHomeSection.continueWatchingId,
+            TVHomeSection.upcomingId,
+            TVHomeSection.localTitlesId,
+            TVHomeSection.jellyfinId,
+        ]
+        let row = sections.first {
+            !skippedIds.contains($0.id) && $0.collectionFolders.isEmpty
+                && !$0.isLoadingPlaceholder && !$0.items.isEmpty
+        }
+        let entries = (row?.items ?? []).prefix(15).map { meta in
+            TopShelfEntry(
+                contentId: meta.id,
+                contentType: meta.type,
+                title: meta.name,
+                subtitle: nil,
+                imageURL: meta.posterUrl,
+                backdropURL: meta.backdropUrl,
+                progress: nil,
+                action: .details
+            )
+        }
+        TopShelfFeedStore.write(Array(entries), section: .catalog, title: row?.title)
     }
 
     func cancelLoad(
