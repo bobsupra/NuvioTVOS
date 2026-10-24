@@ -96,7 +96,7 @@ class DetailsViewModel: ObservableObject {
                 || NuvioMeta.canonicalImdbID(from: cached.id) != nil
             uiState = DetailsUiState(
                 isLoading: false,
-                meta: cached,
+                meta: seedingCachedRatings(into: cached),
                 error: nil,
                 isInWatchlist: LibraryStore.contains(metaId: cached.id, type: cached.type),
                 isWatched: WatchedStore.contains(meta: cached)
@@ -119,7 +119,9 @@ class DetailsViewModel: ObservableObject {
                 self.didLoadMetadataSuccessfully = true
                 self.metadataLoadError = nil
                 
-                let resolvedMeta = meta.preservingEnrichment(from: self.uiState.meta)
+                let resolvedMeta = self.seedingCachedRatings(
+                    into: meta.preservingEnrichment(from: self.uiState.meta)
+                )
                 var primaryState = self.uiState
                 primaryState.meta = resolvedMeta
                 primaryState.isInWatchlist = LibraryStore.contains(metaId: resolvedMeta.id, type: resolvedMeta.type)
@@ -405,7 +407,18 @@ class DetailsViewModel: ObservableObject {
         guard isCurrentRequest(metaId: metaId, generation: generation) else { return }
         if !ratings.isEmpty, let currentMeta = uiState.meta {
             uiState.meta = currentMeta.withExternalRatings(ratings)
+            // The Home hero shows the same row; reuse this answer there.
+            AddonRatingsService.storeHomeHeroRatings(ratings, for: currentMeta)
         }
+    }
+
+    /// Ratings the Home hero already fetched for this title, so the Details
+    /// ratings row is there on the first frame instead of popping in.
+    private func seedingCachedRatings(into meta: NuvioMeta) -> NuvioMeta {
+        guard meta.externalRatings?.isEmpty ?? true,
+              let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta),
+              !cached.isEmpty else { return meta }
+        return meta.withExternalRatings(cached)
     }
 
     private func applyCertification(_ certification: String?, for metaId: String, generation: UInt64) {

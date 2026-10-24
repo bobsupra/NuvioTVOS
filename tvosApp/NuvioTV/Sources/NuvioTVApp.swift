@@ -3821,7 +3821,10 @@ extension CrossfadingBackdrop: Equatable {
 
 /// Small in-memory cache + loader for backdrop images so revisiting a poster is
 /// instant (no decode flicker) and repeated focus changes don't refetch.
-actor BackdropImageCache {
+/// A lock-protected class rather than an actor, so a view can read an image
+/// that is already decoded synchronously when it is created (rating icons are
+/// then drawn on the first frame instead of popping in after an actor hop).
+final class BackdropImageCache: @unchecked Sendable {
     static let shared = BackdropImageCache()
     private static let tracker = NSCacheMemoryTracker(
         maxCost: {
@@ -3841,6 +3844,7 @@ actor BackdropImageCache {
     }
 
     private let cache = NSCache<NSString, UIImage>()
+    private let lock = NSLock()
     private var inFlight: [String: Task<UIImage?, Never>] = [:]
 
     init() {
@@ -3852,9 +3856,7 @@ actor BackdropImageCache {
             object: nil,
             queue: nil
         ) { _ in
-            Task {
-                await BackdropImageCache.shared.purge()
-            }
+            BackdropImageCache.shared.purge()
         }
         #endif
     }
@@ -3866,26 +3868,49 @@ actor BackdropImageCache {
         Self.tracker.reset()
     }
 
-    func image(for url: URL) async -> UIImage? {
-        let key = url.absoluteString as NSString
-        if let cached = cache.object(forKey: key) { return cached }
-        if let pending = inFlight[url.absoluteString] { return await pending.value }
+    /// The decoded image when it is already in memory. Never downloads.
+    func cachedImage(for url: URL) -> UIImage? {
+        cache.object(forKey: url.absoluteString as NSString)
+    }
+
+    /// `minimumBytes` rejects error pages posing as artwork; small rating
+    /// icons pass 0. Non-HTTP responses (`data:` icon URLs) are accepted.
+    func image(
+        for url: URL,
+        priority: TaskPriority = .userInitiated,
+        minimumBytes: Int = 512
+    ) async -> UIImage? {
+        let key = url.absoluteString
+        if let cached = cache.object(forKey: key as NSString) { return cached }
         let pixelSize = Self.maxPixelSize
-        let task = Task.detached(priority: .userInitiated) { () -> UIImage? in
-            guard let (data, response) = try? await URLSession.shared.data(from: url),
-                  !Task.isCancelled,
-                  let http = response as? HTTPURLResponse,
-                  (200...299).contains(http.statusCode),
-                  data.count > 512 else { return nil }
-            return downsampleBackdropImage(data: data, maxPixelSize: pixelSize)
+        let task: Task<UIImage?, Never> = lock.withLock {
+            if let pending = inFlight[key] { return pending }
+            let task = Task.detached(priority: priority) { [weak self] () -> UIImage? in
+                var decoded: UIImage?
+                if let (data, response) = try? await URLSession.shared.data(from: url) {
+                    let statusOK = (response as? HTTPURLResponse).map { (200...299).contains($0.statusCode) } ?? true
+                    if statusOK, data.count > minimumBytes {
+                        decoded = downsampleBackdropImage(data: data, maxPixelSize: pixelSize)
+                    }
+                }
+                // Store before leaving the in-flight list, so a caller arriving
+                // in between finds the image instead of downloading it again.
+                self?.finishLoad(key: key, image: decoded)
+                return decoded
+            }
+            inFlight[key] = task
+            return task
         }
-        inFlight[url.absoluteString] = task
-        defer { inFlight[url.absoluteString] = nil }
-        guard let decoded = await task.value else { return nil }
-        let cost = decoded.decodedByteCost
-        cache.setObject(decoded, forKey: key, cost: cost)
-        Self.tracker.recordInsertion(cost: cost)
-        return decoded
+        return await task.value
+    }
+
+    private func finishLoad(key: String, image: UIImage?) {
+        if let image {
+            let cost = image.decodedByteCost
+            cache.setObject(image, forKey: key as NSString, cost: cost)
+            Self.tracker.recordInsertion(cost: cost)
+        }
+        lock.withLock { inFlight[key] = nil }
     }
 }
 
@@ -10365,7 +10390,8 @@ enum AppCacheManager {
     static func clearCache() async {
         // 1. Wipe poster data (memory + disk + URLSession)
         await PosterArtworkCache.clearAllArtwork()
-        await BackdropImageCache.shared.purge()
+        BackdropImageCache.shared.purge()
+        HomeHeroRatingsCache.shared.clear()
         await PersonProfileImageCache.shared.purge()
 
         // 2. Wipe catalog order & snapshots
@@ -11301,15 +11327,25 @@ private struct TVGridHeroSlideshowView: View {
             updateLibraryStatus()
         }
         .focusSection()
-        .task(id: "\(activeItem?.id ?? "")-\(homeHeroRatingSource)") {
+        .task(id: "\(activeItem?.id ?? "")-\(homeHeroRatingSource)-\(items.count)") {
             guard let item = activeItem,
-                  homeHeroRatingSource != "imdb",
-                  item.externalRatings == nil || item.externalRatings?.isEmpty == true,
-                  gridHeroRatings[item.id] == nil else { return }
-            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: item)
-            if !ratings.isEmpty {
-                gridHeroRatings[item.id] = ratings
+                  AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: item) else { return }
+            // The next slide's ratings, so the timer or Next shows them at once.
+            if items.count > 1 {
+                let next = items[(index + 1) % items.count]
+                if AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: next) {
+                    AddonRatingsService.prefetchHomeHeroRatings(for: [next])
+                }
             }
+            guard gridHeroRatings[item.id] == nil else { return }
+            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: item) {
+                // Keep them with the slide, so they survive the cache entry expiring.
+                gridHeroRatings[item.id] = cached
+                return
+            }
+            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: item)
+            guard !Task.isCancelled else { return }
+            gridHeroRatings[item.id] = ratings
         }
         .task(id: playTargetTaskIdentity) {
             await resolveCurrentHeroPlayTarget()
@@ -11463,6 +11499,14 @@ private struct TVGridHeroSlideshowView: View {
                 .id("hero-meta-\(item.id)")
                 .transition(.opacity)
 
+            // 2b. "All" rating source: the Details ratings row with icons.
+            if AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
+                TvHeroRatingsRow(badges: gridRatingBadges(for: item), iconHeight: 22, fontSize: 19)
+                    .shadow(color: .black.opacity(0.6), radius: 4, y: 2)
+                    .id("hero-ratings-\(item.id)")
+                    .transition(.opacity)
+            }
+
             // 3. Description (2 lines, clean Apple TV typography)
             if let description = item.description, !description.isEmpty {
                 Text(description)
@@ -11533,6 +11577,12 @@ private struct TVGridHeroSlideshowView: View {
         .padding(.bottom, 64)
     }
 
+    private func gridRatingBadges(for item: NuvioMeta) -> [TvRatingBadge] {
+        TvRatingBadge.badges(
+            from: AddonRatingsService.heroDisplayRatings(for: item, fetched: gridHeroRatings[item.id])
+        )
+    }
+
     private func metadataStrings(for item: NuvioMeta) -> [String] {
         let typeLabel = item.isSeries
             ? L10n.string("type_series", fallback: "Series")
@@ -11565,8 +11615,11 @@ private struct TVGridHeroSlideshowView: View {
                 heroBadge(cert)
             } else if let badge = item.statusBadgeLabel, !badge.isEmpty {
                 heroBadge(badge)
-            } else {
-                let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil) ?? gridHeroRatings[item.id]
+            } else if !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) {
+                // ("All" shows the full ratings row on its own line instead.)
+                let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
+                    ?? gridHeroRatings[item.id]
+                    ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
                 if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
                     heroBadge(ratingStr)
                 }
@@ -11726,7 +11779,12 @@ private struct TVGridHeroSlideshowView: View {
         if isInLibraryCache {
             return L10n.string("details_in_library", fallback: "In your library")
         }
-        let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil) ?? gridHeroRatings[item.id]
+        guard !AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource) else {
+            return "4K Ultra HD • HDR • Dolby Atmos"
+        }
+        let effectiveRatings = (item.externalRatings?.isEmpty == false ? item.externalRatings : nil)
+            ?? gridHeroRatings[item.id]
+            ?? AddonRatingsService.cachedHomeHeroRatings(for: item)
         if let ratingStr = AddonRatingsService.heroRatingString(for: item, source: homeHeroRatingSource, ratings: effectiveRatings) {
             return "\(ratingStr) • 4K Ultra HD • HDR"
         }
@@ -11852,7 +11910,10 @@ private struct TVHeroMetaLine: View {
     var episodeLine: String? = nil
     @AppStorage(SettingsKey.showFullDates) private var showFullDates = true
     @AppStorage(SettingsKey.homeHeroRatingSource) private var homeHeroRatingSource = "imdb"
-    @State private var fetchedRatings: [NuvioExternalRating] = []
+    @State private var fetchedRatings: [NuvioExternalRating]?
+    /// Which title/source `fetchedRatings` belong to, so a reused view never
+    /// shows the previous title's scores.
+    @State private var fetchedRatingsKey: String?
 
     var body: some View {
         let values = [
@@ -11863,13 +11924,30 @@ private struct TVHeroMetaLine: View {
         ].compactMap { $0 }.filter { !$0.isEmpty }
 
         let badge = meta.statusBadgeLabel
-        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil) ?? (fetchedRatings.isEmpty ? nil : fetchedRatings)
-        let rating = AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
+        // Same key as the ratings cache: enrichment can add an IMDb id to a
+        // kitsu:/tmdb: item, which must re-run the lookup below.
+        let ratingsKey = "\(AddonRatingsService.homeHeroRatingsKey(for: meta))-\(homeHeroRatingSource)"
+        let fetched = fetchedRatingsKey == ratingsKey ? fetchedRatings : nil
+        let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta)
+        let showsAllRatings = AddonRatingsService.heroShowsAllRatings(homeHeroRatingSource)
+        let ratingBadges = showsAllRatings
+            ? TvRatingBadge.badges(from: AddonRatingsService.heroDisplayRatings(for: meta, fetched: fetched))
+            : []
+        // Still waiting for MDBList/add-on scores: keep the ratings line.
+        let ratingsPending = showsAllRatings && fetched == nil && cached == nil
+        let effectiveRatings = (meta.externalRatings?.isEmpty == false ? meta.externalRatings : nil)
+            ?? nonEmpty(fetched)
+            ?? nonEmpty(cached)
+        let rating = showsAllRatings
+            ? nil
+            : AddonRatingsService.heroRatingString(for: meta, source: homeHeroRatingSource, ratings: effectiveRatings)
         // Movies have no status badge, so their rating would sit alone on the
         // second line; ride it on the primary line right after the date instead.
         let isMovie = !meta.isSeries
         let primaryValues = isMovie ? values + [rating].compactMap { $0 } : values
-        let showSecondLine = !isMovie && (badge != nil || rating != nil)
+        let showSecondLine = showsAllRatings
+            ? (badge != nil || !ratingBadges.isEmpty || ratingsPending)
+            : (!isMovie && (badge != nil || rating != nil))
         // An empty `Text("")` still consumes a full line height and, with the
         // hero VStack spacing, opens a dead gap between the title and the first
         // catalog row (e.g. "The Chi" → "gg"). Collapse entirely when blank.
@@ -11885,7 +11963,8 @@ private struct TVHeroMetaLine: View {
                             .lineLimit(1)
                     }
 
-                    // Second line, like the Android hero: "[ONGOING] • IMDb 7.4".
+                    // Second line, like the Android hero: "[ONGOING] • IMDb 7.4",
+                    // or with "All" the Details ratings row with icons.
                     if showSecondLine {
                         HStack(spacing: 14) {
                             if let badge {
@@ -11900,22 +11979,38 @@ private struct TVHeroMetaLine: View {
                                     )
                             }
 
-                            if let rating {
+                            if showsAllRatings {
+                                TvHeroRatingsRow(badges: ratingBadges, iconHeight: 26, fontSize: 22)
+                            } else if let rating {
                                 Text(badge != nil ? "•  \(rating)" : rating)
                                     .font(.custom("Inter-SemiBold", size: 22))
                                     .foregroundColor(.white.opacity(0.66))
                                     .lineLimit(1)
                             }
                         }
+                        .frame(minHeight: showsAllRatings ? 34 : nil, alignment: .leading)
                     }
                 }
             }
         }
-        .task(id: "\(meta.id)-\(homeHeroRatingSource)") {
-            if homeHeroRatingSource != "imdb" && (meta.externalRatings == nil || meta.externalRatings?.isEmpty == true) {
-                fetchedRatings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+        .task(id: ratingsKey) {
+            guard AddonRatingsService.heroNeedsFetchedRatings(source: homeHeroRatingSource, meta: meta) else { return }
+            if let cached = AddonRatingsService.cachedHomeHeroRatings(for: meta) {
+                // Keep them here too, so the row survives the cache entry expiring.
+                fetchedRatings = cached
+                fetchedRatingsKey = ratingsKey
+                return
             }
+            let ratings = await AddonRatingsService.fetchHomeHeroRatings(for: meta)
+            guard !Task.isCancelled else { return }
+            fetchedRatings = ratings
+            fetchedRatingsKey = ratingsKey
         }
+    }
+
+    private func nonEmpty(_ ratings: [NuvioExternalRating]?) -> [NuvioExternalRating]? {
+        guard let ratings, !ratings.isEmpty else { return nil }
+        return ratings
     }
 
     private var formattedRuntime: String? {

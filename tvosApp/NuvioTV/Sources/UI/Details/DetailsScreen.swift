@@ -4850,148 +4850,8 @@ private struct TvDetailsSummary: View {
     }
 
     private var externalRatingBadges: [TvRatingBadge] {
-        let ratings = Dictionary(
-            (meta.externalRatings ?? []).map { rating in
-                let key = rating.source.lowercased() == "mal" ? MdbListDetailsService.providerMyAnimeList : rating.source
-                return (key, rating)
-            },
-            uniquingKeysWith: { first, _ in first }
-        )
-        // 1. Built-in MDBList provider badges in priority order:
-        var badges = TvRatingVisual.all.compactMap { visual -> TvRatingBadge? in
-            guard let rating = ratings[visual.source] else { return nil }
-            return TvRatingBadge(visual: visual, rating: rating)
-        }
-        // 2. Extra rating badges provided by add-ons:
-        let builtInSources = Set(TvRatingVisual.all.map { $0.source.lowercased() })
-        let extraRatings = (meta.externalRatings ?? []).filter {
-            let lower = $0.source.lowercased()
-            return !builtInSources.contains(lower) && lower != "mal"
-        }
-        for extra in extraRatings {
-            let visual = TvRatingVisual(
-                source: extra.source,
-                displayName: extra.name ?? extra.source.capitalized,
-                assetName: nil,
-                iconUrl: extra.iconUrl.flatMap { URL(string: $0) },
-                iconWidth: 38,
-                color: Color(red: 0.96, green: 0.77, blue: 0.09),
-                format: { AddonRatingsService.formatRating(value: $0, max: extra.max) }
-            )
-            badges.append(TvRatingBadge(visual: visual, rating: extra))
-        }
-        return AddonRatingsService.sortRatings(badges, by: { $0.visual.source })
+        TvRatingBadge.badges(from: meta.externalRatings ?? [])
     }
-}
-
-private struct TvRatingBadge: Identifiable {
-    let visual: TvRatingVisual
-    let rating: NuvioExternalRating
-
-    var id: String { rating.source }
-}
-
-private struct TvRatingVisual {
-    let source: String
-    let displayName: String
-    let assetName: String?
-    let iconUrl: URL?
-    let iconWidth: CGFloat
-    let color: Color
-    let format: (Double) -> String
-
-    init(
-        source: String,
-        displayName: String,
-        assetName: String? = nil,
-        iconUrl: URL? = nil,
-        iconWidth: CGFloat,
-        color: Color,
-        format: @escaping (Double) -> String
-    ) {
-        self.source = source
-        self.displayName = displayName
-        self.assetName = assetName
-        self.iconUrl = iconUrl
-        self.iconWidth = iconWidth
-        self.color = color
-        self.format = format
-    }
-
-    static let all: [TvRatingVisual] = [
-        TvRatingVisual(
-            source: MdbListDetailsService.providerIMDb,
-            displayName: "IMDb",
-            assetName: "rating_imdb",
-            iconWidth: 68,
-            color: Color(red: 0.96, green: 0.77, blue: 0.09),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTMDB,
-            displayName: "TMDB",
-            assetName: "rating_tmdb",
-            iconWidth: 40,
-            color: Color(red: 0.00, green: 0.71, blue: 0.89),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTomatoes,
-            displayName: "Rotten Tomatoes",
-            assetName: "rating_rotten_tomatoes",
-            iconWidth: 38,
-            color: Color(red: 0.98, green: 0.20, blue: 0.04),
-            format: { "\(Int($0.rounded()))%" }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerAudience,
-            displayName: "Audience Score",
-            assetName: "rating_audience_score",
-            iconWidth: 31,
-            color: Color(red: 0.98, green: 0.20, blue: 0.04),
-            format: { "\(Int($0.rounded()))%" }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerMetacritic,
-            displayName: "Metacritic",
-            assetName: "rating_metacritic",
-            iconWidth: 38,
-            color: Color(red: 1.00, green: 0.80, blue: 0.20),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTrakt,
-            displayName: "Trakt",
-            assetName: "rating_trakt",
-            iconWidth: 38,
-            color: Color(red: 0.93, green: 0.11, blue: 0.14),
-            format: { String(Int($0.rounded())) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerLetterboxd,
-            displayName: "Letterboxd",
-            assetName: "rating_letterboxd",
-            iconWidth: 38,
-            color: Color(red: 0.00, green: 0.88, blue: 0.33),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerMyAnimeList,
-            displayName: "MyAnimeList",
-            assetName: "rating_myanimelist",
-            iconWidth: 42,
-            color: Color(red: 0.18, green: 0.32, blue: 0.64),
-            format: { String(format: "%.1f", $0) }
-        ),
-        TvRatingVisual(
-            source: MdbListDetailsService.providerTVDB,
-            displayName: "TVDB",
-            assetName: "rating_tvdb",
-            iconWidth: 42,
-            color: Color(red: 0.11, green: 0.66, blue: 0.31),
-            format: { $0 > 10 ? "\(Int($0.rounded()))%" : String(format: "%.1f", $0) }
-        ),
-    ]
 }
 
 private struct TvDetailsRatingsRow: View {
@@ -5002,37 +4862,9 @@ private struct TvDetailsRatingsRow: View {
             HStack(spacing: 26) {
                 ForEach(badges) { badge in
                     HStack(spacing: 9) {
-                        if let assetName = badge.visual.assetName {
-                            Image(assetName)
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: badge.visual.iconWidth, height: 38)
-                                .accessibilityLabel(badge.visual.displayName)
-                        } else if let iconUrl = badge.visual.iconUrl {
-                            AsyncImage(url: iconUrl) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                } else {
-                                    Image(systemName: "star.fill")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .foregroundColor(badge.visual.color)
-                                }
-                            }
-                            .frame(width: badge.visual.iconWidth, height: 38)
-                            .accessibilityLabel(badge.visual.displayName)
-                        } else {
-                            Image(systemName: "star.fill")
-                                .resizable()
-                                .scaledToFit()
-                                .frame(width: 24, height: 24)
-                                .foregroundColor(badge.visual.color)
-                                .accessibilityLabel(badge.visual.displayName)
-                        }
+                        TvRatingIcon(visual: badge.visual, height: 38)
 
-                        Text(badge.visual.format(badge.rating.value))
+                        Text(badge.formattedValue)
                             .font(.system(size: 28, weight: .regular))
                             .foregroundColor(.white.opacity(0.62))
                     }
@@ -7425,19 +7257,8 @@ private struct TvEpisodeCard: View {
                         ForEach(episodeRatingItems) { item in
                             HStack(spacing: 6) {
                                 if let iconUrl = item.iconUrl {
-                                    AsyncImage(url: iconUrl) { phase in
-                                        if let image = phase.image {
-                                            image
-                                                .resizable()
-                                                .scaledToFit()
-                                        } else {
-                                            Image(systemName: "star.fill")
-                                                .resizable()
-                                                .scaledToFit()
-                                                .foregroundColor(item.color)
-                                        }
-                                    }
-                                    .frame(width: 22, height: 22)
+                                    CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                        .frame(width: 22, height: 22)
                                 } else if let assetName = item.assetName {
                                     Image(assetName)
                                         .resizable()
@@ -7660,19 +7481,8 @@ private struct TvEpisodeCard: View {
                 ForEach(episodeRatingItems) { item in
                     HStack(spacing: 6) {
                         if let iconUrl = item.iconUrl {
-                            AsyncImage(url: iconUrl) { phase in
-                                if let image = phase.image {
-                                    image
-                                        .resizable()
-                                        .scaledToFit()
-                                } else {
-                                    Image(systemName: "star.fill")
-                                        .resizable()
-                                        .scaledToFit()
-                                        .foregroundColor(item.color)
-                                }
-                            }
-                            .frame(width: 22, height: 22)
+                            CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                .frame(width: 22, height: 22)
                         } else if let assetName = item.assetName {
                             Image(assetName)
                                 .resizable()
@@ -8196,19 +8006,8 @@ private struct TvStreamPickerOverlay: View {
                             ForEach(episodeRatingItems) { item in
                                 HStack(spacing: 6) {
                                     if let iconUrl = item.iconUrl {
-                                        AsyncImage(url: iconUrl) { phase in
-                                            if let image = phase.image {
-                                                image
-                                                    .resizable()
-                                                    .scaledToFit()
-                                            } else {
-                                                Image(systemName: "star.fill")
-                                                    .resizable()
-                                                    .scaledToFit()
-                                                    .foregroundColor(item.color)
-                                            }
-                                        }
-                                        .frame(width: 24, height: 24)
+                                        CachedRatingIcon(url: iconUrl, fallbackColor: item.color)
+                                            .frame(width: 24, height: 24)
                                     } else if let assetName = item.assetName {
                                         Image(assetName)
                                             .resizable()

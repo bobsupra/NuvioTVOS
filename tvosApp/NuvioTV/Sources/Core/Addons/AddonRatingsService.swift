@@ -640,17 +640,29 @@ enum AddonRatingsService {
 
     // MARK: - Home Hero Rating Source & Resolution
 
-    static let builtInHeroRatingSources: [HeroRatingSourceOption] = [
-        HeroRatingSourceOption(id: "imdb", displayName: "IMDb", addonName: nil),
-        HeroRatingSourceOption(id: "tmdb", displayName: "TMDB", addonName: nil),
-        HeroRatingSourceOption(id: "tomatoes", displayName: "Rotten Tomatoes", addonName: nil),
-        HeroRatingSourceOption(id: "metacritic", displayName: "Metacritic", addonName: nil),
-        HeroRatingSourceOption(id: "trakt", displayName: "Trakt", addonName: nil),
-        HeroRatingSourceOption(id: "letterboxd", displayName: "Letterboxd", addonName: nil),
-        HeroRatingSourceOption(id: "audience", displayName: "Audience Score", addonName: nil),
-        HeroRatingSourceOption(id: "myanimelist", displayName: "MyAnimeList", addonName: nil),
-        HeroRatingSourceOption(id: "tvdb", displayName: "TVDB", addonName: nil)
-    ]
+    /// Hero rating source that shows the full Details ratings row (icons, up
+    /// to five providers) instead of a single "IMDb 7.4" label.
+    static let heroAllRatingsSource = "all"
+
+    /// Computed so the "All" label follows an in-app language change.
+    static var builtInHeroRatingSources: [HeroRatingSourceOption] {
+        [
+            HeroRatingSourceOption(
+                id: heroAllRatingsSource,
+                displayName: L10n.string("tvos_layout_hero_rating_all", fallback: "All (as in Details)"),
+                addonName: nil
+            ),
+            HeroRatingSourceOption(id: "imdb", displayName: "IMDb", addonName: nil),
+            HeroRatingSourceOption(id: "tmdb", displayName: "TMDB", addonName: nil),
+            HeroRatingSourceOption(id: "tomatoes", displayName: "Rotten Tomatoes", addonName: nil),
+            HeroRatingSourceOption(id: "metacritic", displayName: "Metacritic", addonName: nil),
+            HeroRatingSourceOption(id: "trakt", displayName: "Trakt", addonName: nil),
+            HeroRatingSourceOption(id: "letterboxd", displayName: "Letterboxd", addonName: nil),
+            HeroRatingSourceOption(id: "audience", displayName: "Audience Score", addonName: nil),
+            HeroRatingSourceOption(id: "myanimelist", displayName: "MyAnimeList", addonName: nil),
+            HeroRatingSourceOption(id: "tvdb", displayName: "TVDB", addonName: nil)
+        ]
+    }
 
     static func availableHeroRatingSources(
         defaults: UserDefaults = ProfileSettings.current
@@ -717,6 +729,7 @@ enum AddonRatingsService {
 
     static func sampleRatingString(for source: String) -> String {
         switch source.lowercased() {
+        case heroAllRatingsSource: return "IMDb 8.6  ·  TMDB 86  ·  RT 92%"
         case "tmdb": return "TMDB 8.6"
         case "tomatoes", "rotten_tomatoes": return "Rotten Tomatoes 92%"
         case "metacritic": return "Metacritic 79"
@@ -740,21 +753,85 @@ enum AddonRatingsService {
         for meta: NuvioMeta,
         defaults: UserDefaults = ProfileSettings.current
     ) async -> [NuvioExternalRating] {
-        let cleanId = NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.id
-        if let cached = await HomeHeroRatingsCache.shared.cachedRatings(for: cleanId) {
+        let key = homeHeroRatingsKey(for: meta)
+        if let cached = HomeHeroRatingsCache.shared.cachedRatings(for: key) {
             return cached
         }
 
-        async let addonRatingsTask = fetchRatings(for: meta, defaults: defaults)
-        async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
-        let (addonRatings, mdbRatings) = await (addonRatingsTask, mdbRatingsTask)
+        // The hero, a prefetch of the next slide and Details can ask for the
+        // same title at once; they share one request.
+        let combined = await HomeHeroRatingsCache.shared.load(key: key) {
+            async let addonRatingsTask = fetchRatings(for: meta, defaults: defaults)
+            async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
+            let (addonRatings, mdbRatings) = await (addonRatingsTask, mdbRatingsTask)
 
-        var combined = mdbRatings + addonRatings
-        var seen = Set<String>()
-        combined = combined.filter { seen.insert($0.source.lowercased()).inserted }
-
-        await HomeHeroRatingsCache.shared.setRatings(combined, for: cleanId)
+            var seen = Set<String>()
+            return (mdbRatings + addonRatings).filter { seen.insert($0.source.lowercased()).inserted }
+        }
         return combined
+    }
+
+    /// Cache key shared by the hero and Details for one title.
+    static func homeHeroRatingsKey(for meta: NuvioMeta) -> String {
+        NuvioMeta.canonicalImdbID(from: meta.imdbId ?? meta.id) ?? meta.id
+    }
+
+    /// Ratings already fetched for this title, read synchronously so a view
+    /// can show them in the same frame it switches to the title.
+    static func cachedHomeHeroRatings(for meta: NuvioMeta) -> [NuvioExternalRating]? {
+        HomeHeroRatingsCache.shared.cachedRatings(for: homeHeroRatingsKey(for: meta))
+    }
+
+    /// Details fetches the same providers; keep its result for the hero.
+    static func storeHomeHeroRatings(_ ratings: [NuvioExternalRating], for meta: NuvioMeta) {
+        guard !ratings.isEmpty else { return }
+        var seen = Set<String>()
+        let unique = ratings.filter { seen.insert($0.source.lowercased()).inserted }
+        HomeHeroRatingsCache.shared.setRatings(unique, for: homeHeroRatingsKey(for: meta))
+    }
+
+    /// Warms the cache for titles about to be shown (the next hero slide).
+    static func prefetchHomeHeroRatings(for metas: [NuvioMeta]) {
+        for meta in metas where cachedHomeHeroRatings(for: meta) == nil {
+            Task.detached(priority: .utility) {
+                _ = await fetchHomeHeroRatings(for: meta)
+            }
+        }
+    }
+
+    static func heroShowsAllRatings(_ source: String) -> Bool {
+        source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() == heroAllRatingsSource
+    }
+
+    /// Whether the hero needs MDBList/add-on ratings for this title, beyond
+    /// the IMDb score every catalog item carries.
+    static func heroNeedsFetchedRatings(source: String, meta: NuvioMeta) -> Bool {
+        let clean = source.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if clean == heroAllRatingsSource { return true }
+        guard !clean.isEmpty, clean != "imdb" else { return false }
+        return meta.externalRatings?.isEmpty ?? true
+    }
+
+    /// The ratings the hero's "All" row shows: fetched ones first, then any
+    /// the catalog item carried, then the catalog IMDb score so the row is
+    /// never empty while the rest load.
+    static func heroDisplayRatings(
+        for meta: NuvioMeta,
+        fetched: [NuvioExternalRating]?
+    ) -> [NuvioExternalRating] {
+        var result: [NuvioExternalRating] = []
+        var seen = Set<String>()
+        func add(_ rating: NuvioExternalRating) {
+            guard rating.value.isFinite,
+                  seen.insert(normalizedSourceKey(rating.source)).inserted else { return }
+            result.append(rating)
+        }
+        (fetched ?? cachedHomeHeroRatings(for: meta) ?? []).forEach(add)
+        (meta.externalRatings ?? []).forEach(add)
+        if let imdb = meta.rating, imdb > 0 {
+            add(NuvioExternalRating(source: MdbListDetailsService.providerIMDb, value: imdb, max: 10))
+        }
+        return result
     }
 
     private static func isSourceMatch(requested: String, actual: String) -> Bool {
@@ -781,21 +858,80 @@ struct HeroRatingSourceOption: Identifiable, Hashable, Sendable {
     }
 }
 
-/// Thread-safe in-memory cache for Home Hero external ratings.
-actor HomeHeroRatingsCache {
+/// Thread-safe in-memory cache for Home Hero external ratings, shared with
+/// Details. A lock instead of an actor so views read it synchronously while
+/// they render; entries expire so scores do not go stale over a long session.
+final class HomeHeroRatingsCache: @unchecked Sendable {
     static let shared = HomeHeroRatingsCache()
-    private var cache: [String: [NuvioExternalRating]] = [:]
+
+    private static let timeToLive: TimeInterval = 30 * 60
+    /// A title with no ratings may simply have hit a timeout; retry sooner.
+    private static let emptyTimeToLive: TimeInterval = 2 * 60
+    private static let maxEntries = 400
+
+    private struct Entry {
+        let ratings: [NuvioExternalRating]
+        let storedAt: Date
+    }
+
+    private let lock = NSLock()
+    private var cache: [String: Entry] = [:]
+    private var inFlight: [String: Task<[NuvioExternalRating], Never>] = [:]
 
     func cachedRatings(for key: String) -> [NuvioExternalRating]? {
-        cache[key.lowercased()]
+        let key = key.lowercased()
+        return lock.withLock {
+            guard let entry = cache[key] else { return nil }
+            let lifetime = entry.ratings.isEmpty ? Self.emptyTimeToLive : Self.timeToLive
+            guard Date().timeIntervalSince(entry.storedAt) < lifetime else {
+                cache[key] = nil
+                return nil
+            }
+            return entry.ratings
+        }
     }
 
     func setRatings(_ ratings: [NuvioExternalRating], for key: String) {
-        cache[key.lowercased()] = ratings
+        let key = key.lowercased()
+        lock.withLock {
+            if cache[key] == nil, cache.count >= Self.maxEntries {
+                // Drop the oldest quarter rather than one entry per insert.
+                let oldest = cache.sorted { $0.value.storedAt < $1.value.storedAt }
+                    .prefix(Self.maxEntries / 4)
+                    .map(\.key)
+                oldest.forEach { cache[$0] = nil }
+            }
+            cache[key] = Entry(ratings: ratings, storedAt: Date())
+        }
+    }
+
+    /// Runs `fetch` once per key at a time; later callers wait for the same
+    /// result. The result is stored before anyone is answered.
+    func load(
+        key: String,
+        fetch: @escaping @Sendable () async -> [NuvioExternalRating]
+    ) async -> [NuvioExternalRating] {
+        let key = key.lowercased()
+        let task: Task<[NuvioExternalRating], Never> = lock.withLock {
+            if let existing = inFlight[key] { return existing }
+            let task = Task.detached(priority: .userInitiated) { [weak self] () -> [NuvioExternalRating] in
+                let ratings = await fetch()
+                self?.finish(key: key, ratings: ratings)
+                return ratings
+            }
+            inFlight[key] = task
+            return task
+        }
+        return await task.value
+    }
+
+    private func finish(key: String, ratings: [NuvioExternalRating]) {
+        setRatings(ratings, for: key)
+        lock.withLock { inFlight[key] = nil }
     }
 
     func clear() {
-        cache.removeAll()
+        lock.withLock { cache.removeAll() }
     }
 }
 
