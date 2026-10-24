@@ -307,6 +307,19 @@ final class CinemetaCatalogRepository: CatalogRepository {
     private(set) var homeCatalogLoadWasPartial = false
     private(set) var homeCatalogFailureSignature: String?
 
+    /// Identifies the profile-scoped sources available to Search. Both search
+    /// layouts use this to discard cached results after a catalog toggle or sync.
+    static var searchSourceSignature: String {
+        [
+            ProfileSettings.activeProfileID ?? "default",
+            isCinemetaEnabled ? "1" : "0",
+            configuredStreamAddonManifestURLs.map(\.absoluteString).joined(separator: ","),
+            TVHomeCatalogOrder.disabledCatalogKeys().sorted().joined(separator: ","),
+            TVHomeCatalogOrder.disabledAddonIDs().sorted().joined(separator: ","),
+            TVHomeCatalogOrder.disabledAddonNames().sorted().joined(separator: ",")
+        ].joined(separator: "|")
+    }
+
     /// Everything a Home request reads before it can decide which rows exist.
     /// Sorted so an unordered set or dictionary cannot produce a spurious
     /// difference between two otherwise identical snapshots.
@@ -1688,6 +1701,38 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
+    /// Home toggles are keyed by add-on, media type and catalog ID. Search-only
+    /// endpoints have no Home row of their own, so they follow the visibility
+    /// of the add-on's browseable catalogs of the same media type (if any).
+    static func shouldSearchCatalog(
+        _ catalog: AddonManifestCatalog,
+        in catalogs: [AddonManifestCatalog],
+        addonID: String,
+        addonName: String,
+        disabledKeys: Set<String>,
+        disabledAddonIDs: Set<String>,
+        disabledAddonNames: Set<String>
+    ) -> Bool {
+        guard !disabledAddonIDs.contains(addonID),
+              !disabledAddonNames.contains(TVHomeCatalogOrder.normalizedAddonSourceName(addonName)) else {
+            return false
+        }
+        func isDisabled(_ candidate: AddonManifestCatalog) -> Bool {
+            disabledKeys.contains(TVHomeCatalogOrder.catalogSettingsKey(
+                addonId: addonID, contentType: candidate.type, catalogId: candidate.id
+            ))
+        }
+        guard !isDisabled(catalog) else { return false }
+        guard !catalog.eligibleForHome else { return true }
+
+        let browseable = catalogs.filter {
+            $0.type == catalog.type && $0.eligibleForHome
+                && (!$0.requiresGenre || $0.firstGenreOption != nil)
+        }
+        // A search-only add-on with no Home catalogs must remain searchable.
+        return browseable.isEmpty || browseable.contains(where: { !isDisabled($0) })
+    }
+
     func search(query: String) async throws -> [NuvioMeta] {
         let metadataContext = Self.metadataCacheContext
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -1702,27 +1747,34 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
 
         var targets: [SearchTarget] = []
+        let disabledKeys = TVHomeCatalogOrder.disabledCatalogKeys()
+        let disabledAddonIDs = TVHomeCatalogOrder.disabledAddonIDs()
+        let disabledAddonNames = TVHomeCatalogOrder.disabledAddonNames()
 
-        // 1. Cinemeta default targets (always available immediately when enabled)
-        if Self.isCinemetaEnabled {
-            targets.append(
-                SearchTarget(
-                    addonName: "Cinemeta",
-                    baseURL: baseURL,
-                    type: "movie",
-                    catalogId: "top",
-                    isAddon: false
-                )
+        // Cinemeta searches through /top, but that endpoint serves general
+        // search even when the Top Rated Home row is the one still enabled.
+        let cinemetaVisible = Self.isCinemetaEnabled
+            && !disabledAddonIDs.contains(Self.cinemetaAddonId)
+            && !disabledAddonNames.contains(
+                TVHomeCatalogOrder.normalizedAddonSourceName(Self.cinemetaDisplayName)
             )
-            targets.append(
-                SearchTarget(
-                    addonName: "Cinemeta",
-                    baseURL: baseURL,
-                    type: "series",
-                    catalogId: "top",
-                    isAddon: false
-                )
-            )
+        if cinemetaVisible {
+            for type in ["movie", "series"] {
+                let hasVisibleRow = ["top", "imdbRating"].contains { catalogID in
+                    !disabledKeys.contains(TVHomeCatalogOrder.catalogSettingsKey(
+                        addonId: Self.cinemetaAddonId, contentType: type, catalogId: catalogID
+                    ))
+                }
+                if hasVisibleRow {
+                    targets.append(SearchTarget(
+                        addonName: Self.cinemetaDisplayName,
+                        baseURL: baseURL,
+                        type: type,
+                        catalogId: "top",
+                        isAddon: false
+                    ))
+                }
+            }
         }
 
         // 2. Discover search-capable targets from configured add-ons in parallel
@@ -1741,10 +1793,21 @@ final class CinemetaCatalogRepository: CatalogRepository {
                     ? manifestURL.deletingLastPathComponent()
                     : manifestURL
 
-                for catalog in manifest.catalogs ?? [] where catalog.supportsSearch {
+                let addonName = manifest.displayName ?? Self.streamAddonName(for: manifestURL)
+                let catalogs = manifest.catalogs ?? []
+                for catalog in catalogs where catalog.supportsSearch {
+                    guard Self.shouldSearchCatalog(
+                        catalog,
+                        in: catalogs,
+                        addonID: manifest.id,
+                        addonName: addonName,
+                        disabledKeys: disabledKeys,
+                        disabledAddonIDs: disabledAddonIDs,
+                        disabledAddonNames: disabledAddonNames
+                    ) else { continue }
                     targets.append(
                         SearchTarget(
-                            addonName: manifest.displayName ?? Self.streamAddonName(for: manifestURL),
+                            addonName: addonName,
                             baseURL: sourceBaseURL,
                             type: catalog.type,
                             catalogId: catalog.id,
@@ -1755,12 +1818,8 @@ final class CinemetaCatalogRepository: CatalogRepository {
             }
         }
 
-        if targets.isEmpty {
-            targets = [
-                SearchTarget(addonName: "Cinemeta", baseURL: baseURL, type: "movie", catalogId: "top", isAddon: false),
-                SearchTarget(addonName: "Cinemeta", baseURL: baseURL, type: "series", catalogId: "top", isAddon: false)
-            ]
-        }
+        // Do not silently re-enable Cinemeta when the user hid every source.
+        guard !targets.isEmpty else { return [] }
 
         guard !Task.isCancelled else { return [] }
 

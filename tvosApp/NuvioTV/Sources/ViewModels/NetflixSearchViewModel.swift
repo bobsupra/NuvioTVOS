@@ -30,6 +30,7 @@ class NetflixSearchViewModel: ObservableObject {
     /// enriched results once the background enrichment finishes.
     private var cachedResults: [String: [NuvioMeta]] = [:]
     private var cacheOrder: [String] = []
+    private var cachedSourceSignature = CinemetaCatalogRepository.searchSourceSignature
     private var sessionCommittedQuery: String?
 
     init(
@@ -55,6 +56,15 @@ class NetflixSearchViewModel: ObservableObject {
                 self?.performSearch(query: text)
             }
             .store(in: &cancellables)
+
+        // Home toggles and incoming profile sync must invalidate in-memory
+        // search results rather than reusing posters from disabled catalogs.
+        for name in [TVHomeCatalogOrder.changedNotification, TVHomeCatalogOrder.snapshotChangedNotification] {
+            NotificationCenter.default.publisher(for: name)
+                .receive(on: DispatchQueue.main)
+                .sink { [weak self] _ in self?.searchSourcesDidChange() }
+                .store(in: &cancellables)
+        }
     }
 
     var hasQuery: Bool {
@@ -62,6 +72,7 @@ class NetflixSearchViewModel: ObservableObject {
     }
 
     private func handleQueryChange(_ query: String) {
+        invalidateSourceCacheIfNeeded()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else {
             searchGeneration &+= 1
@@ -100,6 +111,7 @@ class NetflixSearchViewModel: ObservableObject {
     }
 
     func performSearch(query: String) {
+        invalidateSourceCacheIfNeeded()
         let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
         let cacheKey = trimmed.folding(options: [.caseInsensitive, .diacriticInsensitive], locale: .current)
         searchGeneration &+= 1
@@ -254,6 +266,29 @@ class NetflixSearchViewModel: ObservableObject {
         sessionCommittedQuery = newSession
         recentSearches = updated
         SearchHistoryStore.save(updated)
+    }
+
+    private func searchSourcesDidChange() {
+        guard invalidateSourceCacheIfNeeded() else { return }
+        if hasQuery { performSearch(query: searchText) }
+    }
+
+    @discardableResult
+    private func invalidateSourceCacheIfNeeded() -> Bool {
+        let signature = CinemetaCatalogRepository.searchSourceSignature
+        guard signature != cachedSourceSignature else { return false }
+        cachedSourceSignature = signature
+        searchGeneration &+= 1
+        searchTimeoutTask?.cancel()
+        searchTask?.cancel()
+        enrichmentTask?.cancel()
+        cachedResults.removeAll()
+        cacheOrder.removeAll()
+        allResults = []
+        results = []
+        error = nil
+        isLoading = false
+        return true
     }
 
     private func cache(_ results: [NuvioMeta], for key: String) {
