@@ -857,9 +857,15 @@ struct StreamAddonStreamDTO: Decodable {
     let clientResolve: StreamAddonClientResolveDTO?
     let notPlayable: Bool?
     let action: Bool?
+    /// Stremio Usenet stream fields: the NZB, the add-on's NNTP servers
+    /// (`nntps://user:pass@host:563/5`) and the file to pick in a multi-file NZB.
+    var nzbUrl: String? = nil
+    var servers: [String]? = nil
+    var fileMustInclude: [String]? = nil
 
     enum CodingKeys: String, CodingKey {
         case url, externalUrl, name, title, description, subtitles, behaviorHints, infoHash, fileIdx, sources, clientResolve, notPlayable, action
+        case nzbUrl, servers, fileMustInclude
     }
 
     init(
@@ -915,6 +921,13 @@ struct StreamAddonStreamDTO: Decodable {
         }
         self.sources = (try? container.decodeIfPresent([String?].self, forKey: .sources))?.compactMap { $0 }
         self.clientResolve = try? container.decodeIfPresent(StreamAddonClientResolveDTO.self, forKey: .clientResolve)
+        self.nzbUrl = try? container.decodeIfPresent(String.self, forKey: .nzbUrl)
+        self.servers = (try? container.decodeIfPresent([String?].self, forKey: .servers))?.compactMap { $0 }
+        if let list = try? container.decodeIfPresent([String].self, forKey: .fileMustInclude) {
+            self.fileMustInclude = list
+        } else if let single = try? container.decodeIfPresent(String.self, forKey: .fileMustInclude) {
+            self.fileMustInclude = [single]
+        }
 
         if let b = try? container.decodeIfPresent(Bool.self, forKey: .notPlayable) {
             self.notPlayable = b
@@ -937,11 +950,26 @@ struct StreamAddonStreamDTO: Decodable {
         }
     }
 
+    /// A Usenet stream, carried as a `nuvio-usenet://` URL until playback.
+    var usenetSpec: UsenetStreamSpec? {
+        guard let raw = nzbUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty,
+              let nzb = URL(string: raw), let scheme = nzb.scheme?.lowercased(),
+              scheme == "http" || scheme == "https" else { return nil }
+        let patterns = (fileMustInclude ?? []).map(UsenetReleaseResolver.normalizedPattern).filter { !$0.isEmpty }
+        return UsenetStreamSpec(
+            nzbURL: nzb,
+            servers: (servers ?? []).compactMap(UsenetServerConfig.init(url:)),
+            fileMustInclude: patterns.isEmpty ? nil : patterns.map { "(?:\($0))" }.joined(separator: "|"),
+            fileIdx: fileIdx
+        )
+    }
+
     func toNuvioStream(addonName: String) -> NuvioStream? {
         let resolve = clientResolve
+        let usenet = usenetSpec
         let parsed = TorrentSourceParser.parse(
-            urls: [url, externalUrl, resolve?.magnetUri],
-            infoHash: infoHash ?? resolve?.infoHash,
+            urls: [usenet?.url.absoluteString ?? url, externalUrl, resolve?.magnetUri],
+            infoHash: usenet == nil ? (infoHash ?? resolve?.infoHash) : nil,
             fileIdx: fileIdx ?? resolve?.fileIdx
         )
         guard parsed.directURL != nil || parsed.infoHash != nil else { return nil }

@@ -691,6 +691,13 @@ class PlayerViewModel: ObservableObject {
                 }
             }
             .store(in: &cancellables)
+        UsenetEngineManager.shared.$damagedStreamURL
+            .receive(on: DispatchQueue.main)
+            .sink { [weak self] url in
+                guard let self, let url else { return }
+                self.handleUsenetDamage(url)
+            }
+            .store(in: &cancellables)
         NotificationCenter.default.addObserver(
             self,
             selector: #selector(handleAudioRouteChange),
@@ -1439,11 +1446,15 @@ class PlayerViewModel: ObservableObject {
             }
             self.currentEpisodeVideo = currentEpisode
         }
-        if TorrentEngineManager.shared.activeStreamURL == url {
+        // Usenet streams use the same local-server lifecycle as torrents.
+        if TorrentEngineManager.shared.activeStreamURL == url || UsenetEngineManager.shared.activeStreamURL == url {
             sessionCoordinator.torrentStreamSourceURL = url
         }
         self.activeStreamURL = url.absoluteString
         self.activeHTTPHeaders = httpHeaders
+        if UsenetEngineManager.shared.damagedStreamURL == url {
+            Task { @MainActor [weak self] in self?.handleUsenetDamage(url) }
+        }
         if !isStandalonePlaybackSession && watchPartyPlayerBridge == nil {
             postPlayController.start(
                 contentId: meta.id,
@@ -2611,6 +2622,18 @@ class PlayerViewModel: ObservableObject {
         return ContinueWatchingStore.item(for: meta.id)?.resumePosition
     }
 
+    /// The playing Usenet release turned out too damaged (long runs of
+    /// missing articles): switch to the next source at the current position,
+    /// the same way a failed stream does.
+    private func handleUsenetDamage(_ url: URL) {
+        guard activeStreamURL == url.absoluteString, !didShutdown, !isFailingOver else { return }
+        failedStreamURLs.insert(url.absoluteString)
+        attemptFailover(
+            reason: L10n.string("usenet_error_damaged", fallback: "This Usenet release is too damaged to play, and no other source worked."),
+            toast: L10n.string("usenet_switching_damaged", fallback: "Release damaged — switching source")
+        )
+    }
+
     /// A stream died or never started. Remember the position, pick the next
     /// viable source (excluding failed URLs), and switch silently. The error
     /// overlay only appears when every candidate is exhausted.
@@ -2878,6 +2901,18 @@ class PlayerViewModel: ObservableObject {
                 info.diskBufferSeconds = diskLeadAhead
             }
             info.concurrency = diskCacheConcurrencyStr
+            let usenet = UsenetEngineManager.shared
+            if let usenetURL = usenet.activeStreamURL, usenetURL.absoluteString == activeStreamURL {
+                let stats = usenet.activeStats
+                info.provider = stats.kind == UsenetStreamSource.Kind.rar.rawValue ? "Usenet · RAR" : "Usenet"
+                if !stats.server.isEmpty { info.server = stats.server }
+                if !stats.fileName.isEmpty {
+                    info.fileName = (stats.fileName as NSString).lastPathComponent
+                    let ext = (stats.fileName as NSString).pathExtension
+                    if !ext.isEmpty { info.fileExtension = ext.uppercased() }
+                }
+                if stats.fileSize > 0 { info.size = Self.formatFileSize(stats.fileSize) }
+            }
         }
     }
 
@@ -4122,7 +4157,10 @@ class PlayerViewModel: ObservableObject {
         shutdown(preservingPictureInPicture: false)
         if let sourceURL {
             // Server URLs carry unique session tokens; a delayed exit cannot stop a successor.
-            Task { await TorrentEngineManager.shared.stopActiveStream(for: sourceURL) }
+            Task {
+                await TorrentEngineManager.shared.stopActiveStream(for: sourceURL)
+                await UsenetEngineManager.shared.stopActiveStream(for: sourceURL)
+            }
         }
     }
 

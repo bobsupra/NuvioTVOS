@@ -143,6 +143,7 @@ extension PlayerView {
                     Task {
                         guard let sourceURL else { return }
                         await TorrentEngineManager.shared.stopActiveStream(for: sourceURL)
+                        await UsenetEngineManager.shared.stopActiveStream(for: sourceURL)
                     }
                 }
             }

@@ -291,6 +291,7 @@ struct PlayerLoadingOverlay: View {
     @State private var logoLoadFailed = false
     @State private var mountedDate = Date()
     @ObservedObject private var torrentManager = TorrentEngineManager.shared
+    @ObservedObject private var usenetManager = UsenetEngineManager.shared
 
     private var effectiveStartTime: Date {
         startTime ?? mountedDate
@@ -452,6 +453,66 @@ struct PlayerLoadingOverlay: View {
                             Text(L10n.string("player_torrent_peers", fallback: "peers"))
                                 .font(.system(size: 12, weight: .medium))
                                 .foregroundColor(.white.opacity(0.7))
+                        }
+                    }
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 5)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.45))
+                            .overlay(
+                                Capsule()
+                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                            )
+                    )
+                    .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
+                }
+
+                if showLoadingStatus && usenetManager.isStreaming && !TorrentSettings.hideStats() {
+                    let stats = usenetManager.activeStats
+                    HStack(spacing: 12) {
+                        HStack(spacing: 5) {
+                            Image(systemName: "arrow.down.circle.fill")
+                                .font(.system(size: 13))
+                                .foregroundColor(.green)
+                            Text(stats.downloadRateFormatted)
+                                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                        }
+
+                        Text("•")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.4))
+
+                        HStack(spacing: 4) {
+                            Text(stats.connectionsText)
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                .foregroundColor(.green)
+                            Text(L10n.string("player_usenet_connections", fallback: "connections"))
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+
+                        Text("•")
+                            .font(.system(size: 11))
+                            .foregroundColor(.white.opacity(0.4))
+
+                        HStack(spacing: 4) {
+                            Text(stats.bufferedFormatted)
+                                .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                .foregroundColor(.blue)
+                            Text(L10n.string("player_usenet_buffered", fallback: "buffered"))
+                                .font(.system(size: 12, weight: .medium))
+                                .foregroundColor(.white.opacity(0.7))
+                        }
+
+                        if stats.missingArticles > 0 {
+                            Text("•")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+                            Text(L10n.format("player_usenet_missing", fallback: "%d missing", stats.missingArticles))
+                                .font(.system(size: 12, weight: .semibold))
+                                .foregroundColor(.orange)
                         }
                     }
                     .foregroundColor(.white)

@@ -4202,6 +4202,8 @@ private struct IntegrationSettingsView: View {
 
             SMBSettingsSection(accentColor: accentColor)
 
+            UsenetSettingsSection(accentColor: accentColor)
+
             JellyfinSettingsSection(accentColor: accentColor)
         }
         .onAppear {
@@ -15654,3 +15656,336 @@ struct SettingsView_Previews: PreviewProvider {
     }
 }
 #endif
+
+
+// MARK: - Usenet
+
+/// Usenet providers for on-device NZB streaming. Server details live in the
+/// profile's settings, passwords in Keychain (`UsenetCredentialStore`).
+@MainActor
+private final class UsenetSettingsModel: ObservableObject {
+    enum TestState: Equatable {
+        case idle
+        case testing
+        case ok
+        case failed(String)
+    }
+
+    @Published var servers: [UsenetSavedServer] = UsenetSettings.servers()
+    @Published var tests: [String: TestState] = [:]
+
+    func reload() { servers = UsenetSettings.servers() }
+
+    func remove(_ server: UsenetSavedServer) {
+        UsenetSettings.remove(server.id)
+        tests[server.id] = nil
+        reload()
+    }
+
+    func test(_ server: UsenetSavedServer) {
+        tests[server.id] = .testing
+        let config = server.config(password: UsenetCredentialStore.password(forServerID: server.id))
+        Task {
+            let connection = UsenetNNTPConnection(config: config)
+            do {
+                try await connection.open()
+                await connection.close()
+                tests[server.id] = .ok
+            } catch let error as UsenetNNTPError {
+                await connection.close()
+                tests[server.id] = .failed(UsenetConnectionPool.describe(error))
+            } catch {
+                await connection.close()
+                tests[server.id] = .failed(error.localizedDescription)
+            }
+        }
+    }
+}
+
+private struct UsenetSettingsSection: View {
+    let accentColor: Color
+
+    @StateObject private var model = UsenetSettingsModel()
+    @State private var editingServer: UsenetSavedServer?
+    @State private var isAddingServer = false
+    @State private var profile = UsenetSettings.profile().rawValue
+    @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
+    @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("usenet_group_title", fallback: "Usenet"),
+            subtitle: L10n.string("usenet_group_subtitle", fallback: "Stream NZB sources on this Apple TV with your own Usenet provider")
+        ) {
+            SettingsActionRow(
+                title: L10n.string("usenet_add_server", fallback: "Add Server"),
+                subtitle: L10n.string("usenet_add_server_subtitle", fallback: "Host, port and login of your provider (e.g. Eweka, Newshosting)"),
+                value: "",
+                accentColor: accentColor
+            ) {
+                isAddingServer = true
+            }
+
+            ForEach(model.servers) { server in
+                UsenetServerRow(
+                    server: server,
+                    accentColor: accentColor,
+                    testState: model.tests[server.id] ?? .idle,
+                    onEdit: { editingServer = server },
+                    onTest: { model.test(server) },
+                    onDelete: { model.remove(server) }
+                )
+            }
+
+            SettingsChoiceRow(
+                title: L10n.string("usenet_profile_title", fallback: "Performance Profile"),
+                subtitle: L10n.string("usenet_profile_subtitle", fallback: "Memory for buffered articles and how far ahead to read (32 / 64 / 128 MB)"),
+                selection: $profile,
+                options: UsenetMemoryProfile.allCases.map(\.rawValue),
+                optionLabels: Dictionary(uniqueKeysWithValues: UsenetMemoryProfile.allCases.map { ($0.rawValue, $0.title) }),
+                accentColor: accentColor
+            )
+
+            SettingsChoiceRow(
+                title: L10n.string("usenet_speed_limit_title", fallback: "Speed Limit"),
+                subtitle: L10n.string("usenet_speed_limit_subtitle", fallback: "Cap downloads while playing so buffering doesn't saturate your connection. 1080p needs about 5–10 Mbit/s, 4K remux up to 80."),
+                selection: $speedLimit,
+                options: UsenetSettings.speedLimitOptions.map(String.init),
+                optionLabels: Dictionary(uniqueKeysWithValues: UsenetSettings.speedLimitOptions.map {
+                    (String($0), $0 == 0 ? L10n.string("usenet_speed_unlimited", fallback: "Unlimited") : "\($0) Mbit/s")
+                }),
+                accentColor: accentColor
+            )
+
+            SettingsToggleRow(
+                title: L10n.string("usenet_prefer_own_title", fallback: "Always Use My Servers"),
+                subtitle: L10n.string("usenet_prefer_own_subtitle", fallback: "Ignore servers an add-on sends with its streams. When off, yours are the fallback."),
+                isOn: $prefersOwnServers,
+                accentColor: accentColor
+            )
+        }
+        .onChange(of: profile) { _, value in
+            UsenetSettings.setProfile(UsenetMemoryProfile(rawValue: value) ?? .balanced)
+        }
+        .onChange(of: prefersOwnServers) { _, value in
+            UsenetSettings.setPrefersOwnServers(value)
+        }
+        .onChange(of: speedLimit) { _, value in
+            UsenetSettings.setSpeedLimitMbps(Int(value) ?? 0)
+        }
+        .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
+            model.reload()
+        }
+        .sheet(isPresented: $isAddingServer) {
+            UsenetServerEditSheet(server: nil, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+        .sheet(item: $editingServer) { server in
+            UsenetServerEditSheet(server: server, accentColor: accentColor)
+                .modifier(ClearPresentationBackgroundIfAvailable())
+        }
+    }
+}
+
+private struct UsenetServerRow: View {
+    let server: UsenetSavedServer
+    let accentColor: Color
+    let testState: UsenetSettingsModel.TestState
+    let onEdit: () -> Void
+    let onTest: () -> Void
+    let onDelete: () -> Void
+
+    @FocusState private var isFocused: Bool
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Button(action: onEdit) {
+                SettingsRowShell(isFocused: isFocused, accentColor: accentColor) {
+                    SettingsRowText(title: server.displayName, subtitle: subtitleText)
+                    Spacer(minLength: 24)
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(testState == .ok ? Color.green : Color.white.opacity(0.3))
+                            .frame(width: 10, height: 10)
+                        Text(statusText)
+                            .font(.system(size: 17, weight: .semibold))
+                            .foregroundColor(.white.opacity(0.7))
+                    }
+                }
+            }
+            .buttonStyle(PosterCardButtonStyle())
+            .focused($isFocused)
+            .focusEffectDisabledIfAvailable()
+
+            HStack(spacing: 12) {
+                SMBRowButton(
+                    title: L10n.string("smb_test", fallback: "Test"),
+                    accentColor: accentColor,
+                    isLoading: testState == .testing,
+                    action: onTest
+                )
+                Spacer()
+                SMBDeleteButton(action: onDelete)
+            }
+        }
+        .padding(.bottom, 4)
+    }
+
+    private var subtitleText: String {
+        var parts = ["\(server.host):\(server.port)" + (server.useSSL ? " · SSL" : ""),
+                     L10n.format("usenet_connections_count", fallback: "%d connections", server.connections)]
+        if !server.isEnabled { parts.append(L10n.string("tvos_settings_disabled", fallback: "Disabled")) }
+        if case .failed(let message) = testState { parts.append(message) }
+        return parts.joined(separator: " · ")
+    }
+
+    private var statusText: String {
+        switch testState {
+        case .idle: return ""
+        case .testing: return L10n.string("smb_connecting", fallback: "Connecting…")
+        case .ok: return L10n.string("usenet_test_ok", fallback: "Login OK")
+        case .failed: return L10n.string("smb_failed", fallback: "Failed")
+        }
+    }
+}
+
+private struct UsenetServerEditSheet: View {
+    let server: UsenetSavedServer?
+    let accentColor: Color
+
+    @Environment(\.dismiss) private var dismiss
+    @AppStorage(SettingsKey.amoled) private var amoled = false
+    @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
+
+    @State private var name: String
+    @State private var host: String
+    @State private var portText: String
+    @State private var useSSL: Bool
+    @State private var username: String
+    @State private var password: String
+    @State private var connections: Int
+    @State private var isEnabled: Bool
+
+    init(server: UsenetSavedServer?, accentColor: Color) {
+        self.server = server
+        self.accentColor = accentColor
+        _name = State(initialValue: server?.name ?? "")
+        _host = State(initialValue: server?.host ?? "")
+        _portText = State(initialValue: server.map { String($0.port) } ?? "")
+        _useSSL = State(initialValue: server?.useSSL ?? true)
+        _username = State(initialValue: server?.username ?? "")
+        _password = State(initialValue: server.map { UsenetCredentialStore.password(forServerID: $0.id) } ?? "")
+        _connections = State(initialValue: server?.connections ?? UsenetServerConfig.defaultConnections)
+        _isEnabled = State(initialValue: server?.isEnabled ?? true)
+    }
+
+    var body: some View {
+        ZStack {
+            Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 24) {
+                    Text(server == nil
+                         ? L10n.string("usenet_add_server", fallback: "Add Server")
+                         : L10n.string("usenet_edit_server", fallback: "Edit Server"))
+                        .font(.system(size: 36, weight: .bold))
+                        .foregroundColor(.white)
+
+                    SettingsGroup(
+                        title: L10n.string("smb_connection", fallback: "Connection"),
+                        subtitle: L10n.string("usenet_connection_subtitle", fallback: "Your provider's news server")
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_display_name", fallback: "Name"),
+                            subtitle: "",
+                            placeholder: "Eweka",
+                            text: $name
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_host", fallback: "Host"),
+                            subtitle: L10n.string("usenet_host_subtitle", fallback: "e.g. news.eweka.nl"),
+                            placeholder: "news.example.com",
+                            text: $host
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("usenet_ssl", fallback: "SSL / TLS"),
+                            subtitle: L10n.string("usenet_ssl_subtitle", fallback: "Encrypted connection (port 563 by default)"),
+                            isOn: $useSSL,
+                            accentColor: accentColor
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_port", fallback: "Port"),
+                            subtitle: L10n.string("usenet_port_subtitle", fallback: "Leave blank for the default (563 with SSL, 119 without)"),
+                            placeholder: useSSL ? "563" : "119",
+                            text: $portText
+                        )
+                        SettingsStepperRow(
+                            title: L10n.string("usenet_connections", fallback: "Connections"),
+                            subtitle: L10n.string("usenet_connections_subtitle", fallback: "How many your plan allows; 5 to 10 is plenty for streaming"),
+                            value: $connections,
+                            range: 1...30,
+                            step: 1,
+                            suffix: "",
+                            accentColor: accentColor
+                        )
+                        SettingsToggleRow(
+                            title: L10n.string("usenet_enabled", fallback: "Use This Server"),
+                            subtitle: "",
+                            isOn: $isEnabled,
+                            accentColor: accentColor
+                        )
+                    }
+
+                    SettingsGroup(
+                        title: L10n.string("smb_authentication", fallback: "Authentication"),
+                        subtitle: ""
+                    ) {
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_username", fallback: "Username"),
+                            subtitle: "",
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $username
+                        )
+                        SettingsNativeTextFieldRow(
+                            title: L10n.string("smb_password", fallback: "Password"),
+                            subtitle: L10n.string("tvos_settings_stored_locally_on_this_apple_tv", fallback: "Stored locally on this Apple TV"),
+                            placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                            text: $password,
+                            isSecure: true
+                        )
+                    }
+
+                    HStack {
+                        SMBDialogButton(title: L10n.string("action_cancel", fallback: "Cancel"), isPrimary: false) { dismiss() }
+                        Spacer()
+                        SMBDialogButton(title: L10n.string("action_save", fallback: "Save"), isPrimary: true, enabled: canSave) {
+                            save()
+                            dismiss()
+                        }
+                    }
+                    .focusSection()
+                }
+                .padding(40)
+            }
+        }
+    }
+
+    private var trimmedHost: String { host.trimmingCharacters(in: .whitespacesAndNewlines) }
+
+    private var canSave: Bool { !trimmedHost.isEmpty }
+
+    private func save() {
+        let port = Int(portText.trimmingCharacters(in: .whitespacesAndNewlines)) ?? (useSSL ? 563 : 119)
+        let saved = UsenetSavedServer(
+            id: server?.id ?? UUID().uuidString,
+            name: name.trimmingCharacters(in: .whitespacesAndNewlines),
+            host: trimmedHost,
+            port: port,
+            useSSL: useSSL,
+            username: username.trimmingCharacters(in: .whitespacesAndNewlines),
+            connections: connections,
+            isEnabled: isEnabled
+        )
+        UsenetSettings.upsert(saved, password: password)
+    }
+}

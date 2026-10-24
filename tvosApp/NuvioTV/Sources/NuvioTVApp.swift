@@ -1692,6 +1692,26 @@ struct ContentView: View {
         collectionContext: CollectionPlaybackContext? = nil,
         isActionPlaybackSession: Bool = false
     ) {
+        // Usenet streams arrive as nuvio-usenet:// URLs: start the local
+        // engine first, then play its 127.0.0.1 URL like any other stream.
+        if let usenet = UsenetStreamSpec(url: url) {
+            Task { @MainActor in
+                do {
+                    let localURL = try await UsenetEngineManager.shared.startStream(usenet)
+                    presentPlayback(
+                        url: localURL, meta: meta, subtitle: subtitle, externalSubtitles: externalSubtitles,
+                        resumeFrom: resumeFrom, httpHeaders: httpHeaders, origin: origin, customPlayer: customPlayer,
+                        cacheFileIdentity: cacheFileIdentity, filename: filename, videoSize: videoSize,
+                        videoHash: videoHash, startupBenchmarkToken: startupBenchmarkToken, sourceID: sourceID,
+                        collectionContext: collectionContext, isActionPlaybackSession: isActionPlaybackSession
+                    )
+                } catch {
+                    PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
+                    usenetLog.error("usenet: playback not started: \(error.localizedDescription, privacy: .public)")
+                }
+            }
+            return
+        }
         playbackIsActionPlaybackSession = isActionPlaybackSession
         let isTrailer = subtitle == PlaybackMarkers.trailerSubtitle
         let isStandalonePlaybackSession = isTrailer || isActionPlaybackSession
@@ -1950,6 +1970,7 @@ struct ContentView: View {
                 PlaybackStartupTiming.cancel(token: startupBenchmarkToken)
                 if PictureInPictureManager.shared.activeCoordinator?.torrentStreamSourceURL != url {
                     await TorrentEngineManager.shared.stopActiveStream(for: url)
+                    await UsenetEngineManager.shared.stopActiveStream(for: url)
                 }
                 guard partyLaunchID == mark, !Task.isCancelled else { return }
                 watchPartyOwner.message = error is WatchPartyLaunchError
@@ -2405,6 +2426,7 @@ struct ContentView: View {
             Task {
                 guard let sourceURL else { return }
                 await TorrentEngineManager.shared.stopActiveStream(for: sourceURL)
+                await UsenetEngineManager.shared.stopActiveStream(for: sourceURL)
             }
         }
     }
@@ -3058,7 +3080,8 @@ struct ContentView: View {
             // Direct URL already known-bad this session.
             if let urlString = candidate.directURL?.trimmingCharacters(in: .whitespacesAndNewlines),
                !urlString.isEmpty,
-               excludingURLs.contains(urlString) {
+               excludingURLs.contains(urlString)
+                || UsenetEngineManager.isExcluded(sourceURL: urlString, excludedPlaybackURLs: excludingURLs) {
                 continue
             }
 
@@ -3123,7 +3146,8 @@ struct ContentView: View {
                 )
             }
 
-            guard let urlString = candidate.directURL, let url = URL(string: urlString) else { continue }
+            guard let urlString = candidate.directURL, let rawURL = URL(string: urlString),
+                  let url = await Self.playableURL(for: rawURL) else { continue }
             PlaybackStartupTiming.markSourcePicked(stream: candidate, token: startupToken)
             LastStreamQualityStore.save(
                 metaId: metaIdForTags,
@@ -3217,6 +3241,18 @@ struct ContentView: View {
         }
     }
 
+    /// A Usenet stream URL becomes the on-device engine's local URL (nil when
+    /// it can't start); every other URL is returned unchanged.
+    private static func playableURL(for url: URL) async -> URL? {
+        guard let spec = UsenetStreamSpec(url: url) else { return url }
+        do {
+            return try await UsenetEngineManager.shared.startStream(spec)
+        } catch {
+            usenetLog.error("usenet: source not started: \(error.localizedDescription, privacy: .public)")
+            return nil
+        }
+    }
+
     /// Resolves one user-picked source (direct URL or debrid) for mid-playback switch.
     private static func resolveChosenStream(
         _ stream: NuvioStream,
@@ -3293,7 +3329,8 @@ struct ContentView: View {
             )
         }
 
-        guard let urlString = stream.directURL, let url = URL(string: urlString) else { return nil }
+        guard let urlString = stream.directURL, let rawURL = URL(string: urlString),
+              let url = await playableURL(for: rawURL) else { return nil }
         LastStreamQualityStore.save(
             metaId: metaIdForTags,
             stream: stream,
