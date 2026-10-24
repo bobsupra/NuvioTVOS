@@ -1,5 +1,6 @@
 import CryptoKit
 import Foundation
+import OSLog
 
 /// Production company / network shown on the details Production row.
 struct MetaCompany: Identifiable, Equatable, Hashable {
@@ -1857,17 +1858,119 @@ enum MdbListDetailsService {
         providerTVDB: SettingsKey.mdbListUseTvdb
     ]
 
-    private struct RatingRequest: Encodable {
-        let ids: [String]
-        let provider: String
+    /// The title response: every provider's rating in one list.
+    private struct TitleResponse: Decodable {
+        let ratings: [TitleRating]?
+        let error: String?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            ratings = try? container.decodeIfPresent([TitleRating].self, forKey: .ratings)
+            error = try? container.decodeIfPresent(String.self, forKey: .error)
+        }
+
+        private enum CodingKeys: String, CodingKey { case ratings, error }
     }
 
-    private struct RatingResponse: Decodable {
-        let ratings: [RatingItem]
+    private struct TitleRating: Decodable {
+        let source: String?
+        let value: Double?
+        let score: Double?
+
+        init(from decoder: Decoder) throws {
+            let container = try decoder.container(keyedBy: CodingKeys.self)
+            source = try? container.decodeIfPresent(String.self, forKey: .source)
+            value = try? container.decodeIfPresent(Double.self, forKey: .value)
+            score = try? container.decodeIfPresent(Double.self, forKey: .score)
+        }
+
+        private enum CodingKeys: String, CodingKey { case source, value, score }
     }
 
-    private struct RatingItem: Decodable {
-        let rating: Double?
+    /// Our provider for a source name in MDBList's title response.
+    static func provider(forSource source: String) -> String? {
+        switch source.lowercased() {
+        case "imdb": return providerIMDb
+        case "tmdb": return providerTMDB
+        case "tomatoes": return providerTomatoes
+        case "popcorn", "audience", "tomatoesaudience": return providerAudience
+        case "metacritic": return providerMetacritic
+        case "trakt": return providerTrakt
+        case "letterboxd": return providerLetterboxd
+        case "myanimelist", "mal": return providerMyAnimeList
+        case "tvdb": return providerTVDB
+        default: return nil
+        }
+    }
+
+    /// The scale each provider's badge expects: IMDb and MAL out of 10,
+    /// Letterboxd out of 5, the rest out of 100 (as NuvioTV on Android).
+    static func maximumValue(for provider: String) -> Double {
+        switch provider {
+        case providerIMDb, providerMyAnimeList: return 10
+        case providerLetterboxd: return 5
+        default: return 100
+        }
+    }
+
+    /// What one title request came back with.
+    enum TitleResult: Equatable, Sendable {
+        /// Every rating MDBList has for the title, by provider.
+        case ratings([String: Double])
+        /// MDBList doesn't know the title.
+        case notFound
+        /// The API key's daily request limit is used up.
+        case limitReached
+        /// A network or server error: try again later.
+        case failed
+    }
+
+    /// Reads a title response. Unknown sources, missing values and values
+    /// off their provider's scale are left out; zero means "no rating".
+    static func titleResult(status: Int, data: Data) -> TitleResult {
+        let response = try? JSONDecoder().decode(TitleResponse.self, from: data)
+        let error = response?.error?.lowercased()
+        if status == 429 || error?.contains("limit") == true { return .limitReached }
+        guard status == 200 else {
+            // Only an error body is searched for the limit message; a title's
+            // own text (a description) never is.
+            let body = String(data: data.prefix(512), encoding: .utf8)?.lowercased() ?? ""
+            if body.contains("limit") { return .limitReached }
+            return status == 404 ? .notFound : .failed
+        }
+        guard let response else { return .failed }
+        if let error { return error.contains("not found") ? .notFound : .failed }
+        var values: [String: Double] = [:]
+        for rating in response.ratings ?? [] {
+            guard let source = rating.source, let mapped = Self.provider(forSource: source),
+                  values[mapped] == nil else { continue }
+            var candidate = rating.value
+            if mapped == providerLetterboxd, let score = rating.score { candidate = score / 20 }
+            guard let value = candidate, value.isFinite, value > 0,
+                  value <= maximumValue(for: mapped) else { continue }
+            values[mapped] = value
+        }
+        return .ratings(values)
+    }
+
+    /// One request for every rating of a title (the per-provider endpoint
+    /// cost up to nine requests per title against the daily limit).
+    static func requestTitleRatings(imdbID: String, mediaType: String, apiKey: String) async -> TitleResult {
+        var components = URLComponents()
+        components.scheme = "https"
+        components.host = "api.mdblist.com"
+        components.path = "/imdb/\(mediaType)/\(imdbID)"
+        components.queryItems = [URLQueryItem(name: "apikey", value: apiKey)]
+        guard let url = components.url else { return .failed }
+        var request = URLRequest(url: url)
+        request.timeoutInterval = 8
+        request.setValue("application/json", forHTTPHeaderField: "Accept")
+        do {
+            let (data, response) = try await URLSession.shared.data(for: request)
+            return titleResult(status: (response as? HTTPURLResponse)?.statusCode ?? 0, data: data)
+        } catch {
+            return .failed
+        }
     }
 
     static func fetchRatings(for meta: NuvioMeta) async -> [NuvioExternalRating] {
@@ -1888,59 +1991,14 @@ enum MdbListDetailsService {
         }
 
         let mediaType = meta.isSeries ? "show" : "movie"
-        return await withTaskGroup(of: (String, NuvioExternalRating?).self) { group in
-            for provider in providers {
-                group.addTask {
-                    (provider, await fetchProviderRating(
-                        imdbID: imdbID,
-                        mediaType: mediaType,
-                        provider: provider,
-                        apiKey: apiKey
-                    ))
-                }
-            }
-
-            var resolved: [String: NuvioExternalRating] = [:]
-            for await (provider, rating) in group {
-                if let rating {
-                    resolved[provider] = rating
-                }
-            }
-            return providerPriorityOrder.compactMap { resolved[$0] }
+        // Rating badges are optional enrichment: a failed request leaves the
+        // rest of the page usable and simply shows fewer badges.
+        guard let all = await MdbListRatingsStore.shared.ratings(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey) else {
+            return []
         }
-    }
-
-    private static func fetchProviderRating(
-        imdbID: String,
-        mediaType: String,
-        provider: String,
-        apiKey: String
-    ) async -> NuvioExternalRating? {
-        let apiProvider = apiProvider(for: provider)
-        guard let url = URL(string: "https://api.mdblist.com/rating/\(mediaType)/\(apiProvider)?apikey=\(apiKey)") else {
-            return nil
-        }
-
-        var request = URLRequest(url: url)
-        request.httpMethod = "POST"
-        request.timeoutInterval = 8
-        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        request.httpBody = try? JSONEncoder().encode(
-            RatingRequest(ids: [imdbID], provider: providerIMDb)
-        )
-
-        do {
-            let (data, response) = try await URLSession.shared.data(for: request)
-            guard (response as? HTTPURLResponse)?.statusCode == 200 else { return nil }
-            let payload = try JSONDecoder().decode(RatingResponse.self, from: data)
-            guard let value = payload.ratings.first?.rating, value.isFinite else { return nil }
+        return providerPriorityOrder.compactMap { provider in
+            guard providers.contains(provider), let value = all[provider] else { return nil }
             return NuvioExternalRating(source: provider, value: value)
-        } catch is CancellationError {
-            return nil
-        } catch {
-            // Rating badges are optional enrichment; leave the rest of the
-            // details page usable when an individual provider fails.
-            return nil
         }
     }
 
@@ -1951,6 +2009,142 @@ enum MdbListDetailsService {
             return String(candidate[range])
         }
         return nil
+    }
+}
+
+private let mdbListLog = Logger(subsystem: "com.pyksel.nuviotvos", category: "mdblist")
+
+/// MDBList ratings by title, shared by the hero and Details:
+/// - one request per title for every provider;
+/// - kept on disk for a day (a title MDBList doesn't know for six hours),
+///   so browsing the same rows again costs nothing;
+/// - one request at a time per title;
+/// - after the API reports its daily limit, no requests for an hour; older
+///   ratings still on disk are shown meanwhile.
+actor MdbListRatingsStore {
+    static let shared = MdbListRatingsStore()
+
+    static let lifetime: TimeInterval = 24 * 60 * 60
+    static let notFoundLifetime: TimeInterval = 6 * 60 * 60
+    static let limitPause: TimeInterval = 60 * 60
+    static let maxEntries = 4_000
+
+    struct Entry: Codable, Equatable, Sendable {
+        let storedAt: Date
+        let ratings: [String: Double]
+    }
+
+    private let fileURL: URL?
+    private var entries: [String: Entry]?
+    private var inflight: [String: Task<MdbListDetailsService.TitleResult, Never>] = [:]
+    private var pausedUntil: Date?
+    private var saveTask: Task<Void, Never>?
+
+    init(fileURL: URL? = MdbListRatingsStore.defaultFileURL) {
+        self.fileURL = fileURL
+    }
+
+    static var defaultFileURL: URL? {
+        FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+            .appendingPathComponent("mdblist-ratings-v1.json")
+    }
+
+    /// Whether a stored entry is still fresh enough to skip the request.
+    static func isFresh(_ entry: Entry, now: Date) -> Bool {
+        let age = now.timeIntervalSince(entry.storedAt)
+        return age >= 0 && age < (entry.ratings.isEmpty ? notFoundLifetime : lifetime)
+    }
+
+    /// Every rating MDBList has for the title, by provider, or nil when they
+    /// can't be had right now.
+    func ratings(imdbID: String, mediaType: String, apiKey: String,
+                 request: (@Sendable () async -> MdbListDetailsService.TitleResult)? = nil) async -> [String: Double]? {
+        let key = "\(mediaType):\(imdbID)"
+        loadIfNeeded()
+        let now = Date()
+        let stored = entries?[key]
+        if let stored, Self.isFresh(stored, now: now) { return stored.ratings }
+        if let pausedUntil, pausedUntil > now { return stored?.ratings }
+
+        let task: Task<MdbListDetailsService.TitleResult, Never>
+        if let running = inflight[key] {
+            task = running
+        } else {
+            let fetch: @Sendable () async -> MdbListDetailsService.TitleResult = request ?? {
+                await MdbListDetailsService.requestTitleRatings(imdbID: imdbID, mediaType: mediaType, apiKey: apiKey)
+            }
+            task = Task { await fetch() }
+            inflight[key] = task
+        }
+        let result = await task.value
+        if inflight[key] == task { inflight[key] = nil }
+
+        switch result {
+        case .ratings(let ratings):
+            store(Entry(storedAt: Date(), ratings: ratings), for: key)
+            return ratings
+        case .notFound:
+            store(Entry(storedAt: Date(), ratings: [:]), for: key)
+            return [:]
+        case .limitReached:
+            if pausedUntil.map({ $0 <= Date() }) ?? true {
+                mdbListLog.notice("MDBList daily request limit reached; ratings paused for an hour")
+            }
+            pausedUntil = Date().addingTimeInterval(Self.limitPause)
+            return stored?.ratings
+        case .failed:
+            return stored?.ratings
+        }
+    }
+
+    /// Stored ratings, for tests.
+    func entry(for imdbID: String, mediaType: String) -> Entry? {
+        loadIfNeeded()
+        return entries?["\(mediaType):\(imdbID)"]
+    }
+
+    // MARK: - Disk
+
+    private func loadIfNeeded() {
+        guard entries == nil else { return }
+        guard let fileURL, let data = try? Data(contentsOf: fileURL),
+              let decoded = try? JSONDecoder().decode([String: Entry].self, from: data) else {
+            entries = [:]
+            return
+        }
+        let now = Date()
+        entries = decoded.filter { now.timeIntervalSince($0.value.storedAt) < Self.lifetime }
+    }
+
+    private func store(_ entry: Entry, for key: String) {
+        loadIfNeeded()
+        entries?[key] = entry
+        if let count = entries?.count, count > Self.maxEntries, let current = entries {
+            let keep = current.sorted { $0.value.storedAt > $1.value.storedAt }.prefix(Self.maxEntries)
+            entries = Dictionary(uniqueKeysWithValues: keep.map { ($0.key, $0.value) })
+        }
+        scheduleSave()
+    }
+
+    private func scheduleSave() {
+        guard fileURL != nil, saveTask == nil else { return }
+        saveTask = Task {
+            try? await Task.sleep(for: .seconds(2))
+            guard !Task.isCancelled else { return }
+            self.save()
+        }
+    }
+
+    /// Writes pending changes now instead of two seconds later.
+    func flushToDisk() {
+        saveTask?.cancel()
+        save()
+    }
+
+    private func save() {
+        saveTask = nil
+        guard let fileURL, let entries, let data = try? JSONEncoder().encode(entries) else { return }
+        try? data.write(to: fileURL, options: .atomic)
     }
 }
 
