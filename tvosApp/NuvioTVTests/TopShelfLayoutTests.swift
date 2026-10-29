@@ -120,6 +120,25 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertNil(TopShelfEntry.runtimeMinutes(nil))
     }
 
+    // MARK: Artwork sources
+
+    func testArtworkIsFetchedAtTheLargestSizeTheHostServesThenAsGiven() {
+        func candidates(_ text: String) -> [String] {
+            TopShelfFeedStore.highResolutionCandidates(for: text).map(\.absoluteString)
+        }
+        XCTAssertEqual(candidates("https://image.tmdb.org/t/p/w1280/abc.jpg"),
+                       ["https://image.tmdb.org/t/p/original/abc.jpg", "https://image.tmdb.org/t/p/w1280/abc.jpg"])
+        XCTAssertEqual(candidates("https://image.tmdb.org/t/p/original/abc.jpg"),
+                       ["https://image.tmdb.org/t/p/original/abc.jpg"])
+        XCTAssertEqual(candidates("https://images.metahub.space/background/medium/tt0111161/img"),
+                       ["https://images.metahub.space/background/large/tt0111161/img",
+                        "https://images.metahub.space/background/medium/tt0111161/img"])
+        XCTAssertEqual(candidates("https://assets.fanart.tv/preview/movies/1/moviebackground/a.jpg"),
+                       ["https://assets.fanart.tv/fanart/movies/1/moviebackground/a.jpg",
+                        "https://assets.fanart.tv/preview/movies/1/moviebackground/a.jpg"])
+        XCTAssertEqual(candidates("https://cdn.example.test/art.jpg"), ["https://cdn.example.test/art.jpg"])
+    }
+
     // MARK: Pruning
 
     func testPruningKeepsBothRendersOfShownTitlesAndDropsUnchosenCatalogs() throws {

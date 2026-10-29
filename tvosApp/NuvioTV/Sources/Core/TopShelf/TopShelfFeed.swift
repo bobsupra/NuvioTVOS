@@ -234,12 +234,14 @@ actor TopShelfArtworkRefresher {
 /// group container isn't available (e.g. entitlement not provisioned), so the
 /// app never crashes or blocks on it.
 public enum TopShelfFeedStore {
-    private static let artworkRenderVersion = 3
-    private static let carouselRenderVersion = 1
+    // Version 4 / 2: drawn from the largest source the image host offers, the
+    // carousel at the screen's scale.
+    private static let artworkRenderVersion = 4
+    private static let carouselRenderVersion = 2
     /// Rendered card size. 16:9, large enough for the 2x shelf scale.
     private static let artworkSize = CGSize(width: 1_280, height: 720)
-    /// Rendered carousel size: the full screen at 1x. Sources are rarely
-    /// larger, and the system scales it for 4K.
+    /// Rendered carousel size: the full screen, in points. Drawn at the
+    /// screen's scale, so 3840x2160 pixels on a 4K TV.
     private static let carouselArtworkSize = CGSize(width: 1_920, height: 1_080)
     private static let writeCoordinators: [TopShelfSection: TopShelfWriteCoordinator] =
         Dictionary(uniqueKeysWithValues: TopShelfSection.allCases.map { ($0, TopShelfWriteCoordinator()) })
@@ -323,7 +325,8 @@ public enum TopShelfFeedStore {
             #if canImport(UIKit)
             let rows = TopShelfComposer.rows(configuration: configuration) { read($0) }
             let displayed = TopShelfComposer.displayedEntries(configuration: configuration, rows: rows)
-            await cacheArtwork(for: displayed, carousel: configuration.style.isCarousel)
+            let scale = await MainActor.run { min(max(UIScreen.main.scale, 1), 2) }
+            await cacheArtwork(for: displayed, carousel: configuration.style.isCarousel, scale: scale)
             #endif
             TopShelfArtworkPruner.prune(in: container)
             notifyTopShelfContentChanged()
@@ -383,6 +386,35 @@ public enum TopShelfFeedStore {
         ])
     }
 
+    /// The same image at the largest size its host serves, then the URL as
+    /// given. Catalogs hand out mid-size artwork (TMDB w1280, Cinemeta
+    /// "medium"), which a full-screen 4K shelf shows soft.
+    static func highResolutionCandidates(for text: String) -> [URL] {
+        guard let url = URL(string: text) else { return [] }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host?.lowercased() else { return [url] }
+        var parts = components.path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        switch host {
+        case "image.tmdb.org":
+            // /t/p/<size>/<file>
+            guard parts.count > 4, parts[1] == "t", parts[2] == "p", parts[3] != "original" else { return [url] }
+            parts[3] = "original"
+        case "images.metahub.space":
+            // /<kind>/<size>/<imdb id>/img
+            guard parts.count > 3, ["small", "medium"].contains(parts[2]) else { return [url] }
+            parts[2] = "large"
+        case "assets.fanart.tv":
+            // /preview/<path> is a downscaled copy of /fanart/<path>.
+            guard parts.count > 2, parts[1] == "preview" else { return [url] }
+            parts[1] = "fanart"
+        default:
+            return [url]
+        }
+        components.path = parts.joined(separator: "/")
+        guard let upgraded = components.url, upgraded != url else { return [url] }
+        return [upgraded, url]
+    }
+
     private static func generatedName(for parts: [String]) -> String {
         let source = parts.joined(separator: "\u{1F}")
         var hash: UInt64 = 1_469_598_103_934_665_603 // FNV-1a offset basis
@@ -400,7 +432,7 @@ public enum TopShelfFeedStore {
     }
 
     #if canImport(UIKit)
-    private static func cacheArtwork(for entries: [TopShelfEntry], carousel: Bool) async {
+    private static func cacheArtwork(for entries: [TopShelfEntry], carousel: Bool, scale: CGFloat) async {
         #if DEBUG
         let start = DispatchTime.now().uptimeNanoseconds
         print("[TVTrace] topShelf.cacheArtwork begin entries=\(entries.count) carousel=\(carousel)")
@@ -411,21 +443,17 @@ public enum TopShelfFeedStore {
             let destination = container.appendingPathComponent(name)
             guard !FileManager.default.fileExists(atPath: destination.path),
                   let sourceText = entry.artworkSourceURL,
-                  let sourceURL = URL(string: sourceText) else { continue }
-            do {
-                let (data, _) = try await URLSession.shared.data(from: sourceURL)
-                guard let image = UIImage(data: data) else { continue }
-                let rendered: Data?
-                if carousel {
-                    rendered = renderedCarouselArtwork(from: image, logo: await logoImage(for: entry))
-                } else {
-                    rendered = renderedArtwork(from: image, subtitle: entry.subtitle)
-                }
-                guard let rendered else { continue }
-                try rendered.write(to: destination, options: .atomic)
-            } catch {
-                continue
+                  let image = await downloadedImage(sourceText) else { continue }
+            let rendered: Data?
+            if carousel {
+                var logo: UIImage?
+                if let logoText = entry.logoURL { logo = await downloadedImage(logoText) }
+                rendered = renderedCarouselArtwork(from: image, logo: logo, scale: scale)
+            } else {
+                rendered = renderedArtwork(from: image, subtitle: entry.subtitle)
             }
+            guard let rendered else { continue }
+            try? rendered.write(to: destination, options: .atomic)
         }
         #if DEBUG
         let totalElapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
@@ -433,10 +461,14 @@ public enum TopShelfFeedStore {
         #endif
     }
 
-    private static func logoImage(for entry: TopShelfEntry) async -> UIImage? {
-        guard let text = entry.logoURL, let url = URL(string: text),
-              let response = try? await URLSession.shared.data(from: url) else { return nil }
-        return UIImage(data: response.0)
+    /// The image at the largest size offered, else as given.
+    private static func downloadedImage(_ text: String) async -> UIImage? {
+        for url in highResolutionCandidates(for: text) {
+            guard let result = try? await URLSession.shared.data(from: url) else { continue }
+            if let http = result.1 as? HTTPURLResponse, !(200...299).contains(http.statusCode) { continue }
+            if let image = UIImage(data: result.0) { return image }
+        }
+        return nil
     }
 
     /// Renders a 16:9 card. Landscape art fills it; portrait art (a poster used
@@ -488,10 +520,10 @@ public enum TopShelfFeedStore {
 
     /// Renders a full-screen carousel image: the backdrop, darkened toward the
     /// left edge where the system draws its text, with the title's logo there.
-    private static func renderedCarouselArtwork(from image: UIImage, logo: UIImage?) -> Data? {
+    private static func renderedCarouselArtwork(from image: UIImage, logo: UIImage?, scale: CGFloat) -> Data? {
         let size = carouselArtworkSize
         let format = UIGraphicsImageRendererFormat()
-        format.scale = 1
+        format.scale = scale
         format.opaque = true
         let renderer = UIGraphicsImageRenderer(size: size, format: format)
         let rendered = renderer.image { context in
@@ -505,8 +537,8 @@ public enum TopShelfFeedStore {
 
             guard let logo, logo.size.width > 0, logo.size.height > 0 else { return }
             let maximum = CGSize(width: size.width * 0.34, height: size.height * 0.2)
-            let scale = min(maximum.width / logo.size.width, maximum.height / logo.size.height)
-            let logoSize = CGSize(width: logo.size.width * scale, height: logo.size.height * scale)
+            let logoScale = min(maximum.width / logo.size.width, maximum.height / logo.size.height)
+            let logoSize = CGSize(width: logo.size.width * logoScale, height: logo.size.height * logoScale)
             let origin = CGPoint(x: 120, y: size.height * 0.42 - logoSize.height / 2)
             logo.draw(in: CGRect(origin: origin, size: logoSize))
         }
