@@ -31,7 +31,11 @@ private final class IntroDBMockURLProtocol: URLProtocol {
         case ("1", "2"):
             payload = #"{"intro":{"start_sec":12,"end_sec":32}}"#
         default:
-            payload = "{}"
+            if values["is_movie"] == "true" {
+                payload = #"{"outro":{"start_sec":5400,"end_sec":5800},"post_credits":{"start_sec":5600,"end_sec":5700}}"#
+            } else {
+                payload = "{}"
+            }
         }
         let response = HTTPURLResponse(url: url, statusCode: 200, httpVersion: nil, headerFields: nil)!
         client?.urlProtocol(self, didReceive: response, cacheStoragePolicy: .notAllowed)
@@ -376,6 +380,26 @@ final class PostPlayRecommendationTests: XCTestCase {
         XCTAssertEqual(twoEpisodes.first(where: { $0.type == "outro" })?.startTime, 673.5)
     }
 
+    func testIntroDBMovieSkipIntervalsParsing() async {
+        let configuration = URLSessionConfiguration.ephemeral
+        configuration.protocolClasses = [IntroDBMockURLProtocol.self]
+        let service = IntroDBSkipService(session: URLSession(configuration: configuration))
+
+        let intervals = await service.intervals(imdbId: "tt9999999", isMovie: true)
+        XCTAssertEqual(intervals.count, 2)
+
+        let credits = intervals.first(where: { $0.type == "movie-credits" })
+        let postCredits = intervals.first(where: { $0.type == "post-credits" })
+
+        XCTAssertNotNil(credits)
+        XCTAssertNotNil(postCredits)
+        // safeCredits clipped to start of post_credits scene (5600)
+        XCTAssertEqual(credits?.startTime, 5400)
+        XCTAssertEqual(credits?.endTime, 5600)
+        XCTAssertEqual(postCredits?.startTime, 5600)
+        XCTAssertEqual(postCredits?.endTime, 5700)
+    }
+
     private func seasonSample(
         episode: Int,
         duration: Double,
@@ -660,6 +684,8 @@ final class PostPlayRecommendationTests: XCTestCase {
         let outro2 = SkipInterval(startTime: 500, endTime: 550, type: "ed", provider: "introdb")
         let outro3 = SkipInterval(startTime: 500, endTime: 550, type: "ending", provider: "introdb")
         let outro4 = SkipInterval(startTime: 500, endTime: 550, type: "credits", provider: "introdb")
+        let movieCredits = SkipInterval(startTime: 500, endTime: 550, type: "movie-credits", provider: "introdb")
+        let postCredits = SkipInterval(startTime: 560, endTime: 580, type: "post-credits", provider: "introdb")
 
         XCTAssertTrue(intro1.isIntro)
         XCTAssertTrue(intro2.isIntro)
@@ -667,10 +693,14 @@ final class PostPlayRecommendationTests: XCTestCase {
         XCTAssertTrue(intro4.isIntro)
         XCTAssertFalse(intro1.isRecap)
         XCTAssertFalse(intro1.isEnding)
+        XCTAssertFalse(intro1.isMovieCredits)
+        XCTAssertFalse(intro1.isPostCredits)
 
         XCTAssertTrue(recap.isRecap)
         XCTAssertFalse(recap.isIntro)
         XCTAssertFalse(recap.isEnding)
+        XCTAssertFalse(recap.isMovieCredits)
+        XCTAssertFalse(recap.isPostCredits)
 
         XCTAssertTrue(outro1.isEnding)
         XCTAssertTrue(outro2.isEnding)
@@ -678,15 +708,48 @@ final class PostPlayRecommendationTests: XCTestCase {
         XCTAssertTrue(outro4.isEnding)
         XCTAssertFalse(outro1.isIntro)
         XCTAssertFalse(outro1.isRecap)
+        XCTAssertFalse(outro1.isMovieCredits)
+        XCTAssertFalse(outro1.isPostCredits)
+
+        XCTAssertTrue(movieCredits.isMovieCredits)
+        XCTAssertFalse(movieCredits.isEnding)
+        XCTAssertFalse(movieCredits.isIntro)
+        XCTAssertFalse(movieCredits.isRecap)
+        XCTAssertFalse(movieCredits.isPostCredits)
+
+        XCTAssertTrue(postCredits.isPostCredits)
+        XCTAssertFalse(postCredits.isEnding)
+        XCTAssertFalse(postCredits.isIntro)
+        XCTAssertFalse(postCredits.isRecap)
+        XCTAssertFalse(postCredits.isMovieCredits)
+
+        // Labels
+        XCTAssertEqual(movieCredits.label, "Skip Credits")
+        XCTAssertEqual(movieCredits.label(targetsPostCredits: true), "Skip to Post-Credits")
+        XCTAssertEqual(outro1.label(targetsPostCredits: true), "Skip to Post-Credits")
+
+        // Post-credits following detection
+        let intervals = [movieCredits, postCredits]
+        let foundScene = movieCredits.followingPostCreditsScene(intervals: intervals, duration: 600)
+        XCTAssertEqual(foundScene?.startTime, 560)
+        XCTAssertEqual(foundScene?.type, "post-credits")
+
+        // Heuristic fallback for significant gap (> 5s)
+        let heuristicScene = movieCredits.followingPostCreditsScene(intervals: [movieCredits], duration: 560)
+        XCTAssertEqual(heuristicScene?.startTime, 550)
+        XCTAssertEqual(heuristicScene?.endTime, 560)
+        XCTAssertEqual(heuristicScene?.provider, "heuristic")
     }
 
     func testAutoSkipSettingsKeysRegistered() {
         XCTAssertEqual(SettingsKey.autoSkipIntro, "nuvio.tv.settings.playback.autoSkipIntro")
         XCTAssertEqual(SettingsKey.autoSkipRecap, "nuvio.tv.settings.playback.autoSkipRecap")
         XCTAssertEqual(SettingsKey.autoSkipOutro, "nuvio.tv.settings.playback.autoSkipOutro")
+        XCTAssertEqual(SettingsKey.autoSkipMovieCredits, "nuvio.tv.settings.playback.autoSkipMovieCredits")
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.autoSkipIntro))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.autoSkipRecap))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.autoSkipOutro))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.autoSkipMovieCredits))
     }
 
     @MainActor
@@ -695,29 +758,37 @@ final class PostPlayRecommendationTests: XCTestCase {
         let intro = SkipInterval(startTime: 10, endTime: 40, type: "intro", provider: "introdb")
         let recap = SkipInterval(startTime: 0, endTime: 10, type: "recap", provider: "introdb")
         let outro = SkipInterval(startTime: 500, endTime: 550, type: "outro", provider: "introdb")
+        let movieCredits = SkipInterval(startTime: 500, endTime: 550, type: "movie-credits", provider: "introdb")
+        let postCredits = SkipInterval(startTime: 560, endTime: 580, type: "post-credits", provider: "introdb")
 
         let store = ProfileSettings.current
         let origIntro = store.object(forKey: SettingsKey.autoSkipIntro)
         let origRecap = store.object(forKey: SettingsKey.autoSkipRecap)
         let origOutro = store.object(forKey: SettingsKey.autoSkipOutro)
+        let origMovieCredits = store.object(forKey: SettingsKey.autoSkipMovieCredits)
         defer {
             store.set(origIntro, forKey: SettingsKey.autoSkipIntro)
             store.set(origRecap, forKey: SettingsKey.autoSkipRecap)
             store.set(origOutro, forKey: SettingsKey.autoSkipOutro)
+            store.set(origMovieCredits, forKey: SettingsKey.autoSkipMovieCredits)
         }
 
         viewModel.autoSkipIntroEnabled = false
         viewModel.autoSkipRecapEnabled = false
         viewModel.autoSkipOutroEnabled = false
+        viewModel.autoSkipMovieCreditsEnabled = false
 
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: intro))
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: recap))
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: outro))
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: movieCredits))
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: postCredits))
 
         viewModel.autoSkipIntroEnabled = true
         XCTAssertTrue(viewModel.shouldAutoSkip(interval: intro))
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: recap))
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: outro))
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: movieCredits))
 
         viewModel.autoSkipRecapEnabled = true
         XCTAssertTrue(viewModel.shouldAutoSkip(interval: recap))
@@ -725,17 +796,24 @@ final class PostPlayRecommendationTests: XCTestCase {
         viewModel.autoSkipOutroEnabled = true
         XCTAssertTrue(viewModel.shouldAutoSkip(interval: outro))
 
+        viewModel.autoSkipMovieCreditsEnabled = true
+        XCTAssertTrue(viewModel.shouldAutoSkip(interval: movieCredits))
+        // Post credits should never be auto-skipped
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: postCredits))
+
         let originalStatus = viewModel.status
         viewModel.status = .paused
         viewModel.beginScrub()
         XCTAssertTrue(viewModel.isScrubbing)
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: intro))
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: movieCredits))
         viewModel.cancelScrub()
         XCTAssertFalse(viewModel.isScrubbing)
         viewModel.status = originalStatus
 
         viewModel.isHoldingSeek = true
         XCTAssertFalse(viewModel.shouldAutoSkip(interval: intro))
+        XCTAssertFalse(viewModel.shouldAutoSkip(interval: movieCredits))
         viewModel.isHoldingSeek = false
     }
 
@@ -748,5 +826,9 @@ final class PostPlayRecommendationTests: XCTestCase {
         XCTAssertEqual(L10n.string("auto_skip_recap_sub", fallback: ""), "Skip recap segments automatically.")
         XCTAssertEqual(L10n.string("auto_skip_outro", fallback: ""), "Outro / Ending")
         XCTAssertEqual(L10n.string("auto_skip_outro_sub", fallback: ""), "Skip outros and anime endings automatically.")
+        XCTAssertEqual(L10n.string("auto_skip_movie_credits", fallback: ""), "End Credits")
+        XCTAssertEqual(L10n.string("auto_skip_movie_credits_sub", fallback: ""), "Skip movie credits automatically, keeping post-credits scenes.")
+        XCTAssertEqual(L10n.string("skip_movie_credits", fallback: ""), "Skip Credits")
+        XCTAssertEqual(L10n.string("skip_to_post_credits", fallback: ""), "Skip to Post-Credits")
     }
 }

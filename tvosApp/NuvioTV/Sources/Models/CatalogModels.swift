@@ -6001,6 +6001,108 @@ struct WatchedPlaybackCompletionUpload: Codable, Equatable, Sendable, Identifiab
     }
 }
 
+/// A durable library-only mark or unmark waiting for one provider account.
+/// Unlike playback completions, this event must not change resume history.
+struct WatchedLibraryMutationUpload: Codable, Equatable, Sendable, Identifiable {
+    let id: String
+    let provider: String
+    let accountID: String?
+    let profileID: String?
+    let meta: NuvioMeta
+    let season: Int?
+    let episode: Int?
+    let episodes: [Int]
+    let isWatched: Bool
+    let isPrimaryTarget: Bool
+    let changedAt: Date
+    var attemptCount: Int
+    var nextAttemptAt: Date?
+
+    private enum CodingKeys: String, CodingKey {
+        case id, provider, accountID, profileID, meta, season, episode, episodes
+        case isWatched, isPrimaryTarget, changedAt, attemptCount, nextAttemptAt
+    }
+
+    init(
+        id: String = UUID().uuidString,
+        provider: TraktWatchProgressSource,
+        accountID: String?,
+        profileID: String?,
+        meta: NuvioMeta,
+        season: Int?,
+        episode: Int?,
+        episodes: [Int] = [],
+        isWatched: Bool,
+        isPrimaryTarget: Bool = false,
+        changedAt: Date = Date(),
+        attemptCount: Int = 0,
+        nextAttemptAt: Date? = nil
+    ) {
+        self.id = id
+        self.provider = provider.rawValue
+        self.accountID = accountID
+        self.profileID = profileID
+        self.meta = WatchedStore.playbackCompletionMetaSnapshot(meta)
+        self.season = season
+        self.episode = episode
+        self.episodes = Array(Set(episodes)).sorted()
+        self.isWatched = isWatched
+        self.isPrimaryTarget = isPrimaryTarget
+        self.changedAt = changedAt
+        self.attemptCount = attemptCount
+        self.nextAttemptAt = nextAttemptAt
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        id = try container.decode(String.self, forKey: .id)
+        provider = try container.decode(String.self, forKey: .provider)
+        accountID = try container.decodeIfPresent(String.self, forKey: .accountID)
+        profileID = try container.decodeIfPresent(String.self, forKey: .profileID)
+        meta = try container.decode(NuvioMeta.self, forKey: .meta)
+        season = try container.decodeIfPresent(Int.self, forKey: .season)
+        episode = try container.decodeIfPresent(Int.self, forKey: .episode)
+        episodes = try container.decodeIfPresent([Int].self, forKey: .episodes) ?? []
+        isWatched = try container.decode(Bool.self, forKey: .isWatched)
+        isPrimaryTarget = try container.decodeIfPresent(Bool.self, forKey: .isPrimaryTarget) ?? false
+        changedAt = try container.decode(Date.self, forKey: .changedAt)
+        attemptCount = try container.decodeIfPresent(Int.self, forKey: .attemptCount) ?? 0
+        nextAttemptAt = try container.decodeIfPresent(Date.self, forKey: .nextAttemptAt)
+    }
+
+    func affects(_ item: WatchedStoreItem) -> Bool {
+        guard WatchedStore.sameContent(meta, item.meta), season == item.season else { return false }
+        if !episodes.isEmpty { return item.episode.map(episodes.contains) ?? false }
+        if let episode { return item.episode == episode }
+        return item.episode == nil
+    }
+
+    func overlaps(_ other: WatchedLibraryMutationUpload) -> Bool {
+        guard WatchedStore.sameContent(meta, other.meta) else { return false }
+        let coversTitle = season == nil && episode == nil && episodes.isEmpty
+        let otherCoversTitle = other.season == nil && other.episode == nil && other.episodes.isEmpty
+        if coversTitle || otherCoversTitle { return true }
+        guard season == other.season else { return false }
+        let coversSeason = episode == nil && episodes.isEmpty
+        let otherCoversSeason = other.episode == nil && other.episodes.isEmpty
+        if coversSeason || otherCoversSeason { return true }
+        let left = Set(episodes.isEmpty ? episode.map { [$0] } ?? [] : episodes)
+        let right = Set(other.episodes.isEmpty ? other.episode.map { [$0] } ?? [] : other.episodes)
+        return !left.isDisjoint(with: right)
+    }
+}
+
+struct WatchedLibraryMutationTarget: Equatable, Sendable {
+    let provider: TraktWatchProgressSource
+    let accountID: String?
+}
+
+struct WatchedLibraryMutationContext: Equatable, Sendable {
+    let librarySource: TraktLibrarySourceMode
+    let profileID: String?
+    let targets: [WatchedLibraryMutationTarget]
+}
+
 struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
     var id: String {
         if let season, let episode {
@@ -6030,15 +6132,32 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
     /// Provider-local completion counts. Older watched rows have no count
     /// payload and are interpreted as one watch for each attributed source.
     var watchCountsBySource: [String: Int]
+    /// Account bindings for accepted provider marks. Missing bindings identify
+    /// legacy rows that have not yet been confirmed by an authenticated pull.
+    var sourceAccountIDsBySource: [String: String]
+    /// Provider-specific change times prevent an older in-flight pull from
+    /// undoing a newer mark or unmark after its upload has been acknowledged.
+    var sourceChangedAtBySource: [String: Date]
+    /// Last confirmed/local desired watched state per provider. `false` entries
+    /// act as provider-scoped deletion tombstones until a later full pull confirms.
+    var sourceStateBySource: [String: Bool]
     /// Idempotency key for the latest playback completion counted per provider.
     var lastCountedPlaybackIDsBySource: [String: String]
     /// Durable provider upload events. Kept with the watched row so each event
     /// and its local count are committed by the same atomic watched-file write.
     var pendingPlaybackCompletions: [WatchedPlaybackCompletionUpload]
+    /// Durable user-initiated library changes. These are intentionally separate
+    /// from playback completions so they never alter Continue Watching state.
+    var pendingLibraryMutations: [WatchedLibraryMutationUpload]
+    /// Preserves the legacy union behavior for rows whose original owner was
+    /// never recorded. Library views remain strict and do not treat this flag as
+    /// evidence that a selected provider contains the mark.
+    var legacyUnattributed: Bool
 
     enum CodingKeys: String, CodingKey {
-        case meta, watchedAt, season, episode, sources, watchCountsBySource, lastCountedPlaybackIDsBySource
-        case pendingPlaybackCompletions
+        case meta, watchedAt, season, episode, sources, watchCountsBySource, sourceAccountIDsBySource
+        case sourceChangedAtBySource, sourceStateBySource, lastCountedPlaybackIDsBySource
+        case pendingPlaybackCompletions, pendingLibraryMutations, legacyUnattributed
     }
 
     init(
@@ -6048,8 +6167,13 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
         episode: Int? = nil,
         sources: Set<String> = [],
         watchCountsBySource: [String: Int] = [:],
+        sourceAccountIDsBySource: [String: String] = [:],
+        sourceChangedAtBySource: [String: Date] = [:],
+        sourceStateBySource: [String: Bool] = [:],
         lastCountedPlaybackIDsBySource: [String: String] = [:],
-        pendingPlaybackCompletions: [WatchedPlaybackCompletionUpload] = []
+        pendingPlaybackCompletions: [WatchedPlaybackCompletionUpload] = [],
+        pendingLibraryMutations: [WatchedLibraryMutationUpload] = [],
+        legacyUnattributed: Bool? = nil
     ) {
         self.meta = meta
         self.watchedAt = watchedAt
@@ -6057,8 +6181,14 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
         self.episode = episode
         self.sources = sources
         self.watchCountsBySource = watchCountsBySource
+        self.sourceAccountIDsBySource = sourceAccountIDsBySource
+        self.sourceChangedAtBySource = sourceChangedAtBySource
+        self.sourceStateBySource = sourceStateBySource
         self.lastCountedPlaybackIDsBySource = lastCountedPlaybackIDsBySource
         self.pendingPlaybackCompletions = pendingPlaybackCompletions
+        self.pendingLibraryMutations = pendingLibraryMutations
+        self.legacyUnattributed = legacyUnattributed
+            ?? (sources.isEmpty && pendingPlaybackCompletions.isEmpty && pendingLibraryMutations.isEmpty)
     }
 
     init(from decoder: Decoder) throws {
@@ -6069,6 +6199,18 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
         episode = try container.decodeIfPresent(Int.self, forKey: .episode)
         sources = try container.decodeIfPresent(Set<String>.self, forKey: .sources) ?? []
         watchCountsBySource = try container.decodeIfPresent([String: Int].self, forKey: .watchCountsBySource) ?? [:]
+        sourceAccountIDsBySource = try container.decodeIfPresent(
+            [String: String].self,
+            forKey: .sourceAccountIDsBySource
+        ) ?? [:]
+        sourceChangedAtBySource = try container.decodeIfPresent(
+            [String: Date].self,
+            forKey: .sourceChangedAtBySource
+        ) ?? [:]
+        sourceStateBySource = try container.decodeIfPresent(
+            [String: Bool].self,
+            forKey: .sourceStateBySource
+        ) ?? [:]
         lastCountedPlaybackIDsBySource = try container.decodeIfPresent(
             [String: String].self,
             forKey: .lastCountedPlaybackIDsBySource
@@ -6077,25 +6219,50 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
             [WatchedPlaybackCompletionUpload].self,
             forKey: .pendingPlaybackCompletions
         ) ?? []
+        pendingLibraryMutations = try container.decodeIfPresent(
+            [WatchedLibraryMutationUpload].self,
+            forKey: .pendingLibraryMutations
+        ) ?? []
+        legacyUnattributed = try container.decodeIfPresent(Bool.self, forKey: .legacyUnattributed)
+            ?? (sources.isEmpty && pendingPlaybackCompletions.isEmpty && pendingLibraryMutations.isEmpty)
     }
 
     /// Visible when the active source confirmed it, or when nothing has attributed
     /// it yet — an unattributed row is not evidence that the source *lacks* it.
     func isVisible(under source: TraktWatchProgressSource) -> Bool {
-        guard !(sources.isEmpty && !pendingPlaybackCompletions.isEmpty) else { return false }
-        return sources.isEmpty || sources.contains { $0.caseInsensitiveCompare(source.rawValue) == .orderedSame }
+        if legacyUnattributed { return true }
+        guard !sources.isEmpty else {
+            return pendingPlaybackCompletions.isEmpty && pendingLibraryMutations.isEmpty
+        }
+        return sources.contains { $0.caseInsensitiveCompare(source.rawValue) == .orderedSame }
     }
 
-    func adding(source: TraktWatchProgressSource) -> WatchedStoreItem {
-        WatchedStoreItem(
+    func adding(
+        source: TraktWatchProgressSource,
+        accountID: String? = nil,
+        changedAt: Date? = nil
+    ) -> WatchedStoreItem {
+        var accountBindings = sourceAccountIDsBySource
+        if let accountID { accountBindings[source.rawValue] = accountID }
+        var changedAtBySource = sourceChangedAtBySource
+        if let changedAt { changedAtBySource[source.rawValue] = changedAt }
+        else if changedAtBySource[source.rawValue] == nil { changedAtBySource[source.rawValue] = watchedAt }
+        var stateBySource = sourceStateBySource
+        stateBySource[source.rawValue] = true
+        return WatchedStoreItem(
             meta: meta,
             watchedAt: watchedAt,
             season: season,
             episode: episode,
             sources: sources.union([source.rawValue]),
             watchCountsBySource: watchCountsBySource,
+            sourceAccountIDsBySource: accountBindings,
+            sourceChangedAtBySource: changedAtBySource,
+            sourceStateBySource: stateBySource,
             lastCountedPlaybackIDsBySource: lastCountedPlaybackIDsBySource,
-            pendingPlaybackCompletions: pendingPlaybackCompletions
+            pendingPlaybackCompletions: pendingPlaybackCompletions,
+            pendingLibraryMutations: pendingLibraryMutations,
+            legacyUnattributed: legacyUnattributed
         )
     }
 
@@ -6108,7 +6275,30 @@ struct WatchedStoreItem: Identifiable, Codable, Equatable, Sendable {
         copy.lastCountedPlaybackIDsBySource = copy.lastCountedPlaybackIDsBySource.filter {
             $0.key.caseInsensitiveCompare(source.rawValue) != .orderedSame
         }
+        copy.sourceAccountIDsBySource = copy.sourceAccountIDsBySource.filter {
+            $0.key.caseInsensitiveCompare(source.rawValue) != .orderedSame
+        }
+        copy.sourceChangedAtBySource = copy.sourceChangedAtBySource.filter {
+            $0.key.caseInsensitiveCompare(source.rawValue) != .orderedSame
+        }
+        copy.sourceStateBySource = copy.sourceStateBySource.filter {
+            $0.key.caseInsensitiveCompare(source.rawValue) != .orderedSame
+        }
         return copy
+    }
+
+    func isLibraryVisible(
+        under source: TraktWatchProgressSource,
+        accountID: String? = nil
+    ) -> Bool {
+        guard sources.contains(where: { $0.caseInsensitiveCompare(source.rawValue) == .orderedSame }) else {
+            return false
+        }
+        guard let accountID else { return true }
+        let storedAccountID = sourceAccountIDsBySource.first {
+            $0.key.caseInsensitiveCompare(source.rawValue) == .orderedSame
+        }?.value
+        return storedAccountID == accountID
     }
 }
 
@@ -6591,13 +6781,76 @@ struct WatchedSnapshot {
     init(
         items: [WatchedStoreItem],
         source: TraktWatchProgressSource,
-        additionalVisibleSources: Set<TraktWatchProgressSource> = []
+        additionalVisibleSources: Set<TraktWatchProgressSource> = [],
+        strictSourceOnly: Bool = false,
+        libraryAccountID: String? = nil,
+        libraryProfileID: String? = nil
     ) {
         self.source = source
         self.additionalVisibleSources = additionalVisibleSources
-        let visible = items.filter { item in
-            item.isVisible(under: source)
+        var pendingMutationsByIdentity: [String: WatchedLibraryMutationUpload] = [:]
+        if strictSourceOnly {
+            for event in items.flatMap(\.pendingLibraryMutations) where
+                event.provider.caseInsensitiveCompare(source.rawValue) == .orderedSame
+                    && event.accountID == libraryAccountID
+                    && event.profileID == libraryProfileID
+                    && event.isPrimaryTarget {
+                let episodes: [Int?]
+                if !event.episodes.isEmpty {
+                    episodes = event.episodes.map(Optional.some)
+                } else {
+                    episodes = [event.episode]
+                }
+                for episode in episodes {
+                    for key in WatchedStore.watchedIdentityKeys(
+                        metaId: event.meta.id,
+                        imdbId: event.meta.imdbId,
+                        tmdbId: event.meta.tmdbId,
+                        contentType: event.meta.canonicalType,
+                        season: event.season,
+                        episode: episode
+                    ) {
+                        if let existing = pendingMutationsByIdentity[key],
+                           (existing.changedAt, existing.id) > (event.changedAt, event.id) {
+                            continue
+                        }
+                        pendingMutationsByIdentity[key] = event
+                    }
+                }
+            }
+        }
+        let visible: [WatchedStoreItem] = items.compactMap { item in
+            if strictSourceOnly {
+                let identityKeys = WatchedStore.watchedIdentityKeys(
+                    metaId: item.meta.id,
+                    imdbId: item.meta.imdbId,
+                    tmdbId: item.meta.tmdbId,
+                    contentType: item.meta.canonicalType,
+                    season: item.season,
+                    episode: item.episode
+                )
+                let pendingPrimaryMutation = identityKeys
+                    .compactMap { pendingMutationsByIdentity[$0] }
+                    .max {
+                        if $0.changedAt != $1.changedAt { return $0.changedAt < $1.changedAt }
+                        return $0.id < $1.id
+                    }
+                if let pendingPrimaryMutation {
+                    guard pendingPrimaryMutation.isWatched else { return nil }
+                    var optimistic = item
+                    optimistic.sources.insert(source.rawValue)
+                    optimistic.watchCountsBySource[source.rawValue] = max(
+                        1,
+                        optimistic.watchCountsBySource[source.rawValue] ?? 0
+                    )
+                    return optimistic
+                }
+                return item.isLibraryVisible(under: source, accountID: libraryAccountID) ? item : nil
+            }
+            return item.isVisible(under: source)
                 || additionalVisibleSources.contains { item.isVisible(under: $0) }
+                ? item
+                : nil
         }
         self.visibleItems = visible
 
@@ -6763,11 +7016,10 @@ struct WatchedSnapshot {
             result[key] = max(result[key] ?? 0, max(1, entry.value))
         }
 
-        if item.sources.isEmpty {
+        if item.legacyUnattributed {
             var result = storedCounts
-            if result.isEmpty {
-                result[activeSource.rawValue.lowercased()] = 1
-            }
+            let activeKey = activeSource.rawValue.lowercased()
+            result[activeKey] = max(1, result[activeKey] ?? 0)
             return result
         }
 
@@ -7102,6 +7354,34 @@ struct WatchedSnapshot {
 
 enum WatchedStore {
     static let changedNotification = Notification.Name("nuvio.tv.watched.changed")
+    private(set) static var nuvioSyncChangeGeneration: UInt = 0
+
+    private struct WatchedRowIdentity: Hashable {
+        let season: Int?
+        let episode: Int?
+    }
+
+    private struct LibraryMutationScope: Equatable {
+        let season: Int?
+        let episode: Int?
+        let episodes: [Int]
+
+        var rowIdentities: [WatchedRowIdentity] {
+            if !episodes.isEmpty {
+                return episodes.sorted().map { WatchedRowIdentity(season: season, episode: $0) }
+            }
+            return [WatchedRowIdentity(season: season, episode: episode)]
+        }
+
+        var anchor: WatchedRowIdentity {
+            WatchedRowIdentity(season: season, episode: episode ?? episodes.sorted().first)
+        }
+
+        var eventEpisode: Int? {
+            guard episodes.isEmpty else { return episode }
+            return episode
+        }
+    }
 
     struct PlaybackProviderAccountBinding: Hashable, Sendable {
         let provider: String
@@ -7123,10 +7403,80 @@ enum WatchedStore {
     private static var cachedKey: String?
     private static var cachedData: Data?
     private static var cachedSnapshot: WatchedSnapshot?
+    private struct LibrarySnapshotCacheKey: Hashable {
+        let storageKey: String
+        let source: TraktWatchProgressSource
+        let accountID: String?
+    }
+    private static var cachedLibrarySnapshots: [LibrarySnapshotCacheKey: WatchedSnapshot] = [:]
     private static var cachedSource: TraktWatchProgressSource?
     private static var cachedTraktHistoryVisibility = false
     private static var cachedAdditionalSources: Set<TraktWatchProgressSource> = []
     private static var cacheGeneration = 0
+    @MainActor private static var libraryHistorySyncTasks: [String: Task<Bool, Never>] = [:]
+
+    private struct NuvioWatchedProjection: Equatable {
+        let identity: [String]
+        let contentID: String
+        let contentType: String
+        let title: String
+        let watchedAt: Date
+        let season: Int?
+        let episode: Int?
+        let hasMark: Bool
+        let accountID: String?
+        let sourceWatchedAt: Date?
+        let watchCount: Int?
+        let lastPlaybackID: String?
+        let pendingCompletions: [WatchedPlaybackCompletionUpload]
+        let pendingLibraryMutationIDs: [String]
+    }
+
+    private static func nuvioWatchedProjection(_ items: [WatchedStoreItem]) -> [NuvioWatchedProjection] {
+        let source = TraktWatchProgressSource.nuvioSync.rawValue
+        return items.compactMap { item in
+            let hasMark = item.sources.contains { $0.caseInsensitiveCompare(source) == .orderedSame }
+            let count = item.watchCountsBySource.first {
+                $0.key.caseInsensitiveCompare(source) == .orderedSame
+            }?.value
+            let lastID = item.lastCountedPlaybackIDsBySource.first {
+                $0.key.caseInsensitiveCompare(source) == .orderedSame
+            }?.value
+            let completions = item.pendingPlaybackCompletions.filter {
+                $0.provider.caseInsensitiveCompare(source) == .orderedSame
+            }
+            let mutations = item.pendingLibraryMutations.filter {
+                $0.provider.caseInsensitiveCompare(source) == .orderedSame
+            }
+            guard hasMark || !completions.isEmpty || !mutations.isEmpty else { return nil }
+            return NuvioWatchedProjection(
+                identity: contentIdentityKeys(for: item.meta).sorted(),
+                contentID: item.meta.id,
+                contentType: item.meta.type,
+                title: item.meta.name,
+                watchedAt: item.watchedAt,
+                season: item.season,
+                episode: item.episode,
+                hasMark: hasMark,
+                accountID: item.sourceAccountIDsBySource.first {
+                    $0.key.caseInsensitiveCompare(TraktWatchProgressSource.nuvioSync.rawValue) == .orderedSame
+                }?.value,
+                sourceWatchedAt: item.sourceChangedAtBySource.first {
+                    $0.key.caseInsensitiveCompare(TraktWatchProgressSource.nuvioSync.rawValue) == .orderedSame
+                }?.value ?? item.watchedAt,
+                watchCount: count,
+                lastPlaybackID: lastID,
+                pendingCompletions: completions,
+                pendingLibraryMutationIDs: mutations.map(\.id).sorted()
+            )
+        }.sorted {
+            let leftIdentity = $0.identity.joined(separator: ",")
+            let rightIdentity = $1.identity.joined(separator: ",")
+            let left = "\(leftIdentity)|\($0.contentID)|\($0.contentType)|\($0.season ?? -1)|\($0.episode ?? -1)"
+            let right = "\(rightIdentity)|\($1.contentID)|\($1.contentType)|\($1.season ?? -1)|\($1.episode ?? -1)"
+            return left < right
+        }
+    }
 
     private enum PersistenceError: LocalizedError {
         case storageUnavailable(String)
@@ -7169,6 +7519,7 @@ enum WatchedStore {
         cachedKey = nil
         cachedData = nil
         cachedSnapshot = nil
+        cachedLibrarySnapshots = [:]
         cachedSource = nil
         cachedTraktHistoryVisibility = false
         cachedAdditionalSources = []
@@ -7231,15 +7582,12 @@ enum WatchedStore {
         cachedKey = key
         cachedData = data
         cachedSnapshot = nil
+        cachedLibrarySnapshots = [:]
     }
 
-    /// Attributes rows written before `sources` existed.
-    ///
-    /// The best available reconstruction is the trackers' own cached snapshots:
-    /// anything Simkl supplied is still listed there, so those rows are tagged
-    /// accordingly and everything else is treated as Nuvio Sync's. Runs once per
-    /// profile — after it, an empty `sources` means a genuinely new row rather
-    /// than a legacy one.
+    /// Backfills rows written before `sources` existed using the existing local
+    /// history migration. The library-specific snapshot still requires explicit
+    /// provider attribution before it displays a row.
     private static func migrateSourcesIfNeeded() {
         guard let id = activeProfileId, !id.isEmpty else { return }
         let flagKey = "nuvio.tv.watched.sourcesMigrated.\(id)"
@@ -7251,7 +7599,6 @@ enum WatchedStore {
             store.set(true, forKey: flagKey)
             return
         }
-
         let simklKeys = Set(
             SimklSyncCache.history(in: store)
                 .flatMap(\.items)
@@ -7261,7 +7608,9 @@ enum WatchedStore {
             guard item.sources.isEmpty else { return item }
             let source: TraktWatchProgressSource =
                 watchedIdentityKeys(item).isDisjoint(with: simklKeys) ? .nuvioSync : .simkl
-            return item.adding(source: source)
+            var attributed = item.adding(source: source)
+            attributed.legacyUnattributed = false
+            return attributed
         }
         guard persist(migrated) else { return }
         store.set(true, forKey: flagKey)
@@ -7306,6 +7655,34 @@ enum WatchedStore {
             }
     }
 
+    static func pendingLibraryMutations(
+        provider: TraktWatchProgressSource,
+        profileId: String? = activeProfileId,
+        readyOnly: Bool = false
+    ) -> [WatchedLibraryMutationUpload] {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let events = mergedLibraryMutations(
+            itemsLocked(profileId: profileId)
+                .flatMap(\.pendingLibraryMutations)
+                .filter { $0.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame }
+        )
+        guard readyOnly else { return events }
+        let now = Date()
+        return events.filter { event in
+            guard (event.nextAttemptAt ?? .distantPast) <= now else { return false }
+            let hasEarlierOverlappingEvent = events.contains { older in
+                guard older.id != event.id,
+                      older.accountID == event.accountID,
+                      older.profileID == event.profileID,
+                      (older.changedAt < event.changedAt
+                        || (older.changedAt == event.changedAt && older.id < event.id)) else { return false }
+                return older.overlaps(event)
+            }
+            return !hasEarlierOverlappingEvent
+        }
+    }
+
     /// Acknowledges exactly one event for exactly one provider account and
     /// profile. A retry after a successful acknowledgement is an idempotent
     /// success; a different account's event is untouched.
@@ -7332,13 +7709,329 @@ enum WatchedStore {
                 return !matches
             }
             copy.pendingPlaybackCompletions = remaining
-            if copy.sources.isEmpty, copy.pendingPlaybackCompletions.isEmpty {
+            if copy.sources.isEmpty,
+               copy.pendingPlaybackCompletions.isEmpty,
+               copy.pendingLibraryMutations.isEmpty,
+               !copy.legacyUnattributed {
                 return nil
             }
             return copy
         }
         guard didRemove else { return !foundProviderEvent }
         return persistLocked(updated, profileId: profileId)
+    }
+
+    /// Removes exactly one account-bound library mutation. A successful mark
+    /// only becomes that provider's accepted source after the server responds.
+    @discardableResult
+    static func acknowledgeLibraryMutation(
+        id: String,
+        provider: TraktWatchProgressSource,
+        accountID: String,
+        profileId: String?
+    ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let current = itemsLocked(profileId: profileId)
+        var acknowledged: WatchedLibraryMutationUpload?
+        var foundProviderEvent = false
+        for event in current.flatMap(\.pendingLibraryMutations) where event.id == id
+            && event.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame {
+            foundProviderEvent = true
+            if event.accountID == accountID, event.profileID == profileId {
+                acknowledged = event
+                break
+            }
+        }
+        guard let acknowledged else { return !foundProviderEvent }
+
+        var rows = current
+        if acknowledged.isWatched {
+            let identities: [WatchedRowIdentity]
+            if !acknowledged.episodes.isEmpty {
+                identities = acknowledged.episodes.map {
+                    WatchedRowIdentity(season: acknowledged.season, episode: $0)
+                }
+            } else {
+                identities = [WatchedRowIdentity(season: acknowledged.season, episode: acknowledged.episode)]
+            }
+            for identity in identities where !rows.contains(where: {
+                sameContent($0.meta, acknowledged.meta)
+                    && $0.season == identity.season
+                    && $0.episode == identity.episode
+            }) {
+                rows.append(WatchedStoreItem(
+                    meta: acknowledged.meta,
+                    watchedAt: acknowledged.changedAt,
+                    season: identity.season,
+                    episode: identity.episode,
+                    legacyUnattributed: false
+                ))
+            }
+        }
+
+        let updated = rows.compactMap { item -> WatchedStoreItem? in
+            var copy = item
+            copy.pendingLibraryMutations.removeAll { $0.id == id }
+            if acknowledged.affects(item) {
+                let hasNewerIntent = rows
+                    .flatMap(\.pendingLibraryMutations)
+                    .contains { later in
+                        later.id != id
+                            && later.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                            && later.accountID == accountID
+                            && later.profileID == profileId
+                            && later.changedAt > acknowledged.changedAt
+                            && later.affects(item)
+                    }
+                let hasNewerProviderState = (copy.sourceChangedAtBySource[provider.rawValue] ?? .distantPast)
+                    > acknowledged.changedAt
+                    && copy.sourceAccountIDsBySource[provider.rawValue] == accountID
+                if !hasNewerIntent && !hasNewerProviderState, acknowledged.isWatched {
+                    copy.sources.insert(provider.rawValue)
+                    copy.watchCountsBySource[provider.rawValue] = max(
+                        1,
+                        copy.watchCountsBySource[provider.rawValue] ?? 0
+                    )
+                    copy.sourceAccountIDsBySource[provider.rawValue] = accountID
+                    copy.sourceChangedAtBySource[provider.rawValue] = acknowledged.changedAt
+                    copy.sourceStateBySource[provider.rawValue] = true
+                } else if !hasNewerIntent && !hasNewerProviderState {
+                    copy = copy.removing(source: provider)
+                    copy.sourceAccountIDsBySource[provider.rawValue] = accountID
+                    copy.sourceChangedAtBySource[provider.rawValue] = acknowledged.changedAt
+                    copy.sourceStateBySource[provider.rawValue] = false
+                }
+            }
+            if copy.sources.isEmpty,
+               copy.pendingPlaybackCompletions.isEmpty,
+               copy.pendingLibraryMutations.isEmpty,
+               !copy.legacyUnattributed {
+                return nil
+            }
+            return copy
+        }
+        return persistLocked(updated, profileId: profileId)
+    }
+
+    @discardableResult
+    static func acknowledgeLibraryMutationPartial(
+        id: String,
+        provider: TraktWatchProgressSource,
+        accountID: String,
+        profileId: String?,
+        unresolvedEpisodes: [Int]
+    ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let current = itemsLocked(profileId: profileId)
+        let event = current.flatMap(\.pendingLibraryMutations).first {
+            $0.id == id
+                && $0.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                && $0.accountID == accountID
+                && $0.profileID == profileId
+        }
+        guard let event else {
+            return !current.flatMap(\.pendingLibraryMutations).contains(where: {
+                $0.id == id && $0.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+            })
+        }
+
+        let originalEpisodes = event.episodes.isEmpty
+            ? event.episode.map { [$0] } ?? []
+            : event.episodes
+        guard !originalEpisodes.isEmpty else { return false }
+        let originalSet = Set(originalEpisodes)
+        let unresolvedSet = Set(unresolvedEpisodes).intersection(originalSet)
+        let acceptedEpisodes = originalSet.subtracting(unresolvedSet).sorted()
+        var rows = current.map { item -> WatchedStoreItem in
+            var copy = item
+            copy.pendingLibraryMutations.removeAll { $0.id == id }
+            return copy
+        }
+
+        for episode in acceptedEpisodes {
+            let identity = WatchedRowIdentity(season: event.season, episode: episode)
+            let matchingIndices = rows.indices.filter {
+                sameContent(rows[$0].meta, event.meta)
+                    && rows[$0].season == identity.season
+                    && rows[$0].episode == identity.episode
+            }
+            if matchingIndices.isEmpty {
+                let candidate = WatchedStoreItem(
+                    meta: event.meta,
+                    watchedAt: event.changedAt,
+                    season: identity.season,
+                    episode: identity.episode,
+                    legacyUnattributed: false
+                )
+                let hasNewerIntent = current.flatMap(\.pendingLibraryMutations).contains { later in
+                    later.id != id
+                        && later.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                        && later.accountID == accountID
+                        && later.profileID == profileId
+                        && later.changedAt > event.changedAt
+                        && later.affects(candidate)
+                }
+                guard !hasNewerIntent else { continue }
+                rows.append(WatchedStoreItem(
+                    meta: candidate.meta,
+                    watchedAt: event.changedAt,
+                    season: identity.season,
+                    episode: identity.episode,
+                    sources: [provider.rawValue],
+                    watchCountsBySource: [provider.rawValue: 1],
+                    sourceAccountIDsBySource: [provider.rawValue: accountID],
+                    sourceChangedAtBySource: [provider.rawValue: event.changedAt],
+                    sourceStateBySource: [provider.rawValue: true],
+                    legacyUnattributed: false
+                ))
+                continue
+            }
+            for index in matchingIndices {
+                let hasNewerIntent = current.flatMap(\.pendingLibraryMutations).contains { later in
+                    later.id != id
+                        && later.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                        && later.accountID == accountID
+                        && later.profileID == profileId
+                        && later.changedAt > event.changedAt
+                        && later.affects(rows[index])
+                }
+                guard !hasNewerIntent else { continue }
+                rows[index].sources.insert(provider.rawValue)
+                rows[index].watchCountsBySource[provider.rawValue] = max(
+                    1,
+                    rows[index].watchCountsBySource[provider.rawValue] ?? 0
+                )
+                rows[index].sourceAccountIDsBySource[provider.rawValue] = accountID
+                rows[index].sourceChangedAtBySource[provider.rawValue] = event.changedAt
+                rows[index].sourceStateBySource[provider.rawValue] = true
+            }
+        }
+
+        if !unresolvedSet.isEmpty {
+            let remaining = unresolvedSet.sorted()
+            let attemptCount = event.attemptCount + 1
+            let exponent = min(max(attemptCount - 1, 0), 8)
+            let delay = min(900.0, 5.0 * pow(2.0, Double(exponent)))
+            let partial = WatchedLibraryMutationUpload(
+                id: event.id,
+                provider: provider,
+                accountID: accountID,
+                profileID: profileId,
+                meta: event.meta,
+                season: event.season,
+                episode: remaining.count == 1 ? remaining[0] : nil,
+                episodes: remaining.count > 1 ? remaining : [],
+                isWatched: event.isWatched,
+                isPrimaryTarget: event.isPrimaryTarget,
+                changedAt: event.changedAt,
+                attemptCount: attemptCount,
+                nextAttemptAt: Date().addingTimeInterval(delay)
+            )
+            let anchor = WatchedRowIdentity(
+                season: partial.season,
+                episode: partial.episode ?? partial.episodes.first
+            )
+            if let anchorIndex = rows.firstIndex(where: {
+                sameContent($0.meta, partial.meta)
+                    && $0.season == anchor.season
+                    && $0.episode == anchor.episode
+            }) {
+                rows[anchorIndex].pendingLibraryMutations.append(partial)
+            } else {
+                rows.append(WatchedStoreItem(
+                    meta: partial.meta,
+                    watchedAt: partial.changedAt,
+                    season: anchor.season,
+                    episode: anchor.episode,
+                    pendingLibraryMutations: [partial],
+                    legacyUnattributed: false
+                ))
+            }
+        }
+
+        let updated = rows.filter {
+            !$0.sources.isEmpty
+                || !$0.pendingPlaybackCompletions.isEmpty
+                || !$0.pendingLibraryMutations.isEmpty
+                || $0.legacyUnattributed
+        }
+        let saved = persistLocked(mergedByIdentity(updated), profileId: profileId)
+        guard saved, !unresolvedSet.isEmpty else { return saved }
+        let nextAttemptAt = Date().addingTimeInterval(
+            min(900.0, 5.0 * pow(2.0, Double(min(max(event.attemptCount, 0), 8))))
+        )
+        let delay = max(0, nextAttemptAt.timeIntervalSinceNow)
+        Task.detached(priority: .utility) {
+            if delay > 0 { try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000)) }
+            scheduleLibraryMutationFlush(provider, profileId: profileId)
+        }
+        return true
+    }
+
+    /// Keeps a failed provider write durable and backs off retries without
+    /// changing its original ordering or rebinding it to a new account.
+    @discardableResult
+    static func deferLibraryMutation(
+        id: String,
+        provider: TraktWatchProgressSource,
+        accountID: String,
+        profileId: String?,
+        now: Date = Date()
+    ) -> Bool {
+        cacheLock.lock()
+        let current = itemsLocked(profileId: profileId)
+        var didDefer = false
+        let updated = current.map { item -> WatchedStoreItem in
+            var copy = item
+            copy.pendingLibraryMutations = copy.pendingLibraryMutations.map { event in
+                guard event.id == id,
+                      event.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame,
+                      event.accountID == accountID,
+                      event.profileID == profileId else { return event }
+                let attemptCount = event.attemptCount + 1
+                let exponent = min(max(attemptCount - 1, 0), 8)
+                let delay = min(900.0, 5.0 * pow(2.0, Double(exponent)))
+                didDefer = true
+                return WatchedLibraryMutationUpload(
+                    id: event.id,
+                    provider: provider,
+                    accountID: event.accountID,
+                    profileID: event.profileID,
+                    meta: event.meta,
+                    season: event.season,
+                    episode: event.episode,
+                    episodes: event.episodes,
+                    isWatched: event.isWatched,
+                    isPrimaryTarget: event.isPrimaryTarget,
+                    changedAt: event.changedAt,
+                    attemptCount: attemptCount,
+                    nextAttemptAt: now.addingTimeInterval(delay)
+                )
+            }
+            return copy
+        }
+        guard didDefer else {
+            cacheLock.unlock()
+            return false
+        }
+        let nextAttemptAt = updated
+            .flatMap(\.pendingLibraryMutations)
+            .first { $0.id == id }?
+            .nextAttemptAt ?? now.addingTimeInterval(5)
+        let saved = persistLocked(updated, profileId: profileId)
+        cacheLock.unlock()
+        guard saved else { return false }
+
+        let delay = max(0, nextAttemptAt.timeIntervalSinceNow)
+        Task.detached(priority: .utility) {
+            if delay > 0 {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+            }
+            scheduleLibraryMutationFlush(provider, profileId: profileId)
+        }
+        return true
     }
 
     private static func itemsLocked(profileId: String?) -> [WatchedStoreItem] {
@@ -7428,6 +8121,590 @@ enum WatchedStore {
     /// local union, because sync pushes and history transfers work from that.
     static func visibleItems() -> [WatchedStoreItem] {
         currentSnapshot().visibleItems
+    }
+
+    /// Strict source-only index for library surfaces. `librarySourceMode` is
+    /// independent from the playback owner, so this snapshot never adds the
+    /// selected resume provider, Trakt mirrors, or scrobble targets.
+    static func librarySnapshot(
+        for librarySource: TraktLibrarySourceMode,
+        profileId: String? = activeProfileId
+    ) -> WatchedSnapshot {
+        let source = watchedSource(for: librarySource)
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let store = ProfileSettings.store(for: profileId)
+        let accountID = libraryAccountBinding(for: source, in: store, profileId: profileId)
+        let key = LibrarySnapshotCacheKey(
+            storageKey: storageKey(for: profileId),
+            source: source,
+            accountID: accountID
+        )
+        if profileId == activeProfileId, let cached = cachedLibrarySnapshots[key] {
+            return cached
+        }
+        let snapshot = WatchedSnapshot(
+            items: itemsLocked(profileId: profileId),
+            source: source,
+            strictSourceOnly: true,
+            libraryAccountID: accountID,
+            libraryProfileID: profileId
+        )
+        if profileId == activeProfileId {
+            cachedLibrarySnapshots[key] = snapshot
+        }
+        return snapshot
+    }
+
+    static func isWatchedForLibrary(
+        meta: NuvioMeta,
+        source: TraktLibrarySourceMode,
+        profileId: String? = activeProfileId
+    ) -> Bool {
+        let snapshot = librarySnapshot(for: source, profileId: profileId)
+        if snapshot.contains(meta: meta) { return true }
+        guard meta.isSeries, let videos = meta.videos, !videos.isEmpty else { return false }
+        return CatalogWatchedPolicy.hasWatchedAllAiredEpisodes(
+            videos: videos,
+            watchedEpisodeKeys: snapshot.catalogWatchedEpisodeKeys(meta: meta)
+        )
+    }
+
+    @discardableResult
+    static func setLibraryWatched(
+        _ meta: NuvioMeta,
+        season: Int? = nil,
+        episode: Int? = nil,
+        isWatched: Bool,
+        context: WatchedLibraryMutationContext
+    ) -> Bool {
+        if meta.isSeries, season == nil, episode == nil {
+            let episodesBySeason = airedRegularEpisodeNumbers(bySeason: meta)
+            if meta.videos != nil, episodesBySeason.isEmpty { return false }
+            let scopes = episodesBySeason.keys.sorted().map { season in
+                LibraryMutationScope(
+                    season: season,
+                    episode: nil,
+                    episodes: (episodesBySeason[season] ?? []).sorted()
+                )
+            }
+            if scopes.isEmpty {
+                return applyLibraryMutation(
+                    meta: meta,
+                    scopes: [LibraryMutationScope(season: nil, episode: nil, episodes: [])],
+                    isWatched: isWatched,
+                    context: context,
+                    removesWholeTitleMarker: !isWatched
+                )
+            }
+            return applyLibraryMutation(
+                meta: meta,
+                scopes: scopes,
+                isWatched: isWatched,
+                context: context,
+                removesWholeTitleMarker: !isWatched
+            )
+        }
+        return applyLibraryMutation(
+            meta: meta,
+            scopes: [LibraryMutationScope(season: season, episode: episode, episodes: [])],
+            isWatched: isWatched,
+            context: context
+        )
+    }
+
+    @discardableResult
+    static func setLibrarySeasonWatched(
+        _ meta: NuvioMeta,
+        season: Int,
+        episodes: [Int],
+        isWatched: Bool,
+        context: WatchedLibraryMutationContext
+    ) -> Bool {
+        let episodeNumbers = Array(Set(episodes.filter { $0 > 0 })).sorted()
+        guard season >= 0, !episodeNumbers.isEmpty else { return false }
+        return applyLibraryMutation(
+            meta: meta,
+            scopes: [LibraryMutationScope(season: season, episode: nil, episodes: episodeNumbers)],
+            isWatched: isWatched,
+            context: context
+        )
+    }
+
+    @discardableResult
+    static func setLibraryWatchedUpTo(
+        _ meta: NuvioMeta,
+        season: Int,
+        episode: Int,
+        context: WatchedLibraryMutationContext
+    ) -> Bool {
+        guard season >= 0, episode > 0 else { return false }
+        var episodesBySeason: [Int: Set<Int>] = [:]
+        if let videos = meta.videos, !videos.isEmpty {
+            if season > 0 {
+                let eligible = videos.filter { video in
+                    guard video.season > 0, video.episode > 0 else { return false }
+                    if video.season < season { return EpisodeReleasePolicy.hasAired(video.released) }
+                    if video.season == season {
+                        return video.episode <= episode
+                            && (EpisodeReleasePolicy.hasAired(video.released) || video.episode == episode)
+                    }
+                    return false
+                }
+                episodesBySeason = Dictionary(grouping: eligible, by: \.season)
+                    .mapValues { Set($0.map(\.episode)) }
+            } else {
+                let eligible = videos.filter { $0.season == season && $0.episode <= episode }
+                episodesBySeason = Dictionary(grouping: eligible, by: \.season)
+                    .mapValues { Set($0.map(\.episode)) }
+            }
+        }
+        episodesBySeason[season, default: []].insert(episode)
+        if season > 0,
+           (episodesBySeason[season]?.count ?? 0) <= 1,
+           episode > 1,
+           meta.videos == nil || meta.videos?.isEmpty == true {
+            episodesBySeason[season] = Set(1...episode)
+        }
+        let scopes = episodesBySeason.keys.sorted().map { season in
+            LibraryMutationScope(
+                season: season,
+                episode: nil,
+                episodes: (episodesBySeason[season] ?? []).sorted()
+            )
+        }
+        guard !scopes.isEmpty else { return false }
+        return applyLibraryMutation(meta: meta, scopes: scopes, isWatched: true, context: context)
+    }
+
+    @discardableResult
+    private static func applyLibraryMutation(
+        meta: NuvioMeta,
+        scopes: [LibraryMutationScope],
+        isWatched: Bool,
+        context: WatchedLibraryMutationContext,
+        removesWholeTitleMarker: Bool = false
+    ) -> Bool {
+        guard isCurrentLibraryMutationContext(context) else { return false }
+        cacheLock.lock()
+        guard isCurrentLibraryMutationContext(context) else {
+            cacheLock.unlock()
+            return false
+        }
+        let profileId = context.profileID
+        let primary = watchedSource(for: context.librarySource)
+        let libraryChangedAt = Date()
+        var current = itemsLocked(profileId: profileId)
+        let wholeTitleMarkerWasOwnedByNuvio = removesWholeTitleMarker
+            && current.contains(where: { item in
+                sameContent(item.meta, meta)
+                    && item.season == nil
+                    && item.episode == nil
+                    && item.isLibraryVisible(
+                        under: .nuvioSync,
+                        accountID: context.targets.first(where: { $0.provider == .nuvioSync })?.accountID
+                    )
+            })
+        var rowIdentities = Set(scopes.flatMap(\.rowIdentities))
+        if removesWholeTitleMarker { rowIdentities.insert(WatchedRowIdentity(season: nil, episode: nil)) }
+
+        for identity in rowIdentities {
+            let matchingIndexes = current.indices.filter {
+                sameContent(current[$0].meta, meta)
+                    && current[$0].season == identity.season
+                    && current[$0].episode == identity.episode
+            }
+            let matchingRows = matchingIndexes.map { current[$0] }
+            var row = mergedByIdentity(matchingRows).first ?? WatchedStoreItem(
+                meta: meta.persistenceSnapshot,
+                watchedAt: Date(),
+                season: identity.season,
+                episode: identity.episode,
+                legacyUnattributed: false
+            )
+            if isWatched {
+                for target in context.targets {
+                    let source = target.provider.rawValue
+                    if primary == .nuvioSync && target.provider == primary && target.accountID == nil {
+                        row.sources.insert(source)
+                        row.watchCountsBySource[source] = max(1, row.watchCountsBySource[source] ?? 0)
+                        row.sourceChangedAtBySource[source] = libraryChangedAt
+                        row.sourceStateBySource[source] = true
+                    }
+                }
+            } else {
+                for target in context.targets {
+                    guard target.provider == primary else { continue }
+                    let storedAccountID = row.sourceAccountIDsBySource.first {
+                        $0.key.caseInsensitiveCompare(target.provider.rawValue) == .orderedSame
+                    }?.value
+                    if let storedAccountID, storedAccountID != target.accountID {
+                        continue
+                    }
+                    row = row.removing(source: target.provider)
+                    guard let accountID = target.accountID else { continue }
+                    row.sourceAccountIDsBySource[target.provider.rawValue] = accountID
+                    row.sourceChangedAtBySource[target.provider.rawValue] = libraryChangedAt
+                    row.sourceStateBySource[target.provider.rawValue] = false
+                }
+            }
+            if !matchingIndexes.isEmpty {
+                for index in matchingIndexes.reversed() { current.remove(at: index) }
+            }
+            if !row.sources.isEmpty
+                || !row.pendingPlaybackCompletions.isEmpty
+                || !row.pendingLibraryMutations.isEmpty
+                || !row.sourceStateBySource.isEmpty
+                || row.legacyUnattributed {
+                current.append(row)
+            }
+        }
+
+        var providersToFlush = Set<TraktWatchProgressSource>()
+        for scope in scopes {
+            let scopeRows = scope.rowIdentities
+            for target in context.targets {
+                let isLocalPrimary = isWatched && target.provider == primary && primary == .nuvioSync
+                guard let accountID = target.accountID else { continue }
+                if isWatched, !isLocalPrimary,
+                   scopeRows.allSatisfy({ identity in
+                       current.contains(where: {
+                           sameContent($0.meta, meta)
+                               && $0.season == identity.season && $0.episode == identity.episode
+                               && $0.isLibraryVisible(under: target.provider, accountID: target.accountID)
+                       })
+                   }),
+                   !hasPendingOppositeLibraryMutation(
+                       in: current,
+                       provider: target.provider,
+                       accountID: accountID,
+                       meta: meta,
+                       scope: scope,
+                       desiredState: true
+                   ) {
+                    continue
+                }
+                let event = WatchedLibraryMutationUpload(
+                    provider: target.provider,
+                    accountID: accountID,
+                    profileID: profileId,
+                    meta: meta,
+                    season: scope.season,
+                    episode: scope.eventEpisode,
+                    episodes: scope.episodes,
+                    isWatched: isWatched,
+                    isPrimaryTarget: target.provider == primary,
+                    changedAt: libraryChangedAt
+                )
+                upsertLibraryMutation(event, scope: scope, into: &current)
+                providersToFlush.insert(target.provider)
+            }
+        }
+
+        if wholeTitleMarkerWasOwnedByNuvio,
+           !scopes.contains(where: { $0.season == nil && $0.episode == nil && $0.episodes.isEmpty }),
+           let target = context.targets.first(where: { $0.provider == .nuvioSync }),
+           let accountID = target.accountID {
+            let titleScope = LibraryMutationScope(season: nil, episode: nil, episodes: [])
+            let event = WatchedLibraryMutationUpload(
+                provider: .nuvioSync,
+                accountID: accountID,
+                profileID: profileId,
+                meta: meta,
+                season: nil,
+                episode: nil,
+                episodes: [],
+                isWatched: false,
+                isPrimaryTarget: target.provider == primary,
+                changedAt: libraryChangedAt
+            )
+            upsertLibraryMutation(event, scope: titleScope, into: &current)
+            providersToFlush.insert(.nuvioSync)
+        }
+
+        let updated = mergedByIdentity(current)
+        guard isCurrentLibraryMutationContext(context) else {
+            cacheLock.unlock()
+            return false
+        }
+        let saved = persistLocked(updated, profileId: profileId)
+        cacheLock.unlock()
+        guard saved else { return false }
+        for provider in providersToFlush {
+            scheduleLibraryMutationFlush(provider, profileId: profileId)
+        }
+        return true
+    }
+
+    private static func hasPendingOppositeLibraryMutation(
+        in items: [WatchedStoreItem],
+        provider: TraktWatchProgressSource,
+        accountID: String,
+        meta: NuvioMeta,
+        scope: LibraryMutationScope,
+        desiredState: Bool
+    ) -> Bool {
+        items.flatMap(\.pendingLibraryMutations).contains { event in
+            event.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                && event.accountID == accountID
+                && event.isWatched != desiredState
+                && sameContent(event.meta, meta)
+                && eventMatchesScope(event, scope: scope)
+        }
+    }
+
+    private static func eventMatchesScope(
+        _ event: WatchedLibraryMutationUpload,
+        scope: LibraryMutationScope
+    ) -> Bool {
+        event.season == scope.season
+            && event.episode == scope.eventEpisode
+            && event.episodes.sorted() == scope.episodes.sorted()
+    }
+
+    private static func eventAffects(
+        _ event: WatchedLibraryMutationUpload,
+        identity: WatchedRowIdentity
+    ) -> Bool {
+        guard event.season == identity.season else { return false }
+        if !event.episodes.isEmpty { return identity.episode.map(event.episodes.contains) ?? false }
+        if let episode = event.episode { return identity.episode == episode }
+        return identity.episode == nil
+    }
+
+    private static func upsertLibraryMutation(
+        _ event: WatchedLibraryMutationUpload,
+        scope: LibraryMutationScope,
+        into items: inout [WatchedStoreItem]
+    ) {
+        let anchor = scope.anchor
+        let matchingIndices = items.indices.filter {
+            sameContent(items[$0].meta, event.meta)
+                && items[$0].season == anchor.season
+                && items[$0].episode == anchor.episode
+        }
+        let index: Int
+        if let first = matchingIndices.first {
+            index = first
+        } else {
+            index = items.count
+            items.append(WatchedStoreItem(
+                meta: event.meta,
+                watchedAt: event.changedAt,
+                season: anchor.season,
+                episode: anchor.episode,
+                pendingLibraryMutations: [event],
+                legacyUnattributed: false
+            ))
+            return
+        }
+        items[index].pendingLibraryMutations.removeAll { existing in
+            existing.provider.caseInsensitiveCompare(event.provider) == .orderedSame
+                && existing.accountID == event.accountID
+                && existing.profileID == event.profileID
+                && sameContent(existing.meta, event.meta)
+                && eventMatchesScope(existing, scope: scope)
+        }
+        items[index].pendingLibraryMutations = mergedLibraryMutations(
+            items[index].pendingLibraryMutations + [event]
+        )
+    }
+
+    static func watchedSource(for librarySource: TraktLibrarySourceMode) -> TraktWatchProgressSource {
+        switch librarySource {
+        case .trakt: return .trakt
+        case .simkl: return .simkl
+        case .mdblist: return .mdblist
+        case .wetrakr: return .wetrakr
+        case .local: return .nuvioSync
+        }
+    }
+
+    /// Captures the selected library owner and the exact accounts that can
+    /// receive this action. Views retain this value so delayed callbacks cannot
+    /// accidentally write to a newly selected profile or relinked account.
+    static func captureLibraryMutationContext(
+        for librarySource: TraktLibrarySourceMode,
+        profileId: String? = activeProfileId
+    ) -> WatchedLibraryMutationContext? {
+        guard activeProfileId == profileId,
+              ProfileSettings.activeProfileID == profileId else { return nil }
+        let store = ProfileSettings.store(for: profileId)
+        let configuredSource = TraktSettingsStore.librarySourceMode(in: store)
+        let isLocalFallback = librarySource == .local
+            && configuredSource != .local
+            && !RemoteTrackingState.isLibrarySourceAuthenticated(configuredSource, in: store, profileScope: profileId)
+        guard ProfileSettings.isActiveStore(store),
+              configuredSource == librarySource || isLocalFallback,
+              let targets = libraryMutationTargets(for: librarySource, in: store, profileId: profileId) else {
+            return nil
+        }
+        return WatchedLibraryMutationContext(
+            librarySource: librarySource,
+            profileID: profileId,
+            targets: targets
+        )
+    }
+
+    @MainActor
+    static func syncLibraryHistory(
+        for librarySource: TraktLibrarySourceMode,
+        profileId: String? = activeProfileId
+    ) async -> Bool {
+        guard let context = captureLibraryMutationContext(for: librarySource, profileId: profileId) else {
+            return false
+        }
+        let primary = watchedSource(for: librarySource)
+        let primaryAccountID = context.targets.first { $0.provider == primary }?.accountID ?? "local"
+        let key = "\(profileId ?? "legacy")|\(librarySource.rawValue)|\(primaryAccountID)"
+        if let existing = libraryHistorySyncTasks[key] {
+            return await existing.value
+        }
+        let task = Task { @MainActor in
+            let store = ProfileSettings.store(for: profileId)
+            let succeeded: Bool
+            switch librarySource {
+            case .trakt:
+                succeeded = await TraktHistoryService.syncWatchedHistory(store: store)
+            case .simkl:
+                succeeded = await SimklHistoryService.syncWatchedHistory(
+                    store: store,
+                    force: true,
+                    profileScope: profileId
+                )
+            case .mdblist:
+                succeeded = await MdbListProgressService.syncWatchedHistory(
+                    store: store,
+                    profileScope: profileId
+                )
+            case .wetrakr:
+                succeeded = await WeTrakrProgressService.syncWatchedHistory(store: store)
+            case .local:
+                guard let syncManager = NuvioSyncManager.current else { return false }
+                syncManager.refreshAccountIfIdle()
+                succeeded = true
+            }
+            return succeeded && isCurrentLibraryMutationContext(context)
+        }
+        libraryHistorySyncTasks[key] = task
+        let result = await task.value
+        libraryHistorySyncTasks.removeValue(forKey: key)
+        return result
+    }
+
+    /// Binds Nuvio Sync library writes to the account/profile pair currently
+    /// used by NuvioSyncService. Events created while signed out remain local
+    /// and are never rebound to a later account.
+    static func setNuvioSyncAccountBinding(_ accountID: String?, profileId: String?) {
+        guard let profileId, !profileId.isEmpty else { return }
+        cacheLock.lock()
+        let store = ProfileSettings.store(for: profileId)
+        let key = "nuvio.tv.watched.nuvioSyncAccountBinding"
+        let previous = store.string(forKey: key)
+        let trimmed = accountID?.trimmingCharacters(in: .whitespacesAndNewlines)
+        let normalized = (trimmed?.isEmpty == false) ? trimmed : nil
+        if let normalized {
+            store.set(normalized, forKey: key)
+        } else {
+            store.removeObject(forKey: key)
+        }
+        let changed = previous != normalized
+        if changed, profileId == activeProfileId { cachedLibrarySnapshots = [:] }
+        cacheLock.unlock()
+        if changed {
+            DispatchQueue.main.async {
+                NotificationCenter.default.post(name: changedNotification, object: nil)
+            }
+        }
+    }
+
+    static func nuvioSyncAccountBinding(profileId: String? = activeProfileId) -> String? {
+        guard let profileId, !profileId.isEmpty else { return nil }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let value = ProfileSettings.store(for: profileId)
+            .string(forKey: "nuvio.tv.watched.nuvioSyncAccountBinding")?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return value?.isEmpty == false ? value : nil
+    }
+
+    private static func libraryMutationTargets(
+        for librarySource: TraktLibrarySourceMode,
+        in store: UserDefaults,
+        profileId: String?
+    ) -> [WatchedLibraryMutationTarget]? {
+        let primary = watchedSource(for: librarySource)
+        var sources = Set([primary])
+        sources.formUnion(RemoteTrackingState.activeScrobbleSources(in: store))
+        if RemoteTrackingState.isNuvioSyncScrobbleEnabled(in: store) {
+            sources.insert(.nuvioSync)
+        }
+
+        var targets: [WatchedLibraryMutationTarget] = []
+        for source in sources.sorted(by: { $0.rawValue < $1.rawValue }) {
+            let accountID = libraryAccountBinding(for: source, in: store, profileId: profileId)
+            if source == primary {
+                if source != .nuvioSync, accountID == nil { return nil }
+                targets.append(WatchedLibraryMutationTarget(provider: source, accountID: accountID))
+            } else if accountID != nil {
+                targets.append(WatchedLibraryMutationTarget(provider: source, accountID: accountID))
+            }
+        }
+        return targets
+    }
+
+    private static func libraryAccountBinding(
+        for provider: TraktWatchProgressSource,
+        in store: UserDefaults,
+        profileId: String?
+    ) -> String? {
+        switch provider {
+        case .trakt:
+            return TraktHistoryService.completionAccountID(in: store, profileId: profileId)
+        case .simkl:
+            guard RemoteTrackingState.isProgressSourceAuthenticated(
+                .simkl,
+                in: store,
+                profileScope: profileId
+            ) else { return nil }
+            let id = SimklAuthStore.accountBindingID(in: store)
+            return id.isEmpty ? nil : id
+        case .mdblist:
+            let scope = profileId ?? MdbListRuntimeSession.profileScope()
+            guard RemoteTrackingState.isProgressSourceAuthenticated(
+                .mdblist,
+                in: store,
+                profileScope: scope
+            ) else { return nil }
+            let id = MdbListAuthStore.accountBindingID(in: store)
+            return id.isEmpty ? nil : id
+        case .wetrakr:
+            return WeTrakrProgressService.completionAccountID(in: store, profileId: profileId)
+        case .nuvioSync:
+            return nuvioSyncAccountBinding(profileId: profileId)
+        }
+    }
+
+    private static func isCurrentLibraryMutationContext(_ context: WatchedLibraryMutationContext) -> Bool {
+        guard activeProfileId == context.profileID,
+              ProfileSettings.activeProfileID == context.profileID else { return false }
+        guard let current = captureLibraryMutationContext(
+            for: context.librarySource,
+            profileId: context.profileID
+        ) else { return false }
+        return current == context
+    }
+
+    static func attributedRemoteItems(
+        _ remoteItems: [WatchedStoreItem],
+        to provider: TraktWatchProgressSource,
+        accountID: String? = nil
+    ) -> [WatchedStoreItem] {
+        remoteItems.map { item in
+            var copy = item
+            copy.legacyUnattributed = false
+            return copy.adding(source: provider, accountID: accountID, changedAt: item.watchedAt)
+        }
     }
 
     /// Alias-aware keys for catalog badges. A Trakt IMDb row and a TMDB-backed
@@ -8027,13 +9304,28 @@ enum WatchedStore {
         }
         var sources: Set<String> = [source.rawValue]
         var countsBySource: [String: Int] = [:]
+        var accountIDsBySource: [String: String] = [:]
+        var changedAtBySource: [String: Date] = [:]
+        var stateBySource: [String: Bool] = [:]
         var lastIDsBySource: [String: String] = [:]
         var lastIDDates: [String: Date] = [:]
         var pendingCompletions: [WatchedPlaybackCompletionUpload] = []
+        var pendingLibraryMutations: [WatchedLibraryMutationUpload] = []
+        var legacyUnattributed = false
         for item in matching {
+            legacyUnattributed = legacyUnattributed || item.legacyUnattributed
             sources.formUnion(item.sources)
             for (provider, count) in item.watchCountsBySource {
                 countsBySource[provider] = max(countsBySource[provider] ?? 0, count)
+            }
+            for (provider, accountID) in item.sourceAccountIDsBySource {
+                accountIDsBySource[provider] = accountID
+            }
+            for (provider, changedAt) in item.sourceChangedAtBySource {
+                if changedAt >= (changedAtBySource[provider] ?? .distantPast) {
+                    changedAtBySource[provider] = changedAt
+                    stateBySource[provider] = item.sourceStateBySource[provider]
+                }
             }
             for (provider, completionID) in item.lastCountedPlaybackIDsBySource {
                 if item.watchedAt >= (lastIDDates[provider] ?? .distantPast) {
@@ -8044,7 +9336,19 @@ enum WatchedStore {
             pendingCompletions = mergedPlaybackCompletions(
                 pendingCompletions + item.pendingPlaybackCompletions
             )
+            pendingLibraryMutations = mergedLibraryMutations(
+                pendingLibraryMutations + item.pendingLibraryMutations
+            )
         }
+        if let accountID = libraryAccountBinding(
+            for: source,
+            in: ProfileSettings.store(for: activeProfileId),
+            profileId: activeProfileId
+        ) {
+            accountIDsBySource[source.rawValue] = accountID
+        }
+        changedAtBySource[source.rawValue] = watchedAt
+        stateBySource[source.rawValue] = true
         return WatchedStoreItem(
             meta: meta.persistenceSnapshot,
             watchedAt: watchedAt,
@@ -8052,8 +9356,13 @@ enum WatchedStore {
             episode: episode,
             sources: sources,
             watchCountsBySource: countsBySource,
+            sourceAccountIDsBySource: accountIDsBySource,
+            sourceChangedAtBySource: changedAtBySource,
+            sourceStateBySource: stateBySource,
             lastCountedPlaybackIDsBySource: lastIDsBySource,
-            pendingPlaybackCompletions: pendingCompletions
+            pendingPlaybackCompletions: pendingCompletions,
+            pendingLibraryMutations: pendingLibraryMutations,
+            legacyUnattributed: legacyUnattributed
         )
     }
 
@@ -8066,6 +9375,19 @@ enum WatchedStore {
         }
         return byID.values.sorted {
             if $0.watchedAt != $1.watchedAt { return $0.watchedAt < $1.watchedAt }
+            return $0.id < $1.id
+        }
+    }
+
+    private static func mergedLibraryMutations(
+        _ events: [WatchedLibraryMutationUpload]
+    ) -> [WatchedLibraryMutationUpload] {
+        var byID: [String: WatchedLibraryMutationUpload] = [:]
+        for event in events where byID[event.id] == nil {
+            byID[event.id] = event
+        }
+        return byID.values.sorted {
+            if $0.changedAt != $1.changedAt { return $0.changedAt < $1.changedAt }
             return $0.id < $1.id
         }
     }
@@ -8136,11 +9458,20 @@ enum WatchedStore {
             countsBySource[key] = priorCount + 1
         }
 
+        let watchedAt = Date()
         var lastIDsBySource = existing?.lastCountedPlaybackIDsBySource ?? [:]
+        var accountIDsBySource = existing?.sourceAccountIDsBySource ?? [:]
+        var changedAtBySource = existing?.sourceChangedAtBySource ?? [:]
+        var sourceStates = existing?.sourceStateBySource ?? [:]
         for key in targetSourceKeys {
             lastIDsBySource[key] = completionID
+            if let provider = TraktWatchProgressSource(rawValue: key),
+               let accountID = libraryAccountBinding(for: provider, in: settings, profileId: profileId) {
+                accountIDsBySource[key] = accountID
+            }
+            changedAtBySource[key] = watchedAt
+            sourceStates[key] = true
         }
-        let watchedAt = Date()
         var pendingCompletions = existing?.pendingPlaybackCompletions ?? []
         for target in completionTargets {
             let event = WatchedPlaybackCompletionUpload(
@@ -8162,8 +9493,13 @@ enum WatchedStore {
             episode: episode,
             sources: (existing?.sources ?? []).union(targetSourceKeys),
             watchCountsBySource: countsBySource,
+            sourceAccountIDsBySource: accountIDsBySource,
+            sourceChangedAtBySource: changedAtBySource,
+            sourceStateBySource: sourceStates,
             lastCountedPlaybackIDsBySource: lastIDsBySource,
-            pendingPlaybackCompletions: pendingCompletions
+            pendingPlaybackCompletions: pendingCompletions,
+            pendingLibraryMutations: existing?.pendingLibraryMutations ?? [],
+            legacyUnattributed: existing?.legacyUnattributed ?? false
         )
         let updated = [item] + current.filter {
             !(sameContent($0.meta, meta) && $0.season == season && $0.episode == episode)
@@ -8482,12 +9818,14 @@ enum WatchedStore {
                         && $0.accountID == event.accountID
                 })
             }
-            guard !remainingEvents.isEmpty else { return nil }
+            let remainingLibraryMutations = item.pendingLibraryMutations
+            guard !remainingEvents.isEmpty || !remainingLibraryMutations.isEmpty else { return nil }
             var outboxOnly = item
             outboxOnly.sources = []
             outboxOnly.watchCountsBySource = [:]
             outboxOnly.lastCountedPlaybackIDsBySource = [:]
             outboxOnly.pendingPlaybackCompletions = remainingEvents
+            outboxOnly.legacyUnattributed = false
             return outboxOnly
         }
     }
@@ -8710,6 +10048,47 @@ enum WatchedStore {
         }
     }
 
+    private static func scheduleLibraryMutationFlush(
+        _ provider: TraktWatchProgressSource,
+        profileId: String?
+    ) {
+        let store = ProfileSettings.store(for: profileId)
+        switch provider {
+        case .trakt:
+            Task { @MainActor in
+                _ = await TraktHistoryService.flushPendingPlaybackCompletions(
+                    store: store,
+                    profileId: profileId
+                )
+            }
+        case .simkl:
+            Task { @MainActor in
+                _ = await SimklHistoryService.flushPendingLibraryMutations(
+                    store: store,
+                    profileScope: profileId
+                )
+            }
+        case .mdblist:
+            Task { @MainActor in
+                _ = await MdbListProgressService.flushPendingLibraryMutations(
+                    store: store,
+                    profileScope: profileId
+                )
+            }
+        case .wetrakr:
+            Task { @MainActor in
+                _ = await WeTrakrProgressService.flushPendingPlaybackCompletions(
+                    store: store,
+                    profileId: profileId
+                )
+            }
+        case .nuvioSync:
+            Task { @MainActor in
+                NuvioSyncManager.current?.schedulePush(scope: .watched, delay: 0)
+            }
+        }
+    }
+
     /// Merges a FULL remote snapshot. Tombstones (locally removed marks) block
     /// their remote row and stay alive until a pull shows the row is really
     /// gone from the server — the pushed delete is best-effort, so the pull is
@@ -8805,6 +10184,82 @@ enum WatchedStore {
         }
     }
 
+    private static func hasPendingLibraryMutation(
+        _ item: WatchedStoreItem,
+        provider: TraktWatchProgressSource,
+        accountID: String?,
+        profileId: String?
+    ) -> Bool {
+        item.pendingLibraryMutations.contains {
+            $0.provider.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+                && $0.accountID == accountID
+                && $0.profileID == profileId
+                && $0.affects(item)
+        }
+    }
+
+    private static func providerChangedAt(
+        _ item: WatchedStoreItem,
+        provider: TraktWatchProgressSource
+    ) -> Date {
+        item.sourceChangedAtBySource.first {
+            $0.key.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+        }?.value ?? item.watchedAt
+    }
+
+    @discardableResult
+    private static func clearConfirmedProviderRemovalTombstones(
+        provider: TraktWatchProgressSource,
+        accountID: String?,
+        remoteItems: [WatchedStoreItem],
+        syncStartedAt: Date,
+        profileId: String?
+    ) -> Bool {
+        let current = itemsLocked(profileId: profileId)
+        var didChange = false
+        let updated = current.compactMap { item -> WatchedStoreItem? in
+            var copy = item
+            let sourceState = copy.sourceStateBySource.first {
+                $0.key.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+            }
+            let sourceAccountID = copy.sourceAccountIDsBySource.first {
+                $0.key.caseInsensitiveCompare(provider.rawValue) == .orderedSame
+            }?.value
+            guard sourceState?.value == false,
+                  sourceAccountID == accountID,
+                  providerChangedAt(copy, provider: provider) <= syncStartedAt else {
+                return copy
+            }
+            let remoteRow = remoteItems.first {
+                sameContent($0.meta, copy.meta)
+                    && $0.season == copy.season
+                    && $0.episode == copy.episode
+            }
+            if let remoteRow, remoteRow.watchedAt <= providerChangedAt(copy, provider: provider) {
+                return copy
+            }
+            copy.sourceStateBySource = copy.sourceStateBySource.filter {
+                $0.key.caseInsensitiveCompare(provider.rawValue) != .orderedSame
+            }
+            copy.sourceChangedAtBySource = copy.sourceChangedAtBySource.filter {
+                $0.key.caseInsensitiveCompare(provider.rawValue) != .orderedSame
+            }
+            copy.sourceAccountIDsBySource = copy.sourceAccountIDsBySource.filter {
+                $0.key.caseInsensitiveCompare(provider.rawValue) != .orderedSame
+            }
+            didChange = true
+            if copy.sources.isEmpty,
+               copy.pendingPlaybackCompletions.isEmpty,
+               copy.pendingLibraryMutations.isEmpty,
+               !copy.legacyUnattributed {
+                return nil
+            }
+            return copy
+        }
+        guard didChange else { return true }
+        return persistLocked(updated, profileId: profileId)
+    }
+
     private static func mergeRemoteLocked(
         _ remoteItems: [WatchedStoreItem],
         confirmsTombstoneDeletions: Bool,
@@ -8833,11 +10288,45 @@ enum WatchedStore {
             _ = persistTombstonesLocked(stillBlocking, profileId: profileId)
         }
 
+        let current = itemsLocked(profileId: profileId)
+        let pendingLibraryRemovals: [WatchedLibraryMutationUpload]
+        let acknowledgedLibraryRemovals: [WatchedStoreItem]
+        if let authoritativeProvider, let currentAccountID {
+            pendingLibraryRemovals = current
+                .flatMap(\.pendingLibraryMutations)
+                .filter {
+                    $0.provider.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame
+                        && $0.accountID == currentAccountID
+                        && $0.profileID == profileId
+                        && !$0.isWatched
+                }
+            acknowledgedLibraryRemovals = current.filter { item in
+                item.sourceStateBySource.first {
+                    $0.key.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame
+                }?.value == false
+                    && item.sourceAccountIDsBySource.first {
+                        $0.key.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame
+                    }?.value == currentAccountID
+            }
+        } else {
+            pendingLibraryRemovals = []
+            acknowledgedLibraryRemovals = []
+        }
         let accepted = remoteItems.filter { item in
             !stillBlocking.contains { tombstoneMatches($0, item: item) }
+                && !pendingLibraryRemovals.contains {
+                    $0.affects(item) && $0.changedAt >= item.watchedAt
+                }
+                && !acknowledgedLibraryRemovals.contains { removed in
+                    sameContent(removed.meta, item.meta)
+                        && removed.season == item.season
+                        && removed.episode == item.episode
+                        && authoritativeProvider.map {
+                            providerChangedAt(removed, provider: $0) >= item.watchedAt
+                        } == true
+                }
         }
 
-        let current = itemsLocked(profileId: profileId)
         let mergeAccepted: [WatchedStoreItem]
         var authoritativeCountsByIdentity: [String: Int] = [:]
         var protectedCountIdentities = Set<String>()
@@ -8845,20 +10334,31 @@ enum WatchedStore {
             let pendingMutations = allProviderMutations(profileId: profileId).filter {
                 $0.provider.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame
             }
+            let pendingLibraryMutations = current
+                .flatMap(\.pendingLibraryMutations)
+                .filter { $0.provider.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame }
             var protectedLocalCountsByIdentity: [String: Int] = [:]
             for item in current {
                 let providerEvents = item.pendingPlaybackCompletions.filter {
                     $0.provider.caseInsensitiveCompare(authoritativeProvider.rawValue) == .orderedSame
                 }
                 let hasCurrentAccountCompletion = providerEvents.contains { $0.accountID == currentAccountID }
+                let providerLibraryEvents = pendingLibraryMutations.filter { $0.affects(item) }
+                let hasCurrentAccountLibraryMutation = providerLibraryEvents.contains {
+                    $0.accountID == currentAccountID && $0.profileID == profileId
+                }
                 let hasOtherAccountWork = providerEvents.contains { $0.accountID != currentAccountID }
+                    || providerLibraryEvents.contains {
+                        $0.accountID != currentAccountID || $0.profileID != profileId
+                    }
                     || pendingMutations.contains {
                         $0.accountID != currentAccountID && pendingMatches($0, item: item)
                     }
                 let hasCurrentAccountMutation = pendingMutations.contains {
                     $0.accountID == currentAccountID && pendingMatches($0, item: item)
-                }
-                let protectsNewerLocalCount = item.watchedAt > syncStartedAt && !hasOtherAccountWork
+                } || hasCurrentAccountLibraryMutation
+                let protectsNewerLocalCount = providerChangedAt(item, provider: authoritativeProvider) > syncStartedAt
+                    && !hasOtherAccountWork
                 guard hasCurrentAccountCompletion || hasCurrentAccountMutation || protectsNewerLocalCount else {
                     continue
                 }
@@ -8884,6 +10384,17 @@ enum WatchedStore {
         }
 
         var merged = mergedByIdentity(current + mergeAccepted)
+        if let authoritativeProvider {
+            for index in merged.indices where merged[index].legacyUnattributed {
+                let confirmed = accepted.contains { remote in
+                    remote.isLibraryVisible(under: authoritativeProvider)
+                        && sameContent(remote.meta, merged[index].meta)
+                        && remote.season == merged[index].season
+                        && remote.episode == merged[index].episode
+                }
+                if confirmed { merged[index].legacyUnattributed = false }
+            }
+        }
         if let authoritativeProvider, !authoritativeCountsByIdentity.isEmpty {
             for index in merged.indices {
                 let keys = watchedIdentityKeys(merged[index])
@@ -8905,7 +10416,8 @@ enum WatchedStore {
         if profileId == activeProfileId {
             Task { @MainActor in
                 guard ContinueWatchingStore.activeProfileId == profileId else { return }
-                ContinueWatchingStore.removeWatched(merged)
+                let playbackVisibleItems = currentSnapshot().visibleItems
+                ContinueWatchingStore.removeWatched(playbackVisibleItems)
             }
         }
         return true
@@ -8932,21 +10444,40 @@ enum WatchedStore {
     static func reconcileNuvioSnapshot(
         _ remoteItems: [WatchedStoreItem],
         syncStartedAt: Date,
-        profileId: String?
+        profileId: String?,
+        currentAccountID: String? = nil
     ) -> Bool {
         var obsoleteItemsToRetire: [WatchedStoreItem] = []
         let didReconcile: Bool = cacheLock.withLock {
-            let preparedRemote = remoteItems.map { $0.adding(source: .nuvioSync) }
-            guard mergeRemoteLocked(preparedRemote, confirmsTombstoneDeletions: true, profileId: profileId) else {
+            let nuvioAccountID = currentAccountID ?? nuvioSyncAccountBinding(profileId: profileId)
+            let preparedRemote = attributedRemoteItems(
+                remoteItems,
+                to: .nuvioSync,
+                accountID: nuvioAccountID
+            )
+            guard mergeRemoteLocked(
+                preparedRemote,
+                confirmsTombstoneDeletions: true,
+                profileId: profileId,
+                authoritativeProvider: .nuvioSync,
+                currentAccountID: nuvioAccountID,
+                syncStartedAt: syncStartedAt
+            ) else {
                 return false
             }
 
             let remoteKeys = Set(preparedRemote.flatMap(watchedIdentityKeys))
             let current = itemsLocked(profileId: profileId)
             let obsolete = current.filter { item in
-                guard item.watchedAt <= syncStartedAt,
+                guard providerChangedAt(item, provider: .nuvioSync) <= syncStartedAt,
                       item.pendingPlaybackCompletions.isEmpty,
-                      item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.nuvioSync.rawValue) else {
+                      !hasPendingLibraryMutation(
+                        item,
+                        provider: .nuvioSync,
+                        accountID: currentAccountID ?? nuvioSyncAccountBinding(profileId: profileId),
+                        profileId: profileId
+                      ),
+                      item.sources.contains(TraktWatchProgressSource.nuvioSync.rawValue) else {
                     return false
                 }
                 let keys = watchedIdentityKeys(item)
@@ -8957,14 +10488,23 @@ enum WatchedStore {
             let obsoleteIDs = Set(obsolete.map(\.id))
             let updated = current.compactMap { item -> WatchedStoreItem? in
                 guard obsoleteIDs.contains(item.id) else { return item }
-                guard !item.sources.isEmpty else { return nil }
                 let retained = item.removing(source: .nuvioSync)
-                return retained.sources.isEmpty ? nil : retained
+                return retained.sources.isEmpty
+                    && retained.pendingPlaybackCompletions.isEmpty
+                    && retained.pendingLibraryMutations.isEmpty
+                    && !retained.legacyUnattributed ? nil : retained
             }
             let changed = updated.count != current.count || zip(updated, current).contains {
                 $0.id != $1.id || $0.sources != $1.sources
             }
             guard !changed || persistLocked(updated, profileId: profileId) else { return false }
+            guard clearConfirmedProviderRemovalTombstones(
+                provider: .nuvioSync,
+                accountID: nuvioAccountID,
+                remoteItems: preparedRemote,
+                syncStartedAt: syncStartedAt,
+                profileId: profileId
+            ) else { return false }
 
             obsoleteItemsToRetire = obsolete
             return true
@@ -9006,12 +10546,30 @@ enum WatchedStore {
     }
 
     @discardableResult
+    static func mergeTraktPartialSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        syncStartedAt: Date,
+        currentAccountID: String?,
+        profileId: String? = activeProfileId
+    ) -> Bool {
+        mergeAuthoritativeProviderSnapshot(
+            attributedRemoteItems(remoteItems, to: .trakt, accountID: currentAccountID),
+            provider: .trakt,
+            currentAccountID: currentAccountID,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
+    }
+
+    @discardableResult
     static func reconcileTraktSnapshot(
         _ remoteItems: [WatchedStoreItem],
         syncStartedAt: Date,
         currentAccountID: String?
     ) -> Bool {
-        let remoteItems = remoteItems.map { $0.adding(source: .trakt) }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let remoteItems = attributedRemoteItems(remoteItems, to: .trakt, accountID: currentAccountID)
         let profileId = activeProfileId
         guard mergeAuthoritativeProviderSnapshot(
             remoteItems,
@@ -9028,12 +10586,18 @@ enum WatchedStore {
         } ?? []
         let current = items()
         let obsolete = current.filter { item in
-            guard item.watchedAt <= syncStartedAt,
-                  item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.trakt.rawValue),
+            guard providerChangedAt(item, provider: .trakt) <= syncStartedAt,
+                  item.sources.contains(TraktWatchProgressSource.trakt.rawValue),
                   isRepresentedByTraktSnapshot(item) else { return false }
             let keys = traktIdentityKeys(item)
             guard keys.isDisjoint(with: remoteKeys) else { return false }
-            guard !hasPendingCompletion(
+            guard !hasPendingLibraryMutation(
+                    item,
+                    provider: .trakt,
+                    accountID: currentAccountID,
+                    profileId: profileId
+                  ),
+                  !hasPendingCompletion(
                 item,
                 provider: .trakt,
                 accountID: currentAccountID
@@ -9045,7 +10609,10 @@ enum WatchedStore {
             let updated = current.compactMap { item -> WatchedStoreItem? in
                 guard obsoleteIDs.contains(item.id) else { return item }
                 let retained = item.removing(source: .trakt)
-                return retained.sources.isEmpty && retained.pendingPlaybackCompletions.isEmpty
+                return retained.sources.isEmpty
+                    && retained.pendingPlaybackCompletions.isEmpty
+                    && retained.pendingLibraryMutations.isEmpty
+                    && !retained.legacyUnattributed
                     ? nil
                     : retained
             }
@@ -9056,6 +10623,13 @@ enum WatchedStore {
             profileId: profileId,
             currentAccountID: currentAccountID
         )
+        guard clearConfirmedProviderRemovalTombstones(
+            provider: .trakt,
+            accountID: currentAccountID,
+            remoteItems: remoteItems,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        ) else { return false }
         return true
     }
 
@@ -9066,10 +10640,20 @@ enum WatchedStore {
     static func reconcileSimklSnapshot(
         _ remoteItems: [WatchedStoreItem],
         previousRemoteItems: [WatchedStoreItem],
-        syncStartedAt: Date
+        syncStartedAt: Date,
+        currentAccountID: String? = nil
     ) -> Bool {
-        let remoteItems = remoteItems.map { $0.adding(source: .simkl) }
-        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
+        let remoteItems = attributedRemoteItems(remoteItems, to: .simkl, accountID: currentAccountID)
+        let profileId = activeProfileId
+        guard mergeAuthoritativeProviderSnapshot(
+            remoteItems,
+            provider: .simkl,
+            currentAccountID: currentAccountID,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        ) else { return false }
 
         let currentRemoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
         let removedRemoteKeys = Set(previousRemoteItems.flatMap(watchedIdentityKeys))
@@ -9078,20 +10662,35 @@ enum WatchedStore {
 
         let current = items()
         let updated = current.compactMap { item -> WatchedStoreItem? in
-            guard item.watchedAt <= syncStartedAt,
+            guard providerChangedAt(item, provider: .simkl) <= syncStartedAt,
                   item.pendingPlaybackCompletions.isEmpty,
+                  !hasPendingLibraryMutation(
+                    item,
+                    provider: .simkl,
+                    accountID: currentAccountID,
+                    profileId: profileId
+                  ),
                   !watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys),
-                  item.sources.isEmpty || item.sources.contains(TraktWatchProgressSource.simkl.rawValue) else {
+                  item.sources.contains(TraktWatchProgressSource.simkl.rawValue) else {
                 return item
             }
-            guard !item.sources.isEmpty else { return nil }
             let retained = item.removing(source: .simkl)
-            return retained.sources.isEmpty ? nil : retained
+            return retained.sources.isEmpty
+                && retained.pendingPlaybackCompletions.isEmpty
+                && retained.pendingLibraryMutations.isEmpty
+                && !retained.legacyUnattributed ? nil : retained
         }
         let changed = updated.count != current.count || zip(updated, current).contains {
             $0.id != $1.id || $0.sources != $1.sources
         }
-        return !changed || persist(updated)
+        guard !changed || persist(updated) else { return false }
+        return clearConfirmedProviderRemovalTombstones(
+            provider: .simkl,
+            accountID: currentAccountID,
+            remoteItems: remoteItems,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
     }
 
     /// Applies MDBList's complete watched snapshot while removing only rows
@@ -9101,11 +10700,21 @@ enum WatchedStore {
     static func reconcileMdbListSnapshot(
         _ remoteItems: [WatchedStoreItem],
         previousRemoteItems: [WatchedStoreItem],
-        syncStartedAt: Date
+        syncStartedAt: Date,
+        currentAccountID: String? = nil
     ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let source = TraktWatchProgressSource.mdblist.rawValue
-        let remoteItems = remoteItems.map { $0.adding(source: .mdblist) }
-        guard mergeRemote(remoteItems, confirmsTombstoneDeletions: false) else { return false }
+        let remoteItems = attributedRemoteItems(remoteItems, to: .mdblist, accountID: currentAccountID)
+        let profileId = activeProfileId
+        guard mergeAuthoritativeProviderSnapshot(
+            remoteItems,
+            provider: .mdblist,
+            currentAccountID: currentAccountID,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        ) else { return false }
 
         let currentRemoteKeys = Set(remoteItems.flatMap(watchedIdentityKeys))
         let removedRemoteKeys = Set(previousRemoteItems.flatMap(watchedIdentityKeys))
@@ -9114,13 +10723,18 @@ enum WatchedStore {
 
         let current = items()
         let updated = current.compactMap { item -> WatchedStoreItem? in
-            guard item.watchedAt <= syncStartedAt,
+            guard providerChangedAt(item, provider: .mdblist) <= syncStartedAt,
                   item.pendingPlaybackCompletions.isEmpty,
+                  !hasPendingLibraryMutation(
+                    item,
+                    provider: .mdblist,
+                    accountID: currentAccountID,
+                    profileId: profileId
+                  ),
                   !watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys),
-                  item.sources.isEmpty || item.sources.contains(source) else {
+                  item.sources.contains(source) else {
                 return item
             }
-            guard !item.sources.isEmpty else { return nil }
             var retained = item
             retained.sources.remove(source)
             retained.watchCountsBySource = retained.watchCountsBySource.filter {
@@ -9129,12 +10743,38 @@ enum WatchedStore {
             retained.lastCountedPlaybackIDsBySource = retained.lastCountedPlaybackIDsBySource.filter {
                 $0.key.caseInsensitiveCompare(source) != .orderedSame
             }
-            return retained.sources.isEmpty ? nil : retained
+            return retained.sources.isEmpty
+                && retained.pendingPlaybackCompletions.isEmpty
+                && retained.pendingLibraryMutations.isEmpty
+                && !retained.legacyUnattributed ? nil : retained
         }
         let changed = updated.count != current.count || zip(updated, current).contains {
             $0.id != $1.id || $0.sources != $1.sources
         }
-        return !changed || persist(updated)
+        guard !changed || persist(updated) else { return false }
+        return clearConfirmedProviderRemovalTombstones(
+            provider: .mdblist,
+            accountID: currentAccountID,
+            remoteItems: remoteItems,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
+    }
+
+    @discardableResult
+    static func mergeMdbListPartialSnapshot(
+        _ remoteItems: [WatchedStoreItem],
+        syncStartedAt: Date,
+        currentAccountID: String?,
+        profileId: String? = activeProfileId
+    ) -> Bool {
+        mergeAuthoritativeProviderSnapshot(
+            attributedRemoteItems(remoteItems, to: .mdblist, accountID: currentAccountID),
+            provider: .mdblist,
+            currentAccountID: currentAccountID,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
     }
 
     /// Applies WeTrakr's remote snapshot while removing only rows previously
@@ -9165,8 +10805,10 @@ enum WatchedStore {
         syncStartedAt: Date,
         currentAccountID: String?
     ) -> Bool {
+        cacheLock.lock()
+        defer { cacheLock.unlock() }
         let source = TraktWatchProgressSource.wetrakr.rawValue
-        let remoteItems = remoteItems.map { $0.adding(source: .wetrakr) }
+        let remoteItems = attributedRemoteItems(remoteItems, to: .wetrakr, accountID: currentAccountID)
         let profileId = activeProfileId
         guard mergeAuthoritativeProviderSnapshot(
             remoteItems,
@@ -9187,12 +10829,18 @@ enum WatchedStore {
                 .filter { $0.isWatched && $0.accountID == accountID }
         } ?? []
         let updated = current.compactMap { item -> WatchedStoreItem? in
-            guard item.watchedAt <= syncStartedAt,
+            guard providerChangedAt(item, provider: .wetrakr) <= syncStartedAt,
                   !watchedIdentityKeys(item).isDisjoint(with: removedRemoteKeys),
-                  item.sources.isEmpty || item.sources.contains(source) else {
+                  item.sources.contains(source) else {
                 return item
             }
-            guard !hasPendingCompletion(item, provider: .wetrakr, accountID: currentAccountID),
+            guard !hasPendingLibraryMutation(
+                    item,
+                    provider: .wetrakr,
+                    accountID: currentAccountID,
+                    profileId: profileId
+                  ),
+                  !hasPendingCompletion(item, provider: .wetrakr, accountID: currentAccountID),
                   !pendingMarks.contains(where: { pendingMatches($0, item: item) }) else {
                 return item
             }
@@ -9204,7 +10852,10 @@ enum WatchedStore {
             retained.lastCountedPlaybackIDsBySource = retained.lastCountedPlaybackIDsBySource.filter {
                 $0.key.caseInsensitiveCompare(source) != .orderedSame
             }
-            return retained.sources.isEmpty && retained.pendingPlaybackCompletions.isEmpty
+            return retained.sources.isEmpty
+                && retained.pendingPlaybackCompletions.isEmpty
+                && retained.pendingLibraryMutations.isEmpty
+                && !retained.legacyUnattributed
                 ? nil
                 : retained
         }
@@ -9215,7 +10866,14 @@ enum WatchedStore {
                 || $0.lastCountedPlaybackIDsBySource != $1.lastCountedPlaybackIDsBySource
                 || $0.pendingPlaybackCompletions != $1.pendingPlaybackCompletions
         }
-        return !changed || persist(updated)
+        guard !changed || persist(updated) else { return false }
+        return clearConfirmedProviderRemovalTombstones(
+            provider: .wetrakr,
+            accountID: currentAccountID,
+            remoteItems: remoteItems,
+            syncStartedAt: syncStartedAt,
+            profileId: profileId
+        )
     }
 
     private static func hasStandardMediaID(for meta: NuvioMeta) -> Bool {
@@ -9307,6 +10965,25 @@ enum WatchedStore {
                 for (provider, count) in item.watchCountsBySource {
                     combinedCounts[provider] = max(combinedCounts[provider] ?? 0, count)
                 }
+                var combinedAccountIDs = existing.sourceAccountIDsBySource
+                var combinedChangedAt = existing.sourceChangedAtBySource
+                var combinedSourceStates = existing.sourceStateBySource
+                for (provider, accountID) in item.sourceAccountIDsBySource {
+                    let accountChanged = combinedAccountIDs[provider] != nil
+                        && combinedAccountIDs[provider] != accountID
+                    let incomingChangedAt = item.sourceChangedAtBySource[provider] ?? item.watchedAt
+                    let existingChangedAt = combinedChangedAt[provider] ?? .distantPast
+                    if accountChanged || incomingChangedAt >= existingChangedAt {
+                        combinedAccountIDs[provider] = accountID
+                        combinedChangedAt[provider] = incomingChangedAt
+                        combinedSourceStates[provider] = item.sourceStateBySource[provider]
+                    }
+                }
+                for (provider, changedAt) in item.sourceChangedAtBySource where
+                    combinedChangedAt[provider] == nil || changedAt > combinedChangedAt[provider]! {
+                    combinedChangedAt[provider] = changedAt
+                    combinedSourceStates[provider] = item.sourceStateBySource[provider]
+                }
                 var combinedCompletionIDs = existing.lastCountedPlaybackIDsBySource
                 for (provider, completionID) in item.lastCountedPlaybackIDsBySource {
                     if combinedCompletionIDs[provider] == nil || item.watchedAt >= existing.watchedAt {
@@ -9316,13 +10993,22 @@ enum WatchedStore {
                 let combinedPlaybackCompletions = mergedPlaybackCompletions(
                     existing.pendingPlaybackCompletions + item.pendingPlaybackCompletions
                 )
+                let combinedLibraryMutations = mergedLibraryMutations(
+                    existing.pendingLibraryMutations + item.pendingLibraryMutations
+                )
+                let isLegacyUnattributed = existing.legacyUnattributed || item.legacyUnattributed
                 if item.watchedAt > existing.watchedAt {
                     merged[existingIndex] = item
                 }
                 merged[existingIndex].sources = combinedSources
                 merged[existingIndex].watchCountsBySource = combinedCounts
+                merged[existingIndex].sourceAccountIDsBySource = combinedAccountIDs
+                merged[existingIndex].sourceChangedAtBySource = combinedChangedAt
+                merged[existingIndex].sourceStateBySource = combinedSourceStates
                 merged[existingIndex].lastCountedPlaybackIDsBySource = combinedCompletionIDs
                 merged[existingIndex].pendingPlaybackCompletions = combinedPlaybackCompletions
+                merged[existingIndex].pendingLibraryMutations = combinedLibraryMutations
+                merged[existingIndex].legacyUnattributed = isLegacyUnattributed
                 // Retain every alias learned for this content so a later row
                 // can match by IMDb, TMDB, or catalog id without another scan.
                 for key in identityKeys {
@@ -9848,8 +11534,13 @@ enum WatchedStore {
                 episode: $0.episode,
                 sources: $0.sources,
                 watchCountsBySource: $0.watchCountsBySource,
+                sourceAccountIDsBySource: $0.sourceAccountIDsBySource,
+                sourceChangedAtBySource: $0.sourceChangedAtBySource,
+                sourceStateBySource: $0.sourceStateBySource,
                 lastCountedPlaybackIDsBySource: $0.lastCountedPlaybackIDsBySource,
-                pendingPlaybackCompletions: $0.pendingPlaybackCompletions
+                pendingPlaybackCompletions: $0.pendingPlaybackCompletions,
+                pendingLibraryMutations: $0.pendingLibraryMutations,
+                legacyUnattributed: $0.legacyUnattributed
             )
         }
         .sorted { $0.watchedAt > $1.watchedAt }
@@ -9892,12 +11583,17 @@ enum WatchedStore {
         }
 
         let previousItems = profileId == activeProfileId ? cachedItems : nil
+        if let previousItems,
+           nuvioWatchedProjection(previousItems) != nuvioWatchedProjection(sorted) {
+            nuvioSyncChangeGeneration &+= 1
+        }
         if profileId == activeProfileId {
             cacheGeneration &+= 1
             cachedItems = sorted
             cachedKey = key
             cachedData = data
             cachedSnapshot = nil
+            cachedLibrarySnapshots = [:]
             persistenceDiagnostic = "\(sorted.count) item(s), \(data.count) bytes"
         }
 
@@ -9908,8 +11604,13 @@ enum WatchedStore {
                     && old.watchedAt == new.watchedAt
                     && old.sources == new.sources
                     && old.watchCountsBySource == new.watchCountsBySource
+                    && old.sourceAccountIDsBySource == new.sourceAccountIDsBySource
+                    && old.sourceChangedAtBySource == new.sourceChangedAtBySource
+                    && old.sourceStateBySource == new.sourceStateBySource
                     && old.lastCountedPlaybackIDsBySource == new.lastCountedPlaybackIDsBySource
                     && old.pendingPlaybackCompletions == new.pendingPlaybackCompletions
+                    && old.pendingLibraryMutations == new.pendingLibraryMutations
+                    && old.legacyUnattributed == new.legacyUnattributed
             }
         } else {
             isUnchanged = false
@@ -10244,6 +11945,7 @@ enum ProfileSettings {
         SettingsKey.traktConnected,
         SettingsKey.traktClientID,
         SettingsKey.traktClientSecret,
+        SettingsKey.traktRedirectURI,
         // Simkl
         SettingsKey.simklClientID,
         SettingsKey.simklAccessToken,
@@ -10473,7 +12175,8 @@ enum ProfileSettings {
         [
             SettingsKey.traktConnected,
             SettingsKey.traktClientID,
-            SettingsKey.traktClientSecret
+            SettingsKey.traktClientSecret,
+            SettingsKey.traktRedirectURI
         ].forEach { store.removeObject(forKey: $0) }
         store.removeObject(forKey: SettingsKey.traktWatchProgressSource)
         store.removeObject(forKey: SettingsKey.watchProgressSourceChosenByUser)

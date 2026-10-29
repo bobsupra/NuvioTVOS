@@ -14,6 +14,8 @@ enum MdbListLibraryService {
         let poster: String?
         let backdrop: String?
         let addedAt: Date
+        let hasAddedAt: Bool
+        let isWatchlist: Bool
     }
 
     static func fetchLibrary(
@@ -38,6 +40,10 @@ enum MdbListLibraryService {
             var seenCursors = Set<String>()
             while !Task.isCancelled {
                 var query = [URLQueryItem(name: "limit", value: "1000")]
+                if path == "/watchlist/items" {
+                    query.append(URLQueryItem(name: "sort", value: "added"))
+                    query.append(URLQueryItem(name: "order", value: "asc"))
+                }
                 if let cursor { query.append(URLQueryItem(name: "cursor", value: cursor)) }
                 do {
                     let response = try await service.authorizedRequest(path: path, method: .get, queryItems: query)
@@ -172,8 +178,12 @@ enum MdbListLibraryService {
         if ids["tvdb"] == nil { ids["tvdb"] = row["tvdb_id"] }
         guard let identity = identity(for: ids) else { return nil }
         let title = string(row["title"] ?? row["name"]) ?? identity
-        let date = date(row["added_at"] ?? row["listed_at"] ?? row["collected_at"] ?? row["addedAt"] ?? row["listedAt"] ?? row["collectedAt"])
-            ?? .distantPast
+        let watchlistDate = source == "/watchlist/items"
+            ? (date(row["watchlist_at"]) ?? date(row["watchlistAt"]))
+            : nil
+        let parsedDate = watchlistDate
+            ?? date(row["added_at"] ?? row["listed_at"] ?? row["collected_at"] ?? row["addedAt"] ?? row["listedAt"] ?? row["collectedAt"])
+        let date = parsedDate ?? .distantPast
         return Seed(
             type: type,
             ids: ids,
@@ -182,7 +192,9 @@ enum MdbListLibraryService {
             year: integer(row["year"] ?? row["release_year"]),
             poster: string(row["poster"]),
             backdrop: string(row["backdrop"] ?? row["background"]),
-            addedAt: date
+            addedAt: date,
+            hasAddedAt: parsedDate != nil,
+            isWatchlist: source == "/watchlist/items"
         )
     }
 
@@ -200,12 +212,25 @@ enum MdbListLibraryService {
         var unique: [String: Seed] = [:]
         for seed in seeds {
             if let existing = unique[seed.identity] {
-                if seed.addedAt > existing.addedAt { unique[seed.identity] = seed }
+                let shouldReplace: Bool
+                if seed.isWatchlist != existing.isWatchlist {
+                    let watchlistHasDate = seed.isWatchlist ? seed.hasAddedAt : existing.hasAddedAt
+                    let collectionHasDate = seed.isWatchlist ? existing.hasAddedAt : seed.hasAddedAt
+                    shouldReplace = !watchlistHasDate && collectionHasDate
+                        ? !seed.isWatchlist
+                        : seed.isWatchlist
+                } else {
+                    shouldReplace = seed.addedAt > existing.addedAt
+                }
+                if shouldReplace { unique[seed.identity] = seed }
             } else {
                 unique[seed.identity] = seed
             }
         }
-        return unique.values.sorted { $0.addedAt > $1.addedAt }
+        return unique.values.sorted {
+            if $0.addedAt != $1.addedAt { return $0.addedAt > $1.addedAt }
+            return $0.identity < $1.identity
+        }
     }
 
     private static func ids(for meta: NuvioMeta) -> [String: Any]? {
@@ -258,8 +283,45 @@ enum MdbListLibraryService {
     private static func date(_ value: Any?) -> Date? {
         if let number = value as? NSNumber { return Date(timeIntervalSince1970: number.doubleValue > 10_000_000_000 ? number.doubleValue / 1000 : number.doubleValue) }
         guard let value = string(value) else { return nil }
+        if let date = mdbListWatchlistDate(value) { return date }
         let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        if let date = formatter.date(from: value) { return date }
+
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         return formatter.date(from: value)
+    }
+
+    private static let mdbListWatchlistDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.calendar = Calendar(identifier: .gregorian)
+        formatter.timeZone = TimeZone(secondsFromGMT: 0)
+        formatter.dateFormat = "yyyy-MM-dd HH:mm:ss"
+        formatter.isLenient = false
+        return formatter
+    }()
+
+    private static func mdbListWatchlistDate(_ value: String) -> Date? {
+        let parts = value.split(separator: ".", omittingEmptySubsequences: false)
+        guard parts.count == 1 || parts.count == 2 else { return nil }
+        let base = String(parts[0])
+        let baseBytes = Array(base.utf8)
+        guard baseBytes.count == 19,
+              baseBytes[4] == 45, baseBytes[7] == 45, baseBytes[10] == 32,
+              baseBytes[13] == 58, baseBytes[16] == 58,
+              baseBytes.enumerated().allSatisfy({ index, byte in
+                  [4, 7, 10, 13, 16].contains(index) || (48...57).contains(byte)
+              }),
+              let baseDate = mdbListWatchlistDateFormatter.date(from: base),
+              mdbListWatchlistDateFormatter.string(from: baseDate) == base else { return nil }
+
+        guard parts.count == 2 else { return baseDate }
+        let fraction = parts[1]
+        guard (1...6).contains(fraction.utf8.count),
+              fraction.utf8.allSatisfy({ (48...57).contains($0) }),
+              let fractionalSeconds = Double("0.\(fraction)") else { return nil }
+        return baseDate.addingTimeInterval(fractionalSeconds)
     }
 }
 

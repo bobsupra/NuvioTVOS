@@ -3,6 +3,8 @@ import Combine
 
 @MainActor
 public class LibraryViewModel: ObservableObject {
+    typealias LibraryHistorySyncHandler = @MainActor (TraktLibrarySourceMode, String?) async -> Bool
+
     @Published public var items: [StremioMeta] = []
     @Published public var sortOption: SortOption = .dateAdded
     @Published public var groupOption: GroupOption = .none
@@ -10,11 +12,14 @@ public class LibraryViewModel: ObservableObject {
     @Published public var genreFilter: String?
     @Published private(set) var mdbListLists: [MdbListUserList] = []
     @Published private(set) var selectedMdbListListID: Int?
+    @Published private(set) var displayedWatchedContext: LibraryWatchedContext?
     /// Last focused card, kept here (outside the view, like
     /// `TVHomeStore.lastFocusedCardID`) so it survives the details push and
     /// returning restores that card instead of snapping to the top.
     public var lastFocusedItemID: String?
     private var libraryObserver: NSObjectProtocol?
+    private var watchedOwnerObserver: NSObjectProtocol?
+    private var watchedTargetsObserver: NSObjectProtocol?
     private var traktAuthObserver: NSObjectProtocol?
     private var simklAuthObserver: NSObjectProtocol?
     private var mdbListAuthObserver: NSObjectProtocol?
@@ -25,6 +30,8 @@ public class LibraryViewModel: ObservableObject {
     private var wetrakrMutationObserver: NSObjectProtocol?
     private var displayedSource: TraktLibrarySourceMode?
     private var refreshGeneration = 0
+    private var lastLibraryHistorySyncRequest: [String: Date] = [:]
+    private let libraryHistorySyncHandler: LibraryHistorySyncHandler
     private let repository: CatalogRepository = CinemetaCatalogRepository()
     
     public enum SortOption: String, CaseIterable, Identifiable {
@@ -63,7 +70,14 @@ public class LibraryViewModel: ObservableObject {
         }
     }
     
-    public init() {
+    public convenience init() {
+        self.init(libraryHistorySyncHandler: { source, profileID in
+            await WatchedStore.syncLibraryHistory(for: source, profileId: profileID)
+        })
+    }
+
+    init(libraryHistorySyncHandler: @escaping LibraryHistorySyncHandler) {
+        self.libraryHistorySyncHandler = libraryHistorySyncHandler
         loadLibrary()
         libraryObserver = NotificationCenter.default.addObserver(
             forName: LibraryStore.changedNotification,
@@ -74,13 +88,31 @@ public class LibraryViewModel: ObservableObject {
                 self?.loadLibrary()
             }
         }
+        watchedOwnerObserver = NotificationCenter.default.addObserver(
+            forName: WatchedStore.changedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.refreshDisplayedWatchedOwnerAfterStoreChange()
+            }
+        }
+        watchedTargetsObserver = NotificationCenter.default.addObserver(
+            forName: TraktSettingsStore.continueWatchingChangedNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor in
+                self?.rebindDisplayedWatchedOwner()
+            }
+        }
         traktAuthObserver = NotificationCenter.default.addObserver(
             forName: TraktAuthStore.changedNotification,
             object: nil,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshSelectedLibrary()
+                await self?.refreshAfterWatchedOwnerChange()
             }
         }
         simklAuthObserver = NotificationCenter.default.addObserver(
@@ -89,7 +121,7 @@ public class LibraryViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshSelectedLibrary()
+                await self?.refreshAfterWatchedOwnerChange()
             }
         }
         mdbListAuthObserver = NotificationCenter.default.addObserver(
@@ -98,7 +130,7 @@ public class LibraryViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshSelectedLibrary()
+                await self?.refreshAfterWatchedOwnerChange()
             }
         }
         traktSettingsObserver = NotificationCenter.default.addObserver(
@@ -107,7 +139,7 @@ public class LibraryViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshSelectedLibrary()
+                await self?.refreshAfterWatchedOwnerChange()
             }
         }
         traktMutationObserver = NotificationCenter.default.addObserver(
@@ -136,7 +168,7 @@ public class LibraryViewModel: ObservableObject {
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                await self?.refreshSelectedLibrary()
+                await self?.refreshAfterWatchedOwnerChange()
             }
         }
         wetrakrMutationObserver = NotificationCenter.default.addObserver(
@@ -150,9 +182,84 @@ public class LibraryViewModel: ObservableObject {
         }
     }
 
+    private func refreshAfterWatchedOwnerChange() async {
+        invalidateStaleDisplayedLibrary()
+        await refreshSelectedLibrary(syncWatchedHistory: true)
+    }
+
+    private func invalidateStaleDisplayedLibrary() {
+        guard let displayedWatchedContext,
+              !displayedWatchedContext.isCurrentScope else { return }
+        items = []
+        self.displayedWatchedContext = nil
+        mdbListLists = []
+        selectedMdbListListID = nil
+        validateFilters()
+    }
+
+    private func refreshDisplayedWatchedOwnerAfterStoreChange() {
+        guard let displayedWatchedContext,
+              displayedWatchedContext.source == .local,
+              displayedWatchedContext.mutationContext != nil,
+              !displayedWatchedContext.nuvioSyncMutationTargetIsCurrent else { return }
+        let previousAccountID = displayedWatchedContext.mutationContext?.targets
+            .first(where: { $0.provider == .nuvioSync })?.accountID
+        rebindDisplayedWatchedOwner()
+        guard let reboundContext = self.displayedWatchedContext,
+              reboundContext.source == .local,
+              reboundContext.mutationContext?.targets
+                .first(where: { $0.provider == .nuvioSync })?.accountID != previousAccountID else { return }
+        scheduleLibraryHistorySync(for: reboundContext)
+    }
+
+    private func rebindDisplayedWatchedOwner() {
+        guard let displayedWatchedContext else { return }
+        let refreshedContext = LibraryWatchedContext.capture(
+            source: displayedWatchedContext.source,
+            profileId: displayedWatchedContext.profileId
+        )
+        if displayedWatchedContext.source == .local {
+            guard displayedWatchedContext.profileId == refreshedContext.profileId else {
+                invalidateStaleDisplayedLibrary()
+                return
+            }
+            guard displayedWatchedContext.mutationContext != refreshedContext.mutationContext else { return }
+            self.displayedWatchedContext = refreshedContext
+            return
+        }
+        guard displayedWatchedContext.hasSameDisplayOwner(as: refreshedContext) else {
+            invalidateStaleDisplayedLibrary()
+            return
+        }
+        guard displayedWatchedContext.mutationContext != refreshedContext.mutationContext else { return }
+        self.displayedWatchedContext = refreshedContext
+    }
+
+    @discardableResult
+    func applyFetchedLibraryItems(
+        _ items: [StremioMeta],
+        source: TraktLibrarySourceMode,
+        watchedContext: LibraryWatchedContext
+    ) -> Bool {
+        guard watchedContext.isCurrentScope else {
+            self.items = []
+            self.displayedWatchedContext = nil
+            mdbListLists = []
+            selectedMdbListListID = nil
+            validateFilters()
+            return false
+        }
+        displayedSource = source
+        displayedWatchedContext = watchedContext
+        self.items = items
+        validateFilters()
+        return true
+    }
+
     deinit {
         for observer in [
-            libraryObserver, traktAuthObserver, simklAuthObserver, mdbListAuthObserver,
+            libraryObserver, watchedOwnerObserver, watchedTargetsObserver,
+            traktAuthObserver, simklAuthObserver, mdbListAuthObserver,
             wetrakrAuthObserver, traktSettingsObserver, traktMutationObserver,
             mdbListMutationObserver, wetrakrMutationObserver
         ].compactMap({ $0 }) {
@@ -165,6 +272,7 @@ public class LibraryViewModel: ObservableObject {
             if displayedSource != TraktSettingsStore.librarySourceMode {
                 displayedSource = TraktSettingsStore.librarySourceMode
                 items = []
+                displayedWatchedContext = nil
                 if TraktSettingsStore.librarySourceMode != .mdblist {
                     mdbListLists = []
                     selectedMdbListListID = nil
@@ -175,6 +283,10 @@ public class LibraryViewModel: ObservableObject {
         }
 
         displayedSource = .local
+        displayedWatchedContext = LibraryWatchedContext.capture(
+            source: .local,
+            profileId: LibraryStore.activeProfileId
+        )
         mdbListLists = []
         selectedMdbListListID = nil
         let storeItems = LibraryStore.items()
@@ -183,7 +295,7 @@ public class LibraryViewModel: ObservableObject {
         validateFilters()
     }
 
-    public func refreshSelectedLibrary() async {
+    public func refreshSelectedLibrary(syncWatchedHistory: Bool = false) async {
         refreshGeneration &+= 1
         let generation = refreshGeneration
         let profileID = LibraryStore.activeProfileId
@@ -191,15 +303,24 @@ public class LibraryViewModel: ObservableObject {
         let settingsStore = ProfileSettings.current
         let source = TraktSettingsStore.librarySourceMode(in: settingsStore)
         let traktContext = source == .trakt ? TraktLibraryMutationContext() : nil
+        let watchedContext = LibraryWatchedContext.capture(source: source, profileId: profileID)
 
         guard usesRemoteLibrary else {
             loadLibrary()
+            if syncWatchedHistory, let watchedContext = displayedWatchedContext {
+                scheduleLibraryHistorySync(for: watchedContext)
+            }
             return
+        }
+
+        if syncWatchedHistory {
+            scheduleLibraryHistorySync(for: watchedContext)
         }
 
         if displayedSource != TraktSettingsStore.librarySourceMode {
             displayedSource = TraktSettingsStore.librarySourceMode
             items = []
+            displayedWatchedContext = nil
             validateFilters()
         }
 
@@ -211,12 +332,14 @@ public class LibraryViewModel: ObservableObject {
                     settingsProfileID: settingsProfileID,
                     store: settingsStore,
                     source: source,
-                    traktContext: traktContext
+                    traktContext: traktContext,
+                    watchedContext: watchedContext
                   ) else { return false }
-            self.displayedSource = source
-            self.items = snapshot.map(\.stremioMeta)
-            self.validateFilters()
-            return true
+            return self.applyFetchedLibraryItems(
+                snapshot.map(\.stremioMeta),
+                source: source,
+                watchedContext: watchedContext
+            )
         }
 
         guard let remoteItems = await SelectedLibraryService.fetchLibrary(
@@ -228,14 +351,19 @@ public class LibraryViewModel: ObservableObject {
             settingsProfileID: settingsProfileID,
             store: settingsStore,
             source: source,
-            traktContext: traktContext
+            traktContext: traktContext,
+            watchedContext: watchedContext
         ) else {
+            invalidateStaleDisplayedLibrary()
             return
         }
 
-        displayedSource = source
         remoteItems.forEach { CinemetaCatalogRepository.cacheCatalogMetadata($0.meta) }
-        items = remoteItems.map(\.stremioMeta)
+        guard applyFetchedLibraryItems(
+            remoteItems.map(\.stremioMeta),
+            source: source,
+            watchedContext: watchedContext
+        ) else { return }
         if source == .mdblist {
             let lists = await MdbListListService.fetchUserLists()
             guard !Task.isCancelled,
@@ -244,14 +372,19 @@ public class LibraryViewModel: ObservableObject {
                   settingsProfileID == ProfileSettings.activeProfileID,
                   ProfileSettings.isActiveStore(settingsStore),
                   TraktSettingsStore.librarySourceMode(in: settingsStore) == source,
-                  SelectedLibraryService.isSelectedAndAuthenticated else { return }
+                  SelectedLibraryService.isSelectedAndAuthenticated,
+                  watchedContext.isCurrentScope else {
+                invalidateStaleDisplayedLibrary()
+                return
+            }
             mdbListLists = lists ?? []
             if let selectedMdbListListID,
                mdbListLists.contains(where: { $0.id == selectedMdbListListID }) {
                 await loadMdbListListItems(
                     selectedMdbListListID,
                     generation: generation,
-                    profileID: profileID
+                    profileID: profileID,
+                    watchedContext: watchedContext
                 )
             } else {
                 selectedMdbListListID = nil
@@ -263,13 +396,51 @@ public class LibraryViewModel: ObservableObject {
         validateFilters()
     }
 
+    /// Pull the selected Library provider's watched history once per visible
+    /// owner refresh. This is intentionally independent of the Continue
+    /// Watching source and does not block the Library fetch or replace its
+    /// current contents. WatchedStore coalesces concurrent provider requests;
+    /// the local throttle covers repeated auth/settings notifications and
+    /// view task restarts for the same owner.
+    func scheduleLibraryHistorySync(for context: LibraryWatchedContext) {
+        let capturedLocalSyncAccountID = context.source == .local
+            ? WatchedStore.nuvioSyncAccountBinding(profileId: context.profileId)
+            : nil
+        Task { @MainActor [weak self] in
+            guard let self,
+                  context.isCurrentScope,
+                  context.source != .local
+                    || WatchedStore.nuvioSyncAccountBinding(profileId: context.profileId) == capturedLocalSyncAccountID else { return }
+            let localAccountKey = context.source == .local
+                ? (capturedLocalSyncAccountID ?? "no-sync-account")
+                : ""
+            let key = "\(context.cacheIdentity)\u{1f}\(localAccountKey)"
+            let now = Date()
+            if let previousRequest = self.lastLibraryHistorySyncRequest[key],
+               now.timeIntervalSince(previousRequest) < 30 {
+                return
+            }
+            self.lastLibraryHistorySyncRequest[key] = now
+            if self.lastLibraryHistorySyncRequest.count > 16 {
+                self.lastLibraryHistorySyncRequest = self.lastLibraryHistorySyncRequest.filter {
+                    now.timeIntervalSince($0.value) < 300
+                }
+            }
+            guard context.isCurrentScope,
+                  context.source != .local
+                    || WatchedStore.nuvioSyncAccountBinding(profileId: context.profileId) == capturedLocalSyncAccountID else { return }
+            _ = await self.libraryHistorySyncHandler(context.source, context.profileId)
+        }
+    }
+
     private func isCurrentRemoteRefresh(
         generation: Int,
         profileID: String?,
         settingsProfileID: String?,
         store: UserDefaults,
         source: TraktLibrarySourceMode,
-        traktContext: TraktLibraryMutationContext?
+        traktContext: TraktLibraryMutationContext?,
+        watchedContext: LibraryWatchedContext
     ) -> Bool {
         !Task.isCancelled
             && generation == refreshGeneration
@@ -279,13 +450,17 @@ public class LibraryViewModel: ObservableObject {
             && TraktSettingsStore.librarySourceMode(in: store) == source
             && TraktSettingsStore.librarySourceMode == source
             && (source != .trakt || traktContext?.isCurrent == true)
+            && watchedContext.isCurrentScope
             && source != .local
             && SelectedLibraryService.isSelectedAndAuthenticated
     }
 
     public func selectMdbListList(_ listID: Int?) async {
         guard TraktSettingsStore.librarySourceMode == .mdblist,
-              usesRemoteLibrary else { return }
+              usesRemoteLibrary,
+              let watchedContext = displayedWatchedContext,
+              watchedContext.source == .mdblist,
+              watchedContext.isCurrentScope else { return }
         refreshGeneration &+= 1
         let generation = refreshGeneration
         let profileID = LibraryStore.activeProfileId
@@ -294,13 +469,19 @@ public class LibraryViewModel: ObservableObject {
             await refreshSelectedLibrary()
             return
         }
-        await loadMdbListListItems(listID, generation: generation, profileID: profileID)
+        await loadMdbListListItems(
+            listID,
+            generation: generation,
+            profileID: profileID,
+            watchedContext: watchedContext
+        )
     }
 
     private func loadMdbListListItems(
         _ listID: Int,
         generation: Int,
-        profileID: String?
+        profileID: String?,
+        watchedContext: LibraryWatchedContext
     ) async {
         guard let listItems = await MdbListListService.fetchItems(
             listID: listID,
@@ -310,9 +491,16 @@ public class LibraryViewModel: ObservableObject {
         generation == refreshGeneration,
         profileID == LibraryStore.activeProfileId,
         TraktSettingsStore.librarySourceMode == .mdblist,
-        usesRemoteLibrary else { return }
-        items = listItems.map(\.stremioMeta)
-        validateFilters()
+        usesRemoteLibrary,
+        watchedContext.isCurrentScope else {
+            invalidateStaleDisplayedLibrary()
+            return
+        }
+        _ = applyFetchedLibraryItems(
+            listItems.map(\.stremioMeta),
+            source: .mdblist,
+            watchedContext: watchedContext
+        )
     }
 
     private var usesRemoteLibrary: Bool {
@@ -325,6 +513,7 @@ public class LibraryViewModel: ObservableObject {
     func applyTraktMutation(_ mutation: TraktLibraryMutation) {
         // The observer queues a MainActor task. Ownership may have changed
         // since the service posted this notification, so check again here.
+        guard displayedWatchedContext?.isCurrentScope == true else { return }
         if let context = mutation.context {
             guard context.isCurrent, displayedSource == .trakt else { return }
         } else {
@@ -338,7 +527,8 @@ public class LibraryViewModel: ObservableObject {
 
     private func applyMdbListMutation(_ mutation: MdbListLibraryMutation) {
         guard TraktSettingsStore.librarySourceMode == .mdblist,
-              usesRemoteLibrary else { return }
+              usesRemoteLibrary,
+              displayedWatchedContext?.isCurrentScope == true else { return }
         guard selectedMdbListListID == nil else {
             Task { @MainActor in await refreshSelectedLibrary() }
             return
@@ -351,7 +541,8 @@ public class LibraryViewModel: ObservableObject {
     }
 
     private func applyLibraryMutation(meta: NuvioMeta, isInWatchlist: Bool) {
-        guard usesRemoteLibrary else { return }
+        guard usesRemoteLibrary,
+              displayedWatchedContext?.isCurrentScope == true else { return }
         let item = LibraryStoreItem(meta: meta, addedAt: Date()).stremioMeta
         if isInWatchlist {
             items = [item] + items.filter { !matchesLibraryMutation($0, meta: meta) }

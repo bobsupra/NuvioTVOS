@@ -2507,9 +2507,33 @@ private func downsamplePosterImage(data: Data, maxPixelSize: Int) -> UIImage? {
 /// previews usually omit `videos`, so completion cannot be decided until the
 /// episode guide is available. Only series with watched episode rows reach this
 /// cache, avoiding a request for every untouched poster on screen.
+struct CatalogWatchedGuideResolution {
+    let profileId: String?
+    let titleIdentityKeys: Set<String>
+
+    init(profileId: String?, meta: NuvioMeta) {
+        self.profileId = profileId
+        titleIdentityKeys = CatalogWatchedBadgeIdentity.titleIdentityKeys(for: meta)
+    }
+}
+
+enum CatalogWatchedBadgeIdentity {
+    static func titleIdentityKeys(for meta: NuvioMeta) -> Set<String> {
+        var keys = WatchedStore.catalogTitleIdentityKeys(for: meta)
+        guard let year = meta.year else { return keys }
+        let title = WatchedStore.normalizedCatalogTitle(meta.name)
+        guard !title.isEmpty else { return keys }
+        keys.insert("title:\(meta.canonicalType.lowercased()):\(title):\(year)")
+        return keys
+    }
+}
+
 @MainActor
 final class CatalogWatchedMetadataCache {
     static let shared = CatalogWatchedMetadataCache()
+    static let fullSeriesGuideResolvedNotification = Notification.Name(
+        "nuvio.tv.watched.fullSeriesGuideResolved"
+    )
     nonisolated private static let tracker = SimpleCountTracker()
 
     nonisolated static func telemetryCount() -> Int {
@@ -2519,8 +2543,20 @@ final class CatalogWatchedMetadataCache {
     private let repository = CinemetaCatalogRepository()
     private var metadataByKey: [String: NuvioMeta] = [:]
     private var inFlightByKey: [String: Task<NuvioMeta?, Never>] = [:]
+    private var notifiedGuideKeys: Set<String> = []
     private var decisionsByKey: [String: Int] = [:]
+    private struct DecisionOwner {
+        let profileId: String?
+        let titleIdentityKeys: Set<String>
+    }
+    struct DecisionToken: Equatable {
+        let globalGeneration: UInt64
+        let keyGeneration: UInt64
+    }
+    private var decisionOwnersByKey: [String: DecisionOwner] = [:]
+    private var decisionGenerationsByKey: [String: UInt64] = [:]
     private var generation: UInt64 = 0
+    private var decisionGeneration: UInt64 = 0
     private let notificationCenter: NotificationCenter
     private var observers: [NSObjectProtocol] = []
     private let metadataFetcher: (@MainActor (String, String) async -> NuvioMeta?)?
@@ -2531,15 +2567,26 @@ final class CatalogWatchedMetadataCache {
     ) {
         self.notificationCenter = notificationCenter
         self.metadataFetcher = metadataFetcher
-        observers.append(notificationCenter.addObserver(
-            forName: WatchedStore.changedNotification,
-            object: nil,
-            queue: .main
-        ) { [weak self] _ in
-            MainActor.assumeIsolated {
-                self?.decisionsByKey.removeAll()
-            }
-        })
+        let watchedVisibilityNotifications = [
+            WatchedStore.changedNotification,
+            TraktSettingsStore.continueWatchingChangedNotification,
+            TraktAuthStore.changedNotification,
+            SimklAuthStore.changedNotification,
+            MdbListAuthStore.changedNotification,
+            WeTrakrAuthStore.changedNotification,
+            TraktSettingsStore.libraryChangedNotification
+        ]
+        for name in watchedVisibilityNotifications {
+            observers.append(notificationCenter.addObserver(
+                forName: name,
+                object: nil,
+                queue: .main
+            ) { [weak self] _ in
+                MainActor.assumeIsolated {
+                    self?.invalidateDecisions()
+                }
+            })
+        }
         var purgeNotifications = [AppCacheManager.didClearCacheNotification]
         #if canImport(UIKit)
         purgeNotifications.append(UIApplication.didReceiveMemoryWarningNotification)
@@ -2567,6 +2614,9 @@ final class CatalogWatchedMetadataCache {
         generation &+= 1
         metadataByKey.removeAll()
         decisionsByKey.removeAll()
+        decisionOwnersByKey.removeAll()
+        decisionGenerationsByKey.removeAll()
+        notifiedGuideKeys.removeAll()
         inFlightByKey.removeAll()
         Self.tracker.set(count: 0)
     }
@@ -2575,14 +2625,66 @@ final class CatalogWatchedMetadataCache {
         decisionsByKey[key]
     }
 
-    func setDecision(_ watchCount: Int, for key: String) {
+    func setDecision(_ watchCount: Int, for key: String, ifGenerationMatches expectedGeneration: UInt64? = nil) {
+        if let expectedGeneration, expectedGeneration != decisionGeneration { return }
         decisionsByKey[key] = max(0, watchCount)
+        decisionOwnersByKey.removeValue(forKey: key)
+    }
+
+    func decisionGenerationToken() -> UInt64 {
+        decisionGeneration
+    }
+
+    func decisionGenerationToken(for key: String) -> DecisionToken {
+        DecisionToken(
+            globalGeneration: decisionGeneration,
+            keyGeneration: decisionGenerationsByKey[key, default: 0]
+        )
+    }
+
+    func isCurrent(_ token: DecisionToken, for key: String) -> Bool {
+        token.globalGeneration == decisionGeneration
+            && token.keyGeneration == decisionGenerationsByKey[key, default: 0]
+    }
+
+    func setDecision(
+        _ watchCount: Int,
+        for key: String,
+        ifTokenMatches token: DecisionToken,
+        profileId: String?,
+        titleIdentityKeys: Set<String>
+    ) {
+        guard isCurrent(token, for: key) else { return }
+        decisionsByKey[key] = max(0, watchCount)
+        decisionOwnersByKey[key] = DecisionOwner(
+            profileId: profileId,
+            titleIdentityKeys: titleIdentityKeys
+        )
+    }
+
+    func invalidateDecisions(matching resolution: CatalogWatchedGuideResolution) {
+        let matchingKeys = decisionOwnersByKey.compactMap { key, owner -> String? in
+            guard owner.profileId == resolution.profileId,
+                  !owner.titleIdentityKeys.isDisjoint(with: resolution.titleIdentityKeys) else { return nil }
+            return key
+        }
+        for key in matchingKeys {
+            decisionsByKey.removeValue(forKey: key)
+            decisionOwnersByKey.removeValue(forKey: key)
+            decisionGenerationsByKey[key, default: 0] &+= 1
+        }
+    }
+
+    private func invalidateDecisions() {
+        decisionGeneration &+= 1
+        decisionsByKey.removeAll()
+        decisionOwnersByKey.removeAll()
+        decisionGenerationsByKey.removeAll()
     }
 
     func fullMetadata(metaId: String, type: String, preview: NuvioMeta?) async -> NuvioMeta? {
         let requestGeneration = generation
-        let profile = WatchedStore.activeProfileId ?? "default"
-        let key = "\(profile)\u{1f}\(type.lowercased())\u{1f}\(metaId.lowercased())"
+        let key = metadataKey(metaId: metaId, type: type)
         if let cached = metadataByKey[key] { return cached }
         if let inFlight = inFlightByKey[key] { return await inFlight.value }
 
@@ -2608,6 +2710,44 @@ final class CatalogWatchedMetadataCache {
             Self.tracker.set(count: metadataByKey.count)
         }
         return resolved
+    }
+
+    /// Library series actions must not treat a compact preview as a complete
+    /// guide. If an earlier catalog badge cached that preview after an offline
+    /// lookup, discard only the incomplete value and retry on the next menu use.
+    func fullSeriesMetadata(metaId: String, type: String, preview: NuvioMeta?) async -> NuvioMeta? {
+        let key = metadataKey(metaId: metaId, type: type)
+        let profileId = WatchedStore.activeProfileId
+        if let cached = metadataByKey[key], cached.isSeries, cached.videos?.isEmpty == false {
+            notifyGuideResolutionIfNeeded(key: key, profileId: profileId, meta: cached)
+            return cached
+        }
+        removeIncompleteGuideIfNeeded(for: key)
+
+        let resolved = await fullMetadata(metaId: metaId, type: type, preview: preview)
+        guard let resolved, resolved.isSeries, resolved.videos?.isEmpty == false else {
+            removeIncompleteGuideIfNeeded(for: key)
+            return nil
+        }
+        notifyGuideResolutionIfNeeded(key: key, profileId: profileId, meta: resolved)
+        return resolved
+    }
+
+    private func notifyGuideResolutionIfNeeded(key: String, profileId: String?, meta: NuvioMeta) {
+        guard notifiedGuideKeys.insert(key).inserted else { return }
+        let resolution = CatalogWatchedGuideResolution(profileId: profileId, meta: meta)
+        invalidateDecisions(matching: resolution)
+        notificationCenter.post(name: Self.fullSeriesGuideResolvedNotification, object: resolution)
+    }
+
+    private func metadataKey(metaId: String, type: String) -> String {
+        "\(WatchedStore.activeProfileId ?? "default")\u{1f}\(type.lowercased())\u{1f}\(metaId.lowercased())"
+    }
+
+    private func removeIncompleteGuideIfNeeded(for key: String) {
+        guard let cached = metadataByKey[key], cached.videos?.isEmpty != false else { return }
+        metadataByKey.removeValue(forKey: key)
+        Self.tracker.set(count: metadataByKey.count)
     }
 }
 
@@ -2697,6 +2837,8 @@ struct WatchedCheckmarkBadge: View {
     let metaId: String
     let type: String
     let meta: NuvioMeta?
+    var libraryWatchedContext: LibraryWatchedContext? = nil
+    var isLibraryContextCurrent = true
     var size: CGFloat = 38
 
     @State private var watchCount = 0
@@ -2707,13 +2849,21 @@ struct WatchedCheckmarkBadge: View {
         self.metaId = metaId
         self.type = type
         self.meta = nil
+        self.libraryWatchedContext = nil
         self.size = size
     }
 
-    init(meta: NuvioMeta, size: CGFloat = 38) {
+    init(
+        meta: NuvioMeta,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
+        isLibraryContextCurrent: Bool = true,
+        size: CGFloat = 38
+    ) {
         self.metaId = meta.id
         self.type = meta.type
         self.meta = meta
+        self.libraryWatchedContext = libraryWatchedContext
+        self.isLibraryContextCurrent = isLibraryContextCurrent
         self.size = size
     }
 
@@ -2736,7 +2886,33 @@ struct WatchedCheckmarkBadge: View {
             .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
                 refreshVersion &+= 1
             }
+            .onReceive(NotificationCenter.default.publisher(for: SimklAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: MdbListAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: WeTrakrAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
             .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
+                refreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: CatalogWatchedMetadataCache.fullSeriesGuideResolvedNotification).receive(on: RunLoop.main)) { notification in
+                guard let resolution = notification.object as? CatalogWatchedGuideResolution else { return }
+                let badgeProfileId: String?
+                if let libraryWatchedContext {
+                    badgeProfileId = libraryWatchedContext.profileId
+                } else {
+                    badgeProfileId = WatchedStore.activeProfileId
+                }
+                guard badgeProfileId == resolution.profileId else { return }
+                let badgeMeta = meta ?? NuvioMeta(id: metaId, name: "", type: type)
+                let badgeKeys = CatalogWatchedBadgeIdentity.titleIdentityKeys(for: badgeMeta)
+                guard !badgeKeys.isDisjoint(with: resolution.titleIdentityKeys) else { return }
                 refreshVersion &+= 1
             }
     }
@@ -2750,17 +2926,35 @@ struct WatchedCheckmarkBadge: View {
             .trimmingCharacters(in: .whitespacesAndNewlines)
             .lowercased() ?? ""
         let tmdb = meta?.tmdbId.map(String.init) ?? ""
-        return "\(WatchedStore.activeProfileId ?? "default")\u{1f}\(type.lowercased())\u{1f}\(metaId)\u{1f}\(imdb)\u{1f}\(tmdb)"
+        let profile: String
+        if let libraryWatchedContext {
+            profile = libraryWatchedContext.profileId ?? "legacy"
+        } else {
+            profile = WatchedStore.activeProfileId ?? "default"
+        }
+        let scope = libraryWatchedContext?.source.rawValue ?? "global"
+        return "\(scope)\u{1f}\(profile)\u{1f}\(type.lowercased())\u{1f}\(metaId)\u{1f}\(imdb)\u{1f}\(tmdb)"
     }
 
     private var refreshTaskIdentity: String {
-        "\(refreshIdentity)\u{1f}\(refreshVersion)\u{1f}\(isEnabled)"
+        "\(refreshIdentity)\u{1f}\(refreshVersion)\u{1f}\(isEnabled)\u{1f}\(isLibraryContextCurrent)"
     }
 
     @MainActor
     private func refresh() async {
-        if let cached = CatalogWatchedMetadataCache.shared.cachedDecision(for: refreshIdentity) {
+        let decisionCache = CatalogWatchedMetadataCache.shared
+        let decisionGeneration = decisionCache.decisionGenerationToken(for: refreshIdentity)
+        if let cached = decisionCache.cachedDecision(for: refreshIdentity) {
             watchCount = cached
+            return
+        }
+
+        if let libraryWatchedContext {
+            await refreshLibraryScopedWatchedState(
+                using: libraryWatchedContext,
+                decisionCache: decisionCache,
+                decisionGeneration: decisionGeneration
+            )
             return
         }
 
@@ -2773,7 +2967,7 @@ struct WatchedCheckmarkBadge: View {
             if let meta {
                 let result = snapshot.watchCount(meta: meta)
                 watchCount = result
-                CatalogWatchedMetadataCache.shared.setDecision(result, for: refreshIdentity)
+                cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: meta)
                 return
             }
 
@@ -2786,16 +2980,16 @@ struct WatchedCheckmarkBadge: View {
 
             guard titleWasWatched || knownCount > 0 else {
                 watchCount = 0
-                CatalogWatchedMetadataCache.shared.setDecision(0, for: refreshIdentity)
+                cacheDecision(0, in: decisionCache, token: decisionGeneration)
                 return
             }
 
-            let fullMeta = await CatalogWatchedMetadataCache.shared.fullMetadata(
+            let fullMeta = await decisionCache.fullMetadata(
                 metaId: metaId,
                 type: type,
                 preview: nil
             )
-            guard !Task.isCancelled else { return }
+            guard !Task.isCancelled, decisionCache.isCurrent(decisionGeneration, for: refreshIdentity) else { return }
 
             let result: Int
             if let fullMeta {
@@ -2811,7 +3005,7 @@ struct WatchedCheckmarkBadge: View {
                 result = max(knownCount, titleWasWatched ? 1 : 0)
             }
             watchCount = result
-            CatalogWatchedMetadataCache.shared.setDecision(result, for: refreshIdentity)
+            cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: fullMeta)
             return
         }
 
@@ -2826,7 +3020,7 @@ struct WatchedCheckmarkBadge: View {
         guard hasEpisodeHistory else {
             let result = max(previewCount, titleWasWatched ? 1 : 0)
             watchCount = result
-            CatalogWatchedMetadataCache.shared.setDecision(result, for: refreshIdentity)
+            cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: meta)
             return
         }
 
@@ -2835,13 +3029,13 @@ struct WatchedCheckmarkBadge: View {
         if suppliedGuide {
             fullMeta = meta
         } else {
-            fullMeta = await CatalogWatchedMetadataCache.shared.fullMetadata(
+            fullMeta = await decisionCache.fullMetadata(
                 metaId: metaId,
                 type: type,
                 preview: meta
             )
         }
-        guard !Task.isCancelled else { return }
+        guard !Task.isCancelled, decisionCache.isCurrent(decisionGeneration, for: refreshIdentity) else { return }
 
         let freshSnapshot = WatchedStore.currentSnapshot()
         let resolvedCount: Int
@@ -2858,7 +3052,99 @@ struct WatchedCheckmarkBadge: View {
             || titleWasWatched
         let result = max(resolvedCount, hasTitleMarker ? 1 : 0)
         watchCount = result
-        CatalogWatchedMetadataCache.shared.setDecision(result, for: refreshIdentity)
+        cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: fullMeta ?? meta)
+    }
+
+    @MainActor
+    private func refreshLibraryScopedWatchedState(
+        using context: LibraryWatchedContext,
+        decisionCache: CatalogWatchedMetadataCache,
+        decisionGeneration: CatalogWatchedMetadataCache.DecisionToken
+    ) async {
+        watchCount = 0
+        guard isLibraryContextCurrent else { return }
+        var resolvedMeta = meta
+        let initialSnapshot = WatchedStore.librarySnapshot(for: context.source, profileId: context.profileId)
+        let isSeries = meta?.isSeries ?? NuvioMeta.isSeriesType(type)
+        let titleWasWatched = meta.map { initialSnapshot.containsCatalogTitle(meta: $0) }
+            ?? initialSnapshot.contains(metaId: metaId, type: type)
+
+        guard isSeries else {
+            let result = CatalogWatchedBadgeCountResolver.movieWatchCount(
+                snapshot: initialSnapshot,
+                metaId: metaId,
+                type: type,
+                resolvedMeta: meta
+            )
+            watchCount = result
+            cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: meta)
+            return
+        }
+
+        let episodeHistory = meta.map { initialSnapshot.catalogEpisodeWatchCounts(meta: $0) } ?? [:]
+        let hasEpisodeHistory = !episodeHistory.isEmpty
+            || !(meta.map { initialSnapshot.catalogWatchedEpisodeKeys(meta: $0) }
+                ?? initialSnapshot.watchedEpisodeKeys(metaId: metaId)).isEmpty
+        guard hasEpisodeHistory else {
+            let result = max(meta.map { initialSnapshot.catalogWatchCount(meta: $0) } ?? 0, titleWasWatched ? 1 : 0)
+            watchCount = result
+            cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: meta)
+            return
+        }
+
+        if resolvedMeta?.videos?.isEmpty != false {
+            resolvedMeta = await decisionCache.fullMetadata(metaId: metaId, type: type, preview: meta)
+        }
+        guard !Task.isCancelled,
+              isLibraryContextCurrent,
+              decisionCache.isCurrent(decisionGeneration, for: refreshIdentity) else { return }
+
+        guard resolvedMeta?.videos?.isEmpty == false else {
+            // Episode completion cannot be determined from a compact preview.
+            // Leave this decision uncached so a later full-guide resolution can
+            // trigger a fresh badge query.
+            watchCount = titleWasWatched ? 1 : 0
+            return
+        }
+
+        let freshSnapshot = WatchedStore.librarySnapshot(for: context.source, profileId: context.profileId)
+        let resolvedCount: Int
+        if let resolvedMeta {
+            resolvedCount = freshSnapshot.catalogWatchCount(meta: resolvedMeta)
+        } else {
+            resolvedCount = 0
+        }
+        let hasTitleMarker = (resolvedMeta.map { freshSnapshot.containsCatalogTitle(meta: $0) } ?? false)
+            || titleWasWatched
+        let result = max(resolvedCount, hasTitleMarker ? 1 : 0)
+        watchCount = result
+        cacheDecision(result, in: decisionCache, token: decisionGeneration, resolvedMeta: resolvedMeta)
+    }
+
+    private func cacheDecision(
+        _ result: Int,
+        in cache: CatalogWatchedMetadataCache,
+        token: CatalogWatchedMetadataCache.DecisionToken,
+        resolvedMeta: NuvioMeta? = nil
+    ) {
+        let identityMeta = meta ?? NuvioMeta(id: metaId, name: "", type: type)
+        var identityKeys = CatalogWatchedBadgeIdentity.titleIdentityKeys(for: identityMeta)
+        if let resolvedMeta {
+            identityKeys.formUnion(CatalogWatchedBadgeIdentity.titleIdentityKeys(for: resolvedMeta))
+        }
+        let profileId: String?
+        if let libraryWatchedContext {
+            profileId = libraryWatchedContext.profileId
+        } else {
+            profileId = WatchedStore.activeProfileId
+        }
+        cache.setDecision(
+            result,
+            for: refreshIdentity,
+            ifTokenMatches: token,
+            profileId: profileId,
+            titleIdentityKeys: identityKeys
+        )
     }
 }
 
@@ -3016,9 +3302,37 @@ struct PosterCard_Previews: PreviewProvider {
 
 // MARK: - Title actions native context menu
 
+enum LibraryWatchedMenuStatePolicy {
+    static func resolvedState(
+        _ state: Bool?,
+        identity: String?,
+        currentIdentity: String
+    ) -> Bool? {
+        guard identity == currentIdentity else { return nil }
+        return state
+    }
+
+    static func isGuideResolutionPending(
+        isSeries: Bool,
+        hasFullGuide: Bool,
+        resolvedIdentity: String?,
+        currentIdentity: String
+    ) -> Bool {
+        isSeries && !hasFullGuide && resolvedIdentity != currentIdentity
+    }
+}
+
+enum WatchedMenuIntentPolicy {
+    static func needsMutation(currentlyWatched: Bool, desiredIsWatched: Bool) -> Bool {
+        currentlyWatched != desiredIsWatched
+    }
+}
+
 /// Native tvOS/iOS context menu for titles (Go to details / Add to library / Mark as watched / Continue watching actions)
 struct TitleActionsMenuContent: View {
     let meta: NuvioMeta
+    var libraryWatchedContext: LibraryWatchedContext? = nil
+    var onOpenLibraryDetails: ((LibraryWatchedContext) -> Void)? = nil
     var onOpenDetails: (() -> Void)? = nil
     var continueProgress: Double? = nil
     var continueIsUpNext: Bool = false
@@ -3026,17 +3340,110 @@ struct TitleActionsMenuContent: View {
     var onStartFromBeginning: (() -> Void)? = nil
     var onRemoveFromContinueWatching: (() -> Void)? = nil
     var onRefreshCatalog: (() -> Void)? = nil
+    @State private var libraryWatchedState: Bool?
+    @State private var resolvedLibraryWatchedTaskIdentity: String?
+    @State private var libraryWatchedRefreshVersion = 0
+
     var body: some View {
         contextMenuContent
+            .task(id: libraryWatchedTaskIdentity) {
+                await refreshLibraryWatchedState()
+            }
+            .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: SimklAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: MdbListAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: WeTrakrAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                libraryWatchedRefreshVersion &+= 1
+            }
+    }
+
+    private var isLibraryWatched: Bool {
+        guard let libraryWatchedContext else { return false }
+        if let resolved = LibraryWatchedMenuStatePolicy.resolvedState(
+            libraryWatchedState,
+            identity: resolvedLibraryWatchedTaskIdentity,
+            currentIdentity: libraryWatchedTaskIdentity
+        ) {
+            return resolved
+        }
+        return WatchedStore.isWatchedForLibrary(
+            meta: meta,
+            source: libraryWatchedContext.source,
+            profileId: libraryWatchedContext.profileId
+        )
+    }
+
+    private var isLibraryWatchedResolutionPending: Bool {
+        guard let libraryWatchedContext else { return false }
+        guard libraryWatchedContext.isCurrentScope,
+              libraryWatchedContext.isCurrent else { return true }
+        return LibraryWatchedMenuStatePolicy.isGuideResolutionPending(
+            isSeries: meta.isSeries,
+            hasFullGuide: meta.videos?.isEmpty == false,
+            resolvedIdentity: resolvedLibraryWatchedTaskIdentity,
+            currentIdentity: libraryWatchedTaskIdentity
+        )
+    }
+
+    private var libraryWatchedTaskIdentity: String {
+        "\(libraryWatchedContext?.cacheIdentity ?? "global")\u{1f}\(meta.id)\u{1f}\(meta.type)\u{1f}\(libraryWatchedRefreshVersion)"
+    }
+
+    private func scheduleOpenDetails() {
+        if let libraryWatchedContext, let onOpenLibraryDetails {
+            guard let capturedContext = libraryWatchedContext.recaptureForCurrentAction() else { return }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                onOpenLibraryDetails(capturedContext)
+            }
+        } else {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                onOpenDetails?()
+            }
+        }
+    }
+
+    @MainActor
+    private func refreshLibraryWatchedState() async {
+        libraryWatchedState = nil
+        resolvedLibraryWatchedTaskIdentity = nil
+        guard let context = libraryWatchedContext else {
+            return
+        }
+        var resolvedMeta = meta
+        if meta.isSeries, meta.videos?.isEmpty != false {
+            guard let fullSeriesMeta = await CatalogWatchedMetadataCache.shared.fullSeriesMetadata(
+                metaId: meta.id,
+                type: meta.type,
+                preview: meta
+            ) else { return }
+            resolvedMeta = fullSeriesMeta
+        }
+        guard !Task.isCancelled, context.isCurrentScope else { return }
+        libraryWatchedState = WatchedStore.isWatchedForLibrary(
+            meta: resolvedMeta,
+            source: context.source,
+            profileId: context.profileId
+        )
+        resolvedLibraryWatchedTaskIdentity = libraryWatchedTaskIdentity
     }
 
     @ViewBuilder
     private var contextMenuContent: some View {
         if continueProgress != nil || continueIsUpNext {
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-                    onOpenDetails?()
-                }
+                scheduleOpenDetails()
             } label: {
                 Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
@@ -3072,33 +3479,18 @@ struct TitleActionsMenuContent: View {
             }
         } else {
             let inLibrary = LibraryStore.contains(metaId: meta.id, type: meta.type)
-            let isItemWatched = WatchedStore.contains(meta: meta)
+            let isItemWatched = libraryWatchedContext == nil
+                ? WatchedStore.contains(meta: meta)
+                : isLibraryWatched
 
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-                    onOpenDetails?()
-                }
+                scheduleOpenDetails()
             } label: {
                 Label(L10n.string("action_go_to_details", fallback: "Go to details"), systemImage: "info.circle")
             }
 
             Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-                    toggleLibrary(currentlyInLibrary: inLibrary)
-                }
-            } label: {
-                Label(
-                    inLibrary
-                        ? L10n.string("action_remove_from_library", fallback: "Remove from library")
-                        : L10n.string("action_add_to_library", fallback: "Add to library"),
-                    systemImage: inLibrary ? "checkmark" : "plus"
-                )
-            }
-
-            Button {
-                DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
-                    toggleWatched()
-                }
+                scheduleWatchedToggle(desiredIsWatched: !isItemWatched)
             } label: {
                 Label(
                     isItemWatched
@@ -3107,6 +3499,7 @@ struct TitleActionsMenuContent: View {
                     systemImage: isItemWatched ? "eye.slash" : "eye"
                 )
             }
+            .disabled(isLibraryWatchedResolutionPending)
 
             if let onRefreshCatalog {
                 Button {
@@ -3115,6 +3508,24 @@ struct TitleActionsMenuContent: View {
                     }
                 } label: {
                     Label(L10n.string("action_refresh_catalog", fallback: "Refresh Catalog"), systemImage: "arrow.clockwise")
+                }
+            }
+
+            if inLibrary {
+                Button(role: .destructive) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                        toggleLibrary(currentlyInLibrary: true)
+                    }
+                } label: {
+                    Label(L10n.string("action_remove", fallback: "Remove"), systemImage: "trash")
+                }
+            } else {
+                Button {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+                        toggleLibrary(currentlyInLibrary: false)
+                    }
+                } label: {
+                    Label(L10n.string("action_add_to_library", fallback: "Add to library"), systemImage: "plus")
                 }
             }
         }
@@ -3137,9 +3548,42 @@ struct TitleActionsMenuContent: View {
         }
     }
 
-    private func toggleWatched() {
+    private func scheduleWatchedToggle(desiredIsWatched: Bool) {
+        let capturedContext = libraryWatchedContext?.recaptureForCurrentAction()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.30) {
+            guard libraryWatchedContext != nil else {
+                setGlobalWatched(to: desiredIsWatched)
+                return
+            }
+            guard let capturedContext else { return }
+            Task { @MainActor in
+                var resolvedMeta = meta
+                if meta.isSeries, meta.videos?.isEmpty != false {
+                    guard let fullSeriesMeta = await CatalogWatchedMetadataCache.shared.fullSeriesMetadata(
+                        metaId: meta.id,
+                        type: meta.type,
+                        preview: meta
+                    ) else { return }
+                    resolvedMeta = fullSeriesMeta
+                }
+                guard !Task.isCancelled, capturedContext.isCurrent else { return }
+                guard !meta.isSeries || resolvedMeta.videos?.isEmpty == false else { return }
+                _ = capturedContext.setWatchedUsingCapturedAction(
+                    resolvedMeta,
+                    isWatched: desiredIsWatched
+                )
+            }
+        }
+    }
+
+    private func setGlobalWatched(to desiredIsWatched: Bool) {
         let isSeries = ["series", "tv", "show", "tvshow"].contains(meta.type.lowercased())
         guard isSeries else {
+            let currentlyWatched = WatchedStore.contains(meta: meta)
+            guard WatchedMenuIntentPolicy.needsMutation(
+                currentlyWatched: currentlyWatched,
+                desiredIsWatched: desiredIsWatched
+            ) else { return }
             _ = WatchedStore.toggle(meta: meta)
             return
         }
@@ -3151,6 +3595,11 @@ struct TitleActionsMenuContent: View {
                 preview: meta
             ) ?? meta
             guard !Task.isCancelled else { return }
+            let currentlyWatched = WatchedStore.isWatchedForDisplay(meta: fullMeta)
+            guard WatchedMenuIntentPolicy.needsMutation(
+                currentlyWatched: currentlyWatched,
+                desiredIsWatched: desiredIsWatched
+            ) else { return }
             _ = WatchedStore.toggle(meta: fullMeta)
         }
     }
@@ -3158,6 +3607,8 @@ struct TitleActionsMenuContent: View {
 
 struct TitleActionsContextMenu: ViewModifier {
     let meta: NuvioMeta
+    var libraryWatchedContext: LibraryWatchedContext? = nil
+    var onOpenLibraryDetails: ((LibraryWatchedContext) -> Void)? = nil
     var isEnabled = true
     var onOpenDetails: (() -> Void)? = nil
     var continueProgress: Double? = nil
@@ -3174,6 +3625,8 @@ struct TitleActionsContextMenu: ViewModifier {
                 .contextMenu {
                     TitleActionsMenuContent(
                         meta: meta,
+                        libraryWatchedContext: libraryWatchedContext,
+                        onOpenLibraryDetails: onOpenLibraryDetails,
                         onOpenDetails: onOpenDetails,
                         continueProgress: continueProgress,
                         continueIsUpNext: continueIsUpNext,
@@ -3192,6 +3645,8 @@ struct TitleActionsContextMenu: ViewModifier {
 extension View {
     func titleActionsContextMenu(
         meta: NuvioMeta,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
+        onOpenLibraryDetails: ((LibraryWatchedContext) -> Void)? = nil,
         onOpenDetails: (() -> Void)? = nil,
         continueProgress: Double? = nil,
         continueIsUpNext: Bool = false,
@@ -3204,6 +3659,8 @@ extension View {
         modifier(
             TitleActionsContextMenu(
                 meta: meta,
+                libraryWatchedContext: libraryWatchedContext,
+                onOpenLibraryDetails: onOpenLibraryDetails,
                 isEnabled: isEnabled,
                 onOpenDetails: onOpenDetails,
                 continueProgress: continueProgress,

@@ -266,8 +266,11 @@ enum MdbListProgressService {
     ) async -> Bool {
         let scope = profileScope ?? MdbListRuntimeSession.profileScope()
         let startingProfile = (ProfileSettings.activeProfileID, WatchedStore.activeProfileId)
+        let accountID = MdbListAuthStore.accountBindingID(in: store)
         guard ProfileSettings.isActiveStore(store),
+              !accountID.isEmpty,
               (TraktSettingsStore.watchProgressSource(in: store) == .mdblist
+                || TraktSettingsStore.librarySourceMode(in: store) == .mdblist
                 || RemoteTrackingState.isScrobbleEnabled(
                     for: .mdblist,
                     in: store,
@@ -284,9 +287,24 @@ enum MdbListProgressService {
             profileScope: scope,
             tokenStorage: tokenStorage
         )
+        _ = await flushPendingLibraryMutations(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: scope
+        )
+        guard isCurrentWatchedHistoryContext(
+            store: store,
+            scope: scope,
+            profileId: startingProfile.1,
+            expectedProfileID: startingProfile.0,
+            accountID: accountID,
+            tokenStorage: tokenStorage
+        ) else { return false }
         let syncStartedAt = Date()
         do {
             var remoteItems: [WatchedStoreItem] = []
+            var snapshotComplete = true
             let mediaTypes = ["movie", "show", "episode", "season"]
 
             for mediaType in mediaTypes {
@@ -295,19 +313,32 @@ enum MdbListProgressService {
                     URLQueryItem(name: "mediatype", value: mediaType)
                 ]
                 var visitedCursors = Set<String>()
+                var receivedResponse = false
+                var reachedEnd = false
 
-                for _ in 0..<1_000 {
+                for pageIndex in 0..<1_000 {
                     let response = try await service.authorizedRequest(
                         path: "/sync/watched",
                         method: .get,
                         queryItems: query
                     )
+                    guard isCurrentWatchedHistoryContext(
+                        store: store,
+                        scope: scope,
+                        profileId: startingProfile.1,
+                        expectedProfileID: startingProfile.0,
+                        accountID: accountID,
+                        tokenStorage: tokenStorage
+                    ) else { return false }
                     guard (200..<300).contains(response.statusCode) else {
+                        snapshotComplete = false
                         break
                     }
                     guard let json = try? JSONSerialization.jsonObject(with: response.data) else {
+                        snapshotComplete = false
                         break
                     }
+                    receivedResponse = true
                     let items = watchedItems(from: json)
                     remoteItems.append(contentsOf: items)
 
@@ -317,26 +348,41 @@ enum MdbListProgressService {
                         nextCursor = string(pagination["next_cursor"])
                     }
                     guard let cursor = nextCursor, !cursor.isEmpty else {
+                        reachedEnd = true
                         break
                     }
-                    guard visitedCursors.insert(cursor).inserted else { break }
+                    guard visitedCursors.insert(cursor).inserted else {
+                        snapshotComplete = false
+                        break
+                    }
+                    if pageIndex == 999 { snapshotComplete = false }
                     query = [
                         URLQueryItem(name: "limit", value: "1000"),
                         URLQueryItem(name: "mediatype", value: mediaType),
                         URLQueryItem(name: "cursor", value: cursor)
                     ]
                 }
+                if !receivedResponse || !reachedEnd { snapshotComplete = false }
             }
 
             if remoteItems.isEmpty {
                 var query = [URLQueryItem(name: "limit", value: "1000")]
                 var visitedCursors = Set<String>()
-                for _ in 0..<1_000 {
+                var fallbackComplete = false
+                for pageIndex in 0..<1_000 {
                     let response = try await service.authorizedRequest(
                         path: "/sync/watched",
                         method: .get,
                         queryItems: query
                     )
+                    guard isCurrentWatchedHistoryContext(
+                        store: store,
+                        scope: scope,
+                        profileId: startingProfile.1,
+                        expectedProfileID: startingProfile.0,
+                        accountID: accountID,
+                        tokenStorage: tokenStorage
+                    ) else { return false }
                     guard (200..<300).contains(response.statusCode),
                           let json = try? JSONSerialization.jsonObject(with: response.data) else {
                         break
@@ -348,37 +394,149 @@ enum MdbListProgressService {
                         nextCursor = string(pagination["next_cursor"])
                     }
                     guard let cursor = nextCursor, !cursor.isEmpty, visitedCursors.insert(cursor).inserted else {
+                        fallbackComplete = nextCursor == nil || nextCursor?.isEmpty == true
                         break
                     }
+                    if pageIndex == 999 { break }
                     query = [
                         URLQueryItem(name: "limit", value: "1000"),
                         URLQueryItem(name: "cursor", value: cursor)
                     ]
                 }
+                snapshotComplete = fallbackComplete
             }
 
             // The global watch stores follow the active profile. Do not apply
             // a response that started for one profile after the user switched
             // to another while pagination was in flight.
             guard startingProfile.0 == ProfileSettings.activeProfileID,
-                  startingProfile.1 == WatchedStore.activeProfileId else {
+                  startingProfile.1 == WatchedStore.activeProfileId,
+                  MdbListAuthStore.accountBindingID(in: store) == accountID else {
                 return false
             }
 
-            let previous = previousWatchedSnapshots[scope]
-                ?? WatchedStore.items().filter { $0.isVisible(under: .mdblist) }
+            let snapshotKey = "\(scope)|\(accountID)"
+            let previous = previousWatchedSnapshots[snapshotKey]
+                ?? WatchedStore.items(profileId: startingProfile.1).filter {
+                    $0.isLibraryVisible(under: .mdblist, accountID: accountID)
+                }
             let merged = WatchedStore.mergedByIdentity(remoteItems)
+            if !snapshotComplete {
+                guard !merged.isEmpty,
+                      WatchedStore.mergeMdbListPartialSnapshot(
+                        merged,
+                        syncStartedAt: syncStartedAt,
+                        currentAccountID: accountID,
+                        profileId: startingProfile.1
+                      ) else { return false }
+                NotificationCenter.default.post(name: WatchedStore.changedNotification, object: nil)
+                return true
+            }
             guard WatchedStore.reconcileMdbListSnapshot(
                 merged,
                 previousRemoteItems: previous,
-                syncStartedAt: syncStartedAt
+                syncStartedAt: syncStartedAt,
+                currentAccountID: accountID
             ) else { return false }
-            previousWatchedSnapshots[scope] = merged
+            previousWatchedSnapshots[snapshotKey] = merged
             NotificationCenter.default.post(name: WatchedStore.changedNotification, object: nil)
             return true
         } catch {
             return false
         }
+    }
+
+    /// Drains account-bound manual library changes. Playback scrobble remains
+    /// on its existing endpoints and never shares this outbox.
+    static func flushPendingLibraryMutations(
+        store: UserDefaults = ProfileSettings.current,
+        client: MdbListAPIClient = MdbListAPIClient(),
+        tokenStorage: MdbListTokenStorage = MdbListKeychainTokenStorage(),
+        profileScope: String? = nil
+    ) async -> Bool {
+        let scope = profileScope ?? MdbListRuntimeSession.profileScope()
+        let profileId = WatchedStore.activeProfileId
+        let expectedProfileID = ProfileSettings.activeProfileID
+        let accountID = MdbListAuthStore.accountBindingID(in: store)
+        guard expectedProfileID == profileId,
+              ProfileSettings.isActiveStore(store),
+              RemoteTrackingState.isProgressSourceAuthenticated(
+                .mdblist,
+                in: store,
+                mdbListTokenStorage: tokenStorage,
+                profileScope: scope
+              ) else { return false }
+
+        let service = MdbListAuthService(
+            client: client,
+            store: store,
+            profileScope: scope,
+            tokenStorage: tokenStorage
+        )
+        let mutations = WatchedStore.pendingLibraryMutations(
+            provider: .mdblist,
+            profileId: profileId,
+            readyOnly: true
+        )
+            .filter { $0.accountID == accountID && $0.profileID == profileId }
+        for mutation in mutations {
+            guard isCurrentWatchedHistoryContext(
+                store: store,
+                scope: scope,
+                profileId: profileId,
+                expectedProfileID: expectedProfileID,
+                accountID: accountID,
+                tokenStorage: tokenStorage
+            ) else { return false }
+            let episodes = mutation.episodes.isEmpty
+                ? mutation.episode.map { [$0] } ?? []
+                : mutation.episodes
+            guard let body = historyBody(
+                meta: mutation.meta,
+                season: mutation.season,
+                episodes: episodes,
+                watchedAt: mutation.isWatched ? iso8601(mutation.changedAt) : nil
+            ) else { return false }
+            do {
+                let response = try await service.authorizedRequest(
+                    path: mutation.isWatched ? "/sync/watched" : "/sync/watched/remove",
+                    method: .post,
+                    body: try jsonData(body)
+                )
+                guard (200..<300).contains(response.statusCode) else {
+                    _ = WatchedStore.deferLibraryMutation(
+                        id: mutation.id,
+                        provider: .mdblist,
+                        accountID: accountID,
+                        profileId: profileId
+                    )
+                    return false
+                }
+                guard isCurrentWatchedHistoryContext(
+                        store: store,
+                        scope: scope,
+                        profileId: profileId,
+                        expectedProfileID: expectedProfileID,
+                        accountID: accountID,
+                        tokenStorage: tokenStorage
+                      ),
+                      WatchedStore.acknowledgeLibraryMutation(
+                        id: mutation.id,
+                        provider: .mdblist,
+                        accountID: accountID,
+                        profileId: profileId
+                      ) else { return false }
+            } catch {
+                _ = WatchedStore.deferLibraryMutation(
+                    id: mutation.id,
+                    provider: .mdblist,
+                    accountID: accountID,
+                    profileId: profileId
+                )
+                return false
+            }
+        }
+        return true
     }
 
     static func setWatched(
@@ -458,7 +616,30 @@ enum MdbListProgressService {
     }
 
     static func invalidateWatchedSnapshot(for profileScope: String = MdbListRuntimeSession.profileScope()) {
-        previousWatchedSnapshots.removeValue(forKey: profileScope)
+        previousWatchedSnapshots = previousWatchedSnapshots.filter {
+            !$0.key.hasPrefix("\(profileScope)|")
+        }
+    }
+
+    private static func isCurrentWatchedHistoryContext(
+        store: UserDefaults,
+        scope: String,
+        profileId: String?,
+        expectedProfileID: String?,
+        accountID: String,
+        tokenStorage: MdbListTokenStorage
+    ) -> Bool {
+        ProfileSettings.isActiveStore(store)
+            && ProfileSettings.activeProfileID == expectedProfileID
+            && WatchedStore.activeProfileId == profileId
+            && profileId == expectedProfileID
+            && MdbListAuthStore.accountBindingID(in: store) == accountID
+            && RemoteTrackingState.isProgressSourceAuthenticated(
+                .mdblist,
+                in: store,
+                mdbListTokenStorage: tokenStorage,
+                profileScope: scope
+            )
     }
 
     // MARK: Request bodies
@@ -556,9 +737,13 @@ enum MdbListProgressService {
     }
 
     private static func iso8601Now() -> String {
+        iso8601(Date())
+    }
+
+    private static func iso8601(_ date: Date) -> String {
         let formatter = ISO8601DateFormatter()
         formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
-        return formatter.string(from: Date())
+        return formatter.string(from: date)
     }
 
     // MARK: Playback decoding

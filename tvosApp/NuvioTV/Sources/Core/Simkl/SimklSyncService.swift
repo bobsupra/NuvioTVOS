@@ -841,7 +841,8 @@ struct SimklAuthorizedClient {
     func getOptional<T: Decodable>(
         _ type: T.Type,
         path: String,
-        query: [URLQueryItem] = []
+        query: [URLQueryItem] = [],
+        noContentValue: T? = nil
     ) async -> T? {
         let requestToken = owner.token
         guard let result: SimklHTTPResult<T> = try? await client.get(
@@ -861,10 +862,12 @@ struct SimklAuthorizedClient {
                 if retry.statusCode == 401 {
                     clearAuthIfCurrent(rejectedToken: refreshedToken)
                 }
+                if retry.statusCode == 204 { return noContentValue }
                 return (200..<300).contains(retry.statusCode) ? retry.value : nil
             }
             clearAuthIfCurrent(rejectedToken: requestToken)
         }
+        if result.statusCode == 204 { return noContentValue }
         guard (200..<300).contains(result.statusCode) else { return nil }
         return result.value
     }
@@ -1034,6 +1037,13 @@ private enum SimklSyncLoader {
 struct SimklHistoryRecord: Codable {
     let key: String
     let items: [WatchedStoreItem]
+    let category: String?
+
+    init(key: String, items: [WatchedStoreItem], category: String? = nil) {
+        self.key = key
+        self.items = items
+        self.category = category
+    }
 }
 
 struct SimklHistoryService {
@@ -1045,20 +1055,49 @@ struct SimklHistoryService {
         tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
         profileScope: String? = nil
     ) async -> Bool {
-        guard ProfileSettings.isActiveStore(store) else { return false }
+        guard ProfileSettings.isActiveStore(store),
+              TraktSettingsStore.watchProgressSource(in: store) == .simkl
+                || TraktSettingsStore.librarySourceMode(in: store) == .simkl
+                || RemoteTrackingState.isScrobbleEnabled(
+                    for: .simkl,
+                    in: store,
+                    simklTokenStorage: tokenStorage,
+                    profileScope: profileScope
+                ) else { return false }
+        let expectedProfileID = ProfileSettings.activeProfileID
+        let expectedWatchedProfileID = WatchedStore.activeProfileId
+        let accountID = SimklAuthStore.accountBindingID(in: store)
         let syncStartedAt = Date()
-        let sourceAtStart = TraktSettingsStore.watchProgressSource(in: store)
         guard let service = SimklAuthorizedClient(
             store: store,
             client: client,
             tokenStorage: tokenStorage,
             profileScope: profileScope
-        ),
-              let activities = try? await SimklSyncLoader.activities(using: service) else {
-            return false
-        }
-        guard service.isCurrentAuthorization(),
-              TraktSettingsStore.watchProgressSource(in: store) == sourceAtStart else { return false }
+        ) else { return false }
+        _ = await flushPendingLibraryMutations(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileScope
+        )
+        guard isCurrentWatchedHistoryContext(
+                store: store,
+                profileScope: profileScope,
+                expectedProfileID: expectedProfileID,
+                expectedWatchedProfileID: expectedWatchedProfileID,
+                accountID: accountID,
+                tokenStorage: tokenStorage
+              ),
+              let activities = try? await SimklSyncLoader.activities(using: service),
+              isCurrentWatchedHistoryContext(
+                store: store,
+                profileScope: profileScope,
+                expectedProfileID: expectedProfileID,
+                expectedWatchedProfileID: expectedWatchedProfileID,
+                accountID: accountID,
+                tokenStorage: tokenStorage
+              ) else { return false }
+        guard service.isCurrentAuthorization() else { return false }
 
         let previousSnapshot = SimklSyncCache.historySnapshot(in: store)
         let previousRecords = previousSnapshot?.records ?? []
@@ -1076,37 +1115,77 @@ struct SimklHistoryService {
 
         var records = previousRecords
         if previousRecords.isEmpty || oldWatermark == nil || hadRemovals {
-            records = []
-            var anySucceeded = false
             async let showsResponse = service.getOptional(
                 SimklAllItemsResponse.self,
                 path: "sync/all-items/shows",
-                query: historyQuery()
+                query: historyQuery(),
+                noContentValue: SimklAllItemsResponse()
             )
             async let moviesResponse = service.getOptional(
                 SimklAllItemsResponse.self,
                 path: "sync/all-items/movies",
-                query: historyQuery()
+                query: historyQuery(),
+                noContentValue: SimklAllItemsResponse()
             )
             async let animeResponse = service.getOptional(
                 SimklAllItemsResponse.self,
                 path: "sync/all-items/anime",
-                query: historyQuery()
+                query: historyQuery(),
+                noContentValue: SimklAllItemsResponse()
             )
             let (shows, movies, anime) = await (showsResponse, moviesResponse, animeResponse)
+            let fullSnapshotSucceeded = shows != nil && movies != nil && anime != nil
+            guard shows != nil || movies != nil || anime != nil else { return false }
+            if fullSnapshotSucceeded {
+                // All three endpoints are authoritative, so they can replace
+                // the old snapshot, including rows from older cache formats.
+                records = []
+            }
             if let shows {
-                records = mergeHistory(records, response: shows)
-                anySucceeded = true
+                records = fullSnapshotSucceeded
+                    ? mergeHistory(records, response: shows, onlyCategory: "shows")
+                    : replacingHistoryCategory("shows", in: records, response: shows)
             }
             if let movies {
-                records = mergeHistory(records, response: movies)
-                anySucceeded = true
+                records = fullSnapshotSucceeded
+                    ? mergeHistory(records, response: movies, onlyCategory: "movies")
+                    : replacingHistoryCategory("movies", in: records, response: movies)
             }
             if let anime {
-                records = mergeHistory(records, response: anime)
-                anySucceeded = true
+                records = fullSnapshotSucceeded
+                    ? mergeHistory(records, response: anime, onlyCategory: "anime")
+                    : replacingHistoryCategory("anime", in: records, response: anime)
             }
-            guard anySucceeded || previousRecords.isEmpty else { return false }
+
+            // A partial read may still contribute useful categories, but its
+            // watermark must remain invalid so the missing category is retried
+            // on the next sync instead of becoming a permanent omission.
+            if !fullSnapshotSucceeded {
+                guard service.isCurrentAuthorization(),
+                      isCurrentWatchedHistoryContext(
+                        store: store,
+                        profileScope: profileScope,
+                        expectedProfileID: expectedProfileID,
+                        expectedWatchedProfileID: expectedWatchedProfileID,
+                        accountID: accountID,
+                        tokenStorage: tokenStorage
+                      ) else { return false }
+                let previousItems = previousRecords.flatMap(\.items)
+                let remoteItems = records.flatMap(\.items)
+                guard WatchedStore.reconcileSimklSnapshot(
+                    remoteItems,
+                    previousRemoteItems: previousItems,
+                    syncStartedAt: syncStartedAt,
+                    currentAccountID: accountID
+                ) else { return false }
+                SimklSyncCache.saveHistory(
+                    records,
+                    watermark: nil,
+                    activities: previousActivities,
+                    store: store
+                )
+                return true
+            }
         } else {
             var query = historyQuery()
             query.append(URLQueryItem(name: "date_from", value: oldWatermark))
@@ -1116,17 +1195,27 @@ struct SimklHistoryService {
                 query: query
             ) {
                 records = mergeHistory(records, response: delta)
+            } else {
+                return false
             }
         }
 
         guard service.isCurrentAuthorization(),
-              TraktSettingsStore.watchProgressSource(in: store) == sourceAtStart else { return false }
+              isCurrentWatchedHistoryContext(
+                store: store,
+                profileScope: profileScope,
+                expectedProfileID: expectedProfileID,
+                expectedWatchedProfileID: expectedWatchedProfileID,
+                accountID: accountID,
+                tokenStorage: tokenStorage
+              ) else { return false }
         let previousItems = previousRecords.flatMap(\.items)
         let remoteItems = records.flatMap(\.items)
         guard WatchedStore.reconcileSimklSnapshot(
             remoteItems,
             previousRemoteItems: previousItems,
-            syncStartedAt: syncStartedAt
+            syncStartedAt: syncStartedAt,
+            currentAccountID: accountID
         ) else { return false }
         SimklSyncCache.saveHistory(
             records,
@@ -1135,6 +1224,204 @@ struct SimklHistoryService {
             store: store
         )
         return true
+    }
+
+    @MainActor
+    static func flushPendingLibraryMutations(
+        store: UserDefaults = ProfileSettings.current,
+        client: SimklAPIClient = SimklAPIClient(),
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage(),
+        profileScope: String? = nil
+    ) async -> Bool {
+        let expectedProfileID = ProfileSettings.activeProfileID
+        let profileId = WatchedStore.activeProfileId
+        let accountID = SimklAuthStore.accountBindingID(in: store)
+        guard ProfileSettings.isActiveStore(store),
+              expectedProfileID == profileId,
+              RemoteTrackingState.isProgressSourceAuthenticated(
+                .simkl,
+                in: store,
+                simklTokenStorage: tokenStorage,
+                profileScope: profileScope
+              ),
+              let service = SimklAuthorizedClient(
+                store: store,
+                client: client,
+                tokenStorage: tokenStorage,
+                profileScope: profileScope
+              ) else { return false }
+
+        let mutations = WatchedStore.pendingLibraryMutations(
+            provider: .simkl,
+            profileId: profileId,
+            readyOnly: true
+        )
+            .filter { $0.accountID == accountID && $0.profileID == profileId }
+        var allMutationsAcknowledged = true
+        for mutation in mutations {
+            guard isCurrentWatchedHistoryContext(
+                store: store,
+                profileScope: profileScope,
+                expectedProfileID: expectedProfileID,
+                expectedWatchedProfileID: profileId,
+                accountID: accountID,
+                tokenStorage: tokenStorage
+            ) else { return false }
+            let episodes = mutation.episodes.isEmpty
+                ? mutation.episode.map { [$0] } ?? []
+                : mutation.episodes
+            guard let body = mutation.isWatched
+                ? historyMutation(
+                    meta: mutation.meta,
+                    season: mutation.season,
+                    episodes: episodes,
+                    watchedAt: iso8601(mutation.changedAt)
+                )
+                : historyRemoval(
+                    meta: mutation.meta,
+                    season: mutation.season,
+                    episodes: episodes,
+                    store: store
+                ) else { return false }
+            do {
+                let response = try await service.postReturningBody(
+                    path: mutation.isWatched ? "sync/history" : "sync/history/remove",
+                    body: body
+                )
+                guard (200..<300).contains(response.status) else {
+                    _ = WatchedStore.deferLibraryMutation(
+                        id: mutation.id,
+                        provider: .simkl,
+                        accountID: accountID,
+                        profileId: profileId
+                    )
+                    return false
+                }
+                var unresolvedEpisodes: [Int]?
+                if mutation.isWatched {
+                    switch libraryMutationOutcome(in: response.data, mutation: mutation) {
+                    case .accepted:
+                        break
+                    case .rejected, .unverifiable:
+                        _ = WatchedStore.deferLibraryMutation(
+                            id: mutation.id,
+                            provider: .simkl,
+                            accountID: accountID,
+                            profileId: profileId
+                        )
+                        return false
+                    case .partiallyAccepted(let unresolved):
+                        unresolvedEpisodes = unresolved
+                    }
+                }
+                guard service.isCurrentAuthorization(),
+                      isCurrentWatchedHistoryContext(
+                        store: store,
+                        profileScope: profileScope,
+                        expectedProfileID: expectedProfileID,
+                        expectedWatchedProfileID: profileId,
+                        accountID: accountID,
+                        tokenStorage: tokenStorage
+                      ),
+                      (unresolvedEpisodes.map { unresolved in
+                        WatchedStore.acknowledgeLibraryMutationPartial(
+                            id: mutation.id,
+                            provider: .simkl,
+                            accountID: accountID,
+                            profileId: profileId,
+                            unresolvedEpisodes: unresolved
+                        )
+                      } ?? WatchedStore.acknowledgeLibraryMutation(
+                        id: mutation.id,
+                        provider: .simkl,
+                        accountID: accountID,
+                        profileId: profileId
+                      )) else { return false }
+                if unresolvedEpisodes != nil { allMutationsAcknowledged = false }
+            } catch {
+                _ = WatchedStore.deferLibraryMutation(
+                    id: mutation.id,
+                    provider: .simkl,
+                    accountID: accountID,
+                    profileId: profileId
+                )
+                return false
+            }
+        }
+        return allMutationsAcknowledged
+    }
+
+    private enum LibraryMutationOutcome {
+        case accepted
+        case rejected
+        case partiallyAccepted(unresolvedEpisodes: [Int])
+        case unverifiable
+    }
+
+    /// `/sync/history` can return 201 even when the title or some episodes
+    /// could not be resolved. A missing or malformed `not_found` report is
+    /// ambiguous, so keep the outbox event durable instead of acknowledging it.
+    private static func libraryMutationOutcome(
+        in data: Data,
+        mutation: WatchedLibraryMutationUpload
+    ) -> LibraryMutationOutcome {
+        guard !data.isEmpty,
+              let object = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let notFound = object["not_found"] as? [String: Any] else {
+            return .unverifiable
+        }
+
+        func rows(_ key: String) -> [[String: Any]]? {
+            guard let value = notFound[key] else { return [] }
+            guard let values = value as? [Any] else { return nil }
+            var rows: [[String: Any]] = []
+            for value in values {
+                guard let row = value as? [String: Any] else { return nil }
+                rows.append(row)
+            }
+            return rows
+        }
+
+        guard let rejectedMovies = rows("movies"),
+              let rejectedShows = rows("shows"),
+              let rejectedEpisodes = rows("episodes") else {
+            return .unverifiable
+        }
+        for (key, value) in notFound where !["movies", "shows", "episodes"].contains(key) {
+            guard let rows = value as? [Any], rows.isEmpty else { return .unverifiable }
+        }
+
+        if !mutation.meta.isSeries {
+            return rejectedMovies.isEmpty && rejectedShows.isEmpty && rejectedEpisodes.isEmpty
+                ? .accepted : .rejected
+        }
+        if !rejectedMovies.isEmpty || !rejectedShows.isEmpty {
+            return .rejected
+        }
+        guard !rejectedEpisodes.isEmpty else { return .accepted }
+
+        let requestedEpisodes = mutation.episodes.isEmpty
+            ? mutation.episode.map { [$0] } ?? []
+            : mutation.episodes
+        guard let season = mutation.season, !requestedEpisodes.isEmpty else { return .rejected }
+        var unresolved = Set<Int>()
+        for row in rejectedEpisodes {
+            guard Self.responseInteger(row["season"]) == season,
+                  let episode = Self.responseInteger(row["number"] ?? row["episode"]),
+                  requestedEpisodes.contains(episode) else {
+                return .unverifiable
+            }
+            unresolved.insert(episode)
+        }
+        guard !unresolved.isEmpty else { return .unverifiable }
+        guard unresolved.count < Set(requestedEpisodes).count else { return .rejected }
+        return .partiallyAccepted(unresolvedEpisodes: unresolved.sorted())
+    }
+
+    private static func responseInteger(_ value: Any?) -> Int? {
+        if let number = value as? Int { return number }
+        if let string = value as? String { return Int(string) }
+        return nil
     }
 
     static func setWatched(
@@ -1214,6 +1501,26 @@ struct SimklHistoryService {
         }
     }
 
+    private static func isCurrentWatchedHistoryContext(
+        store: UserDefaults,
+        profileScope: String?,
+        expectedProfileID: String?,
+        expectedWatchedProfileID: String?,
+        accountID: String,
+        tokenStorage: SimklTokenStorage = SimklKeychainTokenStorage()
+    ) -> Bool {
+        ProfileSettings.isActiveStore(store)
+            && ProfileSettings.activeProfileID == expectedProfileID
+            && WatchedStore.activeProfileId == expectedWatchedProfileID
+            && expectedProfileID == expectedWatchedProfileID
+            && SimklAuthStore.accountBindingID(in: store) == accountID
+            && SimklRuntimeSession.authenticatedState(
+                store: store,
+                tokenStorage: tokenStorage,
+                profileScope: profileScope
+            ) != nil
+    }
+
     private static func historyQuery() -> [URLQueryItem] {
         [
             URLQueryItem(name: "extended", value: "full"),
@@ -1224,24 +1531,45 @@ struct SimklHistoryService {
 
     private static func mergeHistory(
         _ existing: [SimklHistoryRecord],
-        response: SimklAllItemsResponse
+        response: SimklAllItemsResponse,
+        onlyCategory: String? = nil
     ) -> [SimklHistoryRecord] {
         var records = existing
-        let typedItems: [(String, SimklSyncItem)] =
-            (response.movies ?? []).map { ("movie", $0) }
-            + (response.shows ?? []).map { ("series", $0) }
-            + (response.anime ?? []).map { ("series", $0) }
+        let typedItems: [(String, String, SimklSyncItem)] =
+            (response.movies ?? []).map { ("movies", "movie", $0) }
+            + (response.shows ?? []).map { ("shows", "series", $0) }
+            + (response.anime ?? []).map { ("anime", "series", $0) }
 
-        for (type, item) in typedItems {
+        for (category, type, item) in typedItems where onlyCategory == nil || onlyCategory == category {
             let key = "\(type):\(SimklAllItemsResponse.identity(item))"
             let record = SimklHistoryRecord(
                 key: key,
-                items: watchedItems(from: item, type: type)
+                items: watchedItems(from: item, type: type),
+                category: category
             )
             records.removeAll { $0.key == key }
             records.append(record)
         }
         return records
+    }
+
+    private static func replacingHistoryCategory(
+        _ category: String,
+        in records: [SimklHistoryRecord],
+        response: SimklAllItemsResponse
+    ) -> [SimklHistoryRecord] {
+        let preserved = records.filter { record in
+            if record.category == category { return false }
+            // Legacy cache rows did not remember whether a series came from
+            // Simkl's shows or anime endpoint. Keep those ambiguous rows when
+            // only one endpoint succeeds; a complete three-category read can
+            // safely replace them all.
+            if record.category == nil, category == "movies", record.key.hasPrefix("movie:") {
+                return false
+            }
+            return true
+        }
+        return mergeHistory(preserved, response: response, onlyCategory: category)
     }
 
     static func watchedItems(
@@ -2638,12 +2966,13 @@ struct SimklProgressService {
             scrobbleDiagnostic = "skipped: inactive profile store"
             return false
         }
-        guard RemoteTrackingState.isScrobbleEnabled(
-            for: .simkl,
-            in: store,
-            simklTokenStorage: tokenStorage,
-            profileScope: profileScope
-        ) else {
+        guard TraktSettingsStore.watchProgressSource(in: store) == .simkl
+            || RemoteTrackingState.isScrobbleEnabled(
+                for: .simkl,
+                in: store,
+                simklTokenStorage: tokenStorage,
+                profileScope: profileScope
+            ) else {
             scrobbleDiagnostic = "skipped: Simkl scrobble is not enabled or authenticated"
             return false
         }
@@ -2695,11 +3024,13 @@ struct SimklProgressService {
             if isLockCollision(status: response.status, data: response.data) {
                 try? await Task.sleep(nanoseconds: 3_000_000_000)
                 guard !Task.isCancelled, ProfileSettings.isActiveStore(store),
-                  RemoteTrackingState.isScrobbleEnabled(for: .simkl, in: store, simklTokenStorage: tokenStorage, profileScope: profileScope) else { return false }
+                  (TraktSettingsStore.watchProgressSource(in: store) == .simkl
+                    || RemoteTrackingState.isScrobbleEnabled(for: .simkl, in: store, simklTokenStorage: tokenStorage, profileScope: profileScope)) else { return false }
                 response = try await service.postReturningBody(path: path, body: body)
             }
             guard !Task.isCancelled, ProfileSettings.isActiveStore(store),
-                  RemoteTrackingState.isScrobbleEnabled(for: .simkl, in: store, simklTokenStorage: tokenStorage, profileScope: profileScope) else { return false }
+                  (TraktSettingsStore.watchProgressSource(in: store) == .simkl
+                    || RemoteTrackingState.isScrobbleEnabled(for: .simkl, in: store, simklTokenStorage: tokenStorage, profileScope: profileScope)) else { return false }
             let status = response.status
             // Simkl documents 409 stop as idempotent success for a recently
             // completed session.

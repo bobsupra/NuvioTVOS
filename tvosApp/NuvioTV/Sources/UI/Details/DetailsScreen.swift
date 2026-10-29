@@ -16,6 +16,7 @@ import AVKit
 struct DetailsScreen: View {
     let id: String
     let type: String
+    let libraryWatchedContext: LibraryWatchedContext?
     let initialPlaybackRequestID: UInt?
     let onInitialPlaybackRequestConsumed: ((UInt) -> Void)?
     /// (streamURL, httpHeaders, meta, episodeSubtitleLine, streamSubtitles, currentEpisode, orderedEpisodes, actionSession).
@@ -130,9 +131,22 @@ struct DetailsScreen: View {
         }
     }
 
+    private var displayedDetailsUiState: DetailsUiState {
+        var state = viewModel.uiState
+        if let meta = state.meta, let libraryWatchedContext {
+            state.isWatched = WatchedStore.isWatchedForLibrary(
+                meta: meta,
+                source: libraryWatchedContext.source,
+                profileId: libraryWatchedContext.profileId
+            )
+        }
+        return state
+    }
+
     init(
         id: String,
         type: String,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         repository: CatalogRepository,
         initialPlaybackRequestID: UInt? = nil,
         onInitialPlaybackRequestConsumed: ((UInt) -> Void)? = nil,
@@ -170,6 +184,7 @@ struct DetailsScreen: View {
     ) {
         self.id = id
         self.type = type
+        self.libraryWatchedContext = libraryWatchedContext
         self.initialPlaybackRequestID = initialPlaybackRequestID
         self.onInitialPlaybackRequestConsumed = onInitialPlaybackRequestConsumed
         self.onPlayClick = onPlayClick
@@ -222,6 +237,7 @@ struct DetailsScreen: View {
                 #if os(tvOS)
                 TvDetailsContent(
                     uiState: viewModel.uiState,
+                    libraryWatchedContext: libraryWatchedContext,
                     initialPlayRequestID: readyInitialPlaybackRequestID,
                     initialFocusEpisode: initialFocusEpisode,
                     onInitialPlayRequestConsumed: { requestID in
@@ -284,7 +300,7 @@ struct DetailsScreen: View {
                         isEpisodeMenuPresented = isPresented
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onWatchedClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched(libraryContext: libraryWatchedContext) },
                     mdbListUserRating: viewModel.uiState.mdbListUserRating,
                     showMdbListRating: false,
                     onRateClick: { showingMdbListRating = true },
@@ -312,7 +328,7 @@ struct DetailsScreen: View {
                 .disabled(isStreamPickerPresented || expandedComment != nil || isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback)
                 #else
                 MobileDetailsContent(
-                    uiState: viewModel.uiState,
+                    uiState: displayedDetailsUiState,
                     onPlayClick: {
                         if let url = viewModel.uiState.streams.first?.url,
                            let meta = viewModel.uiState.meta {
@@ -320,7 +336,7 @@ struct DetailsScreen: View {
                         }
                     },
                     onWatchlistClick: { viewModel.toggleWatchlist() },
-                    onWatchedClick: { viewModel.toggleWatched() },
+                    onWatchedClick: { viewModel.toggleWatched(libraryContext: libraryWatchedContext) },
                     onShareClick: { shareContent(viewModel.uiState.meta!) },
                     onBack: handleBack
                 )
@@ -3663,6 +3679,7 @@ private enum TvDetailsFocusSection: Hashable {
 
 struct TvDetailsContent: View {
     let uiState: DetailsUiState
+    var libraryWatchedContext: LibraryWatchedContext? = nil
     var initialPlayRequestID: UInt? = nil
     var initialFocusEpisode: DetailsEpisodeFocus? = nil
     var onInitialPlayRequestConsumed: ((UInt) -> Void)? = nil
@@ -3921,6 +3938,17 @@ struct TvDetailsContent: View {
         isScrolledDown ? 22 : 0
     }
 
+    private func isWatchedForDetails(_ meta: NuvioMeta) -> Bool {
+        guard let libraryWatchedContext else {
+            return WatchedStore.isWatchedForDisplay(meta: meta)
+        }
+        return WatchedStore.isWatchedForLibrary(
+            meta: meta,
+            source: libraryWatchedContext.source,
+            profileId: libraryWatchedContext.profileId
+        )
+    }
+
     @ViewBuilder
     private func backdropView(for meta: NuvioMeta) -> some View {
         TvDetailsBackdrop(
@@ -3959,7 +3987,7 @@ struct TvDetailsContent: View {
         let canBypassPicker = smartStreamSelection || (reuseLastLink && hasStoredPlaybackStream(for: playTarget))
         TvDetailsActionRow(
             isInWatchlist: uiState.isInWatchlist,
-            isWatched: WatchedStore.isWatchedForDisplay(meta: meta),
+            isWatched: isWatchedForDetails(meta),
             playTitle: playTarget.label,
             playHint: canBypassPicker
                 ? L10n.string("details_play_hint_smart", fallback: "Plays the best link. Hold Select to choose a source manually.")
@@ -4028,6 +4056,7 @@ struct TvDetailsContent: View {
             if !episodes.isEmpty {
                 TvDetailsEpisodes(
                     meta: meta,
+                    libraryWatchedContext: libraryWatchedContext,
                     episodeGuide: episodeGuide,
                     initialState: episodePresentation.initialState,
                     presentationRevision: episodePresentation.revision,
@@ -4307,6 +4336,7 @@ struct TvDetailsContent: View {
                 meta: meta,
                 progressRevision: progressRevision,
                 focusEpisode: initialFocusEpisode,
+                libraryWatchedContext: libraryWatchedContext,
                 continueItemProvider: { currentContinueWatchingItem(for: meta) },
                 playTargetBuilder: { episodes, continueItem, watchedKeys in
                     TvDetailsPlayTargetBuilder.makePlayTarget(
@@ -4559,6 +4589,9 @@ struct TvDetailsContent: View {
             // hop later — so every one of them has to be able to invalidate this
             // view, not just the mark itself.
             .onReceive(NotificationCenter.default.publisher(for: WatchedStore.changedNotification).receive(on: RunLoop.main)) { _ in
+                progressRevision &+= 1
+            }
+            .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
                 progressRevision &+= 1
             }
             .onReceive(NotificationCenter.default.publisher(for: TraktAuthStore.changedNotification).receive(on: RunLoop.main)) { _ in
@@ -7010,6 +7043,20 @@ private struct TvEpisodeGuide {
         continueItem: ContinueWatchingItem?,
         watchedKeys: Set<String>
     ) -> NuvioVideo? {
+        TvDetailsInitialEpisodeResolver.resolve(
+            episodes: episodes,
+            continueItem: continueItem,
+            watchedKeys: watchedKeys
+        )
+    }
+}
+
+enum TvDetailsInitialEpisodeResolver {
+    static func resolve(
+        episodes: [NuvioVideo],
+        continueItem: ContinueWatchingItem?,
+        watchedKeys: Set<String>
+    ) -> NuvioVideo? {
         if let numbers = continueItem?.episodeNumbers,
            let progressEpisode = episodes.first(where: {
                $0.season == numbers.season && $0.episode == numbers.episode
@@ -7138,6 +7185,19 @@ private struct TvDetailsEpisodeInitialState {
     let seasonIsWatched: Bool
 }
 
+/// Separates Library-scoped episode indicators from the progress owner used to
+/// select playback. Details can originate in a provider-filtered Library while
+/// Continue Watching and the initial play target remain global.
+struct TvDetailsEpisodeWatchedKeys {
+    let display: Set<String>
+    let playTarget: Set<String>
+
+    init(meta: NuvioMeta, progressSnapshot: WatchedSnapshot, librarySnapshot: WatchedSnapshot?) {
+        playTarget = progressSnapshot.watchedEpisodeKeys(meta: meta)
+        display = librarySnapshot?.catalogWatchedEpisodeKeys(meta: meta) ?? playTarget
+    }
+}
+
 private struct TvDetailsEpisodePresentation {
     let guide: TvEpisodeGuide
     let continueItem: ContinueWatchingItem?
@@ -7153,10 +7213,12 @@ private struct TvDetailsEpisodePresentationRevision: Equatable {
 
 /// Builds episode-derived state synchronously on the first Details render and
 /// refreshes it only when episode metadata or watched/progress state changes.
+@MainActor
 private final class TvDetailsEpisodeCache: ObservableObject {
     private var input: TvEpisodeGuideInput?
     private var lookupIdentity: TvEpisodeLookupIdentity?
     private var progressRevision: Int?
+    private var libraryWatchedContextIdentity: String?
     private var focusEpisode: DetailsEpisodeFocus?
     private var presentation: TvDetailsEpisodePresentation?
 
@@ -7164,6 +7226,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
         meta: NuvioMeta,
         progressRevision: Int,
         focusEpisode: DetailsEpisodeFocus? = nil,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         continueItemProvider: () -> ContinueWatchingItem?,
         playTargetBuilder: ([NuvioVideo], ContinueWatchingItem?, Set<String>) -> TvDetailsPlayTarget
     ) -> TvDetailsEpisodePresentation {
@@ -7177,9 +7240,10 @@ private final class TvDetailsEpisodeCache: ObservableObject {
         let guideChanged = self.input != input
         let lookupIdentityChanged = self.lookupIdentity != lookupIdentity
         let progressChanged = self.progressRevision != progressRevision
+        let watchedContextChanged = self.libraryWatchedContextIdentity != libraryWatchedContext?.cacheIdentity
         let focusChanged = self.focusEpisode != focusEpisode
 
-        if guideChanged || lookupIdentityChanged || progressChanged || focusChanged {
+        if guideChanged || lookupIdentityChanged || progressChanged || focusChanged || watchedContextChanged {
             let guideRevision = guideChanged
                 ? (presentation.map { $0.guide.revision &+ 1 } ?? 0)
                 : presentation!.guide.revision
@@ -7187,15 +7251,25 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                 ? TvEpisodeGuide(metaID: input.metaID, videos: input.videos, revision: guideRevision)
                 : presentation!.guide
             let continueItem = continueItemProvider()
-            let watchedSnapshot = WatchedStore.currentSnapshot()
-            let watchedKeys = watchedSnapshot.watchedEpisodeKeys(meta: meta)
-            let episodeWatchCounts = watchedSnapshot.catalogEpisodeWatchCounts(meta: meta)
+            let progressSnapshot = WatchedStore.currentSnapshot()
+            let librarySnapshot = libraryWatchedContext.map {
+                WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
+            }
+            let watchedKeys = TvDetailsEpisodeWatchedKeys(
+                meta: meta,
+                progressSnapshot: progressSnapshot,
+                librarySnapshot: librarySnapshot
+            )
+            let progressWatchedKeys = watchedKeys.playTarget
+            let displayWatchedKeys = watchedKeys.display
+            let displaySnapshot = librarySnapshot ?? progressSnapshot
+            let episodeWatchCounts = displaySnapshot.catalogEpisodeWatchCounts(meta: meta)
             // A calendar entry asks for a specific episode; otherwise follow
             // progress as before.
             let focusedEpisode = focusEpisode.flatMap { $0.pick(from: guide.episodes) }
             let initialEpisode = focusedEpisode ?? guide.initialEpisode(
                 continueItem: continueItem,
-                watchedKeys: watchedKeys
+                watchedKeys: progressWatchedKeys
             )
             let selectedSeason = initialEpisode?.season ?? guide.defaultSeason()
             let seasonEpisodes = guide.episodesBySeason[selectedSeason] ?? []
@@ -7206,18 +7280,18 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                 indices[entry.element.id] = entry.offset
             }
             let seasonIsWatched = !seasonEpisodes.isEmpty && seasonEpisodes.allSatisfy {
-                watchedKeys.contains("\($0.season):\($0.episode)")
+                displayWatchedKeys.contains("\($0.season):\($0.episode)")
             }
             let initialState = TvDetailsEpisodeInitialState(
                 selectedSeason: selectedSeason,
                 seasonEpisodes: seasonEpisodes,
                 seasonEpisodeIndexByID: seasonEpisodeIndexByID,
                 episodeScrollIndex: episodeScrollIndex,
-                watchedEpisodeKeys: watchedKeys,
+                watchedEpisodeKeys: displayWatchedKeys,
                 episodeWatchCounts: episodeWatchCounts,
                 watchedSummary: WatchedEpisodeSummary.make(
                     videos: guide.episodes,
-                    watchedEpisodeKeys: watchedKeys
+                    watchedEpisodeKeys: displayWatchedKeys
                 ),
                 seasonIsWatched: seasonIsWatched
             )
@@ -7230,7 +7304,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             presentation = TvDetailsEpisodePresentation(
                 guide: guide,
                 continueItem: continueItem,
-                playTarget: playTargetBuilder(guide.episodes, continueItem, watchedKeys),
+                playTarget: playTargetBuilder(guide.episodes, continueItem, progressWatchedKeys),
                 initialState: initialState,
                 revision: nextRevision
             )
@@ -7238,6 +7312,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
             self.lookupIdentity = lookupIdentity
             self.progressRevision = progressRevision
             self.focusEpisode = focusEpisode
+            self.libraryWatchedContextIdentity = libraryWatchedContext?.cacheIdentity
         }
 
         return presentation!
@@ -7246,6 +7321,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
 
 private struct TvDetailsEpisodes: View {
     let meta: NuvioMeta
+    var libraryWatchedContext: LibraryWatchedContext? = nil
     let episodeGuide: TvEpisodeGuide
     let initialState: TvDetailsEpisodeInitialState
     let presentationRevision: TvDetailsEpisodePresentationRevision
@@ -7283,6 +7359,7 @@ private struct TvDetailsEpisodes: View {
 
     init(
         meta: NuvioMeta,
+        libraryWatchedContext: LibraryWatchedContext? = nil,
         episodeGuide: TvEpisodeGuide,
         initialState: TvDetailsEpisodeInitialState,
         presentationRevision: TvDetailsEpisodePresentationRevision,
@@ -7302,6 +7379,7 @@ private struct TvDetailsEpisodes: View {
         onMoveDownFromEpisode: @escaping () -> Void
     ) {
         self.meta = meta
+        self.libraryWatchedContext = libraryWatchedContext
         self.episodeGuide = episodeGuide
         self.initialState = initialState
         self.presentationRevision = presentationRevision
@@ -7355,6 +7433,9 @@ private struct TvDetailsEpisodes: View {
         .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.continueWatchingChangedNotification).receive(on: RunLoop.main)) { _ in
             refreshWatchedState()
         }
+        .onReceive(NotificationCenter.default.publisher(for: TraktSettingsStore.libraryChangedNotification).receive(on: RunLoop.main)) { _ in
+            refreshWatchedState()
+        }
         .onReceive(NotificationCenter.default.publisher(for: AddonRatingsService.ratingOrderChangedNotification).receive(on: RunLoop.main)) { _ in
             ratingOrderRevision &+= 1
         }
@@ -7406,9 +7487,13 @@ private struct TvDetailsEpisodes: View {
     }
 
     private func refreshWatchedState() {
-        let snapshot = WatchedStore.currentSnapshot()
+        let snapshot = libraryWatchedContext.map {
+            WatchedStore.librarySnapshot(for: $0.source, profileId: $0.profileId)
+        } ?? WatchedStore.currentSnapshot()
         refreshWatchedState(
-            using: snapshot.watchedEpisodeKeys(meta: meta),
+            using: libraryWatchedContext == nil
+                ? snapshot.watchedEpisodeKeys(meta: meta)
+                : snapshot.catalogWatchedEpisodeKeys(meta: meta),
             episodeWatchCounts: snapshot.catalogEpisodeWatchCounts(meta: meta)
         )
     }
@@ -7533,26 +7618,53 @@ private struct TvDetailsEpisodes: View {
                             onFocus()
                         },
                         onToggleWatched: {
-                            _ = WatchedStore.toggleEpisode(
-                                meta: meta,
-                                season: video.season,
-                                episode: video.episode
-                            )
+                            let isWatched = watchedEpisodeKeys.contains(watchKey)
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setWatched(
+                                    meta,
+                                    season: video.season,
+                                    episode: video.episode,
+                                    isWatched: !isWatched
+                                )
+                            } else {
+                                _ = WatchedStore.toggleEpisode(
+                                    meta: meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            }
                         },
                         onMarkWatchedUpTo: {
-                            WatchedStore.markWatchedUpTo(
-                                meta: meta,
-                                season: video.season,
-                                episode: video.episode
-                            )
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setWatchedUpTo(
+                                    meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            } else {
+                                WatchedStore.markWatchedUpTo(
+                                    meta: meta,
+                                    season: video.season,
+                                    episode: video.episode
+                                )
+                            }
                         },
                         onToggleSeasonWatched: {
-                            WatchedStore.setSeasonWatched(
-                                meta: meta,
-                                season: selectedSeason,
-                                episodes: seasonEpisodes.map(\.episode),
-                                isWatched: !isSeasonWatched
-                            )
+                            if let libraryWatchedContext {
+                                _ = libraryWatchedContext.setSeasonWatched(
+                                    meta,
+                                    season: selectedSeason,
+                                    episodes: seasonEpisodes.map(\.episode),
+                                    isWatched: !isSeasonWatched
+                                )
+                            } else {
+                                WatchedStore.setSeasonWatched(
+                                    meta: meta,
+                                    season: selectedSeason,
+                                    episodes: seasonEpisodes.map(\.episode),
+                                    isWatched: !isSeasonWatched
+                                )
+                            }
                         },
                         onMenuOpened: { onEpisodeMenuPresented(true) },
                         onMenuClosed: { onEpisodeMenuPresented(false) },

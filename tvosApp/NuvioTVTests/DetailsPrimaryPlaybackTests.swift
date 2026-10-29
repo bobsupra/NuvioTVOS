@@ -205,6 +205,53 @@ final class DetailsPrimaryPlayTargetTests: XCTestCase {
         XCTAssertTrue(target.isPlayable)
     }
 
+    func testLibraryEpisodeMarksDoNotChangeGlobalInitialPlayTarget() {
+        let series = seriesMeta()
+        let progressItem = WatchedStoreItem(
+            meta: series,
+            watchedAt: Date(timeIntervalSince1970: 1),
+            season: 1,
+            episode: 1,
+            sources: [TraktWatchProgressSource.nuvioSync.rawValue],
+            legacyUnattributed: false
+        )
+        let libraryItem = WatchedStoreItem(
+            meta: series,
+            watchedAt: Date(timeIntervalSince1970: 2),
+            season: 1,
+            episode: 2,
+            sources: [TraktWatchProgressSource.trakt.rawValue],
+            legacyUnattributed: false
+        )
+        let progressSnapshot = WatchedSnapshot(items: [progressItem, libraryItem], source: .nuvioSync)
+        let librarySnapshot = WatchedSnapshot(
+            items: [progressItem, libraryItem],
+            source: .trakt,
+            strictSourceOnly: true
+        )
+
+        let watchedKeys = TvDetailsEpisodeWatchedKeys(
+            meta: series,
+            progressSnapshot: progressSnapshot,
+            librarySnapshot: librarySnapshot
+        )
+        let target = TvDetailsPlayTargetBuilder.makePlayTarget(
+            episodes: TvDetailsPlayTargetBuilder.orderedEpisodes(series.videos ?? []),
+            continueItem: nil,
+            watchedKeys: watchedKeys.playTarget
+        )
+        let initialEpisode = TvDetailsInitialEpisodeResolver.resolve(
+            episodes: TvDetailsPlayTargetBuilder.orderedEpisodes(series.videos ?? []),
+            continueItem: nil,
+            watchedKeys: watchedKeys.playTarget
+        )
+
+        XCTAssertEqual(watchedKeys.display, ["1:2"])
+        XCTAssertEqual(watchedKeys.playTarget, ["1:1"])
+        XCTAssertEqual(target.episode?.id, "series:1:2")
+        XCTAssertEqual(initialEpisode?.id, "series:1:2")
+    }
+
     func testUnairedNextEpisodeIsUpcomingAndNotPlayable() {
         let episodes = [
             episode("s1e1", season: 1, number: 1, released: "2020-01-01"),

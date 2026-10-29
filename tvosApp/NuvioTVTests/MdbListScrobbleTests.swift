@@ -12,6 +12,7 @@ final class MdbListScrobbleTests: XCTestCase {
     override func setUp() {
         super.setUp()
         ProfileSettings.clearActiveProfile()
+        WatchedStore.setActiveProfile(nil)
         suiteName = "MdbListScrobbleTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
         defaults.removePersistentDomain(forName: suiteName)
@@ -26,6 +27,7 @@ final class MdbListScrobbleTests: XCTestCase {
 
     override func tearDown() {
         ProfileSettings.clearActiveProfile()
+        WatchedStore.setActiveProfile(nil)
         MdbListURLProtocolStub.handler = nil
         defaults.removePersistentDomain(forName: suiteName)
         defaults = nil
@@ -298,6 +300,188 @@ final class MdbListScrobbleTests: XCTestCase {
         let movies = try XCTUnwrap(body["movies"] as? [[String: Any]])
         let movie = try XCTUnwrap(movies.first)
         XCTAssertEqual(movie["ids"] as? [String: Any] as? [String: String], ["imdb": "tt1234567"])
+    }
+
+    func testLibrarySortIsStableAcrossShuffledResponsesAndKeepsNewestDuplicate() async throws {
+        let watchlistRows: [[String: Any]] = [
+            ["title": "Tie C", "ids": ["imdb": "tt1000009"], "listed_at": "2026-09-08T01:00:00Z"],
+            ["title": "Missing D", "ids": ["imdb": "tt1000004"]],
+            ["title": "Fractional Earlier", "ids": ["imdb": "tt1000006"], "added_at": "2026-09-10T03:00:00.125Z"],
+            ["title": "Missing C", "ids": ["imdb": "tt1000003"]],
+            ["title": "Numeric Newest", "ids": ["imdb": "tt1000010"], "added_at": 1_800_000_000_000],
+            ["title": "Tie B", "ids": ["imdb": "tt1000001"], "listed_at": "2026-09-08T01:00:00Z"],
+            ["title": "Fractional Later", "ids": ["imdb": "tt1000005"], "added_at": "2026-09-10T03:00:00.250Z"],
+            ["title": "Whole Second", "ids": ["imdb": "tt1000007"], "added_at": "2026-09-10T03:00:00Z"],
+            ["title": "Older Duplicate", "ids": ["imdb": "tt1000002"], "listed_at": "2026-09-06T01:00:00Z"]
+        ]
+        let collectionRows: [[String: Any]] = [
+            ["title": "Newer Duplicate", "ids": ["imdb": "tt1000002"], "collected_at": "2026-09-11T01:00:00Z"],
+            ["title": "Tie A", "ids": ["imdb": "tt1000000"], "collected_at": "2026-09-08T01:00:00Z"]
+        ]
+        let watchlistResponses = try [
+            watchlistRows,
+            Array(watchlistRows.reversed())
+        ].map { try Self.jsonString(["movies": $0]) }
+        let collectionResponses = try [
+            collectionRows,
+            Array(collectionRows.reversed())
+        ].map { try Self.jsonString(["movies": $0]) }
+        var watchlistRequestCount = 0
+        var collectionRequestCount = 0
+        MdbListURLProtocolStub.handler = { request in
+            switch request.url?.path {
+            case "/watchlist/items":
+                let index = min(watchlistRequestCount, watchlistResponses.count - 1)
+                watchlistRequestCount += 1
+                return Self.response(for: request, json: watchlistResponses[index])
+            case "/sync/collection":
+                let index = min(collectionRequestCount, collectionResponses.count - 1)
+                collectionRequestCount += 1
+                return Self.response(for: request, json: collectionResponses[index])
+            default:
+                XCTFail("Unexpected MDBList request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
+            }
+        }
+
+        let repository = MdbListCatalogRepository()
+        let firstFetchedItems = await MdbListLibraryService.fetchLibrary(
+            repository: repository,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        let firstItems = try XCTUnwrap(firstFetchedItems)
+        let secondFetchedItems = await MdbListLibraryService.fetchLibrary(
+            repository: repository,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        let secondItems = try XCTUnwrap(secondFetchedItems)
+        let expectedIDs = [
+            "tt1000010", "tt1000005", "tt1000006", "tt1000007", "tt1000000",
+            "tt1000001", "tt1000009", "tt1000002", "tt1000003", "tt1000004"
+        ]
+        XCTAssertEqual(firstItems.map(\.meta.id), expectedIDs)
+        XCTAssertEqual(secondItems.map(\.meta.id), expectedIDs)
+        XCTAssertEqual(firstItems.map(\.addedAt), secondItems.map(\.addedAt))
+        XCTAssertEqual(watchlistRequestCount, 2)
+        XCTAssertEqual(collectionRequestCount, 2)
+
+        let itemsByID = Dictionary(uniqueKeysWithValues: firstItems.map { ($0.meta.id, $0) })
+        XCTAssertEqual(itemsByID["tt1000010"]?.addedAt, Date(timeIntervalSince1970: 1_800_000_000))
+        let duplicateDate = try XCTUnwrap(ISO8601DateFormatter().date(from: "2026-09-06T01:00:00Z"))
+        XCTAssertEqual(itemsByID["tt1000002"]?.addedAt, duplicateDate)
+        let laterFractionalItem = try XCTUnwrap(itemsByID["tt1000005"])
+        let earlierFractionalItem = try XCTUnwrap(itemsByID["tt1000006"])
+        XCTAssertEqual(
+            laterFractionalItem.addedAt.timeIntervalSince(earlierFractionalItem.addedAt),
+            0.125,
+            accuracy: 0.0001
+        )
+    }
+
+    func testLibraryUsesMdbListWatchlistTimestampsAndDocumentedSort() async throws {
+        let movieRows: [[String: Any]] = [
+            ["title": "Fractional Earlier", "imdb_id": "tt1000002", "mediatype": "movie", "watchlist_at": "2025-02-21 12:59:56.824123"],
+            ["title": "Older Duplicate", "imdb_id": "tt1000003", "mediatype": "movie", "watchlist_at": "2025-02-20 10:00:00.000000"],
+            ["title": "Fractional Later", "imdb_id": "tt1000001", "mediatype": "movie", "watchlist_at": "2025-02-21 12:59:56.824522"],
+            ["title": "Newer Watchlist Duplicate", "imdb_id": "tt1000003", "mediatype": "movie", "watchlist_at": "2025-02-21 12:59:56.900000"],
+            ["title": "Undated Watchlist Duplicate", "imdb_id": "tt1000006", "mediatype": "movie"]
+        ]
+        let showRows: [[String: Any]] = [
+            ["title": "Show Camel Timestamp", "imdb_id": "tt1000004", "mediatype": "show", "watchlistAt": "2025-02-21 12:59:57"],
+            ["title": "Show Fractional Timestamp", "imdb_id": "tt1000005", "mediatype": "show", "watchlist_at": "2025-02-20 09:00:00.1"]
+        ]
+        let collectionRows: [[String: Any]] = [
+            ["title": "Newer Duplicate", "imdb_id": "tt1000003", "mediatype": "movie", "collected_at": "2025-02-22T01:00:00Z"],
+            ["title": "Dated Collection Fallback", "imdb_id": "tt1000006", "mediatype": "movie", "collected_at": "2025-02-23T01:00:00Z"]
+        ]
+        let watchlistResponses = try [
+            ["movies": movieRows, "shows": showRows],
+            ["movies": Array(movieRows.reversed()), "shows": Array(showRows.reversed())]
+        ].map { try Self.jsonString($0) }
+        let collectionResponses = try [
+            ["movies": collectionRows],
+            ["movies": Array(collectionRows.reversed())]
+        ].map { try Self.jsonString($0) }
+        var watchlistRequestCount = 0
+        var collectionRequestCount = 0
+        MdbListURLProtocolStub.handler = { request in
+            let components = URLComponents(url: request.url!, resolvingAgainstBaseURL: false)
+            switch request.url?.path {
+            case "/watchlist/items":
+                XCTAssertEqual(components?.queryItems?.first(where: { $0.name == "sort" })?.value, "added")
+                XCTAssertEqual(components?.queryItems?.first(where: { $0.name == "order" })?.value, "asc")
+                let index = min(watchlistRequestCount, watchlistResponses.count - 1)
+                watchlistRequestCount += 1
+                return Self.response(for: request, json: watchlistResponses[index])
+            case "/sync/collection":
+                XCTAssertNil(components?.queryItems?.first(where: { $0.name == "sort" }))
+                XCTAssertNil(components?.queryItems?.first(where: { $0.name == "order" }))
+                let index = min(collectionRequestCount, collectionResponses.count - 1)
+                collectionRequestCount += 1
+                return Self.response(for: request, json: collectionResponses[index])
+            default:
+                XCTFail("Unexpected MDBList request: \(request.url?.absoluteString ?? "nil")")
+                return Self.response(for: request, status: 404, json: #"{"error":"not_found"}"#)
+            }
+        }
+
+        let repository = MdbListCatalogRepository()
+        let firstFetchedItems = await MdbListLibraryService.fetchLibrary(
+            repository: repository,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        let firstItems = try XCTUnwrap(firstFetchedItems)
+        let secondFetchedItems = await MdbListLibraryService.fetchLibrary(
+            repository: repository,
+            store: defaults,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: "profile-1"
+        )
+        let secondItems = try XCTUnwrap(secondFetchedItems)
+        let expectedIDs = ["tt1000006", "tt1000004", "tt1000003", "tt1000001", "tt1000002", "tt1000005"]
+        XCTAssertEqual(firstItems.map(\.meta.id), expectedIDs)
+        XCTAssertEqual(secondItems.map(\.meta.id), expectedIDs)
+        XCTAssertEqual(watchlistRequestCount, 2)
+        XCTAssertEqual(collectionRequestCount, 2)
+
+        let itemsByID = Dictionary(uniqueKeysWithValues: firstItems.map { ($0.meta.id, $0) })
+        let utcBase = try XCTUnwrap(ISO8601DateFormatter().date(from: "2025-02-21T12:59:56Z"))
+        XCTAssertEqual(
+            try XCTUnwrap(itemsByID["tt1000001"]).addedAt.timeIntervalSince(utcBase),
+            0.824522,
+            accuracy: 0.000001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(itemsByID["tt1000002"]).addedAt.timeIntervalSince(utcBase),
+            0.824123,
+            accuracy: 0.000001
+        )
+        XCTAssertEqual(
+            try XCTUnwrap(itemsByID["tt1000001"]).addedAt.timeIntervalSince(itemsByID["tt1000002"]!.addedAt),
+            0.000399,
+            accuracy: 0.000001
+        )
+        let camelCaseBase = try XCTUnwrap(ISO8601DateFormatter().date(from: "2025-02-21T12:59:57Z"))
+        XCTAssertEqual(itemsByID["tt1000004"]?.addedAt, camelCaseBase)
+        let duplicateBase = try XCTUnwrap(ISO8601DateFormatter().date(from: "2025-02-21T12:59:56Z"))
+        let duplicateItem = try XCTUnwrap(itemsByID["tt1000003"])
+        XCTAssertEqual(
+            duplicateItem.addedAt.timeIntervalSince(duplicateBase),
+            0.9,
+            accuracy: 0.000001
+        )
+        let datedCollection = try XCTUnwrap(ISO8601DateFormatter().date(from: "2025-02-23T01:00:00Z"))
+        XCTAssertEqual(itemsByID["tt1000006"]?.addedAt, datedCollection)
     }
 
     func testPersonalListDiscoveryLoadsItems() async throws {
@@ -828,6 +1012,146 @@ final class MdbListScrobbleTests: XCTestCase {
         XCTAssertEqual(unwrapped.totalWatchedHours, 2)
     }
 
+    func testLibraryMutationDrainsForCapturedMdbListAccountAndAcknowledgesOnlySuccess() async throws {
+        let profileId = "mdblist-library-mutation-\(UUID().uuidString)"
+        let previousSettingsProfileId = ProfileSettings.activeProfileID
+        let previousSettingsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        let previousWatchedProfileId = WatchedStore.activeProfileId
+        ProfileSettings.setActiveProfile(profileId, isPrimary: false)
+        WatchedStore.setActiveProfile(profileId)
+        let store = ProfileSettings.current
+        defer {
+            WatchedStore.eraseProfile(profileId)
+            WatchedStore.setActiveProfile(previousWatchedProfileId)
+            if let previousSettingsProfileId {
+                ProfileSettings.setActiveProfile(previousSettingsProfileId, isPrimary: previousSettingsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            UserDefaults.standard.removePersistentDomain(forName: "nuvio.tv.profile.settings.\(profileId)")
+            tokenStorage.remove(for: profileId)
+        }
+
+        store.set(TraktLibrarySourceMode.mdblist.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let tokens = MdbListStoredTokens(
+            accessToken: "library-access",
+            refreshToken: "library-refresh",
+            expiresAtMillis: Date().timeIntervalSince1970 * 1_000 + 3_600_000
+        )
+        XCTAssertTrue(MdbListAuthStore.saveTokens(
+            tokens,
+            user: MdbListUser(accountID: "library-user", username: "library-user", displayName: "Library User"),
+            profileScope: profileId,
+            store: store,
+            tokenStorage: tokenStorage
+        ))
+        let accountID = MdbListAuthStore.accountBindingID(in: store)
+        let meta = Self.meta(id: "tt8877665", type: "movie")
+        let mutation = WatchedLibraryMutationUpload(
+            provider: .mdblist,
+            accountID: accountID,
+            profileID: profileId,
+            meta: meta,
+            season: nil,
+            episode: nil,
+            isWatched: true,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: mutation.changedAt,
+                pendingLibraryMutations: [mutation],
+                legacyUnattributed: false
+            )
+        ])
+
+        var captured: [URLRequest] = []
+        MdbListURLProtocolStub.handler = { request in
+            captured.append(request)
+            XCTAssertEqual(request.url?.path, "/sync/watched")
+            XCTAssertEqual(request.httpMethod, "POST")
+            XCTAssertEqual(request.value(forHTTPHeaderField: "Authorization"), "Bearer library-access")
+            let body = Self.jsonBody(request)
+            XCTAssertNotNil(body["movies"])
+            XCTAssertNil(body["shows"])
+            return Self.response(for: request, status: 200, json: #"{"added":{"movies":[{"ids":{"imdb":"tt8877665"}}]}}"#)
+        }
+
+        let marked = await MdbListProgressService.flushPendingLibraryMutations(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileId
+        )
+        XCTAssertTrue(marked)
+        XCTAssertEqual(captured.count, 1)
+        XCTAssertTrue(WatchedStore.pendingLibraryMutations(provider: .mdblist, profileId: profileId).isEmpty)
+        let saved = try XCTUnwrap(WatchedStore.items(profileId: profileId).first { $0.meta.id == meta.id })
+        XCTAssertTrue(saved.isLibraryVisible(under: .mdblist))
+        XCTAssertEqual(saved.watchCountsBySource[TraktWatchProgressSource.mdblist.rawValue], 1)
+
+        let removeMutation = WatchedLibraryMutationUpload(
+            provider: .mdblist,
+            accountID: accountID,
+            profileID: profileId,
+            meta: meta,
+            season: nil,
+            episode: nil,
+            isWatched: false,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: mutation.changedAt,
+                pendingLibraryMutations: [removeMutation],
+                legacyUnattributed: false
+            )
+        ])
+        MdbListURLProtocolStub.handler = { request in
+            captured.append(request)
+            return Self.response(for: request, status: 503, json: #"{"error":"offline"}"#)
+        }
+        let removalFailed = await MdbListProgressService.flushPendingLibraryMutations(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileId
+        )
+        XCTAssertFalse(removalFailed)
+        let pendingAfterFailure = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .mdblist, profileId: profileId).first
+        )
+        XCTAssertEqual(pendingAfterFailure.attemptCount, 1)
+        XCTAssertGreaterThan(pendingAfterFailure.nextAttemptAt ?? .distantPast, Date())
+        XCTAssertFalse(WatchedStore.isWatchedForLibrary(meta: meta, source: .mdblist, profileId: profileId))
+
+        XCTAssertTrue(MdbListAuthStore.saveTokens(
+            MdbListStoredTokens(
+                accessToken: "new-account-access",
+                refreshToken: "new-account-refresh",
+                expiresAtMillis: Date().timeIntervalSince1970 * 1_000 + 3_600_000
+            ),
+            user: MdbListUser(accountID: "different-user", username: "different-user", displayName: "Different User"),
+            profileScope: profileId,
+            store: store,
+            tokenStorage: tokenStorage
+        ))
+        let newAccountFlush = await MdbListProgressService.flushPendingLibraryMutations(
+            store: store,
+            client: client,
+            tokenStorage: tokenStorage,
+            profileScope: profileId
+        )
+        XCTAssertTrue(newAccountFlush)
+        XCTAssertEqual(captured.count, 2, "An old account's pending delete must never be sent to a newly linked MDBList account.")
+        XCTAssertEqual(
+            WatchedStore.pendingLibraryMutations(provider: .mdblist, profileId: profileId).first?.accountID,
+            accountID
+        )
+    }
+
     private static func meta(id: String, type: String) -> NuvioMeta {
         mdbListTestMetadata(id: id, type: type, runtime: nil)
     }
@@ -847,6 +1171,11 @@ final class MdbListScrobbleTests: XCTestCase {
             return [:]
         }
         return object
+    }
+
+    private static func jsonString(_ object: Any) throws -> String {
+        let data = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+        return String(decoding: data, as: UTF8.self)
     }
 
     private static func requestBody(_ request: URLRequest) -> Data? {

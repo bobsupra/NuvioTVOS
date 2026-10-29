@@ -28,10 +28,246 @@ enum LibrarySourceMode: String, CaseIterable, Identifiable {
     }
 }
 
+/// Captures the watched-history scope that produced a Library card. The account
+/// binding travels with the navigation so a delayed action can reject a write
+/// after the selected provider is relinked.
+@MainActor
+struct LibraryWatchedDisplayOwner: Equatable {
+    let source: TraktLibrarySourceMode
+    let profileId: String?
+    let accountBindingId: String?
+
+    static func capture(source: TraktLibrarySourceMode, profileId: String?) -> LibraryWatchedDisplayOwner {
+        let store = ProfileSettings.store(for: profileId)
+        return LibraryWatchedDisplayOwner(
+            source: source,
+            profileId: profileId,
+            accountBindingId: accountBindingID(for: source, profileId: profileId, in: store)
+        )
+    }
+
+    var isCurrent: Bool {
+        guard LibraryStore.activeProfileId == profileId,
+              ProfileSettings.activeProfileID == profileId else { return false }
+        let configuredSource = TraktSettingsStore.librarySourceMode
+        let effectiveSource = SelectedLibraryService.isSelectedAndAuthenticated
+            ? configuredSource
+            : .local
+        guard effectiveSource == source else { return false }
+        return Self.capture(source: source, profileId: profileId).accountBindingId == accountBindingId
+    }
+
+    var cacheIdentity: String {
+        "\(source.rawValue)\u{1f}\(profileId ?? "legacy")\u{1f}\(accountBindingId ?? "no-account")"
+    }
+
+    private static func accountBindingID(
+        for source: TraktLibrarySourceMode,
+        profileId: String?,
+        in store: UserDefaults
+    ) -> String? {
+        switch source {
+        case .local:
+            return WatchedStore.nuvioSyncAccountBinding(profileId: profileId)
+        case .trakt:
+            let state = TraktAuthStore.state(in: store)
+            return TraktAuthStore.accountBindingID(in: store)
+                ?? state.username?.lowercased()
+                ?? state.refreshToken
+        case .simkl:
+            return SimklAuthStore.accountBindingID(in: store)
+        case .mdblist:
+            return MdbListAuthStore.accountBindingID(in: store)
+        case .wetrakr:
+            return WeTrakrAuthStore.accountBindingID(in: store)
+        }
+    }
+}
+
+@MainActor
+struct LibraryWatchedContext {
+    let source: TraktLibrarySourceMode
+    let profileId: String?
+    let displayOwner: LibraryWatchedDisplayOwner
+    let mutationContext: WatchedLibraryMutationContext?
+
+    private init(
+        source: TraktLibrarySourceMode,
+        profileId: String?,
+        displayOwner: LibraryWatchedDisplayOwner,
+        mutationContext: WatchedLibraryMutationContext?
+    ) {
+        self.source = source
+        self.profileId = profileId
+        self.displayOwner = displayOwner
+        self.mutationContext = mutationContext
+    }
+
+    static func currentScope() -> LibraryWatchedContext {
+        let selectedSource = TraktSettingsStore.librarySourceMode
+        let isRemoteLibraryAvailable = SelectedLibraryService.isSelectedAndAuthenticated
+        let source = isRemoteLibraryAvailable ? selectedSource : .local
+        return LibraryWatchedContext(
+            source: source,
+            profileId: LibraryStore.activeProfileId,
+            displayOwner: LibraryWatchedDisplayOwner.capture(
+                source: source,
+                profileId: LibraryStore.activeProfileId
+            ),
+            mutationContext: nil
+        )
+    }
+
+    static func captureCurrent() -> LibraryWatchedContext {
+        let scope = currentScope()
+        return capture(source: scope.source, profileId: scope.profileId)
+    }
+
+    static func capture(
+        source: TraktLibrarySourceMode,
+        profileId: String?
+    ) -> LibraryWatchedContext {
+        return LibraryWatchedContext(
+            source: source,
+            profileId: profileId,
+            displayOwner: LibraryWatchedDisplayOwner.capture(source: source, profileId: profileId),
+            mutationContext: WatchedStore.captureLibraryMutationContext(
+                for: source,
+                profileId: profileId
+            )
+        )
+    }
+
+    var cacheIdentity: String {
+        displayOwner.cacheIdentity
+    }
+
+    func hasSameDisplayOwner(as other: LibraryWatchedContext) -> Bool {
+        displayOwner == other.displayOwner
+    }
+
+    var isCurrentScope: Bool {
+        displayOwner.isCurrent
+    }
+
+    var hasMutationContext: Bool {
+        mutationContext != nil
+    }
+
+    var isCurrent: Bool {
+        guard isCurrentScope else { return false }
+        guard let mutationContext,
+              let current = WatchedStore.captureLibraryMutationContext(for: source, profileId: profileId) else {
+            return false
+        }
+        return Self.hasSamePrimaryTarget(mutationContext, current)
+    }
+
+    var nuvioSyncMutationTargetIsCurrent: Bool {
+        guard let mutationContext else { return false }
+        let shouldIncludeTarget = source == .local
+            || RemoteTrackingState.isNuvioSyncScrobbleEnabled(in: ProfileSettings.store(for: profileId))
+        let target = mutationContext.targets.first(where: { $0.provider == .nuvioSync })
+        guard shouldIncludeTarget else { return target == nil }
+        return target?.accountID == WatchedStore.nuvioSyncAccountBinding(profileId: profileId)
+    }
+
+    static func hasSamePrimaryTarget(
+        _ original: WatchedLibraryMutationContext,
+        _ current: WatchedLibraryMutationContext
+    ) -> Bool {
+        guard original.librarySource == current.librarySource,
+              original.profileID == current.profileID else { return false }
+        let primary = WatchedStore.watchedSource(for: original.librarySource)
+        let originalPrimary = original.targets.first { $0.provider == primary }
+        let currentPrimary = current.targets.first { $0.provider == primary }
+        return originalPrimary != nil && originalPrimary == currentPrimary
+    }
+
+    func recaptureForCurrentAction() -> LibraryWatchedContext? {
+        let current = Self.captureCurrent()
+        guard current.source == source,
+              current.profileId == profileId,
+              current.displayOwner == displayOwner else { return nil }
+        if let mutationContext {
+            guard let currentMutationContext = current.mutationContext,
+                  Self.hasSamePrimaryTarget(mutationContext, currentMutationContext) else { return nil }
+        }
+        return current
+    }
+
+    @discardableResult
+    func setWatched(
+        _ meta: NuvioMeta,
+        season: Int? = nil,
+        episode: Int? = nil,
+        isWatched: Bool
+    ) -> Bool {
+        guard let mutationContext = currentMutationContextForImmediateAction() else { return false }
+        return WatchedStore.setLibraryWatched(
+            meta,
+            season: season,
+            episode: episode,
+            isWatched: isWatched,
+            context: mutationContext
+        )
+    }
+
+    @discardableResult
+    func setSeasonWatched(
+        _ meta: NuvioMeta,
+        season: Int,
+        episodes: [Int],
+        isWatched: Bool
+    ) -> Bool {
+        guard let mutationContext = currentMutationContextForImmediateAction() else { return false }
+        return WatchedStore.setLibrarySeasonWatched(
+            meta,
+            season: season,
+            episodes: episodes,
+            isWatched: isWatched,
+            context: mutationContext
+        )
+    }
+
+    @discardableResult
+    func setWatchedUpTo(_ meta: NuvioMeta, season: Int, episode: Int) -> Bool {
+        guard let mutationContext = currentMutationContextForImmediateAction() else { return false }
+        return WatchedStore.setLibraryWatchedUpTo(
+            meta,
+            season: season,
+            episode: episode,
+            context: mutationContext
+        )
+    }
+
+    @discardableResult
+    func setWatchedUsingCapturedAction(
+        _ meta: NuvioMeta,
+        isWatched: Bool
+    ) -> Bool {
+        guard isCurrentScope, let mutationContext else { return false }
+        return WatchedStore.setLibraryWatched(
+            meta,
+            isWatched: isWatched,
+            context: mutationContext
+        )
+    }
+
+    private func currentMutationContextForImmediateAction() -> WatchedLibraryMutationContext? {
+        guard isCurrent,
+              let current = WatchedStore.captureLibraryMutationContext(for: source, profileId: profileId),
+              let mutationContext,
+              Self.hasSamePrimaryTarget(mutationContext, current) else { return nil }
+        return current
+    }
+}
+
 public struct LibraryView: View {
     @StateObject private var viewModel: LibraryViewModel
     @StateObject private var cloudViewModel: CloudLibraryViewModel
     let onContentClick: (String, String) -> Void
+    var onLibraryContentClick: ((String, String, LibraryWatchedContext) -> Void)? = nil
     var onLongPress: ((NuvioMeta) -> Void)? = nil
     /// Opens the debrid Cloud Library screen; kept for external callers.
     var onOpenCloudLibrary: (() -> Void)? = nil
@@ -71,6 +307,7 @@ public struct LibraryView: View {
         viewModel: LibraryViewModel,
         store: UserDefaults = ProfileSettings.current,
         onContentClick: @escaping (String, String) -> Void,
+        onLibraryContentClick: ((String, String, LibraryWatchedContext) -> Void)? = nil,
         onLongPress: ((NuvioMeta) -> Void)? = nil,
         onOpenCloudLibrary: (() -> Void)? = nil,
         onPlayCloudFile: ((URL, NuvioMeta) -> Void)? = nil
@@ -78,6 +315,7 @@ public struct LibraryView: View {
         _viewModel = StateObject(wrappedValue: viewModel)
         _cloudViewModel = StateObject(wrappedValue: CloudLibraryViewModel(store: store))
         self.onContentClick = onContentClick
+        self.onLibraryContentClick = onLibraryContentClick
         self.onLongPress = onLongPress
         self.onOpenCloudLibrary = onOpenCloudLibrary
         self.onPlayCloudFile = onPlayCloudFile
@@ -303,7 +541,7 @@ public struct LibraryView: View {
             }
         }
         .task {
-            await viewModel.refreshSelectedLibrary()
+            await viewModel.refreshSelectedLibrary(syncWatchedHistory: true)
             if cloudViewModel.isAvailable {
                 await cloudViewModel.load()
             }
@@ -339,7 +577,9 @@ public struct LibraryView: View {
     }
 
     private var savedContent: some View {
-        ScrollView {
+        let watchedContext = viewModel.displayedWatchedContext ?? LibraryWatchedContext.currentScope()
+        let watchedContextIsCurrent = watchedContext.isCurrentScope
+        return ScrollView {
             VStack(alignment: .leading, spacing: 20) {
                 ForEach(viewModel.sortedAndGroupedItems.keys.sorted(), id: \.self) { group in
                     if viewModel.groupOption != .none {
@@ -353,6 +593,9 @@ public struct LibraryView: View {
                         ForEach(viewModel.sortedAndGroupedItems[group] ?? [], id: \.id) { item in
                             LibraryItemButton(
                                 item: item,
+                                watchedContext: watchedContext,
+                                watchedContextIsCurrent: watchedContextIsCurrent,
+                                onLibraryContentClick: onLibraryContentClick,
                                 externalFocus: $focusedItemID,
                                 retainFocusAppearance: overlayRestoreItemID == item.id,
                                 onFocus: {
@@ -364,9 +607,18 @@ public struct LibraryView: View {
                             ) {
                                 overlayRestoreItemID = item.id
                                 lastFocusedItemID = item.id
-                                onContentClick(item.id, item.contentType)
+                                if let onLibraryContentClick {
+                                    guard watchedContextIsCurrent,
+                                          let capturedContext = watchedContext.recaptureForCurrentAction() else { return }
+                                    onLibraryContentClick(item.id, item.contentType, capturedContext)
+                                } else {
+                                    onContentClick(item.id, item.contentType)
+                                }
                             }
-                            .disabled(overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
+                            .disabled(
+                                (overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
+                                    || !watchedContextIsCurrent
+                            )
                         }
                     }
                 }
@@ -668,6 +920,9 @@ public struct LibraryView: View {
 
 struct LibraryItemButton: View {
     let item: StremioMeta
+    var watchedContext: LibraryWatchedContext? = nil
+    var watchedContextIsCurrent = true
+    var onLibraryContentClick: ((String, String, LibraryWatchedContext) -> Void)? = nil
     var externalFocus: FocusState<String?>.Binding? = nil
     var retainFocusAppearance = false
     var onFocus: (() -> Void)? = nil
@@ -721,7 +976,11 @@ struct LibraryItemButton: View {
                     )
                 )
                 .overlay(alignment: .topTrailing) {
-                    WatchedCheckmarkBadge(metaId: item.id, type: item.contentType)
+                    WatchedCheckmarkBadge(
+                        meta: item.asNuvioMeta,
+                        libraryWatchedContext: watchedContext,
+                        isLibraryContextCurrent: watchedContextIsCurrent
+                    )
                 }
                 .overlay(
                     RoundedRectangle(cornerRadius: cardCornerRadius, style: .continuous)
@@ -751,7 +1010,12 @@ struct LibraryItemButton: View {
         .focusEffectDisabledIfAvailable()
         .titleActionsContextMenu(
             meta: item.asNuvioMeta,
-            onOpenDetails: action
+            libraryWatchedContext: watchedContext,
+            onOpenLibraryDetails: onLibraryContentClick.map { callback in
+                { context in callback(item.id, item.contentType, context) }
+            },
+            onOpenDetails: action,
+            isEnabled: watchedContextIsCurrent
         )
         .onChange(of: isFocused) { _, focused in
             if focused {
@@ -759,6 +1023,7 @@ struct LibraryItemButton: View {
             }
         }
         .animation(smoothFocus ? .spring(response: 0.28, dampingFraction: 0.75) : nil, value: showsFocusedAppearance)
+        .disabled(!watchedContextIsCurrent)
         .zIndex(showsFocusedAppearance ? 1 : 0)
     }
 

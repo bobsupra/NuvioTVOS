@@ -1128,9 +1128,24 @@ class DetailsViewModel: ObservableObject {
         }
     }
 
-    func toggleWatched() {
+    func toggleWatched(libraryContext: LibraryWatchedContext? = nil) {
         guard let meta = uiState.meta else { return }
-        uiState.isWatched = WatchedStore.toggle(meta: meta)
+        if let libraryContext {
+            guard libraryContext.isCurrent else { return }
+            let desiredState = !WatchedStore.isWatchedForLibrary(
+                meta: meta,
+                source: libraryContext.source,
+                profileId: libraryContext.profileId
+            )
+            _ = libraryContext.setWatched(meta, isWatched: desiredState)
+            uiState.isWatched = WatchedStore.isWatchedForLibrary(
+                meta: meta,
+                source: libraryContext.source,
+                profileId: libraryContext.profileId
+            )
+        } else {
+            uiState.isWatched = WatchedStore.toggle(meta: meta)
+        }
     }
 
     func setMdbListUserRating(_ rating: Int?) {

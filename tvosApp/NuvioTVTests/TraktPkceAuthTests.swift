@@ -62,7 +62,67 @@ final class TraktPkceAuthTests: XCTestCase {
         XCTAssertFalse(TraktConfig.isConfigured(in: store), "client_id is still required")
     }
 
+    // MARK: - Redirect URI compatibility
+
+    func testResolvingNewProfileDefaultDoesNotWriteUntilCommitted() {
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), TraktConfig.defaultRedirectURI)
+        XCTAssertNil(store.object(forKey: SettingsKey.traktRedirectURI))
+    }
+
+    func testExistingProfileWithoutRedirectSettingKeepsLegacyURI() {
+        store.set("legacy-id", forKey: SettingsKey.traktClientID)
+
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), TraktConfig.legacyRedirectURI)
+        XCTAssertEqual(TraktConfig.initializeRedirectURI(in: store), TraktConfig.legacyRedirectURI)
+        XCTAssertEqual(store.string(forKey: SettingsKey.traktRedirectURI), TraktConfig.legacyRedirectURI)
+    }
+
+    func testNewProfilePinsLocalhostBeforeClientIDIsSaved() {
+        XCTAssertEqual(TraktConfig.initializeRedirectURI(in: store), TraktConfig.defaultRedirectURI)
+        store.set("new-id", forKey: SettingsKey.traktClientID)
+
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), TraktConfig.defaultRedirectURI)
+    }
+
+    func testBlankRedirectCommitKeepsPinnedLocalhostAfterClientIDIsSaved() {
+        TraktConfig.initializeRedirectURI(in: store)
+        store.set("new-id", forKey: SettingsKey.traktClientID)
+
+        XCTAssertEqual(TraktConfig.setRedirectURI(" \n\t", in: store), TraktConfig.defaultRedirectURI)
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), TraktConfig.defaultRedirectURI)
+    }
+
+    func testRedirectURIStoresCustomAndLegacyValuesAfterTrimming() {
+        let customURI = "https://example.test/trakt/callback"
+        XCTAssertEqual(
+            TraktConfig.setRedirectURI(" \n\(customURI) \t", in: store),
+            customURI
+        )
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), customURI)
+        XCTAssertEqual(TraktConfig.setRedirectURI("  \n", in: store), customURI)
+
+        XCTAssertEqual(
+            TraktConfig.setRedirectURI(" \(TraktConfig.legacyRedirectURI) \n", in: store),
+            TraktConfig.legacyRedirectURI
+        )
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), TraktConfig.legacyRedirectURI)
+        XCTAssertEqual(TraktConfig.setRedirectURI("", in: store), TraktConfig.legacyRedirectURI)
+    }
+
     // MARK: - Device token exchange
+
+    func testStartingDeviceAuthPinsLegacyURIForExistingClientID() async throws {
+        store.set("legacy-id", forKey: SettingsKey.traktClientID)
+        TraktStubURLProtocol.responder = { _ in
+            (200, Data("""
+                {"device_code":"DEVICE","user_code":"USER","verification_url":"https://trakt.tv/activate","expires_in":600,"interval":5}
+                """.utf8))
+        }
+
+        _ = try await TraktAuthService(session: stubbedSession(), store: store).startDeviceAuth()
+
+        XCTAssertEqual(store.string(forKey: SettingsKey.traktRedirectURI), TraktConfig.legacyRedirectURI)
+    }
 
     func testDeviceTokenExchangeOmitsClientSecretForSecretlessApp() async throws {
         store.set("YcBz-test-id", forKey: SettingsKey.traktClientID)
@@ -78,6 +138,7 @@ final class TraktPkceAuthTests: XCTestCase {
         XCTAssertEqual(body["code"] as? String, "DEVCODE")
         XCTAssertEqual(body["client_id"] as? String, "YcBz-test-id")
         XCTAssertNil(body["client_secret"], "a secret-less app must NOT send client_secret")
+        XCTAssertNil(body["redirect_uri"], "device exchange does not use a redirect URI")
         guard case .approved = result else {
             return XCTFail("expected .approved, got \(result)")
         }
@@ -163,6 +224,7 @@ final class TraktPkceAuthTests: XCTestCase {
 
     func testRefreshOmitsClientSecretForSecretlessApp() async throws {
         store.set("YcBz-test-id", forKey: SettingsKey.traktClientID)
+        TraktConfig.setRedirectURI(TraktConfig.defaultRedirectURI, in: store)
         TraktAuthStore.saveToken(
             TraktTokenResponse(
                 accessToken: "old-access",
@@ -188,9 +250,72 @@ final class TraktPkceAuthTests: XCTestCase {
         XCTAssertEqual(body["refresh_token"] as? String, "old-refresh")
         XCTAssertEqual(body["client_id"] as? String, "YcBz-test-id")
         XCTAssertEqual(body["grant_type"] as? String, "refresh_token")
+        XCTAssertEqual(body["redirect_uri"] as? String, "http://localhost:5173/callback")
+    }
+
+    func testEditingRedirectURIDoesNotSignOut() {
+        seedConnectedSession(clientID: "edit-uri-id")
+
+        TraktConfig.setRedirectURI("https://example.test/callback", in: store)
+
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: store))
+        XCTAssertEqual(TraktAuthStore.state(in: store).refreshToken, "old-refresh")
+    }
+
+    func testStaleUnauthorizedRefreshAfterRedirectURIChangeDoesNotClearAuth() async throws {
+        seedConnectedSession(clientID: "stale-uri-id")
+        TraktConfig.setRedirectURI(TraktConfig.defaultRedirectURI, in: store)
+        let store = try XCTUnwrap(self.store)
+        TraktStubURLProtocol.responder = { _ in
+            TraktConfig.setRedirectURI("https://example.test/new-callback", in: store)
+            return (401, Data("{}".utf8))
+        }
+
+        let ok = await TraktAuthService(session: stubbedSession(), store: store).refreshTokenIfNeeded(force: true)
+
+        XCTAssertFalse(ok)
+        XCTAssertTrue(TraktAuthStore.isAuthenticated(in: store))
+        XCTAssertEqual(TraktAuthStore.state(in: store).refreshToken, "old-refresh")
+        let request = try requireRequest(suffix: "oauth/token")
+        XCTAssertEqual(try json(request.body)["redirect_uri"] as? String, TraktConfig.defaultRedirectURI)
+    }
+
+    func testRefreshSuccessAfterRedirectURIChangeSavesRotatedToken() async throws {
+        seedConnectedSession(clientID: "rotated-uri-id")
+        TraktConfig.setRedirectURI(TraktConfig.defaultRedirectURI, in: store)
+        let store = try XCTUnwrap(self.store)
+        TraktStubURLProtocol.responder = { _ in
+            TraktConfig.setRedirectURI("https://example.test/new-callback", in: store)
+            return (200, Data("""
+                {"access_token":"rotated-access","token_type":"Bearer","expires_in":7776000,"refresh_token":"rotated-refresh","created_at":2}
+                """.utf8))
+        }
+
+        let ok = await TraktAuthService(session: stubbedSession(), store: store).refreshTokenIfNeeded(force: true)
+
+        XCTAssertTrue(ok)
+        XCTAssertEqual(TraktAuthStore.state(in: store).refreshToken, "rotated-refresh")
+        XCTAssertEqual(TraktAuthStore.state(in: store).accessToken, "rotated-access")
+        XCTAssertEqual(TraktConfig.redirectURI(in: store), "https://example.test/new-callback")
     }
 
     // MARK: - Helpers
+
+    private func seedConnectedSession(clientID: String) {
+        store.set(clientID, forKey: SettingsKey.traktClientID)
+        TraktAuthStore.saveToken(
+            TraktTokenResponse(
+                accessToken: "old-access",
+                tokenType: "Bearer",
+                expiresIn: 7_776_000,
+                refreshToken: "old-refresh",
+                createdAt: 1
+            ),
+            clientID: clientID,
+            store: store
+        )
+        store.set(true, forKey: SettingsKey.traktConnected)
+    }
 
     private func seedActiveDeviceFlow(clientID: String) {
         TraktAuthStore.saveDeviceFlow(

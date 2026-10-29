@@ -1392,7 +1392,7 @@ struct WeTrakrProgressService {
         guard let context = requestContext(
                 in: store,
                 profileId: profileID,
-                requiresWeTrakrSource: true
+                requiresWeTrakrSource: false
               ) else {
             return false
         }
@@ -1401,14 +1401,15 @@ struct WeTrakrProgressService {
                 context,
                 in: store,
                 profileId: profileID,
-                requiresWeTrakrSource: true
+                requiresWeTrakrSource: false
             ) else {
                 return false
             }
             return await flushPendingPlaybackCompletionsLocked(
                 store: store,
                 profileId: profileID,
-                context: currentContext
+                context: currentContext,
+                requiresWeTrakrSource: false
             )
         }
     }
@@ -1416,11 +1417,12 @@ struct WeTrakrProgressService {
     private static func flushPendingPlaybackCompletionsLocked(
         store: UserDefaults,
         profileId: String?,
-        context: WeTrakrRequestContext
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool = true
     ) async -> Bool {
         let mutations = WatchedStore.pendingProviderMutations(provider: .wetrakr, profileId: profileId)
         for mutation in mutations {
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
                 return false
             }
             guard let mutationAccountID = mutation.accountID?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1432,9 +1434,15 @@ struct WeTrakrProgressService {
                 in: store,
                 profileId: profileId,
                 expectedAccountID: mutationAccountID,
-                requiresWeTrakrSource: true
-            ), await sendProviderMutation(mutation, store: store, profileId: profileId, context: mutationContext),
-                  contextIsCurrent(mutationContext, in: store, profileId: profileId, requiresWeTrakrSource: true),
+                requiresWeTrakrSource: requiresWeTrakrSource
+            ), await sendProviderMutation(
+                mutation,
+                store: store,
+                profileId: profileId,
+                context: mutationContext,
+                requiresWeTrakrSource: requiresWeTrakrSource
+            ),
+                  contextIsCurrent(mutationContext, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
                   WatchedStore.acknowledgeProviderMutation(
                     id: mutation.id,
                     provider: .wetrakr,
@@ -1444,9 +1452,56 @@ struct WeTrakrProgressService {
             }
         }
 
+        let libraryMutations = WatchedStore.pendingLibraryMutations(
+            provider: .wetrakr,
+            profileId: profileId,
+            readyOnly: true
+        )
+        for mutation in libraryMutations {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
+                return false
+            }
+            guard let accountID = mutation.accountID?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !accountID.isEmpty,
+                  mutation.profileID == profileId else {
+                continue
+            }
+            guard accountID == context.accountID else { continue }
+            let didSend = await sendLibraryMutation(
+                mutation,
+                store: store,
+                profileId: profileId,
+                context: context,
+                requiresWeTrakrSource: requiresWeTrakrSource
+            )
+            guard didSend else {
+                _ = WatchedStore.deferLibraryMutation(
+                    id: mutation.id,
+                    provider: .wetrakr,
+                    accountID: accountID,
+                    profileId: profileId
+                )
+                return false
+            }
+            guard contextIsCurrent(
+                    context,
+                    in: store,
+                    profileId: profileId,
+                    requiresWeTrakrSource: requiresWeTrakrSource
+                  ),
+                  WatchedStore.acknowledgeLibraryMutation(
+                    id: mutation.id,
+                    provider: .wetrakr,
+                    accountID: accountID,
+                    profileId: profileId
+                  ) else {
+                return false
+            }
+        }
+
         let completions = WatchedStore.pendingPlaybackCompletions(provider: .wetrakr, profileId: profileId)
         for completion in completions {
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
                 return false
             }
             guard let completionAccountID = completion.accountID?.trimmingCharacters(in: .whitespacesAndNewlines),
@@ -1454,14 +1509,26 @@ struct WeTrakrProgressService {
                 continue
             }
             guard completionAccountID == context.accountID else { continue }
-            guard await cancelOwnedLivePlaybackIfPresent(
-                completion,
-                store: store,
-                profileId: profileId,
-                context: context
-            ),
-                  await sendPlaybackCompletion(completion, store: store, profileId: profileId, context: context),
-                  contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true),
+            let cancelledLivePlayback: Bool
+            if requiresWeTrakrSource {
+                cancelledLivePlayback = await cancelOwnedLivePlaybackIfPresent(
+                    completion,
+                    store: store,
+                    profileId: profileId,
+                    context: context
+                )
+            } else {
+                cancelledLivePlayback = true
+            }
+            guard cancelledLivePlayback,
+                  await sendPlaybackCompletion(
+                    completion,
+                    store: store,
+                    profileId: profileId,
+                    context: context,
+                    requiresWeTrakrSource: requiresWeTrakrSource
+                  ),
+                  contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
                   WatchedStore.acknowledgePlaybackCompletion(
                     completionID: completion.completionID,
                     provider: .wetrakr,
@@ -1483,7 +1550,8 @@ struct WeTrakrProgressService {
         _ mutation: WatchedStore.PendingProviderMutation,
         store: UserDefaults,
         profileId: String?,
-        context: WeTrakrRequestContext
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool
     ) async -> Bool {
         do {
             let response: WeTrakrHTTPResult<Data>
@@ -1515,7 +1583,7 @@ struct WeTrakrProgressService {
                 )
             }
             _ = try response.valueOrThrow()
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true),
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
                   responseConfirmsProviderMutation(response.rawData, mutation: mutation) else {
                 print("[WeTrakrProgressService] provider mutation \(mutation.id) is not yet confirmed")
                 return false
@@ -1527,11 +1595,79 @@ struct WeTrakrProgressService {
         }
     }
 
+    private static func sendLibraryMutation(
+        _ mutation: WatchedLibraryMutationUpload,
+        store: UserDefaults,
+        profileId: String?,
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool
+    ) async -> Bool {
+        guard wetrakrIDs(for: mutation.meta).hasUsableIdentifier else { return false }
+        let episodes = mutation.episodes.isEmpty
+            ? mutation.episode.map { [$0] } ?? []
+            : mutation.episodes
+        let confirmation = WatchedStore.PendingProviderMutation(
+            id: mutation.id,
+            provider: .wetrakr,
+            accountID: mutation.accountID,
+            meta: mutation.meta,
+            season: mutation.season,
+            episode: episodes.count == 1 ? episodes[0] : nil,
+            isWatched: mutation.isWatched,
+            changedAt: mutation.changedAt
+        )
+        do {
+            let response: WeTrakrHTTPResult<Data>
+            if mutation.isWatched {
+                response = try await client.postRaw(
+                    path: "/sync/tracking",
+                    body: trackingAddPayload(
+                        meta: mutation.meta,
+                        season: mutation.season,
+                        episode: mutation.episode,
+                        episodes: mutation.episodes,
+                        allowRewatch: false,
+                        trackedAt: nil
+                    ),
+                    accessToken: context.token,
+                    clientID: context.clientID,
+                    idempotencyKey: mutation.id
+                )
+            } else {
+                response = try await client.postRaw(
+                    path: "/sync/tracking/remove/all",
+                    body: trackingRemovePayload(
+                        meta: mutation.meta,
+                        season: mutation.season,
+                        episode: mutation.episode,
+                        episodes: mutation.episodes
+                    ),
+                    accessToken: context.token,
+                    clientID: context.clientID,
+                    idempotencyKey: mutation.id
+                )
+            }
+            _ = try response.valueOrThrow()
+            guard contextIsCurrent(
+                context,
+                in: store,
+                profileId: profileId,
+                requiresWeTrakrSource: requiresWeTrakrSource
+            ), responseConfirmsProviderMutation(response.rawData, mutation: confirmation) else {
+                return false
+            }
+            return true
+        } catch {
+            return false
+        }
+    }
+
     private static func sendPlaybackCompletion(
         _ completion: WatchedPlaybackCompletionUpload,
         store: UserDefaults,
         profileId: String?,
-        context: WeTrakrRequestContext
+        context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool
     ) async -> Bool {
         guard let trackedAt = iso8601String(completion.watchedAt),
               let payload = completionTrackingPayload(completion, trackedAt: trackedAt) else {
@@ -1547,7 +1683,7 @@ struct WeTrakrProgressService {
                 idempotencyKey: completion.completionID
             )
             _ = try response.valueOrThrow()
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
                 return false
             }
 
@@ -1582,6 +1718,7 @@ struct WeTrakrProgressService {
         meta: NuvioMeta,
         season: Int?,
         episode: Int?,
+        episodes: [Int] = [],
         allowRewatch: Bool,
         trackedAt: String?
     ) -> WeTrakrTrackingAddPayload {
@@ -1600,8 +1737,11 @@ struct WeTrakrProgressService {
         }
 
         let episodePayload: [WeTrakrEpisodeTrackingPayload]? = {
-            guard let episode, episode > 0 else { return nil }
-            return [WeTrakrEpisodeTrackingPayload(number: episode, status: "watched", trackedAt: trackedAt)]
+            let numbers = episodes.isEmpty ? episode.map { [$0] } ?? [] : episodes
+            guard !numbers.isEmpty, numbers.allSatisfy({ $0 > 0 }) else { return nil }
+            return numbers.sorted().map {
+                WeTrakrEpisodeTrackingPayload(number: $0, status: "watched", trackedAt: trackedAt)
+            }
         }()
         let seasonPayload: [WeTrakrSeasonTrackingPayload]? = {
             guard let season, season >= 0 else { return nil }
@@ -1645,7 +1785,8 @@ struct WeTrakrProgressService {
     private static func trackingRemovePayload(
         meta: NuvioMeta,
         season: Int?,
-        episode: Int?
+        episode: Int?,
+        episodes: [Int] = []
     ) -> WeTrakrTrackingRemovePayload {
         let ids = wetrakrIDs(for: meta)
         guard meta.isSeries else {
@@ -1656,14 +1797,15 @@ struct WeTrakrProgressService {
                 status: "watched"
             )])
         }
-        let episodes: [WeTrakrEpisodeTrackingPayload]? = episode.map {
-            [WeTrakrEpisodeTrackingPayload(number: $0, status: "watched")]
-        }
+        let episodeNumbers = episodes.isEmpty ? episode.map { [$0] } ?? [] : episodes
+        let episodePayload: [WeTrakrEpisodeTrackingPayload]? = episodeNumbers.isEmpty
+            ? nil
+            : episodeNumbers.sorted().map { WeTrakrEpisodeTrackingPayload(number: $0, status: "watched") }
         let seasons: [WeTrakrSeasonTrackingPayload]? = season.map {
             [WeTrakrSeasonTrackingPayload(
                 number: $0,
-                status: episodes == nil ? "watched" : nil,
-                episodes: episodes
+                status: episodePayload == nil ? "watched" : nil,
+                episodes: episodePayload
             )]
         }
         return WeTrakrTrackingRemovePayload(shows: [WeTrakrShowTrackingPayload(
@@ -2297,6 +2439,7 @@ struct WeTrakrProgressService {
         store: UserDefaults,
         profileId: String?,
         context: WeTrakrRequestContext,
+        requiresWeTrakrSource: Bool = true,
         identity: (Item) -> String?
     ) async -> (items: [Item], complete: Bool) {
         var items: [Item] = []
@@ -2306,7 +2449,7 @@ struct WeTrakrProgressService {
         var page = 1
 
         while true {
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
                 return (items, false)
             }
             let query = [
@@ -2325,7 +2468,7 @@ struct WeTrakrProgressService {
             } catch {
                 return (items, false)
             }
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true),
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource),
                   let pageItems = try? response.valueOrThrow() else {
                 return (items, false)
             }
@@ -2461,21 +2604,30 @@ struct WeTrakrProgressService {
         store: UserDefaults = ProfileSettings.current
     ) async -> Bool {
         let profileId = resolvedProfileID(in: store, explicit: nil)
+        let selectedForPlayback = TraktSettingsStore.watchProgressSource(in: store) == .wetrakr
+        let selectedForLibrary = TraktSettingsStore.librarySourceMode(in: store) == .wetrakr
+        let enabledForScrobble = RemoteTrackingState.isScrobbleEnabled(for: .wetrakr, in: store)
+        guard selectedForPlayback || selectedForLibrary || enabledForScrobble else { return false }
         guard let context = requestContext(
             in: store,
             profileId: profileId,
-            requiresWeTrakrSource: true
+            requiresWeTrakrSource: false
         ) else { return false }
         return await withAccountLane(context.accountID) {
             guard let currentContext = await refreshedContextIfNeeded(
                 context,
                 in: store,
                 profileId: profileId,
-                requiresWeTrakrSource: true
+                requiresWeTrakrSource: false
             ) else {
                 return false
             }
-            return await syncWatchedHistoryLocked(store: store, profileId: profileId, context: currentContext)
+            return await syncWatchedHistoryLocked(
+                store: store,
+                profileId: profileId,
+                context: currentContext,
+                requiresWeTrakrSource: false
+            )
         }
     }
 
@@ -2483,15 +2635,17 @@ struct WeTrakrProgressService {
         store: UserDefaults,
         profileId: String?,
         context: WeTrakrRequestContext,
-        drainPendingBeforeSnapshot: Bool = true
+        drainPendingBeforeSnapshot: Bool = true,
+        requiresWeTrakrSource: Bool = true
     ) async -> Bool {
         if drainPendingBeforeSnapshot {
             _ = await flushPendingPlaybackCompletionsLocked(
                 store: store,
                 profileId: profileId,
-                context: context
+                context: context,
+                requiresWeTrakrSource: requiresWeTrakrSource
             )
-            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
                 return false
             }
         }
@@ -2502,6 +2656,7 @@ struct WeTrakrProgressService {
             store: store,
             profileId: profileId,
             context: context,
+            requiresWeTrakrSource: requiresWeTrakrSource,
             identity: { $0.playID ?? $0.id }
         ) as (items: [WeTrakrTrackingHistoryItemDTO], complete: Bool)
         let movieList = await fetchHistoryPages(
@@ -2510,6 +2665,7 @@ struct WeTrakrProgressService {
             store: store,
             profileId: profileId,
             context: context,
+            requiresWeTrakrSource: requiresWeTrakrSource,
             identity: { item in
                 let meta = makeNuvioMeta(from: item.resolvedMedia, isSeries: false)
                 return historyIdentityKeys(for: meta, season: nil, episode: nil).first
@@ -2521,6 +2677,7 @@ struct WeTrakrProgressService {
             store: store,
             profileId: profileId,
             context: context,
+            requiresWeTrakrSource: requiresWeTrakrSource,
             identity: { $0.playID ?? $0.id }
         ) as (items: [WeTrakrTrackingHistoryItemDTO], complete: Bool)
 
@@ -2604,15 +2761,15 @@ struct WeTrakrProgressService {
             ) else { authoritative = false; continue }
         }
 
-        guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+        guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
             return false
         }
         let remoteItems = groups.values.sorted { $0.id < $1.id }
         guard authoritative else { return false }
         let snapshotKey = "\(profileId ?? "default")|\(context.accountID)"
         let previous = previousWatchedSnapshots[snapshotKey]
-            ?? WatchedStore.items(profileId: profileId).filter { $0.isVisible(under: .wetrakr) }
-        guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: true) else {
+            ?? WatchedStore.items(profileId: profileId).filter { $0.isLibraryVisible(under: .wetrakr) }
+        guard contextIsCurrent(context, in: store, profileId: profileId, requiresWeTrakrSource: requiresWeTrakrSource) else {
             return false
         }
         guard WatchedStore.reconcileWeTrakrSnapshot(

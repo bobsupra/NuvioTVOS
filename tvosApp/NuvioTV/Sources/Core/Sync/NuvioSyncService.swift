@@ -202,6 +202,7 @@ final class NuvioSyncManager: ObservableObject {
     private var isApplyingRemoteProfiles = false
     private var didAttach = false
     private var lastKnownSettingsSnapshot: [String: Any] = [:]
+    private var lastObservedNuvioWatchedGeneration = WatchedStore.nuvioSyncChangeGeneration
 
     private func snapshotSettingsKeys(for profileId: String?) -> [String: Any] {
         ProfileSettingsSnapshot.capture(for: profileId)
@@ -254,7 +255,13 @@ final class NuvioSyncManager: ObservableObject {
             object: nil,
             queue: .main
         ) { [weak self] _ in
-            Task { @MainActor in self?.schedulePush(scope: .watched) }
+            let generation = WatchedStore.nuvioSyncChangeGeneration
+            Task { @MainActor in
+                guard let self,
+                      generation != self.lastObservedNuvioWatchedGeneration else { return }
+                self.lastObservedNuvioWatchedGeneration = generation
+                self.schedulePush(scope: .watched)
+            }
         })
         observers.append(center.addObserver(
             forName: ContinueWatchingStore.changedNotification,
@@ -1376,6 +1383,11 @@ final class NuvioSyncManager: ObservableObject {
                 for: activeProfile,
                 in: profileViewModel.profiles
             )
+            try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+            WatchedStore.setNuvioSyncAccountBinding(
+                "\(session.userId):\(remoteProfileId)",
+                profileId: activeProfile.id
+            )
             let addonProfileId = activeProfile.usesPrimaryAddons && remoteProfileId != 1
                 ? 1
                 : remoteProfileId
@@ -1543,7 +1555,8 @@ final class NuvioSyncManager: ObservableObject {
                     WatchedStore.reconcileNuvioSnapshot(
                         remoteWatched,
                         syncStartedAt: progressPullStartedAt,
-                        profileId: activeProfile.id
+                        profileId: activeProfile.id,
+                        currentAccountID: "\(session.userId):\(remoteProfileId)"
                     )
                 }.value
                 try ensureStillSyncing(profileId: activeProfile.id)
@@ -1876,13 +1889,17 @@ final class NuvioSyncManager: ObservableObject {
             for: activeProfile,
             in: profileViewModel.profiles
         )
-
         do {
+            try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+            WatchedStore.setNuvioSyncAccountBinding(
+                "\(session.userId):\(remoteProfileId)",
+                profileId: activeProfile.id
+            )
             if scopes.contains(.settings) {
                 // A push racing a sign-out would upload the freshly wiped (empty)
                 // local snapshots over the account's server data — abort between
                 // steps the moment auth flips.
-                try ensureStillSyncing(profileId: activeProfile.id)
+                try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
                 try await client.pushProfileSettings(
                     session: session,
                     remoteProfileId: remoteProfileId,
@@ -1899,6 +1916,16 @@ final class NuvioSyncManager: ObservableObject {
             // another profile's rows is how watch state escaped the gate during
             // the launch window, before profile selection had settled.
             guard WatchedStore.activeProfileId == activeProfile.id else { return }
+
+            if scopes.contains(.watched) {
+                try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+                guard try await pushPendingLibraryMutations(
+                    session: session,
+                    remoteProfileId: remoteProfileId,
+                    profileId: activeProfile.id
+                ) else { return }
+                try ensureStillSyncing(profileId: activeProfile.id, accountId: session.userId)
+            }
 
             let ownsLibrary = Self.ownsLibrary(for: activeProfile.id)
             if scopes.contains(.library) && ownsLibrary {
@@ -1951,6 +1978,49 @@ final class NuvioSyncManager: ObservableObject {
         } catch {
             print("Nuvio sync push failed: \(error.localizedDescription)")
         }
+    }
+
+    private func pushPendingLibraryMutations(
+        session: AuthSession,
+        remoteProfileId: Int,
+        profileId: String
+    ) async throws -> Bool {
+        let accountID = "\(session.userId):\(remoteProfileId)"
+        let mutations = WatchedStore.pendingLibraryMutations(
+            provider: .nuvioSync,
+            profileId: profileId,
+            readyOnly: true
+        )
+        for mutation in mutations {
+            guard mutation.accountID == accountID,
+                  mutation.profileID == profileId else {
+                continue
+            }
+            try ensureStillSyncing(profileId: profileId, accountId: session.userId)
+            do {
+                try await client.pushWatchedLibraryMutation(
+                    mutation,
+                    session: session,
+                    remoteProfileId: remoteProfileId
+                )
+            } catch {
+                _ = WatchedStore.deferLibraryMutation(
+                    id: mutation.id,
+                    provider: .nuvioSync,
+                    accountID: accountID,
+                    profileId: profileId
+                )
+                throw error
+            }
+            try ensureStillSyncing(profileId: profileId, accountId: session.userId)
+            guard WatchedStore.acknowledgeLibraryMutation(
+                id: mutation.id,
+                provider: .nuvioSync,
+                accountID: accountID,
+                profileId: profileId
+            ) else { return false }
+        }
+        return true
     }
 
     /// Pushes the complete local add-on list to the account. The public RPC is
@@ -3806,7 +3876,11 @@ final class NuvioAPIClient {
         // account's to upload.
         let payload = WatchedStore.items(profileId: profileId)
             .filter {
-                $0.isVisible(under: .nuvioSync)
+                $0.isLibraryVisible(
+                    under: .nuvioSync,
+                    accountID: "\(session.userId):\(remoteProfileId)"
+                )
+                    && !$0.legacyUnattributed
                     // A series title marker is only a local aggregate used by
                     // tvOS to render the watched state. Upload its concrete
                     // episode rows instead, so specials and unaired episodes
@@ -3849,6 +3923,61 @@ final class NuvioAPIClient {
             if let season = tombstone.season { key["season"] = season }
             if let episode = tombstone.episode { key["episode"] = episode }
             return key
+        }
+        try await rpcVoid(
+            "sync_delete_watched_items",
+            session: session,
+            params: [
+                "p_keys": keys,
+                "p_profile_id": remoteProfileId
+            ]
+        )
+    }
+
+    func pushWatchedLibraryMutation(
+        _ mutation: WatchedLibraryMutationUpload,
+        session: AuthSession,
+        remoteProfileId: Int
+    ) async throws {
+        let episodes = mutation.episodes.isEmpty
+            ? mutation.episode.map { [$0] } ?? []
+            : mutation.episodes
+        if mutation.isWatched {
+            let targets: [Int?] = episodes.isEmpty ? [mutation.episode] : episodes.map(Optional.some)
+            let payload = targets.map { episode -> [String: Any] in
+                [
+                    "content_id": mutation.meta.id,
+                    "content_type": mutation.meta.type,
+                    "title": mutation.meta.name,
+                    "season": mutation.season.map { $0 as Any } ?? NSNull(),
+                    "episode": episode.map { $0 as Any } ?? NSNull(),
+                    "watched_at": Self.milliseconds(from: mutation.changedAt)
+                ]
+            }
+            try await rpcVoid(
+                "sync_push_watched_items",
+                session: session,
+                params: [
+                    "p_items": payload,
+                    "p_profile_id": remoteProfileId
+                ]
+            )
+            return
+        }
+
+        let keys: [[String: Any]]
+        if episodes.isEmpty {
+            var key: [String: Any] = ["content_id": mutation.meta.id]
+            if let season = mutation.season { key["season"] = season }
+            if let episode = mutation.episode { key["episode"] = episode }
+            keys = [key]
+        } else {
+            keys = episodes.map { episode in
+                var key: [String: Any] = ["content_id": mutation.meta.id]
+                if let season = mutation.season { key["season"] = season }
+                key["episode"] = episode
+                return key
+            }
         }
         try await rpcVoid(
             "sync_delete_watched_items",

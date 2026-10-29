@@ -1,3 +1,4 @@
+import Combine
 import XCTest
 @testable import NuvioTV
 
@@ -2882,6 +2883,213 @@ final class ContinueWatchingAndPlayerSyncTests: XCTestCase {
             XCTAssertTrue(finalRecords.contains { $0.progressKey == key }, "Playback record \(key) must survive concurrent reconciliation")
         }
     }
+
+    func testLibraryUnwatchIsSourceScopedAccountBoundAndDoesNotTouchResumeState() throws {
+        let profileId = dismissalTestProfileId
+        let accountID = "nuvio-account-for-\(profileId):1"
+        ProfileSettings.current.set(TraktLibrarySourceMode.local.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        WatchedStore.setNuvioSyncAccountBinding(accountID, profileId: profileId)
+
+        let meta = NuvioMeta(id: "tt-library-nuvio-unwatch", name: "Library Unwatch", type: "movie")
+        let watchedAt = Date(timeIntervalSince1970: 1_700_000_123)
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: watchedAt,
+                sources: [TraktWatchProgressSource.nuvioSync.rawValue, TraktWatchProgressSource.mdblist.rawValue],
+                watchCountsBySource: [
+                    TraktWatchProgressSource.nuvioSync.rawValue: 5,
+                    TraktWatchProgressSource.mdblist.rawValue: 3
+                ],
+                lastCountedPlaybackIDsBySource: [
+                    TraktWatchProgressSource.nuvioSync.rawValue: "nuvio-play-5",
+                    TraktWatchProgressSource.mdblist.rawValue: "mdblist-play-3"
+                ]
+            )
+        ])
+        ContinueWatchingStore.replaceAll([makeDismissalTestItem(contentId: meta.id)])
+        let resumeBefore = ContinueWatchingStore.items()
+        let context = try XCTUnwrap(
+            WatchedStore.captureLibraryMutationContext(for: .local, profileId: profileId)
+        )
+
+        XCTAssertTrue(WatchedStore.setLibraryWatched(meta, isWatched: false, context: context))
+        let stored = try XCTUnwrap(WatchedStore.items().first { $0.meta.id == meta.id })
+        XCTAssertFalse(stored.sources.contains(TraktWatchProgressSource.nuvioSync.rawValue))
+        XCTAssertTrue(stored.sources.contains(TraktWatchProgressSource.mdblist.rawValue))
+        XCTAssertNil(stored.watchCountsBySource[TraktWatchProgressSource.nuvioSync.rawValue])
+        XCTAssertEqual(stored.watchCountsBySource[TraktWatchProgressSource.mdblist.rawValue], 3)
+        XCTAssertEqual(stored.lastCountedPlaybackIDsBySource[TraktWatchProgressSource.mdblist.rawValue], "mdblist-play-3")
+        XCTAssertEqual(stored.watchedAt, watchedAt)
+        XCTAssertEqual(ContinueWatchingStore.items().map(\.id), resumeBefore.map(\.id))
+        XCTAssertFalse(WatchedStore.isWatchedForLibrary(meta: meta, source: .local))
+        XCTAssertTrue(WatchedStore.isWatchedForLibrary(meta: meta, source: .mdblist))
+
+        let mutation = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .nuvioSync, profileId: profileId).first
+        )
+        XCTAssertFalse(mutation.isWatched)
+        XCTAssertEqual(mutation.accountID, accountID)
+        XCTAssertEqual(mutation.profileID, profileId)
+        XCTAssertFalse(WatchedStore.acknowledgeLibraryMutation(
+            id: mutation.id,
+            provider: .nuvioSync,
+            accountID: "different-account",
+            profileId: profileId
+        ))
+        XCTAssertEqual(WatchedStore.pendingLibraryMutations(provider: .nuvioSync, profileId: profileId).count, 1)
+        XCTAssertTrue(WatchedStore.deferLibraryMutation(
+            id: mutation.id,
+            provider: .nuvioSync,
+            accountID: accountID,
+            profileId: profileId
+        ))
+        let deferred = try XCTUnwrap(WatchedStore.pendingLibraryMutations(provider: .nuvioSync, profileId: profileId).first)
+        XCTAssertEqual(deferred.attemptCount, 1)
+        XCTAssertGreaterThan(deferred.nextAttemptAt ?? .distantPast, Date())
+        XCTAssertTrue(WatchedStore.pendingLibraryMutations(
+            provider: .nuvioSync,
+            profileId: profileId,
+            readyOnly: true
+        ).isEmpty)
+        XCTAssertTrue(WatchedStore.acknowledgeLibraryMutation(
+            id: mutation.id,
+            provider: .nuvioSync,
+            accountID: accountID,
+            profileId: profileId
+        ))
+        XCTAssertTrue(WatchedStore.isWatchedForLibrary(meta: meta, source: .mdblist))
+        XCTAssertTrue(WatchedStore.pendingLibraryMutations(provider: .nuvioSync, profileId: profileId).isEmpty)
+    }
+
+    func testLibrarySnapshotShowsOnlyPrimaryPendingMarksAndPreservesLegacyPlaybackCounts() throws {
+        let profileId = dismissalTestProfileId
+        let accountID = "nuvio-account-for-\(profileId):1"
+        ProfileSettings.current.set(TraktLibrarySourceMode.local.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        ProfileSettings.current.set(TraktWatchProgressSource.simkl.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+        WatchedStore.setNuvioSyncAccountBinding(accountID, profileId: profileId)
+
+        let pendingMeta = NuvioMeta(id: "tt-library-secondary-pending", name: "Pending", type: "movie")
+        let secondaryEvent = WatchedLibraryMutationUpload(
+            provider: .nuvioSync,
+            accountID: accountID,
+            profileID: profileId,
+            meta: pendingMeta,
+            season: nil,
+            episode: nil,
+            isWatched: true,
+            isPrimaryTarget: false
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: pendingMeta,
+                watchedAt: Date(),
+                pendingLibraryMutations: [secondaryEvent],
+                legacyUnattributed: false
+            )
+        ])
+        XCTAssertFalse(WatchedStore.isWatchedForLibrary(meta: pendingMeta, source: .local))
+        XCTAssertFalse(WatchedStore.contains(meta: pendingMeta), "A secondary pending scrobble must not change Home/Details playback state.")
+
+        let primaryEvent = WatchedLibraryMutationUpload(
+            id: secondaryEvent.id,
+            provider: .nuvioSync,
+            accountID: accountID,
+            profileID: profileId,
+            meta: pendingMeta,
+            season: nil,
+            episode: nil,
+            isWatched: true,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: pendingMeta,
+                watchedAt: Date(),
+                pendingLibraryMutations: [primaryEvent],
+                legacyUnattributed: false
+            )
+        ])
+        XCTAssertTrue(WatchedStore.isWatchedForLibrary(meta: pendingMeta, source: .local))
+        XCTAssertFalse(WatchedStore.contains(meta: pendingMeta), "Only the selected library gets optimistic pending state.")
+        let context = try XCTUnwrap(
+            WatchedStore.captureLibraryMutationContext(for: .local, profileId: profileId)
+        )
+        XCTAssertTrue(WatchedStore.setLibraryWatched(pendingMeta, isWatched: false, context: context))
+        XCTAssertFalse(WatchedStore.isWatchedForLibrary(meta: pendingMeta, source: .local))
+        let removeMutation = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .nuvioSync, profileId: profileId).first
+        )
+        XCTAssertFalse(removeMutation.isWatched)
+        XCTAssertTrue(WatchedStore.acknowledgeLibraryMutation(
+            id: removeMutation.id,
+            provider: .nuvioSync,
+            accountID: accountID,
+            profileId: profileId
+        ))
+        XCTAssertFalse(WatchedStore.items().contains { $0.meta.id == pendingMeta.id })
+
+        let legacyMeta = NuvioMeta(id: "tt-library-legacy", name: "Legacy", type: "movie")
+        WatchedStore.replaceAll([WatchedStoreItem(meta: legacyMeta, watchedAt: Date(), sources: [])])
+        XCTAssertTrue(WatchedStore.visibleItems().contains { $0.meta.id == legacyMeta.id })
+        XCTAssertEqual(WatchedStore.watchCount(meta: legacyMeta), 1)
+        XCTAssertFalse(WatchedStore.librarySnapshot(for: .mdblist, profileId: profileId)
+            .visibleItems.contains { $0.meta.id == legacyMeta.id })
+
+        let traktMark = WatchedStoreItem(
+            meta: legacyMeta,
+            watchedAt: Date(),
+            sources: [TraktWatchProgressSource.trakt.rawValue]
+        )
+        XCTAssertTrue(WatchedStore.mergeRemote([traktMark], confirmsTombstoneDeletions: false))
+        let mergedLegacy = try XCTUnwrap(WatchedStore.items().first { $0.meta.id == legacyMeta.id })
+        XCTAssertTrue(mergedLegacy.legacyUnattributed)
+        XCTAssertTrue(mergedLegacy.sources.contains(TraktWatchProgressSource.trakt.rawValue))
+        XCTAssertTrue(WatchedStore.visibleItems().contains { $0.meta.id == legacyMeta.id })
+        XCTAssertFalse(WatchedStore.librarySnapshot(for: .simkl, profileId: profileId)
+            .visibleItems.contains { $0.meta.id == legacyMeta.id })
+        XCTAssertTrue(WatchedStore.reconcileTraktSnapshot(
+            [],
+            syncStartedAt: Date().addingTimeInterval(1),
+            currentAccountID: "trakt-test-account"
+        ))
+        let afterTraktRemoval = try XCTUnwrap(WatchedStore.items().first { $0.meta.id == legacyMeta.id })
+        XCTAssertTrue(afterTraktRemoval.legacyUnattributed)
+        XCTAssertTrue(WatchedStore.visibleItems().contains { $0.meta.id == legacyMeta.id })
+        XCTAssertFalse(WatchedStore.librarySnapshot(for: .trakt, profileId: profileId)
+            .visibleItems.contains { $0.meta.id == legacyMeta.id })
+        XCTAssertEqual(WatchedStore.watchCount(meta: legacyMeta), 1)
+    }
+
+    func testLibraryMutationTargetsOnlyCheckedScrobbleProviders() throws {
+        let profileId = dismissalTestProfileId
+        let store = ProfileSettings.current
+        store.set(TraktLibrarySourceMode.local.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        store.set("trakt-test-client", forKey: SettingsKey.traktClientID)
+        store.set("trakt-test-secret", forKey: SettingsKey.traktClientSecret)
+        store.set("trakt-test-client", forKey: "nuvio.tv.trakt.auth.credentialClientID")
+        store.set("trakt-access-token", forKey: "nuvio.tv.trakt.auth.accessToken")
+        store.set("trakt-refresh-token", forKey: "nuvio.tv.trakt.auth.refreshToken")
+        store.set("trakt-test-user", forKey: "nuvio.tv.trakt.auth.userSlug")
+        store.set(true, forKey: SettingsKey.traktConnected)
+        store.set(false, forKey: SettingsKey.traktScrobbleEnabled)
+
+        let disabledContext = try XCTUnwrap(
+            WatchedStore.captureLibraryMutationContext(for: .local, profileId: profileId)
+        )
+        XCTAssertEqual(disabledContext.targets.map(\.provider), [.nuvioSync])
+
+        store.set(true, forKey: SettingsKey.traktScrobbleEnabled)
+        let enabledContext = try XCTUnwrap(
+            WatchedStore.captureLibraryMutationContext(for: .local, profileId: profileId)
+        )
+        XCTAssertEqual(Set(enabledContext.targets.map(\.provider)), [.nuvioSync, .trakt])
+        XCTAssertEqual(
+            enabledContext.targets.first(where: { $0.provider == .trakt })?.accountID,
+            "trakt-test-user"
+        )
+        XCTAssertNotEqual(disabledContext, enabledContext)
+    }
 }
 
 private final class ProfileSettingsSyncURLProtocol: URLProtocol {
@@ -3239,6 +3447,100 @@ final class NuvioSyncProfileSettingsTests: XCTestCase {
             $0.rpc == "sync_push_profile_settings_blob"
         }
         XCTAssertEqual(Set(uploads.compactMap { $0.params["p_platform"] as? String }), Set(["tv", "mobile"]))
+    }
+
+    @MainActor
+    func testNuvioLibraryPullRestores200TitlesIntoVisibleLibrary() async throws {
+        let previousLibraryProfileId = LibraryStore.activeProfileId
+        let previousSettingsProfileId = ProfileSettings.activeProfileID
+        let previousSettingsProfileIsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+
+        LibraryStore.eraseProfile(profileId)
+        eraseContinueWatchingTestSettingsSuite(profileId)
+        ProfileSettings.seedNewProfile(profileId)
+        LibraryStore.setActiveProfile(profileId)
+        ProfileSettings.setActiveProfile(profileId, isPrimary: false)
+        ProfileSettings.current.set(TraktLibrarySourceMode.local.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        defer {
+            LibraryStore.setActiveProfile(previousLibraryProfileId)
+            LibraryStore.eraseProfile(profileId)
+            if let previousSettingsProfileId {
+                ProfileSettings.setActiveProfile(previousSettingsProfileId, isPrimary: previousSettingsProfileIsPrimary)
+            } else {
+                ProfileSettings.clearActiveProfile()
+            }
+            eraseContinueWatchingTestSettingsSuite(profileId)
+        }
+
+        let rowCount = 200
+        let expectedIDs = (0..<rowCount).map { String(format: "tt-library-restore-%03d", $0) }
+        let rows: [[String: Any]] = (0..<rowCount).map { index in
+            let addedAt = Int64(1_700_000_000_000 + (rowCount - index - 1) * 1_000)
+            return [
+                "content_id": expectedIDs[index],
+                "content_type": index.isMultiple(of: 3) ? "series" : "movie",
+                "name": String(format: "Restored Title %03d", index + 1),
+                "poster": "https://images.example.test/library/\(index)/poster.jpg",
+                "background": "https://images.example.test/library/\(index)/background.jpg",
+                "description": "Restored description \(index + 1)",
+                "release_info": String(1990 + index % 35),
+                "imdb_rating": Double(50 + index % 50) / 10.0,
+                "genres": ["Drama", "Genre \(index % 7)"],
+                "added_at": addedAt
+            ]
+        }
+        ProfileSettingsSyncURLProtocol.install { request in
+            guard request.rpc == "sync_pull_library" else { return (404, Data("{}".utf8)) }
+            return self.response(rows)
+        }
+
+        let pulledItems = try await NuvioAPIClient(session: session).pullLibrary(
+            session: authSession,
+            remoteProfileId: 91
+        )
+        XCTAssertEqual(pulledItems.count, rowCount)
+        XCTAssertEqual(pulledItems.map(\.meta.id), expectedIDs)
+
+        let requests = ProfileSettingsSyncURLProtocol.capturedRequests()
+        XCTAssertEqual(requests.count, 1)
+        let pullRequest = try XCTUnwrap(requests.first)
+        XCTAssertEqual(pullRequest.rpc, "sync_pull_library")
+        XCTAssertEqual(pullRequest.params["p_profile_id"] as? Int, 91)
+        XCTAssertEqual(pullRequest.params["p_limit"] as? Int, 500)
+        XCTAssertEqual(pullRequest.params["p_offset"] as? Int, 0)
+
+        let sample = try XCTUnwrap(pulledItems.dropFirst(42).first, "Expected at least 43 pulled titles")
+        XCTAssertEqual(sample.meta.name, "Restored Title 043")
+        XCTAssertEqual(sample.meta.type, "series")
+        XCTAssertEqual(sample.meta.posterUrl, "https://images.example.test/library/42/poster.jpg")
+        XCTAssertEqual(sample.meta.backgroundUrl, "https://images.example.test/library/42/background.jpg")
+        XCTAssertEqual(sample.meta.description, "Restored description 43")
+        XCTAssertEqual(sample.meta.releaseInfo, "1997")
+        XCTAssertEqual(sample.meta.year, 1997)
+        XCTAssertEqual(sample.meta.rating, 9.2)
+        XCTAssertEqual(sample.meta.genres, ["Drama", "Genre 0"])
+
+        let viewModel = LibraryViewModel()
+        XCTAssertTrue(viewModel.items.isEmpty)
+        let visibleItemsUpdated = expectation(description: "LibraryViewModel observes the restored library")
+        let updateSubscription = viewModel.$items
+            .dropFirst()
+            .first(where: { $0.count == rowCount })
+            .sink { _ in visibleItemsUpdated.fulfill() }
+        defer { updateSubscription.cancel() }
+
+        let pullContext = LibraryStore.capturePullContext(profileId: profileId)
+        XCTAssertTrue(LibraryStore.reconcileRemote(pulledItems, context: pullContext))
+        await fulfillment(of: [visibleItemsUpdated], timeout: 1.0)
+        XCTAssertEqual(viewModel.items.count, rowCount)
+        XCTAssertEqual(viewModel.items.map(\.id), expectedIDs)
+        let visibleSample = try XCTUnwrap(viewModel.items.dropFirst(42).first, "Expected at least 43 visible titles")
+        XCTAssertEqual(visibleSample.name, "Restored Title 043")
+        XCTAssertEqual(visibleSample.poster, "https://images.example.test/library/42/poster.jpg")
+        XCTAssertEqual(visibleSample.genres, ["Drama", "Genre 0"])
+        let sortedAndGroupedItems = viewModel.sortedAndGroupedItems["All"] ?? []
+        XCTAssertEqual(sortedAndGroupedItems.count, rowCount)
+        XCTAssertEqual(sortedAndGroupedItems.map(\.id), expectedIDs)
     }
 
     func testConfirmedMatchingDocumentsAreNotUploadedAgain() async throws {

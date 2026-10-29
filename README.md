@@ -102,9 +102,11 @@ fallback behavior, and the distinction from TrueHD passthrough.
 Nuvio supports Trakt device login with user-provided API credentials. This is useful when you want to use your own Trakt application instead of relying on shared app credentials.
 
 1. Create an application at [trakt.tv/oauth/applications](https://trakt.tv/oauth/applications).
-2. Set its redirect URI to `urn:ietf:wg:oauth:2.0:oob`.
+2. Set its redirect URI to `http://localhost:5173/callback`.
 3. On Apple TV, go to **Settings → Integrations → Trakt**, then enter the Trakt Client ID and Client Secret.
 4. Choose **Connect with Trakt**, scan the QR code or enter its code at `trakt.tv/activate`, and approve the connection.
+
+New profiles default to `http://localhost:5173/callback`. Existing profiles with a Trakt Client ID and no saved redirect setting keep the legacy `urn:ietf:wg:oauth:2.0:oob` value. You can keep an app's registered URI or change it in **Settings → Integrations → Trakt**; the value must exactly match the URI registered with Trakt because token refresh uses it.
 
 The Client ID and Client Secret are stored only on that Apple TV; they are deliberately excluded from Nuvio account/profile sync. Changing either credential disconnects the old Trakt session so it cannot be reused with a different application.
 

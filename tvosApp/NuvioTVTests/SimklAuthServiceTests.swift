@@ -8,9 +8,18 @@ final class SimklAuthServiceTests: XCTestCase {
     private var suiteName: String!
     private var tokenStorage: SimklMemoryTokenStorage!
 
+    private struct SimklWatchedProfile {
+        let id: String
+        let store: UserDefaults
+        let previousSettingsProfileID: String?
+        let previousSettingsPrimary: Bool
+        let previousWatchedProfileID: String?
+    }
+
     override func setUp() {
         super.setUp()
         ProfileSettings.clearActiveProfile()
+        WatchedStore.setActiveProfile(nil)
         suiteName = "SimklAuthServiceTests.\(UUID().uuidString)"
         defaults = UserDefaults(suiteName: suiteName)
         defaults.removePersistentDomain(forName: suiteName)
@@ -24,6 +33,7 @@ final class SimklAuthServiceTests: XCTestCase {
 
     override func tearDown() {
         ProfileSettings.clearActiveProfile()
+        WatchedStore.setActiveProfile(nil)
         SimklURLProtocolStub.handler = nil
         defaults.removePersistentDomain(forName: suiteName)
         SimklSyncCache.eraseAll()
@@ -1231,6 +1241,51 @@ final class SimklAuthServiceTests: XCTestCase {
         )
     }
 
+    private func beginSimklWatchedProfile() -> SimklWatchedProfile {
+        let profileId = "simkl-watched-outbox-\(UUID().uuidString)"
+        let previousSettingsProfileID = ProfileSettings.activeProfileID
+        let previousSettingsPrimary = ProfileSettings.isPrimaryProfileStore(ProfileSettings.current)
+        let previousWatchedProfileID = WatchedStore.activeProfileId
+        ProfileSettings.setActiveProfile(profileId, isPrimary: false)
+        WatchedStore.setActiveProfile(profileId)
+        let store = ProfileSettings.current
+        store.set("client-id", forKey: SettingsKey.simklClientID)
+        store.set(TraktWatchProgressSource.simkl.rawValue, forKey: SettingsKey.traktWatchProgressSource)
+        store.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        SimklAuthStore.saveToken(
+            "simkl-token",
+            clientID: "client-id",
+            profileScope: profileId,
+            store: store,
+            tokenStorage: tokenStorage
+        )
+        return SimklWatchedProfile(
+            id: profileId,
+            store: store,
+            previousSettingsProfileID: previousSettingsProfileID,
+            previousSettingsPrimary: previousSettingsPrimary,
+            previousWatchedProfileID: previousWatchedProfileID
+        )
+    }
+
+    private func endSimklWatchedProfile(_ profile: SimklWatchedProfile) {
+        WatchedStore.eraseProfile(profile.id)
+        WatchedStore.setActiveProfile(profile.previousWatchedProfileID)
+        tokenStorage.setAccessToken(nil, for: profile.id)
+        tokenStorage.setRefreshToken(nil, for: profile.id)
+        if let previousSettingsProfileID = profile.previousSettingsProfileID {
+            ProfileSettings.setActiveProfile(
+                previousSettingsProfileID,
+                isPrimary: profile.previousSettingsPrimary
+            )
+        } else {
+            ProfileSettings.clearActiveProfile()
+        }
+        UserDefaults.standard.removePersistentDomain(
+            forName: "nuvio.tv.profile.settings.\(profile.id)"
+        )
+    }
+
     private func makeMeta(type: String) -> NuvioMeta {
         NuvioMeta(
             id: "tt1234567",
@@ -1687,8 +1742,34 @@ final class SimklAuthServiceTests: XCTestCase {
         XCTAssertEqual(watched.first?.watchedAt, expectedDate)
     }
 
-    func testSyncWatchedHistorySucceedsWhenOneCategoryFailsOrReturns204() async throws {
+    func testSyncWatchedHistoryImportsSuccessfulCategoriesAndPreservesFailedCategory() async throws {
         authorize()
+        defaults.set(TraktLibrarySourceMode.simkl.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+        let oldTimestamp = Date(timeIntervalSince1970: 1_700_000_000)
+        let oldMovie = NuvioMeta(id: "tt7654321", name: "Old Movie", imdbId: "tt7654321", type: "movie")
+        let oldAnime = NuvioMeta(id: "mal:7654321", name: "Old Anime", type: "series")
+        SimklSyncCache.saveHistory(
+            [
+                SimklHistoryRecord(
+                    key: "movie:imdb:tt7654321",
+                    items: [WatchedStoreItem(meta: oldMovie, watchedAt: oldTimestamp)],
+                    category: "movies"
+                ),
+                SimklHistoryRecord(
+                    key: "series:mal:7654321",
+                    items: [WatchedStoreItem(
+                        meta: oldAnime,
+                        watchedAt: oldTimestamp,
+                        season: 1,
+                        episode: 3
+                    )],
+                    category: "anime"
+                )
+            ],
+            watermark: nil,
+            activities: nil,
+            store: defaults
+        )
         SimklURLProtocolStub.handler = { request in
             switch request.url?.path {
             case "/sync/activities":
@@ -1743,8 +1824,199 @@ final class SimklAuthServiceTests: XCTestCase {
 
         XCTAssertTrue(success, "History sync should succeed even if movies/anime return 204/404")
         let history = SimklSyncCache.history(in: defaults)
-        XCTAssertEqual(history.count, 1)
-        XCTAssertEqual(history.first?.items.first?.episode, 1)
+        XCTAssertEqual(history.count, 2)
+        XCTAssertTrue(history.contains { $0.items.contains(where: { $0.episode == 1 }) })
+        XCTAssertTrue(history.contains { $0.items.contains(where: { $0.episode == 3 }) })
+        XCTAssertFalse(history.contains { $0.key.hasPrefix("movie:") }, "A 204 is an authoritative empty category")
+        XCTAssertNil(SimklSyncCache.historyWatermark(in: defaults), "The failed category must be retried")
+    }
+
+    func testWatchedLibraryOutboxDefersSimklNotFoundMovie() async throws {
+        let profile = beginSimklWatchedProfile()
+        defer { endSimklWatchedProfile(profile) }
+        let store = profile.store
+        let accountID = SimklAuthStore.accountBindingID(in: store)
+        let mutation = WatchedLibraryMutationUpload(
+            provider: .simkl,
+            accountID: accountID,
+            profileID: profile.id,
+            meta: makeMeta(type: "movie"),
+            season: nil,
+            episode: nil,
+            isWatched: true,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: mutation.meta,
+                watchedAt: mutation.changedAt,
+                pendingLibraryMutations: [mutation],
+                legacyUnattributed: false
+            )
+        ], profileId: profile.id)
+
+        SimklURLProtocolStub.handler = { request in
+            XCTAssertEqual(request.url?.path, "/sync/history")
+            return Self.response(
+                for: request,
+                status: 201,
+                json: #"{"added":{"movies":0},"not_found":{"movies":[{"ids":{"imdb":"tt1234567"}}],"shows":[],"episodes":[]}}"#
+            )
+        }
+
+        let flushed = await SimklHistoryService.flushPendingLibraryMutations(
+            store: store,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: profile.id
+        )
+
+        XCTAssertFalse(flushed)
+        let pending = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .simkl, profileId: profile.id).first
+        )
+        XCTAssertEqual(pending.id, mutation.id)
+        XCTAssertEqual(pending.attemptCount, 1)
+        XCTAssertFalse(WatchedStore.items(profileId: profile.id).contains {
+            $0.sources.contains(TraktWatchProgressSource.simkl.rawValue)
+        })
+    }
+
+    func testWatchedLibraryOutboxRewritesPartialEpisodeRejectsWithoutReplayingSuccesses() async throws {
+        let profile = beginSimklWatchedProfile()
+        defer { endSimklWatchedProfile(profile) }
+        let store = profile.store
+        let accountID = SimklAuthStore.accountBindingID(in: store)
+        let mutation = WatchedLibraryMutationUpload(
+            provider: .simkl,
+            accountID: accountID,
+            profileID: profile.id,
+            meta: makeMeta(type: "series"),
+            season: 1,
+            episode: nil,
+            episodes: [1, 2, 3, 4],
+            isWatched: true,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: mutation.meta,
+                watchedAt: mutation.changedAt,
+                season: 1,
+                episode: 1,
+                pendingLibraryMutations: [mutation],
+                legacyUnattributed: false
+            )
+        ], profileId: profile.id)
+        var sentEpisodes: [Int] = []
+        SimklURLProtocolStub.handler = { request in
+            let body = try Self.jsonBody(request)
+            let shows = try XCTUnwrap(body["shows"] as? [[String: Any]])
+            let seasons = try XCTUnwrap(shows.first?["seasons"] as? [[String: Any]])
+            let episodes = try XCTUnwrap(seasons.first?["episodes"] as? [[String: Any]])
+            sentEpisodes = episodes.compactMap { $0["number"] as? Int }
+            return Self.response(
+                for: request,
+                status: 201,
+                json: #"{"added":{"shows":1,"episodes":2},"not_found":{"movies":[],"shows":[],"episodes":[{"ids":{"imdb":"tt1234567"},"season":1,"number":2},{"ids":{"imdb":"tt1234567"},"season":1,"number":4}]}}"#
+            )
+        }
+
+        let flushed = await SimklHistoryService.flushPendingLibraryMutations(
+            store: store,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: profile.id
+        )
+
+        XCTAssertFalse(flushed, "The unresolved episode must remain pending")
+        XCTAssertEqual(sentEpisodes, [1, 2, 3, 4])
+        let pending = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .simkl, profileId: profile.id).first
+        )
+        XCTAssertEqual(pending.id, mutation.id)
+        XCTAssertEqual(pending.episodes, [2, 4], "Successful episodes must be removed from the retry payload")
+        let rows = WatchedStore.items(profileId: profile.id)
+        for episode in [1, 3] {
+            XCTAssertTrue(rows.contains {
+                $0.season == 1 && $0.episode == episode
+                    && $0.sources.contains(TraktWatchProgressSource.simkl.rawValue)
+            })
+        }
+        XCTAssertFalse(rows.contains {
+            $0.season == 1 && $0.episode == 2
+                && $0.sources.contains(TraktWatchProgressSource.simkl.rawValue)
+        })
+    }
+
+    func testWatchedLibraryPartialAcknowledgementDoesNotOverwriteSupersedingMutation() async throws {
+        let profile = beginSimklWatchedProfile()
+        defer { endSimklWatchedProfile(profile) }
+        let store = profile.store
+        let accountID = SimklAuthStore.accountBindingID(in: store)
+        let meta = makeMeta(type: "series")
+        let mutation = WatchedLibraryMutationUpload(
+            provider: .simkl,
+            accountID: accountID,
+            profileID: profile.id,
+            meta: meta,
+            season: 1,
+            episode: nil,
+            episodes: [1, 2],
+            isWatched: true,
+            isPrimaryTarget: true
+        )
+        WatchedStore.replaceAll([
+            WatchedStoreItem(
+                meta: meta,
+                watchedAt: mutation.changedAt,
+                season: 1,
+                episode: 1,
+                pendingLibraryMutations: [mutation],
+                legacyUnattributed: false
+            )
+        ], profileId: profile.id)
+        let superseding = WatchedLibraryMutationUpload(
+            provider: .simkl,
+            accountID: accountID,
+            profileID: profile.id,
+            meta: meta,
+            season: 1,
+            episode: 3,
+            isWatched: false,
+            isPrimaryTarget: true
+        )
+        SimklURLProtocolStub.handler = { request in
+            WatchedStore.replaceAll([
+                WatchedStoreItem(
+                    meta: meta,
+                    watchedAt: superseding.changedAt,
+                    season: 1,
+                    episode: 3,
+                    pendingLibraryMutations: [superseding],
+                    legacyUnattributed: false
+                )
+            ], profileId: profile.id)
+            return Self.response(
+                for: request,
+                status: 201,
+                json: #"{"added":{"shows":1,"episodes":1},"not_found":{"movies":[],"shows":[],"episodes":[{"ids":{"imdb":"tt1234567"},"season":1,"number":2}]}}"#
+            )
+        }
+
+        _ = await SimklHistoryService.flushPendingLibraryMutations(
+            store: store,
+            client: makeClient(),
+            tokenStorage: tokenStorage,
+            profileScope: profile.id
+        )
+
+        let pending = try XCTUnwrap(
+            WatchedStore.pendingLibraryMutations(provider: .simkl, profileId: profile.id).first
+        )
+        XCTAssertEqual(pending.id, superseding.id)
+        XCTAssertEqual(pending.episode, 3)
+        XCTAssertFalse(pending.isWatched)
     }
 
     func testAllItemsResponseDecodesSingleArrayFormat() throws {
