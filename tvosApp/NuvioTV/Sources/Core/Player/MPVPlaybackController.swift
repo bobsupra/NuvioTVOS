@@ -671,7 +671,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let image = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
@@ -757,7 +758,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         let cached = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,

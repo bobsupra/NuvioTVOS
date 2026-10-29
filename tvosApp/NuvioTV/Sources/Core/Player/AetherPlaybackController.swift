@@ -2383,7 +2383,10 @@ actor HybridSeekThumbnailIndex {
         }
     }
 
-    func lookup(seconds: Double, duration: Double, generation: UInt64) async -> CGImage? {
+    /// `exactOnly` returns only a still that belongs to `seconds` (within the half-second preview
+    /// bound, or the whole-second disk bucket next to it), never a neighbour seconds away: scrubbing
+    /// shows the right still once instead of a nearby one replaced a moment later.
+    func lookup(seconds: Double, duration: Double, generation: UInt64, exactOnly: Bool = false) async -> CGImage? {
         guard self.generation == generation, duration.isFinite, duration > 0 else { return nil }
 
         // Tier 1: External Storyboard / BIF (0ms instant crop)
@@ -2407,11 +2410,13 @@ actor HybridSeekThumbnailIndex {
         // Tier 3: In-memory nearest RAM thumbnail (coarse bucket fallback)
         if let nearest = coarse.min(by: {
             abs($0.value.seconds - seconds) < abs($1.value.seconds - seconds)
-        }), HybridSeekThumbnailPolicy.acceptsCoarse(
-            sampleSeconds: nearest.value.seconds,
-            targetSeconds: seconds,
-            duration: duration
-        ) {
+        }), (exactOnly
+            ? abs(nearest.value.seconds - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError
+            : HybridSeekThumbnailPolicy.acceptsCoarse(
+                sampleSeconds: nearest.value.seconds,
+                targetSeconds: seconds,
+                duration: duration
+            )) {
             accessCounter &+= 1
             var entry = nearest.value
             entry.lastAccess = accessCounter
@@ -2421,7 +2426,8 @@ actor HybridSeekThumbnailIndex {
 
         // Tier 4: Persistent Disk Cache (~0.5ms memory-mapped read)
         if !streamKey.isEmpty {
-            let tolerance = HybridSeekThumbnailPolicy.coarseLookupTolerance(duration: duration)
+            // Disk stills are bucketed by whole seconds, so "exact" admits the neighbouring bucket.
+            let tolerance = exactOnly ? 1 : HybridSeekThumbnailPolicy.coarseLookupTolerance(duration: duration)
             if let diskHit = await TrickplayDiskCache.shared.lookupWithTimestamp(streamKey: streamKey, seconds: seconds, tolerance: tolerance) {
                 // Promote to in-memory cache using actual disk frame timestamp
                 let kind: Kind = abs(diskHit.seconds - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError ? .fine : .coarse
@@ -2899,11 +2905,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let image = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: duration,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
-        return image ?? seekPreviewLaneHost.current?.memoryImage(at: seconds, duration: duration)
+        // No lane cell here: inside the buffer the exact resident still follows, and showing the
+        // cell's keyframe first would swap pictures. generateScrubThumbnail reaches the lane.
+        return image
     }
 
     func scrubThumbnail(
@@ -3236,7 +3245,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let cached = await hybridThumbnailIndex.lookup(
             seconds: seconds,
             duration: durationMs > 0 ? Double(durationMs) / 1000.0 : 3600.0,
-            generation: generation
+            generation: generation,
+            exactOnly: true
         )
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,
@@ -3246,16 +3256,15 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         // admitted by SeekPreviewNetworkPolicy), never through a one-shot extractor per request.
         let usesPreviewLane = SeekPreviewLaneHost.mayServe(sourceContext)
         if usesBoundedProgressiveScrubPreview(sourceContext) {
-            // A fast request (precise: false) takes the keyframe before the target: one
-            // frame decoded instead of the whole stretch up to it. The exact frame is
-            // the follow-up request once the user stops moving.
+            // Fast and exact requests both decode the exact frame: a keyframe some seconds
+            // early, replaced by the exact one a moment later, read as a wrong preview.
             let still = await Self.boundedProgressiveScrubFrame(
                 at: seconds,
-                precise: precise,
+                precise: true,
                 resident: {
                     await engine.scrubPreviewFrame(
                         atSeconds: seconds,
-                        refined: precise,
+                        refined: true,
                         maxWidth: maxWidth,
                         isCancelled: { cancellation.isCancelled })
                 },
