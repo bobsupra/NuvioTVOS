@@ -56,7 +56,7 @@ public actor FrameExtractor {
     var isClosingContextForTesting: Bool { isClosingAuxiliaryContext }
     var isContextOpenForTesting: Bool { context.isOpen }
 
-    private let idleInterval: Duration = .seconds(10)
+    private var idleInterval: Duration = .seconds(10)
     private var idleTask: Task<Void, Never>?
     private var residentApproximation: (width: Int, frame: ScrubFrame)?
     nonisolated let residentIdentity: String?
@@ -72,15 +72,19 @@ public actor FrameExtractor {
         guard !isShutDown, !isClosingAuxiliaryContext, rawTarget.isFinite,
               !Task.isCancelled, !isCancelled() else { return nil }
         guard maxWidth > 0 else { return nil }
-        let width = maxWidth
-        if !refined, let cached = residentApproximation, cached.width == width {
-            scheduleIdleClose()
-            return cached.frame
-        }
+        // A cached approximation is still the latest scrub intent; retire an older refinement
+        // before returning it, using the same cross-mode ownership rule as ordinary stills.
         currentToken?.cancel()
         boundedCancellation?.cancel()
         let token = CancelToken(); currentToken = token
         let generation = admissionGeneration
+        defer {
+            if !isShutDown, currentToken === token { scheduleIdleClose() }
+        }
+        let width = maxWidth
+        if !refined, let cached = residentApproximation, cached.width == width {
+            return cached.frame
+        }
         let context = self.context
         let result: ScrubFrame? = await withTaskCancellationHandler {
             await runOnQueue {
@@ -100,7 +104,6 @@ public actor FrameExtractor {
         if !refined, let result, result.image.bytesPerRow * result.image.height <= 512 * 1_024 {
             residentApproximation = (width, result)
         }
-        scheduleIdleClose()
         return result
     }
 
@@ -150,8 +153,10 @@ public actor FrameExtractor {
                   yieldWhile: yieldWhile)
     }
 
-    init(residentReader: IOReader, formatHint: String, identity: String) {
-        self.init(context: FrameDecodeContext(reader: residentReader, formatHint: formatHint),
+    init(residentReader: IOReader, formatHint: String, identity: String,
+         residentBudget: Duration = .milliseconds(750)) {
+        self.init(context: FrameDecodeContext(reader: residentReader, formatHint: formatHint,
+                                              residentBudget: residentBudget),
                   yieldWhile: nil, residentIdentity: identity)
     }
 
@@ -431,8 +436,19 @@ public actor FrameExtractor {
     ) async -> CGImage? {
         // Audit BIT-105: a 0/0 scrub fraction or `CMTime.indefinite.seconds` is a host bug, not a position.
         guard !isShutDown, !isClosingAuxiliaryContext, !Task.isCancelled, seconds.isFinite, seconds >= 0 else { return nil }
+        // A valid request owns the scrub intent even when its image is already cached or it
+        // yields to playback. Retire the preceding decode before either early return.
+        currentToken?.cancel()
+        boundedCancellation?.cancel()
+        let token = CancelToken()
+        currentToken = token
+        let generation = admissionGeneration
+        // Every admitted outcome owns idle cleanup, including cache hits, yields and caller
+        // cancellation. A late completion cannot extend the newer request's idle lifetime.
+        defer {
+            if !isShutDown, currentToken === token { scheduleIdleClose() }
+        }
         if let hit = cache.get(mode: mode, seconds: seconds, targetWidth: targetWidth, maxSize: maxSize) {
-            scheduleIdleClose()
             return hit
         }
         // Elective thumbnails and precise scrub previews yield while playback is starved; cached hits are free.
@@ -441,12 +457,6 @@ public actor FrameExtractor {
                            category: .swPlayback, level: .verbose)
             return nil
         }
-        currentToken?.cancel()
-        boundedCancellation?.cancel()
-        let token = CancelToken()
-        currentToken = token
-        let generation = admissionGeneration
-
         let context = self.context
         let result = await withTaskCancellationHandler {
             await runOnQueue { () -> FrameResult in
@@ -482,11 +492,12 @@ public actor FrameExtractor {
         } onCancel: {
             token.cancel()
         }
-        guard generation == admissionGeneration, !token.isCancelled, !Task.isCancelled else { return nil }
+        // Cancellation can win after the decode's last check, or while its result waits to
+        // reenter this actor. Never publish/cache that result or reset a newer request's idle timer.
+        guard generation == admissionGeneration, !isShutDown, !Task.isCancelled, !token.isCancelled else { return nil }
         if let image = result.image {
             cache.set(image, mode: mode, seconds: seconds, targetWidth: targetWidth, maxSize: maxSize)
         }
-        scheduleIdleClose()
         return result.image
     }
 
@@ -497,6 +508,12 @@ public actor FrameExtractor {
                 continuation.resume(returning: work())
             }
         }
+    }
+
+    /// Tests that wait for the idle close shorten it, so a starved runner does not spend the
+    /// suite's time limit on a fixed ten-second sleep.
+    func setIdleIntervalForTesting(_ interval: Duration) {
+        idleInterval = interval
     }
 
     /// Restart the idle countdown (called after every request). After `idleInterval`

@@ -17,18 +17,24 @@ enum FrameRateSnap {
     /// VFR / weird capture rates or a probe failure.
     static let standard: [Double] = [23.976, 24, 25, 29.97, 30, 48, 50, 59.94, 60]
 
+    /// How close a probe has to be to 24.000 to be programmed as 24 Hz:
+    /// a fifth of the 0.024 gap to 23.976.
+    static let exact24Tolerance: Double = 0.005
+
     /// Snap `raw` to the nearest member of `standard` within ±0.5 fps,
     /// or `nil` if it falls outside that tolerance from every standard
-    /// rate. Special case: 23.976 wins the [23.5, 24.05] window over
-    /// 24.0 because film-cadence sources commonly probe to 23.976 and
-    /// 23.976 ↔ 24 matters for 3:2 pulldown / judder visibility.
+    /// rate. Special case: the [23.5, 24.05] window goes to 23.976 except
+    /// for a probe within `exact24Tolerance` of 24.000, which goes to 24.
     static func snap(_ raw: Double) -> Double? {
         guard raw > 0, raw.isFinite else { return nil }
 
-        // Film-cadence shortcut. 24.000-fps probes land here too;
-        // sending 23.976 to the panel for them is the conservative
-        // choice (panels that support 24 also support 23.976; the
-        // reverse isn't guaranteed).
+        // AE#884: 24.000 fps on a 23.976 Hz panel repeats a frame every
+        // ~42 s, so a true 24p source needs 24 Hz. A Matroska track with
+        // DefaultDuration probes as an exact 24/1 or 24000/1001, so 24p
+        // is told apart by an exact match and anything noisier stays 23.976.
+        if abs(raw - 24) <= exact24Tolerance {
+            return 24
+        }
         if raw >= 23.5 && raw <= 24.05 {
             return 23.976
         }

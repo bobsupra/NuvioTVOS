@@ -200,6 +200,14 @@ final class AudioBridge: @unchecked Sendable {
     /// S32 @ bits_per_raw_sample=24 for lossless sources (TrueHD, DTS-HD MA, FLAC, ALAC, raw 24/32-bit PCM) so
     /// FLAC output stays bit-perfect (S16 would dither away the bottom 8 bits, audible in quiet passages).
     private var pcmSampleFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
+
+    /// AE#923. While shaping is active the resampler writes interleaved Float32 (`swrOutFmt`), the
+    /// dynamics run on that, and `AudioShapingSampleWriter` hands the encoder its own format: a fold
+    /// or a lift resampled straight into S16/S32 would be clipped inside libswresample before the
+    /// limiter ever saw it.
+    private let shaping: AudioShaping
+    private var dynamics: AudioDynamicsProcessor?
+    private var swrOutFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
     private var pcmBytesPerSample: Int32 = 4
     private var pcmBitsPerRawSample: Int32 = 32
 
@@ -261,10 +269,12 @@ final class AudioBridge: @unchecked Sendable {
         srcCodecpar: UnsafeMutablePointer<AVCodecParameters>,
         srcTimeBase: AVRational,
         mode: Mode = .surroundCompat,
-        forcedEncoder: AVCodecID? = nil
+        forcedEncoder: AVCodecID? = nil,
+        shaping: AudioShaping = AudioShaping()
     ) throws {
         self.srcTimeBase = srcTimeBase
         self.mode = mode
+        self.shaping = shaping.clamped
 
         // 1. Source decoder
         let srcCodecID = srcCodecpar.pointee.codec_id
@@ -350,8 +360,12 @@ final class AudioBridge: @unchecked Sendable {
         // `.surroundCompat`, FLAC VBR max 8 otherwise. bit_rate is set below once the channel count is capped
         // (EAC3 scales 128 kbps x nChannels per DrHurt on AetherEngine#4: 256 stereo, 768 5.1, and scales
         // further if the cap is bumped per Nomis101's PR 21668). FLAC = 0 (VBR).
+        // AE#923: a channel cap decides the encoder like a source of that many channels would, so a
+        // 5.1 source capped to stereo is FLAC, not stereo E-AC-3.
+        let shapedChannels = self.shaping.isActive
+            ? self.shaping.outputChannels(forSource: resolvedChannels) : resolvedChannels
         let encoderCodecID = forcedEncoder
-            ?? Self.bridgeEncoder(for: mode, sourceChannels: resolvedChannels)
+            ?? Self.bridgeEncoder(for: mode, sourceChannels: shapedChannels)
         outputCodecID = encoderCodecID
         if encoderCodecID == AV_CODEC_ID_EAC3 {
             pcmSampleFmt = AV_SAMPLE_FMT_FLTP
@@ -386,7 +400,7 @@ final class AudioBridge: @unchecked Sendable {
 
         // Cap to encoder max (EAC3 5.1, FLAC 7.1). Above-cap downmix happens automatically inside swr_convert
         // when source layout exceeds the encoder's; the resampler picks Apple-compatible ordering.
-        let nChannels: Int32 = min(resolvedChannels, Self.maxEncodedChannels(for: encoderCodecID))
+        let nChannels: Int32 = min(shapedChannels, Self.maxEncodedChannels(for: encoderCodecID))
         let encoderName = avcodec_get_name(encoderCodecID).map { String(cString: $0) } ?? "?"
         let logBitRate: String = encoderCodecID == AV_CODEC_ID_EAC3
             ? "\(Int64(nChannels) * 128) kbps"
@@ -399,7 +413,8 @@ final class AudioBridge: @unchecked Sendable {
             + " "
             + "sourceChannels=\(resolvedChannels) "
             + "encoderChannels=\(nChannels) bitRate=\(logBitRate) "
-            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))",
+            + "(source=\(resolvedSource), container=\(containerChannels), decoder=\(decoderChannels))"
+            + (self.shaping.isActive ? " AE#923 shaping \(self.shaping.summary)" : ""),
             category: .session
         )
 
@@ -458,10 +473,11 @@ final class AudioBridge: @unchecked Sendable {
         swrInRate = inRate
         av_channel_layout_copy(&swrInLayout, &inLayout)
 
+        swrOutFmt = self.shaping.isActive ? AV_SAMPLE_FMT_FLT : pcmSampleFmt
         let swrRet = swr_alloc_set_opts2(
             &swrCtx,
             &enc.pointee.ch_layout,
-            pcmSampleFmt,
+            swrOutFmt,
             sampleRate,
             &inLayout,
             inFmt,
@@ -469,9 +485,14 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
-        guard swrRet >= 0, swrCtx != nil else {
+        guard swrRet >= 0, let swrAllocated = swrCtx else {
             cleanup()
             throw AudioBridgeError.resamplerAllocFailed(code: swrRet)
+        }
+        if self.shaping.isActive {
+            AudioShapingMatrix.apply(to: swrAllocated, input: &inLayout, output: &enc.pointee.ch_layout,
+                                     dialogueGain: self.shaping.dialogueGain)
+            dynamics = AudioDynamicsProcessor(compressor: self.shaping.compressor, sampleRate: sampleRate)
         }
         let initRet = swr_init(swrCtx)
         guard initRet >= 0 else {
@@ -705,6 +726,7 @@ final class AudioBridge: @unchecked Sendable {
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
+        dynamics?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -1039,7 +1061,7 @@ final class AudioBridge: @unchecked Sendable {
         let setRet = swr_alloc_set_opts2(
             &scratch,
             &enc.pointee.ch_layout,
-            pcmSampleFmt,
+            swrOutFmt,
             enc.pointee.sample_rate,
             &sf.pointee.ch_layout,
             frameFmt,
@@ -1047,6 +1069,10 @@ final class AudioBridge: @unchecked Sendable {
             0,
             nil
         )
+        if setRet >= 0, let scratchCtx = scratch, shaping.isActive {
+            AudioShapingMatrix.apply(to: scratchCtx, input: &sf.pointee.ch_layout, output: &enc.pointee.ch_layout,
+                                     dialogueGain: shaping.dialogueGain)
+        }
         let initRet = setRet >= 0 && scratch != nil ? swr_init(scratch) : setRet
         guard initRet >= 0 else {
             swr_free(&scratch)
@@ -1063,6 +1089,7 @@ final class AudioBridge: @unchecked Sendable {
         }
         swr_free(&swrCtx)
         swrCtx = scratch
+        dynamics?.reset()
 
         av_channel_layout_uninit(&swrInLayout)
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
@@ -1073,7 +1100,8 @@ final class AudioBridge: @unchecked Sendable {
         // already written from it, so it cannot change now). If the decoded frame differs, swr must resample
         // or rematrix and the FLAC is no longer bit-perfect. Surface it loudly; a deferred encoder open (open
         // the encoder from the first decoded frame) is the follow-up if this ever fires on real material.
-        if mode == .lossless,
+        // AE#923: shaping changes the layout on purpose and is not lossless to begin with.
+        if mode == .lossless, !shaping.isActive,
            frameRate != enc.pointee.sample_rate
             || av_channel_layout_compare(&sf.pointee.ch_layout, &enc.pointee.ch_layout) != 0 {
             EngineLog.emit(
@@ -1122,6 +1150,11 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
+        if dynamics != nil {
+            resampleShapedIntoFIFO(srcFrame: sf, swr: swr, outNbSamples: outNbSamples,
+                                       channels: Int(nChannels), fifo: fifo)
+            return
+        }
         let isPlanar = av_sample_fmt_is_planar(pcmSampleFmt) != 0
         let bufferCount = isPlanar ? Int(nChannels) : 1
         let bytesPerBuffer = isPlanar
@@ -1162,6 +1195,46 @@ final class AudioBridge: @unchecked Sendable {
                 to: UnsafeMutableRawPointer?.self, capacity: bufferCount
             ) { rebound in
                 av_audio_fifo_write(fifo, rebound, producedSamples)
+            }
+        }
+        if written > 0 {
+            stats.samplesEnqueued += Int64(written)
+            stats.packetsFedSinceLastEnqueue = 0
+        }
+    }
+
+    /// AE#923: the shaped variant of the tail of `resampleAndPushIntoFIFO`. The resampler writes
+    /// interleaved Float32, the dynamics run in place, and the samples are written into the FIFO in
+    /// the encoder's own format.
+    private func resampleShapedIntoFIFO(
+        srcFrame sf: UnsafeMutablePointer<AVFrame>,
+        swr: OpaquePointer,
+        outNbSamples: Int32,
+        channels: Int,
+        fifo: OpaquePointer
+    ) {
+        let floats = UnsafeMutablePointer<Float>.allocate(capacity: Int(outNbSamples) * channels)
+        defer { floats.deallocate() }
+        var outPtrs: [UnsafeMutablePointer<UInt8>?] = [UnsafeMutableRawPointer(floats).assumingMemoryBound(to: UInt8.self)]
+        let produced = outPtrs.withUnsafeMutableBufferPointer { outBuf in
+            withUnsafeMutablePointer(to: &sf.pointee.extended_data) { srcPtr in
+                let srcReadOnly = UnsafeRawPointer(srcPtr.pointee)
+                    .assumingMemoryBound(to: UnsafePointer<UInt8>?.self)
+                return swr_convert(swr, outBuf.baseAddress, outNbSamples, srcReadOnly, sf.pointee.nb_samples)
+            }
+        }
+        guard produced > 0 else {
+            stats.framesDroppedBeforeFIFO += 1
+            return
+        }
+        dynamics?.process(floats, frames: Int(produced), channels: channels)
+        let written = AudioShapingSampleWriter.write(
+            interleaved: floats, frames: Int(produced), channels: channels, format: pcmSampleFmt
+        ) { planes in
+            planes.withUnsafeMutableBufferPointer { buf in
+                buf.baseAddress!.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: buf.count) {
+                    av_audio_fifo_write(fifo, $0, produced)
+                }
             }
         }
         if written > 0 {

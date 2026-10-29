@@ -25,7 +25,7 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        let stream = Self.drain(reader)
+        let stream = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(stream.count, 5 * 188 * 3)
         XCTAssertEqual((0..<5).map { stream[$0 * 188 * 3 + Self.markerOffset] }, [0, 1, 2, 3, 4])
 
@@ -53,12 +53,15 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.requests.contains { $0.path == "/seg2.ts" } }
 
-        XCTAssertTrue(reader.seek(to: 26)) // segment 4 contains 26 s, the restart is one earlier
-        let stream = Self.drain(reader)
+        let sought = await Self.offPool { reader.seek(to: 26) }
+
+        XCTAssertTrue(sought) // segment 4 contains 26 s, the restart is one earlier
+        let stream = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(stream.count, 3 * 188 * 3)
         XCTAssertEqual(stream[Self.markerOffset], 3)
         XCTAssertEqual(server.connectionCount, 1, "the short remainder was drained and the socket kept")
@@ -82,18 +85,21 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var buffer = [UInt8](repeating: 0, count: 188 * 4)
-        var got = 0
-        while got < buffer.count {
-            let n = buffer.withUnsafeMutableBufferPointer { reader.read($0.baseAddress! + got, size: Int32(188 * 4 - got)) }
-            XCTAssertGreaterThan(n, 0)
-            if n <= 0 { break }
-            got += Int(n)
+        let (buffer, got) = await Self.offPool { () -> ([UInt8], Int) in
+            var buffer = [UInt8](repeating: 0, count: 188 * 4)
+            var got = 0
+            while got < buffer.count {
+                let n = buffer.withUnsafeMutableBufferPointer { reader.read($0.baseAddress! + got, size: Int32(188 * 4 - got)) }
+                XCTAssertGreaterThan(n, 0)
+                if n <= 0 { break }
+                got += Int(n)
+            }
+            return (buffer, got)
         }
         XCTAssertEqual(buffer[188 * 3], 0x47, "the first packet of segment 1 is in the reader")
         XCTAssertFalse(server.completed.contains("/seg1.ts"), "while segment 1 is still downloading")
 
-        let rest = Self.drain(reader)
+        let rest = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(got + rest.count, 3 * 188 + 600 * 188)
         XCTAssertEqual(server.connectionCount, 1)
     }
@@ -115,7 +121,7 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         defer { reader.close() }
         XCTAssertFalse(server.completed.contains("/seg0.ts"), "the verdict did not wait for the whole segment")
 
-        let stream = Self.drain(reader)
+        let stream = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(stream.count, 400 * 188 + 3 * 188)
         XCTAssertEqual(stream[Self.markerOffset], 0)
         XCTAssertEqual(stream[400 * 188 + Self.markerOffset], 1)
@@ -140,12 +146,14 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
         let seekStarted = Date()
-        XCTAssertTrue(reader.seek(to: 20)) // segment 3 contains 20 s, the restart is one earlier
-        let stream = Self.drain(reader)
+        let sought = await Self.offPool { reader.seek(to: 20) }
+        XCTAssertTrue(sought) // segment 3 contains 20 s, the restart is one earlier
+        let stream = await Self.offPool { Self.drain(reader) }
         XCTAssertLessThan(Date().timeIntervalSince(seekStarted), 2, "the seek did not wait for a drain")
         XCTAssertEqual(stream.count, 3 * 188 * 3)
         XCTAssertEqual(stream[Self.markerOffset], 2)
@@ -169,13 +177,15 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
         try await Task.sleep(nanoseconds: 500_000_000) // long enough for the body to show its rate
         let seekStarted = Date()
-        XCTAssertTrue(reader.seek(to: 20))
-        let stream = Self.drain(reader)
+        let sought = await Self.offPool { reader.seek(to: 20) }
+        XCTAssertTrue(sought)
+        let stream = await Self.offPool { Self.drain(reader) }
         XCTAssertLessThan(Date().timeIntervalSince(seekStarted), 1.5, "no drain that could not finish")
         XCTAssertEqual(stream.count, 3 * 188 * 3)
         XCTAssertEqual(stream[Self.markerOffset], 2)
@@ -199,12 +209,14 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.requests.contains { $0.path == "/seg1.ts" } }
         let seekStarted = Date()
-        XCTAssertTrue(reader.seek(to: 20))
-        let stream = Self.drain(reader)
+        let sought = await Self.offPool { reader.seek(to: 20) }
+        XCTAssertTrue(sought)
+        let stream = await Self.offPool { Self.drain(reader) }
         let waited = Date().timeIntervalSince(seekStarted)
         XCTAssertGreaterThanOrEqual(waited, PersistentHTTP1Transport.drainDeadline - 0.2)
         XCTAssertLessThan(waited, PersistentHTTP1Transport.drainDeadline + 2)
@@ -246,7 +258,9 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        XCTAssertTrue(reader.seek(to: 20)) // segment 3 contains 20 s; the restart is 2, the first encrypted one
+        let sought = await Self.offPool { reader.seek(to: 20) }
+
+        XCTAssertTrue(sought) // segment 3 contains 20 s; the restart is 2, the first encrypted one
         let done = expectation(description: "drained")
         let box = StreamBox()
         Thread.detachNewThread {
@@ -273,13 +287,14 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.completed.contains("/seg1.ts") }
         try await Task.sleep(nanoseconds: 200_000_000)
         XCTAssertFalse(server.requests.contains { $0.path == "/seg2.ts" }, "the next request waits for the reader")
 
-        let rest = Self.drain(reader)
+        let rest = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(188 + rest.count, (64_000 + 30_000 + 30_000) * 188)
         XCTAssertEqual(server.connectionCount, 1)
     }
@@ -300,13 +315,14 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         let reader = try XCTUnwrap(made)
         defer { reader.close() }
 
-        var head = [UInt8](repeating: 0, count: 188)
-        XCTAssertEqual(head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }, 188)
+        let headCount = await Self.offPool { Self.readPacket(reader) }
+
+        XCTAssertEqual(headCount, 188)
         try await waitUntil { server.completed.contains("/seg1.ts") }
         try await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertFalse(server.requests.contains { $0.path == "/seg2.ts" }, "the next request waits for the reader")
 
-        let rest = Self.drain(reader)
+        let rest = await Self.offPool { Self.drain(reader) }
         XCTAssertEqual(188 + rest.count, (89_000 + 300 + 300) * 188)
         XCTAssertEqual(server.connectionCount, 1)
     }
@@ -330,10 +346,11 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
     func testSteadySlowBodyIsNeverCutOff() async throws {
         let server = try XCTUnwrap(KeepAliveOrigin())
         defer { server.stop() }
-        // 40 packets 50 ms apart: two seconds in all, against a read timeout of 0.3 s.
-        let body = Self.transportStream(marker: 7, packets: 40)
+        // 80 packets 50 ms apart: four seconds in all, against a read timeout of 1 s. The margin is
+        // per gap, and a starved CI runner stretched one 50 ms gap past the 0.3 s this used to allow.
+        let body = Self.transportStream(marker: 7, packets: 80)
         server.route = { _ in .init(body: body, trickleUs: 50_000) }
-        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 0.3)
+        let transport = PersistentHTTP1Transport(label: "test", readTimeout: 1)
         defer { transport.close() }
 
         let answer = try await transport.get(server.url("/slow"), headers: [:], limit: 1 << 20)
@@ -525,6 +542,20 @@ final class Issue732PersistentHTTP1Tests: XCTestCase {
         }
         precondition(status == kCCSuccess)
         return out.prefix(written)
+    }
+
+    /// `read` and `seek` wait on the producer, and the producer runs on the cooperative pool. Called
+    /// straight from an async test body they held that pool's thread, which under
+    /// LIBDISPATCH_COOPERATIVE_POOL_STRICT=1 is its only one, and the test deadlocked.
+    private static func offPool<T: Sendable>(_ body: @escaping @Sendable () -> T) async -> T {
+        await withCheckedContinuation { continuation in
+            Thread.detachNewThread { continuation.resume(returning: body()) }
+        }
+    }
+
+    private static func readPacket(_ reader: HLSVODIngestReader) -> Int32 {
+        var head = [UInt8](repeating: 0, count: 188)
+        return head.withUnsafeMutableBufferPointer { reader.read($0.baseAddress, size: 188) }
     }
 
     private static func drain(_ reader: HLSVODIngestReader) -> [UInt8] {
@@ -781,8 +812,13 @@ struct PersistentHLSSegmentAdmissionTests {
             return .init(body: encryptedFrom.map { index >= $0 } == true
                 ? Issue732PersistentHTTP1Tests.aes128CBC(clear, key: key) : clear)
         }
+        // The factory turns a probe error into nil and only logs it. CI declined once under load
+        // (main d6c46ee6) and nothing said why, so a failure carries the logged reason.
+        let log = EngineLogCapture()
+        defer { log.end() }
         let reader = try #require(try await HLSVODIngestReader.makeIfHEVCMPEGTS(
-            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true))
+            playlistURL: server.url("/vod.m3u8"), httpHeaders: [:], persistentHTTP1: true),
+            "declined: \(log.matching("[HLSVODIngest]").suffix(6))")
         defer { reader.close() }
         let firstRead = ProbeTestJob { () -> Int32 in
             var bytes = [UInt8](repeating: 0, count: 188)
@@ -833,7 +869,9 @@ struct PersistentHLSSegmentAdmissionTests {
         }
         if exit == .consume || exit == .seek {
             #expect(server.requests.filter { $0.path == "/seg2.ts" }.count == 1)
-            #expect(server.connectionCount == 1)
+            // The seek abandons seg1's body, and a drain that misses `drainDeadline` closes the socket
+            // by design. A starved runner gets there (CI read 2 here), so only consumption pins reuse.
+            #expect(server.connectionCount <= (exit == .seek ? 2 : 1))
             #expect(server.maxInFlight == 1)
         }
     }

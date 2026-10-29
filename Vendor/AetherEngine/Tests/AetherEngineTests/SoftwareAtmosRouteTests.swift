@@ -35,6 +35,31 @@ struct SoftwareAtmosRouteTests {
                       rendering: .off) == .pcm)
     }
 
+    @Test("an E-AC-3 track on the dual-layer route with object audio off gets a route line saying it is decoded to PCM")
+    func eac3OnDualLayerRouteLogsPCMDecode() throws {
+        let note = try #require(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_EAC3, rendering: .off, isLive: false, dualLayerRoute: true))
+        #expect(note.contains("E-AC-3"))
+        #expect(note.contains("PCM"))
+        #expect(note.contains("objectAudioRendering off"))
+        // A live source is kept on PCM whatever the rendering asks, and says so.
+        let live = try #require(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_EAC3, rendering: .apac(.l714), isLive: true, dualLayerRoute: true))
+        #expect(live.contains("live source"))
+    }
+
+    @Test("no E-AC-3 route line off the dual-layer route, for other codecs, or when the object path decides")
+    func eac3RouteLineIsNarrow() {
+        #expect(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_EAC3, rendering: .off, isLive: false, dualLayerRoute: false) == nil)
+        #expect(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_TRUEHD, rendering: .off, isLive: false, dualLayerRoute: true) == nil)
+        #expect(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_AC3, rendering: .off, isLive: false, dualLayerRoute: true) == nil)
+        #expect(SoftwarePlaybackHost.eac3PCMRouteNote(
+            codecID: AV_CODEC_ID_EAC3, rendering: .apac(.l714), isLive: false, dualLayerRoute: true) == nil)
+    }
+
     @Test("live sessions keep the PCM decode")
     func liveIsPCM() {
         #expect(route(codec: AV_CODEC_ID_EAC3, live: true) == .pcm)

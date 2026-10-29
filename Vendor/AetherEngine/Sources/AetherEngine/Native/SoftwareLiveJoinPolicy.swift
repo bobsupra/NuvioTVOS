@@ -213,6 +213,14 @@ struct SoftwareLiveHoldback: Equatable, Sendable {
         return edgeCushionSeconds == nil ? nil : joinLeadSeconds
     }
 
+    /// How far behind the newest media a resumed edge rebuffer has to stand before the feeder moves
+    /// it up (AE#882): past the band the live-edge verdict counts as the edge, by the join's minimum
+    /// skip. A rebuffer resumes at most a cushion plus one unit behind, and the cushion never exceeds
+    /// the join lead, so an ordinary resume on a segmented source is never followed by a seek.
+    var resumeCatchUpSpanSeconds: Double {
+        (edgeHoldbackSeconds ?? joinLeadSeconds) + SoftwareLiveJoinPolicy.minimumSkipSeconds
+    }
+
     /// The unit a live ingest delivers in: the longest segment it served or the longest gap it has
     /// closed between arrivals, whichever is larger. nil until either is known.
     static func deliveryUnit(segmentDuration: Double?, closedCadence: Double?) -> Double? {

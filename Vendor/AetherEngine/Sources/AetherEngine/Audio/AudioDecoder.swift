@@ -71,6 +71,7 @@ final class AudioDecoder: @unchecked Sendable {
     }
 
     private(set) var sampleRate: Int32 = 0
+    /// The channels the decoder OUTPUTS: the source's, or fewer under an `AudioShaping` cap.
     private(set) var channels: Int32 = 0
 
     var feedEpoch: UInt64 {
@@ -78,6 +79,10 @@ final class AudioDecoder: @unchecked Sendable {
         defer { stateLock.unlock() }
         return _feedEpoch
     }
+
+    /// AE#923. Set before `open`; a change mid-session arrives as a new decoder or a re-anchor.
+    var shaping = AudioShaping()
+    private var dynamics: AudioDynamicsProcessor?
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -186,6 +191,7 @@ final class AudioDecoder: @unchecked Sendable {
         if frame.pointee.sample_rate > 0 { sampleRate = frame.pointee.sample_rate }
         let frameChannels = frame.pointee.ch_layout.nb_channels
         if frameChannels > 0 && frameChannels <= 8 { channels = frameChannels }
+        if shaping.isActive { channels = shaping.outputChannels(forSource: channels) }
 
         var outLayout = AVChannelLayout()
         // #401: this is the order the stamped layout has to name, so both come from one place.
@@ -219,8 +225,17 @@ final class AudioDecoder: @unchecked Sendable {
             0,
             nil
         )
-        guard ret >= 0, swrContext != nil else { return false }
-        guard swr_init(swrContext) >= 0 else {
+        guard ret >= 0, let swr = swrContext else { return false }
+        if shaping.isActive {
+            AudioShapingMatrix.apply(to: swr, input: &inLayout, output: &outLayout,
+                                     dialogueGain: shaping.dialogueGain)
+            dynamics = AudioDynamicsProcessor(compressor: shaping.clamped.compressor, sampleRate: sampleRate)
+            EngineLog.emit("[AudioDecoder] AE#923 shaping \(shaping.summary): "
+                           + "\(frameChannels)ch -> \(channels)ch", category: .swPlayback)
+        } else {
+            dynamics = nil
+        }
+        guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
             return false
         }
@@ -253,6 +268,7 @@ final class AudioDecoder: @unchecked Sendable {
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
         audioProcessor.reset()
+        dynamics?.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -421,6 +437,11 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
+        if dynamics != nil {
+            tempBuffer.withMemoryRebound(to: Float.self, capacity: Int(convertedSamples) * Int(channels)) {
+                dynamics?.process($0, frames: Int(convertedSamples), channels: Int(channels))
+            }
+        }
 
         let sampleFrames = Int(convertedSamples)
         tempBuffer.withMemoryRebound(to: Float.self, capacity: sampleFrames * Int(channels)) { interleaved in

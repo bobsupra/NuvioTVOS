@@ -739,7 +739,14 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     // the two legitimate reconnects (open + the one seek to the moov). The sequential
     // playback fast path never enters this code, so it carries zero overhead.
     private static let detourBlockSize = 4 * 1024 * 1024
-    private static let detourMaxBlocks = 8                       // ~32 MB LRU ceiling
+    private static let detourMaxBlocks = 8                       // ~32 MB, the resting LRU size
+    /// #909: how far the cache may grow when its working set is larger than `detourMaxBlocks`. A flat
+    /// MP4 that stores each subtitle track in its own byte range makes the demuxer visit one block per
+    /// kept track in turn, and an LRU smaller than that cycle never hits: 14 `mov_text` tracks against
+    /// 8 blocks re-fetched every block on every pass. The cache grows only on a re-fetch of a block it
+    /// evicted, so a file without such a cycle stays at 8; the ceiling covers the 16-track files seen
+    /// so far (#104, #909) with room for samples that straddle a block boundary.
+    private static let detourCeilingBlocks = 24                  // ~96 MB
     /// Audit PERF-108: a detour block nobody has read or filled for this long is a scrub's leftover,
     /// not a parse's working set (a parser revisits its region within seconds).
     private static let detourBlockIdleSecondsDefault: TimeInterval = 30
@@ -1020,6 +1027,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     private var staleGenDroppedBytes: Int64 = 0
     private var connStartedAt = DispatchTime.now()
     private var connFirstDataSeen = false
+    /// The last connection that carried bytes was ended by the peer or the network mid-range, not by
+    /// us (cancel, range end, high water). Set where that connection ends, cleared by the next
+    /// generation's first byte, so the refused attempts that follow a cut keep it. winCond-guarded.
+    private var lastDeliveringConnCut = false
     /// The generation `awaitFirstPersistentData` is waiting on, while it waits. Its first byte is
     /// governed by the open policy's budget, not by the delivery-gap watchdog.
     private var openAwaitedGeneration: Int?
@@ -1040,7 +1051,8 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// (see serveFromDetour), so eviction never shadows a re-fetchable tail. Pure copy/eviction
     /// math lives on the cache and is unit-tested without any network.
     private let detourCache = DetourBlockCache(blockSize: AVIOReader.detourBlockSize,
-                                               maxBlocks: AVIOReader.detourMaxBlocks)
+                                               maxBlocks: AVIOReader.detourMaxBlocks,
+                                               ceilingBlocks: AVIOReader.detourCeilingBlocks)
     /// When the detour cache was last swept for idle blocks (audit PERF-108). Demux-thread-only.
     private var lastDetourIdleSweepNs: UInt64 = 0
     /// How long a detour block may sit unread before the sweep releases it. An init parameter for
@@ -2888,6 +2900,13 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
     /// delays finding out: three paced attempts against an address that will refuse all of them,
     /// 12.5 s in the 6.30.0 retest of #380. There the first refusal is taken at face value.
     ///
+    /// The lingering slot also needs a connection WE ended (range end, high water, a seek). When
+    /// the origin or the network cut the last delivering connection mid-range instead, the refusals
+    /// that follow are the edge revoking the pinned session, not our socket still counted: StreamX
+    /// on 7.50.0, a CDN cut at 16 of 32 MB, three 509s against the pin across 9 s, then a fresh
+    /// redirect through the source got its 206 on the first try, and the 12 s stall was the grace.
+    /// There too the first refusal is taken at face value.
+    ///
     /// Demux-thread-only: it reads the ladder streaks.
     @discardableResult
     private func dropPinIfTheRefusalCallsForIt(isRateLimited: Bool) -> Bool {
@@ -2903,6 +2922,16 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // its backoff would just retry a refusing target faster.
         if idle >= pinIdleSeconds, cachedResolvedURL() != nil {
             invalidateResolvedURL(reason: "rate-limited after \(Int(idle))s idle through pinned URL")
+            return true
+        }
+        // One re-resolve per cut: taking the flag means a re-pinned target that refuses before
+        // its first byte is back on the grace instead of re-resolving on every refusal.
+        winCond.lock()
+        let cut = lastDeliveringConnCut
+        lastDeliveringConnCut = false
+        winCond.unlock()
+        if cut, cachedResolvedURL() != nil {
+            invalidateResolvedURL(reason: "rate-limited after the pinned connection was cut mid-range")
             return true
         }
         if rateLimitStreak >= Self.rateLimitRepinStreak {
@@ -3066,7 +3095,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
             if fetched.count == blockLen, !isFullyClosed {
                 detourCache.insert(blockStart / Int64(Self.detourBlockSize), fetched)
                 #if DEBUG
-                EngineLog.emit("[AVIOReader] detour fill block=\(blockStart / Int64(Self.detourBlockSize)) offset=\(blockStart) size=\(fetched.count) (resident=\(detourCache.residentCount))", category: .demux)
+                EngineLog.emit("[AVIOReader] detour fill block=\(blockStart / Int64(Self.detourBlockSize)) offset=\(blockStart) size=\(fetched.count) (resident=\(detourCache.residentCount) cap=\(detourCache.capacity))", category: .demux)
                 #endif
             }
             block = fetched
@@ -3804,6 +3833,7 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         var firstDataMs: Double? = nil
         if !connFirstDataSeen {
             connFirstDataSeen = true
+            lastDeliveringConnCut = false
             clearRecordedTransportFailure()
             firstDataMs = Double(DispatchTime.now().uptimeNanoseconds - connStartedAt.uptimeNanoseconds) / 1_000_000
             // #281 retest: the price of one round trip against this origin, which is what bounds
@@ -4090,6 +4120,10 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
         // already logged where it was decided; reporting it as an error too would make every
         // drain cycle against a fast origin read like a transport fault.
         let deliberateEnd = isCurrentGen && (connEndedByBackpressure || connEndedAtRangeEnd)
+        if isCurrentGen, connFirstDataSeen, !deliberateEnd, let error,
+           (error as? URLError)?.code != .cancelled {
+            lastDeliveringConnCut = true
+        }
         let windowAhead = isCurrentGen ? (window.count - max(0, Int(position - winStart))) : 0
         winCond.broadcast()
         winCond.unlock()
@@ -5027,22 +5061,38 @@ final class AVIOReader: AVIOProvider, @unchecked Sendable {
 /// (demux-thread reads + teardown-thread `clear`); never held across the network. Stores only
 /// full-size blocks (the fetch/insert decision is the caller's), so eviction can't shadow a
 /// re-fetchable short-body tail. The copy + eviction math is pure and unit-tested without a network.
+///
+/// #909: the capacity starts at `maxBlocks` and grows by one, up to `ceilingBlocks`, each time a block
+/// it evicted is inserted again, which is the signature of a cyclic working set larger than the cache.
+/// The idle sweep shrinks it back toward what is still resident.
 final class DetourBlockCache: @unchecked Sendable {
     private let lock = NSLock()
     private var blocks: [Int64: Data] = [:]
     private var lru: [Int64] = []
     /// When each resident block was last inserted or served, on `now`'s clock (audit PERF-108).
     private var lastHit: [Int64: TimeInterval] = [:]
+    /// Blocks evicted for capacity, oldest first, at most `ceilingBlocks` of them.
+    private var evictedForCapacity: [Int64] = []
     private let maxBlocks: Int
+    private let ceilingBlocks: Int
+    private var currentCapacity: Int
     private let now: @Sendable () -> TimeInterval
     let blockSize: Int
 
-    /// `now` is injectable so the idle test moves a clock instead of waiting one out.
-    init(blockSize: Int, maxBlocks: Int,
+    /// `now` is injectable so the idle test moves a clock instead of waiting one out. Without a
+    /// `ceilingBlocks` the cache never grows past `maxBlocks`.
+    init(blockSize: Int, maxBlocks: Int, ceilingBlocks: Int? = nil,
          now: @escaping @Sendable () -> TimeInterval = { ProcessInfo.processInfo.systemUptime }) {
         self.blockSize = blockSize
         self.maxBlocks = maxBlocks
+        self.ceilingBlocks = max(maxBlocks, ceilingBlocks ?? maxBlocks)
+        self.currentCapacity = maxBlocks
         self.now = now
+    }
+
+    var capacity: Int {
+        lock.lock(); defer { lock.unlock() }
+        return currentCapacity
     }
 
     /// Returns the resident block for `idx` and bumps its recency, or nil on a miss.
@@ -5057,16 +5107,28 @@ final class DetourBlockCache: @unchecked Sendable {
         return data
     }
 
-    /// Inserts a (full-size) block, evicting the least-recently-used tail beyond `maxBlocks`.
+    /// Inserts a (full-size) block, evicting the least-recently-used tail beyond the capacity.
     func insert(_ idx: Int64, _ data: Data) {
         lock.lock(); defer { lock.unlock() }
-        if blocks[idx] == nil { lru.append(idx) }
+        if blocks[idx] == nil {
+            if let i = evictedForCapacity.firstIndex(of: idx) {
+                // The evictions since this one are about how far the working set outruns the cache. A
+                // cycle the ceiling cannot hold misses at every capacity, so growing toward it only
+                // holds more memory for the same fetches.
+                let outrun = evictedForCapacity.count - i
+                evictedForCapacity.remove(at: i)
+                if currentCapacity + outrun <= ceilingBlocks { currentCapacity += 1 }
+            }
+            lru.append(idx)
+        }
         blocks[idx] = data
         lastHit[idx] = now()
-        while lru.count > maxBlocks {
+        while lru.count > currentCapacity {
             let evicted = lru.removeFirst()
             blocks.removeValue(forKey: evicted)
             lastHit[evicted] = nil
+            evictedForCapacity.append(evicted)
+            if evictedForCapacity.count > ceilingBlocks { evictedForCapacity.removeFirst() }
         }
     }
 
@@ -5086,6 +5148,7 @@ final class DetourBlockCache: @unchecked Sendable {
             blocks.removeValue(forKey: idx)
             lastHit[idx] = nil
         }
+        currentCapacity = max(maxBlocks, min(currentCapacity, lru.count))
         return idle.count
     }
 
@@ -5094,6 +5157,8 @@ final class DetourBlockCache: @unchecked Sendable {
         blocks.removeAll()
         lru.removeAll()
         lastHit.removeAll()
+        evictedForCapacity.removeAll()
+        currentCapacity = maxBlocks
         lock.unlock()
     }
 

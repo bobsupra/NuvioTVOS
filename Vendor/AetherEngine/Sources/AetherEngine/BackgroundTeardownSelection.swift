@@ -18,6 +18,8 @@ struct BackgroundTeardownSelection: Sendable, Equatable {
     /// host and publish a zero position before the foreground reload starts.
     var resumePosition: Double?
     var resumesPlaying: Bool = false
+    /// nil means no loaded-session evidence; false is a verified decision worth retaining too.
+    var requiresDeinterlaceWarmup: Bool?
 }
 
 extension AetherEngine {
@@ -47,7 +49,9 @@ extension AetherEngine {
             audioTrackIndex: activeAudioTrackIndex ?? parked?.audioTrackIndex,
             discTitleID: activeDiscTitleID ?? parked?.discTitleID,
             resumePosition: parked?.resumePosition,
-            resumesPlaying: parked?.resumesPlaying ?? sessionRebuildResumesPlaying
+            resumesPlaying: parked?.resumesPlaying ?? sessionRebuildResumesPlaying,
+            requiresDeinterlaceWarmup: playbackBackend != .none
+                ? lastRequiresDeinterlaceWarmup : parked?.requiresDeinterlaceWarmup
         )
     }
 

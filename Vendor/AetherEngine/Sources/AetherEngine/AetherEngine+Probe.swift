@@ -681,11 +681,16 @@ extension AetherEngine {
         if let override, tracks.contains(where: { $0.id == Int(override) }) {
             return override
         }
-        // #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights, which no other
-        // track of the same language does better, so they win ties within a language. Never across one.
-        let atmosRank: ((Int) -> Int)? = prefersObjectAudio
-            ? { isRenderableObjectAudio(tracks[$0]) ? 0 : 1 }
-            : nil
+        // AE#919: within a language the programme mix wins over audio description and commentary, which a
+        // file may list first. #731: with object rendering on, TrueHD Atmos and DTS:X keep their heights,
+        // which no other track of the same language does better, so they win the remaining ties. Never
+        // across a language.
+        let secondaryRank: (Int) -> Int = { index in
+            let track = tracks[index]
+            let descriptorRank = track.isVisualImpaired || track.isCommentary ? 1 : 0
+            let atmosRank = prefersObjectAudio && !isRenderableObjectAudio(track) ? 1 : 0
+            return descriptorRank * 2 + atmosRank
+        }
         // Each preference is scanned across all tracks in order, so an earlier preference on a later
         // track still beats a later preference on an earlier track. Within one preference the most
         // specific tag wins, so an "en-GB" preference takes en-GB over eng over en-US (#590).
@@ -693,7 +698,7 @@ extension AetherEngine {
             languages: tracks.map(\.language),
             preferredLanguages: preferredLanguages,
             kind: .audio,
-            secondaryRank: atmosRank
+            secondaryRank: secondaryRank
         ) {
             return Int32(tracks[index].id)
         }
@@ -723,22 +728,26 @@ extension AetherEngine {
     }
 
     /// TrueHD that FFmpeg marked Atmos while probing (mlpdec sets the profile from the major sync), and
-    /// not a commentary. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is documented as.
+    /// not a commentary or an audio description. `TrackInfo.isAtmos` stays the E-AC-3 JOC answer it is
+    /// documented as.
     nonisolated static func isRenderableTrueHDAtmos(_ track: TrackInfo) -> Bool {
-        linksTrueHDObjectDecoder && track.codec.lowercased() == "truehd" && !track.isCommentary && !track.isExternal
+        linksTrueHDObjectDecoder && track.codec.lowercased() == "truehd"
+            && !track.isCommentary && !track.isVisualImpaired && !track.isExternal
             && track.profile == trueHDAtmosProfileName
     }
 
     nonisolated private static let trueHDAtmosProfileName =
         VideoStreamFormat.profileName(codecID: AV_CODEC_ID_TRUEHD, profile: AV_PROFILE_TRUEHD_ATMOS)
 
-    /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary. FFmpeg names only two of
-    /// DTS:X's markers, so a DTS-HD MA track it labels plain can be DTS:X as well; that one is still
-    /// rendered when it is the track that plays, but only the label can be ranked before playback.
+    /// DTS that FFmpeg labelled DTS:X while probing, and not a commentary or an audio description. FFmpeg
+    /// names only two of DTS:X's markers, so a DTS-HD MA track it labels plain can be DTS:X as well; that
+    /// one is still rendered when it is the track that plays, but only the label can be ranked before
+    /// playback.
     /// `TrackInfo.codec` is the decoder's name, `dca` for libavcodec's DTS decoder; `dts` is the
     /// codec's own name, which a build without the decoder would report.
     nonisolated static func isRenderableDTSX(_ track: TrackInfo) -> Bool {
-        linksDTSXObjectDecoder && ["dca", "dts"].contains(track.codec.lowercased()) && !track.isCommentary && !track.isExternal
+        linksDTSXObjectDecoder && ["dca", "dts"].contains(track.codec.lowercased())
+            && !track.isCommentary && !track.isVisualImpaired && !track.isExternal
             && dtsxProfileNames.contains(track.profile ?? "")
     }
 
@@ -774,6 +783,22 @@ extension AetherEngine {
             secondaryRank: { subtitlePickRank(tracks[$0]) }
         ) else { return nil }
         return Int32(tracks[index].id)
+    }
+
+    /// The subtitle track to activate at the end of a load: `LoadOptions.initialSubtitleTrackID` when it
+    /// names a track in `tracks`, else the best `preferredSubtitleLanguages` match, else nil (subtitles
+    /// off). The explicit id wins because a host that names a track has already made the choice the
+    /// language ranking approximates; an id that matches nothing is ignored rather than treated as an
+    /// error, so a stale server index cannot fail a load. Pure and nonisolated, like `selectSubtitleIndex`.
+    nonisolated static func resolveInitialSubtitleIndex(
+        tracks: [TrackInfo],
+        initialTrackID: Int?,
+        preferredLanguages: [String]
+    ) -> Int32? {
+        if let initialTrackID, tracks.contains(where: { $0.id == initialTrackID }) {
+            return Int32(initialTrackID)
+        }
+        return selectSubtitleIndex(tracks: tracks, preferredLanguages: preferredLanguages)
     }
 
     /// Lower rank wins. The descriptor axis (full > SDH > forced > commentary, from container dispositions)
@@ -891,6 +916,8 @@ extension AetherEngine {
         case .compressedEAC3JOC: return "\(codec) Atmos → renderer (compressed)"
         case .apac(let layout):
             return codec.hasPrefix("DTS") ? "DTS:X → APAC \(layout.rawValue)" : "\(codec) Atmos → APAC \(layout.rawValue)"
+        case .pcmBed(let layout):
+            return codec.hasPrefix("DTS") ? "DTS:X → PCM \(layout.rawValue)" : "\(codec) Atmos → PCM \(layout.rawValue)"
         }
     }
 

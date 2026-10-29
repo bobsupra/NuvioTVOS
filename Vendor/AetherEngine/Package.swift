@@ -86,8 +86,14 @@ let package = Package(
                 .product(name: "Dovi", package: "LibDovi"),
                 .product(name: "TrueHD", package: "LibTrueHD", condition: .when(traits: ["TrueHDObjectAudio"])),
             ],
-            // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS.
-            resources: [.copy("Resources/silent-atmos.mp4")],
+            // Silent E-AC-3 Atmos that `AtmosOutputActivator` loops beside an APAC track on tvOS, and the
+            // privacy manifest for the required-reason APIs the engine calls (#920): systemUptime for
+            // elapsed time, volumeAvailableCapacity before spooling to disk, and stat / attributesOfItem /
+            // creationDate on its own temp files and on local media the host opens.
+            resources: [
+                .copy("Resources/silent-atmos.mp4"),
+                .copy("Resources/PrivacyInfo.xcprivacy"),
+            ],
             linkerSettings: [
                 .linkedFramework("AVFoundation"),
                 .linkedFramework("AVKit"),

@@ -219,6 +219,55 @@ struct VideoPrerollTests {
         try await waitFor { output.synchronizer.rate == 1 }
     }
 
+    @Test("An explicit pause cancels a hold and refuses a stale positive seek or rebuffer release",
+          .timeLimit(.minutes(1)), arguments: [false, true])
+    func explicitPauseOwnsTheClock(gateReady: Bool) {
+        let output = AudioOutput()
+        defer { output.stop() }
+        let transitions = Transitions()
+        output.onPrerollTransition = { transitions.append($0) }
+        output.videoPrerollSatisfied = { _ in false }
+        output.seekClock(to: CMTime(seconds: 5, preferredTimescale: 90000), rate: 1)
+        #expect(output.prerollPending)
+        output.setPlaybackEnabled(false)
+        output.videoPrerollSatisfied = { _ in gateReady }
+        output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 1)
+        output.setRate(1.5)
+        #expect(output.rate == 0)
+        #expect(output.currentTimeSeconds == 9, "a paused seek still moves its anchor")
+        #expect(!output.prerollPending)
+        #expect(transitions.events == [.began, .released(.cancelled)])
+    }
+
+    @Test("Explicit play after a paused seek restores the normal preroll", .timeLimit(.minutes(1)))
+    func explicitPlayRestoresPreroll() async throws {
+        let output = AudioOutput()
+        defer { output.stop() }
+        let gate = Gate()
+        output.videoPrerollSatisfied = { _ in gate.isOpen }
+        output.setPlaybackEnabled(false)
+        output.seekClock(to: CMTime(seconds: 9, preferredTimescale: 90000), rate: 1)
+        output.setPlaybackEnabled(true)
+        #expect(output.rate == 0, "enabling transport alone does not start an unanchored clock")
+        output.setRate(1.5)
+        #expect(output.prerollPending)
+        gate.set(true)
+        try await waitFor { output.rate == 1.5 }
+        #expect(!output.prerollPending)
+    }
+
+    @Test("Stopping a paused output retires its epoch without resetting the clock", .timeLimit(.minutes(1)))
+    func stoppedPausedOutputKeepsItsAnchor() {
+        let output = AudioOutput()
+        output.seekClock(to: CMTime(seconds: 42, preferredTimescale: 90000), rate: 0)
+        let epoch = output.epoch
+        output.stop()
+        #expect(output.epoch != epoch)
+        #expect(output.currentTimeSeconds == 42)
+        output.setRate(1)
+        #expect(output.rate == 0, "a retired output cannot be restarted by late work")
+    }
+
     // MARK: - Decoder progress (#800)
 
     @Test("A hold waits on while the decoder produces frames, up to the cap")

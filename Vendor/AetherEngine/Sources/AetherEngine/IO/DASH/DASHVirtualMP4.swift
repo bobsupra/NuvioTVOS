@@ -118,19 +118,23 @@ struct DASHVirtualLayout: Sendable {
             sidxEnd += sidxSizes[s]
             let index = indexes[s]
             let own = pieceOf[s]
-            var payload = MP4Box.be32(maps[s][index.referenceID] ?? maps[s].values.min() ?? 1)
-                + MP4Box.be32(index.timescale)
-                + MP4Box.be64(index.earliestPresentationTime)
-                + MP4Box.be64(UInt64(pieces[own[0]].virtualOffset - sidxEnd))
-                + [0, 0] + MP4Box.be16(UInt16(own.count))
+            // AE#883: appended piece by piece, Swift 6.2 times out type-checking this as one `+` chain.
+            let referenceID: UInt32 = maps[s][index.referenceID] ?? maps[s].values.min() ?? 1
+            var payload = MP4Box.be32(referenceID)
+            payload += MP4Box.be32(index.timescale)
+            payload += MP4Box.be64(index.earliestPresentationTime)
+            payload += MP4Box.be64(UInt64(pieces[own[0]].virtualOffset - sidxEnd))
+            payload += [0, 0]
+            payload += MP4Box.be16(UInt16(own.count))
             for (k, p) in own.enumerated() {
                 let end = k + 1 < own.count ? pieces[own[k + 1]].virtualOffset : total
                 let span = end - pieces[p].virtualOffset
                 guard span < 0x8000_0000 else {
                     throw DASHSourceError.malformedIndex("a subsegment span exceeds 2 GiB")
                 }
-                payload += MP4Box.be32(UInt32(span)) + MP4Box.be32(index.references[k].duration)
-                    + MP4Box.be32(0x9000_0000)
+                payload += MP4Box.be32(UInt32(span))
+                payload += MP4Box.be32(index.references[k].duration)
+                payload += MP4Box.be32(0x9000_0000)
             }
             let box = MP4Box.fullBox("sidx", version: 1, flags: 0, payload: payload)
             assert(Int64(box.count) == sidxSizes[s])

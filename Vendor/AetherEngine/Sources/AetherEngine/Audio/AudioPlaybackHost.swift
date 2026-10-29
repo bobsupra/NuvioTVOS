@@ -183,6 +183,7 @@ final class AudioPlaybackHost {
         )
 
         let aDec = AudioDecoder()
+        aDec.shaping = audioShaping
         try aDec.open(stream: aStream)
         aDec.setAudioProcessing(audioProcessingSettings)
         self.audioDecoder = aDec
@@ -374,6 +375,9 @@ final class AudioPlaybackHost {
     }
 
     /// #660: held here, not only on the output, because the engine sets it before `load()` builds one.
+    /// AE#923: the host's audio shaping, handed to the decoder when the session opens.
+    var audioShaping = AudioShaping()
+
     var volume: Float = 1.0 {
         didSet { audioOutput?.volume = volume }
     }

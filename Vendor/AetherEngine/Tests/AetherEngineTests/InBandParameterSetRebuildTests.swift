@@ -98,6 +98,84 @@ struct InBandParameterSetRebuildTests {
         #expect(!VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(demuxer: demuxer, streamIndex: videoIdx))
     }
 
+    @Test("The scan stops on whichever of the packet, video-packet and byte budgets is spent first")
+    func scanStopsOnEachBudget() {
+        func more(read: Int = 0, video: Int = 0, bytes: Int = 0) -> Bool {
+            VideoConfigRecord.scanMayContinue(packetsRead: read, videoPackets: video, bytesRead: bytes,
+                                              packetBudget: 16, readBudget: 512, byteBudget: 1_000_000)
+        }
+        #expect(more())
+        #expect(!more(read: 512))
+        #expect(!more(video: 16))
+        #expect(!more(bytes: 1_000_000), "a stream of huge packets with no parameter sets stops on bytes")
+        #expect(more(read: 511, video: 15, bytes: 999_999))
+        #expect(VideoConfigRecord.inBandScanByteBudget > 0)
+    }
+
+    @Test("A spent byte budget leaves the record as it was and the demuxer at the head",
+          .enabled(if: fixtureExists("hev1-inband-xps.mp4"),
+                   "run Scripts/fetch-fixtures.sh to generate the in-band xPS clip"),
+          .timeLimit(.minutes(1)))
+    func spentByteBudgetLeavesRecordAlone() throws {
+        let demuxer = Demuxer()
+        try demuxer.open(url: fixtureURL("hev1-inband-xps.mp4"), profile: .playback)
+        defer { demuxer.close() }
+        let videoIdx = demuxer.videoStreamIndex
+        let codecpar = try #require(demuxer.stream(at: videoIdx)?.pointee.codecpar)
+        let before = codecpar.pointee.extradata_size
+        #expect(!VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(
+            demuxer: demuxer, streamIndex: videoIdx, byteBudget: 0))
+        #expect(codecpar.pointee.extradata_size == before)
+        #expect(VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(demuxer: demuxer, streamIndex: videoIdx))
+    }
+
+    /// Two HEVC frames with a bare record, then zeros no Matroska element starts in: libavformat resyncs
+    /// through them byte by byte inside one `av_read_frame`, so only the ceiling armed on the input
+    /// stops the scan, and the rewind after it must still be allowed.
+    private static let junkBytes = 24 * 1024 * 1024
+    private static let budget = 64 * 1024
+
+    private func scanJunkTail(_ demuxer: Demuxer) throws {
+        let videoIdx = demuxer.videoStreamIndex
+        let codecpar = try #require(demuxer.stream(at: videoIdx)?.pointee.codecpar)
+        let before = codecpar.pointee.extradata_size
+        try #require(HLSVideoEngine.configRecordNeedsInBandRebuild(try #require(codecpar.pointee.extradata),
+                                                                    size: Int(before)))
+        #expect(!VideoConfigRecord.completeHEVCRecordFromInBandParameterSets(
+            demuxer: demuxer, streamIndex: Int32(videoIdx), byteBudget: Self.budget))
+        #expect(demuxer.inputByteBudgetExhausted, "the input ceiling, not the loop check, ended the scan")
+        #expect(codecpar.pointee.extradata_size == before)
+        // The ceiling is disarmed and the demuxer is back at the head: the first packet is the first frame.
+        let first = try #require(try demuxer.readPacket())
+        var toFree: UnsafeMutablePointer<AVPacket>? = first
+        defer { trackedPacketFree(&toFree) }
+        #expect(first.pointee.pts == 0)
+    }
+
+    @Test("A junk tail ends the scan on the input byte budget and the demuxer is rewound, on a custom reader",
+          .timeLimit(.minutes(1)))
+    func junkTailOnACustomReader() throws {
+        let data = try TailHeavyMatroska.make(foreignBytes: Self.junkBytes, junkTail: true, bareRecord: true)
+        try ProbeTestFixtures.withFile(data) { url in
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(reader: try #require(FileIOReader(url: url)), profile: .playback)
+            try scanJunkTail(demuxer)
+        }
+    }
+
+    @Test("A junk tail ends the scan on the input byte budget and the demuxer is rewound, on a local file",
+          .timeLimit(.minutes(1)))
+    func junkTailOnALocalFile() throws {
+        let data = try TailHeavyMatroska.make(foreignBytes: Self.junkBytes, junkTail: true, bareRecord: true)
+        try ProbeTestFixtures.withFile(data) { url in
+            let demuxer = Demuxer()
+            defer { demuxer.close() }
+            try demuxer.open(url: url, profile: .playback)
+            try scanJunkTail(demuxer)
+        }
+    }
+
     /// A Profile 7 enhancement layer carries its own VPS / SPS / PPS inside `unspec63` NAL units;
     /// only the base layer's top-level parameter sets may seed the base layer's record.
     @Test("The collector keeps top-level parameter sets and skips enhancement-layer ones")

@@ -69,6 +69,40 @@ extension HLSVideoEngine {
     ///   producer can never finish and AVPlayer waits on forever. The 60 s default leaves room for a
     ///   long final GOP and for a container duration padded by a trailing audio or subtitle track.
     ///
+    /// The cutter's and the restart gate's reach for each boundary of a keyframe-aligned plan:
+    /// `advance` (how far a repaired keyframe can precede its index entry), held below the distance
+    /// to the keyframe before that boundary so that one never reaches it. Per boundary, not one
+    /// figure for the plan: the 23 fps reporting asset keeps its keyframes 15 s apart but has one
+    /// pair four pictures apart, and a plan-wide bound left every other boundary without the reach
+    /// it needed. Empty when nothing moves.
+    static func keyframeReachTicks(advance: Int64, keyframes: [Int64], boundaries: [Int64]) -> [Int64] {
+        guard advance > 0 else { return [] }
+        let sorted = keyframes.sorted()
+        return boundaries.map { boundary in
+            var low = 0, high = sorted.count
+            while low < high {
+                let mid = (low + high) / 2
+                if sorted[mid] < boundary { low = mid + 1 } else { high = mid }
+            }
+            guard low > 0 else { return advance }
+            let (gap, overflow) = boundary.subtractingReportingOverflow(sorted[low - 1])
+            return overflow ? 0 : max(0, min(advance, gap - 1))
+        }
+    }
+
+    /// `collapseShortSegments`, then the reach for each boundary of the plan it leaves. The order is
+    /// the point: a pair of keyframes a few pictures apart is what makes a segment that gets folded,
+    /// and reaches read off the unfolded plan sat one boundary off from that fold on (three folds on
+    /// the 23 fps reporting asset). Off by one, a boundary takes the reach of the one before, which
+    /// can let the earlier keyframe of the pair open it, and hands its own to the next boundary,
+    /// whose keyframe can then miss it.
+    static func finalizedPlan(_ plan: [Segment], minDurationSeconds: Double, keyframeAdvance: Int64,
+                              keyframes: [Int64]) -> (plan: [Segment], reach: [Int64]) {
+        let collapsed = collapseShortSegments(plan, minDurationSeconds: minDurationSeconds)
+        return (collapsed, keyframeReachTicks(advance: keyframeAdvance, keyframes: keyframes,
+                                              boundaries: collapsed.map(\.startPts)))
+    }
+
     /// An index failing any witness is routed to the uniform-stride fallback.
     static func keyframeIndexIsTrustworthy(
         keyframes: [Int64],

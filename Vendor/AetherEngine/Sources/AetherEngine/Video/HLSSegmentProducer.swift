@@ -58,6 +58,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let nalFramingLatch: NALFramingLatch?
         /// Forwarded to `MP4SegmentMuxer.VideoConfig.stereo`.
         let stereo: StereoVideoSignal?
+        /// AE#886: the exact frame grid of a constant-rate track on a coarse time base. Non-nil gives
+        /// the muxer the grid's time base and puts every on-grid frame onto its slot.
+        let frameGrid: CFRFrameGrid?
 
         init(
             codecpar: UnsafePointer<AVCodecParameters>,
@@ -70,9 +73,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
             nalFramingOverride: VideoNALFraming? = nil,
             convertsAnnexBSamples: Bool = false,
             nalFramingLatch: NALFramingLatch? = nil,
-            stereo: StereoVideoSignal? = nil
+            stereo: StereoVideoSignal? = nil,
+            frameGrid: CFRFrameGrid? = nil
         ) {
             self.stereo = stereo
+            self.frameGrid = frameGrid
             self.codecpar = codecpar
             self.timeBase = timeBase
             self.codecTagOverride = codecTagOverride
@@ -177,6 +182,10 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
     /// Source video TB, carried to rescale timestamps (avformat_write_header rewrites the muxer's TB).
     private let sourceVideoTimeBase: AVRational
+    /// AE#886: `videoConfig.frameGrid` on VOD, nil on live. Pump-thread counters for the finish line.
+    private let frameGrid: CFRFrameGrid?
+    private var griddedVideoPackets = 0
+    private var offGridVideoPackets = 0
     private let videoConfig: StreamConfig
     private let audioConfig: AudioConfig?
 
@@ -549,6 +558,12 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// AE#561: the axis `segmentBoundaries` are stamped on, so the cutter gate compares like with
     /// like. Decode for a mov/mp4 index, presentation for Matroska Cues; see `PlanBoundaryAxis`.
     private let planBoundaryAxis: PlanBoundaryAxis
+    /// `VODSegmentCutter.reachTicks` of the restart boundary, which the gate honours too: the
+    /// keyframe that boundary names can arrive that far before it, and a gate that skipped it opened
+    /// a GOP late (or re-aimed). Only for the boundary itself, never for a re-aim.
+    private var restartGateReachTicks: Int64 {
+        effectiveGateTargetPts == restartTargetVideoPts ? vodCutter.reach(at: 0) : 0
+    }
 
     /// AE#408: the gate target actually in force. Starts at `restartTargetVideoPts` and moves BACK when
     /// the boundary turns out not to be openable, so the segment covers its own advertised start
@@ -1017,10 +1032,11 @@ final class HLSSegmentProducer: @unchecked Sendable {
     /// presentation time is the most permissive reading and cannot starve on a skew in either
     /// direction. What the axis buys here is knowing how much of the resulting overshoot is real,
     /// which is what `boundaryOpenToleranceTicks` spends it on.
-    static func videoGateTargetSatisfied(pts: Int64, dts: Int64, targetPts: Int64) -> Bool {
+    static func videoGateTargetSatisfied(pts: Int64, dts: Int64, targetPts: Int64,
+                                         reachTicks: Int64 = 0) -> Bool {
         if targetPts == Int64.min { return true }
         let ts = pts != Int64.min ? pts : dts
-        return ts != Int64.min && ts >= targetPts
+        return ts != Int64.min && SourceTimestampBounds.sum(ts, max(0, reachTicks)) >= targetPts
     }
 
     // MARK: - AE#408: a boundary that is not a random-access point
@@ -1523,6 +1539,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
         restartTargetVideoPts: Int64 = Int64.min,
         boundaryClaimsRandomAccess: Bool = false,
         planBoundaryAxis: PlanBoundaryAxis = .decode,
+        keyframeReachTicks: [Int64] = [],
         closedCaptionStreamIndex: Int32 = -1,
         subtitleTapStreamIndices: Set<Int32> = [],
         subtitlePacketStreamIndices: Set<Int32> = [],
@@ -1592,13 +1609,15 @@ final class HLSSegmentProducer: @unchecked Sendable {
         self.cache = cache
         self.baseIndex = baseIndex
         self.sourceVideoTimeBase = video.timeBase
+        self.frameGrid = isLive ? nil : video.frameGrid
         self.targetSegmentDurationSeconds = targetSegmentDurationSeconds
         self.segmentBoundaries = segmentBoundaries
         self.planAnchorVideoPts = planAnchorVideoPts
         self.vodCutter = VODSegmentCutter(
             sourceBoundaries: segmentBoundaries,
             planAnchorPts: planAnchorVideoPts,
-            baseIndex: baseIndex
+            baseIndex: baseIndex,
+            reachTicks: keyframeReachTicks
         )
         self.isLive = isLive
         self.foldsSequentialTimeline = foldsSequentialTimeline
@@ -2189,7 +2208,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
 
         let muxerVideo = MP4SegmentMuxer.VideoConfig(
             codecpar: videoCodecpar,
-            timeBase: videoConfig.timeBase,
+            timeBase: frameGrid?.outputTimeBase ?? videoConfig.timeBase,
             codecTagOverride: videoConfig.codecTagOverride,
             // Ad creative carries its own signaling; don't force the program's overrides onto it. A same-PID
             // parameter-set change is still the same program, so it keeps them (isAdCreative false).
@@ -4051,7 +4070,7 @@ final class HLSSegmentProducer: @unchecked Sendable {
                         let isKey = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
                         let targetSatisfied = Self.videoGateTargetSatisfied(
                             pts: packet.pointee.pts, dts: packet.pointee.dts,
-                            targetPts: effectiveGateTargetPts)
+                            targetPts: effectiveGateTargetPts, reachTicks: isKey && !isLive ? restartGateReachTicks : 0)
                         // #133: on a live H.264 Annex-B mid-stream join, opening on a bare keyframe flag is not
                         // enough. A join packet must carry a decodable access unit (in-band SPS+PPS and an
                         // IDR or immediate intra recovery point, AE#627); otherwise the decoder renders references
@@ -4807,7 +4826,9 @@ final class HLSSegmentProducer: @unchecked Sendable {
             "[HLSSegmentProducer] pump finished: reason=\(exitReason) "
             + "packetsRead=\(packetsRead) "
             + "packetsWritten=\(packetsWrittenCount) lastError=\(lastError) "
-            + "elapsed=\(String(format: "%.0f", elapsedMs))ms cacheCount=\(cache.count)",
+            + "elapsed=\(String(format: "%.0f", elapsedMs))ms cacheCount=\(cache.count)"
+            + (frameGrid.map { " frameGrid=1/\($0.outputTimeBase.den)x\($0.frameTicks) "
+                + "onGrid=\(griddedVideoPackets) offGrid=\(offGridVideoPackets)" } ?? ""),
             category: .session
         )
 
@@ -4989,7 +5010,20 @@ final class HLSSegmentProducer: @unchecked Sendable {
         let frameIsKeyframe = (packet.pointee.flags & AV_PKT_FLAG_KEY) != 0
         let frameSegmentIndex = currentMuxerSegmentIndex
 
+        // AE#886: decided on the source time base, before the rescale rounds it away.
+        let gridded = muxer.muxerVideoTimeBase.den == frameGrid?.outputTimeBase.den
+            ? frameGrid?.place(pts: packet.pointee.pts, dts: packet.pointee.dts,
+                               duration: packet.pointee.duration, shift: videoShiftPts)
+            : nil
         av_packet_rescale_ts(packet, sourceVideoTimeBase, muxer.muxerVideoTimeBase)
+        if let gridded {
+            packet.pointee.pts = gridded.pts
+            packet.pointee.dts = gridded.dts
+            packet.pointee.duration = gridded.duration
+            griddedVideoPackets += 1
+        } else if frameGrid != nil {
+            offGridVideoPackets += 1
+        }
         let write = muxer.writePacket(packet)
         if write.rc < 0, !loggedVideoWriteFailure {
             // #369: this rc used to be dropped on the floor; the field failure (movenc rejecting a

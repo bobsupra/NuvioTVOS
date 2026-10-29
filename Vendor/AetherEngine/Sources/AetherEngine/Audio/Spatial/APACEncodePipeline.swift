@@ -1,6 +1,6 @@
 import Foundation
 
-/// Runs an `APACEncoding` on its own serial queue, so the bridge decodes and renders the next chunk
+/// Runs an `APACEncoder` on its own serial queue, so the bridge decodes and renders the next chunk
 /// while the previous one encodes.
 ///
 /// The two halves cost about the same: on Dolby's Unfold demo (27 s, M1, release build) the TrueHD
@@ -19,75 +19,22 @@ import Foundation
 /// position plus k·1024. A failed encode resets the encoder and drops the chunk, so the next run
 /// starts on the next chunk's own position and nothing after the failure moves.
 @available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
-final class APACEncodePipeline: @unchecked Sendable {
+final class APACEncodePipeline: SpatialBedSink, @unchecked Sendable {
 
-    struct StampedPacket {
-        let data: Data
-        let isSync: Bool
-        /// Output time base: 48 kHz frames.
-        let pts: Int64
-    }
-
-    enum Event {
-        case packet(StampedPacket)
-        case encodeError(Error)
-    }
-
-    struct Collected {
-        let events: [Event]
-
-        var packets: [StampedPacket] {
-            events.compactMap { event -> StampedPacket? in
-                guard case .packet(let packet) = event else { return nil }
-                return packet
-            }
-        }
-
-        var errors: [Error] {
-            events.compactMap { event -> Error? in
-                guard case .encodeError(let error) = event else { return nil }
-                return error
-            }
-        }
-    }
-
-    /// Planar float planes, one per bed channel, that grow on demand. Owned by one side at a time:
-    /// the caller between `acquire` and `submit`, the worker until it puts the buffer back.
-    final class PlaneBuffer: @unchecked Sendable {
-        private(set) var planes: [UnsafeMutablePointer<Float>]
-        private(set) var capacity: Int
-
-        init(channels: Int, capacity: Int) {
-            self.capacity = capacity
-            planes = (0..<channels).map { _ in UnsafeMutablePointer<Float>.allocate(capacity: capacity) }
-        }
-
-        deinit { planes.forEach { $0.deallocate() } }
-
-        /// Room for `frames`, keeping the first `keeping` frames of every plane.
-        func ensureCapacity(_ frames: Int, keeping: Int) {
-            guard frames > capacity else { return }
-            let grown = max(frames, capacity * 2)
-            for c in planes.indices {
-                let plane = UnsafeMutablePointer<Float>.allocate(capacity: grown)
-                plane.update(from: planes[c], count: keeping)
-                planes[c].deallocate()
-                planes[c] = plane
-            }
-            capacity = grown
-        }
-    }
+    typealias StampedPacket = SpatialBedPacket
+    typealias PlaneBuffer = SpatialBedBuffer
 
     let leadingFrames: Int
     let magicCookie: Data
 
-    private let encoder: APACEncoding
+    private let encoder: any APACEncoding
     private let queue = DispatchQueue(label: "AetherEngine.SpatialAudioBridge.encode")
 
     /// Guards everything below it.
     private let cond = NSCondition()
     private var freeBuffers: [PlaneBuffer]
-    private var events: [Event] = []
+    private var ready: [StampedPacket] = []
+    private var errors: [Error] = []
     /// Bumped by `reset`; a job submitted before it is skipped, and its output is never collected.
     private var generation = 0
     private var pendingJobs = 0
@@ -97,7 +44,7 @@ final class APACEncodePipeline: @unchecked Sendable {
     private var packetsInRun: Int64 = 0
 
     /// `bufferCount` buffers in all: one the caller renders into, the rest queued or encoding.
-    init(encoder: APACEncoding, channels: Int, bufferFrames: Int, bufferCount: Int = 3) {
+    init(encoder: any APACEncoding, channels: Int, bufferFrames: Int, bufferCount: Int = 3) {
         precondition(bufferCount >= 2, "one buffer to render into and one to encode")
         self.encoder = encoder
         leadingFrames = encoder.leadingFrames
@@ -123,7 +70,7 @@ final class APACEncodePipeline: @unchecked Sendable {
     /// new one on its own position.
     func restart() {
         enqueue { [self] in
-            flushEncoder()
+            stamp(encoder.flushIgnoringErrors())
             encoder.reset()
             runStart = nil
         }
@@ -137,9 +84,9 @@ final class APACEncodePipeline: @unchecked Sendable {
     }
 
     /// Drain the encoder at end of stream and wait for it. Returns everything not yet collected.
-    func finish() -> Collected {
+    func finish() -> (packets: [StampedPacket], errors: [Error]) {
         enqueue { [self] in
-            flushEncoder()
+            stamp(encoder.flushIgnoringErrors())
         }
         cond.lock()
         while pendingJobs > 0 { cond.wait() }
@@ -151,7 +98,8 @@ final class APACEncodePipeline: @unchecked Sendable {
     func reset() {
         cond.lock()
         generation += 1
-        events.removeAll()
+        ready.removeAll()
+        errors.removeAll()
         cond.unlock()
         enqueue { [self] in
             encoder.reset()
@@ -161,16 +109,17 @@ final class APACEncodePipeline: @unchecked Sendable {
     }
 
     /// The packets encoded so far, in order, and the encode errors since the last call.
-    func collect() -> Collected {
+    func collect() -> (packets: [StampedPacket], errors: [Error]) {
         cond.lock()
         defer { cond.unlock() }
-        let out = Collected(events: events)
-        events.removeAll(keepingCapacity: true)
+        let out = (ready, errors)
+        ready.removeAll(keepingCapacity: true)
+        errors.removeAll()
         return out
     }
 
     /// Wait for every queued job, then collect.
-    func settle() -> Collected {
+    func settle() -> (packets: [StampedPacket], errors: [Error]) {
         close()
         return collect()
     }
@@ -217,22 +166,10 @@ final class APACEncodePipeline: @unchecked Sendable {
             // leave every later one early. The chunk becomes a gap instead.
             encoder.reset()
             runStart = nil
-            record(error)
+            cond.lock()
+            if generationMatches() { errors.append(error) }
+            cond.unlock()
         }
-    }
-
-    private func flushEncoder() {
-        do {
-            stamp(try encoder.flush())
-        } catch {
-            record(error)
-        }
-    }
-
-    private func record(_ error: Error) {
-        cond.lock()
-        if generationMatches() { events.append(.encodeError(error)) }
-        cond.unlock()
     }
 
     private func stamp(_ packets: [APACEncoder.Packet]) {
@@ -242,11 +179,12 @@ final class APACEncodePipeline: @unchecked Sendable {
         for packet in packets {
             stamped.append(StampedPacket(
                 data: packet.data, isSync: packet.isSync,
-                pts: start + packetsInRun * Int64(APACEncoder.framesPerPacket)))
+                pts: start + packetsInRun * Int64(APACEncoder.framesPerPacket),
+                frames: APACEncoder.framesPerPacket))
             packetsInRun += 1
         }
         cond.lock()
-        if generationMatches() { events.append(contentsOf: stamped.map { .packet($0) }) }
+        if generationMatches() { ready.append(contentsOf: stamped) }
         cond.unlock()
     }
 
@@ -269,4 +207,9 @@ final class APACEncodePipeline: @unchecked Sendable {
         while freeBuffers.isEmpty { cond.wait() }
         return freeBuffers.removeLast()
     }
+}
+
+@available(macOS 26.0, iOS 26.0, tvOS 26.0, visionOS 26.0, *)
+private extension APACEncoding {
+    func flushIgnoringErrors() -> [APACEncoder.Packet] { (try? flush()) ?? [] }
 }

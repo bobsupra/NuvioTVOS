@@ -14,8 +14,9 @@ struct Issue410SourceStallVisibilityTests {
 
     /// The refusal these tests stage arms the request-rate pacer's wall-clock quiet ladder, which
     /// added 54 s to `bytes handed back out of memory do not clear the stall` and blocked a reader
-    /// thread throughout. The subject here is stall visibility, so the ladder is pinned away.
-    init() { OriginRequestBudget.shared.quietPeriodCapForTesting = 0 }
+    /// thread throughout. The subject here is stall visibility, so the ladder is pinned away, for the
+    /// lifetime of this suite instance (one test) and not for the rest of the process.
+    private let quietCapPin = OriginRequestBudget.shared.pinQuietPeriodCapForTesting(0)
 
     private final class PhaseLog: @unchecked Sendable {
         private let lock = NSLock()

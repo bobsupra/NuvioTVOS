@@ -48,22 +48,22 @@ Download the latest Apple TV `.ipa` from [Releases](https://github.com/bobsupra/
 ## Latest tvOS Beta
 
 <!-- BEGIN LATEST_BETA -->
-**Beta 3.4.7** is the latest tvOS release.
+**Beta 3.4.8** is the latest tvOS release.
 
-[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.7/NuvioTV-3.4.7-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.7) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
+[Quick download (.ipa)](https://github.com/bobsupra/NuvioTVOS/releases/download/tvos-beta-3.4.8/NuvioTV-3.4.8-unsigned-release.ipa) · [Read the release notes](https://github.com/bobsupra/NuvioTVOS/releases/tag/tvos-beta-3.4.8) · [Report a bug or suggest an idea](https://github.com/bobsupra/NuvioTVOS/issues/new/choose)
 <!-- END LATEST_BETA -->
 
 > 🎉 **Thank you for 300+ GitHub Stars!** A huge thank you to everyone in the community for supporting NuvioTVOS and helping us reach 300+ stars!
 
 The IPA requires a compatible tvOS development or sideloading signing workflow before installation.
 
-### New in Beta 3.4.7
+### New in Beta 3.4.8
 
-- **In-App Update Notices & Remote Announcements:** Direct in-app detection of new official releases (`ReleaseUpdateService`) with focus-safe update prompts, QR code download links, and customizable update notification toggles in Settings. Added `AnnouncementService` with support for remote broadcast alerts and release highlights (`announcements.json`).
-- **AetherEngine 7.47.0 & Live HLS Stream Recovery:** Upgraded core playback engine to version 7.47.0 with native live HLS starvation recovery (`NativeLiveHLSStarvationPolicy`), origin HOLD-BACK restoration to eliminate buffer loops, tuned live edge cushion, and keyframe-aligned live joins.
-- **Performance Optimization & Zero-Allocation Diagnostics:** Zero-allocation `@autoclosure` string tracing in `HomeView`, eliminated startup benchmark logging and table formatting in Release builds, and silenced hot-path loop diagnostics (scrub watchdogs, tap brokers, face detection, continue-watching store heartbeats).
-- **Watch Party Polish & Multi-Service Scrobble:** Streamlined sign-in flow directly from the Party tab for expired sessions, hardened cross-platform chat toast layouts, and unified simultaneous scrobbling across Trakt, Simkl, and WeTrakr.
-- **Localization Polish:** Refined translations and terminology across European Portuguese, Traditional Chinese, Simplified Chinese, French, Spanish, German, and Arabic.
+- **Native Usenet & NNTP Streaming Playback:** Stream video directly from NZB URLs (`nzbUrl`) from Stremio addons with up to 100 parallel connections, a decoupled 4-second read-ahead buffer unaffected by speed caps, and non-thrashing seeks.
+- **Dedicated Calendar Tab & Follows:** New **Calendar** tab (`TVTab.calendar`) displaying upcoming episodes and releases with merged manual and automatic follows, plus a dynamic **Today** shelf row on Home.
+- **Smart Credit Skipping & Enhanced Player Controls:** Automatically skip closing credits while preserving mid-credit and post-credit scenes, expanded on-screen player controls, smooth outline subtitle rendering, and prewarmed stream handoffs from Details.
+- **Home, Details & Top Shelf Polish:** Configurable Details section ordering and visibility, unified "All" hero rating source, redesigned Apple TV Top Shelf with four 16:9 rows, fast addon search with linear keyboard sizing, and MDBList request caching.
+- **AetherEngine 7.51.0 & Audio Shaping:** Upgraded core playback engine to version 7.51.0 with dynamic audio shaping (channel fold-down, night mode compression, +12 dB dialogue lift with peak limiting), Apple required-reason privacy manifests (`PrivacyInfo.xcprivacy`), packetized streaming drainage for sidecar bitmap subtitles (`.sup`), and HLS session lifecycle cleanup.
 
 ### Built-in Player
 

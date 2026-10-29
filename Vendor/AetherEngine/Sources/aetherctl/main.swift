@@ -67,7 +67,7 @@ func printUsage() {
 
     Usage:
       aetherctl probe [--detect-hdr10plus] [--detect-hdr-vivid] [--detect-atmos] <url>
-      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
+      aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
       aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
@@ -75,10 +75,11 @@ func printUsage() {
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
                  [--audio-delay <ms>] [--switch-audio-delay <ms>[@ms]]... [--paused]
+                 [--audio-shaping <spec>] [--switch-audio-shaping <spec>[@ms]]...
                  [--reload-applying <key>=<value>]... [--reload-applying-at <ms>]
                  [--drop-audio]
                  [--sequential-origin] [--declared-duration S]
-             [--max-concurrent-requests N] [--atmos-bed 7.1.4]
+             [--max-concurrent-requests N] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]]
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
@@ -115,7 +116,7 @@ func printUsage() {
       aetherctl dvsurvey [--frames N] [--list K] <file>
       aetherctl extract [--at <sec>] [--preview|--snapshot] [--width <px>] [--loops <n>] <url>
       aetherctl audio [--seconds N] <url>
-      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>
+      aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue] <url>
                          (#95: decode the loopback audio track to mono 48k WAV, print continuity stats;
                           --software runs a real session through the SW sink, exit 3 if it yields no audible PCM)
       aetherctl customio [--memory] [--forward-only] [--audio-only] [--reload] [--switch-audio] [--select-subs] [--extract] [--audio-index N] [--reload-decode-path automatic|software] <file>
@@ -313,8 +314,9 @@ func printUsage() {
 // MARK: - Object audio
 
 /// `--atmos-bed 7.1.4`: TrueHD Atmos or DTS:X rendered into that bed and delivered as APAC
-/// (`LoadOptions.objectAudioRendering`, #731). Without it the channel bridge plays them.
-private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
+/// (`LoadOptions.objectAudioRendering`, #731), or with `--bed-format lpcm` as 24-bit PCM. Without it
+/// the channel bridge plays them.
+private func objectAudioRendering(_ flag: String?, format: String? = nil) -> ObjectAudioRendering {
     guard let flag else { return .off }
     guard let layout = SpatialSpeakerLayout(rawValue: flag) else {
         print("ERROR: --atmos-bed expects one of \(SpatialSpeakerLayout.allCases.map(\.rawValue)), got '\(flag)'")
@@ -323,7 +325,13 @@ private func objectAudioRendering(_ flag: String?) -> ObjectAudioRendering {
     #if !(TrueHDObjectAudio || DTSXObjectAudio)
     print("[aetherctl] note: --atmos-bed renders nothing without the TrueHDObjectAudio / DTSXObjectAudio traits")
     #endif
-    return .apac(layout)
+    switch format {
+    case nil, "apac": return .apac(layout)
+    case "lpcm": return .lpcm(layout)
+    default:
+        print("ERROR: --bed-format expects apac or lpcm, got '\(format!)'")
+        exit(64)
+    }
 }
 
 // MARK: - URL parsing
@@ -520,17 +528,25 @@ if first == "scrubpreview" {
     let at = takeStringFlag("--at", from: &rest) ?? "2,5,30,50,65"
     let warm = takeDoubleFlag("--warm", from: &rest) ?? 4
     let keep = takeStringFlag("--keep", from: &rest)
+    let stills = takeFlag("--stills", from: &rest)
+    let maxRequests = takeIntFlag("--max-concurrent-requests", from: &rest)
+    let forward = takeIntFlag("--forward-buffer-segments", from: &rest)
     if let kbps = takeIntFlag("--throttle-kbps", from: &rest) {
         AetherEngine.setSourceThrottleKbpsForTesting(kbps)
         print("[aetherctl] source throttle: \(kbps) kbit/s")
     }
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
-        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] <url>")
+        print("Usage: aetherctl scrubpreview [--at s1,s2,...] [--warm S] [--keep DIR] [--throttle-kbps N] "
+              + "[--stills [--max-concurrent-requests N] [--forward-buffer-segments N]] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "scrubpreview")
     let positions = at.split(separator: ",").compactMap { Double($0.trimmingCharacters(in: .whitespaces)) }
+    if stills {
+        exit(runScrubStills(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm,
+                            maxConcurrentRequests: maxRequests, forwardBufferSegments: forward))
+    }
     exit(runScrubPreview(url: parseSourceURL(urlArg), positions: positions, warmSeconds: warm, keepDir: keep))
 }
 
@@ -574,15 +590,16 @@ if first == "audiotap" {
     rest.removeAll { $0 == "--remote" }
     let software = rest.contains("--software")
     rest.removeAll { $0 == "--software" }
+    let dialogue = takeFlag("--dialogue", from: &rest)
     guard let urlArg = rest.first(where: { !$0.hasPrefix("--") }) else {
         print("ERROR: audiotap requires a <url> argument")
-        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] <url>")
+        print("Usage: aetherctl audiotap [--duration S] [--out PATH.wav] [--remote | --software] [--dialogue] <url>")
         exit(64)
     }
     rest.removeAll { $0 == urlArg }
     rejectStrayFlags(rest, subcommand: "audiotap")
     exit(runAudioTap(url: parseSourceURL(urlArg), duration: duration, outPath: outPath,
-                 remote: remote, software: software))
+                 remote: remote, software: software, channels: dialogue ? .dialogue : .downmix))
 }
 
 if first == "hlsfixture" {
@@ -847,7 +864,8 @@ if first == "play" {
     // with a throttled origin to see the startup difference; on a fast source nothing changes.
     let progressiveSegments = takeFlag("--progressive-segments", from: &rest)
     // #731: TrueHD Atmos or DTS:X rendered into a bed as APAC; the 1 Hz line then reports its objects.
-    let playObjectAudio = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
+    let playObjectAudio = objectAudioRendering(
+        takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
     let declaredDuration = takeDoubleFlag("--declared-duration", from: &rest)
     // #311: install the software frame-time observer and read the presentation timebase, so the
     // per-frame boundaries and the clock a host would pace an overlay against are both observable.
@@ -920,6 +938,26 @@ if first == "play" {
         audioDelaySwitches.append(AudioDelaySwitchRequest(
             milliseconds: ms,
             delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
+    }
+    // AE#923: `--audio-shaping <spec>` is the load option, `--switch-audio-shaping <spec>[@ms]` the
+    // runtime setter. A spec is `off` or a comma list of `ch=N`, `dialogue=DB`, `night`.
+    var audioShaping = AudioShaping()
+    if let spec = takeStringFlag("--audio-shaping", from: &rest) {
+        guard let parsed = parseAudioShapingSpec(spec) else {
+            print("ERROR: --audio-shaping takes off or ch=N,dialogue=DB,night; got '\(spec)'")
+            exit(64)
+        }
+        audioShaping = parsed
+    }
+    var audioShapingSwitches: [AudioShapingSwitchRequest] = []
+    while let spec = takeStringFlag("--switch-audio-shaping", from: &rest) {
+        let parts = spec.split(separator: "@", maxSplits: 1).map(String.init)
+        guard let parsed = parseAudioShapingSpec(parts[0]) else {
+            print("ERROR: --switch-audio-shaping takes <spec>[@ms], got '\(spec)'")
+            exit(64)
+        }
+        audioShapingSwitches.append(AudioShapingSwitchRequest(
+            shaping: parsed, delayMilliseconds: parts.count == 2 ? (Int(parts[1]) ?? 20_000) : 20_000))
     }
     // AE#464 round 2: mount with `autoplay = false`, the shape of a host that owns transport.
     let pausedMount = takeFlag("--paused", from: &rest)
@@ -1049,6 +1087,7 @@ if first == "play" {
                  audioSwitch: audioSwitch,
                  teletextPage: teletextPage, teletextSwitch: teletextSwitch,
                  audioDelayMs: audioDelayMs, audioDelaySwitches: audioDelaySwitches,
+                 audioShaping: audioShaping, audioShapingSwitches: audioShapingSwitches,
                  pausedMount: pausedMount,
                  optionCorrection: optionCorrection,
                  sequentialOrigin: sequentialOrigin, maxConcurrentRequests: maxConcurrentRequests,
@@ -1167,7 +1206,8 @@ if ["probe", "serve", "validate", "swdecode", "extract", "audio", "customio"].co
     // being judged by ear.
     let serveAudioDelayMs = takeIntFlag("--audio-delay", from: &rest) ?? 0
     // #731: TrueHD Atmos or DTS:X rendered into a speaker bed and served as APAC (LoadOptions.objectAudioRendering).
-    let serveObjectAudioRendering = objectAudioRendering(takeStringFlag("--atmos-bed", from: &rest))
+    let serveObjectAudioRendering = objectAudioRendering(
+        takeStringFlag("--atmos-bed", from: &rest), format: takeStringFlag("--bed-format", from: &rest))
     rejectStrayFlags(rest, subcommand: first)
     guard let urlArg = rest.first else {
         print("ERROR: \(first) requires a <url> argument")

@@ -117,7 +117,7 @@ enum StereoVideoSignal: Equatable, Sendable {
         func box(_ type: String, _ payload: [UInt8]) -> [UInt8] {
             bigEndian(UInt32(8 + payload.count)) + Array(type.utf8) + payload
         }
-        let stri = box("stri", [0, 0, 0, 0, (packing.reversed ? 0x08 : 0) | 0x03])
+        let stri = box("stri", [0, 0, 0, 0, UInt8(packing.reversed ? 0x08 : 0) | 0x03])
         let pkin = box("pkin", [0, 0, 0, 0] + Array((packing.kind == .sideBySide ? "side" : "over").utf8))
         return box("vexu", box("eyes", stri) + box("pack", pkin))
     }

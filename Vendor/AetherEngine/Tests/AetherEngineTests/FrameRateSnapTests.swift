@@ -15,17 +15,25 @@ struct FrameRateSnapTests {
         #expect(FrameRateSnap.snap(48) == 48)
     }
 
-    @Test("Film cadence shortcut: 23.5...24.05 → 23.976")
+    @Test("Film cadence window: 23.5...24.05 → 23.976, except an exact 24.000")
     func filmCadencePrefers23976() {
-        // Film-cadence shortcut beats the 24.0 nearest-match because
-        // panels that support 24 also support 23.976; reverse isn't
-        // guaranteed.
+        #expect(FrameRateSnap.snap(24000.0 / 1001.0) == 23.976)
         #expect(FrameRateSnap.snap(23.976) == 23.976)
-        #expect(FrameRateSnap.snap(24.000) == 23.976)
         #expect(FrameRateSnap.snap(23.97) == 23.976)
         #expect(FrameRateSnap.snap(23.98) == 23.976)
         #expect(FrameRateSnap.snap(23.5) == 23.976)
+        #expect(FrameRateSnap.snap(23.99) == 23.976)
+        #expect(FrameRateSnap.snap(24.01) == 23.976)
         #expect(FrameRateSnap.snap(24.05) == 23.976)
+    }
+
+    @Test("AE#884: a 24.000 fps probe is programmed as 24 Hz")
+    func exact24GoesTo24() {
+        #expect(FrameRateSnap.snap(24) == 24)
+        #expect(FrameRateSnap.snap(24.004) == 24)
+        #expect(FrameRateSnap.snap(23.996) == 24)
+        // Above the film window the nearest match still picks 24, as before.
+        #expect(FrameRateSnap.snap(24.3) == 24)
     }
 
     @Test("Nearby probes snap to standard within ±0.5")

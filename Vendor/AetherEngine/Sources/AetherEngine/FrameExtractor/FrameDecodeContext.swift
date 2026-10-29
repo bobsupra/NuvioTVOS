@@ -32,6 +32,9 @@ final class FrameDecodeContext: @unchecked Sendable {
     private let selectTitleID: Int?
     /// Caller metadata can identify a disc image behind an opaque HTTP(S) URL.
     private let discImageHint: Bool
+    /// Wall-clock budget of one resident or bounded decode. Tests that hold the source on an I/O
+    /// gate widen it, so a slow runner cannot turn a deliberate wait into a deadline miss.
+    private let residentBudget: Duration
     /// Owned only during a controlled one-shot extraction. The ordinary URL and
     /// custom-reader paths retain their existing ownership rules.
     private var boundedReader: IOReader?
@@ -187,9 +190,11 @@ final class FrameDecodeContext: @unchecked Sendable {
         self.selectTitleID = selectTitleID
         self.discImageHint = discImageHint
         self.allowsHardwareDecode = allowsHardwareDecode
+        self.residentBudget = .milliseconds(750)
     }
 
-    init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = true) {
+    init(reader: IOReader, formatHint: String?, allowsHardwareDecode: Bool = false,
+         residentBudget: Duration = .milliseconds(750)) {
         // Placeholder; unused when reader != nil (openInternal opens the reader).
         self.url = URL(string: "aether-custom://frame-extractor")!
         self.openedHTTPHeaders = [:]
@@ -198,9 +203,12 @@ final class FrameDecodeContext: @unchecked Sendable {
         self.formatHint = formatHint
         self.selectTitleID = nil
         self.discImageHint = false
-        // Resident readers normally allow VideoToolbox; source-known DV paths can explicitly
-        // disable it when cached segment metadata is incomplete.
-        self.allowsHardwareDecode = allowsHardwareDecode
+        // DataIOReader is internal and exists for the native segment-cache still path. Recognizing
+        // it here keeps both VOD and live FrameExtractor call sites byte-identical and leaves every
+        // public custom-reader/network caller on the issue #27 software default. The 2026-09-02
+        // device trace measured 30 software context opens in 20 seconds over resident H.264 bytes.
+        self.allowsHardwareDecode = allowsHardwareDecode || reader is DataIOReader
+        self.residentBudget = residentBudget
     }
 
     deinit {
@@ -571,7 +579,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             guard let ticks = Demuxer.ticks(forSeconds: max(0, effectiveOffset), timeBase: timeBase) else { return nil }
             offsetTicks = ticks
         }
-        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: .milliseconds(750))
+        let deadline = residentDeadline ?? ContinuousClock.now.advanced(by: residentBudget)
         var packetCount = 0
 
         var frame: UnsafeMutablePointer<AVFrame>? = av_frame_alloc()
@@ -618,9 +626,10 @@ final class FrameDecodeContext: @unchecked Sendable {
                     av_frame_free(&transferredFrame)
                 }
             }
+            let sar = resolvedSAR(frame: f)
             let width = mode.usesTargetWidth
                 ? targetWidth
-                : Self.clampedWidth(frame: f, maxSize: maxSize)
+                : Self.clampedWidth(frame: f, sar: sar, maxSize: maxSize)
             #if DolbyVisionStillReshaping
             if requiredDolbyVisionReshaping || isDolbyVisionNoBaseLayer {
                 let sar = resolvedSAR(frame: f)
@@ -635,7 +644,7 @@ final class FrameDecodeContext: @unchecked Sendable {
             #endif
             if isHDR {
                 var toned = HDRToneMapper.toneMap(frame: f, targetWidth: width, timeBase: timeBase,
-                                                 highQuality: mode.isFrameAccurate)
+                                                 sar: sar, highQuality: mode.isFrameAccurate)
                 if toned != nil {
                     defer { av_frame_free(&toned) }
                     if let img = Self.cgImageFromRGBAFrame(toned!) { return img }
@@ -759,15 +768,21 @@ final class FrameDecodeContext: @unchecked Sendable {
         return (dstW, dstH)
     }
 
-    /// Snapshot output width: native width, optionally capped to `maxSize` (aspect-preserved).
-    private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, maxSize: CGSize?) -> Int {
+    /// Snapshot bounds apply to square-pixel output, after the source SAR corrects its shape.
+    private static func clampedWidth(frame: UnsafeMutablePointer<AVFrame>, sar: AVRational,
+                                     maxSize: CGSize?) -> Int {
         let nativeW = Int(frame.pointee.width)
         let nativeH = Int(frame.pointee.height)
         guard let maxSize, maxSize.width > 0, maxSize.height > 0, nativeW > 0, nativeH > 0 else {
             return nativeW
         }
-        let scale = min(maxSize.width / CGFloat(nativeW), maxSize.height / CGFloat(nativeH), 1.0)
-        return max(1, Int((CGFloat(nativeW) * scale).rounded()))
+        let displayHeight = CGFloat(nativeH) * CGFloat(sar.den) / CGFloat(sar.num)
+        // Whole output pixels must fit both limits, including fractional CGSize bounds.
+        // Keep the width bound in pixels: dividing by nativeW and multiplying back can
+        // turn an exactly fitting integer into the preceding representable value.
+        let heightLimitedWidth = maxSize.height.rounded(.down) * CGFloat(nativeW) / displayHeight
+        let width = min(CGFloat(nativeW), maxSize.width.rounded(.down), heightLimitedWidth)
+        return max(1, Int(width.rounded(.down)))
     }
 
     /// Copy an RGBA AVFrame (e.g. tone-mapper output) into an owned-buffer CGImage.
