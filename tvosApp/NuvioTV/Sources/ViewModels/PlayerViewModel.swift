@@ -8,6 +8,21 @@ protocol ScrubThumbnailProviding: AnyObject {
     var supportsScrubThumbnails: Bool { get }
     func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage?
     func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage?
+    /// The closest still already held within `maxDistance`, shown when the target has none yet.
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage?
+    /// True when `prefetchScrubThumbnails` runs in the background without retiring the
+    /// foreground request (the seek preview lane); false keeps the speculative requests.
+    var prefetchesScrubThumbnailsInBackground: Bool { get }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double)
+    /// Seconds until previews may read the source, when only a just-started pause holds them back.
+    func pendingScrubThumbnailDelay() -> TimeInterval?
+}
+
+extension ScrubThumbnailProviding {
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? { nil }
+    var prefetchesScrubThumbnailsInBackground: Bool { false }
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {}
+    func pendingScrubThumbnailDelay() -> TimeInterval? { nil }
 }
 
 struct LiveStreamFailoverPolicy {
@@ -581,6 +596,8 @@ class PlayerViewModel: ObservableObject {
     private var scrubThumbnailGeneration: UInt64 = 0
     private var scrubThumbnailInteractionToken: UInt64 = 0
     private var scrubThumbnailTargetSeconds: Double?
+    /// How far from the target a held still may stand in while the target has none.
+    static let nearestScrubThumbnailDistance: Double = 30
     private var lastScrubTargetSeconds: Double?
     private var speculativePrefetchTask: Task<Void, Never>?
     private var scrubLastDx: CGFloat = 0
@@ -1234,6 +1251,7 @@ class PlayerViewModel: ObservableObject {
             season: activeEpisodeNumbers?.season,
             episode: activeEpisodeNumbers?.episode,
             duration: expectedDurationSeconds,
+            fileIdentity: (cacheFileIdentity ?? activeCacheFileIdentity)?.cacheKey ?? filename,
             fallbackURL: url.absoluteString
         )
         let isAnime = activeMeta?.isAnime == true
@@ -4894,12 +4912,19 @@ class PlayerViewModel: ObservableObject {
 
     private func scheduleSpeculativePrefetch(from seconds: Double, direction: Double, duration: Double) {
         speculativePrefetchTask?.cancel()
-        guard isSeekPreviewEnabled, activeEngineKind == .aether, duration > 0 else { return }
+        guard isSeekPreviewEnabled, duration > 0,
+              let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
+        if provider.prefetchesScrubThumbnailsInBackground {
+            // The preview lane queues neighbours behind the foreground decode instead of
+            // issuing requests that would retire it.
+            provider.prefetchScrubThumbnails(around: seconds, direction: direction, duration: duration)
+            return
+        }
+        guard activeEngineKind == .aether else { return }
         let step = 15.0 * (direction >= 0 ? 1.0 : -1.0)
         let targets = [seconds + step, seconds + step * 2]
             .filter { $0 >= 0 && $0 <= duration }
         guard !targets.isEmpty else { return }
-        guard let provider = scrubThumbnailProvider, provider.supportsScrubThumbnails else { return }
         speculativePrefetchTask = Task(priority: .utility) { [weak provider] in
             for target in targets {
                 guard !Task.isCancelled else { break }
@@ -4960,12 +4985,14 @@ class PlayerViewModel: ObservableObject {
             }
             var lastAttemptTarget: Double?
             var failedAttempts = 0
+            var usedDeferredRetry = false
             var lastDecodeTime = Date.distantPast
             while !Task.isCancelled {
                 guard let target = self.pendingScrubThumbnailSeconds else { break }
                 self.pendingScrubThumbnailSeconds = nil
                 if lastAttemptTarget != target {
                     failedAttempts = 0
+                    usedDeferredRetry = false
                     lastAttemptTarget = target
                 }
                 let cached = await selectedProvider.cachedScrubThumbnail(
@@ -5010,6 +5037,14 @@ class PlayerViewModel: ObservableObject {
                     lastDecodeTime = Date()
                 }
 
+                // Nothing for the target (outside the buffer, not admitted to the network yet):
+                // the closest still already held keeps the card showing a picture.
+                var nearest: CGImage?
+                if image == nil, !Task.isCancelled, self.pendingScrubThumbnailSeconds == nil {
+                    nearest = await selectedProvider.nearestScrubThumbnail(
+                        atSeconds: target, maxDistance: Self.nearestScrubThumbnailDistance)
+                }
+
                 guard !Task.isCancelled,
                       self.scrubThumbnailGeneration == generation,
                       self.scrubThumbnailTaskInteractionToken == interactionToken,
@@ -5023,6 +5058,9 @@ class PlayerViewModel: ObservableObject {
                 // Completed fast frames provide progressive feedback
                 if let image {
                     self.scrubThumbnail = image
+                    self.scrubThumbnailTargetSeconds = target
+                } else if let nearest {
+                    self.scrubThumbnail = nearest
                     self.scrubThumbnailTargetSeconds = target
                 } else if abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
                     self.scrubThumbnail = nil
@@ -5051,6 +5089,21 @@ class PlayerViewModel: ObservableObject {
                 if let refined {
                     self.scrubThumbnail = refined
                     self.scrubThumbnailTargetSeconds = target
+                } else if image == nil, !usedDeferredRetry,
+                          let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
+                    // A pause has not yet released the playback connection (option off): try the
+                    // settled target once more when it has, without another remote press.
+                    usedDeferredRetry = true
+                    let deadline = Date().addingTimeInterval(delay + 0.2)
+                    // Sliced, so a new target moves on at once instead of after the wait.
+                    while Date() < deadline, self.pendingScrubThumbnailSeconds == nil {
+                        try? await Task.sleep(nanoseconds: 100_000_000)
+                        guard !Task.isCancelled else { return }
+                    }
+                    if self.pendingScrubThumbnailSeconds == nil,
+                       (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
+                        self.pendingScrubThumbnailSeconds = target
+                    }
                 } else if image == nil, failedAttempts < 2 {
                     // A transient cache miss/yield must recover even after the
                     // user stops moving, without requiring another remote press.

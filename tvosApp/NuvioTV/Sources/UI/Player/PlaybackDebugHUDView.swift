@@ -222,6 +222,15 @@ struct PlaybackDebugHUDView: View {
                     hasDot: true,
                     dotColor: info.stallsCount > 1 ? .red : (info.stallsCount == 1 ? .yellow : .green)
                 )
+                let previews = SeekPreviewDiagnostics.shared.line
+                if !previews.isEmpty {
+                    hudRow(
+                        label: "Previews",
+                        value: previews,
+                        hasDot: true,
+                        dotColor: previews.hasPrefix("stopped") ? .red : (previews.hasPrefix("net on") ? .green : .gray)
+                    )
+                }
             }
         }
     }

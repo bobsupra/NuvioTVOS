@@ -1667,6 +1667,19 @@ enum HybridSeekThumbnailPolicy {
     static let coarseIntervalSeconds: Double = 60
     static let maximumCoarseSamples = 120
     static let maximumPreviewTimeError: Double = 0.5
+    /// How far before the requested time the keyframe of a fast preview may be. While the
+    /// user is moving, that keyframe is shown at once; the exact frame follows when they stop.
+    static let maximumKeyframePreviewLead: Double = 12
+
+    /// Whether a decoded still may be shown for `requestedSeconds`: exact requests within
+    /// `maximumPreviewTimeError`, fast ones also from the keyframe before it.
+    static func acceptsPreview(actualSeconds: Double?, requestedSeconds: Double, precise: Bool) -> Bool {
+        guard let actualSeconds, actualSeconds.isFinite, requestedSeconds.isFinite else { return false }
+        if abs(actualSeconds - requestedSeconds) <= maximumPreviewTimeError { return true }
+        guard !precise else { return false }
+        return actualSeconds < requestedSeconds
+            && requestedSeconds - actualSeconds <= maximumKeyframePreviewLead
+    }
 
     static func fineBucket(for seconds: Double) -> Int? {
         guard seconds.isFinite, seconds >= 0 else { return nil }
@@ -1765,11 +1778,15 @@ actor TrickplayDiskCache {
 
     /// Canonical content identifier hashing IMDb/Cinemeta ID, season, episode, and duration bucket.
     /// Uses 10-second duration buckets like VortX to prevent different cuts/releases from sharing previews.
+    /// `fileIdentity` names the exact file (torrent hash and file index, or the release file
+    /// name): two releases of one episode share id, episode and often the runtime bucket, and
+    /// must not share stills.
     static func canonicalKey(
         contentId: String?,
         season: Int? = nil,
         episode: Int? = nil,
         duration: Double? = nil,
+        fileIdentity: String? = nil,
         fallbackURL: String = ""
     ) -> String {
         let id = (contentId ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
@@ -1777,7 +1794,9 @@ actor TrickplayDiskCache {
             let s = season ?? 0
             let e = episode ?? 0
             let durBucket = duration.map { Int(floor($0 / 10.0)) * 10 } ?? 0
-            let raw = "\(id):\(s):\(e):\(durBucket)"
+            var raw = "\(id):\(s):\(e):\(durBucket)"
+            let file = (fileIdentity ?? "").trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+            if !file.isEmpty { raw += "|file:\(file)" }
             let digest = SHA256.hash(data: Data(raw.utf8))
             let hex = digest.map { String(format: "%02x", $0) }.joined()
             return "canon_\(hex.prefix(16))"
@@ -1865,6 +1884,14 @@ actor TrickplayDiskCache {
         CGImageDestinationAddImage(dest, image, options as CFDictionary)
         guard CGImageDestinationFinalize(dest) else { return nil }
         return data as Data
+    }
+
+    /// Marks a title's stills as recently used, so the size budget evicts other titles first.
+    func touch(streamKey: String) {
+        guard !streamKey.isEmpty else { return }
+        let dir = itemDirectory(for: streamKey)
+        guard fileManager.fileExists(atPath: dir.path) else { return }
+        try? fileManager.setAttributes([.modificationDate: Date()], ofItemAtPath: dir.path)
     }
 
     /// Clears frames for a specific stream.
@@ -2347,6 +2374,13 @@ actor HybridSeekThumbnailIndex {
         self.generation = generation
         self.streamKey = streamKey
         self.externalTrickplayProvider = nil
+        if !streamKey.isEmpty {
+            // Pruning evicts the least recently modified title first; opening one counts as use.
+            Task {
+                await TrickplayDiskCache.shared.touch(streamKey: streamKey)
+                await TrickplayDiskCache.shared.touch(streamKey: SeekPreviewLane.diskKey(for: streamKey))
+            }
+        }
     }
 
     func lookup(seconds: Double, duration: Double, generation: UInt64) async -> CGImage? {
@@ -2402,6 +2436,20 @@ actor HybridSeekThumbnailIndex {
     func hasCoarse(at seconds: Double, generation: UInt64) -> Bool {
         guard self.generation == generation else { return false }
         return coarse.values.contains { abs($0.seconds - seconds) < 0.01 }
+    }
+
+    /// The closest still in memory within `maxDistance`, fine or coarse. For a preview that would
+    /// otherwise show nothing: an approximate picture beats an empty card.
+    func nearest(seconds: Double, maxDistance: Double, generation: UInt64) -> CGImage? {
+        guard self.generation == generation, seconds.isFinite, maxDistance > 0 else { return nil }
+        var best: Entry?
+        for entry in fine.values where abs(entry.seconds - seconds) <= maxDistance {
+            if best.map({ abs(entry.seconds - seconds) < abs($0.seconds - seconds) }) ?? true { best = entry }
+        }
+        for entry in coarse.values where abs(entry.seconds - seconds) <= maxDistance {
+            if best.map({ abs(entry.seconds - seconds) < abs($0.seconds - seconds) }) ?? true { best = entry }
+        }
+        return best?.image
     }
 
     func store(
@@ -2589,6 +2637,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private var softwareFrameExtractorCleanupTask: Task<Void, Never>?
     private var softwareFrameExtractorCleanupGeneration: UInt64 = 0
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
+    private let seekPreviewLaneHost = SeekPreviewLaneHost()
+    /// When the current pause began; Aether releases its held source connection 5 s into one.
+    private var previewPausedSince: Date?
     private var thumbnailSourceContext: PlaybackThumbnailSourceContext?
     private var thumbnailIndexResetTask: Task<Void, Never>?
     private var externalTrickplayProvider: (any TrickplayProviding)?
@@ -2727,6 +2778,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         engine.supportsCacheBackedStills
             || isLocalPlaybackCache
             || (!isRemoteStream && engine.playbackBackend == .software)
+            || SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
     }
 
     static func shouldUseBoundedProgressiveScrubPreview(
@@ -2759,15 +2811,17 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         return containers.contains { knownContainers.contains(String($0).trimmingCharacters(in: .whitespaces)) }
     }
 
-    static func acceptsBoundedScrubFrame(_ frame: ScrubFrame?, at seconds: Double) -> Bool {
-        guard let frame, seconds.isFinite, frame.actualSeconds.isFinite,
-              abs(frame.actualSeconds - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError else { return false }
+    static func acceptsBoundedScrubFrame(_ frame: ScrubFrame?, at seconds: Double, precise: Bool = true) -> Bool {
+        guard let frame, seconds.isFinite,
+              HybridSeekThumbnailPolicy.acceptsPreview(
+                actualSeconds: frame.actualSeconds, requestedSeconds: seconds, precise: precise) else { return false }
         return frame.validRange?.contains(seconds) ?? true
     }
 
     @MainActor
     static func boundedProgressiveScrubFrame(
         at seconds: Double,
+        precise: Bool = true,
         resident: @MainActor () async -> ScrubFrame?,
         ownsSource: @MainActor () -> Bool,
         cleanup: @MainActor () async -> Void,
@@ -2780,7 +2834,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         await cleanup()
         // Superseded requests on the same source still drain their decoder, then stop before publication/fallback.
         guard isCurrent() else { return nil }
-        if acceptsBoundedScrubFrame(frame, at: seconds), let frame {
+        if acceptsBoundedScrubFrame(frame, at: seconds, precise: precise), let frame {
             return BoundedStillFrame(image: frame.image, actualSeconds: frame.actualSeconds)
         }
         return await fallback()
@@ -2849,7 +2903,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
-        return image
+        return image ?? seekPreviewLaneHost.current?.memoryImage(at: seconds, duration: duration)
     }
 
     func scrubThumbnail(
@@ -3188,13 +3242,20 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                                              providerGeneration: providerGeneration,
                                              cancellation: cancellation) else { return nil }
         if let cached { return cached }
+        // Remote sources read the origin only through the preview lane (its own paced connection,
+        // admitted by SeekPreviewNetworkPolicy), never through a one-shot extractor per request.
+        let usesPreviewLane = SeekPreviewLaneHost.mayServe(sourceContext)
         if usesBoundedProgressiveScrubPreview(sourceContext) {
+            // A fast request (precise: false) takes the keyframe before the target: one
+            // frame decoded instead of the whole stretch up to it. The exact frame is
+            // the follow-up request once the user stops moving.
             let still = await Self.boundedProgressiveScrubFrame(
                 at: seconds,
+                precise: precise,
                 resident: {
                     await engine.scrubPreviewFrame(
                         atSeconds: seconds,
-                        refined: true,
+                        refined: precise,
                         maxWidth: maxWidth,
                         isCancelled: { cancellation.isCancelled })
                 },
@@ -3217,6 +3278,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                         sourceContext: sourceContext,
                         atSeconds: seconds,
                         maxWidth: maxWidth,
+                        allowsOrigin: !usesPreviewLane,
                         cancellation: cancellation,
                         isCurrent: {
                             self.isCurrentScrubThumbnailRequest(
@@ -3226,20 +3288,116 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 })
             guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                                  providerGeneration: providerGeneration,
-                                                 cancellation: cancellation),
-                  let still, let actual = still.actualSeconds, actual.isFinite else { return nil }
-            await hybridThumbnailIndex.store(
-                still.image, seconds: actual, kind: .fine, generation: generation)
-            guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
-                                                 providerGeneration: providerGeneration,
                                                  cancellation: cancellation) else { return nil }
-            return still.image
+            if let still, let actual = still.actualSeconds, actual.isFinite {
+                // A keyframe some seconds off the target stays in memory only: the disk lookup
+                // matches within seconds and would hand it to the exact request that follows.
+                await hybridThumbnailIndex.store(
+                    still.image, seconds: actual, kind: .fine, generation: generation,
+                    persistToDisk: abs(actual - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError)
+                guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                                     providerGeneration: providerGeneration,
+                                                     cancellation: cancellation) else { return nil }
+                return still.image
+            }
+            guard usesPreviewLane else { return nil }
+            return await previewLaneThumbnail(
+                atSeconds: seconds, sourceContext: sourceContext, generation: generation,
+                requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)
         }
 
-        return await generateLegacyScrubThumbnail(
+        let legacy = await generateLegacyScrubThumbnail(
             atSeconds: seconds, maxWidth: maxWidth, precise: precise,
             generation: generation, requestID: requestID,
             providerGeneration: providerGeneration, cancellation: cancellation)
+        guard legacy == nil, usesPreviewLane,
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return legacy }
+        return await previewLaneThumbnail(
+            atSeconds: seconds, sourceContext: sourceContext, generation: generation,
+            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)
+    }
+
+    // MARK: Seek preview lane
+
+    private func previewLaneThumbnail(
+        atSeconds seconds: Double,
+        sourceContext: PlaybackThumbnailSourceContext?,
+        generation: UInt64,
+        requestID: UInt64,
+        providerGeneration: UInt64,
+        cancellation: PlaybackThumbnailRequestCancellation
+    ) async -> CGImage? {
+        guard let sourceContext, let lane = await previewLane(for: sourceContext),
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        let image = await lane.image(at: seconds, duration: previewDuration)
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        return image
+    }
+
+    private var previewDuration: Double {
+        durationMs > 0 ? Double(durationMs) / 1000.0 : 0
+    }
+
+    private func previewLane(for context: PlaybackThumbnailSourceContext) async -> SeekPreviewLane? {
+        let generation = loadGeneration
+        guard context.generation == generation, !isAwaitingEngineLoad else { return nil }
+        let index = hybridThumbnailIndex
+        return await seekPreviewLaneHost.lane(
+            for: context,
+            diskStreamKey: contentCanonicalKey ?? currentStreamKey,
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.loadGeneration == generation && self.thumbnailSourceContext == context
+            },
+            admission: { [weak self] in
+                self?.seekPreviewNetworkDecision() ?? .busy
+            },
+            localFrame: { seconds, maxDistance in
+                await index.nearest(seconds: seconds, maxDistance: maxDistance, generation: generation)
+            })
+    }
+
+    private func seekPreviewNetworkDecision() -> SeekPreviewNetworkPolicy.Decision {
+        guard !isAwaitingEngineLoad else { return .busy }
+        let telemetry = engine.liveTelemetry
+        let phase = engine.playbackPhase
+        let containerBitrate = engine.sourceVideoBitrate > 0 ? Double(engine.sourceVideoBitrate) / 1_000_000 : nil
+        return SeekPreviewNetworkPolicy.aether(
+            beyondBuffer: SeekPreviewNetworkPolicy.beyondBufferEnabled,
+            isPaused: phase == .paused && !isTransportPlaying,
+            pausedFor: previewPausedSince.map { Date().timeIntervalSince($0) },
+            isPlaying: phase == .playing,
+            forwardBufferSeconds: telemetry?.forwardBufferSeconds,
+            throughputMbps: telemetry?.networkThroughputMbps,
+            bitrateMbps: telemetry?.averageBitrateMbps ?? containerBitrate)
+    }
+
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? {
+        let generation = loadGeneration
+        guard !isAwaitingEngineLoad else { return nil }
+        let fromIndex = await hybridThumbnailIndex.nearest(
+            seconds: seconds, maxDistance: maxDistance, generation: generation)
+        guard loadGeneration == generation else { return nil }
+        return fromIndex ?? seekPreviewLaneHost.current?.nearestImage(to: seconds, maxDistance: maxDistance)
+    }
+
+    var prefetchesScrubThumbnailsInBackground: Bool {
+        SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
+    }
+
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {
+        seekPreviewLaneHost.current?.prefetch(around: seconds, direction: direction, duration: duration)
+    }
+
+    func pendingScrubThumbnailDelay() -> TimeInterval? {
+        seekPreviewLaneHost.current?.admissionDelay(
+            pausedFor: previewPausedSince.map { Date().timeIntervalSince($0) })
     }
 
     private func generateLegacyScrubThumbnail(
@@ -3444,6 +3602,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private func releaseAuxiliaryThumbnailWorkForPlayback() {
         cancelScrubThumbnailWork()
         suspendCoarseThumbnailWork()
+        // Playback takes the source back; the lane re-checks admission on its next request.
+        seekPreviewLaneHost.revokeNetwork()
         let generation = loadGeneration
         let sourceContext = thumbnailSourceContext
         let cleanupEngine = engine
@@ -4249,6 +4409,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         if Self.shouldReleaseAuxiliaryThumbnailWork(for: phase, after: lastAppliedPlaybackPhase) {
             releaseAuxiliaryThumbnailWorkForPlayback()
         }
+        if phase == .paused {
+            if previewPausedSince == nil { previewPausedSince = Date() }
+        } else {
+            previewPausedSince = nil
+        }
         lastAppliedPlaybackPhase = phase
         switch phase {
         case .idle:
@@ -4630,6 +4795,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     func load(_ request: PlaybackLoadRequest, generation: UInt64) {
         cancelScrubThumbnailWork()
         thumbnailSourceContext = nil
+        seekPreviewLaneHost.reset()
+        previewPausedSince = nil
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil
         teardownRemoteCommands()
@@ -5048,6 +5215,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         teardownRemoteCommands()
         cancelScrubThumbnailWork()
         thumbnailSourceContext = nil
+        seekPreviewLaneHost.reset()
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil
         if let key = contentCanonicalKey {

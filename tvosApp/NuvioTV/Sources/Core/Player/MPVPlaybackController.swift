@@ -486,11 +486,14 @@ enum PlaybackThumbnailSourceFallback {
         maxInputBytes: 64 * 1024 * 1024, maxPackets: 2_048,
         maxPacketBytes: 8 * 1024 * 1024, timeBudget: 2)
 
+    /// `allowsOrigin: false` stops after the local cache stage: a remote source the preview lane
+    /// serves never opens a second, unpaced extractor on the origin here.
     @MainActor
     static func boundedSnapshot(
         sourceContext: PlaybackThumbnailSourceContext,
         atSeconds seconds: Double,
         maxWidth: Int,
+        allowsOrigin: Bool = true,
         cancellation: PlaybackThumbnailRequestCancellation,
         isCurrent: @MainActor () -> Bool,
         requiredDolbyVisionReshaping: Bool = false,
@@ -528,7 +531,7 @@ enum PlaybackThumbnailSourceFallback {
             return nil
         }
 
-        guard isCurrent(), !cancellation.isCancelled, yieldWhile?() != true,
+        guard allowsOrigin, isCurrent(), !cancellation.isCancelled, yieldWhile?() != true,
               let stage = cancellation.beginStage() else { return nil }
         let extractor = FrameExtractor(
             url: originURL,
@@ -615,6 +618,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     // MARK: - Trickplay & Seek Previews
     private let hybridThumbnailIndex = HybridSeekThumbnailIndex()
+    private let seekPreviewLaneHost = SeekPreviewLaneHost()
     private var externalTrickplayProvider: (any TrickplayProviding)?
     private var loadGeneration: UInt64 = 0
     private let firstFrameReadiness = MPVFirstFrameReadiness()
@@ -671,7 +675,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
-        return image
+        return image ?? seekPreviewLaneHost.current?.memoryImage(at: seconds, duration: duration)
     }
 
     func scrubThumbnail(
@@ -761,10 +765,13 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         if let cached { return cached }
         guard let sourceContext,
               sourceContext.generation == generation else { return nil }
+        // Remote sources read the origin only through the preview lane (paced, one connection).
+        let usesPreviewLane = SeekPreviewLaneHost.mayServe(sourceContext)
         let still = await PlaybackThumbnailSourceFallback.boundedSnapshot(
             sourceContext: sourceContext,
             atSeconds: seconds,
             maxWidth: maxWidth,
+            allowsOrigin: !usesPreviewLane,
             cancellation: cancellation,
             isCurrent: {
                 self.isCurrentScrubThumbnailRequest(
@@ -774,9 +781,72 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,
                                              cancellation: cancellation) else { return nil }
-        return await storePreviewIfCurrent(
+        if let stored = await storePreviewIfCurrent(
             still, requestedSeconds: seconds, generation: generation,
-            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)
+            requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation) {
+            return stored
+        }
+        guard usesPreviewLane,
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation),
+              let lane = await previewLane(for: sourceContext),
+              isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        let image = await lane.image(at: seconds, duration: duration)
+        guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
+                                             providerGeneration: providerGeneration,
+                                             cancellation: cancellation) else { return nil }
+        return image
+    }
+
+    // MARK: Seek preview lane
+
+    private func previewLane(for context: PlaybackThumbnailSourceContext) async -> SeekPreviewLane? {
+        let generation = loadGeneration
+        guard context.generation == generation else { return nil }
+        let index = hybridThumbnailIndex
+        return await seekPreviewLaneHost.lane(
+            for: context,
+            diskStreamKey: contentCanonicalKey ?? currentStreamKey,
+            isCurrent: { [weak self] in
+                guard let self else { return false }
+                return self.loadGeneration == generation && self.thumbnailSourceContext == context
+            },
+            admission: { [weak self] in
+                self?.seekPreviewNetworkDecision() ?? .busy
+            },
+            localFrame: { seconds, maxDistance in
+                await index.nearest(seconds: seconds, maxDistance: maxDistance, generation: generation)
+            })
+    }
+
+    private func seekPreviewNetworkDecision() -> SeekPreviewNetworkPolicy.Decision {
+        guard mpv != nil else { return .busy }
+        let paused = getFlag("pause")
+        let seeking = getFlag("seeking") || getFlag("paused-for-cache")
+        return SeekPreviewNetworkPolicy.mpv(
+            beyondBuffer: SeekPreviewNetworkPolicy.beyondBufferEnabled,
+            isPaused: paused,
+            isPlaying: !paused && !seeking && isPlayerPlaying,
+            cacheSeconds: readDoubleProperty("demuxer-cache-duration"))
+    }
+
+    func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? {
+        let generation = loadGeneration
+        let fromIndex = await hybridThumbnailIndex.nearest(
+            seconds: seconds, maxDistance: maxDistance, generation: generation)
+        guard loadGeneration == generation else { return nil }
+        return fromIndex ?? seekPreviewLaneHost.current?.nearestImage(to: seconds, maxDistance: maxDistance)
+    }
+
+    var prefetchesScrubThumbnailsInBackground: Bool {
+        SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
+    }
+
+    func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {
+        seekPreviewLaneHost.current?.prefetch(around: seconds, direction: direction, duration: duration)
     }
 
     private func storePreviewIfCurrent(
@@ -846,6 +916,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         isKnownHLS: Bool = false
     ) {
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.reset()
         loadGeneration &+= 1
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil
@@ -1655,6 +1726,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
 
     func playPlayback() {
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.revokeNetwork()
         guard mpv != nil else { return }
         screensaverDebugLog("[ScreensaverDebug][MPVController] playPlayback() called: pos=\(positionMs)ms")
         wasPlayingBeforeBackground = MPVPlaybackLifecyclePolicy.updatingSavedPlayIntent(
@@ -2245,6 +2317,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         memoryWatchdog.stop(event: "destroy")
 #endif
         cancelScrubThumbnailWork()
+        seekPreviewLaneHost.reset()
         loadGeneration &+= 1
         externalProviderGeneration &+= 1
         externalTrickplayProvider = nil

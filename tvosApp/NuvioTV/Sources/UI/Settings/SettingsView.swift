@@ -344,6 +344,7 @@ enum SettingsKey {
     static let playerShowSubtitles = "nuvio.tv.settings.playback.showSubtitles"
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
+    static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -413,7 +414,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8609,6 +8610,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayPreferBingeGroup) private var streamAutoPlayPreferBingeGroup = true
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
+    @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -8763,6 +8765,17 @@ private struct PlaybackSettingsView: View {
                     isOn: $seekPreviewEnabled,
                     accentColor: accentColor
                 )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_seeking_preview_beyond_buffer", fallback: "Previews Beyond the Buffer"),
+                    subtitle: L10n.string(
+                        "tvos_settings_seeking_preview_beyond_buffer_subtitle",
+                        fallback: "Also load previews from the server during playback, over a separate connection, while the buffer is healthy. Off: only while paused."
+                    ),
+                    isOn: $seekPreviewBeyondBuffer,
+                    accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
 
                 SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
