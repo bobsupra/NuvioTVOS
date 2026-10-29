@@ -335,6 +335,7 @@ class PlayerViewModel: ObservableObject {
     @Published var isAdvancingEpisode: Bool = false
     /// Current IntroDB skip segment, visible as a compact skip action.
     @Published var activeSkipInterval: SkipInterval?
+    @Published var activeSkipTargetsPostCredits: Bool = false
     @Published var skipSegmentCountdown: Int?
 
     var showSkipSegmentCard: Bool {
@@ -530,6 +531,11 @@ class PlayerViewModel: ObservableObject {
     var autoSkipOutroEnabled: Bool {
         get { ProfileSettings.current.bool(forKey: SettingsKey.autoSkipOutro) }
         set { ProfileSettings.current.set(newValue, forKey: SettingsKey.autoSkipOutro) }
+    }
+
+    var autoSkipMovieCreditsEnabled: Bool {
+        get { ProfileSettings.current.bool(forKey: SettingsKey.autoSkipMovieCredits) }
+        set { ProfileSettings.current.set(newValue, forKey: SettingsKey.autoSkipMovieCredits) }
     }
     private var skipSegmentAutoHideDeadline: Date?
     private var skipIntervalLoadTask: Task<Void, Never>?
@@ -2073,13 +2079,15 @@ class PlayerViewModel: ObservableObject {
         let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
         let expectedMetaId = meta.id
         let episodeNumbers = activeEpisodeNumbers
+        let isMovie = !meta.isSeries && episodeNumbers == nil
         skipIntervalLoadTask?.cancel()
         skipIntervalLoadTask = Task { [weak self] in
             let intervals = await IntroDBSkipService.shared.intervals(
                 imdbId: imdbId,
                 season: episodeNumbers?.season,
                 episode: episodeNumbers?.episode,
-                duration: self?.time.duration
+                duration: self?.time.duration,
+                isMovie: isMovie
             )
             await MainActor.run {
                 guard let self,
@@ -2122,32 +2130,41 @@ class PlayerViewModel: ObservableObject {
         if interval.isEnding && autoSkipOutroEnabled {
             return true
         }
+        if interval.isMovieCredits && autoSkipMovieCreditsEnabled {
+            return true
+        }
         return false
     }
 
     private func updateSkipIntervalState() {
         if !didRefreshIntroDBForKnownDuration,
            time.duration > 0,
-           let meta = activeMeta,
-           let numbers = activeEpisodeNumbers {
-            didRefreshIntroDBForKnownDuration = true
-            let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
-            let expectedMetaId = meta.id
-            let duration = time.duration
-            skipIntervalLoadTask?.cancel()
-            skipIntervalLoadTask = Task { [weak self] in
-                let intervals = await IntroDBSkipService.shared.intervals(
-                    imdbId: imdbId, season: numbers.season, episode: numbers.episode,
-                    duration: duration
-                )
-                await MainActor.run {
-                    guard let self,
-                          !Task.isCancelled,
-                          self.activeMeta?.id == expectedMetaId,
-                          self.activeEpisodeNumbers?.season == numbers.season,
-                          self.activeEpisodeNumbers?.episode == numbers.episode else { return }
-                    self.skipIntervals = intervals
-                    self.updateSkipIntervalState()
+           let meta = activeMeta {
+            let numbers = activeEpisodeNumbers
+            let isMovie = !meta.isSeries && numbers == nil
+            if numbers != nil || isMovie {
+                didRefreshIntroDBForKnownDuration = true
+                let imdbId = meta.imdbId ?? (meta.id.hasPrefix("tt") ? meta.id : nil)
+                let expectedMetaId = meta.id
+                let duration = time.duration
+                skipIntervalLoadTask?.cancel()
+                skipIntervalLoadTask = Task { [weak self] in
+                    let intervals = await IntroDBSkipService.shared.intervals(
+                        imdbId: imdbId,
+                        season: numbers?.season,
+                        episode: numbers?.episode,
+                        duration: duration,
+                        isMovie: isMovie
+                    )
+                    await MainActor.run {
+                        guard let self,
+                              !Task.isCancelled,
+                              self.activeMeta?.id == expectedMetaId,
+                              self.activeEpisodeNumbers?.season == numbers?.season,
+                              self.activeEpisodeNumbers?.episode == numbers?.episode else { return }
+                        self.skipIntervals = intervals
+                        self.updateSkipIntervalState()
+                    }
                 }
             }
         }
@@ -2176,6 +2193,7 @@ class PlayerViewModel: ObservableObject {
               !isSceneDetailVisible,
               sidePanel == nil else {
             if activeSkipInterval != nil { activeSkipInterval = nil }
+            if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
@@ -2193,14 +2211,22 @@ class PlayerViewModel: ObservableObject {
         }
 
         let interval = skipIntervals.first { segment in
+            !segment.isPostCredits &&
             current >= max(segment.startTime - 0.35, 0) && current < segment.endTime - 0.25
         }
 
         guard let interval else {
             if activeSkipInterval != nil { activeSkipInterval = nil }
+            if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
             if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
             skipSegmentAutoHideDeadline = nil
             return
+        }
+
+        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        let targetsPostCredits = (postCredits != nil)
+        if activeSkipTargetsPostCredits != targetsPostCredits {
+            activeSkipTargetsPostCredits = targetsPostCredits
         }
 
         if shouldAutoSkip(interval: interval) &&
@@ -2217,6 +2243,7 @@ class PlayerViewModel: ObservableObject {
         if dismissedSkipIntervalIds.contains(interval.id) {
             if !showControls {
                 if activeSkipInterval != nil { activeSkipInterval = nil }
+                if activeSkipTargetsPostCredits { activeSkipTargetsPostCredits = false }
                 if skipSegmentCountdown != nil { skipSegmentCountdown = nil }
                 skipSegmentAutoHideDeadline = nil
                 return
@@ -3659,7 +3686,9 @@ class PlayerViewModel: ObservableObject {
         if !isStandalonePlaybackSession && !isLiveStream && watchPartyPlayerBridge == nil {
             let postPlayEnabled = ProfileSettings.current.object(forKey: SettingsKey.postPlayRecommendationsEnabled) as? Bool ?? true
             let hasBlockingOverlay = showSettingsPanel || showScenePanel || isSceneDetailVisible || sidePanel != nil || isScrubbing || showPauseOverlay
-            let endingStartTime = skipIntervals.first(where: \.isEnding)?.startTime
+            let endingInterval = skipIntervals.first(where: \.isEnding)
+            let postCredits = endingInterval?.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+            let endingStartTime: Double? = (postCredits == nil) ? endingInterval?.startTime : nil
             postPlayController.updateTimeline(
                 position: time.current,
                 duration: time.duration,
@@ -4446,6 +4475,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     func skipInterval(_ interval: SkipInterval) {
+        if interval.isPostCredits { return }
         autoSkippedIntervalIds.insert(interval.id)
         dismissedSkipIntervalIds.insert(interval.id)
         autoHiddenSkipIntervalId = interval.id
@@ -4454,10 +4484,13 @@ class PlayerViewModel: ObservableObject {
         if activeSkipInterval?.id == interval.id {
             activeSkipInterval = nil
         }
-        if interval.isEnding {
+        activeSkipTargetsPostCredits = false
+        let postCredits = interval.followingPostCreditsScene(intervals: skipIntervals, duration: time.duration)
+        if interval.isEnding && postCredits == nil {
             postPlayController.showImmediately()
         }
-        seek(to: min(interval.endTime + 0.25, max(time.duration - 0.5, interval.endTime)))
+        let targetTime = postCredits?.startTime ?? interval.endTime
+        seek(to: min(targetTime + 0.25, max(time.duration - 0.5, targetTime)))
         showControls = false
         scheduleControlsHide()
     }

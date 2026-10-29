@@ -1422,6 +1422,7 @@ struct SkipSegmentOverlay: View {
     let interval: SkipInterval
     let countdown: Int?
     var isFocused: Bool
+    var targetsPostCredits: Bool = false
 
     var body: some View {
         HStack(spacing: 16) {
@@ -1434,7 +1435,7 @@ struct SkipSegmentOverlay: View {
                 }
 
             VStack(alignment: .leading, spacing: 3) {
-                Text(interval.label)
+                Text(interval.label(targetsPostCredits: targetsPostCredits))
                     .font(.system(size: 26, weight: .bold))
                     .foregroundColor(.white)
                 Text(detailText)

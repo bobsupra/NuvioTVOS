@@ -42,6 +42,16 @@ struct SkipInterval: Identifiable, Equatable {
         }
     }
 
+    /// Movie credits
+    var isMovieCredits: Bool {
+        type.lowercased() == "movie-credits"
+    }
+
+    /// Post-credits scene
+    var isPostCredits: Bool {
+        type.lowercased() == "post-credits"
+    }
+
     /// Opening / intro / OP
     var isIntro: Bool {
         switch type.lowercased() {
@@ -62,17 +72,51 @@ struct SkipInterval: Identifiable, Equatable {
         }
     }
 
-    var label: String {
+    func label(targetsPostCredits: Bool = false) -> String {
         switch type.lowercased() {
         case "intro", "op", "opening", "mixed-op":
-            return "Skip Intro"
-        case "outro", "ed", "credits", "ending", "mixed-ed":
-            return "Skip Ending"
+            return L10n.string("skip_intro", fallback: "Skip Intro")
         case "recap":
-            return "Skip Recap"
+            return L10n.string("skip_recap", fallback: "Skip Recap")
+        case "movie-credits":
+            return targetsPostCredits
+                ? L10n.string("skip_to_post_credits", fallback: "Skip to Post-Credits")
+                : L10n.string("skip_movie_credits", fallback: "Skip Credits")
+        case "outro", "ed", "credits", "ending", "mixed-ed":
+            return targetsPostCredits
+                ? L10n.string("skip_to_post_credits", fallback: "Skip to Post-Credits")
+                : L10n.string("skip_ending", fallback: "Skip Ending")
         default:
-            return "Skip"
+            return L10n.string("skip", fallback: "Skip")
         }
+    }
+
+    var label: String {
+        label(targetsPostCredits: false)
+    }
+
+    func followingPostCreditsScene(intervals: [SkipInterval], duration: Double) -> SkipInterval? {
+        guard isMovieCredits || isEnding else { return nil }
+        // Explicit post-credits scene from IntroDb
+        let explicit = intervals.filter {
+            $0.isPostCredits && $0.startTime.isFinite && $0.endTime.isFinite &&
+                $0.startTime >= endTime && $0.endTime > $0.startTime &&
+                (duration <= 0 || $0.startTime < duration)
+        }.min { $0.startTime < $1.startTime }
+        if let explicit { return explicit }
+        // Heuristic: significant content after credits/outro suggests a post-credits scene (> 5 seconds).
+        if duration > 0 {
+            let gap = duration - endTime
+            if gap > 5.0 {
+                return SkipInterval(
+                    startTime: endTime,
+                    endTime: duration,
+                    type: "post-credits",
+                    provider: "heuristic"
+                )
+            }
+        }
+        return nil
     }
 }
 
@@ -80,6 +124,14 @@ private struct IntroDBSegmentsResponse: Decodable {
     let intro: IntroDBSegment?
     let recap: IntroDBSegment?
     let outro: IntroDBSegment?
+    let postCredits: IntroDBSegment?
+
+    enum CodingKeys: String, CodingKey {
+        case intro
+        case recap
+        case outro
+        case postCredits = "post_credits"
+    }
 }
 
 private struct IntroDBSegment: Decodable {
@@ -142,7 +194,13 @@ final class IntroDBSkipService: @unchecked Sendable {
         self.session = session
     }
 
-    func intervals(imdbId: String?, season: Int? = nil, episode: Int? = nil, duration: Double? = nil) async -> [SkipInterval] {
+    func intervals(
+        imdbId: String?,
+        season: Int? = nil,
+        episode: Int? = nil,
+        duration: Double? = nil,
+        isMovie: Bool = false
+    ) async -> [SkipInterval] {
         guard let imdbId = normalizedImdbId(imdbId) else {
             return []
         }
@@ -154,7 +212,10 @@ final class IntroDBSkipService: @unchecked Sendable {
             queryItems.append(URLQueryItem(name: "season", value: "\(season)"))
             queryItems.append(URLQueryItem(name: "episode", value: "\(episode)"))
         } else {
-            cacheKey = imdbId
+            cacheKey = isMovie ? "movie:\(imdbId)" : imdbId
+            if isMovie {
+                queryItems.append(URLQueryItem(name: "is_movie", value: "true"))
+            }
         }
         if let cached = cachedIntervals(for: cacheKey) {
             if let season, let episode, let duration, duration > 0 { seedSeasonTemplate(imdbId: imdbId, season: season, episode: episode, intervals: cached, duration: duration) }
@@ -174,13 +235,39 @@ final class IntroDBSkipService: @unchecked Sendable {
                 return inferredSeasonIntervals(imdbId: imdbId, season: season, episode: episode, duration: duration)
             }
             let decoded = try JSONDecoder().decode(IntroDBSegmentsResponse.self, from: data)
-            let intervals = [
-                decoded.recap?.interval(type: "recap"),
-                decoded.intro?.interval(type: "intro"),
-                decoded.outro?.interval(type: "outro")
-            ]
-            .compactMap { $0 }
-            .sorted { $0.startTime < $1.startTime }
+            let intervals: [SkipInterval]
+            if isMovie {
+                let credits = decoded.outro?.interval(type: "movie-credits")
+                let postCredits = decoded.postCredits?.interval(type: "post-credits")
+                let safeCredits: SkipInterval?
+                if let credits, let postCredits,
+                   postCredits.startTime < credits.endTime, postCredits.endTime > credits.startTime {
+                    if postCredits.startTime > credits.startTime {
+                        safeCredits = SkipInterval(
+                            startTime: credits.startTime,
+                            endTime: postCredits.startTime,
+                            type: credits.type,
+                            provider: credits.provider
+                        )
+                    } else {
+                        safeCredits = nil
+                    }
+                } else {
+                    safeCredits = credits
+                }
+                intervals = [safeCredits, postCredits].compactMap { $0 }.sorted { $0.startTime < $1.startTime }
+            } else {
+                let outro = decoded.outro?.interval(type: "outro")
+                let postCredits = decoded.postCredits?.interval(type: "post-credits")
+                intervals = [
+                    decoded.recap?.interval(type: "recap"),
+                    decoded.intro?.interval(type: "intro"),
+                    outro,
+                    postCredits
+                ]
+                .compactMap { $0 }
+                .sorted { $0.startTime < $1.startTime }
+            }
             storeCachedIntervals(intervals, for: cacheKey)
             if let season, let episode, let duration, duration > 0 { seedSeasonTemplate(imdbId: imdbId, season: season, episode: episode, intervals: intervals, duration: duration) }
             return mergedWithSeasonInference(intervals, imdbId: imdbId, season: season, episode: episode, duration: duration)
@@ -251,6 +338,7 @@ final class IntroDBSkipService: @unchecked Sendable {
     static func consensusIntervals(samples: [SeasonSample], targetDuration: Double) -> [SkipInterval] {
         guard samples.count >= 2 else { return [] }
         let types = Set(samples.flatMap { $0.intervals.map { $0.type.lowercased() } })
+            .filter { $0 != "post-credits" }
         return types.compactMap { type -> SkipInterval? in
             let values = samples.compactMap { sample -> (sample: SeasonSample, interval: SkipInterval)? in
                 guard let interval = sample.intervals.first(where: { $0.type.lowercased() == type }) else { return nil }

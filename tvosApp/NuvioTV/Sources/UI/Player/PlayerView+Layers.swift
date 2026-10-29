@@ -559,7 +559,8 @@ extension PlayerView {
                 SkipSegmentOverlay(
                     interval: interval,
                     countdown: viewModel.skipSegmentCountdown,
-                    isFocused: skipSegmentFocused
+                    isFocused: skipSegmentFocused,
+                    targetsPostCredits: viewModel.activeSkipTargetsPostCredits
                 )
             }
             .buttonStyle(PosterCardButtonStyle())

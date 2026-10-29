@@ -2219,7 +2219,11 @@
     "auto_skip_recap": "الملخص",
     "auto_skip_recap_sub": "تخطي فقرات ملخص الاحداث تلقائياً.",
     "auto_skip_outro": "الخاتمة",
-    "auto_skip_outro_sub": "تخطي شارات النهاية تلقائياً."
+    "auto_skip_outro_sub": "تخطي شارات النهاية تلقائياً.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "bg": {
     "sidebar_genres_title": "Жанрове",
@@ -4441,7 +4445,11 @@
     "auto_skip_recap": "Резюме",
     "auto_skip_recap_sub": "Автоматично пропускане на сегменти с резюме.",
     "auto_skip_outro": "Аутро / Край",
-    "auto_skip_outro_sub": "Автоматично пропускане на аутро и аниме завършвания."
+    "auto_skip_outro_sub": "Автоматично пропускане на аутро и аниме завършвания.",
+    "auto_skip_movie_credits": "Крайни надписи",
+    "auto_skip_movie_credits_sub": "Автоматично пропускане на надписите на филма, като се запазват сцените след надписите.",
+    "skip_movie_credits": "Пропускане на надписите",
+    "skip_to_post_credits": "Премини към „Пост-кредити“"
   },
   "bs": {
     "sidebar_genres_title": "Žanrovi",
@@ -6663,7 +6671,11 @@
     "auto_skip_recap": "Sažetak",
     "auto_skip_recap_sub": "Automatski preskoči sažetke prethodnih epizoda.",
     "auto_skip_outro": "Završetak / Odjavna špica",
-    "auto_skip_outro_sub": "Automatski preskoči odjavne špice i anime završetke."
+    "auto_skip_outro_sub": "Automatski preskoči odjavne špice i anime završetke.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "cs": {
     "sidebar_genres_title": "Žánry",
@@ -8886,7 +8898,11 @@
     "auto_skip_recap": "Rekapitulace",
     "auto_skip_recap_sub": "Přeskakovat segmenty rekapitulace automaticky.",
     "auto_skip_outro": "Outro / Ukončení",
-    "auto_skip_outro_sub": "Přeskakovat outra a anime ukončení automaticky."
+    "auto_skip_outro_sub": "Přeskakovat outra a anime ukončení automaticky.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -11108,7 +11124,11 @@
     "auto_skip_recap": "Recap",
     "auto_skip_recap_sub": "Spring recap-segmenter over automatisk.",
     "auto_skip_outro": "Outro / Afslutning",
-    "auto_skip_outro_sub": "Spring outros og anime-afslutninger over automatisk."
+    "auto_skip_outro_sub": "Spring outros og anime-afslutninger over automatisk.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "de": {
     "sidebar_genres_title": "Genres",
@@ -13330,7 +13350,11 @@
     "auto_skip_recap": "Zusammenfassungen",
     "auto_skip_recap_sub": "Zusammenfassungen automatisch überspringen.",
     "auto_skip_outro": "Outro / Ending",
-    "auto_skip_outro_sub": "Outros und Anime-Outros automatisch überspringen."
+    "auto_skip_outro_sub": "Outros und Anime-Outros automatisch überspringen.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "el": {
     "sidebar_genres_title": "Είδη",
@@ -15552,7 +15576,11 @@
     "auto_skip_recap": "Ανασκόπηση",
     "auto_skip_recap_sub": "Αυτόματη παράλειψη τμημάτων ανασκόπησης.",
     "auto_skip_outro": "Επίλογος / Τέλος",
-    "auto_skip_outro_sub": "Αυτόματη παράλειψη επιλόγων και anime endings."
+    "auto_skip_outro_sub": "Αυτόματη παράλειψη επιλόγων και anime endings.",
+    "auto_skip_movie_credits": "Τίτλοι τέλους",
+    "auto_skip_movie_credits_sub": "Αυτόματη παράλειψη των τίτλων τέλους των ταινιών, διατηρώντας τις σκηνές μετά τους τίτλους.",
+    "skip_movie_credits": "Παράλειψη τίτλων",
+    "skip_to_post_credits": "Παράλειψη μετά τους τίτλους"
   },
   "en": {
     "sidebar_genres_title": "Genres",
@@ -17775,7 +17803,11 @@
     "auto_skip_recap": "Recap",
     "auto_skip_recap_sub": "Skip recap segments automatically.",
     "auto_skip_outro": "Outro / Ending",
-    "auto_skip_outro_sub": "Skip outros and anime endings automatically."
+    "auto_skip_outro_sub": "Skip outros and anime endings automatically.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "es": {
     "sidebar_genres_title": "Géneros",
@@ -19997,7 +20029,11 @@
     "auto_skip_recap": "Resumen",
     "auto_skip_recap_sub": "Omitir automáticamente los segmentos de resumen.",
     "auto_skip_outro": "Outro / Ending",
-    "auto_skip_outro_sub": "Omitir automáticamente outros y endings de anime."
+    "auto_skip_outro_sub": "Omitir automáticamente outros y endings de anime.",
+    "auto_skip_movie_credits": "Créditos finales",
+    "auto_skip_movie_credits_sub": "Salta automáticamente los créditos de la película, conservando las escenas post-créditos.",
+    "skip_movie_credits": "Saltar créditos",
+    "skip_to_post_credits": "Saltar a la escena post-créditos"
   },
   "es-419": {
     "sidebar_genres_title": "Géneros",
@@ -22219,7 +22255,11 @@
     "auto_skip_recap": "Resumen",
     "auto_skip_recap_sub": "Omitir automáticamente los segmentos de resumen.",
     "auto_skip_outro": "Outro / Ending",
-    "auto_skip_outro_sub": "Omitir automáticamente outros y endings de anime."
+    "auto_skip_outro_sub": "Omitir automáticamente outros y endings de anime.",
+    "auto_skip_movie_credits": "Créditos finales",
+    "auto_skip_movie_credits_sub": "Omite automáticamente los créditos de la película, conservando las escenas poscréditos.",
+    "skip_movie_credits": "Omitir créditos",
+    "skip_to_post_credits": "Saltar a poscréditos"
   },
   "fr": {
     "sidebar_genres_title": "Genres",
@@ -24441,7 +24481,11 @@
     "auto_skip_recap": "Résumé",
     "auto_skip_recap_sub": "Passer automatiquement les segments de résumé.",
     "auto_skip_outro": "Outro / Générique de fin",
-    "auto_skip_outro_sub": "Passer automatiquement les outros et les génériques de fin d’anime."
+    "auto_skip_outro_sub": "Passer automatiquement les outros et les génériques de fin d’anime.",
+    "auto_skip_movie_credits": "Générique de fin",
+    "auto_skip_movie_credits_sub": "Passer automatiquement le générique des films, en conservant les scènes post-générique.",
+    "skip_movie_credits": "Passer le générique",
+    "skip_to_post_credits": "Aller à la scène post-générique"
   },
   "he": {
     "sidebar_genres_title": "ז׳אנרים",
@@ -26663,7 +26707,11 @@
     "auto_skip_recap": "תקציר",
     "auto_skip_recap_sub": "דלג אוטומטית על קטעי תקציר.",
     "auto_skip_outro": "קטע סיום",
-    "auto_skip_outro_sub": "Skip outros and anime endings automatically."
+    "auto_skip_outro_sub": "Skip outros and anime endings automatically.",
+    "auto_skip_movie_credits": "דילוג על קרדיטים",
+    "auto_skip_movie_credits_sub": "דילוג אוטומטי על קרדיטים בסוף הסרט, מבלי לדלג על סצנות שאחרי הקרדיטים.",
+    "skip_movie_credits": "דילוג על הקרדיטים",
+    "skip_to_post_credits": "דילוג לסצנה שאחרי הקרדיטים"
   },
   "hi": {
     "sidebar_genres_title": "शैलियाँ",
@@ -28885,7 +28933,11 @@
     "auto_skip_recap": "रीकैप",
     "auto_skip_recap_sub": "रीकैप सेगमेंट अपने आप छोड़ें।",
     "auto_skip_outro": "आउट्रो / एंडिंग",
-    "auto_skip_outro_sub": "आउट्रो और एनीमे एंडिंग अपने आप छोड़ें।"
+    "auto_skip_outro_sub": "आउट्रो और एनीमे एंडिंग अपने आप छोड़ें।",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "hu": {
     "sidebar_genres_title": "Műfajok",
@@ -31107,7 +31159,11 @@
     "auto_skip_recap": "Összefoglaló",
     "auto_skip_recap_sub": "Összefoglaló részek automatikus átugrása.",
     "auto_skip_outro": "Outro / Stáblista",
-    "auto_skip_outro_sub": "Outrók és anime zárások automatikus átugrása."
+    "auto_skip_outro_sub": "Outrók és anime zárások automatikus átugrása.",
+    "auto_skip_movie_credits": "Filmstáblista",
+    "auto_skip_movie_credits_sub": "A film stáblistájának automatikus átugrása a stáblista utáni jelenetek kihagyása nélkül.",
+    "skip_movie_credits": "Stáblista átugrása",
+    "skip_to_post_credits": "Ugrás a stáblista utáni jelenethez"
   },
   "in": {
     "sidebar_genres_title": "Genre",
@@ -33329,7 +33385,11 @@
     "auto_skip_recap": "Rekap",
     "auto_skip_recap_sub": "Lewati segmen rekap secara otomatis.",
     "auto_skip_outro": "Outro / Penutup",
-    "auto_skip_outro_sub": "Lewati outro dan penutup anime secara otomatis."
+    "auto_skip_outro_sub": "Lewati outro dan penutup anime secara otomatis.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "it": {
     "sidebar_genres_title": "Generi",
@@ -35551,7 +35611,11 @@
     "auto_skip_recap": "Riassunto",
     "auto_skip_recap_sub": "Salta automaticamente i riassunti degli episodi precedenti.",
     "auto_skip_outro": "Outro / Sigla finale",
-    "auto_skip_outro_sub": "Salta automaticamente le outro e le sigle finali degli anime."
+    "auto_skip_outro_sub": "Salta automaticamente le outro e le sigle finali degli anime.",
+    "auto_skip_movie_credits": "Titoli di coda",
+    "auto_skip_movie_credits_sub": "Salta automaticamente i titoli di coda dei film, mantenendo le scene post-crediti.",
+    "skip_movie_credits": "Salta i titoli di coda",
+    "skip_to_post_credits": "Vai alla scena dopo i titoli di coda"
   },
   "ja": {
     "sidebar_genres_title": "ジャンル",
@@ -37773,7 +37837,11 @@
     "auto_skip_recap": "リキャップ",
     "auto_skip_recap_sub": "リキャップセグメントを自動スキップ",
     "auto_skip_outro": "アウトロ / エンディング",
-    "auto_skip_outro_sub": "アウトロとアニメのエンディングを自動スキップ"
+    "auto_skip_outro_sub": "アウトロとアニメのエンディングを自動スキップ",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "lt": {
     "sidebar_genres_title": "Žanrai",
@@ -39995,7 +40063,11 @@
     "auto_skip_recap": "Santrauka",
     "auto_skip_recap_sub": "Automatiškai praleisti santraukų fragmentus.",
     "auto_skip_outro": "Pabaiga / Pabaigos titrai",
-    "auto_skip_outro_sub": "Automatiškai praleisti pabaigos dalis ir anime pabaigas."
+    "auto_skip_outro_sub": "Automatiškai praleisti pabaigos dalis ir anime pabaigas.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "nl": {
     "sidebar_genres_title": "Genres",
@@ -42217,7 +42289,11 @@
     "auto_skip_recap": "Samenvatting",
     "auto_skip_recap_sub": "Samenvattingssegmenten automatisch overslaan.",
     "auto_skip_outro": "Outro / Eindscène",
-    "auto_skip_outro_sub": "Outro’s en anime-eindes automatisch overslaan."
+    "auto_skip_outro_sub": "Outro’s en anime-eindes automatisch overslaan.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "no": {
     "sidebar_genres_title": "Sjangre",
@@ -44439,7 +44515,11 @@
     "auto_skip_recap": "Oppsummering",
     "auto_skip_recap_sub": "Hopp over oppsummeringer automatisk.",
     "auto_skip_outro": "Outro / Sluttsekvens",
-    "auto_skip_outro_sub": "Hopp over outroer og anime-avslutninger automatisk."
+    "auto_skip_outro_sub": "Hopp over outroer og anime-avslutninger automatisk.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "pl": {
     "sidebar_genres_title": "Gatunki",
@@ -46661,7 +46741,11 @@
     "auto_skip_recap": "Podsumowanie",
     "auto_skip_recap_sub": "Automatycznie pomijaj segmenty podsumowań.",
     "auto_skip_outro": "Outro / Ending",
-    "auto_skip_outro_sub": "Automatycznie pomijaj outra i endingi anime."
+    "auto_skip_outro_sub": "Automatycznie pomijaj outra i endingi anime.",
+    "auto_skip_movie_credits": "Napisy końcowe",
+    "auto_skip_movie_credits_sub": "Automatycznie pomijaj napisy końcowe filmów, zachowując sceny po napisach.",
+    "skip_movie_credits": "Pomiń napisy końcowe",
+    "skip_to_post_credits": "Do sceny po napisach"
   },
   "pt-BR": {
     "sidebar_genres_title": "Gêneros",
@@ -48883,7 +48967,11 @@
     "auto_skip_recap": "Resumo anterior",
     "auto_skip_recap_sub": "Pula o resumo do episódio anterior",
     "auto_skip_outro": "Encerramentos (Créditos)",
-    "auto_skip_outro_sub": "Pula os encerramentos automaticamente"
+    "auto_skip_outro_sub": "Pula os encerramentos automaticamente",
+    "auto_skip_movie_credits": "Créditos finais",
+    "auto_skip_movie_credits_sub": "Pule os créditos dos filmes automaticamente, mantendo as cenas pós-créditos.",
+    "skip_movie_credits": "Pular créditos",
+    "skip_to_post_credits": "Pular para o pós-créditos"
   },
   "pt-PT": {
     "sidebar_genres_title": "Géneros",
@@ -51105,7 +51193,11 @@
     "auto_skip_recap": "Resumo",
     "auto_skip_recap_sub": "Saltar resumos de episódios automaticamente.",
     "auto_skip_outro": "Encerramento / Créditos finais",
-    "auto_skip_outro_sub": "Saltar encerramentos e créditos de anime automaticamente."
+    "auto_skip_outro_sub": "Saltar encerramentos e créditos de anime automaticamente.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "ro": {
     "sidebar_genres_title": "Genuri",
@@ -53327,7 +53419,11 @@
     "auto_skip_recap": "Recapitulare",
     "auto_skip_recap_sub": "Sari automat peste segmentele de recapitulare.",
     "auto_skip_outro": "Outro / Încheiere",
-    "auto_skip_outro_sub": "Sari automat peste outro-uri și finaluri anime."
+    "auto_skip_outro_sub": "Sari automat peste outro-uri și finaluri anime.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "ru": {
     "sidebar_genres_title": "Жанры",
@@ -55549,7 +55645,11 @@
     "auto_skip_recap": "Рекап",
     "auto_skip_recap_sub": "Автоматически пропускать рекап-сегменты.",
     "auto_skip_outro": "Аутро / Эндинг",
-    "auto_skip_outro_sub": "Автоматически пропускать аутро и эндинги аниме."
+    "auto_skip_outro_sub": "Автоматически пропускать аутро и эндинги аниме.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "sk": {
     "sidebar_genres_title": "Žánre",
@@ -57772,7 +57872,11 @@
     "auto_skip_recap": "Rekapitulácia",
     "auto_skip_recap_sub": "Automaticky preskočiť segmenty rekapitulácie.",
     "auto_skip_outro": "Outro / Záver",
-    "auto_skip_outro_sub": "Automaticky preskočiť outrá a anime závery."
+    "auto_skip_outro_sub": "Automaticky preskočiť outrá a anime závery.",
+    "auto_skip_movie_credits": "Záverečné titulky",
+    "auto_skip_movie_credits_sub": "Automaticky preskakovať záverečné titulky filmov so zachovaním medzititulkových a potitulkových scén.",
+    "skip_movie_credits": "Preskočiť titulky",
+    "skip_to_post_credits": "Preskočiť na potitulkovú scénu"
   },
   "sl": {
     "sidebar_genres_title": "Žanri",
@@ -59994,7 +60098,11 @@
     "auto_skip_recap": "Povzetek",
     "auto_skip_recap_sub": "Samodejno preskoči segmente s povzetki.",
     "auto_skip_outro": "Odjava / Odjavna špica",
-    "auto_skip_outro_sub": "Samodejno preskoči odjave in anime odjavne špice."
+    "auto_skip_outro_sub": "Samodejno preskoči odjave in anime odjavne špice.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "sv": {
     "sidebar_genres_title": "Genrer",
@@ -62216,7 +62324,11 @@
     "auto_skip_recap": "Sammanfattning",
     "auto_skip_recap_sub": "Hoppa över sammanfattningssegment automatiskt.",
     "auto_skip_outro": "Outro / Slut",
-    "auto_skip_outro_sub": "Hoppa över outron och anime-slut automatiskt."
+    "auto_skip_outro_sub": "Hoppa över outron och anime-slut automatiskt.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "ta": {
     "sidebar_genres_title": "வகைகள்",
@@ -64438,7 +64550,11 @@
     "auto_skip_recap": "மீள்பார்வு",
     "auto_skip_recap_sub": "மீள்பார்வு பகுதிகளை தானாக தாவு.",
     "auto_skip_outro": "முடிவு / நிறைவு",
-    "auto_skip_outro_sub": "முடிவு மற்றும் anime நிறைவுகளை தானாக தாவு."
+    "auto_skip_outro_sub": "முடிவு மற்றும் anime நிறைவுகளை தானாக தாவு.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "tr": {
     "sidebar_genres_title": "Türler",
@@ -66660,7 +66776,11 @@
     "auto_skip_recap": "Özet",
     "auto_skip_recap_sub": "Özet bölümlerini otomatik atla.",
     "auto_skip_outro": "Jenerik / Kapanış",
-    "auto_skip_outro_sub": "Jenerik ve anime kapanışlarını otomatik atla."
+    "auto_skip_outro_sub": "Jenerik ve anime kapanışlarını otomatik atla.",
+    "auto_skip_movie_credits": "Bitiş Jeneriği",
+    "auto_skip_movie_credits_sub": "Film jeneriğini otomatik atlar; jenerik sonrası sahneleri korur.",
+    "skip_movie_credits": "Jeneriği Atla",
+    "skip_to_post_credits": "Jenerik Sonrasına Atla"
   },
   "uk": {
     "sidebar_genres_title": "Жанри",
@@ -68882,7 +69002,11 @@
     "auto_skip_recap": "Рекап",
     "auto_skip_recap_sub": "Автоматично пропускати рекап-сегменти.",
     "auto_skip_outro": "Аутро / Ендінг",
-    "auto_skip_outro_sub": "Автоматично пропускати аутро та ендінги аніме."
+    "auto_skip_outro_sub": "Автоматично пропускати аутро та ендінги аніме.",
+    "auto_skip_movie_credits": "End Credits",
+    "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
+    "skip_movie_credits": "Skip Credits",
+    "skip_to_post_credits": "Skip to Post-Credits"
   },
   "vi": {
     "sidebar_genres_title": "Thể loại",
@@ -71104,7 +71228,11 @@
     "auto_skip_recap": "Tóm tắt",
     "auto_skip_recap_sub": "Tự động bỏ qua các phân đoạn tóm tắt.",
     "auto_skip_outro": "Kết thúc / Outro",
-    "auto_skip_outro_sub": "Tự động bỏ qua phần kết thúc và ending anime."
+    "auto_skip_outro_sub": "Tự động bỏ qua phần kết thúc và ending anime.",
+    "auto_skip_movie_credits": "Danh đề kết thúc",
+    "auto_skip_movie_credits_sub": "Tự động bỏ qua danh đề phim, giữ lại các cảnh hậu danh đề.",
+    "skip_movie_credits": "Bỏ qua Danh đề",
+    "skip_to_post_credits": "Đến cảnh hậu danh đề"
   },
   "zh-CN": {
     "sidebar_genres_title": "类型",
@@ -73326,7 +73454,11 @@
     "auto_skip_recap": "前情提要",
     "auto_skip_recap_sub": "自动跳过前情提要片段。",
     "auto_skip_outro": "片尾／结尾",
-    "auto_skip_outro_sub": "自动跳过片尾和动画结尾。"
+    "auto_skip_outro_sub": "自动跳过片尾和动画结尾。",
+    "auto_skip_movie_credits": "片尾字幕",
+    "auto_skip_movie_credits_sub": "自动跳过电影片尾字幕，保留片尾彩蛋场景。",
+    "skip_movie_credits": "跳过片尾字幕",
+    "skip_to_post_credits": "跳到片尾彩蛋"
   },
   "zh-TW": {
     "sidebar_genres_title": "類型",
@@ -75548,6 +75680,10 @@
     "auto_skip_recap": "前情提要",
     "auto_skip_recap_sub": "自動跳過前情提要片段。",
     "auto_skip_outro": "片尾／結尾",
-    "auto_skip_outro_sub": "自動跳過片尾和動畫結尾。"
+    "auto_skip_outro_sub": "自動跳過片尾和動畫結尾。",
+    "auto_skip_movie_credits": "片尾字幕",
+    "auto_skip_movie_credits_sub": "自動跳過電影片尾字幕，保留片尾彩蛋場景。",
+    "skip_movie_credits": "跳過片尾字幕",
+    "skip_to_post_credits": "跳到片尾彩蛋"
   }
 }

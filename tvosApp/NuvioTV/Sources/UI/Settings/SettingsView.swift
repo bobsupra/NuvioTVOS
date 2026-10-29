@@ -202,6 +202,7 @@ enum SettingsKey {
     static let traktConnected = "nuvio.tv.settings.integrations.traktConnected"
     static let traktClientID = "nuvio.tv.settings.integrations.traktClientID"
     static let traktClientSecret = "nuvio.tv.settings.integrations.traktClientSecret"
+    static let traktRedirectURI = "nuvio.tv.settings.integrations.traktRedirectURI"
     static let traktContinueWatchingDaysCap = "nuvio.tv.settings.integrations.traktContinueWatchingDaysCap"
     static let traktShowMetaComments = "nuvio.tv.settings.integrations.traktShowMetaComments"
     static let traktWatchProgressSource = "nuvio.tv.settings.integrations.traktWatchProgressSource"
@@ -312,6 +313,7 @@ enum SettingsKey {
     static let autoSkipIntro = "nuvio.tv.settings.playback.autoSkipIntro"
     static let autoSkipRecap = "nuvio.tv.settings.playback.autoSkipRecap"
     static let autoSkipOutro = "nuvio.tv.settings.playback.autoSkipOutro"
+    static let autoSkipMovieCredits = "nuvio.tv.settings.playback.autoSkipMovieCredits"
     static let streamAutoPlayPreferBingeGroup = "nuvio.tv.settings.playback.streamAutoPlayPreferBingeGroup"
     static let streamAutoPlayReuseBingeGroup = "nuvio.tv.settings.playback.streamAutoPlayReuseBingeGroup"
     static let postPlayRecommendationsEnabled = "nuvio.tv.settings.playback.postPlayRecommendationsEnabled"
@@ -362,7 +364,7 @@ enum SettingsKey {
     /// Credentials and device acknowledgements must remain on this Apple TV
     /// and never enter the account settings payload.
     static let deviceLocal = Set([
-        traktConnected, traktClientID, traktClientSecret, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
+        traktConnected, traktClientID, traktClientSecret, traktRedirectURI, simklClientID, wetrakrClientID, wetrakrClientSecret, wetrakrConnected, aiSubtitlesGeminiAPIKey,
         p2pConsentAccepted, iCloudSyncEnabled, iCloudLastSyncDate, tmdbFollowAppLanguage
     ])
 
@@ -377,7 +379,7 @@ enum SettingsKey {
         cardCornerRadius, cardSize, liquidGlassCards,
         hideUnreleased, showFullDates, detailsActionsBelowInfo,
         detailsSectionOrder, detailsSectionDisabled,
-        traktConnected, traktClientID, traktClientSecret,
+        traktConnected, traktClientID, traktClientSecret, traktRedirectURI,
         traktContinueWatchingDaysCap, traktShowMetaComments,
         traktWatchProgressSource, watchProgressSourceChosenByUser,
         nuvioSyncScrobbleEnabled, traktScrobbleEnabled, simklScrobbleEnabled, mdbListScrobbleEnabled, wetrakrScrobbleEnabled,
@@ -406,7 +408,7 @@ enum SettingsKey {
         playerEngine, trueHDSpatialAudio, preferDualLayerDolbyVision, trickplayServer, externalPlayer, smartStreamSelection, reuseLastLink, reuseLastLinkCacheHours, rememberLastSourceFocus, smartStreamUseTopResult, smartStreamQuality, smartSubtitleMatching,
         backgroundStreamPreFetch,
         cachedOnlyStreams, preferHardwareDecodedStreams, preserveAddonStreamOrder, streamSortOption, streamBadgeRules, showFileSizeBadges, showAddonLogo, streamBadgePlacement,
-        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
+        autoPlayNext, autoPlayNextCountdown, autoSkipIntro, autoSkipRecap, autoSkipOutro, autoSkipMovieCredits, streamAutoPlayPreferBingeGroup, streamAutoPlayReuseBingeGroup, postPlayRecommendationsEnabled, trailersEnabled, backgroundTrailersEnabled, trailerPreviewSound, trailerDelay,
         focusedPosterBackdropEnabled, focusedPosterBackdropDelay, audioLanguage,
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
@@ -4055,6 +4057,7 @@ private func layoutVisibleHomeCatalogRows() -> [TVHomeCatalogOrder.SnapshotRow] 
 
 private struct IntegrationSettingsView: View {
     let accentColor: Color
+    private let profileStore: UserDefaults
 
     @StateObject private var traktViewModel: TraktSettingsViewModel
     @StateObject private var simklViewModel: SimklSettingsViewModel
@@ -4062,12 +4065,14 @@ private struct IntegrationSettingsView: View {
     @StateObject private var wetrakrViewModel: WeTrakrSettingsViewModel
     @AppStorage private var traktClientID: String
     @AppStorage private var traktClientSecret: String
+    @AppStorage private var traktRedirectURI: String
     @AppStorage private var simklClientID: String
     @AppStorage private var wetrakrClientID: String
     @AppStorage private var wetrakrClientSecret: String
     @AppStorage private var nuvioSyncScrobbleEnabled: Bool
     @State private var traktClientIDDraft: String
     @State private var traktClientSecretDraft: String
+    @State private var traktRedirectURIDraft: String
     @State private var simklClientIDDraft: String
     @State private var wetrakrClientIDDraft: String
     @State private var wetrakrClientSecretDraft: String
@@ -4109,6 +4114,8 @@ private struct IntegrationSettingsView: View {
     init(accentColor: Color, profileID: String?) {
         self.accentColor = accentColor
         let profileStore = ProfileSettings.store(for: profileID)
+        self.profileStore = profileStore
+        let storedTraktRedirectURI = TraktConfig.redirectURI(in: profileStore)
         let trimmedProfileID = profileID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let profileScope = trimmedProfileID.isEmpty ? "default" : trimmedProfileID
         let storedTraktClientID = profileStore.string(forKey: SettingsKey.traktClientID) ?? ""
@@ -4138,6 +4145,11 @@ private struct IntegrationSettingsView: View {
             SettingsKey.traktClientSecret,
             store: profileStore
         )
+        _traktRedirectURI = AppStorage(
+            wrappedValue: storedTraktRedirectURI,
+            SettingsKey.traktRedirectURI,
+            store: profileStore
+        )
         _simklClientID = AppStorage(
             wrappedValue: "",
             SettingsKey.simklClientID,
@@ -4155,6 +4167,7 @@ private struct IntegrationSettingsView: View {
         )
         _traktClientIDDraft = State(initialValue: storedTraktClientID)
         _traktClientSecretDraft = State(initialValue: storedTraktClientSecret)
+        _traktRedirectURIDraft = State(initialValue: storedTraktRedirectURI)
         _simklClientIDDraft = State(initialValue: storedSimklClientID)
         _wetrakrClientIDDraft = State(initialValue: storedWeTrakrClientID)
         _wetrakrClientSecretDraft = State(initialValue: storedWeTrakrClientSecret)
@@ -4354,6 +4367,7 @@ private struct IntegrationSettingsView: View {
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $traktClientIDDraft,
                     onCommit: {
+                        commitTraktRedirectURI()
                         traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
                         traktViewModel.credentialsDidChange()
                     }
@@ -4374,7 +4388,14 @@ private struct IntegrationSettingsView: View {
                     }
                 )
 
-                SettingsInfoRow(title: "Trakt Redirect URI", value: TraktConfig.redirectURI)
+                SettingsTextFieldRow(
+                    title: "Trakt Redirect URI",
+                    subtitle: "Must exactly match this app's registered Trakt redirect URI; used when refreshing tokens",
+                    placeholder: TraktConfig.defaultRedirectURI,
+                    text: $traktRedirectURIDraft,
+                    fieldWidth: 460,
+                    onCommit: commitTraktRedirectURI
+                )
 
                 TraktConnectionSettingsCard(
                     viewModel: traktViewModel,
@@ -4706,6 +4727,7 @@ private struct IntegrationSettingsView: View {
         .onChange(of: traktClientIDDraft) { _, newValue in
             let trimmed = newValue.trimmingCharacters(in: .whitespacesAndNewlines)
             if traktClientID != trimmed {
+                commitTraktRedirectURI()
                 traktClientID = trimmed
                 traktViewModel.credentialsDidChange()
             }
@@ -4850,11 +4872,18 @@ private struct IntegrationSettingsView: View {
     }
 
     private func connectTrakt() {
+        commitTraktRedirectURI()
         traktClientID = traktClientIDDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         traktClientSecret = traktClientSecretDraft.trimmingCharacters(in: .whitespacesAndNewlines)
         traktViewModel.credentialsDidChange()
         guard traktViewModel.credentialsConfigured else { return }
         showingTraktLogin = true
+    }
+
+    private func commitTraktRedirectURI() {
+        let selected = TraktConfig.setRedirectURI(traktRedirectURIDraft, in: profileStore)
+        traktRedirectURI = selected
+        traktRedirectURIDraft = selected
     }
 
     private func connectSimkl() {
@@ -8288,6 +8317,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.autoSkipIntro) private var autoSkipIntro = false
     @AppStorage(SettingsKey.autoSkipRecap) private var autoSkipRecap = false
     @AppStorage(SettingsKey.autoSkipOutro) private var autoSkipOutro = false
+    @AppStorage(SettingsKey.autoSkipMovieCredits) private var autoSkipMovieCredits = false
     @AppStorage(SettingsKey.streamAutoPlayPreferBingeGroup) private var streamAutoPlayPreferBingeGroup = true
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
@@ -8607,6 +8637,16 @@ private struct PlaybackSettingsView: View {
                         fallback: "Skip outros and anime endings automatically"
                     ),
                     isOn: $autoSkipOutro,
+                    accentColor: accentColor
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("auto_skip_movie_credits", fallback: "End Credits"),
+                    subtitle: L10n.string(
+                        "auto_skip_movie_credits_sub",
+                        fallback: "Skip movie credits automatically, keeping post-credits scenes."
+                    ),
+                    isOn: $autoSkipMovieCredits,
                     accentColor: accentColor
                 )
 
