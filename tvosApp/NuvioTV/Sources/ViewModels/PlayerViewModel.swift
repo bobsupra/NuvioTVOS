@@ -599,6 +599,15 @@ class PlayerViewModel: ObservableObject {
     /// How far from the target a held still may stand in while the target has none.
     static let nearestScrubThumbnailDistance: Double = 30
     private var lastScrubTargetSeconds: Double?
+    /// When the requested target last moved. A superseded frame is shown as feedback only
+    /// while the remote keeps moving.
+    private var lastScrubTargetChange = Date.distantPast
+    /// Requests closer than this ask for the same still: the end of a touch gesture repeats the
+    /// last published target.
+    private static let sameScrubTargetTolerance = 0.05
+    /// Targets change every 33 ms while swiping and every 100 ms while holding: a longer gap
+    /// means the remote rests.
+    private static let scrubMovingWindow: TimeInterval = 0.25
     private var speculativePrefetchTask: Task<Void, Never>?
     private var scrubLastDx: CGFloat = 0
     private var scrubEngagedThisStroke = false
@@ -4950,6 +4959,16 @@ class PlayerViewModel: ObservableObject {
             scrubThumbnailTargetSeconds = nil
             return
         }
+        let isSameTarget = lastScrubTargetSeconds.map {
+            abs($0 - seconds) < Self.sameScrubTargetTolerance
+        } ?? false
+        // The repeat at the end of a gesture asks again for the still the card already shows;
+        // another decode could only swap it for a different one.
+        if isSameTarget, scrubThumbnailTask == nil, scrubThumbnail != nil,
+           let shown = scrubThumbnailTargetSeconds, abs(shown - seconds) < Self.sameScrubTargetTolerance {
+            return
+        }
+        if !isSameTarget { lastScrubTargetChange = Date() }
         // Keep the last still visible while the next frame is decoded. Remote
         // input routinely advances faster than a network decoder can finish.
         pendingScrubThumbnailSeconds = seconds
@@ -5015,7 +5034,7 @@ class PlayerViewModel: ObservableObject {
                 }
 
                 // If newer remote input arrived while querying cache, prioritize moving to it
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     continue
                 }
 
@@ -5026,7 +5045,7 @@ class PlayerViewModel: ObservableObject {
                     if elapsed < 0.18 {
                         try? await Task.sleep(nanoseconds: UInt64((0.18 - elapsed) * 1_000_000_000))
                         guard !Task.isCancelled else { return }
-                        if self.pendingScrubThumbnailSeconds != nil {
+                        if self.hasNewScrubTarget(besides: target) {
                             continue
                         }
                     }
@@ -5055,7 +5074,7 @@ class PlayerViewModel: ObservableObject {
                 // A fast frame can be the keyframe seconds before the target, often another shot.
                 // It is feedback only while the remote keeps moving: a settled target waits for
                 // its exact still, so the card never shows a nearby picture and then swaps it.
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     self.showMovingScrubThumbnail(image, for: target)
                     continue
                 }
@@ -5063,7 +5082,7 @@ class PlayerViewModel: ObservableObject {
                 // Give new input a chance to arrive before paying for exact decode.
                 try? await Task.sleep(nanoseconds: 160_000_000)
                 guard !Task.isCancelled else { return }
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     if self.isCurrentScrubThumbnailWork(
                         generation: generation, interactionToken: interactionToken,
                         provider: selectedProvider, backend: selectedBackend) {
@@ -5083,7 +5102,7 @@ class PlayerViewModel: ObservableObject {
                       self.isSeekPreviewEnabled,
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
-                if self.pendingScrubThumbnailSeconds != nil {
+                if self.hasNewScrubTarget(besides: target) {
                     self.showMovingScrubThumbnail(refined ?? image, for: target)
                     continue
                 }
@@ -5099,7 +5118,7 @@ class PlayerViewModel: ObservableObject {
                     usedDeferredRetry = true
                     let deadline = Date().addingTimeInterval(delay + 0.2)
                     // Sliced, so a new target moves on at once instead of after the wait.
-                    while Date() < deadline, self.pendingScrubThumbnailSeconds == nil {
+                    while Date() < deadline, !self.hasNewScrubTarget(besides: target) {
                         try? await Task.sleep(nanoseconds: 100_000_000)
                         guard !Task.isCancelled else { return }
                     }
@@ -5128,11 +5147,24 @@ class PlayerViewModel: ObservableObject {
         }
     }
 
-    /// A frame finished for a target the remote has already moved past: feedback while moving.
+    /// A frame finished for a target the remote has already moved past: feedback while it keeps
+    /// moving. Once it rests, the next still the card shows is the final target's own.
     private func showMovingScrubThumbnail(_ image: CGImage?, for target: Double) {
-        guard let image else { return }
+        guard let image,
+              Date().timeIntervalSince(lastScrubTargetChange) < Self.scrubMovingWindow else { return }
         scrubThumbnail = image
         scrubThumbnailTargetSeconds = target
+    }
+
+    /// Whether the remote asked for another target than `target`. A repeat of `target` itself
+    /// (the end of a touch gesture) is dropped: it is no movement.
+    private func hasNewScrubTarget(besides target: Double) -> Bool {
+        guard let pending = pendingScrubThumbnailSeconds else { return false }
+        if abs(pending - target) < Self.sameScrubTargetTolerance {
+            pendingScrubThumbnailSeconds = nil
+            return false
+        }
+        return true
     }
 
     private func isCurrentScrubThumbnailWork(
