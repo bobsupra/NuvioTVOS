@@ -427,7 +427,11 @@ private final class NearestOnlyScrubThumbnailProvider: ScrubThumbnailProviding {
     init(nearestImage: CGImage) { self.nearestImage = nearestImage }
 
     func cachedScrubThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? { nil }
-    func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage? { nil }
+    private(set) var decodeRequests = 0
+    func scrubThumbnail(atSeconds seconds: Double, maxWidth: Int, precise: Bool) async -> CGImage? {
+        decodeRequests += 1
+        return nil
+    }
     func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? {
         nearestRequests.append(seconds)
         return nearestImage
@@ -436,7 +440,7 @@ private final class NearestOnlyScrubThumbnailProvider: ScrubThumbnailProviding {
 
 extension SeekPreviewLaneTests {
     @MainActor
-    func testPreviewShowsTheNearestStillWhenTheTargetHasNone() async {
+    func testNearestStillStandsInOnlyAfterTheTargetsOwnRequestsFail() async {
         let defaults = ProfileSettings.current
         let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
         defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
@@ -462,7 +466,9 @@ extension SeekPreviewLaneTests {
         defer { subscription.cancel() }
         model.pendingSeekDelta = 1
         model.requestScrubThumbnail(at: 900)
-        await fulfillment(of: [published], timeout: 3)
-        XCTAssertEqual(provider.nearestRequests.first, 900)
+        // Only after the fast, the exact and both retries came back empty.
+        await fulfillment(of: [published], timeout: 8)
+        XCTAssertEqual(provider.nearestRequests, [900], "asked once, after the target's own requests")
+        XCTAssertGreaterThanOrEqual(provider.decodeRequests, 4)
     }
 }

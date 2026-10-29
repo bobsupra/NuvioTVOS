@@ -3258,15 +3258,21 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         if usesBoundedProgressiveScrubPreview(sourceContext) {
             // Fast and exact requests both decode the exact frame: a keyframe some seconds
             // early, replaced by the exact one a moment later, read as a wrong preview.
+            var residentHoldsTarget = false
             let still = await Self.boundedProgressiveScrubFrame(
                 at: seconds,
                 precise: true,
                 resident: {
-                    await engine.scrubPreviewFrame(
+                    let frame = await engine.scrubPreviewFrame(
                         atSeconds: seconds,
                         refined: true,
                         maxWidth: maxWidth,
                         isCancelled: { cancellation.isCancelled })
+                    // A frame without a valid range comes from the segment holding the target
+                    // (a ladder rung has one): the exact still is reachable, it only ran out of
+                    // time. The next request gets it; the lane's nearby keyframe must not stand in.
+                    residentHoldsTarget = frame != nil && frame?.validRange == nil
+                    return frame
                 },
                 ownsSource: {
                     loadGeneration == generation
@@ -3309,7 +3315,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                                                      cancellation: cancellation) else { return nil }
                 return still.image
             }
-            guard usesPreviewLane else { return nil }
+            guard usesPreviewLane, !residentHoldsTarget else { return nil }
             return await previewLaneThumbnail(
                 atSeconds: seconds, sourceContext: sourceContext, generation: generation,
                 requestID: requestID, providerGeneration: providerGeneration, cancellation: cancellation)

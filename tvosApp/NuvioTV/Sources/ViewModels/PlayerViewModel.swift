@@ -5037,14 +5037,6 @@ class PlayerViewModel: ObservableObject {
                     lastDecodeTime = Date()
                 }
 
-                // Nothing for the target (outside the buffer, not admitted to the network yet):
-                // the closest still already held keeps the card showing a picture.
-                var nearest: CGImage?
-                if image == nil, !Task.isCancelled, self.pendingScrubThumbnailSeconds == nil {
-                    nearest = await selectedProvider.nearestScrubThumbnail(
-                        atSeconds: target, maxDistance: Self.nearestScrubThumbnailDistance)
-                }
-
                 guard !Task.isCancelled,
                       self.scrubThumbnailGeneration == generation,
                       self.scrubThumbnailTaskInteractionToken == interactionToken,
@@ -5058,9 +5050,6 @@ class PlayerViewModel: ObservableObject {
                 // Completed fast frames provide progressive feedback
                 if let image {
                     self.scrubThumbnail = image
-                    self.scrubThumbnailTargetSeconds = target
-                } else if let nearest {
-                    self.scrubThumbnail = nearest
                     self.scrubThumbnailTargetSeconds = target
                 } else if abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
                     self.scrubThumbnail = nil
@@ -5092,8 +5081,12 @@ class PlayerViewModel: ObservableObject {
                 } else if image == nil, !usedDeferredRetry,
                           let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
                     // A pause has not yet released the playback connection (option off): try the
-                    // settled target once more when it has, without another remote press.
+                    // settled target once more when it has, without another remote press. The
+                    // closest held still stands in meanwhile.
                     usedDeferredRetry = true
+                    await self.showNearestScrubThumbnail(
+                        for: target, provider: selectedProvider, backend: selectedBackend,
+                        generation: generation, interactionToken: interactionToken)
                     let deadline = Date().addingTimeInterval(delay + 0.2)
                     // Sliced, so a new target moves on at once instead of after the wait.
                     while Date() < deadline, self.pendingScrubThumbnailSeconds == nil {
@@ -5114,9 +5107,40 @@ class PlayerViewModel: ObservableObject {
                        (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
+                } else if image == nil {
+                    // Nothing for the target will come (outside the buffer, no network for
+                    // previews): the closest held still keeps the card showing a picture.
+                    await self.showNearestScrubThumbnail(
+                        for: target, provider: selectedProvider, backend: selectedBackend,
+                        generation: generation, interactionToken: interactionToken)
                 }
             }
         }
+    }
+
+    /// Only when the target gets no still of its own: shown after its requests came back empty,
+    /// never before, so the card does not swap a nearby picture for the right one.
+    private func showNearestScrubThumbnail(
+        for target: Double,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind,
+        generation: UInt64,
+        interactionToken: UInt64
+    ) async {
+        guard self.pendingScrubThumbnailSeconds == nil,
+              let nearest = await provider.nearestScrubThumbnail(
+                atSeconds: target, maxDistance: Self.nearestScrubThumbnailDistance),
+              !Task.isCancelled,
+              self.pendingScrubThumbnailSeconds == nil,
+              self.scrubThumbnailGeneration == generation,
+              self.scrubThumbnailTaskInteractionToken == interactionToken,
+              (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused),
+              self.activeEngineKind == backend,
+              self.sessionCoordinator.activeBackend == backend,
+              self.isSeekPreviewEnabled,
+              self.scrubThumbnailProvider === provider else { return }
+        self.scrubThumbnail = nearest
+        self.scrubThumbnailTargetSeconds = target
     }
 
     private func restartScrubTimeout() {
