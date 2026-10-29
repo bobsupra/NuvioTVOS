@@ -281,7 +281,140 @@ actor UsenetStreamSession {
         cache = [:]
         cacheOrder = []
         cachedBytes = 0
+        previewStopped = true
+        previewCache = [:]
+        previewOrder = []
+        previewCachedBytes = 0
+        let preview = previewConnection
+        previewConnection = nil
+        await preview?.close()
         await pool.shutdown()
+    }
+
+    // MARK: - Seek previews
+
+    /// Seek previews read through one NNTP connection reserved from the pool (taken on the first
+    /// preview, kept for the stream) and a small cache of their own. They never move the playhead
+    /// or the read-ahead and never evict what playback holds; an article playback already has, or
+    /// is fetching, is shared instead of downloaded twice.
+    static let previewCacheBytes = 24 * 1024 * 1024
+    private var previewCache: [Int: Data] = [:]
+    private var previewOrder: [Int] = []
+    private var previewCachedBytes = 0
+    private var previewConnection: UsenetNNTPConnection?
+    private var previewSlotReserved = false
+    private var previewUnavailable = false
+    private var previewStopped = false
+    /// Preview fetches run one after another: the reserved connection carries one command at a time.
+    private var previewTail: Task<Void, Never>?
+
+    /// Like `read`, for a seek preview.
+    func previewRead(offset: Int64, maxLength: Int) async throws -> Data {
+        guard !previewStopped, offset < totalSize,
+              let place = UsenetStreamSource.locate(offset, extents: source.extents, starts: extentStarts) else { return Data() }
+        let extent = source.extents[place.extent]
+        let volume = extent.volume
+        let extentEnd = extentStarts[place.extent] + extent.length
+        let limit = Int(min(Int64(maxLength), extentEnd - offset))
+        let target = place.volumeOffset
+        let segmentCount = source.volumes[volume].segments.count
+
+        var probe = layouts[volume].index(for: target)
+        var hops = 0
+        while true {
+            let data = try await previewArticle(bases[volume] + probe.index)
+            guard let range = layouts[volume].range(of: probe.index) else { throw UsenetError.noPlayableFile }
+            if range.contains(target) {
+                let start = Int(target - range.lowerBound)
+                let end = min(data.count, start + limit)
+                guard start < end else { return Data() }
+                return data.subdata(in: start..<end)
+            }
+            hops += 1
+            guard hops < 64 else { throw UsenetError.noPlayableFile }
+            let next = target < range.lowerBound ? probe.index - 1 : probe.index + 1
+            guard next >= 0, next < segmentCount else { return Data() }
+            probe = (next, false)
+        }
+    }
+
+    private func previewArticle(_ index: Int) async throws -> Data {
+        if let data = cache[index] { return data }
+        if let data = previewCache[index] {
+            touchPreview(index)
+            return data
+        }
+        if let task = inflight[index] { return try await task.value }
+        let place = split(index)
+        let segment = source.volumes[place.volume].segments[place.index]
+        let body = try await fetchPreviewBody(segment.messageID)
+        if let data = cache[index] ?? previewCache[index] { return data }
+        let decoded = try await Self.decode(body)
+        let begin = Int64(decoded.fileOffset)
+        layouts[place.volume].learn(place.index, range: begin..<(begin + Int64(decoded.data.count)))
+        storePreview(index, decoded.data)
+        return decoded.data
+    }
+
+    private func fetchPreviewBody(_ messageID: String) async throws -> Data {
+        let previous = previewTail
+        let task = Task { () throws -> Data in
+            _ = await previous?.result
+            return try await self.previewBody(messageID)
+        }
+        previewTail = Task { _ = await task.result }
+        return try await task.value
+    }
+
+    private func previewBody(_ messageID: String) async throws -> Data {
+        for attempt in 0..<2 {
+            let connection = try await readyPreviewConnection()
+            do {
+                return try await connection.fetchBody(messageID: messageID)
+            } catch let error as UsenetNNTPError where error.isTransient && attempt == 0 {
+                // The server dropped the idle connection: open a replacement once.
+                await connection.close()
+                if previewConnection === connection { previewConnection = nil }
+            }
+        }
+        throw UsenetNNTPError.connectionClosed
+    }
+
+    private func readyPreviewConnection() async throws -> UsenetNNTPConnection {
+        guard !previewStopped, !previewUnavailable else { throw UsenetNNTPError.notConnected }
+        if let connection = previewConnection, !(await connection.isClosed) { return connection }
+        let connection: UsenetNNTPConnection
+        if previewSlotReserved {
+            connection = try await pool.reopenPreviewConnection()
+        } else {
+            guard let reserved = try await pool.reservePreviewConnection() else {
+                previewUnavailable = true
+                throw UsenetNNTPError.notConnected
+            }
+            previewSlotReserved = true
+            connection = reserved
+        }
+        guard !previewStopped else {
+            await connection.close()
+            throw CancellationError()
+        }
+        previewConnection = connection
+        return connection
+    }
+
+    private func storePreview(_ index: Int, _ data: Data) {
+        if previewCache[index] == nil { previewCachedBytes += data.count }
+        previewCache[index] = data
+        touchPreview(index)
+        while previewCachedBytes > Self.previewCacheBytes, let oldest = previewOrder.first {
+            previewOrder.removeFirst()
+            if let removed = previewCache.removeValue(forKey: oldest) { previewCachedBytes -= removed.count }
+        }
+    }
+
+    private func touchPreview(_ index: Int) {
+        if let position = previewOrder.firstIndex(of: index) { previewOrder.remove(at: position) }
+        previewOrder.append(index)
     }
 
     // MARK: - Addressing

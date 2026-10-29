@@ -1113,6 +1113,36 @@ final class UsenetPoolTests: XCTestCase {
         }
     }
 
+    func testPreviewConnectionComesOutOfThePoolsOwnCount() async throws {
+        let server = FakeNNTPServer(allowed: 3, refusal: .greeting)
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 3)
+
+        let reserved = try await pool.reservePreviewConnection()
+        let preview = try XCTUnwrap(reserved)
+        let body = try await preview.fetchBody(messageID: "preview@test")
+        let results = await fetchAll(6, from: pool)
+        let stats = await pool.stats()
+        await preview.close()
+        await pool.shutdown()
+        server.stop()
+
+        XCTAssertFalse(body.isEmpty)
+        XCTAssertEqual(results, Array(repeating: .body, count: 6))
+        XCTAssertEqual(stats.totalConnections, 2, "the pool keeps to one fewer while previews hold one")
+        XCTAssertEqual(server.counts.turnedAway, 0, "previews never push the stream past the configured count")
+    }
+
+    func testSingleConnectionPlanKeepsItsConnectionForPlayback() async throws {
+        let server = FakeNNTPServer(allowed: 1, refusal: .greeting)
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 1)
+        let reserved = try await pool.reservePreviewConnection()
+        await pool.shutdown()
+        server.stop()
+        XCTAssertNil(reserved)
+    }
+
     func testEveryConnectionRefusedIsAnErrorNotAMissingArticle() async throws {
         for refusal in [FakeNNTPServer.Refusal.greeting, .login] {
             let server = FakeNNTPServer(allowed: 0, refusal: refusal)

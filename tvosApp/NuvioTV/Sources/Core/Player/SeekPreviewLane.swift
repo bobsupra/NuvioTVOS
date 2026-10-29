@@ -34,6 +34,8 @@ enum SeekPreviewNetworkPolicy {
         ProfileSettings.current.object(forKey: SettingsKey.seekPreviewBeyondBuffer) as? Bool ?? false
     }
 
+    /// `playbackHoldsConnection: false` for a Usenet stream: previews read over their own NNTP
+    /// connection reserved from the pool, never the connection a pause releases.
     static func aether(
         beyondBuffer: Bool,
         isPaused: Bool,
@@ -41,10 +43,11 @@ enum SeekPreviewNetworkPolicy {
         isPlaying: Bool,
         forwardBufferSeconds: Double?,
         throughputMbps: Double?,
-        bitrateMbps: Double?
+        bitrateMbps: Double?,
+        playbackHoldsConnection: Bool = true
     ) -> Decision {
         if isPaused {
-            if beyondBuffer { return .allowed }
+            if beyondBuffer || !playbackHoldsConnection { return .allowed }
             guard let pausedFor, pausedFor >= heldConnectionReleaseSeconds else { return .pauseTooRecent }
             return .allowed
         }
@@ -82,8 +85,9 @@ enum SeekPreviewNetworkPolicy {
     }
 
     /// The origin a preview reads, or nil when this source is not served by the preview lane:
-    /// live, HLS, disc images, and every loopback source (torrent, Usenet, a cache proxy without
-    /// its remote descriptor) keep the previews they had.
+    /// live, HLS, disc images, and the other loopback sources (torrent, a cache proxy without its
+    /// remote descriptor) keep the previews they had. A Usenet stream is read through the local
+    /// server's preview path, which has an NNTP connection of its own.
     static func previewOrigin(
         playbackURL: URL?,
         headerSourceURL: URL?,
@@ -91,7 +95,11 @@ enum SeekPreviewNetworkPolicy {
         isLive: Bool,
         isKnownHLS: Bool
     ) -> URL? {
-        guard !isLive, !isKnownHLS,
+        guard !isLive, !isKnownHLS else { return nil }
+        if let playbackURL, UsenetStreamServer.isStreamURL(playbackURL) {
+            return UsenetStreamServer.previewURL(for: playbackURL)
+        }
+        guard
               let url = descriptorRemoteURL ?? headerSourceURL ?? playbackURL,
               let scheme = url.scheme?.lowercased(), ["http", "https"].contains(scheme),
               let host = url.host?.lowercased(), !host.isEmpty,
@@ -458,7 +466,7 @@ final class SeekPreviewRangeTransport: NSObject, URLSessionDataDelegate, @unchec
 /// next request, up to 8 MB, so FFmpeg's own read pattern decides how much a still costs.
 final class SeekPreviewRangeReader: IOReader, @unchecked Sendable {
     static let initialFetchBytes = 512 * 1024
-    static let maximumFetchBytes = 8 * 1024 * 1024
+    static let defaultMaximumFetchBytes = 8 * 1024 * 1024
     static let cacheLimitBytes = 48 * 1024 * 1024
     private static let avseekSize: Int32 = 0x10000
     private static let avseekForce: Int32 = 0x20000
@@ -483,8 +491,13 @@ final class SeekPreviewRangeReader: IOReader, @unchecked Sendable {
     private var networkPermitted = false
     private var closed = false
 
-    init(transport: SeekPreviewRangeTransport) {
+    private let maximumFetchBytes: Int
+
+    /// `maximumFetchBytes` caps how far a running read grows; a Usenet stream keeps it small,
+    /// since every megabyte there is articles fetched one after another.
+    init(transport: SeekPreviewRangeTransport, maximumFetchBytes: Int = SeekPreviewRangeReader.defaultMaximumFetchBytes) {
         self.transport = transport
+        self.maximumFetchBytes = max(Self.initialFetchBytes, maximumFetchBytes)
     }
 
     var discImageProbeEnabled: Bool { false }
@@ -639,7 +652,7 @@ final class SeekPreviewRangeReader: IOReader, @unchecked Sendable {
 
     private func fetchLengthLocked(at offset: Int64, requested: Int) -> Int {
         var length = offset == lastFetchEnd && lastFetchLength > 0
-            ? min(lastFetchLength * 2, Self.maximumFetchBytes)
+            ? min(lastFetchLength * 2, maximumFetchBytes)
             : Self.initialFetchBytes
         length = max(length, requested)
         if let next = segments.first(where: { $0.start > offset }) {
@@ -748,6 +761,8 @@ final class SeekPreviewLane {
     static let neighborCount = 2
     static let backgroundSpacingNanoseconds: UInt64 = 800_000_000
     static let consecutiveDecodeFailureLimit = 4
+    /// About three articles: a range stays well inside the request timeout over one NNTP connection.
+    static let usenetMaximumFetchBytes = 2 * 1024 * 1024
     /// Disk namespace version of grid keyframes; bump when what a cell holds changes.
     nonisolated static let diskKeySuffix = "_kf1"
 
@@ -796,7 +811,10 @@ final class SeekPreviewLane {
         self.localFrame = localFrame
         let transport = SeekPreviewRangeTransport(originURL: originURL, headers: headers)
         self.transport = transport
-        self.reader = SeekPreviewRangeReader(transport: transport)
+        self.reader = SeekPreviewRangeReader(
+            transport: transport,
+            maximumFetchBytes: UsenetStreamServer.isStreamURL(originURL)
+                ? Self.usenetMaximumFetchBytes : SeekPreviewRangeReader.defaultMaximumFetchBytes)
         publishDiagnostics()
     }
 

@@ -301,6 +301,29 @@ actor UsenetConnectionPool {
         return .missing
     }
 
+    /// Takes one connection to the first server out of the pool for seek previews, for the rest
+    /// of the stream. The pool then keeps to one fewer, so the provider never sees more than the
+    /// configured count. nil when the server allows only one connection: playback needs it.
+    func reservePreviewConnection() async throws -> UsenetNNTPConnection? {
+        guard !closed, let index = servers.indices.first, servers[index].limit > 1 else { return nil }
+        let connection = try await acquire(index, urgent: false)
+        guard !closed else {
+            Task { await connection.close() }
+            throw CancellationError()
+        }
+        servers[index].open = max(0, servers[index].open - 1)
+        servers[index].limit = max(1, servers[index].limit - 1)
+        return connection
+    }
+
+    /// A replacement for a reserved preview connection the server closed: the slot stays reserved.
+    func reopenPreviewConnection() async throws -> UsenetNNTPConnection {
+        guard !closed, let config = servers.first?.config else { throw CancellationError() }
+        let connection = UsenetNNTPConnection(config: config)
+        try await connection.open()
+        return connection
+    }
+
     func shutdown() {
         closed = true
         for index in servers.indices {

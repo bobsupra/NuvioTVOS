@@ -3384,7 +3384,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPlaying: phase == .playing,
             forwardBufferSeconds: telemetry?.forwardBufferSeconds,
             throughputMbps: telemetry?.networkThroughputMbps,
-            bitrateMbps: telemetry?.averageBitrateMbps ?? containerBitrate)
+            bitrateMbps: telemetry?.averageBitrateMbps ?? containerBitrate,
+            playbackHoldsConnection: !UsenetStreamServer.isStreamURL(thumbnailSourceContext?.playbackURL))
     }
 
     func nearestScrubThumbnail(atSeconds seconds: Double, maxDistance: Double) async -> CGImage? {
@@ -4843,8 +4844,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         let isLocalPlaybackCache = request.videoURL.host == "127.0.0.1"
             && request.videoURL.path.hasPrefix("/stream/")
         // The local Usenet stream is loopback too, but every read downloads
-        // articles: it is played like a remote source (one held connection)
-        // and never read for thumbnails.
+        // articles: it is played like a remote source (one held connection).
+        // Seek previews read its preview path (SeekPreviewLane), never this URL.
         let isUsenetStream = UsenetStreamServer.isStreamURL(request.videoURL)
         self.isLocalPlaybackCache = isLocalPlaybackCache
         self.isRemoteStream = isRemote || isLocalPlaybackCache || isUsenetStream

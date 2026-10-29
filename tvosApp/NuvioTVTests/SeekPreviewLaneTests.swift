@@ -151,6 +151,30 @@ final class SeekPreviewLaneTests: XCTestCase {
             .allowed)
     }
 
+    func testUsenetPreviewsDoNotWaitForThePausedConnection() {
+        XCTAssertEqual(
+            SeekPreviewNetworkPolicy.aether(
+                beyondBuffer: false, isPaused: true, pausedFor: 0.5, isPlaying: false,
+                forwardBufferSeconds: nil, throughputMbps: nil, bitrateMbps: nil,
+                playbackHoldsConnection: false),
+            .allowed)
+        XCTAssertEqual(
+            SeekPreviewNetworkPolicy.aether(
+                beyondBuffer: false, isPaused: false, pausedFor: nil, isPlaying: true,
+                forwardBufferSeconds: 60, throughputMbps: nil, bitrateMbps: nil,
+                playbackHoldsConnection: false),
+            .playing, "during playback the option still decides")
+    }
+
+    func testUsenetPreviewPathMapsOnlyStreamURLs() {
+        XCTAssertEqual(
+            UsenetStreamServer.previewURL(for: URL(string: "http://127.0.0.1:5000/usenet/ABC/video.mkv")!),
+            URL(string: "http://127.0.0.1:5000/usenet/ABC/preview/video.mkv")!)
+        XCTAssertNil(UsenetStreamServer.previewURL(for: URL(string: "http://127.0.0.1:5000/usenet/ABC/preview/video.mkv")!))
+        XCTAssertNil(UsenetStreamServer.previewURL(for: URL(string: "https://example.com/usenet/ABC/video.mkv")!))
+        XCTAssertNil(UsenetStreamServer.previewURL(for: URL(string: "http://127.0.0.1:5000/stream/ABC/video.mkv")!))
+    }
+
     func testMPVPauseAdmitsAtOnceAndPlaybackFollowsTheOption() {
         XCTAssertEqual(SeekPreviewNetworkPolicy.mpv(beyondBuffer: false, isPaused: true, isPlaying: false, cacheSeconds: nil), .allowed)
         XCTAssertEqual(SeekPreviewNetworkPolicy.mpv(beyondBuffer: false, isPaused: false, isPlaying: true, cacheSeconds: 60), .playing)
@@ -166,7 +190,10 @@ final class SeekPreviewLaneTests: XCTestCase {
         XCTAssertNil(origin(playback: URL(string: "https://cdn.example/master.m3u8")!))
         XCTAssertNil(origin(playback: URL(string: "https://cdn.example/disc.iso")!))
         XCTAssertNil(origin(playback: URL(string: "http://127.0.0.1:8090/play/abc")!))
-        XCTAssertNil(origin(playback: URL(string: "http://127.0.0.1:9000/usenet/token/file.mkv")!))
+        XCTAssertEqual(origin(playback: URL(string: "http://127.0.0.1:9000/usenet/token/video.mkv")!),
+                       URL(string: "http://127.0.0.1:9000/usenet/token/preview/video.mkv")!,
+                       "a Usenet stream is read through its preview path")
+        XCTAssertNil(origin(playback: URL(string: "http://127.0.0.1:9000/usenet/token/video.mkv")!, isLive: true))
         XCTAssertNil(origin(playback: URL(fileURLWithPath: "/tmp/movie.mkv")))
 
         let proxy = URL(string: "http://127.0.0.1:7000/stream/session/file.mkv")!

@@ -20,6 +20,9 @@ actor UsenetStreamServer {
     private(set) var port: UInt16 = 0
     nonisolated let token = UUID().uuidString
     nonisolated var path: String { "/usenet/\(token)/\(Self.safeName(fileName))" }
+    /// Seek previews read here: the same bytes over the session's preview connection, without
+    /// moving the read-ahead or taking over playback.
+    nonisolated var previewPath: String { "/usenet/\(token)/preview/\(Self.safeName(fileName))" }
     var url: URL { URL(string: "http://127.0.0.1:\(port)\(path)")! }
 
     init(session: UsenetStreamSession, fileName: String, fileLength: Int64) {
@@ -138,7 +141,8 @@ actor UsenetStreamServer {
         let parts = first.components(separatedBy: " ")
         let method = parts.first ?? "GET"
         let requested = parts.count > 1 ? String(parts[1].prefix { $0 != "?" && $0 != "#" }) : ""
-        guard requested == path else {
+        let isPreview = requested == previewPath
+        guard requested == path || isPreview else {
             try await sendHead(connection, "404 Not Found", ["Content-Length": "0", "Connection": "close"])
             return false
         }
@@ -164,6 +168,19 @@ actor UsenetStreamServer {
         }
         try await sendHead(connection, status, headers)
         guard method != "HEAD" else { return true }
+
+        if isPreview {
+            var position = range.lowerBound
+            while position <= range.upperBound {
+                try Task.checkCancellation()
+                let wanted = Int(min(Int64(Self.chunkBytes), range.upperBound - position + 1))
+                let chunk = try await session.previewRead(offset: position, maxLength: wanted)
+                guard !chunk.isEmpty else { throw NetworkIO.Failure.closed }
+                try await NetworkIO.send(connection, chunk)
+                position += Int64(chunk.count)
+            }
+            return true
+        }
 
         // The newest read takes over playback and moves the read-ahead; an
         // older one is served while the player still reads it but no longer
@@ -210,6 +227,17 @@ actor UsenetStreamServer {
 
     nonisolated static func mimeType(for name: String) -> String {
         TorrentStreamServer.mimeType(for: name)
+    }
+
+    /// The preview path of a stream URL (`/usenet/<token>/preview/<name>`), nil for anything else.
+    nonisolated static func previewURL(for url: URL) -> URL? {
+        guard isStreamURL(url) else { return nil }
+        let parts = url.path.split(separator: "/").map(String.init)
+        guard parts.count == 3, parts[0] == "usenet", parts[2] != "preview" else { return nil }
+        var components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        components?.path = "/usenet/\(parts[1])/preview/\(parts[2])"
+        components?.query = nil
+        return components?.url
     }
 
     /// A URL-safe file name, so players that sniff the extension see `.mkv`.
