@@ -5047,21 +5047,30 @@ class PlayerViewModel: ObservableObject {
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
 
-                // Completed fast frames provide progressive feedback
-                if let image {
-                    self.scrubThumbnail = image
-                    self.scrubThumbnailTargetSeconds = target
-                } else if abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
+                if image == nil, abs(target - (self.scrubThumbnailTargetSeconds ?? target)) > 15 {
                     self.scrubThumbnail = nil
                     self.scrubThumbnailTargetSeconds = nil
                 }
 
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                // A fast frame can be the keyframe seconds before the target, often another shot.
+                // It is feedback only while the remote keeps moving: a settled target waits for
+                // its exact still, so the card never shows a nearby picture and then swaps it.
+                if self.pendingScrubThumbnailSeconds != nil {
+                    self.showMovingScrubThumbnail(image, for: target)
+                    continue
+                }
 
                 // Give new input a chance to arrive before paying for exact decode.
                 try? await Task.sleep(nanoseconds: 160_000_000)
                 guard !Task.isCancelled else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
+                if self.pendingScrubThumbnailSeconds != nil {
+                    if self.isCurrentScrubThumbnailWork(
+                        generation: generation, interactionToken: interactionToken,
+                        provider: selectedProvider, backend: selectedBackend) {
+                        self.showMovingScrubThumbnail(image, for: target)
+                    }
+                    continue
+                }
                 let refined = await selectedProvider.scrubThumbnail(
                     atSeconds: target, maxWidth: 480, precise: true
                 )
@@ -5074,19 +5083,20 @@ class PlayerViewModel: ObservableObject {
                       self.isSeekPreviewEnabled,
                       self.scrubThumbnailProvider === selectedProvider,
                       selectedProvider.supportsScrubThumbnails else { return }
-                if self.pendingScrubThumbnailSeconds != nil { continue }
-                if let refined {
-                    self.scrubThumbnail = refined
+                if self.pendingScrubThumbnailSeconds != nil {
+                    self.showMovingScrubThumbnail(refined ?? image, for: target)
+                    continue
+                }
+                if let still = refined ?? image {
+                    // The exact still; the fast frame only when no exact one came.
+                    self.scrubThumbnail = still
                     self.scrubThumbnailTargetSeconds = target
-                } else if image == nil, !usedDeferredRetry,
+                } else if !usedDeferredRetry,
                           let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
                     // A pause has not yet released the playback connection (option off): try the
                     // settled target once more when it has, without another remote press. The
-                    // closest held still stands in meanwhile.
+                    // previous still stays meanwhile rather than a nearby one that would be swapped.
                     usedDeferredRetry = true
-                    await self.showNearestScrubThumbnail(
-                        for: target, provider: selectedProvider, backend: selectedBackend,
-                        generation: generation, interactionToken: interactionToken)
                     let deadline = Date().addingTimeInterval(delay + 0.2)
                     // Sliced, so a new target moves on at once instead of after the wait.
                     while Date() < deadline, self.pendingScrubThumbnailSeconds == nil {
@@ -5097,7 +5107,7 @@ class PlayerViewModel: ObservableObject {
                        (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
-                } else if image == nil, failedAttempts < 2 {
+                } else if failedAttempts < 2 {
                     // A transient cache miss/yield must recover even after the
                     // user stops moving, without requiring another remote press.
                     failedAttempts += 1
@@ -5107,7 +5117,7 @@ class PlayerViewModel: ObservableObject {
                        (self.isScrubbing || self.isHoldingSeek || self.pendingSeekDelta != 0 || self.isTimelineFocused) {
                         self.pendingScrubThumbnailSeconds = target
                     }
-                } else if image == nil {
+                } else {
                     // Nothing for the target will come (outside the buffer, no network for
                     // previews): the closest held still keeps the card showing a picture.
                     await self.showNearestScrubThumbnail(
@@ -5116,6 +5126,29 @@ class PlayerViewModel: ObservableObject {
                 }
             }
         }
+    }
+
+    /// A frame finished for a target the remote has already moved past: feedback while moving.
+    private func showMovingScrubThumbnail(_ image: CGImage?, for target: Double) {
+        guard let image else { return }
+        scrubThumbnail = image
+        scrubThumbnailTargetSeconds = target
+    }
+
+    private func isCurrentScrubThumbnailWork(
+        generation: UInt64,
+        interactionToken: UInt64,
+        provider: any ScrubThumbnailProviding,
+        backend: PlayerEngineKind
+    ) -> Bool {
+        scrubThumbnailGeneration == generation
+            && scrubThumbnailTaskInteractionToken == interactionToken
+            && (isScrubbing || isHoldingSeek || pendingSeekDelta != 0 || isTimelineFocused)
+            && activeEngineKind == backend
+            && sessionCoordinator.activeBackend == backend
+            && isSeekPreviewEnabled
+            && scrubThumbnailProvider === provider
+            && provider.supportsScrubThumbnails
     }
 
     /// Only when the target gets no still of its own: shown after its requests came back empty,

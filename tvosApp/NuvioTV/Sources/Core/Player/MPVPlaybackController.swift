@@ -676,7 +676,9 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         )
         guard isCurrentScrubThumbnailRequest(
             requestID, generation: generation, providerGeneration: providerGeneration) else { return nil }
-        return image ?? seekPreviewLaneHost.current?.memoryImage(at: seconds, duration: duration)
+        // No lane cell here: its keyframe can sit seconds before the target, and an exact still
+        // from the cache may follow. generateScrubThumbnail reaches the lane, from memory at once.
+        return image
     }
 
     func scrubThumbnail(

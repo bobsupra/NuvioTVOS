@@ -1652,23 +1652,85 @@ extension PlayerControlsSettingsTests {
         )
         model.pendingSeekDelta = 1
         let fast = makeTestImage()
-        let published = expectation(description: "Fast frame visible")
+        let decoded = expectation(description: "Fast frame decoded")
         var preciseCalls = 0
         provider.decode = { _, precise in
-            if precise { preciseCalls += 1 }
+            if precise {
+                preciseCalls += 1
+            } else {
+                decoded.fulfill()
+            }
             return fast
         }
-        let subscription = model.$scrubThumbnail.sink { image in
-            if image === fast { published.fulfill() }
-        }
-        defer { subscription.cancel() }
         model.requestScrubThumbnail(at: 10)
-        await fulfillment(of: [published], timeout: 2)
+        await fulfillment(of: [decoded], timeout: 2)
         model.pendingSeekDelta = 0
         model.setTimelineFocused(false)
         try? await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(preciseCalls, 0)
         XCTAssertNil(model.scrubThumbnail)
+    }
+
+    @MainActor
+    func testSettledTargetShowsOnlyItsExactStill() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        // The fast frame stands for the keyframe seconds before the target.
+        let keyframe = makeTestImage()
+        let exact = makeTestImage()
+        provider.decode = { _, precise in precise ? exact : keyframe }
+        var shown: [CGImage] = []
+        let refined = expectation(description: "The exact still is shown")
+        let subscription = model.$scrubThumbnail.sink { image in
+            guard let image else { return }
+            shown.append(image)
+            if image === exact { refined.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 1_365)
+        await fulfillment(of: [refined], timeout: 2)
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(shown.count, 1, "a settled target must not show a nearby frame first")
+        XCTAssertTrue(shown.first === exact)
+    }
+
+    @MainActor
+    func testFastFrameStandsWhenNoExactStillComes() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let keyframe = makeTestImage()
+        var preciseCalls = 0
+        provider.decode = { _, precise in
+            guard precise else { return keyframe }
+            preciseCalls += 1
+            return nil
+        }
+        let published = expectation(description: "The fast frame is shown once the exact one fails")
+        let subscription = model.$scrubThumbnail.sink { image in
+            if image === keyframe { published.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 600)
+        await fulfillment(of: [published], timeout: 2)
+        XCTAssertEqual(preciseCalls, 1, "shown only after the exact request came back empty")
     }
 
     func testTrickplayDiskCacheStoreAndLookup() async {

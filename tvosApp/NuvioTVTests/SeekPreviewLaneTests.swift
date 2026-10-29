@@ -284,6 +284,19 @@ final class SeekPreviewLaneTests: XCTestCase {
         XCTAssertNil(otherGeneration)
     }
 
+    func testKeyframeStillNeverAnswersTheExactLookupOfItsTarget() async {
+        let index = HybridSeekThumbnailIndex()
+        await index.reset(generation: 5)
+        let keyframe = makeImage()
+        await index.store(keyframe, seconds: 1_365, kind: .approximate, generation: 5, persistToDisk: false)
+        let exact = await index.lookup(seconds: 1_365, duration: 7_200, generation: 5, exactOnly: true)
+        let nearby = await index.nearest(seconds: 1_370, maxDistance: 30, generation: 5)
+        let sampled = await index.hasCoarse(at: 1_365, generation: 5)
+        XCTAssertNil(exact, "a keyframe decoded for 1365 s is not the still at 1365 s")
+        XCTAssertTrue(nearby === keyframe, "it still stands in for a nearby target")
+        XCTAssertFalse(sampled)
+    }
+
     // MARK: Transport
 
     func testContentRangeTotalParses() {

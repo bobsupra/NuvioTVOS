@@ -2341,7 +2341,10 @@ actor TrickplayUploader {
 /// Session-scoped, bounded hybrid cache. Fine entries use half-second buckets;
 /// coarse entries are nearest-neighbor fallbacks within the same precision bound.
 actor HybridSeekThumbnailIndex {
-    enum Kind: Sendable { case fine, coarse }
+    /// `approximate`: a keyframe-snapped still decoded for a target whose real timestamp is
+    /// unknown. It stands in for a nearby target only (`nearest`), never answers an exact lookup
+    /// and never reaches disk, where it would read as the target's own still in later sessions.
+    enum Kind: Sendable { case fine, coarse, approximate }
 
     private struct Entry {
         let image: CGImage
@@ -2408,7 +2411,8 @@ actor HybridSeekThumbnailIndex {
         }
 
         // Tier 3: In-memory nearest RAM thumbnail (coarse bucket fallback)
-        if let nearest = coarse.min(by: {
+        let coarseCandidates = exactOnly ? coarse.filter { $0.value.kind != .approximate } : coarse
+        if let nearest = coarseCandidates.min(by: {
             abs($0.value.seconds - seconds) < abs($1.value.seconds - seconds)
         }), (exactOnly
             ? abs(nearest.value.seconds - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError
@@ -2441,7 +2445,7 @@ actor HybridSeekThumbnailIndex {
 
     func hasCoarse(at seconds: Double, generation: UInt64) -> Bool {
         guard self.generation == generation else { return false }
-        return coarse.values.contains { abs($0.seconds - seconds) < 0.01 }
+        return coarse.values.contains { $0.kind != .approximate && abs($0.seconds - seconds) < 0.01 }
     }
 
     /// The closest still in memory within `maxDistance`, fine or coarse. For a preview that would
@@ -2474,14 +2478,14 @@ actor HybridSeekThumbnailIndex {
         case .fine:
             guard let bucket = HybridSeekThumbnailPolicy.fineBucket(for: seconds) else { return }
             if let old = fine.updateValue(entry, forKey: bucket) { totalCost -= old.cost }
-        case .coarse:
+        case .coarse, .approximate:
             let key = Int((seconds * 1000).rounded())
             if let old = coarse.updateValue(entry, forKey: key) { totalCost -= old.cost }
         }
         totalCost += cost
         evictIfNeeded()
 
-        if persistToDisk, !streamKey.isEmpty {
+        if persistToDisk, kind != .approximate, !streamKey.isEmpty {
             let key = streamKey
             Task {
                 await TrickplayDiskCache.shared.store(image: image, streamKey: key, seconds: seconds)
@@ -3431,8 +3435,9 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                                                  providerGeneration: providerGeneration,
                                                  cancellation: cancellation) else { return nil }
             if let image {
+                // A fast still is the keyframe before `seconds`, not the still at it.
                 await hybridThumbnailIndex.store(
-                    image, seconds: seconds, kind: precise ? .fine : .coarse, generation: generation)
+                    image, seconds: seconds, kind: precise ? .fine : .approximate, generation: generation)
                 guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                                      providerGeneration: providerGeneration,
                                                      cancellation: cancellation) else { return nil }
@@ -3462,7 +3467,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         }
         if let image {
             await hybridThumbnailIndex.store(
-                image, seconds: seconds, kind: precise ? .fine : .coarse, generation: generation)
+                image, seconds: seconds, kind: precise ? .fine : .approximate, generation: generation)
             guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                                  providerGeneration: providerGeneration,
                                                  cancellation: cancellation) else { return nil }
