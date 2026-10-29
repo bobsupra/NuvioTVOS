@@ -201,6 +201,12 @@ struct AddonRatingItem: Decodable {
 }
 
 enum AddonRatingsService {
+    /// UserDefaults supports concurrent access. Keep the caller's profile store
+    /// when the shared cache runs its fetch closure in a detached task.
+    private struct SendableDefaultsStore: @unchecked Sendable {
+        let value: UserDefaults
+    }
+
     /// Built-in providers that cannot be spoofed by add-ons.
     static let builtInProviders: Set<String> = [
         "imdb", "tmdb", "tomatoes", "metacritic", "trakt",
@@ -760,8 +766,9 @@ enum AddonRatingsService {
 
         // The hero, a prefetch of the next slide and Details can ask for the
         // same title at once; they share one request.
+        let defaultsStore = SendableDefaultsStore(value: defaults)
         let combined = await HomeHeroRatingsCache.shared.load(key: key) {
-            async let addonRatingsTask = fetchRatings(for: meta, defaults: defaults)
+            async let addonRatingsTask = fetchRatings(for: meta, defaults: defaultsStore.value)
             async let mdbRatingsTask = MdbListDetailsService.fetchRatings(for: meta)
             let (addonRatings, mdbRatings) = await (addonRatingsTask, mdbRatingsTask)
 
