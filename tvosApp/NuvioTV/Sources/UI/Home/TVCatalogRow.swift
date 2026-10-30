@@ -1631,9 +1631,21 @@ struct TVCollectionFolderCard: View {
     }
 
     private var coverImageURL: URL? {
-        guard let raw = folder.coverImageUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !raw.isEmpty else { return nil }
-        return URL(string: raw)
+        let candidate: String?
+        if !folder.focusGifEnabled,
+           let gifUrl = folder.focusGifUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !gifUrl.isEmpty {
+            candidate = gifUrl
+        } else {
+            candidate = folder.coverImageUrl?.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        guard let raw = candidate, !raw.isEmpty, let url = URL(string: raw) else { return nil }
+        return url
+    }
+
+    private func isCoverGifURL(_ url: URL) -> Bool {
+        let lower = url.absoluteString.lowercased()
+        return lower.hasSuffix(".gif") || lower.contains(".gif?") || lower.contains("/gif")
     }
 
     private var usesEmojiCover: Bool {
@@ -1686,6 +1698,9 @@ struct TVCollectionFolderCard: View {
             .focusEffectDisabledIfAvailable()
             .modifier(OptionalMoveCommandHandler(handler: onMove))
             .onAppear {
+                if let raw = focusGifURLString, let url = URL(string: raw) {
+                    AnimatedGIFCache.shared.preload(url: url)
+                }
                 guard shouldRequestInitialFocus, !didRequestInitialFocus else { return }
                 didRequestInitialFocus = true
                 onInitialFocusRequested?()
@@ -1755,22 +1770,28 @@ struct TVCollectionFolderCard: View {
                         )
                     )
             }
-            AsyncImage(url: url) { phase in
-                switch phase {
-                case .success(let image):
-                    if usesLogoCoverPresentation {
-                        image
-                            .resizable()
-                            .scaledToFit()
-                            .padding(.horizontal, cardWidth * 0.10)
-                            .padding(.vertical, cardHeight * 0.10)
-                    } else {
-                        image
-                            .resizable()
-                            .aspectRatio(contentMode: .fill)
+            if isCoverGifURL(url) {
+                AnimatedRemoteGIFView(urlString: url.absoluteString, isActive: showFocus)
+                    .frame(width: cardWidth, height: cardHeight)
+                    .clipped()
+            } else {
+                AsyncImage(url: url) { phase in
+                    switch phase {
+                    case .success(let image):
+                        if usesLogoCoverPresentation {
+                            image
+                                .resizable()
+                                .scaledToFit()
+                                .padding(.horizontal, cardWidth * 0.10)
+                                .padding(.vertical, cardHeight * 0.10)
+                        } else {
+                            image
+                                .resizable()
+                                .aspectRatio(contentMode: .fill)
+                        }
+                    default:
+                        emptyCoverFill
                     }
-                default:
-                    emptyCoverFill
                 }
             }
             focusGifOverlay

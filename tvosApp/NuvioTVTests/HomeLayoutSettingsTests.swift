@@ -2476,5 +2476,91 @@ final class HomeLayoutSettingsTests: XCTestCase {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.detailsSectionOrder))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.detailsSectionDisabled))
     }
+
+    func testFocusedPosterExpandingToBackdropPrefersBackgroundOverLandscapePoster() {
+        let meta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            posterUrl: "https://example.com/poster.jpg",
+            backgroundUrl: "https://example.com/clean-backdrop.jpg",
+            logoUrl: "https://example.com/logo.png",
+            type: "series",
+            landscapePosterUrl: "https://example.com/landscape-poster-with-logo.jpg"
+        )
+
+        // When expanding a focused poster to a backdrop card (isEffectivelyAlwaysLandscape == false),
+        // the backdrop card must display the clean backdrop (backgroundUrl) rather than the landscape poster.
+        let resolvedCardArtwork = PosterCard.resolvedLandscapeArtworkURL(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: false
+        )
+        XCTAssertEqual(resolvedCardArtwork, "https://example.com/clean-backdrop.jpg")
+
+        // The Home hero backdrop must also resolve to the clean backdrop.
+        let heroBackdrop = TVHomeView.preferredBackdropURL(for: meta)
+        XCTAssertEqual(heroBackdrop, "https://example.com/clean-backdrop.jpg")
+
+        // Over the clean backdrop, the logo overlay is displayed.
+        let showOverlay = PosterCard.shouldShowLandscapeOverlay(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: false,
+            showsPosterTitle: true
+        )
+        XCTAssertTrue(showOverlay)
+    }
+
+    func testFocusedPosterExpandingToBackdropFallsBackToLandscapePosterWhenBackgroundMissing() {
+        let meta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            posterUrl: "https://example.com/poster.jpg",
+            backgroundUrl: nil,
+            logoUrl: "https://example.com/logo.png",
+            type: "series",
+            landscapePosterUrl: "https://example.com/landscape-poster-with-logo.jpg"
+        )
+
+        let resolvedCardArtwork = PosterCard.resolvedLandscapeArtworkURL(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: false
+        )
+        XCTAssertEqual(resolvedCardArtwork, "https://example.com/landscape-poster-with-logo.jpg")
+
+        let heroBackdrop = TVHomeView.preferredBackdropURL(for: meta)
+        XCTAssertEqual(heroBackdrop, "https://example.com/landscape-poster-with-logo.jpg")
+    }
+
+    func testLandscapePosterRowUsesLandscapePosterAndSuppressesDuplicateLogoOverlay() {
+        let meta = NuvioMeta(
+            id: "tt0903747",
+            name: "Breaking Bad",
+            posterUrl: "https://example.com/poster.jpg",
+            backgroundUrl: "https://example.com/clean-backdrop.jpg",
+            logoUrl: "https://example.com/logo.png",
+            type: "series",
+            landscapePosterUrl: "https://example.com/landscape-poster-with-logo.jpg"
+        )
+
+        // In a landscape poster row (isEffectivelyAlwaysLandscape == true),
+        // the card displays the landscape poster.
+        let resolvedCardArtwork = PosterCard.resolvedLandscapeArtworkURL(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: true
+        )
+        XCTAssertEqual(resolvedCardArtwork, "https://example.com/landscape-poster-with-logo.jpg")
+
+        // Because the landscape poster already has the logo/title baked in,
+        // the card's logo overlay should be suppressed to avoid duplicate logos.
+        let showOverlay = PosterCard.shouldShowLandscapeOverlay(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: true,
+            showsPosterTitle: true
+        )
+        XCTAssertFalse(showOverlay)
+
+        // The screen's hero backdrop still uses the clean background fanart.
+        let heroBackdrop = TVHomeView.preferredBackdropURL(for: meta)
+        XCTAssertEqual(heroBackdrop, "https://example.com/clean-backdrop.jpg")
+    }
 }
 

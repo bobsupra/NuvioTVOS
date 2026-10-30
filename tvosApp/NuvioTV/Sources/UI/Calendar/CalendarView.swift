@@ -621,6 +621,10 @@ struct CalendarView: View {
             Color.nuvioBackground(amoled: amoled, body: bodyColor).ignoresSafeArea()
             content
         }
+        #if os(tvOS)
+        .toolbar(.hidden, for: .navigationBar)
+        .toolbar(.hidden, for: .tabBar)
+        #endif
         .onAppear { model.loadIfNeeded() }
         .sheet(isPresented: $showingSkipped) {
             if case .loaded(let result, _) = model.state {
@@ -719,7 +723,7 @@ struct CalendarView: View {
         .padding(.horizontal, 49)
         .padding(.top, 56)
         .padding(.bottom, 30)
-        .defaultFocus($focus, .day(today))
+        .defaultFocusIfAvailable($focus, didFocusToday ? nil : .day(today))
         .onAppear(perform: focusTodayOnFirstOpen)
         // Back from the episode list returns to the selected day instead
         // of jumping to the sidebar (which slides the whole grid over).
@@ -897,6 +901,7 @@ struct CalendarView: View {
         .onChange(of: focus) { _, newValue in
             if case .day(let day) = newValue {
                 selectedDay = day
+                didFocusToday = true
             }
         }
         .onChange(of: displayedMonth) { _, month in
@@ -1231,6 +1236,8 @@ private struct CalendarDayPanel: View {
     var focus: FocusState<CalendarFocus?>.Binding
     let onOpen: (CalendarEntry) -> Void
 
+    @State private var scrolledSectionID: String?
+
     private var sections: [CalendarDaySection] {
         result.days.filter { $0.date.isSameMonth(as: month) }
     }
@@ -1299,10 +1306,24 @@ private struct CalendarDayPanel: View {
                 .padding(.vertical, 20)
                 .padding(.horizontal, 12)
             }
+            .scrollPosition(id: $scrolledSectionID, anchor: .top)
             .scrollClipDisabledIfAvailable()
-            .onAppear { scroll(proxy) }
-            .onChange(of: selectedDay) { _, _ in scroll(proxy) }
-            .onChange(of: month) { _, _ in scroll(proxy) }
+            .onAppear {
+                scrolledSectionID = anchorID
+                scroll(proxy)
+            }
+            .onChange(of: selectedDay) { _, _ in
+                scrolledSectionID = anchorID
+                scroll(proxy)
+            }
+            .onChange(of: month) { _, _ in
+                scrolledSectionID = anchorID
+                scroll(proxy)
+            }
+            .onChange(of: focus.wrappedValue) { _, _ in
+                scrolledSectionID = anchorID
+                scroll(proxy)
+            }
         }
     }
 

@@ -701,8 +701,49 @@ struct PosterCard: View {
         isAlwaysLandscape || tileShape == .landscape || meta.tileShape == .landscape
     }
 
+    private var isUsingAddonLandscapePoster: Bool {
+        Self.isUsingAddonLandscapePoster(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: isEffectivelyAlwaysLandscape,
+            hasCustomLandscapeArtwork: customLandscapeArtworkURL != nil
+        )
+    }
+
+    static func isUsingAddonLandscapePoster(
+        meta: NuvioMeta,
+        isEffectivelyAlwaysLandscape: Bool,
+        hasCustomLandscapeArtwork: Bool = false
+    ) -> Bool {
+        guard isEffectivelyAlwaysLandscape,
+              let customLandscape = meta.landscapePosterUrl?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !customLandscape.isEmpty else {
+            return false
+        }
+        return !hasCustomLandscapeArtwork
+    }
+
+    static func shouldShowLandscapeOverlay(
+        meta: NuvioMeta,
+        isEffectivelyAlwaysLandscape: Bool,
+        isContinueOrUpcomingCard: Bool = false,
+        usesLoadedCustomLandscapeArtwork: Bool = false,
+        showsPosterTitle: Bool = false
+    ) -> Bool {
+        if usesLoadedCustomLandscapeArtwork { return false }
+        if isUsingAddonLandscapePoster(meta: meta, isEffectivelyAlwaysLandscape: isEffectivelyAlwaysLandscape) {
+            return false
+        }
+        if isContinueOrUpcomingCard { return true }
+        if isEffectivelyAlwaysLandscape {
+            let hasLogo = meta.logoUrl?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty == false
+            return hasLogo || !showsPosterTitle
+        }
+        return true
+    }
+
     private var shouldShowLandscapeOverlay: Bool {
         if usesLoadedCustomLandscapeArtwork { return false }
+        if isUsingAddonLandscapePoster { return false }
         if isContinueOrUpcomingCard { return true }
         if isEffectivelyAlwaysLandscape {
             return landscapeLogoURL != nil || !showsPosterTitle
@@ -712,6 +753,7 @@ struct PosterCard: View {
 
     private var shouldShowLandscapeGradient: Bool {
         if usesLoadedCustomLandscapeArtwork { return false }
+        if isUsingAddonLandscapePoster { return false }
         if isContinueOrUpcomingCard { return true }
         if isEffectivelyAlwaysLandscape {
             return landscapeLogoURL != nil || !showsPosterTitle
@@ -777,17 +819,33 @@ struct PosterCard: View {
     }
 
     private var originalLandscapeArtworkURL: String? {
+        Self.resolvedLandscapeArtworkURL(
+            meta: meta,
+            isEffectivelyAlwaysLandscape: isEffectivelyAlwaysLandscape,
+            continueEpisodeText: continueEpisodeText,
+            continueEpisodeArtworkURL: continueEpisodeArtworkURL
+        )
+    }
+
+    static func resolvedLandscapeArtworkURL(
+        meta: NuvioMeta,
+        isEffectivelyAlwaysLandscape: Bool,
+        continueEpisodeText: String? = nil,
+        continueEpisodeArtworkURL: String? = nil
+    ) -> String? {
         if continueEpisodeText != nil,
            let continueEpisodeArtworkURL, !continueEpisodeArtworkURL.isEmpty {
             return continueEpisodeArtworkURL
         }
-        if let customLandscape = meta.landscapePosterUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customLandscape.isEmpty {
-            return customLandscape
+        if isEffectivelyAlwaysLandscape {
+            if let customLandscape = meta.landscapePosterUrl?.trimmingCharacters(in: .whitespacesAndNewlines), !customLandscape.isEmpty {
+                return customLandscape
+            }
+            if meta.posterShape == "landscape" || meta.tileShape == .landscape {
+                return meta.posterUrl ?? meta.backgroundUrl
+            }
         }
-        if meta.posterShape == "landscape" || meta.tileShape == .landscape {
-            return meta.posterUrl ?? meta.backgroundUrl
-        }
-        return meta.backgroundUrl ?? meta.posterUrl
+        return meta.backgroundUrl ?? meta.landscapePosterUrl ?? meta.posterUrl
     }
 
     private var customPortraitArtworkURL: String? {
