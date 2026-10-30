@@ -20,7 +20,7 @@ struct PlayerSubtitleOverlay: View {
         return min(configured, max(0.5, textSize * 0.3))
     }
     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
-    private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
+    private var verticalOffset: CGFloat { CGFloat(style.subMarginY) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
     private func textAppearance(alignment: TextAlignment) -> SubtitleTextAppearance {
@@ -274,7 +274,7 @@ struct MPVSubtitleOverlay: View {
         return min(configured, max(0.5, textSize * 0.3))
     }
     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
-    private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
+    private var verticalOffset: CGFloat { CGFloat(style.subMarginY) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
     var body: some View {
