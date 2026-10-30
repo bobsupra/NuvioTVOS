@@ -1783,6 +1783,54 @@ extension PlayerControlsSettingsTests {
     }
 
     @MainActor
+    func testStillFromAnotherPositionDimsOnceTheRemoteRests() async {
+        let defaults = ProfileSettings.current
+        let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
+        defaults.set(true, forKey: SettingsKey.seekPreviewEnabled)
+        defer { defaults.set(previous, forKey: SettingsKey.seekPreviewEnabled) }
+        let provider = ControlledScrubThumbnailProvider()
+        let model = PlayerViewModel(
+            sessionCoordinator: PlaybackSessionCoordinator(aetherControllerFactory: { nil }),
+            scrubThumbnailProvider: provider
+        )
+        model.pendingSeekDelta = 1
+        defer { model.pendingSeekDelta = 0; model.setTimelineFocused(false) }
+        let first = makeTestImage()
+        let second = makeTestImage()
+        let firstShown = expectation(description: "The first target's still is shown")
+        let secondShown = expectation(description: "The second target's still is shown")
+        let secondStarted = expectation(description: "The second target's decode is in flight")
+        var secondContinuation: CheckedContinuation<CGImage?, Never>?
+        provider.decode = { seconds, _ in
+            if seconds == 10 { return first }
+            return await withCheckedContinuation { continuation in
+                if secondContinuation == nil {
+                    secondContinuation = continuation
+                    secondStarted.fulfill()
+                } else {
+                    continuation.resume(returning: second)
+                }
+            }
+        }
+        let subscription = model.$scrubThumbnail.sink { image in
+            if image === first { firstShown.fulfill() }
+            if image === second { secondShown.fulfill() }
+        }
+        defer { subscription.cancel() }
+        model.requestScrubThumbnail(at: 10)
+        await fulfillment(of: [firstShown], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale)
+        model.requestScrubThumbnail(at: 300)
+        await fulfillment(of: [secondStarted], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale, "not while the remote may still be moving")
+        try? await Task.sleep(nanoseconds: 400_000_000)
+        XCTAssertTrue(model.scrubThumbnailIsStale, "the still for 10 s is not the preview of 300 s")
+        secondContinuation?.resume(returning: second)
+        await fulfillment(of: [secondShown], timeout: 2)
+        XCTAssertFalse(model.scrubThumbnailIsStale)
+    }
+
+    @MainActor
     func testFrameForAPassedTargetIsNotShownOnceTheRemoteRests() async {
         let defaults = ProfileSettings.current
         let previous = defaults.object(forKey: SettingsKey.seekPreviewEnabled)
