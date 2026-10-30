@@ -1551,13 +1551,24 @@ public final class HLSVideoEngine: @unchecked Sendable {
                           + "and the prefix it consumes is the producer's only pass)"
                 )
             } else {
-                let prewarmStart = DispatchTime.now()
-                let prewarmOK = dem.seekBounded(to: durationSeconds * 0.5, timeout: Self.cuePrewarmTimeout)
-                let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
-                if prewarmOK {
-                    EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", durationSeconds * 0.5))s took \(String(format: "%.1f", prewarmMs))ms")
+                let existingEntries = dem.indexedKeyframeEntries(streamIndex: videoIndex)
+                let existingKeyframes = existingEntries.map(\.pts)
+                if existingKeyframes.count >= 2, Self.keyframeIndexIsTrustworthy(
+                    keyframes: existingKeyframes,
+                    videoTimeBase: videoTimeBase,
+                    sourceDurationSeconds: durationSeconds
+                ) {
+                    EngineLog.emit("[HLSVideoEngine] cue prewarm: skipped; index already populated (\(existingKeyframes.count) keyframes)")
                 } else {
-                    EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index, index points past EOF or is absent); building plan from whatever keyframes were scanned")
+                    let prewarmStart = DispatchTime.now()
+                    let targetSeekSeconds = min(durationSeconds * 0.5, 2.0)
+                    let prewarmOK = dem.seekBounded(to: targetSeekSeconds, timeout: Self.cuePrewarmTimeout)
+                    let prewarmMs = Double(DispatchTime.now().uptimeNanoseconds - prewarmStart.uptimeNanoseconds) / 1_000_000
+                    if prewarmOK {
+                        EngineLog.emit("[HLSVideoEngine] cue prewarm: seek to \(String(format: "%.1f", targetSeekSeconds))s took \(String(format: "%.1f", prewarmMs))ms")
+                    } else {
+                        EngineLog.emit("[HLSVideoEngine] cue prewarm: capped at \(String(format: "%.1f", prewarmMs))ms (no usable Cues index, index points past EOF or is absent); building plan from whatever keyframes were scanned")
+                    }
                 }
             }
 

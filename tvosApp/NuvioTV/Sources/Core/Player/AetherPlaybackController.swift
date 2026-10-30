@@ -4783,6 +4783,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let isLive = request.isLiveStream || request.isSports
         let preferDualLayerDolbyVision = ProfileSettings.current.bool(forKey: SettingsKey.preferDualLayerDolbyVision)
+        // Bound find_stream_info probe budget for remote VOD streams (#68).
+        // The 50 MiB default reads over the network to completion for sparse attachments (fonts, cover art),
+        // adding ~6-8s of startup latency. Bounding to 15 MiB / 10s safely resolves all video/audio tracks
+        // while avoiding multi-chunk remote stall. Local SMB and Live IPTV retain the full engine defaults.
+        let isRemoteVOD = (isRemote || isLocalPlaybackCache || isUsenetStream) && !isLive
+        let probeBudgetBytes: Int64? = isRemoteVOD ? 15 * 1024 * 1024 : nil
+        let maxAnalyzeDurationMicroseconds: Int64? = isRemoteVOD ? 10 * 1_000_000 : nil
+
         let options = LoadOptions(
             httpHeaders: request.httpHeaders,
             discImageHint: PlaybackBackendPolicy.isDiscImage(
@@ -4804,6 +4812,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             prepareNativeSubtitles: false,
             maxConcurrentSourceRequests: isRemote || isUsenetStream ? 1 : nil,
             heldSourceConnection: isLocalPlaybackCache || isRemote || isUsenetStream,
+            probesize: probeBudgetBytes,
+            maxAnalyzeDuration: maxAnalyzeDurationMicroseconds,
             preferredAudioLanguages: request.preferredAudioLanguages,
             preferredSubtitleLanguages: request.preferredSubtitleLanguages,
             externalSubtitles: externalRegistration.tracks,

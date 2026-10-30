@@ -1588,6 +1588,11 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         stateLock.unlock()
     }
     private var _mediaFetchCount: UInt64 = 0
+    /// AE#418: tracks whether the consumer has placed its first media segment in this session.
+    /// Priming pre-seeds `cache.declareTarget(0)` (or startIndex) before any consumer request arrives,
+    /// which left `previousTarget == index` on the first fetch and caused `placesSegmentAnew` to treat
+    /// the session's first segment as an uncounted repeat, skipping initial timeline shift publication.
+    private var _hasPlacedInitialSegment: Bool = false
 
     /// The index the consumer is currently blocked on, and how often a pump has passed it without
     /// producing a segment (#358). Two folds mean a re-anchor already tried and rebuilt the same gap.
@@ -1661,6 +1666,10 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
     private func handleTargetChange(to index: Int) {
         stateLock.lock()
         _mediaFetchCount += 1
+        let isFirstPlacement = !_hasPlacedInitialSegment
+        if isFirstPlacement {
+            _hasPlacedInitialSegment = true
+        }
         stateLock.unlock()
         let previousTarget = cache.targetIndex
         cache.declareTarget(index)
@@ -1669,7 +1678,9 @@ final class VideoSegmentProvider: HLSSegmentProvider, @unchecked Sendable {
         // the axis its timeline already carries (measured with `play --picture-probe`). So a segment
         // whose content starts below its advertised start moves the axis by that much, every time it
         // is placed. A re-request of the same index is a retry of one placement, not a second one.
-        if Self.placesSegmentAnew(index: index, previousTarget: previousTarget) {
+        // Startup priming pre-seeds `targetIndex == index` before any fetch arrives; `isFirstPlacement`
+        // guarantees that the consumer's first fetch is always counted as a placement.
+        if isFirstPlacement || Self.placesSegmentAnew(index: index, previousTarget: previousTarget) {
             segmentPlacedHandler?(index)
         }
 
