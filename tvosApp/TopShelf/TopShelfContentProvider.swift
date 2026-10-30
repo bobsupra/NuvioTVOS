@@ -131,10 +131,9 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         if let trailer, let url = URL(string: trailer.url) {
             item.previewVideoURL = url
         }
-        // More Info opens the details page; Play resumes what can be resumed.
-        if let details = entry.detailsURL {
-            item.displayAction = TVTopShelfAction(url: details)
-        }
+        // One button, Play: it resumes what can be resumed (Continue Watching,
+        // Up Next) and opens the details page of everything else. A second
+        // button (More Info) appears only with a display action.
         if let play = entry.deepLinkURL {
             item.playAction = TVTopShelfAction(url: play)
         }
