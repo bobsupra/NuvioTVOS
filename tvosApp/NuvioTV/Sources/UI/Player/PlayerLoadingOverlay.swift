@@ -420,53 +420,62 @@ struct PlayerLoadingOverlay: View {
 
                 if torrentManager.isStreaming && !TorrentSettings.hideStats() {
                     let stats = torrentManager.activeStats
-                    HStack(spacing: 12) {
-                        HStack(spacing: 5) {
-                            Image(systemName: "arrow.down.circle.fill")
-                                .font(.system(size: 13))
-                                .foregroundColor(.green)
-                            Text(stats.downloadRateFormatted)
-                                .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                    VStack(spacing: 8) {
+                        HStack(spacing: 12) {
+                            HStack(spacing: 5) {
+                                Image(systemName: "arrow.down.circle.fill")
+                                    .font(.system(size: 13))
+                                    .foregroundColor(.green)
+                                Text(stats.downloadRateFormatted)
+                                    .font(.system(size: 14, weight: .semibold, design: .monospaced))
+                            }
+
+                            Text("•")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+
+                            HStack(spacing: 4) {
+                                Text("\(stats.connectedSeeds)")
+                                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.green)
+                                Text(L10n.string("player_torrent_seeds", fallback: "seeds"))
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.7))
+                            }
+
+                            Text("•")
+                                .font(.system(size: 11))
+                                .foregroundColor(.white.opacity(0.4))
+
+                            HStack(spacing: 4) {
+                                Text("\(stats.connectedPeers)")
+                                    .font(.system(size: 14, weight: .bold, design: .monospaced))
+                                    .foregroundColor(.blue)
+                                Text(L10n.string("player_torrent_peers", fallback: "peers"))
+                                    .font(.system(size: 12, weight: .medium))
+                                    .foregroundColor(.white.opacity(0.7))
+                            }
                         }
+                        .foregroundColor(.white)
+                        .padding(.horizontal, 14)
+                        .padding(.vertical, 5)
+                        .background(
+                            Capsule()
+                                .fill(Color.black.opacity(0.45))
+                                .overlay(
+                                    Capsule()
+                                        .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
+                                )
+                        )
+                        .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
 
-                        Text("•")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.4))
-
-                        HStack(spacing: 4) {
-                            Text("\(stats.connectedSeeds)")
-                                .font(.system(size: 14, weight: .bold, design: .monospaced))
-                                .foregroundColor(.green)
-                            Text(L10n.string("player_torrent_seeds", fallback: "seeds"))
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white.opacity(0.7))
-                        }
-
-                        Text("•")
-                            .font(.system(size: 11))
-                            .foregroundColor(.white.opacity(0.4))
-
-                        HStack(spacing: 4) {
-                            Text("\(stats.connectedPeers)")
-                                .font(.system(size: 14, weight: .bold, design: .monospaced))
-                                .foregroundColor(.blue)
-                            Text(L10n.string("player_torrent_peers", fallback: "peers"))
-                                .font(.system(size: 12, weight: .medium))
-                                .foregroundColor(.white.opacity(0.7))
+                        if let stage = torrentManager.startupStage, !stage.isEmpty {
+                            Text(stage)
+                                .font(.system(size: 14, weight: .medium, design: .monospaced))
+                                .foregroundColor(.white.opacity(0.65))
+                                .shadow(color: .black.opacity(0.6), radius: 4, y: 1)
                         }
                     }
-                    .foregroundColor(.white)
-                    .padding(.horizontal, 14)
-                    .padding(.vertical, 5)
-                    .background(
-                        Capsule()
-                            .fill(Color.black.opacity(0.45))
-                            .overlay(
-                                Capsule()
-                                    .strokeBorder(Color.white.opacity(0.18), lineWidth: 1)
-                            )
-                    )
-                    .shadow(color: .black.opacity(0.5), radius: 4, y: 1)
                 }
 
                 if showLoadingStatus && usenetManager.isStreaming && !TorrentSettings.hideStats() {

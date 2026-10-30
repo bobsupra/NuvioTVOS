@@ -75,6 +75,13 @@ extension PlayerView {
         if let diagnostic = viewModel.currentErrorDiagnostic {
             PlaybackErrorOverlayView(
                 diagnostic: diagnostic,
+                supportReport: PlaybackErrorSupportReport(
+                    httpStatusCode: diagnostic.httpStatusCode,
+                    engine: viewModel.activeEngineKind,
+                    appVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String,
+                    buildNumber: Bundle.main.object(forInfoDictionaryKey: "CFBundleVersion") as? String,
+                    renderedFirstFrame: viewModel.hasRenderedFirstFrame
+                ),
                 showSources: onRequestSources != nil || (diagnostic.isHostingIssue && (viewModel.availableSources.count > 1 || fetchPlaybackSources != nil)),
                 onSources: {
                     if let onRequestSources {
@@ -139,6 +146,7 @@ extension PlayerView {
 
 struct PlaybackErrorOverlayView: View {
     let diagnostic: PlaybackErrorDiagnostic
+    let supportReport: PlaybackErrorSupportReport?
     let showSources: Bool
     let onSources: () -> Void
     let onRetry: () -> Void
@@ -174,6 +182,31 @@ struct PlaybackErrorOverlayView: View {
                     .multilineTextAlignment(.center)
                     .lineSpacing(3)
                     .frame(maxWidth: 620)
+            }
+
+            if let supportReport {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("SUPPORT DETAILS")
+                        .font(.system(size: 12, weight: .bold))
+                        .foregroundColor(Color.white.opacity(0.65))
+
+                    Text(supportReport.statusLine)
+                        .font(.system(size: 16, weight: .semibold))
+                        .foregroundColor(.white)
+
+                    Text(supportReport.playbackLine)
+                        .font(.system(size: 14, weight: .regular))
+                        .foregroundColor(Color.white.opacity(0.82))
+
+                    Text(supportReport.sharingPrompt)
+                        .font(.system(size: 13, weight: .regular))
+                        .foregroundColor(Color.white.opacity(0.68))
+                }
+                .frame(maxWidth: 620, alignment: .leading)
+                .padding(.horizontal, 18)
+                .padding(.vertical, 12)
+                .background(Color.white.opacity(0.08), in: RoundedRectangle(cornerRadius: 16))
+                .accessibilityElement(children: .combine)
             }
 
             // Action Buttons
@@ -272,6 +305,7 @@ struct PlaybackErrorOverlayView: View {
     @ViewBuilder
     var debugOverlayLayer: some View {
         if viewModel.isPlaybackDebugHUDVisible,
+           viewModel.currentErrorDiagnostic?.httpStatusCode != 403,
            let info = viewModel.playbackDebugInfo {
             PlaybackDebugHUDView(
                 info: info,

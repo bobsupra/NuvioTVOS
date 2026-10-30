@@ -83,6 +83,12 @@ struct PlaybackDebugHUDView: View {
                 if !hideTorrentStats && TorrentEngineManager.shared.isStreaming {
                     let stats = TorrentEngineManager.shared.activeStats
                     hudRow(label: "P2P Swarm", value: "\(stats.connectedSeeds) seeds · \(stats.connectedPeers) peers · \(stats.downloadRateFormatted)")
+                    if let diag = TorrentEngineManager.shared.activeDiagnostics {
+                        hudRow(label: "P2P Net", value: "DHT: \(diag.dhtNodes) nodes · Peers: \(diag.listPeers) · Fails: \(diag.connectFailures)")
+                        if !diag.lastPeerSource.isEmpty {
+                            hudRow(label: "Last Tracker", value: diag.lastPeerSource)
+                        }
+                    }
                 }
                 if !hideTorrentStats && UsenetEngineManager.shared.isStreaming {
                     let usenet = UsenetEngineManager.shared.activeStats

@@ -372,6 +372,10 @@ class PlayerViewModel: ObservableObject {
     private var nextEpisodeAutoHideDeadline: Date?
     private var nextEpisodeAutoPlayDeadline: Date?
     private var watchPartySuspendedAutoPlayWasCancelled: Bool?
+    private var preResolvedNextEpisodeTask: Task<PreparedNextStream?, Never>?
+    private var preResolvedNextEpisodeId: String?
+    private var preResolvedNextStream: PreparedNextStream?
+    private var preResolvedStreamWarmToken: UUID?
     /// While a next-episode resolver is outstanding, engine polls still describe
     /// the previous episode and must not mark that old frame as the new load.
     private var pendingAdvanceResolutionGeneration: UInt64?
@@ -384,6 +388,9 @@ class PlayerViewModel: ObservableObject {
     private static let nextEpisodeAutoHideSeconds = 10
     /// Same lead-in used by skip-segment detection so both cards arm together.
     private static let skipSegmentStartLead: Double = 0.35
+    /// Start pre-resolving the next stream ahead of the prompt appearing (60s earlier),
+    /// so by the time the "Next Episode" card appears on screen, sources and range probes are already primed.
+    private static let nextEpisodePreResolveLeadSeconds: Double = 60.0
 
     /// Owns Aether (default) and the one-way MPV compatibility fallback.
     var sessionCoordinator: PlaybackSessionCoordinator
@@ -996,6 +1003,10 @@ class PlayerViewModel: ObservableObject {
         trickplayResolveTask?.cancel()
         subtitleFetchTask?.cancel()
         scrubThumbnailTask?.cancel()
+        preResolvedNextEpisodeTask?.cancel()
+        if let token = preResolvedStreamWarmToken {
+            PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
+        }
         Task { @MainActor in
             poll?.invalidate()
             hide?.invalidate()
@@ -1575,6 +1586,7 @@ class PlayerViewModel: ObservableObject {
         self.autoSkippedIntervalIds = []
         self.skipSegmentAutoHideDeadline = nil
         self.showNextEpisodeCard = false
+        cancelPreResolvedNextEpisode()
         self.nextEpisodeCountdown = nil
         self.autoHiddenNextEpisodeCard = false
         self.nextEpisodeAutoHideDeadline = nil
@@ -1960,7 +1972,7 @@ class PlayerViewModel: ObservableObject {
     /// IntroDB has an outro) and auto-hides it like the Skip Intro card.
     private func updateNextEpisodeState() {
         guard allowsManualEpisodeSelection,
-              let _ = nextEpisode,
+              let next = nextEpisode,
               !isStandalonePlaybackSession,
               !isAdvanceInFlight,
               !isAdvancingEpisode,
@@ -1975,6 +1987,10 @@ class PlayerViewModel: ObservableObject {
               sidePanel == nil else {
             clearNextEpisodeCard()
             return
+        }
+
+        if shouldPreResolveNextEpisodeStream {
+            preResolveNextEpisodeStreamIfNeeded(for: next)
         }
 
         guard shouldPresentNextEpisodeCard else {
@@ -2018,6 +2034,25 @@ class PlayerViewModel: ObservableObject {
 
     }
 
+    /// Start resolving the next episode's stream and warming probe caches ahead of the prompt,
+    /// so the stream is already prepared if the user clicks Next Episode immediately.
+    private var shouldPreResolveNextEpisodeStream: Bool {
+        guard !postPlayState.isVisible,
+              hasRenderedFirstFrame,
+              !isAdvanceInFlight,
+              !isAdvancingEpisode,
+              !isAwaitingStreamStart,
+              time.duration >= 60,
+              time.remaining > 0,
+              time.current / time.duration >= 0.5 else {
+            return false
+        }
+        if let ending = skipIntervals.first(where: \.isEnding) {
+            return time.current >= max(ending.startTime - Self.skipSegmentStartLead - Self.nextEpisodePreResolveLeadSeconds, 0)
+        }
+        return time.remaining <= (Self.nextCardLeadSeconds + Self.nextEpisodePreResolveLeadSeconds)
+    }
+
     /// Prefer IntroDB ending start so Next Episode and Skip Ending appear together.
     /// Without an ending marker, fall back to the fixed lead-before-end window.
     private var shouldPresentNextEpisodeCard: Bool {
@@ -2047,6 +2082,58 @@ class PlayerViewModel: ObservableObject {
         autoHiddenNextEpisodeCard = false
         nextEpisodeAutoHideDeadline = nil
         nextEpisodeAutoPlayDeadline = nil
+    }
+
+    private func preResolveNextEpisodeStreamIfNeeded(for next: NuvioVideo) {
+        guard allowsManualEpisodeSelection,
+              !isStandalonePlaybackSession,
+              !isAdvanceInFlight,
+              !isAdvancingEpisode,
+              !isAwaitingStreamStart,
+              currentEpisodeVideo?.id != next.id,
+              lastAdvancedEpisodeId != next.id,
+              (EpisodeReleasePolicy.hasAired(next.released) || EpisodeReleasePolicy.isAiringToday(next.released)),
+              let resolver = resolveNextStream else { return }
+
+        guard preResolvedNextEpisodeId != next.id, preResolvedNextEpisodeTask == nil else { return }
+
+        let episodeId = next.id
+        preResolvedNextEpisodeId = episodeId
+        preResolvedNextStream = nil
+
+        preResolvedNextEpisodeTask = Task { @MainActor [weak self] in
+            guard let self else { return nil }
+            let prepared = await resolver(next, nil)
+            guard !Task.isCancelled,
+                  self.preResolvedNextEpisodeId == episodeId,
+                  self.nextEpisode?.id == episodeId else {
+                return nil
+            }
+            self.preResolvedNextStream = prepared
+            if let prepared {
+                let token = UUID()
+                self.preResolvedStreamWarmToken = token
+                let profileID = ProfileSettings.activeProfileID ?? ""
+                _ = await PlaybackStreamCacheManager.shared.warmRangeProbeMemo(
+                    url: prepared.url,
+                    headers: prepared.httpHeaders,
+                    profileID: profileID,
+                    token: token
+                )
+            }
+            return prepared
+        }
+    }
+
+    private func cancelPreResolvedNextEpisode() {
+        preResolvedNextEpisodeTask?.cancel()
+        preResolvedNextEpisodeTask = nil
+        preResolvedNextStream = nil
+        preResolvedNextEpisodeId = nil
+        if let token = preResolvedStreamWarmToken {
+            preResolvedStreamWarmToken = nil
+            PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
+        }
     }
 
     /// Stop autoplay UI/resolution after the current player is adopted into a room.
@@ -2346,7 +2433,7 @@ class PlayerViewModel: ObservableObject {
               let next = nextEpisode,
               currentEpisodeVideo?.id != next.id,
               lastAdvancedEpisodeId != next.id,
-              EpisodeReleasePolicy.hasAired(next.released),
+              (EpisodeReleasePolicy.hasAired(next.released) || EpisodeReleasePolicy.isAiringToday(next.released)),
               let resolver = resolveNextStream else { return }
         lastAdvancedEpisodeId = next.id
         advanceGeneration &+= 1
@@ -2369,6 +2456,9 @@ class PlayerViewModel: ObservableObject {
         // Pause/stop active playback so the finishing episode doesn't produce
         // lingering playback phase or EOF events while resolving the next stream.
         engine.pausePlayback()
+
+        let preResolved = (preResolvedNextEpisodeId == next.id) ? preResolvedNextStream : nil
+        let inFlightResolution = (preResolvedNextEpisodeId == next.id) ? preResolvedNextEpisodeTask : nil
 
         // Mark the finishing episode watched. With Trakt selected its scrobble
         // history produces the remote Next Up entry; Nuvio Sync keeps the
@@ -2397,7 +2487,18 @@ class PlayerViewModel: ObservableObject {
                 self.cancelStartupBenchmark(token: startupToken)
                 return
             }
-            let prepared = await resolver(next, startupToken)
+            let prepared: PreparedNextStream?
+            if let preResolved {
+                prepared = preResolved
+            } else if let inFlightResolution {
+                if let resolved = await inFlightResolution.value {
+                    prepared = resolved
+                } else {
+                    prepared = await resolver(next, startupToken)
+                }
+            } else {
+                prepared = await resolver(next, startupToken)
+            }
             guard !Task.isCancelled,
                   self.advanceGeneration == gen,
                   self.pendingAdvanceResolutionGeneration == gen,
@@ -2451,6 +2552,7 @@ class PlayerViewModel: ObservableObject {
     }
 
     private func cancelPendingAdvanceResolution() {
+        cancelPreResolvedNextEpisode()
         guard let generation = pendingAdvanceResolutionGeneration else { return }
         _ = clearPendingAdvanceResolution(generation: generation)
         if advanceGeneration == generation { advanceGeneration &+= 1 }
@@ -2516,6 +2618,7 @@ class PlayerViewModel: ObservableObject {
             )
         }
         clearNextEpisodeCard()
+        cancelPreResolvedNextEpisode()
         isReloadingStream = false
         isSwitchingSource = false
         showControls = false
@@ -7835,17 +7938,16 @@ class PlayerViewModel: ObservableObject {
     // MARK: - Expired-link / replacement-stream detection
 
     /// True when the file mpv actually opened can't be the title we set out to
-    /// play. Stream hosts answer an expired link with a short "slate" clip that
-    /// decodes cleanly (no mpv error), so the only tell is its length: it is far
-    /// shorter than the content we meant to resume. Judged against the duration
-    /// we expected (prior Continue Watching entry or metadata runtime) and the
-    /// resume point — you can't be 40 min into a 2 min file.
+    /// play. Stream hosts can answer an expired link with a short "slate" clip
+    /// that decodes cleanly (no mpv error), so compare its length with the
+    /// expected title duration and resume point — you can't be 40 min into a
+    /// 2 min file. A short duration alone is not enough to identify a slate.
     static func streamLooksLikeReplacement(
         loadedDuration: Double,
         pendingResumeSeconds: Double?,
         expectedDurationSeconds: Double?,
         isStandalonePlaybackSession: Bool,
-        isLiveStream: Bool
+        isLiveStream _: Bool
     ) -> Bool {
         guard !isStandalonePlaybackSession, loadedDuration > 0 else { return false }
         if let resume = pendingResumeSeconds, resume > loadedDuration + 60 {
@@ -7854,7 +7956,7 @@ class PlayerViewModel: ObservableObject {
         if let expected = expectedDurationSeconds, expected >= 60, loadedDuration < expected * 0.5 {
             return true
         }
-        return !isLiveStream && loadedDuration < 180
+        return false
     }
 
     private func loadedStreamLooksLikeReplacement() -> Bool {

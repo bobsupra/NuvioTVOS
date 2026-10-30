@@ -301,7 +301,8 @@ extension PlayerView {
 
     @ViewBuilder
     var playerToastLayer: some View {
-        if let toast = viewModel.playerToast {
+        if viewModel.currentErrorDiagnostic?.httpStatusCode != 403,
+           let toast = viewModel.playerToast {
             let hasAvatar = toast.avatarURL != nil || toast.initials != nil
             VStack {
                 HStack(spacing: 12) {

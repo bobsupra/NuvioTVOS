@@ -174,6 +174,16 @@ struct SwarmStats: Sendable {
     }
 }
 
+struct TorrentSwarmDiagnostics: Sendable {
+    var dhtNodes: Int = 0
+    var connectCandidates: Int = 0
+    var listPeers: Int = 0
+    var outgoingAttempts: Int64 = 0
+    var connectFailures: Int64 = 0
+    var lastPeerSource: String = ""
+    var disconnectSummary: String = ""
+}
+
 enum TorrentEngineError: LocalizedError {
     case failedToStart
     case metadataTimeout

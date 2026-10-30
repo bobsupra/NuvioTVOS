@@ -39,6 +39,7 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
         XCTAssertFalse(diag.message.localizedCaseInsensitiveContains("expired"))
         XCTAssertTrue(diag.technicalDetails?.contains("Status: HTTP 403 (Forbidden)") == true)
         XCTAssertTrue(diag.technicalDetails?.contains(rawError) == true)
+        XCTAssertEqual(diag.httpStatusCode, 403)
     }
 
     func testHttp401Remains401() {
@@ -52,6 +53,8 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
         XCTAssertTrue(diag.message.contains("HTTP 401 (Unauthorized)"))
         XCTAssertFalse(diag.message.contains("HTTP 403"))
         XCTAssertTrue(diag.technicalDetails?.contains("Status: HTTP 401 (Unauthorized)") == true)
+        XCTAssertEqual(diag.httpStatusCode, 401)
+        XCTAssertNil(makeSupportReport(for: diag))
     }
 
     func testRecognizesExplicitHttp403FormsInNestedErrors() {
@@ -73,6 +76,7 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
             )
             XCTAssertEqual(diag.badgeText, "STREAM ACCESS DENIED", rawError)
             XCTAssertTrue(diag.message.contains("HTTP 403 (Forbidden)"), rawError)
+            XCTAssertEqual(diag.httpStatusCode, 403, rawError)
             XCTAssertTrue(diag.technicalDetails?.contains(rawError) == true, rawError)
         }
     }
@@ -100,7 +104,44 @@ final class PlaybackErrorDiagnosticTests: XCTestCase {
             let diag = PlaybackErrorDiagnostic.analyze(errorMessage: rawError, streamURL: streamURL)
             XCTAssertNotEqual(diag.title, "Stream Access Denied", rawError)
             XCTAssertNotEqual(diag.badgeText, "STREAM ACCESS DENIED", rawError)
+            XCTAssertNil(diag.httpStatusCode, rawError)
+            XCTAssertNil(makeSupportReport(for: diag), rawError)
         }
+    }
+
+    func testHttp403SupportReportContainsOnlyAllowlistedContext() throws {
+        let rawError = "HTTP 403 Forbidden: https://user:password@private.example/video?token=secret-token"
+        let streamURL = URL(string: "https://user:password@private.example/video?token=secret-token")!
+        let diagnostic = PlaybackErrorDiagnostic.analyze(errorMessage: rawError, streamURL: streamURL)
+        let report = try XCTUnwrap(makeSupportReport(for: diagnostic))
+        let screenshotText = [
+            diagnostic.badgeText,
+            diagnostic.title,
+            diagnostic.message,
+            report.statusLine,
+            report.playbackLine,
+            report.sharingPrompt
+        ].joined(separator: "\n")
+
+        XCTAssertTrue(screenshotText.contains("HTTP 403"))
+        XCTAssertTrue(screenshotText.contains("AetherEngine"))
+        XCTAssertTrue(screenshotText.contains("App 3.4.4 (Build 75)"))
+        XCTAssertTrue(screenshotText.contains("First frame rendered this session: No"))
+        XCTAssertTrue(screenshotText.contains("Photograph this screen and send it to support."))
+
+        for privateValue in ["user", "password", "private.example", "secret-token", "https://", rawError] {
+            XCTAssertFalse(screenshotText.localizedCaseInsensitiveContains(privateValue), "Report exposed \(privateValue)")
+        }
+    }
+
+    private func makeSupportReport(for diagnostic: PlaybackErrorDiagnostic) -> PlaybackErrorSupportReport? {
+        PlaybackErrorSupportReport(
+            httpStatusCode: diagnostic.httpStatusCode,
+            engine: .aether,
+            appVersion: "3.4.4",
+            buildNumber: "75",
+            renderedFirstFrame: false
+        )
     }
 
     func testRateLimitedHttp429() {

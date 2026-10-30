@@ -3303,7 +3303,7 @@ final class PlaybackCompletionTrackerTests: XCTestCase {
         makeModel(meta: live, subtitle: "", duration: 1_200).saveProgress(force: true)
         XCTAssertEqual(WatchedStore.watchCount(meta: live), 0)
 
-        let replacement = NuvioMeta(id: "replacement-slate", name: "Slate", type: "movie")
+        let replacement = NuvioMeta(id: "replacement-slate", name: "Slate", type: "movie", runtime: "120 min")
         makeModel(meta: replacement, subtitle: "", duration: 120).saveProgress(force: true)
         XCTAssertEqual(WatchedStore.watchCount(meta: replacement), 0)
     }

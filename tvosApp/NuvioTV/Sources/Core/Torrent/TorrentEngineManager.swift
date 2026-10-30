@@ -7,6 +7,8 @@ final class TorrentEngineManager: ObservableObject {
     static let shared = TorrentEngineManager()
 
     @Published private(set) var activeStats = SwarmStats()
+    @Published private(set) var activeDiagnostics: TorrentSwarmDiagnostics?
+    @Published private(set) var startupStage: String?
     @Published private(set) var isStreaming = false
     @Published private(set) var currentInfoHash: String?
 
@@ -38,6 +40,8 @@ final class TorrentEngineManager: ObservableObject {
         currentInfoHash = infoHash
         isStreaming = true
         activeStats = SwarmStats()
+        activeDiagnostics = nil
+        startupStage = "Initializing torrent engine..."
 
         do {
             let (session, streamURL) = try await TorrentSession.start(
@@ -45,7 +49,13 @@ final class TorrentEngineManager: ObservableObject {
                 fileIdx: fileIdx,
                 trackers: trackers,
                 timeout: timeout,
-                filename: filename
+                filename: filename,
+                onStatusUpdate: { [weak self] stage in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.startGeneration == generation else { return }
+                        self.startupStage = stage
+                    }
+                }
             )
             guard generation == startGeneration, !Task.isCancelled else {
                 await session.stop()
@@ -53,6 +63,7 @@ final class TorrentEngineManager: ObservableObject {
             }
             self.activeSession = session
             self.activeStreamURL = streamURL
+            self.startupStage = "Buffering stream..."
 
             // Start polling stats
             startStatsPolling(for: session)
@@ -84,6 +95,8 @@ final class TorrentEngineManager: ObservableObject {
         isStreaming = false
         currentInfoHash = nil
         activeStats = SwarmStats()
+        activeDiagnostics = nil
+        startupStage = nil
 
         if let session {
             await session.stop()
@@ -97,9 +110,11 @@ final class TorrentEngineManager: ObservableObject {
                 guard let self else { return }
                 Task {
                     let stats = await session.currentStats()
+                    let diags = await session.currentDiagnostics()
                     await MainActor.run {
                         guard self.activeSession === session else { return }
                         self.activeStats = stats
+                        self.activeDiagnostics = diags
                     }
                 }
             }

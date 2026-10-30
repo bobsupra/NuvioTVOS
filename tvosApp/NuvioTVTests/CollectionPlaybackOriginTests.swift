@@ -162,4 +162,97 @@ final class CollectionPlaybackOriginTests: XCTestCase {
             XCTAssertNil(decoded.collectionContext)
         }
     }
+
+    // MARK: - Collection GIF Hardware Acceleration & Timing Tests
+
+    func testAnimatedGIFCacheGCDAndFrameExpansion() {
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(10, 20), 10)
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(15, 25), 5)
+        XCTAssertEqual(AnimatedGIFCache.greatestCommonDivisor(7, 13), 1)
+
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 10, height: 10))
+        let img1 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.red.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 10, height: 10)) }
+        let img2 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.blue.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 10, height: 10)) }
+
+        let frames = [
+            (image: img1, delayCentiseconds: 10),
+            (image: img2, delayCentiseconds: 20)
+        ]
+
+        let expanded = AnimatedGIFCache.expandFrames(frames: frames)
+        XCTAssertNotNil(expanded)
+        XCTAssertEqual(expanded?.images.count, 3) // 1 img1 + 2 img2
+        XCTAssertEqual(expanded?.duration ?? 0, 0.30, accuracy: 0.001)
+
+        let metrics = AnimatedGIFCache.telemetryMetrics()
+        XCTAssertGreaterThanOrEqual(metrics.maxCost, 0)
+    }
+
+    func testDecodedAnimatedImageKeyframeAnimationAttributes() {
+        let renderer = UIGraphicsImageRenderer(size: CGSize(width: 20, height: 20))
+        let img1 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.red.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        let img2 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.green.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+        let img3 = renderer.image { ctx in ctx.cgContext.setFillColor(UIColor.blue.cgColor); ctx.fill(CGRect(x: 0, y: 0, width: 20, height: 20)) }
+
+        guard let cg1 = img1.cgImage, let cg2 = img2.cgImage, let cg3 = img3.cgImage else {
+            XCTFail("Failed to obtain CGImage from test images")
+            return
+        }
+
+        let keyTimes: [NSNumber] = [0.0, 0.25, 0.75]
+        let decoded = DecodedAnimatedImage(
+            animatedImage: img1,
+            firstFrame: img1,
+            frameCount: 3,
+            duration: 0.40,
+            totalByteCost: 4096,
+            cgFrames: [cg1, cg2, cg3],
+            keyTimes: keyTimes
+        )
+
+        XCTAssertTrue(decoded.isAnimated)
+        XCTAssertEqual(decoded.frameCount, 3)
+        XCTAssertEqual(decoded.duration, 0.40, accuracy: 0.001)
+        XCTAssertEqual(decoded.cgFrames.count, 3)
+        XCTAssertEqual(decoded.keyTimes, keyTimes)
+
+        let animation = decoded.makeKeyframeAnimation()
+        XCTAssertEqual(animation.keyPath, "contents")
+        XCTAssertEqual(animation.calculationMode, .discrete)
+        XCTAssertEqual(animation.repeatCount, .infinity)
+        XCTAssertFalse(animation.isRemovedOnCompletion)
+        XCTAssertEqual(animation.duration, 0.40, accuracy: 0.001)
+        XCTAssertEqual((animation.values as? [CGImage])?.count, 3)
+        XCTAssertEqual(animation.keyTimes, keyTimes)
+    }
+
+    func testCollectionFolderEffectiveCoverImageSelection() throws {
+        // When focusGifEnabled is true, coverImageUrl is authoritative for the static tile
+        let folderWithGifFocus: [String: Any] = [
+            "id": "netflix",
+            "title": "Netflix",
+            "coverImageUrl": "https://example.com/netflix_static.png",
+            "focusGifUrl": "https://example.com/netflix_animated.gif",
+            "focusGifEnabled": true,
+            "sources": []
+        ]
+        let data1 = try JSONSerialization.data(withJSONObject: folderWithGifFocus)
+        let decoded1 = try JSONDecoder().decode(NuvioCollectionFolder.self, from: data1)
+        let item1 = TVCollectionFolderItem(collectionId: "c", folder: decoded1, sources: [])
+        XCTAssertEqual(item1.activeFocusGifURLString, "https://example.com/netflix_animated.gif")
+
+        // When focusGifEnabled is false, focusGifUrl acts as regular poster (priority over cover image)
+        let folderWithGifAsPoster: [String: Any] = [
+            "id": "anime",
+            "title": "Anime",
+            "coverImageUrl": "https://example.com/anime_static.png",
+            "focusGifUrl": "https://example.com/anime_poster.gif",
+            "focusGifEnabled": false,
+            "sources": []
+        ]
+        let data2 = try JSONSerialization.data(withJSONObject: folderWithGifAsPoster)
+        let decoded2 = try JSONDecoder().decode(NuvioCollectionFolder.self, from: data2)
+        let item2 = TVCollectionFolderItem(collectionId: "c", folder: decoded2, sources: [])
+        XCTAssertNil(item2.activeFocusGifURLString)
+    }
 }

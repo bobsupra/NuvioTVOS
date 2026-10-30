@@ -27,6 +27,29 @@ struct PlaybackErrorDiagnostic: Equatable {
     let suggestedAction: String
     let technicalDetails: String?
     let host: String?
+    let httpStatusCode: Int?
+
+    init(
+        origin: PlaybackErrorOrigin,
+        badgeText: String,
+        badgeIconName: String,
+        title: String,
+        message: String,
+        suggestedAction: String,
+        technicalDetails: String?,
+        host: String?,
+        httpStatusCode: Int? = nil
+    ) {
+        self.origin = origin
+        self.badgeText = badgeText
+        self.badgeIconName = badgeIconName
+        self.title = title
+        self.message = message
+        self.suggestedAction = suggestedAction
+        self.technicalDetails = technicalDetails
+        self.host = host
+        self.httpStatusCode = httpStatusCode
+    }
 
     var isHostingIssue: Bool {
         origin == .hostingProvider
@@ -140,7 +163,8 @@ struct PlaybackErrorDiagnostic: Equatable {
                     statusName: statusName,
                     raw: rawError
                 ),
-                host: host
+                host: host,
+                httpStatusCode: status
             )
         }
 
@@ -363,5 +387,57 @@ struct PlaybackErrorDiagnostic: Equatable {
             }
         }
         return parts.joined(separator: " • ")
+    }
+}
+
+/// Screenshot-friendly context built only from explicitly allowlisted values.
+/// It intentionally has no fields for source URLs, hosts, error text, or logs.
+struct PlaybackErrorSupportReport: Equatable {
+    let httpStatusCode: Int
+    let engine: PlayerEngineKind
+    let appVersion: String
+    let buildNumber: String
+    let renderedFirstFrame: Bool
+
+    init?(
+        httpStatusCode: Int?,
+        engine: PlayerEngineKind,
+        appVersion: String?,
+        buildNumber: String?,
+        renderedFirstFrame: Bool
+    ) {
+        guard httpStatusCode == 403 else { return nil }
+        self.httpStatusCode = 403
+        self.engine = engine
+        self.appVersion = Self.safeIdentifier(appVersion)
+        self.buildNumber = Self.safeIdentifier(buildNumber)
+        self.renderedFirstFrame = renderedFirstFrame
+    }
+
+    var statusLine: String {
+        "HTTP \(httpStatusCode) • \(engineName) • App \(appVersion) (Build \(buildNumber))"
+    }
+
+    var playbackLine: String {
+        "First frame rendered this session: \(renderedFirstFrame ? "Yes" : "No")"
+    }
+
+    let sharingPrompt = "Photograph this screen and send it to support."
+
+    private var engineName: String {
+        switch engine {
+        case .aether: return "AetherEngine"
+        case .mpv: return "MPVKit"
+        }
+    }
+
+    private static func safeIdentifier(_ value: String?) -> String {
+        guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !value.isEmpty,
+              value.count <= 24,
+              value.range(of: #"^[A-Za-z0-9][A-Za-z0-9._-]*$"#, options: .regularExpression) != nil else {
+            return "unknown"
+        }
+        return value
     }
 }

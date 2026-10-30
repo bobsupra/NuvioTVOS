@@ -8346,6 +8346,8 @@ private struct TvStreamPickerOverlay: View {
     @State private var ratingOrderRevision: UInt64 = 0
     @State private var showingP2PConsent = false
     @State private var pendingTorrentSelection: (stream: NuvioStream, player: ExternalPlayer?)? = nil
+    @State private var focusedStreamWarmTask: Task<Void, Never>? = nil
+    @State private var focusedStreamWarmToken: UUID? = nil
 
 
     private let filterAllKey = "filter::all"
@@ -8505,6 +8507,28 @@ private struct TvStreamPickerOverlay: View {
                 if let newValue, newValue != filterAllKey, !didSeedStreamFocus {
                     didSeedStreamFocus = true
                 }
+                focusedStreamWarmTask?.cancel()
+                if let streamId = newValue,
+                   !streamId.hasPrefix("filter::"),
+                   let stream = streams.first(where: { $0.id == streamId }),
+                   let raw = stream.directURL,
+                   let url = URL(string: raw),
+                   ["http", "https"].contains(url.scheme?.lowercased() ?? "") {
+                    let token = UUID()
+                    focusedStreamWarmToken = token
+                    let profileID = pickerProfileID ?? ProfileSettings.activeProfileID ?? ""
+                    let headers = stream.httpHeaders ?? [:]
+                    focusedStreamWarmTask = Task { @MainActor in
+                        try? await Task.sleep(nanoseconds: 300_000_000)
+                        guard !Task.isCancelled else { return }
+                        _ = await PlaybackStreamCacheManager.shared.warmRangeProbeMemo(
+                            url: url,
+                            headers: headers,
+                            profileID: profileID,
+                            token: token
+                        )
+                    }
+                }
                 guard newValue == nil else { return }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.2) {
                     if focusedItem == nil {
@@ -8517,7 +8541,15 @@ private struct TvStreamPickerOverlay: View {
                 streamBadgeSettings = StreamBadgeSettingsStore.snapshot
                 streamBadgeSettingsRevision &+= 1
             }
-            .onDisappear { pickerIsVisible = false }
+            .onDisappear {
+                pickerIsVisible = false
+                focusedStreamWarmTask?.cancel()
+                focusedStreamWarmTask = nil
+                if let token = focusedStreamWarmToken {
+                    PlaybackStreamCacheManager.discardRangeProbeMemo(token: token)
+                    focusedStreamWarmToken = nil
+                }
+            }
             .onExitCommand(perform: onDismiss)
         }
         .background(Color.black.ignoresSafeArea())
@@ -8942,6 +8974,15 @@ private struct TvStreamPickerOverlay: View {
                     Text(L10n.string("details_preparing_stream", fallback: "Preparing stream"))
                         .font(.system(size: 30, weight: .semibold))
                         .foregroundColor(.white.opacity(0.74))
+
+                    if TorrentEngineManager.shared.isStreaming,
+                       let stage = TorrentEngineManager.shared.startupStage {
+                        Text(stage)
+                            .font(.system(size: 18, weight: .medium, design: .monospaced))
+                            .foregroundColor(.white.opacity(0.65))
+                            .multilineTextAlignment(.center)
+                            .padding(.horizontal, 40)
+                    }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .background(Color.black.opacity(0.55))

@@ -175,7 +175,12 @@ actor TorrentStreamServer {
         let tailStartPiece = Int(max(fileOffset, fileEnd + 1 - tailBytes) / pieceLength)
         let headDone = (firstPiece...max(firstPiece, headEnd)).allSatisfy { engine.hasPiece($0) }
         let tailDone = (min(tailStartPiece, lastPiece)...lastPiece).allSatisfy { engine.hasPiece($0) }
-        if headDone && tailDone { return true }
+        if headDone && tailDone {
+            torrentLog.notice("[Watchdog:Prebuffer:Ready] Head and tail pieces verified on disk.")
+            return true
+        }
+        let stats = engine.stats()
+        torrentLog.notice("[Watchdog:Prebuffer] Head done: \(headDone), Tail done: \(tailDone) | Swarm: \(stats.numSeeds) seeds, \(stats.numPeers) peers, \(String(format: "%.1f", stats.downloadRate / 1024)) KB/s")
         primeHeadAndTail()
         if lastPlayhead >= 0 { updatePlayhead(absoluteOffset: lastPlayhead) }
         return false
@@ -288,6 +293,7 @@ actor TorrentStreamServer {
             status = "206 Partial Content"
             headers["Content-Range"] = "bytes \(rangeStart)-\(rangeEnd)/\(fileLength)"
         }
+        torrentLog.notice("[Watchdog:HTTP:Request] \(method) \(requestedPath) range=\(isRange ? "\(rangeStart)-\(rangeEnd)" : "full")")
         try await sendHead(connection, status, headers)
         guard method != "HEAD" else { return true }
 
@@ -312,14 +318,39 @@ actor TorrentStreamServer {
 
     private func streamBody(_ connection: NWConnection, from start: Int64, to end: Int64, generation: Int?) async throws {
         var position = start
+        let requestStart = Date()
+        torrentLog.notice("[Watchdog:HTTP:StreamStart] Player reading range \(start)-\(end) (\((end - start + 1) / 1024) KB)")
         while position <= end {
             try Task.checkCancellation()
             if let generation, generation != playbackGeneration { return }
             let absolute = fileOffset + position
             let pieceIndex = Int(absolute / pieceLength)
 
+            let waitStart = Date()
+            let hadPiece = engine.hasPiece(pieceIndex)
+            if !hadPiece {
+                torrentLog.notice("[Watchdog:Stream:PieceWait] Waiting for piece #\(pieceIndex) (offset \(absolute))...")
+            }
+
+            let stallWatchdog = Task { [engine] in
+                var waitSec = 0
+                while !Task.isCancelled {
+                    try? await Task.sleep(nanoseconds: 2_000_000_000)
+                    if Task.isCancelled { break }
+                    waitSec += 2
+                    let stats = engine.stats()
+                    torrentLog.warning("[Watchdog:Stream:Stall] Still waiting for piece #\(pieceIndex) (\(waitSec)s). Swarm: \(stats.numSeeds) seeds, \(stats.numPeers) peers, \(String(format: "%.1f", stats.downloadRate / 1024)) KB/s")
+                }
+            }
+
             await waiters.wait(pieceIndex) { [engine] piece in engine.hasPiece(piece) }
+            stallWatchdog.cancel()
             guard engine.hasPiece(pieceIndex) else { throw CancellationError() }
+
+            let waitDuration = Date().timeIntervalSince(waitStart)
+            if !hadPiece || waitDuration >= 1.0 {
+                torrentLog.notice("[Watchdog:Stream:PieceReady] Piece #\(pieceIndex) delivered after \(String(format: "%.2f", waitDuration))s.")
+            }
 
             let pieceStart = Int64(pieceIndex) * pieceLength
             let pieceEnd = pieceStart + pieceLength
@@ -334,6 +365,8 @@ actor TorrentStreamServer {
                 updatePlayhead(absoluteOffset: fileOffset + position)
             }
         }
+        let totalTime = Date().timeIntervalSince(requestStart)
+        torrentLog.notice("[Watchdog:HTTP:StreamEnd] Finished range in \(String(format: "%.2f", totalTime))s.")
     }
 
     private func readChunk(piece: Int, offsetInPiece: Int, length: Int, absoluteOffset: Int64) async throws -> Data {
