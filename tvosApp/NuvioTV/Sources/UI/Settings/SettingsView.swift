@@ -3968,19 +3968,19 @@ private struct TopShelfSettingsGroup: View {
                     fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
                 )
             ) {
-                CollectionChipButton(
+                TopShelfChipButton(
                     title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
                     isSelected: configuration.includesContinueWatching
                 ) { update { $0.includesContinueWatching.toggle() } }
-                CollectionChipButton(
+                TopShelfChipButton(
                     title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
                     isSelected: configuration.includesUpNext
                 ) { update { $0.includesUpNext.toggle() } }
-                CollectionChipButton(
+                TopShelfChipButton(
                     title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
                     isSelected: configuration.includesToday
                 ) { update { $0.includesToday.toggle() } }
-                CollectionChipButton(
+                TopShelfChipButton(
                     title: L10n.string("nav_library", fallback: "Library"),
                     isSelected: configuration.includesLibrary
                 ) { update { $0.includesLibrary.toggle() } }
@@ -4000,7 +4000,7 @@ private struct TopShelfSettingsGroup: View {
                     )
                 ) {
                     ForEach(catalogs, id: \.id) { catalog in
-                        CollectionChipButton(
+                        TopShelfChipButton(
                             title: catalog.title ?? catalog.id,
                             isSelected: isCatalogSelected(catalog.id)
                         ) { toggleCatalog(catalog.id) }
@@ -4067,6 +4067,65 @@ private struct TopShelfSettingsGroup: View {
     private func loadCatalogs() {
         configuration = TopShelfConfigurationStore.load()
         catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
+    }
+}
+
+/// A Top Shelf source chip whose state reads at a glance on a TV: a green check and
+/// tint when on, an empty circle and dimmed text when off, both kept while focused.
+private struct TopShelfChipButton: View {
+    let title: String
+    let isSelected: Bool
+    let action: () -> Void
+
+    @FocusState private var focused: Bool
+    private static let onColor = Color(red: 0.19, green: 0.78, blue: 0.48)
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 10) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(iconColor)
+                Text(title)
+                    .font(.system(size: 22, weight: isSelected ? .bold : .semibold))
+                    .foregroundColor(textColor)
+            }
+            .padding(.leading, 18)
+            .padding(.trailing, 26)
+            .frame(height: 52)
+            .background(chipBackground, in: Capsule())
+            .overlay(
+                Capsule()
+                    .strokeBorder(borderColor, lineWidth: focused ? AppFocusOutline.width : (isSelected ? 2 : 1))
+            )
+        }
+        .buttonStyle(PosterCardButtonStyle())
+        .focused($focused)
+        .focusEffectDisabledIfAvailable()
+        .scaleEffect(focused ? 1.05 : 1)
+        .animation(.easeOut(duration: 0.12), value: focused)
+        .animation(.easeOut(duration: 0.12), value: isSelected)
+        .accessibilityAddTraits(isSelected ? .isSelected : [])
+    }
+
+    private var iconColor: Color {
+        if isSelected { return Self.onColor }
+        return focused ? .black.opacity(0.45) : .white.opacity(0.4)
+    }
+
+    private var textColor: Color {
+        if focused { return .black }
+        return isSelected ? .white : .white.opacity(0.5)
+    }
+
+    private var chipBackground: Color {
+        if focused { return .white }
+        return isSelected ? Self.onColor.opacity(0.28) : Color.white.opacity(0.04)
+    }
+
+    private var borderColor: Color {
+        if focused { return AppFocusOutline.color }
+        return isSelected ? Self.onColor.opacity(0.9) : Color.white.opacity(0.15)
     }
 }
 
