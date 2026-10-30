@@ -231,6 +231,12 @@ struct PlaybackDebugHUDView: View {
                         dotColor: previews.hasPrefix("stopped") ? .red : (previews.hasPrefix("net on") ? .green : .gray)
                     )
                 }
+                // The last stills the preview card showed, newest first: target, path←origin,
+                // and how far the frame is from the target.
+                let shownStills = SeekPreviewDiagnostics.shared.shown
+                ForEach(Array(shownStills.enumerated()), id: \.offset) { index, still in
+                    hudRow(label: index == 0 ? "Shown" : "", value: still)
+                }
             }
         }
     }

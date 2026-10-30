@@ -5031,6 +5031,7 @@ class PlayerViewModel: ObservableObject {
                 if let cached {
                     self.scrubThumbnail = cached
                     self.scrubThumbnailTargetSeconds = target
+                    SeekPreviewDiagnostics.shared.noteShown(cached, target: target, path: "cache")
                 }
 
                 // If newer remote input arrived while querying cache, prioritize moving to it
@@ -5110,6 +5111,7 @@ class PlayerViewModel: ObservableObject {
                     // The exact still; the fast frame only when no exact one came.
                     self.scrubThumbnail = still
                     self.scrubThumbnailTargetSeconds = target
+                    SeekPreviewDiagnostics.shared.noteShown(still, target: target, path: refined != nil ? "exact" : "fast")
                 } else if !usedDeferredRetry,
                           let delay = selectedProvider.pendingScrubThumbnailDelay(), delay > 0, delay < 6 {
                     // A pause has not yet released the playback connection (option off): try the
@@ -5154,6 +5156,7 @@ class PlayerViewModel: ObservableObject {
               Date().timeIntervalSince(lastScrubTargetChange) < Self.scrubMovingWindow else { return }
         scrubThumbnail = image
         scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(image, target: target, path: "moving")
     }
 
     /// Whether the remote asked for another target than `target`. A repeat of `target` itself
@@ -5206,6 +5209,7 @@ class PlayerViewModel: ObservableObject {
               self.scrubThumbnailProvider === provider else { return }
         self.scrubThumbnail = nearest
         self.scrubThumbnailTargetSeconds = target
+        SeekPreviewDiagnostics.shared.noteShown(nearest, target: target, path: "nearest")
     }
 
     private func restartScrubTimeout() {

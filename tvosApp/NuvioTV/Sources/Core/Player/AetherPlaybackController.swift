@@ -2433,6 +2433,7 @@ actor HybridSeekThumbnailIndex {
             // Disk stills are bucketed by whole seconds, so "exact" admits the neighbouring bucket.
             let tolerance = exactOnly ? 1 : HybridSeekThumbnailPolicy.coarseLookupTolerance(duration: duration)
             if let diskHit = await TrickplayDiskCache.shared.lookupWithTimestamp(streamKey: streamKey, seconds: seconds, tolerance: tolerance) {
+                SeekPreviewOriginTags.shared.tag(diskHit.image, "disk", seconds: diskHit.seconds)
                 // Promote to in-memory cache using actual disk frame timestamp
                 let kind: Kind = abs(diskHit.seconds - seconds) <= HybridSeekThumbnailPolicy.maximumPreviewTimeError ? .fine : .coarse
                 self.store(diskHit.image, seconds: diskHit.seconds, kind: kind, generation: generation, persistToDisk: false)
@@ -3272,6 +3273,11 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                         refined: true,
                         maxWidth: maxWidth,
                         isCancelled: { cancellation.isCancelled })
+                    if let frame {
+                        SeekPreviewOriginTags.shared.tag(
+                            frame.image, frame.validRange == nil ? "resident" : "resident-rung",
+                            seconds: frame.actualSeconds)
+                    }
                     // A frame without a valid range comes from the segment holding the target
                     // (a ladder rung has one): the exact still is reachable, it only ran out of
                     // time. The next request gets it; the lane's nearby keyframe must not stand in.
@@ -3293,7 +3299,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 },
                 fallback: {
                     guard let sourceContext else { return nil }
-                    return await PlaybackThumbnailSourceFallback.boundedSnapshot(
+                    let snapshot = await PlaybackThumbnailSourceFallback.boundedSnapshot(
                         sourceContext: sourceContext,
                         atSeconds: seconds,
                         maxWidth: maxWidth,
@@ -3304,6 +3310,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                                 requestID, generation: generation, providerGeneration: providerGeneration,
                                 cancellation: cancellation)
                         })
+                    SeekPreviewOriginTags.shared.tag(snapshot?.image, "snapshot", seconds: snapshot?.actualSeconds)
+                    return snapshot
                 })
             guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                                  providerGeneration: providerGeneration,
@@ -3431,6 +3439,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     ) async -> CGImage? {
         if engine.supportsCacheBackedStills {
             let image = await engine.scrubThumbnail(atSeconds: seconds, maxWidth: maxWidth, precise: precise)
+            SeekPreviewOriginTags.shared.tag(
+                image, precise ? "engine-exact" : "engine-keyframe", seconds: precise ? seconds : nil)
             guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                                  providerGeneration: providerGeneration,
                                                  cancellation: cancellation) else { return nil }
@@ -3457,6 +3467,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
         } else {
             image = await extractor.thumbnail(at: seconds, maxWidth: maxWidth)
         }
+        SeekPreviewOriginTags.shared.tag(
+            image, precise ? "extractor-exact" : "extractor-keyframe", seconds: precise ? seconds : nil)
         guard isCurrentScrubThumbnailRequest(requestID, generation: generation,
                                              providerGeneration: providerGeneration,
                                              cancellation: cancellation),
@@ -3577,6 +3589,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             isPerformingPassiveCapture = false
             return
         }
+        SeekPreviewOriginTags.shared.tag(capturedImage, "capture", seconds: targetSeconds)
 
         let key = self.contentCanonicalKey ?? self.currentStreamKey
         Task { [weak self] in
@@ -3721,6 +3734,7 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             // The extractor cache keys omit output size; match the foreground
             // card so prefetch cannot leave a lower-resolution cached still.
             let image = await extractor.preciseThumbnail(at: seconds, maxWidth: 480)
+            SeekPreviewOriginTags.shared.tag(image, "sample", seconds: seconds)
             guard !Task.isCancelled,
                   self.engine.playbackPhase == .paused,
                   !self.isTransportPlaying,

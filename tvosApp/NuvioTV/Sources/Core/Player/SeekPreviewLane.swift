@@ -740,9 +740,71 @@ private final class SeekPreviewResumeGate: @unchecked Sendable {
 final class SeekPreviewDiagnostics {
     static let shared = SeekPreviewDiagnostics()
     private(set) var line = ""
+    /// The last stills the preview card showed, newest first: target, how the loop got it,
+    /// where it came from and how far its frame is from the target.
+    private(set) var shown: [String] = []
 
     func update(_ line: String) { self.line = line }
     func clear() { line = "" }
+
+    func noteShown(_ image: CGImage, target: Double, path: String) {
+        let origin = SeekPreviewOriginTags.shared.tag(of: image)
+        var text = "\(Self.clock(target)) \(path)←\(origin?.source ?? "?")"
+        if let seconds = origin?.seconds, seconds.isFinite {
+            text += String(format: " Δ%+.1f", seconds - target)
+        }
+        shown.insert(text, at: 0)
+        if shown.count > 3 { shown.removeLast(shown.count - 3) }
+    }
+
+    private static func clock(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "--" }
+        let total = Int(seconds.rounded())
+        return total >= 3600
+            ? String(format: "%d:%02d:%02d", total / 3600, total / 60 % 60, total % 60)
+            : String(format: "%d:%02d", total / 60, total % 60)
+    }
+}
+
+/// Debug HUD only: where each preview still came from (the decoder, a cache, the lane) and the
+/// time its frame belongs to, keyed by the image object so a cached copy keeps its origin.
+final class SeekPreviewOriginTags: @unchecked Sendable {
+    struct Tag: Sendable {
+        let source: String
+        let seconds: Double?
+    }
+
+    static let shared = SeekPreviewOriginTags()
+    private static let capacity = 128
+    private let lock = NSLock()
+    private var tags: [ObjectIdentifier: Tag] = [:]
+    private var order: [ObjectIdentifier] = []
+
+    /// Tags `image` unless it already has a tag (a cache handing back a decoded still keeps
+    /// the decoder's tag); `replacing` overrides it.
+    @discardableResult
+    func tag(_ image: CGImage?, _ source: String, seconds: Double?, replacing: Bool = false) -> CGImage? {
+        guard let image else { return nil }
+        let key = ObjectIdentifier(image)
+        lock.lock()
+        defer { lock.unlock() }
+        if tags[key] != nil {
+            guard replacing else { return image }
+        } else {
+            order.append(key)
+            if order.count > Self.capacity {
+                tags[order.removeFirst()] = nil
+            }
+        }
+        tags[key] = Tag(source: source, seconds: seconds)
+        return image
+    }
+
+    func tag(of image: CGImage) -> Tag? {
+        lock.lock()
+        defer { lock.unlock() }
+        return tags[ObjectIdentifier(image)]
+    }
 }
 
 /// Seek previews for one remote source session, outside what playback buffered: one persistent
@@ -922,12 +984,16 @@ final class SeekPreviewLane {
         }
         // A still playback already produced inside the cell (passive capture, resident decode).
         if let local = await localFrame(SeekPreviewGrid.center(of: cell), SeekPreviewGrid.cellSeconds / 2) {
+            let origin = SeekPreviewOriginTags.shared.tag(of: local)
+            SeekPreviewOriginTags.shared.tag(
+                local, "lane-local(\(origin?.source ?? "?"))", seconds: origin?.seconds, replacing: true)
             remember(local, for: cell)
             return local
         }
         let storage = SeekPreviewGrid.storageSeconds(of: cell)
         if let disk = await TrickplayDiskCache.shared.lookup(streamKey: diskKey, seconds: storage, tolerance: 0) {
             guard !isShutDown else { return nil }
+            SeekPreviewOriginTags.shared.tag(disk, "lane-disk", seconds: SeekPreviewGrid.center(of: cell))
             remember(disk, for: cell)
             return disk
         }
@@ -959,6 +1025,8 @@ final class SeekPreviewLane {
         let started = Date()
         let task = Task { @MainActor [weak self] () -> CGImage? in
             let image = await extractor.thumbnail(at: center, maxWidth: Self.width)
+            // The cell's keyframe: at or before its center, how far is not known here.
+            SeekPreviewOriginTags.shared.tag(image, "lane-net", seconds: center)
             guard let self else { return image }
             let superseded = self.decodeSequence != id
             if self.inFlight?.id == id { self.inFlight = nil }

@@ -861,6 +861,7 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
         providerGeneration: UInt64,
         cancellation: PlaybackThumbnailRequestCancellation
     ) async -> CGImage? {
+        SeekPreviewOriginTags.shared.tag(still?.image, "snapshot", seconds: still?.actualSeconds)
         guard let still,
               let actualSeconds = still.actualSeconds,
               actualSeconds.isFinite,
