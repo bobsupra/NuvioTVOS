@@ -9194,7 +9194,7 @@ struct SubtitleStyleEditor: View {
                     subtitle: L10n.string("subtitle_vertical_position_adjustment_desc", fallback: "Increase to move captions away from the screen edge; decrease to move them closer"),
                     value: $bottomOffset,
                     range: SubtitleStyleDefaults.bottomOffsetRange,
-                    step: 2,
+                    step: 4,
                     suffix: "",
                     accentColor: accentColor
                 )

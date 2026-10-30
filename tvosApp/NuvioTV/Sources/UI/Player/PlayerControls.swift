@@ -2230,12 +2230,12 @@ struct PlayerSettingsPanel: View {
                         plusKey: .heightPlus,
                         onMinus: {
                             updateStyle {
-                                $0.bottomOffset = max($0.bottomOffset - 2, SubtitleStyleDefaults.bottomOffsetRange.lowerBound)
+                                $0.bottomOffset = max($0.bottomOffset - 4, SubtitleStyleDefaults.bottomOffsetRange.lowerBound)
                             }
                         },
                         onPlus: {
                             updateStyle {
-                                $0.bottomOffset = min($0.bottomOffset + 2, SubtitleStyleDefaults.bottomOffsetRange.upperBound)
+                                $0.bottomOffset = min($0.bottomOffset + 4, SubtitleStyleDefaults.bottomOffsetRange.upperBound)
                             }
                         }
                     )
