@@ -366,6 +366,7 @@ enum TraktAuthStore {
             Key.expiresAt, Key.pollInterval, Key.credentialClientID, Key.cachedStats
         ].forEach { defaults.removeObject(forKey: $0) }
         defaults.removeObject(forKey: SettingsKey.traktConnected)
+        RemoteLibraryStore.clear(source: .trakt, profileId: ProfileSettings.activeProfileID)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)
@@ -510,8 +511,10 @@ enum TraktSettingsStore {
             librarySourceMode(in: ProfileSettings.current)
         }
         set {
-            guard newValue != librarySourceMode else { return }
+            let previous = librarySourceMode
+            guard newValue != previous else { return }
             ProfileSettings.current.set(newValue.rawValue, forKey: SettingsKey.traktLibrarySourceMode)
+            RemoteLibraryStore.clear(source: previous, profileId: ProfileSettings.activeProfileID)
             NotificationCenter.default.post(name: libraryChangedNotification, object: nil)
         }
     }

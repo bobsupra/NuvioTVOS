@@ -61,26 +61,12 @@ struct LibraryWatchedDisplayOwner: Equatable {
         "\(source.rawValue)\u{1f}\(profileId ?? "legacy")\u{1f}\(accountBindingId ?? "no-account")"
     }
 
-    private static func accountBindingID(
+    static func accountBindingID(
         for source: TraktLibrarySourceMode,
         profileId: String?,
         in store: UserDefaults
     ) -> String? {
-        switch source {
-        case .local:
-            return WatchedStore.nuvioSyncAccountBinding(profileId: profileId)
-        case .trakt:
-            let state = TraktAuthStore.state(in: store)
-            return TraktAuthStore.accountBindingID(in: store)
-                ?? state.username?.lowercased()
-                ?? state.refreshToken
-        case .simkl:
-            return SimklAuthStore.accountBindingID(in: store)
-        case .mdblist:
-            return MdbListAuthStore.accountBindingID(in: store)
-        case .wetrakr:
-            return WeTrakrAuthStore.accountBindingID(in: store)
-        }
+        RemoteLibraryStore.accountBindingID(for: source, profileId: profileId, in: store)
     }
 }
 
@@ -576,60 +562,102 @@ public struct LibraryView: View {
         return list.name
     }
 
+    @ViewBuilder
     private var savedContent: some View {
         let watchedContext = viewModel.displayedWatchedContext ?? LibraryWatchedContext.currentScope()
         let watchedContextIsCurrent = watchedContext.isCurrentScope
-        return ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                ForEach(viewModel.sortedAndGroupedItems.keys.sorted(), id: \.self) { group in
-                    if viewModel.groupOption != .none {
-                        Text(group.capitalized)
-                            .font(.system(size: 28, weight: .semibold))
-                            .foregroundColor(.white.opacity(0.85))
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
+        if viewModel.isLoading && viewModel.items.isEmpty {
+            centeredMessage {
+                ProgressView()
+                    .progressViewStyle(.circular)
+                    .tint(.white)
+                    .scaleEffect(1.6)
+            }
+        } else if viewModel.items.isEmpty {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "books.vertical")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(L10n.string("library_empty_title", fallback: "Your library is empty"))
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(L10n.string("library_empty_message", fallback: "Titles you add to your library will appear here."))
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else if viewModel.sortedAndGroupedItems.values.allSatisfy(\.isEmpty) {
+            centeredMessage {
+                VStack(spacing: 16) {
+                    Image(systemName: "line.3.horizontal.decrease.circle")
+                        .font(.system(size: 56))
+                        .foregroundColor(.white.opacity(0.4))
+                    Text(L10n.string("library_filter_empty_title", fallback: "No matching titles"))
+                        .font(.system(size: 32, weight: .bold))
+                        .foregroundColor(.white)
+                    Text(L10n.string("library_filter_empty_message", fallback: "Try changing or clearing your filters."))
+                        .font(.system(size: 22))
+                        .foregroundColor(.white.opacity(0.6))
+                        .multilineTextAlignment(.center)
+                        .frame(maxWidth: 600)
+                }
+            }
+        } else {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 20) {
+                    ForEach(viewModel.sortedAndGroupedItems.keys.sorted(), id: \.self) { group in
+                        if viewModel.groupOption != .none {
+                            Text(group.capitalized)
+                                .font(.system(size: 28, weight: .semibold))
+                                .foregroundColor(.white.opacity(0.85))
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
 
-                    LazyVGrid(columns: gridColumns, alignment: .leading, spacing: LibraryGridMetrics.posterGap) {
-                        ForEach(viewModel.sortedAndGroupedItems[group] ?? [], id: \.id) { item in
-                            LibraryItemButton(
-                                item: item,
-                                watchedContext: watchedContext,
-                                watchedContextIsCurrent: watchedContextIsCurrent,
-                                onLibraryContentClick: onLibraryContentClick,
-                                externalFocus: $focusedItemID,
-                                retainFocusAppearance: overlayRestoreItemID == item.id,
-                                onFocus: {
-                                    if overlayRestoreItemID == item.id {
-                                        overlayRestoreItemID = nil
+                        LazyVGrid(columns: gridColumns, alignment: .leading, spacing: LibraryGridMetrics.posterGap) {
+                            ForEach(viewModel.sortedAndGroupedItems[group] ?? [], id: \.id) { item in
+                                LibraryItemButton(
+                                    item: item,
+                                    watchedContext: watchedContext,
+                                    watchedContextIsCurrent: watchedContextIsCurrent,
+                                    onLibraryContentClick: onLibraryContentClick,
+                                    externalFocus: $focusedItemID,
+                                    retainFocusAppearance: overlayRestoreItemID == item.id,
+                                    onFocus: {
+                                        if overlayRestoreItemID == item.id {
+                                            overlayRestoreItemID = nil
+                                        }
+                                    },
+                                    onLongPress: onLongPress.map { cb in { cb(item.asNuvioMeta) } }
+                                ) {
+                                    overlayRestoreItemID = item.id
+                                    lastFocusedItemID = item.id
+                                    if let onLibraryContentClick {
+                                        guard watchedContextIsCurrent,
+                                              let capturedContext = watchedContext.recaptureForCurrentAction() else { return }
+                                        onLibraryContentClick(item.id, item.contentType, capturedContext)
+                                    } else {
+                                        onContentClick(item.id, item.contentType)
                                     }
-                                },
-                                onLongPress: onLongPress.map { cb in { cb(item.asNuvioMeta) } }
-                            ) {
-                                overlayRestoreItemID = item.id
-                                lastFocusedItemID = item.id
-                                if let onLibraryContentClick {
-                                    guard watchedContextIsCurrent,
-                                          let capturedContext = watchedContext.recaptureForCurrentAction() else { return }
-                                    onLibraryContentClick(item.id, item.contentType, capturedContext)
-                                } else {
-                                    onContentClick(item.id, item.contentType)
                                 }
+                                .disabled(
+                                    (overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
+                                        || !watchedContextIsCurrent
+                                )
                             }
-                            .disabled(
-                                (overlayRestoreItemID != nil && overlayRestoreItemID != item.id)
-                                    || !watchedContextIsCurrent
-                            )
                         }
                     }
                 }
+                .padding(.top, 16)
+                .padding(.horizontal, 12)
+                .padding(.bottom, 90)
+                .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .padding(.top, 16)
-            .padding(.horizontal, 12)
-            .padding(.bottom, 90)
-            .frame(maxWidth: .infinity, alignment: .leading)
+            .focusSection()
+            .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
         }
-        .focusSection()
-        .defaultFocusIfAvailable($focusedItemID, shouldRestoreFocus ? lastFocusedItemID : nil)
     }
 
     @ViewBuilder

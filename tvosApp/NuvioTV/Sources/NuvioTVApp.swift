@@ -655,8 +655,14 @@ struct ContentView: View {
         .environmentObject(announcementService)
         // Apply selected app language (locale + L10n catalog) and refresh UI on change.
         .appliesAppLocale()
-        .onChange(of: profileViewModel.activeProfile?.id) { _, _ in
+        .onChange(of: profileViewModel.activeProfile?.id) { _, newID in
             AppLocaleManager.shared.reloadFromProfileStore()
+            if newID != nil, activeScreen == .main {
+                libraryViewModel.loadLibrary()
+                Task { @MainActor in
+                    await libraryViewModel.refreshSelectedLibrary()
+                }
+            }
         }
         // Backing out of the switch must not leave the cover behind.
         .onChange(of: isOnProfileSelection) { _, isSelecting in
@@ -1400,6 +1406,12 @@ struct ContentView: View {
         profileGateStartedAt = Date()
         let generation = profileGateGeneration
         TVHomeDebugTrace.log("profileGate.begin gen=\(generation) timeout=\(Self.profileGateTimeout)s minDuration=\(Self.profileGateMinimumDuration)s")
+        libraryViewModel.loadLibrary()
+        if NSClassFromString("XCTestCase") == nil {
+            Task { @MainActor in
+                await libraryViewModel.refreshSelectedLibrary()
+            }
+        }
         profileGateTask = Task { @MainActor in
             try? await Task.sleep(nanoseconds: UInt64(Self.profileGateTimeout * 1_000_000_000))
             guard !Task.isCancelled,
@@ -2886,6 +2898,7 @@ struct ContentView: View {
                 authManager.signOut()
                 profileViewModel.resetForSignedOut()
                 homeStore.reset()
+                libraryViewModel.loadLibrary()
                 searchViewModel.clear()
                 searchViewModel.clearRecent()
                 netflixSearchViewModel.clear()
@@ -7831,17 +7844,23 @@ struct TVHomeView: View {
         return preferredBackdropURL(for: visibleFocusedMeta) ?? preferredBackdropURL(for: visibleHero)
     }
 
-    private func preferredBackdropURL(for meta: NuvioMeta?) -> String? {
+    static func preferredBackdropURL(for meta: NuvioMeta?) -> String? {
         guard let meta else { return nil }
 
-        // Match PosterCard's landscape artwork selection. BetterPosters catalog
-        // entries intentionally contain `poster` without `background`; falling
-        // back here keeps the focused card and the Home backdrop in sync.
-        for candidate in [meta.landscapePosterUrl, meta.backgroundUrl, meta.posterUrl] {
+        // Match PosterCard's backdrop artwork selection: clean background fanart
+        // takes priority over landscape posters and portrait posters. Falling back
+        // to landscapePosterUrl and posterUrl supports catalog items without a
+        // dedicated background (such as BetterPosters) while keeping the focused
+        // card and the Home hero backdrop in sync.
+        for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
             let url = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             if !url.isEmpty { return url }
         }
         return nil
+    }
+
+    private func preferredBackdropURL(for meta: NuvioMeta?) -> String? {
+        Self.preferredBackdropURL(for: meta)
     }
 
     private func isVisible(_ meta: NuvioMeta) -> Bool {

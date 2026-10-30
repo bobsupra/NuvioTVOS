@@ -371,6 +371,7 @@ enum WeTrakrAuthStore {
             Key.expiresAt, Key.pollInterval, Key.credentialClientID, Key.hasAccessToken,
             Key.cachedStats, Key.tokenExpiresAt
         ].forEach { defaults.removeObject(forKey: $0) }
+        RemoteLibraryStore.clear(source: .wetrakr, profileId: profileScope)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)

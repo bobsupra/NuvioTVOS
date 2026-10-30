@@ -366,6 +366,7 @@ enum SimklAuthStore {
             Key.expiresAt, Key.pollInterval, Key.credentialClientID, Key.hasAccessToken,
             Key.cachedStats, Key.settingsWatermark, Key.tokenExpiresAt, Key.isV2Flow
         ].forEach { defaults.removeObject(forKey: $0) }
+        RemoteLibraryStore.clear(source: .simkl, profileId: profileScope)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)

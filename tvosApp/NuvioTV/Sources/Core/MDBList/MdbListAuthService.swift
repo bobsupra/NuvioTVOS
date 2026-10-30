@@ -420,6 +420,7 @@ enum MdbListAuthStore {
             Key.accountBindingID, Key.username, Key.displayName, Key.accountID, Key.deviceCode, Key.userCode,
             Key.verificationURL, Key.expiresAtMillis, Key.pollInterval, Key.cachedStats
         ].forEach { defaults.removeObject(forKey: $0) }
+        RemoteLibraryStore.clear(source: .mdblist, profileId: profileScope)
         NotificationCenter.default.post(name: changedNotification, object: nil)
         RemoteTrackingState.normalizeWatchProgressSource(in: defaults)
         RemoteTrackingState.normalizeLibrarySource(in: defaults)
