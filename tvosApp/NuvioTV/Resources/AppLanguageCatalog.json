@@ -8918,7 +8918,9 @@
     "tvos_settings_topshelf_sources_subtitle": "Vyber libovolnou kombinaci. Karusel ukáže nejvýš 15 titulů, z každého zdroje část.",
     "tvos_settings_topshelf_catalogs": "Katalogy z Home",
     "tvos_settings_topshelf_catalogs_subtitle": "V pořadí jako na Home. Dokud nevybereš, první katalog z Home.",
-    "tvos_settings_topshelf_today": "Dnes"
+    "tvos_settings_topshelf_today": "Dnes",
+    "tvos_settings_topshelf_trailers": "Trailery",
+    "tvos_settings_topshelf_trailers_subtitle": "Když na titulu chvíli zůstaneš, karusel přehraje jeho trailer v nejlepší dostupné kvalitě"
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -17835,7 +17837,9 @@
     "tvos_settings_topshelf_sources_subtitle": "Choose any mix. The carousel shows up to 15 titles, a share from each.",
     "tvos_settings_topshelf_catalogs": "Home Catalogs",
     "tvos_settings_topshelf_catalogs_subtitle": "Shown in Home order. Until you choose, the first Home catalog.",
-    "tvos_settings_topshelf_today": "Today"
+    "tvos_settings_topshelf_today": "Today",
+    "tvos_settings_topshelf_trailers": "Trailers",
+    "tvos_settings_topshelf_trailers_subtitle": "Stay on a title and the carousel plays its trailer, in the best quality available"
   },
   "es": {
     "sidebar_genres_title": "Géneros",

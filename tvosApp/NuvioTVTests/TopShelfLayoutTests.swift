@@ -219,6 +219,99 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertTrue(remaining.isDisjoint(with: [hiddenCard, hiddenCarousel]))
     }
 
+    // MARK: Trailers
+
+    func testTrailersArePlayedUnlessTurnedOff() throws {
+        XCTAssertTrue(TopShelfConfiguration.default.playsTrailers)
+        let off = try JSONDecoder().decode(TopShelfConfiguration.self, from: Data(#"{"playsTrailers":false}"#.utf8))
+        XCTAssertFalse(off.playsTrailers)
+    }
+
+    func testTrailerWithTheBestPictureIsPicked() {
+        func pick(_ providers: [String]) -> String? {
+            TopShelfTrailerPicker.best(providers.map {
+                TopShelfTrailerLink(url: "https://cdn.example.test/\($0.count).m3u8", provider: $0)
+            })?.provider
+        }
+        // Resolution first, then Dolby Vision over HDR, then the sound.
+        XCTAssertEqual(pick(["Apple TV 1080p 5.1", "Plex 4K", "⭐ Apple TV 4K HDR 5.1", "Apple TV 4K DV Atmos"]),
+                       "Apple TV 4K DV Atmos")
+        XCTAssertEqual(pick(["⭐ Apple TV 1080p 5.1", "Plex 4K"]), "Plex 4K")
+        XCTAssertEqual(pick(["MUBI 720p", "Plex 1080p"]), "Plex 1080p")
+        // The same picture: Apple TV first, as on Details.
+        XCTAssertEqual(pick(["Rotten Tomatoes 1080p", "Apple TV 1080p"]), "Apple TV 1080p")
+        XCTAssertEqual(pick(["Apple TV 1080p", "Apple TV 1080p 5.1", "Apple TV 1080p Atmos"]), "Apple TV 1080p Atmos")
+        XCTAssertNil(pick([]))
+    }
+
+    func testTrailerHLSBeatsASingleFileOfTheSamePicture() {
+        let file = TopShelfTrailerLink(url: "https://cdn.example.test/a.mp4", provider: "Apple TV 1080p")
+        let stream = TopShelfTrailerLink(url: "https://cdn.example.test/a.m3u8?x=1", provider: "Apple TV 1080p")
+        XCTAssertEqual(TopShelfTrailerPicker.best([file, stream]), stream)
+        XCTAssertEqual(TopShelfTrailerPicker.best([stream, stream]), stream)
+    }
+
+    func testTrailerioResponseKeepsOnlyWebLinks() throws {
+        let json = #"""
+        {"meta":{"id":"tt1","links":[
+          {"trailers":"https://play-edge.itunes.apple.com/a/master.m3u8","provider":"Apple TV 4K HDR 5.1"},
+          {"trailers":"  ","provider":"Empty"},
+          {"trailers":"ftp://example.test/a.mp4","provider":"FTP"},
+          {"provider":"No link"},
+          {"trailers":"https://video.fandango.com/a.mp4"}
+        ]}}
+        """#
+        let links = try XCTUnwrap(TopShelfTrailerResolver.links(from: Data(json.utf8)))
+        XCTAssertEqual(links.map(\.url), ["https://play-edge.itunes.apple.com/a/master.m3u8",
+                                          "https://video.fandango.com/a.mp4"])
+        XCTAssertEqual(links.map(\.provider), ["Apple TV 4K HDR 5.1", ""])
+        XCTAssertEqual(TopShelfTrailerResolver.links(from: Data(#"{"meta":null}"#.utf8)), [])
+        XCTAssertNil(TopShelfTrailerResolver.links(from: Data("<html>busy</html>".utf8)))
+    }
+
+    func testTrailerIsLookedUpByIMDbIdAndKind() {
+        func url(_ id: String, _ type: String, imdb: String? = nil) -> String? {
+            TopShelfTrailerResolver.lookupURL(for: TopShelfEntry(
+                contentId: id, contentType: type, title: id, subtitle: nil, imageURL: nil,
+                progress: nil, imdbId: imdb))?.absoluteString
+        }
+        XCTAssertEqual(url("tt0816692", "movie"), "https://trailerio.cc/meta/movie/tt0816692.json")
+        XCTAssertEqual(url("tt0903747:1:2", "series"), "https://trailerio.cc/meta/series/tt0903747.json")
+        XCTAssertEqual(url("tmdb:1396", "tv", imdb: "tt0903747"), "https://trailerio.cc/meta/series/tt0903747.json")
+        XCTAssertNil(url("kitsu:1", "anime"))
+    }
+
+    func testTitlesWithATrailerAreLookedUpEveryTimeAndThoseWithoutOnceADay() {
+        typealias Record = TopShelfTrailerStore.Record
+        let now = Date()
+        let link = TopShelfTrailerLink(url: "https://cdn.example.test/a.m3u8", provider: "Apple TV 1080p")
+        func needsLookup(_ record: Record?) -> Bool { TopShelfTrailerStore.needsLookup(record, now: now) }
+        XCTAssertTrue(needsLookup(nil))
+        XCTAssertTrue(needsLookup(Record(link: link, fetchedAt: now)))
+        XCTAssertFalse(needsLookup(Record(link: nil, fetchedAt: now.addingTimeInterval(-3_600))))
+        XCTAssertTrue(needsLookup(Record(link: nil, fetchedAt: now.addingTimeInterval(-90_000))))
+    }
+
+    func testSavedTrailersStandInAndTitlesNoLongerShownAreForgotten() async throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("topshelf-trailers-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let now = Date()
+        let link = TopShelfTrailerLink(url: "https://cdn.example.test/a.m3u8", provider: "Apple TV 1080p")
+        // Neither title can be looked up (no IMDb id), so nothing goes online.
+        TopShelfTrailerStore.write([
+            "kitsu:1": .init(link: link, fetchedAt: now.addingTimeInterval(-600)),
+            "kitsu:2": .init(link: nil, fetchedAt: now.addingTimeInterval(-600)),
+            "kitsu:gone": .init(link: link, fetchedAt: now.addingTimeInterval(-600)),
+        ], in: directory)
+        let shown = ["kitsu:1", "kitsu:2"].map {
+            TopShelfEntry(contentId: $0, contentType: "anime", title: $0, subtitle: nil, imageURL: nil, progress: nil)
+        }
+        let trailers = await TopShelfTrailerResolver.trailers(for: shown, in: directory, now: now)
+        XCTAssertEqual(trailers, ["kitsu:1": link])
+        XCTAssertEqual(Set(TopShelfTrailerStore.read(in: directory).keys), ["kitsu:1", "kitsu:2"])
+    }
+
     // MARK: Helpers
 
     private func makeFeeds() -> [TopShelfSection: TopShelfFeed] {

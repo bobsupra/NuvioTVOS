@@ -3,8 +3,10 @@ import TVServices
 /// Populates the Apple TV home-screen Top Shelf from the sections the main app
 /// mirrors into the shared App Group (Continue Watching, Up Next, Library and
 /// the Home catalog rows), laid out as chosen in the app's Settings: a
-/// full-screen carousel or labeled rows. Reads `TopShelfFeedStore` and
-/// `TopShelfComposer` (`TopShelfFeed.swift`, `TopShelfLayout.swift`).
+/// full-screen carousel, which can play each title's trailer, or labeled rows.
+/// Reads `TopShelfFeedStore` and `TopShelfComposer` (`TopShelfFeed.swift`,
+/// `TopShelfLayout.swift`); trailers come from `TopShelfTrailerResolver`
+/// (`TopShelfTrailers.swift`).
 final class TopShelfContentProvider: TVTopShelfContentProvider {
     /// Headings used when the app didn't supply one.
     private static let fallbackTitles: [TopShelfSection: String] = [
@@ -24,16 +26,24 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         }
         switch configuration.style {
         case .carouselDetails, .carouselActions:
-            let ratings = TopShelfFeedStore.savedRatings()
-            let items = TopShelfComposer.carousel(from: rows).map {
-                Self.carouselItem(for: $0, configuration: configuration, ratings: ratings)
-            }
-            guard !items.isEmpty else {
+            let slots = TopShelfComposer.carousel(from: rows)
+            guard !slots.isEmpty else {
                 completionHandler(nil)
                 return
             }
-            let style: TVTopShelfCarouselContent.Style = configuration.style == .carouselDetails ? .details : .actions
-            completionHandler(TVTopShelfCarouselContent(style: style, items: items))
+            let ratings = TopShelfFeedStore.savedRatings()
+            guard configuration.playsTrailers else {
+                completionHandler(Self.carousel(slots, configuration: configuration, ratings: ratings, trailers: [:]))
+                return
+            }
+            // The system plays the trailers itself and says nothing when an
+            // item gains focus, so their links are looked up now, as the shelf
+            // loads, rather than taken from days ago.
+            Task {
+                let trailers = await TopShelfTrailerResolver.trailers(
+                    for: slots.map(\.entry), in: TopShelfFeedStore.containerURL)
+                completionHandler(Self.carousel(slots, configuration: configuration, ratings: ratings, trailers: trailers))
+            }
         case .rows:
             let collections = rows.map { row -> TVTopShelfItemCollection<TVTopShelfSectionedItem> in
                 let collection = TVTopShelfItemCollection(items: row.entries.map { Self.sectionedItem(for: $0, rowID: row.id) })
@@ -67,10 +77,24 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         return item
     }
 
+    private static func carousel(
+        _ slots: [TopShelfCarouselEntry],
+        configuration: TopShelfConfiguration,
+        ratings: [String: TopShelfRatingsStore.Record],
+        trailers: [String: TopShelfTrailerLink]
+    ) -> TVTopShelfCarouselContent {
+        let style: TVTopShelfCarouselContent.Style = configuration.style == .carouselDetails ? .details : .actions
+        let items = slots.map {
+            carouselItem(for: $0, configuration: configuration, ratings: ratings, trailer: trailers[$0.entry.contentId])
+        }
+        return TVTopShelfCarouselContent(style: style, items: items)
+    }
+
     private static func carouselItem(
         for slot: TopShelfCarouselEntry,
         configuration: TopShelfConfiguration,
-        ratings: [String: TopShelfRatingsStore.Record]
+        ratings: [String: TopShelfRatingsStore.Record],
+        trailer: TopShelfTrailerLink?
     ) -> TVTopShelfCarouselItem {
         let entry = slot.entry
         let item = TVTopShelfCarouselItem(identifier: "\(slot.rowID):\(entry.contentId)")
@@ -102,6 +126,10 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         if let url = imageURL {
             item.setImageURL(url, for: .screenScale1x)
             item.setImageURL(url, for: .screenScale2x)
+        }
+        // Played over the image once the item stays in focus.
+        if let trailer, let url = URL(string: trailer.url) {
+            item.previewVideoURL = url
         }
         // More Info opens the details page; Play resumes what can be resumed.
         if let details = entry.detailsURL {

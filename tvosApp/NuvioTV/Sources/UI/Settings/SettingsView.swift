@@ -3961,6 +3961,21 @@ private struct TopShelfSettingsGroup: View {
                 }
             )
 
+            if configuration.style.isCarousel {
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_topshelf_trailers", fallback: "Trailers"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_trailers_subtitle",
+                        fallback: "Stay on a title and the carousel plays its trailer, in the best quality available"
+                    ),
+                    isOn: Binding(
+                        get: { configuration.playsTrailers },
+                        set: { isOn in update { $0.playsTrailers = isOn } }
+                    ),
+                    accentColor: accentColor
+                )
+            }
+
             chipSection(
                 title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
                 subtitle: L10n.string(

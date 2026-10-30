@@ -201,6 +201,7 @@ let topShelfTarget: Target = .target(
         // this into a framework both targets link instead of double-compiling.
         "NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift",
         "NuvioTV/Sources/Core/TopShelf/TopShelfLayout.swift",
+        "NuvioTV/Sources/Core/TopShelf/TopShelfTrailers.swift",
     ],
     entitlements: .file(path: "TopShelf/TopShelf.entitlements"),
     settings: .settings(

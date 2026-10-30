@@ -30,6 +30,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     /// Home catalog rows to show, by row id, in Home order. Nil: the first Home
     /// catalog (the shelf before this setting). Empty: no catalog.
     public var catalogRowIDs: [String]?
+    /// Carousel only: play the title's trailer when its item stays in focus.
+    public var playsTrailers: Bool
     /// Localized attribute names for the carousel details. The extension has no
     /// string catalog of its own.
     public var starringLabel: String?
@@ -42,6 +44,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         includesToday: Bool = true,
         includesLibrary: Bool = true,
         catalogRowIDs: [String]? = nil,
+        playsTrailers: Bool = true,
         starringLabel: String? = nil,
         directorLabel: String? = nil
     ) {
@@ -51,6 +54,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.includesToday = includesToday
         self.includesLibrary = includesLibrary
         self.catalogRowIDs = catalogRowIDs
+        self.playsTrailers = playsTrailers
         self.starringLabel = starringLabel
         self.directorLabel = directorLabel
     }
@@ -59,7 +63,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
 
     private enum CodingKeys: String, CodingKey {
         case style, includesContinueWatching, includesUpNext, includesToday, includesLibrary
-        case catalogRowIDs, starringLabel, directorLabel
+        case catalogRowIDs, playsTrailers, starringLabel, directorLabel
     }
 
     /// Missing or unknown values fall back to the defaults, so a file written
@@ -77,6 +81,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         includesLibrary = (try? container.decodeIfPresent(Bool.self, forKey: .includesLibrary))
             ?? fallback.includesLibrary
         catalogRowIDs = (try? container.decodeIfPresent([String].self, forKey: .catalogRowIDs)) ?? nil
+        playsTrailers = (try? container.decodeIfPresent(Bool.self, forKey: .playsTrailers))
+            ?? fallback.playsTrailers
         starringLabel = (try? container.decodeIfPresent(String.self, forKey: .starringLabel)) ?? nil
         directorLabel = (try? container.decodeIfPresent(String.self, forKey: .directorLabel)) ?? nil
     }
