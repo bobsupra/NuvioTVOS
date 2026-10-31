@@ -77,6 +77,10 @@
 		<string>_googlecast._tcp</string>
 		<string>_CC1AD845._googlecast._tcp</string>
 	</array>
+	<key>BGTaskSchedulerPermittedIdentifiers</key>
+	<array>
+		<string>com.nuvio.tv.topshelf.refresh</string>
+	</array>
 	<key>NSLocalNetworkUsageDescription</key>
 	<string>Allow $(PRODUCT_NAME) to access your local network</string>
 	<key>NSMicrophoneUsageDescription</key>
@@ -90,6 +94,7 @@
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
+		<string>fetch</string>
 	</array>
 	<key>UIFileSharingEnabled</key>
 	<true/>

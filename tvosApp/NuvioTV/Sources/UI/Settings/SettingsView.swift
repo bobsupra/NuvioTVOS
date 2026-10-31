@@ -3917,6 +3917,7 @@ private struct TopShelfSettingsGroup: View {
     let accentColor: Color
     @State private var configuration = TopShelfConfigurationStore.load()
     @State private var catalogs: [TopShelfFeedRow] = []
+    @State private var backgroundStatus = TopShelfBackgroundRefresh.lastStatus
 
     private static let styleLabels: [TopShelfConfiguration.Style: (key: String, fallback: String)] = [
         .carouselDetails: ("tvos_settings_topshelf_style_carousel_details", "Carousel with Details"),
@@ -4038,8 +4039,34 @@ private struct TopShelfSettingsGroup: View {
                     }
                 }
             }
+
+            // When the system last let Nuvio refresh the catalogs in the background.
+            SettingsInfoRow(
+                title: L10n.string("tvos_settings_topshelf_background", fallback: "Background Refresh"),
+                value: backgroundStatusText
+            )
         }
         .onAppear(perform: loadCatalogs)
+    }
+
+    private var backgroundStatusText: String {
+        guard let status = backgroundStatus else {
+            return L10n.string("tvos_settings_topshelf_background_never", fallback: "Not yet")
+        }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        formatter.doesRelativeDateFormatting = true
+        var parts = [formatter.string(from: status.date)]
+        if status.rows > 0 {
+            parts.append(String(
+                format: L10n.string("tvos_settings_topshelf_background_rows", fallback: "catalogs: %d"),
+                status.rows))
+        }
+        if !status.complete {
+            parts.append(L10n.string("tvos_settings_topshelf_background_partial", fallback: "incomplete"))
+        }
+        return parts.joined(separator: " · ")
     }
 
     private func chipSection<Chips: View>(
@@ -4097,6 +4124,7 @@ private struct TopShelfSettingsGroup: View {
 
     private func loadCatalogs() {
         configuration = TopShelfConfigurationStore.load()
+        backgroundStatus = TopShelfBackgroundRefresh.lastStatus
         catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
     }
 }

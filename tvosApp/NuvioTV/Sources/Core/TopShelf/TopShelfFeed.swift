@@ -289,22 +289,30 @@ final class TopShelfWriteCoordinator: @unchecked Sendable {
 }
 
 /// Runs artwork refreshes one at a time; a request made during a pass runs
-/// one more pass after it, so the last feed and setting always win.
+/// one more pass after it, so the last feed and setting always win. Every
+/// caller returns once a pass that started after its request has finished.
 actor TopShelfArtworkRefresher {
     static let shared = TopShelfArtworkRefresher()
 
     private var isRunning = false
     private var isPending = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
 
     func refresh(_ pass: @Sendable () async -> Void) async {
         isPending = true
-        guard !isRunning else { return }
+        guard !isRunning else {
+            await withCheckedContinuation { waiting.append($0) }
+            return
+        }
         isRunning = true
         while isPending {
             isPending = false
             await pass()
         }
         isRunning = false
+        let finished = waiting
+        waiting = []
+        finished.forEach { $0.resume() }
     }
 }
 
@@ -390,6 +398,20 @@ public enum TopShelfFeedStore {
                 entries: [],
                 rows: rows.map { TopShelfFeedRow(id: $0.id, title: $0.title, entries: $0.entries.map(decorated)) })
         }
+    }
+
+    /// The background refresh's write: returns once the shelf's artwork is
+    /// drawn, as the system suspends the app when the task completes.
+    static func writeCatalogRowsAndWait(_ rows: [TopShelfFeedRow]) async {
+        guard isAvailable, let writeCoordinator = writeCoordinators[.catalog] else { return }
+        let generation = writeCoordinator.beginWrite()
+        let feed = TopShelfFeed(
+            entries: [],
+            rows: rows.map { TopShelfFeedRow(id: $0.id, title: $0.title, entries: $0.entries.map(decorated)) })
+        guard writeCoordinator.commitIfCurrent(generation, commit: {
+            writeFeed(feed, section: .catalog)
+        }) else { return }
+        await refreshArtworkNow()
     }
 
     private static func commit(section: TopShelfSection, feed makeFeed: @escaping @Sendable () -> TopShelfFeed) {

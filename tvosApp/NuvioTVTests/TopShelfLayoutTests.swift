@@ -303,6 +303,46 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertFalse(TopShelfConfiguration.default.mergesUpNext)
     }
 
+    // MARK: Background refresh
+
+    func testBackgroundRefreshKeepsTheRowsItDidNotGetInTime() {
+        let previous = [
+            TopShelfFeedRow(id: "a", title: "A", entries: entries("a-old", count: 1)),
+            TopShelfFeedRow(id: "b", title: "B", entries: entries("b-old", count: 1)),
+        ]
+        let refreshed = [
+            TopShelfFeedRow(id: "b", title: "B", entries: entries("b-new", count: 2)),
+            TopShelfFeedRow(id: "c", title: "C", entries: entries("c-new", count: 1)),
+        ]
+        let complete = TopShelfBackgroundRefresh.merged(refreshed: refreshed, previous: previous, complete: true)
+        XCTAssertEqual(complete.map(\.id), ["b", "c"])
+        let partial = TopShelfBackgroundRefresh.merged(refreshed: refreshed, previous: previous, complete: false)
+        XCTAssertEqual(partial.map(\.id), ["a", "b", "c"])
+        XCTAssertEqual(partial[0].entries.map(\.contentId), ["a-old-0"])
+        XCTAssertEqual(partial[1].entries.map(\.contentId), ["b-new-0", "b-new-1"])
+        // Nothing arrived: the shelf keeps what it had.
+        XCTAssertEqual(TopShelfBackgroundRefresh.merged(refreshed: [], previous: previous, complete: true).map(\.id),
+                       ["a", "b"])
+    }
+
+    func testArtworkRefreshReturnsOnlyAfterAPassThatStartedAfterTheRequest() async throws {
+        let refresher = TopShelfArtworkRefresher()
+        let passes = PassCounter()
+        let first = Task {
+            await refresher.refresh { await passes.run(sleepNanoseconds: 300_000_000) }
+        }
+        // Wait until the first pass is under way, then ask again.
+        var attempts = 0
+        while await passes.count == 0, attempts < 200 {
+            attempts += 1
+            try await Task.sleep(nanoseconds: 5_000_000)
+        }
+        await refresher.refresh { await passes.run(sleepNanoseconds: 0) }
+        let count = await passes.count
+        XCTAssertEqual(count, 2)
+        await first.value
+    }
+
     // MARK: Trailers
 
     func testTrailersArePlayedUnlessTurnedOff() throws {
@@ -428,5 +468,16 @@ final class TopShelfLayoutTests: XCTestCase {
     private func entry(_ id: String) -> TopShelfEntry {
         TopShelfEntry(contentId: id, contentType: "movie", title: id, subtitle: nil, imageURL: nil,
                       progress: nil, action: .details)
+    }
+}
+
+private actor PassCounter {
+    private(set) var count = 0
+
+    func run(sleepNanoseconds: UInt64) async {
+        count += 1
+        if sleepNanoseconds > 0 {
+            try? await Task.sleep(nanoseconds: sleepNanoseconds)
+        }
     }
 }

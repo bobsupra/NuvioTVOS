@@ -25,6 +25,8 @@ struct NuvioTVApp: App {
         URLCache.shared.memoryCapacity = memCapacity
         URLCache.shared.diskCapacity = diskCapacity
         TopShelfRatingsBridge.install()
+        // Before launch finishes, as BGTaskScheduler requires.
+        TopShelfBackgroundRefresh.register()
         let payloadMigrationKey = "nuvio.tv.migrations.largePayloadPreferences.v1"
         if !UserDefaults.standard.bool(forKey: payloadMigrationKey),
            HomeCatalogPayloadStore.migrateAllKnownPreferences() {
@@ -842,6 +844,7 @@ struct ContentView: View {
                 watchPartyOwner.suspendForInactivity()
                 backgroundedAt = Date()
                 syncManager.flushPendingPushes()
+                TopShelfBackgroundRefresh.schedule()
             case .active:
                 if backgroundedAt != nil {
                     releaseUpdateService.beginForegroundSession()
@@ -8123,7 +8126,9 @@ struct TVHomeView: View {
         await load(for: identity, forceReload: true)
     }
 
-    private static func makeHomeCatalogSections(
+    /// Also used by the Top Shelf's background refresh, which builds the same
+    /// rows without Home on screen.
+    static func makeHomeCatalogSections(
         from catalogs: [NuvioCatalog],
         repository: CatalogRepository
     ) async -> [TVHomeSection] {
@@ -10911,6 +10916,14 @@ final class TVHomeStore: ObservableObject {
     /// that aren't plain title lists are skipped.
     private func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
+        TopShelfConfigurationStore.setLabels(
+            starring: L10n.string("details_cast", fallback: "Cast"),
+            director: L10n.string("details_director", fallback: "Director"))
+        TopShelfFeedStore.writeCatalogRows(Self.topShelfCatalogRows(from: sections))
+    }
+
+    /// The shelf's copy of Home's catalog rows, in Home order.
+    static func topShelfCatalogRows(from sections: [TVHomeSection]) -> [TopShelfFeedRow] {
         let skippedIds: Set<String> = [
             TVHomeSection.continueWatchingId,
             TVHomeSection.upcomingId,
@@ -10933,10 +10946,7 @@ final class TVHomeStore: ObservableObject {
                         TopShelfEntry(meta: $0, subtitle: nil, progress: nil, action: .details)
                     })
             }
-        TopShelfConfigurationStore.setLabels(
-            starring: L10n.string("details_cast", fallback: "Cast"),
-            director: L10n.string("details_director", fallback: "Director"))
-        TopShelfFeedStore.writeCatalogRows(Array(rows))
+        return Array(rows)
     }
 
     /// Settings offers this many Home catalogs for the shelf.
