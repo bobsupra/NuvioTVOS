@@ -3977,6 +3977,10 @@ private struct TopShelfSettingsGroup: View {
                     isSelected: configuration.includesUpNext
                 ) { update { $0.includesUpNext.toggle() } }
                 CollectionChipButton(
+                    title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
+                    isSelected: configuration.includesToday
+                ) { update { $0.includesToday.toggle() } }
+                CollectionChipButton(
                     title: L10n.string("nav_library", fallback: "Library"),
                     isSelected: configuration.includesLibrary
                 ) { update { $0.includesLibrary.toggle() } }

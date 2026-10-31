@@ -48,6 +48,55 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertFalse(rows.contains { $0.id == "upNext" })
     }
 
+    func testTodayComesAfterUpNextAndOnlyForItsDay() {
+        var feeds = makeFeeds()
+        let airing = TopShelfEntry(contentId: "tt-today", contentType: "series", title: "Airing", subtitle: "S2E5",
+                                   imageURL: nil, progress: nil, action: .details, airDate: "2026-10-29")
+        let yesterday = TopShelfEntry(contentId: "tt-old", contentType: "series", title: "Old", subtitle: nil,
+                                      imageURL: nil, progress: nil, action: .details, airDate: "2026-10-28")
+        feeds[.today] = TopShelfFeed(entries: [airing, yesterday], title: "Today")
+        let rows = TopShelfComposer.rows(configuration: .default, today: "2026-10-29") { feeds[$0] }
+        XCTAssertEqual(rows.map(\.id), ["continueWatching", "upNext", "today", "library", "catalog:popular"])
+        XCTAssertEqual(rows.first { $0.id == "today" }?.entries.map(\.contentId), ["tt-today"])
+        let nextDay = TopShelfComposer.rows(configuration: .default, today: "2026-10-30") { feeds[$0] }
+        XCTAssertFalse(nextDay.contains { $0.id == "today" }, "past days leave the shelf without the app")
+        var off = TopShelfConfiguration.default
+        off.includesToday = false
+        XCTAssertFalse(TopShelfComposer.rows(configuration: off, today: "2026-10-29") { feeds[$0] }.contains { $0.id == "today" })
+    }
+
+    func testDayIsTheLocalCalendarDay() {
+        let utc = TimeZone(identifier: "UTC")!
+        let prague = TimeZone(identifier: "Europe/Prague")!
+        let lateEvening = Date(timeIntervalSince1970: 1_793_316_600) // 2026-10-29 23:30 UTC
+        XCTAssertEqual(TopShelfComposer.day(of: lateEvening, timeZone: utc), "2026-10-29")
+        XCTAssertEqual(TopShelfComposer.day(of: lateEvening, timeZone: prague), "2026-10-30")
+    }
+
+    // MARK: Ratings
+
+    func testRatingsRenameTheCarouselImageSoNewScoresRedrawIt() {
+        let entry = TopShelfEntry(contentId: "tt1", contentType: "movie", title: "A", subtitle: nil, imageURL: nil,
+                                  progress: nil, action: .details, carouselArtworkFileName: "top-shelf-c1.jpg")
+        let imdb = TopShelfRatingBadge(source: "imdb", name: "IMDb", value: "8.1", iconAssetName: "rating_imdb",
+                                       iconURL: nil, iconWidth: 68)
+        let newer = TopShelfRatingBadge(source: "imdb", name: "IMDb", value: "8.2", iconAssetName: "rating_imdb",
+                                        iconURL: nil, iconWidth: 68)
+        XCTAssertEqual(TopShelfFeedStore.carouselImageName(for: entry, badges: nil), "top-shelf-c1.jpg")
+        XCTAssertEqual(TopShelfFeedStore.carouselImageName(for: entry, badges: []), "top-shelf-c1.jpg")
+        let rated = TopShelfFeedStore.carouselImageName(for: entry, badges: [imdb])
+        XCTAssertNotEqual(rated, "top-shelf-c1.jpg")
+        XCTAssertEqual(rated, TopShelfFeedStore.carouselImageName(for: entry, badges: [imdb]))
+        XCTAssertNotEqual(rated, TopShelfFeedStore.carouselImageName(for: entry, badges: [newer]))
+    }
+
+    func testRatingsAreFreshForADay() {
+        let now = Date()
+        XCTAssertTrue(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-3_600)), now: now))
+        XCTAssertFalse(TopShelfRatingsStore.isFresh(.init(badges: [], fetchedAt: now.addingTimeInterval(-90_000)), now: now))
+        XCTAssertFalse(TopShelfRatingsStore.isFresh(nil, now: now))
+    }
+
     // MARK: Carousel
 
     func testCarouselGivesEverySourceItsShareThenTopsUpInTurn() {

@@ -127,13 +127,14 @@ struct CalendarTodayHomeFeed: ViewModifier {
     }
 
     private func update(_ state: CalendarViewModel.State) {
-        let next = enabled
-            ? CalendarHomeToday.build(
-                from: model.currentResult(from: state),
-                today: CalendarDay(date: Date()),
-                hideSpoilers: hideSpoilers
-            )
-            : CalendarHomeToday()
+        let today = CalendarHomeToday.build(
+            from: model.currentResult(from: state),
+            today: CalendarDay(date: Date()),
+            hideSpoilers: hideSpoilers
+        )
+        // The Top Shelf can show Today even when Home's row is off.
+        TopShelfTodayFeed.write(today)
+        let next = enabled ? today : CalendarHomeToday()
         if next != row { row = next }
     }
 }

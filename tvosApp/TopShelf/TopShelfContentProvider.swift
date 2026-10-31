@@ -10,6 +10,7 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
     private static let fallbackTitles: [TopShelfSection: String] = [
         .continueWatching: "Continue Watching",
         .upNext: "Up Next",
+        .today: "Today",
         .library: "Library",
         .catalog: "Popular",
     ]
@@ -23,7 +24,10 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         }
         switch configuration.style {
         case .carouselDetails, .carouselActions:
-            let items = TopShelfComposer.carousel(from: rows).map { Self.carouselItem(for: $0, configuration: configuration) }
+            let ratings = TopShelfFeedStore.savedRatings()
+            let items = TopShelfComposer.carousel(from: rows).map {
+                Self.carouselItem(for: $0, configuration: configuration, ratings: ratings)
+            }
             guard !items.isEmpty else {
                 completionHandler(nil)
                 return
@@ -65,7 +69,8 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
 
     private static func carouselItem(
         for slot: TopShelfCarouselEntry,
-        configuration: TopShelfConfiguration
+        configuration: TopShelfConfiguration,
+        ratings: [String: TopShelfRatingsStore.Record]
     ) -> TVTopShelfCarouselItem {
         let entry = slot.entry
         let item = TVTopShelfCarouselItem(identifier: "\(slot.rowID):\(entry.contentId)")
@@ -90,8 +95,9 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         }
         item.namedAttributes = attributes
 
-        // The rendered image carries the logo; the raw backdrop stands in until it exists.
-        let imageURL = TopShelfFeedStore.carouselArtworkURL(for: entry)
+        // The rendered image carries the logo and the ratings; the raw backdrop
+        // stands in until it exists.
+        let imageURL = TopShelfFeedStore.carouselArtworkURL(for: entry, ratings: ratings)
             ?? entry.artworkSourceURL.flatMap(URL.init(string:))
         if let url = imageURL {
             item.setImageURL(url, for: .screenScale1x)

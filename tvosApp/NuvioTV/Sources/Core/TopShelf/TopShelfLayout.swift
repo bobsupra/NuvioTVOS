@@ -24,6 +24,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     public var style: Style
     public var includesContinueWatching: Bool
     public var includesUpNext: Bool
+    /// The calendar's titles coming out today.
+    public var includesToday: Bool
     public var includesLibrary: Bool
     /// Home catalog rows to show, by row id, in Home order. Nil: the first Home
     /// catalog (the shelf before this setting). Empty: no catalog.
@@ -37,6 +39,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         style: Style = .carouselDetails,
         includesContinueWatching: Bool = true,
         includesUpNext: Bool = true,
+        includesToday: Bool = true,
         includesLibrary: Bool = true,
         catalogRowIDs: [String]? = nil,
         starringLabel: String? = nil,
@@ -45,6 +48,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.style = style
         self.includesContinueWatching = includesContinueWatching
         self.includesUpNext = includesUpNext
+        self.includesToday = includesToday
         self.includesLibrary = includesLibrary
         self.catalogRowIDs = catalogRowIDs
         self.starringLabel = starringLabel
@@ -54,7 +58,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     public static let `default` = TopShelfConfiguration()
 
     private enum CodingKeys: String, CodingKey {
-        case style, includesContinueWatching, includesUpNext, includesLibrary
+        case style, includesContinueWatching, includesUpNext, includesToday, includesLibrary
         case catalogRowIDs, starringLabel, directorLabel
     }
 
@@ -68,6 +72,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
             ?? fallback.includesContinueWatching
         includesUpNext = (try? container.decodeIfPresent(Bool.self, forKey: .includesUpNext))
             ?? fallback.includesUpNext
+        includesToday = (try? container.decodeIfPresent(Bool.self, forKey: .includesToday))
+            ?? fallback.includesToday
         includesLibrary = (try? container.decodeIfPresent(Bool.self, forKey: .includesLibrary))
             ?? fallback.includesLibrary
         catalogRowIDs = (try? container.decodeIfPresent([String].self, forKey: .catalogRowIDs)) ?? nil
@@ -166,22 +172,29 @@ public enum TopShelfComposer {
     /// source gets more.
     public static let carouselMinimumShare = 3
 
-    /// The chosen sources in shelf order: Continue Watching, Up Next, Library,
-    /// then the chosen Home catalogs in Home order. Empty sources are left out.
+    /// The chosen sources in shelf order: Continue Watching, Up Next, Today,
+    /// Library, then the chosen Home catalogs in Home order. Empty sources are
+    /// left out, and so are Today's titles once their day (`today`) passed.
     public static func rows(
         configuration: TopShelfConfiguration,
+        today: String = TopShelfComposer.day(of: Date()),
         feed: (TopShelfSection) -> TopShelfFeed?
     ) -> [TopShelfRow] {
         var rows: [TopShelfRow] = []
         let fixed: [(TopShelfSection, Bool)] = [
             (.continueWatching, configuration.includesContinueWatching),
             (.upNext, configuration.includesUpNext),
+            (.today, configuration.includesToday),
             (.library, configuration.includesLibrary),
         ]
         for (section, included) in fixed {
-            guard included, let sectionFeed = feed(section), !sectionFeed.entries.isEmpty else { continue }
+            guard included, let sectionFeed = feed(section) else { continue }
+            let entries = section == .today
+                ? sectionFeed.entries.filter { $0.airDate == nil || $0.airDate == today }
+                : sectionFeed.entries
+            guard !entries.isEmpty else { continue }
             rows.append(TopShelfRow(
-                id: section.rawValue, section: section, title: sectionFeed.title, entries: sectionFeed.entries))
+                id: section.rawValue, section: section, title: sectionFeed.title, entries: entries))
         }
         guard let catalogFeed = feed(.catalog) else { return rows }
         let available = catalogFeed.catalogRows.filter { !$0.entries.isEmpty }
@@ -200,6 +213,14 @@ public enum TopShelfComposer {
                 section: .catalog, title: row.title, entries: row.entries))
         }
         return rows
+    }
+
+    /// The local calendar day of `date`, as Today entries carry it.
+    public static func day(of date: Date, timeZone: TimeZone = .current) -> String {
+        var calendar = Calendar(identifier: .gregorian)
+        calendar.timeZone = timeZone
+        let parts = calendar.dateComponents([.year, .month, .day], from: date)
+        return String(format: "%04d-%02d-%02d", parts.year ?? 1970, parts.month ?? 1, parts.day ?? 1)
     }
 
     /// Carousel slots: every source gets its share first, then the remaining

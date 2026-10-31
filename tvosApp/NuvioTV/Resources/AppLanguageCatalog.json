@@ -8917,7 +8917,8 @@
     "tvos_settings_topshelf_sources": "Obsah",
     "tvos_settings_topshelf_sources_subtitle": "Vyber libovolnou kombinaci. Karusel ukáže nejvýš 15 titulů, z každého zdroje část.",
     "tvos_settings_topshelf_catalogs": "Katalogy z Home",
-    "tvos_settings_topshelf_catalogs_subtitle": "V pořadí jako na Home. Dokud nevybereš, první katalog z Home."
+    "tvos_settings_topshelf_catalogs_subtitle": "V pořadí jako na Home. Dokud nevybereš, první katalog z Home.",
+    "tvos_settings_topshelf_today": "Dnes"
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -17833,7 +17834,8 @@
     "tvos_settings_topshelf_sources": "Content",
     "tvos_settings_topshelf_sources_subtitle": "Choose any mix. The carousel shows up to 15 titles, a share from each.",
     "tvos_settings_topshelf_catalogs": "Home Catalogs",
-    "tvos_settings_topshelf_catalogs_subtitle": "Shown in Home order. Until you choose, the first Home catalog."
+    "tvos_settings_topshelf_catalogs_subtitle": "Shown in Home order. Until you choose, the first Home catalog.",
+    "tvos_settings_topshelf_today": "Today"
   },
   "es": {
     "sidebar_genres_title": "Géneros",
