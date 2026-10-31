@@ -13,6 +13,8 @@ struct UsenetStreamStats: Equatable, Sendable {
     var cacheHitRate: Double?
     var missingArticles = 0
     var fallbackArticles = 0
+    /// Connections closed and opened again (idle too long, or dropped).
+    var reconnects = 0
     var server = ""
     var serverCount = 0
     var fileName = ""
@@ -46,6 +48,7 @@ struct UsenetStreamStats: Equatable, Sendable {
         if let cacheHitRate { parts.append("hit \(Int((cacheHitRate * 100).rounded()))%") }
         parts.append("missing \(missingArticles)")
         if fallbackArticles > 0 { parts.append("backup \(fallbackArticles)") }
+        if reconnects > 0 { parts.append("reconnect \(reconnects)") }
         return parts.joined(separator: " · ")
     }
 
@@ -253,6 +256,7 @@ final class UsenetEngineManager: ObservableObject {
                 stats.totalConnections = poolStats.totalConnections
                 stats.configuredConnections = poolStats.configuredConnections
                 stats.fallbackArticles = poolStats.fallbackArticles
+                stats.reconnects = poolStats.reconnects
                 stats.bufferedAheadBytes = sessionStats.bufferedAheadBytes
                 stats.missingArticles = sessionStats.missingArticles
                 stats.cacheHitRate = lookups > 0 ? Double(sessionStats.cacheHits) / Double(lookups) : nil

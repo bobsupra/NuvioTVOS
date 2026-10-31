@@ -925,9 +925,14 @@ final class UsenetServerTests: XCTestCase {
 /// the plan's connection limit: some at the greeting, some at the login.
 private final class FakeNNTPServer: @unchecked Sendable {
     enum Refusal { case greeting, login }
+    /// How BODY is answered: always, only a connection's first (then "400 idle timeout" and
+    /// closed, like a provider dropping an idle connection), or never (every connection fails).
+    enum Bodies { case always, firstPerConnection, never }
 
     private let allowed: Int
     private let refusal: Refusal
+    private let bodies: Bodies
+    private var served: [ObjectIdentifier: Int] = [:]
     private let queue = DispatchQueue(label: "nuvio.tests.fake-nntp")
     private let lock = NSLock()
     private var listener: NWListener?
@@ -935,9 +940,19 @@ private final class FakeNNTPServer: @unchecked Sendable {
     private var accepted = 0
     private var turnedAway = 0
 
-    init(allowed: Int, refusal: Refusal) {
+    init(allowed: Int, refusal: Refusal, bodies: Bodies = .always) {
         self.allowed = allowed
         self.refusal = refusal
+        self.bodies = bodies
+    }
+
+    /// Bodies this connection asked for before, counting this one.
+    private func countBody(on connection: NWConnection) -> Int {
+        lock.lock()
+        defer { lock.unlock() }
+        let key = ObjectIdentifier(connection)
+        served[key, default: 0] += 1
+        return served[key, default: 0]
     }
 
     var counts: (accepted: Int, turnedAway: Int) {
@@ -1018,6 +1033,11 @@ private final class FakeNNTPServer: @unchecked Sendable {
                 send("481 Too many connections\r\n", on: connection, thenClose: true)
             }
         } else if line.hasPrefix("BODY") {
+            let count = countBody(on: connection)
+            if bodies == .never || (bodies == .firstPerConnection && count > 1) {
+                send("400 Idle timeout, closing connection\r\n", on: connection, thenClose: true)
+                return
+            }
             // Slow enough that the pool wants more connections than it gets.
             queue.asyncAfter(deadline: .now() + 0.05) {
                 self.send("222 0 body follows\r\nfake article line\r\n.\r\n", on: connection)
@@ -1125,5 +1145,51 @@ final class UsenetPoolTests: XCTestCase {
 
             XCTAssertEqual(results, Array(repeating: .rejected, count: 4), "\(refusal)")
         }
+    }
+
+    func testConnectionsDroppedWhileIdleAreReplacedNotCountedMissing() async throws {
+        // A provider that closes every connection after one article: what a pause or a full
+        // buffer leaves behind. The second round finds only dead idle connections.
+        let server = FakeNNTPServer(allowed: 100, refusal: .greeting, bodies: .firstPerConnection)
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 4)
+
+        let first = await fetchAll(4, from: pool)
+        let second = await fetchAll(4, from: pool)
+        let stats = await pool.stats()
+        await pool.shutdown()
+        server.stop()
+
+        XCTAssertEqual(first, Array(repeating: .body, count: 4))
+        XCTAssertEqual(second, Array(repeating: .body, count: 4), "a dropped connection is no missing article")
+        XCTAssertGreaterThan(stats.reconnects, 0, "the idle connections that went with it were replaced")
+    }
+
+    func testConnectionsThatKeepFailingAreAnErrorNotAMissingArticle() async throws {
+        let server = FakeNNTPServer(allowed: 100, refusal: .greeting, bodies: .never)
+        let port = try await server.start()
+        let pool = pool(port: port, login: false, connections: 2)
+
+        let results = await fetchAll(3, from: pool)
+        await pool.shutdown()
+        server.stop()
+
+        // Only a server saying the article is gone makes a hole that counts as damage.
+        XCTAssertEqual(results, Array(repeating: .rejected, count: 3))
+    }
+
+    func testIdleConnectionsPastTheLimitAreNotUsedAgain() {
+        let config = UsenetServerConfig(host: "127.0.0.1", port: 119, useSSL: false,
+                                        username: nil, password: nil, maxConnections: 2)
+        let now = ContinuousClock.now
+        let fresh = UsenetConnectionPool.IdleConnection(
+            connection: UsenetNNTPConnection(config: config), since: now - .seconds(10))
+        let stale = UsenetConnectionPool.IdleConnection(
+            connection: UsenetNNTPConnection(config: config), since: now - .seconds(61))
+        let split = UsenetConnectionPool.splitStale([stale, fresh], now: now)
+        XCTAssertEqual(split.fresh.count, 1)
+        XCTAssertEqual(split.stale.count, 1)
+        XCTAssertTrue(split.fresh.first?.connection === fresh.connection)
+        XCTAssertEqual(UsenetConnectionPool.maxIdle, .seconds(60))
     }
 }
