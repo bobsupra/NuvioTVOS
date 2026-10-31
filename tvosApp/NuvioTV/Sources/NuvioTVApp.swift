@@ -10904,9 +10904,10 @@ final class TVHomeStore: ObservableObject {
         }
     }
 
-    /// Mirrors the first populated catalog row on Home into the App Group for
-    /// the Top Shelf. Rows the shelf already covers (Continue Watching) and
-    /// rows that aren't plain title lists are skipped.
+    /// Mirrors the populated catalog rows on Home into the App Group for the
+    /// Top Shelf, which shows the ones chosen in Settings (the first by
+    /// default). Rows the shelf already covers (Continue Watching) and rows
+    /// that aren't plain title lists are skipped.
     private func writeTopShelfFeed() {
         guard TopShelfFeedStore.isAvailable else { return }
         let skippedIds: Set<String> = [
@@ -10915,24 +10916,30 @@ final class TVHomeStore: ObservableObject {
             TVHomeSection.localTitlesId,
             TVHomeSection.jellyfinId,
         ]
-        let row = sections.first {
-            !skippedIds.contains($0.id) && $0.collectionFolders.isEmpty
-                && !$0.isLoadingPlaceholder && !$0.items.isEmpty
-        }
-        let entries = (row?.items ?? []).prefix(15).map { meta in
-            TopShelfEntry(
-                contentId: meta.id,
-                contentType: meta.type,
-                title: meta.name,
-                subtitle: nil,
-                imageURL: meta.posterUrl,
-                backdropURL: meta.backdropUrl,
-                progress: nil,
-                action: .details
-            )
-        }
-        TopShelfFeedStore.write(Array(entries), section: .catalog, title: row?.title)
+        var seenIds = Set<String>()
+        let rows = sections
+            .filter {
+                !skippedIds.contains($0.id) && $0.collectionFolders.isEmpty
+                    && !$0.isLoadingPlaceholder && !$0.items.isEmpty
+                    && seenIds.insert($0.id).inserted
+            }
+            .prefix(Self.topShelfCatalogRowLimit)
+            .map { row in
+                TopShelfFeedRow(
+                    id: row.id,
+                    title: row.title,
+                    entries: row.items.prefix(15).map {
+                        TopShelfEntry(meta: $0, subtitle: nil, progress: nil, action: .details)
+                    })
+            }
+        TopShelfConfigurationStore.setLabels(
+            starring: L10n.string("details_cast", fallback: "Cast"),
+            director: L10n.string("details_director", fallback: "Director"))
+        TopShelfFeedStore.writeCatalogRows(Array(rows))
     }
+
+    /// Settings offers this many Home catalogs for the shelf.
+    static let topShelfCatalogRowLimit = 30
 
     func cancelLoad(
         _ generation: UInt,

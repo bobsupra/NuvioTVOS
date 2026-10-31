@@ -200,6 +200,7 @@ let topShelfTarget: Target = .target(
         // Shared with the app target today. The Phase 2 module split moves
         // this into a framework both targets link instead of double-compiling.
         "NuvioTV/Sources/Core/TopShelf/TopShelfFeed.swift",
+        "NuvioTV/Sources/Core/TopShelf/TopShelfLayout.swift",
     ],
     entitlements: .file(path: "TopShelf/TopShelf.entitlements"),
     settings: .settings(

@@ -3593,13 +3593,10 @@ enum ContinueWatchingStore {
             subtitleParts.append("\(remaining) left")
         }
         return TopShelfEntry(
-            contentId: item.meta.id,
-            contentType: item.meta.type,
-            title: item.meta.name,
+            meta: item.meta,
             subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
-            imageURL: item.meta.posterUrl,
-            backdropURL: item.meta.backdropUrl,
-            progress: item.isUpNextEntry ? nil : fraction
+            progress: item.isUpNextEntry ? nil : fraction,
+            action: .resume
         )
     }
 
@@ -4339,16 +4336,7 @@ enum LibraryStore {
             .sorted { $0.addedAt > $1.addedAt }
             .prefix(15)
             .map { item in
-                TopShelfEntry(
-                    contentId: item.meta.id,
-                    contentType: item.meta.type,
-                    title: item.meta.name,
-                    subtitle: nil,
-                    imageURL: item.meta.posterUrl,
-                    backdropURL: item.meta.backdropUrl,
-                    progress: nil,
-                    action: .details
-                )
+                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details)
             }
         TopShelfFeedStore.write(Array(entries), section: .library,
                                 title: L10n.string("nav_library", fallback: "Library"))

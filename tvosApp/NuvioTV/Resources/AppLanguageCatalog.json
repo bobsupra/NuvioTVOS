@@ -8902,7 +8902,22 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "tvos_settings_topshelf_status": "Top Shelf",
+    "tvos_settings_topshelf_status_detail": "Sdílení dat s horní řadou na ploše (App Group %@)",
+    "tvos_settings_topshelf_available": "OK",
+    "tvos_settings_topshelf_unavailable": "Nedostupné",
+    "tvos_settings_topshelf_group": "Top Shelf",
+    "tvos_settings_topshelf_group_subtitle": "Co ukazuje plocha Apple TV, když je Nuvio v horní řadě Docku",
+    "tvos_settings_topshelf_style": "Styl",
+    "tvos_settings_topshelf_style_subtitle": "Celoobrazovkový karusel, nebo řady karet",
+    "tvos_settings_topshelf_style_carousel_details": "Karusel s popisem",
+    "tvos_settings_topshelf_style_carousel": "Karusel",
+    "tvos_settings_topshelf_style_rows": "Řady",
+    "tvos_settings_topshelf_sources": "Obsah",
+    "tvos_settings_topshelf_sources_subtitle": "Vyber libovolnou kombinaci. Karusel ukáže nejvýš 15 titulů, z každého zdroje část.",
+    "tvos_settings_topshelf_catalogs": "Katalogy z Home",
+    "tvos_settings_topshelf_catalogs_subtitle": "V pořadí jako na Home. Dokud nevybereš, první katalog z Home."
   },
   "da": {
     "sidebar_genres_title": "Genrer",
@@ -17807,7 +17822,18 @@
     "auto_skip_movie_credits": "End Credits",
     "auto_skip_movie_credits_sub": "Skip movie credits automatically, keeping post-credits scenes.",
     "skip_movie_credits": "Skip Credits",
-    "skip_to_post_credits": "Skip to Post-Credits"
+    "skip_to_post_credits": "Skip to Post-Credits",
+    "tvos_settings_topshelf_group": "Top Shelf",
+    "tvos_settings_topshelf_group_subtitle": "What the Apple TV home screen shows when Nuvio is in the top row of the Dock",
+    "tvos_settings_topshelf_style": "Style",
+    "tvos_settings_topshelf_style_subtitle": "A full-screen carousel, or rows of cards",
+    "tvos_settings_topshelf_style_carousel_details": "Carousel with Details",
+    "tvos_settings_topshelf_style_carousel": "Carousel",
+    "tvos_settings_topshelf_style_rows": "Rows",
+    "tvos_settings_topshelf_sources": "Content",
+    "tvos_settings_topshelf_sources_subtitle": "Choose any mix. The carousel shows up to 15 titles, a share from each.",
+    "tvos_settings_topshelf_catalogs": "Home Catalogs",
+    "tvos_settings_topshelf_catalogs_subtitle": "Shown in Home order. Until you choose, the first Home catalog."
   },
   "es": {
     "sidebar_genres_title": "Géneros",

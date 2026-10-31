@@ -3736,6 +3736,8 @@ private struct LayoutDiscoverySettingsView: View {
                     showingDetailsSectionsSettings = true
                 }
             }
+
+            TopShelfSettingsGroup(accentColor: accentColor)
         }
         .task {
             heroRatingSourceOptions = await AddonRatingsService.availableHeroRatingSources()
@@ -3905,6 +3907,162 @@ private struct HeroCatalogSelectionRow: View {
                 && !$0.id.hasPrefix(TVHomeSection.collectionIdPrefix)
                 && TVHomeCatalogOrder.isRowEnabled($0, context: visibility)
         }
+    }
+}
+
+/// What the Apple TV home screen shows for the app when it sits in the top row
+/// of the Dock. Device-wide (one shelf per Apple TV), saved by
+/// `TopShelfConfigurationStore`, which redraws the shelf on every change.
+private struct TopShelfSettingsGroup: View {
+    let accentColor: Color
+    @State private var configuration = TopShelfConfigurationStore.load()
+    @State private var catalogs: [TopShelfFeedRow] = []
+
+    private static let styleLabels: [TopShelfConfiguration.Style: (key: String, fallback: String)] = [
+        .carouselDetails: ("tvos_settings_topshelf_style_carousel_details", "Carousel with Details"),
+        .carouselActions: ("tvos_settings_topshelf_style_carousel", "Carousel"),
+        .rows: ("tvos_settings_topshelf_style_rows", "Rows"),
+    ]
+
+    var body: some View {
+        SettingsGroup(
+            title: L10n.string("tvos_settings_topshelf_group", fallback: "Top Shelf"),
+            subtitle: L10n.string(
+                "tvos_settings_topshelf_group_subtitle",
+                fallback: "What the Apple TV home screen shows when Nuvio is in the top row of the Dock"
+            )
+        ) {
+            if !TopShelfFeedStore.isAvailable {
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
+                    value: L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable")
+                )
+            }
+
+            SettingsOptionRow(
+                title: L10n.string("tvos_settings_topshelf_style", fallback: "Style"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_style_subtitle",
+                    fallback: "A full-screen carousel, or rows of cards"
+                ),
+                selection: Binding(
+                    get: { configuration.style.rawValue },
+                    set: { raw in
+                        guard let style = TopShelfConfiguration.Style(rawValue: raw) else { return }
+                        update { $0.style = style }
+                    }
+                ),
+                options: TopShelfConfiguration.Style.allCases.map(\.rawValue),
+                accentColor: accentColor,
+                optionLabel: { raw in
+                    guard let style = TopShelfConfiguration.Style(rawValue: raw),
+                          let label = Self.styleLabels[style] else { return raw }
+                    return L10n.string(label.key, fallback: label.fallback)
+                }
+            )
+
+            chipSection(
+                title: L10n.string("tvos_settings_topshelf_sources", fallback: "Content"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_sources_subtitle",
+                    fallback: "Choose any mix. The carousel shows up to 15 titles, a share from each."
+                )
+            ) {
+                CollectionChipButton(
+                    title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
+                    isSelected: configuration.includesContinueWatching
+                ) { update { $0.includesContinueWatching.toggle() } }
+                CollectionChipButton(
+                    title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
+                    isSelected: configuration.includesUpNext
+                ) { update { $0.includesUpNext.toggle() } }
+                CollectionChipButton(
+                    title: L10n.string("nav_library", fallback: "Library"),
+                    isSelected: configuration.includesLibrary
+                ) { update { $0.includesLibrary.toggle() } }
+            }
+
+            if catalogs.isEmpty {
+                SettingsInfoRow(
+                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                    value: L10n.string("tvos_settings_open_home_once", fallback: "Open Home once")
+                )
+            } else {
+                chipSection(
+                    title: L10n.string("tvos_settings_topshelf_catalogs", fallback: "Home Catalogs"),
+                    subtitle: L10n.string(
+                        "tvos_settings_topshelf_catalogs_subtitle",
+                        fallback: "Shown in Home order. Until you choose, the first Home catalog."
+                    )
+                ) {
+                    ForEach(catalogs, id: \.id) { catalog in
+                        CollectionChipButton(
+                            title: catalog.title ?? catalog.id,
+                            isSelected: isCatalogSelected(catalog.id)
+                        ) { toggleCatalog(catalog.id) }
+                    }
+                }
+            }
+        }
+        .onAppear(perform: loadCatalogs)
+    }
+
+    private func chipSection<Chips: View>(
+        title: String,
+        subtitle: String,
+        @ViewBuilder chips: () -> Chips
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text(title)
+                    .font(.system(size: 24, weight: .semibold))
+                    .foregroundColor(.white)
+                Text(subtitle)
+                    .font(.system(size: 18, weight: .medium))
+                    .foregroundColor(.white.opacity(0.56))
+            }
+            ScrollView(.horizontal, showsIndicators: false) {
+                HStack(spacing: 14) { chips() }
+                    .padding(.horizontal, 4)
+                    .padding(.vertical, 6)
+            }
+            .focusSection()
+        }
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.top, 8)
+        .animation(.easeInOut(duration: 0.2), value: configuration)
+    }
+
+    private func isCatalogSelected(_ id: String) -> Bool {
+        if let ids = configuration.catalogRowIDs { return ids.contains(id) }
+        return id == catalogs.first?.id
+    }
+
+    private func toggleCatalog(_ id: String) {
+        var selected = configuration.catalogRowIDs ?? catalogs.prefix(1).map(\.id)
+        if let index = selected.firstIndex(of: id) {
+            selected.remove(at: index)
+        } else {
+            selected.append(id)
+        }
+        // Home order; a chosen catalog missing from Home right now stays chosen.
+        let offered = catalogs.map(\.id)
+        let ordered = offered.filter(selected.contains) + selected.filter { !offered.contains($0) }
+        update { $0.catalogRowIDs = ordered }
+    }
+
+    private func update(_ change: (inout TopShelfConfiguration) -> Void) {
+        var next = configuration
+        change(&next)
+        next.starringLabel = L10n.string("details_cast", fallback: "Cast")
+        next.directorLabel = L10n.string("details_director", fallback: "Director")
+        configuration = next
+        TopShelfConfigurationStore.save(next)
+    }
+
+    private func loadCatalogs() {
+        configuration = TopShelfConfigurationStore.load()
+        catalogs = (TopShelfFeedStore.read(.catalog)?.catalogRows ?? []).filter { !$0.entries.isEmpty }
     }
 }
 
@@ -9798,6 +9956,22 @@ private struct AdvancedSettingsView: View {
                     action: { showingPlaybackHistory = true }
                 )
                 #endif
+
+                // Whether the app can hand its rows to the Top Shelf extension: a sideloaded
+                // build only can when its signing kept the App Group.
+                SettingsActionRow(
+                    title: L10n.string("tvos_settings_topshelf_status", fallback: "Top Shelf"),
+                    subtitle: L10n.format(
+                        "tvos_settings_topshelf_status_detail",
+                        fallback: "Data shared with the home screen row (App Group %@)",
+                        topShelfAppGroupID
+                    ),
+                    value: TopShelfFeedStore.isAvailable
+                        ? L10n.string("tvos_settings_topshelf_available", fallback: "OK")
+                        : L10n.string("tvos_settings_topshelf_unavailable", fallback: "Unavailable"),
+                    accentColor: accentColor,
+                    action: {}
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("tvos_settings_playback_debug_overlay", fallback: "Playback Debug Overlay"),
