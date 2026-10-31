@@ -8893,9 +8893,28 @@ private struct PlaybackSettingsView: View {
                 title: L10n.string("tvos_settings_seekr_title", fallback: "Seekr"),
                 subtitle: L10n.string(
                     "tvos_settings_seekr_subtitle",
-                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series. With your own key, previews appear instantly and the player reads nothing from the video for them. Titles Seekr doesn't have keep the player's own previews. Get a key by signing up at seekr.tv. During the public beta, each key covers 20 movies and 70 episodes a day."
+                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series. With your own key, previews appear instantly and the player reads nothing from the video for them. Titles Seekr doesn't have keep the player's own previews. Anyone can sign up for a key at seekr.tv/join. During the public beta, each key covers 20 movies and 70 episodes a day. If Seekr works well for you, consider supporting its running costs at buymeacoffee.com/seekrtvdev."
                 )
             ) {
+                HStack(spacing: 48) {
+                    SettingsQRCodeCard(
+                        title: L10n.string("tvos_settings_seekr_join", fallback: "Get a key"),
+                        link: "https://seekr.tv/join"
+                    )
+                    SettingsQRCodeCard(
+                        title: L10n.string("tvos_settings_seekr_support", fallback: "Support Seekr"),
+                        link: "https://buymeacoffee.com/seekrtvdev"
+                    )
+                    Spacer(minLength: 0)
+                }
+                .padding(20)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .settingsGlass(shape: RoundedRectangle(cornerRadius: 24, style: .continuous), isProminent: false)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 24, style: .continuous)
+                        .strokeBorder(Color.white.opacity(0.10), lineWidth: 1)
+                )
+
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
                     subtitle: seekrKeySubtitle,

@@ -86,4 +86,13 @@ final class SeekrTrickplayTests: XCTestCase {
         let base = URL(string: "https://sprites.seekr.tv/603/8280000/thumbnails.vtt?exp=1749123456&sig=abc123")!
         XCTAssertNotNil(WebVTTStoryboardProvider.parse(vttContent: vtt, baseURL: base))
     }
+
+    func testSettingsLinksAsQRCodes() throws {
+        let join = try XCTUnwrap(SettingsQRCode.image(for: "https://seekr.tv/join"))
+        XCTAssertEqual(join.width, join.height)
+        XCTAssertGreaterThanOrEqual(join.width, 21, "a QR code is at least 21 modules wide")
+        XCTAssertTrue(SettingsQRCode.image(for: "https://seekr.tv/join") === join, "made once per link")
+        XCTAssertEqual(SettingsQRCode.displayText(for: "https://buymeacoffee.com/seekrtvdev"), "buymeacoffee.com/seekrtvdev")
+        XCTAssertEqual(SettingsQRCode.displayText(for: "https://seekr.tv/join/"), "seekr.tv/join")
+    }
 }
