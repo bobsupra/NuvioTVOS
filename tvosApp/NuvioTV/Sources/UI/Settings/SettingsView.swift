@@ -3922,6 +3922,7 @@ private struct TopShelfSettingsGroup: View {
         .carouselDetails: ("tvos_settings_topshelf_style_carousel_details", "Carousel with Details"),
         .carouselActions: ("tvos_settings_topshelf_style_carousel", "Carousel"),
         .rows: ("tvos_settings_topshelf_style_rows", "Rows"),
+        .posters: ("tvos_settings_topshelf_style_posters", "Posters"),
     ]
 
     var body: some View {
@@ -3943,7 +3944,7 @@ private struct TopShelfSettingsGroup: View {
                 title: L10n.string("tvos_settings_topshelf_style", fallback: "Style"),
                 subtitle: L10n.string(
                     "tvos_settings_topshelf_style_subtitle",
-                    fallback: "A full-screen carousel, or rows of cards"
+                    fallback: "A full-screen carousel, or rows of cards or posters"
                 ),
                 selection: Binding(
                     get: { configuration.style.rawValue },
@@ -3987,10 +3988,12 @@ private struct TopShelfSettingsGroup: View {
                     title: L10n.string("home_continue_watching", fallback: "Continue Watching"),
                     isSelected: configuration.includesContinueWatching
                 ) { update { $0.includesContinueWatching.toggle() } }
-                TopShelfChipButton(
-                    title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
-                    isSelected: configuration.includesUpNext
-                ) { update { $0.includesUpNext.toggle() } }
+                if !configuration.mergesUpNext {
+                    TopShelfChipButton(
+                        title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized,
+                        isSelected: configuration.includesUpNext
+                    ) { update { $0.includesUpNext.toggle() } }
+                }
                 TopShelfChipButton(
                     title: L10n.string("tvos_settings_topshelf_today", fallback: "Today"),
                     isSelected: configuration.includesToday
@@ -4000,6 +4003,19 @@ private struct TopShelfSettingsGroup: View {
                     isSelected: configuration.includesLibrary
                 ) { update { $0.includesLibrary.toggle() } }
             }
+
+            SettingsToggleRow(
+                title: L10n.string("tvos_settings_topshelf_merge_up_next", fallback: "Up Next in Continue Watching"),
+                subtitle: L10n.string(
+                    "tvos_settings_topshelf_merge_up_next_subtitle",
+                    fallback: "One row, in the order Home shows them"
+                ),
+                isOn: Binding(
+                    get: { configuration.mergesUpNext },
+                    set: { isOn in update { $0.mergesUpNext = isOn } }
+                ),
+                accentColor: accentColor
+            )
 
             if catalogs.isEmpty {
                 SettingsInfoRow(

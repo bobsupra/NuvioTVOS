@@ -8910,7 +8910,7 @@
     "tvos_settings_topshelf_group": "Top Shelf",
     "tvos_settings_topshelf_group_subtitle": "Co ukazuje plocha Apple TV, když je Nuvio v horní řadě Docku",
     "tvos_settings_topshelf_style": "Styl",
-    "tvos_settings_topshelf_style_subtitle": "Celoobrazovkový karusel, nebo řady karet",
+    "tvos_settings_topshelf_style_subtitle": "Celoobrazovkový karusel, nebo řady karet či plakátů",
     "tvos_settings_topshelf_style_carousel_details": "Karusel s popisem",
     "tvos_settings_topshelf_style_carousel": "Karusel",
     "tvos_settings_topshelf_style_rows": "Řady",
@@ -8920,6 +8920,9 @@
     "tvos_settings_topshelf_catalogs_subtitle": "V pořadí jako na Home. Dokud nevybereš, první katalog z Home.",
     "tvos_settings_topshelf_today": "Dnes",
     "tvos_settings_topshelf_trailers": "Trailery",
+    "tvos_settings_topshelf_style_posters": "Plakáty",
+    "tvos_settings_topshelf_merge_up_next": "Spojit Další s Pokračovat ve sledování",
+    "tvos_settings_topshelf_merge_up_next_subtitle": "Jedna řada, v pořadí jako na Home",
     "tvos_settings_topshelf_trailers_subtitle": "Když na titulu chvíli zůstaneš, karusel přehraje jeho trailer v nejlepší dostupné kvalitě"
   },
   "da": {
@@ -17829,7 +17832,7 @@
     "tvos_settings_topshelf_group": "Top Shelf",
     "tvos_settings_topshelf_group_subtitle": "What the Apple TV home screen shows when Nuvio is in the top row of the Dock",
     "tvos_settings_topshelf_style": "Style",
-    "tvos_settings_topshelf_style_subtitle": "A full-screen carousel, or rows of cards",
+    "tvos_settings_topshelf_style_subtitle": "A full-screen carousel, or rows of cards or posters",
     "tvos_settings_topshelf_style_carousel_details": "Carousel with Details",
     "tvos_settings_topshelf_style_carousel": "Carousel",
     "tvos_settings_topshelf_style_rows": "Rows",
@@ -17839,6 +17842,9 @@
     "tvos_settings_topshelf_catalogs_subtitle": "Shown in Home order. Until you choose, the first Home catalog.",
     "tvos_settings_topshelf_today": "Today",
     "tvos_settings_topshelf_trailers": "Trailers",
+    "tvos_settings_topshelf_style_posters": "Posters",
+    "tvos_settings_topshelf_merge_up_next": "Up Next in Continue Watching",
+    "tvos_settings_topshelf_merge_up_next_subtitle": "One row, in the order Home shows them",
     "tvos_settings_topshelf_trailers_subtitle": "Stay on a title and the carousel plays its trailer, in the best quality available"
   },
   "es": {

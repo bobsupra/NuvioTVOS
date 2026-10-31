@@ -91,6 +91,9 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
     public let imdbId: String?
     public let tmdbId: Int?
     public let imdbRating: Double?
+    /// Continue Watching and Up Next: the position on Home's Continue
+    /// Watching row, so the two can share one shelf row in that order.
+    public let homeOrder: Int?
 
     public init(contentId: String, contentType: String, title: String,
                 subtitle: String?, imageURL: String?, backdropURL: String? = nil,
@@ -100,7 +103,8 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
                 releaseDate: String? = nil, runtimeMinutes: Int? = nil,
                 logoURL: String? = nil, cast: [String]? = nil, directors: [String]? = nil,
                 carouselArtworkFileName: String? = nil, airDate: String? = nil,
-                imdbId: String? = nil, tmdbId: Int? = nil, imdbRating: Double? = nil) {
+                imdbId: String? = nil, tmdbId: Int? = nil, imdbRating: Double? = nil,
+                homeOrder: Int? = nil) {
         self.contentId = contentId
         self.contentType = contentType
         self.title = title
@@ -123,11 +127,17 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
         self.imdbId = imdbId
         self.tmdbId = tmdbId
         self.imdbRating = imdbRating
+        self.homeOrder = homeOrder
     }
 
     /// Artwork the card is rendered from: the backdrop, else the poster.
     var artworkSourceURL: String? {
         backdropURL ?? imageURL
+    }
+
+    /// Artwork the poster is rendered from: the poster, else the backdrop.
+    var posterSourceURL: String? {
+        imageURL ?? backdropURL
     }
 
     /// Deep link back into the app. Resumable entries go straight to
@@ -306,11 +316,27 @@ public enum TopShelfFeedStore {
     // carousel at the screen's scale.
     private static let artworkRenderVersion = 4
     private static let carouselRenderVersion = 3
+    private static let posterRenderVersion = 1
     /// Rendered card size. 16:9, large enough for the 2x shelf scale.
     private static let artworkSize = CGSize(width: 1_280, height: 720)
     /// Rendered carousel size: the full screen, in points. Drawn at the
     /// screen's scale, so 3840x2160 pixels on a 4K TV.
     private static let carouselArtworkSize = CGSize(width: 1_920, height: 1_080)
+    /// Rendered poster size, 2:3, in pixels: above what the 2x shelf shows.
+    private static let posterArtworkSize = CGSize(width: 1_000, height: 1_500)
+
+    /// What the configured style shows for each title.
+    enum ArtworkKind {
+        case card, carousel, poster
+
+        init(_ style: TopShelfConfiguration.Style) {
+            switch style {
+            case .carouselDetails, .carouselActions: self = .carousel
+            case .rows: self = .card
+            case .posters: self = .poster
+            }
+        }
+    }
     /// Set by the app: the ratings the carousel shows for a title, in Nuvio's
     /// own sources and order. Nil in the extension, which only reads them.
     public static var ratingsProvider: (@Sendable (TopShelfEntry) async -> [TopShelfRatingBadge])?
@@ -413,7 +439,7 @@ public enum TopShelfFeedStore {
                     TopShelfRatingsStore.write(ratings, in: container)
                 }
             }
-            await cacheArtwork(for: displayed, carousel: configuration.style.isCarousel, ratings: ratings, scale: scale)
+            await cacheArtwork(for: displayed, kind: ArtworkKind(configuration.style), ratings: ratings, scale: scale)
             #endif
             TopShelfArtworkPruner.prune(in: container)
             notifyTopShelfContentChanged()
@@ -431,6 +457,24 @@ public enum TopShelfFeedStore {
     public static func carouselArtworkURL(for entry: TopShelfEntry, ratings: [String: TopShelfRatingsStore.Record]) -> URL? {
         existingArtwork(named: carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges))
             ?? existingArtwork(named: entry.carouselArtworkFileName)
+    }
+
+    /// Resolves the rendered 2:3 poster with its episode/time pill.
+    public static func posterArtworkURL(for entry: TopShelfEntry) -> URL? {
+        existingArtwork(named: posterArtworkName(for: entry))
+    }
+
+    /// The poster render's name, from what is drawn on it. Derived rather than
+    /// stored, so feeds written before posters existed get them too.
+    static func posterArtworkName(for entry: TopShelfEntry) -> String? {
+        guard let source = entry.posterSourceURL else { return nil }
+        return generatedName(for: [
+            "poster",
+            String(posterRenderVersion),
+            entry.contentId,
+            source,
+            entry.subtitle ?? ""
+        ])
     }
 
     /// The ratings saved for the shelf's titles.
@@ -535,25 +579,33 @@ public enum TopShelfFeedStore {
     #if canImport(UIKit)
     private static func cacheArtwork(
         for entries: [TopShelfEntry],
-        carousel: Bool,
+        kind: ArtworkKind,
         ratings: [String: TopShelfRatingsStore.Record],
         scale: CGFloat
     ) async {
         #if DEBUG
         let start = DispatchTime.now().uptimeNanoseconds
-        print("[TVTrace] topShelf.cacheArtwork begin entries=\(entries.count) carousel=\(carousel)")
+        print("[TVTrace] topShelf.cacheArtwork begin entries=\(entries.count) kind=\(kind)")
         #endif
         var icons: [String: UIImage] = [:]
         for entry in entries {
             let badges = ratings[entry.contentId]?.badges ?? []
-            let name = carousel ? carouselImageName(for: entry, badges: badges) : entry.artworkFileName
+            let name: String?
+            switch kind {
+            case .card: name = entry.artworkFileName
+            case .carousel: name = carouselImageName(for: entry, badges: badges)
+            case .poster: name = posterArtworkName(for: entry)
+            }
             guard let name, let container = containerURL else { continue }
             let destination = container.appendingPathComponent(name)
             guard !FileManager.default.fileExists(atPath: destination.path),
-                  let sourceText = entry.artworkSourceURL,
+                  let sourceText = kind == .poster ? entry.posterSourceURL : entry.artworkSourceURL,
                   let image = await downloadedImage(sourceText) else { continue }
             let rendered: Data?
-            if carousel {
+            switch kind {
+            case .poster:
+                rendered = renderedPoster(from: image, subtitle: entry.subtitle)
+            case .carousel:
                 var logo: UIImage?
                 if let logoText = entry.logoURL { logo = await downloadedImage(logoText) }
                 var drawn: [(icon: UIImage?, badge: TopShelfRatingBadge)] = []
@@ -562,7 +614,7 @@ public enum TopShelfFeedStore {
                     drawn.append((icon: icon, badge: badge))
                 }
                 rendered = renderedCarouselArtwork(from: image, logo: logo, ratings: drawn, scale: scale)
-            } else {
+            case .card:
                 rendered = renderedArtwork(from: image, subtitle: entry.subtitle)
             }
             guard let rendered else { continue }
@@ -640,6 +692,53 @@ public enum TopShelfFeedStore {
             )
         }
         return rendered.jpegData(compressionQuality: 0.85)
+    }
+
+    /// Renders a 2:3 poster as the shelf drew it before the 16:9 cards: the
+    /// poster filling the card, the episode and time left in a pill at the
+    /// top (the system draws the progress bar at the bottom). Landscape art
+    /// (no poster) sits centered over a dimmed, filled copy of itself.
+    private static func renderedPoster(from image: UIImage, subtitle: String?) -> Data? {
+        let size = posterArtworkSize
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let rendered = renderer.image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            let fillRect = aspectRect(for: image.size, in: size, fill: true)
+            if image.size.height >= image.size.width * 1.2 {
+                image.draw(in: fillRect)
+            } else {
+                image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)
+                image.draw(in: aspectRect(for: image.size, in: size, fill: false))
+            }
+
+            guard let subtitle else { return }
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 44, weight: .bold),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: style
+            ]
+            let textSize = (subtitle as NSString).size(withAttributes: attributes)
+            let horizontalPadding: CGFloat = 72
+            let pillWidth = min(size.width - 88, ceil(textSize.width) + horizontalPadding)
+            let pillHeight = max(108, ceil(textSize.height) + 36)
+            let pillRect = CGRect(x: (size.width - pillWidth) / 2, y: 44, width: pillWidth, height: pillHeight)
+            UIColor.black.withAlphaComponent(0.76).setFill()
+            UIBezierPath(roundedRect: pillRect, cornerRadius: pillHeight / 2).fill()
+            subtitle.draw(
+                in: CGRect(
+                    x: pillRect.minX + horizontalPadding / 2,
+                    y: pillRect.midY - ceil(textSize.height) / 2,
+                    width: pillRect.width - horizontalPadding,
+                    height: ceil(textSize.height)),
+                withAttributes: attributes)
+        }
+        return rendered.jpegData(compressionQuality: 0.88)
     }
 
     /// Where the logo's center sits, as a fraction of the image height. Logo
@@ -798,7 +897,8 @@ enum TopShelfArtworkPruner {
                 [
                     entry.artworkFileName,
                     entry.carouselArtworkFileName,
-                    TopShelfFeedStore.carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges)
+                    TopShelfFeedStore.carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges),
+                    TopShelfFeedStore.posterArtworkName(for: entry)
                 ].compactMap { $0 }
             })
             guard let files = try? FileManager.default.contentsOfDirectory(

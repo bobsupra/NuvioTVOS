@@ -3,7 +3,8 @@ import TVServices
 /// Populates the Apple TV home-screen Top Shelf from the sections the main app
 /// mirrors into the shared App Group (Continue Watching, Up Next, Library and
 /// the Home catalog rows), laid out as chosen in the app's Settings: a
-/// full-screen carousel, which can play each title's trailer, or labeled rows.
+/// full-screen carousel, which can play each title's trailer, or labeled rows
+/// of 16:9 cards or 2:3 posters.
 /// Reads `TopShelfFeedStore` and `TopShelfComposer` (`TopShelfFeed.swift`,
 /// `TopShelfLayout.swift`); trailers come from `TopShelfTrailerResolver`
 /// (`TopShelfTrailers.swift`).
@@ -44,9 +45,12 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
                     for: slots.map(\.entry), in: TopShelfFeedStore.containerURL)
                 completionHandler(Self.carousel(slots, configuration: configuration, ratings: ratings, trailers: trailers))
             }
-        case .rows:
+        case .rows, .posters:
+            let posters = configuration.style == .posters
             let collections = rows.map { row -> TVTopShelfItemCollection<TVTopShelfSectionedItem> in
-                let collection = TVTopShelfItemCollection(items: row.entries.map { Self.sectionedItem(for: $0, rowID: row.id) })
+                let collection = TVTopShelfItemCollection(items: row.entries.map {
+                    Self.sectionedItem(for: $0, rowID: row.id, poster: posters)
+                })
                 collection.title = row.title ?? Self.fallbackTitles[row.section]
                 return collection
             }
@@ -54,14 +58,16 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         }
     }
 
-    private static func sectionedItem(for entry: TopShelfEntry, rowID: String) -> TVTopShelfSectionedItem {
+    private static func sectionedItem(for entry: TopShelfEntry, rowID: String, poster: Bool) -> TVTopShelfSectionedItem {
         // A title can sit on more than one row (e.g. Library and a catalog).
         let item = TVTopShelfSectionedItem(identifier: "\(rowID):\(entry.contentId)")
         item.title = entry.title
-        item.imageShape = .hdtv
+        item.imageShape = poster ? .poster : .hdtv
 
-        let imageURL = TopShelfFeedStore.artworkURL(for: entry)
-            ?? entry.artworkSourceURL.flatMap(URL.init(string:))
+        // The rendered card or poster; the raw artwork stands in until it exists.
+        let imageURL = poster
+            ? TopShelfFeedStore.posterArtworkURL(for: entry) ?? entry.posterSourceURL.flatMap(URL.init(string:))
+            : TopShelfFeedStore.artworkURL(for: entry) ?? entry.artworkSourceURL.flatMap(URL.init(string:))
         if let url = imageURL {
             item.setImageURL(url, for: .screenScale1x)
             item.setImageURL(url, for: .screenScale2x)

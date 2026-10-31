@@ -15,15 +15,20 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         case carouselDetails
         /// Full-screen carousel with the title and the two buttons only.
         case carouselActions
-        /// Labeled rows of cards, one per source.
+        /// Labeled rows of 16:9 cards, one per source.
         case rows
+        /// Labeled rows of 2:3 posters, one per source (the shelf before the
+        /// 16:9 cards).
+        case posters
 
-        public var isCarousel: Bool { self != .rows }
+        public var isCarousel: Bool { self == .carouselDetails || self == .carouselActions }
     }
 
     public var style: Style
     public var includesContinueWatching: Bool
     public var includesUpNext: Bool
+    /// Up Next shares the Continue Watching row, in Home's order, as on Home.
+    public var mergesUpNext: Bool
     /// The calendar's titles coming out today.
     public var includesToday: Bool
     public var includesLibrary: Bool
@@ -41,6 +46,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         style: Style = .carouselDetails,
         includesContinueWatching: Bool = true,
         includesUpNext: Bool = true,
+        mergesUpNext: Bool = false,
         includesToday: Bool = true,
         includesLibrary: Bool = true,
         catalogRowIDs: [String]? = nil,
@@ -51,6 +57,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         self.style = style
         self.includesContinueWatching = includesContinueWatching
         self.includesUpNext = includesUpNext
+        self.mergesUpNext = mergesUpNext
         self.includesToday = includesToday
         self.includesLibrary = includesLibrary
         self.catalogRowIDs = catalogRowIDs
@@ -62,7 +69,7 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
     public static let `default` = TopShelfConfiguration()
 
     private enum CodingKeys: String, CodingKey {
-        case style, includesContinueWatching, includesUpNext, includesToday, includesLibrary
+        case style, includesContinueWatching, includesUpNext, mergesUpNext, includesToday, includesLibrary
         case catalogRowIDs, playsTrailers, starringLabel, directorLabel
     }
 
@@ -76,6 +83,8 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
             ?? fallback.includesContinueWatching
         includesUpNext = (try? container.decodeIfPresent(Bool.self, forKey: .includesUpNext))
             ?? fallback.includesUpNext
+        mergesUpNext = (try? container.decodeIfPresent(Bool.self, forKey: .mergesUpNext))
+            ?? fallback.mergesUpNext
         includesToday = (try? container.decodeIfPresent(Bool.self, forKey: .includesToday))
             ?? fallback.includesToday
         includesLibrary = (try? container.decodeIfPresent(Bool.self, forKey: .includesLibrary))
@@ -181,6 +190,7 @@ public enum TopShelfComposer {
     /// The chosen sources in shelf order: Continue Watching, Up Next, Today,
     /// Library, then the chosen Home catalogs in Home order. Empty sources are
     /// left out, and so are Today's titles once their day (`today`) passed.
+    /// Merged, Up Next joins the Continue Watching row and has none of its own.
     public static func rows(
         configuration: TopShelfConfiguration,
         today: String = TopShelfComposer.day(of: Date()),
@@ -189,12 +199,21 @@ public enum TopShelfComposer {
         var rows: [TopShelfRow] = []
         let fixed: [(TopShelfSection, Bool)] = [
             (.continueWatching, configuration.includesContinueWatching),
-            (.upNext, configuration.includesUpNext),
+            (.upNext, configuration.includesUpNext && !configuration.mergesUpNext),
             (.today, configuration.includesToday),
             (.library, configuration.includesLibrary),
         ]
         for (section, included) in fixed {
-            guard included, let sectionFeed = feed(section) else { continue }
+            guard included else { continue }
+            if section == .continueWatching, configuration.mergesUpNext {
+                let inProgress = feed(.continueWatching)
+                let entries = homeOrdered(inProgress?.entries ?? [], feed(.upNext)?.entries ?? [])
+                guard !entries.isEmpty else { continue }
+                rows.append(TopShelfRow(
+                    id: section.rawValue, section: section, title: inProgress?.title, entries: entries))
+                continue
+            }
+            guard let sectionFeed = feed(section) else { continue }
             let entries = section == .today
                 ? sectionFeed.entries.filter { $0.airDate == nil || $0.airDate == today }
                 : sectionFeed.entries
@@ -219,6 +238,17 @@ public enum TopShelfComposer {
                 section: .catalog, title: row.title, entries: row.entries))
         }
         return rows
+    }
+
+    /// Continue Watching and Up Next as one list, in the order Home shows them.
+    /// Feeds written before that order was kept: in progress first.
+    static func homeOrdered(_ inProgress: [TopShelfEntry], _ upNext: [TopShelfEntry]) -> [TopShelfEntry] {
+        var seen = Set<String>()
+        let combined = (inProgress + upNext).filter { seen.insert($0.contentId).inserted }
+        guard combined.allSatisfy({ $0.homeOrder != nil }) else { return combined }
+        return combined.enumerated()
+            .sorted { ($0.element.homeOrder ?? 0, $0.offset) < ($1.element.homeOrder ?? 0, $1.offset) }
+            .map(\.element)
     }
 
     /// The local calendar day of `date`, as Today entries carry it.
@@ -275,7 +305,8 @@ public enum TopShelfComposer {
         }
     }
 
-    /// The entries that get artwork rendered for the configured style.
+    /// The entries that get artwork rendered for the configured style: the
+    /// carousel's picks, else every row's entries.
     public static func displayedEntries(
         configuration: TopShelfConfiguration,
         rows: [TopShelfRow]

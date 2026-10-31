@@ -7,7 +7,7 @@ import Foundation
 extension TopShelfEntry {
     /// A shelf entry for `meta`, carrying what the carousel details show.
     init(meta: NuvioMeta, subtitle: String?, progress: Double?, action: TopShelfEntryAction,
-         airDate: String? = nil) {
+         airDate: String? = nil, homeOrder: Int? = nil) {
         self.init(
             contentId: meta.id,
             contentType: meta.type,
@@ -28,7 +28,8 @@ extension TopShelfEntry {
             airDate: airDate,
             imdbId: meta.imdbId,
             tmdbId: meta.tmdbId,
-            imdbRating: meta.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+            imdbRating: meta.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil },
+            homeOrder: homeOrder
         )
     }
 

@@ -219,6 +219,90 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertTrue(remaining.isDisjoint(with: [hiddenCard, hiddenCarousel]))
     }
 
+    func testPruningKeepsThePostersOfShownTitles() throws {
+        let directory = FileManager.default.temporaryDirectory.appendingPathComponent("topshelf-posters-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: false)
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let shown = posterEntry("tt-a", poster: "https://image.tmdb.org/t/p/w500/a.jpg")
+        let hidden = posterEntry("tt-b", poster: "https://image.tmdb.org/t/p/w500/b.jpg")
+        let shownPoster = try XCTUnwrap(TopShelfFeedStore.posterArtworkName(for: shown))
+        let hiddenPoster = try XCTUnwrap(TopShelfFeedStore.posterArtworkName(for: hidden))
+        for name in [shownPoster, hiddenPoster] {
+            try Data([1]).write(to: directory.appendingPathComponent(name))
+        }
+        let feed = TopShelfFeed(entries: [], rows: [
+            TopShelfFeedRow(id: "popular", title: "Popular", entries: [shown]),
+            TopShelfFeedRow(id: "trending", title: "Trending", entries: [hidden]),
+        ])
+        try JSONEncoder().encode(feed).write(to: directory.appendingPathComponent(TopShelfSection.catalog.feedFileName))
+        TopShelfConfigurationStore.write(TopShelfConfiguration(style: .posters, catalogRowIDs: ["popular"]), in: directory)
+
+        TopShelfArtworkPruner.prune(in: directory)
+
+        let remaining = Set(try FileManager.default.contentsOfDirectory(atPath: directory.path))
+        XCTAssertTrue(remaining.contains(shownPoster))
+        XCTAssertFalse(remaining.contains(hiddenPoster))
+    }
+
+    // MARK: Posters
+
+    func testPostersAreRowsOfEveryChosenTitle() throws {
+        let posters = try JSONDecoder().decode(TopShelfConfiguration.self, from: Data(#"{"style":"posters"}"#.utf8))
+        XCTAssertEqual(posters.style, .posters)
+        XCTAssertFalse(posters.style.isCarousel)
+        XCTAssertTrue(TopShelfConfiguration.Style.carouselActions.isCarousel)
+        let feeds = makeFeeds()
+        let rows = TopShelfComposer.rows(configuration: posters) { feeds[$0] }
+        XCTAssertEqual(TopShelfComposer.displayedEntries(configuration: posters, rows: rows).count,
+                       rows.flatMap(\.entries).count)
+    }
+
+    func testPosterIsDrawnFromThePosterAndRedrawnForANewPill() {
+        let poster = posterEntry("tt1", poster: "https://image.tmdb.org/t/p/w500/p.jpg",
+                                 backdrop: "https://image.tmdb.org/t/p/w1280/b.jpg")
+        XCTAssertEqual(poster.posterSourceURL, "https://image.tmdb.org/t/p/w500/p.jpg")
+        let backdropOnly = posterEntry("tt1", poster: nil, backdrop: "https://image.tmdb.org/t/p/w1280/b.jpg")
+        XCTAssertEqual(backdropOnly.posterSourceURL, "https://image.tmdb.org/t/p/w1280/b.jpg")
+        XCTAssertNil(TopShelfFeedStore.posterArtworkName(for: posterEntry("tt1", poster: nil)))
+
+        let name = TopShelfFeedStore.posterArtworkName(for: poster)
+        XCTAssertEqual(name, TopShelfFeedStore.posterArtworkName(for: poster))
+        XCTAssertNotEqual(name, TopShelfFeedStore.posterArtworkName(
+            for: posterEntry("tt1", poster: "https://image.tmdb.org/t/p/w500/p.jpg",
+                             backdrop: "https://image.tmdb.org/t/p/w1280/b.jpg", subtitle: "S1 · E2")))
+        XCTAssertTrue(name?.hasPrefix("top-shelf-") == true)
+    }
+
+    func testMergedUpNextSharesContinueWatchingInHomeOrder() {
+        func item(_ id: String, _ order: Int?) -> TopShelfEntry {
+            TopShelfEntry(contentId: id, contentType: "series", title: id, subtitle: nil, imageURL: nil,
+                          progress: nil, homeOrder: order)
+        }
+        let feeds: [TopShelfSection: TopShelfFeed] = [
+            .continueWatching: TopShelfFeed(entries: [item("a", 0), item("c", 3)], title: "Continue Watching"),
+            .upNext: TopShelfFeed(entries: [item("b", 1), item("d", 4), item("a", 2)], title: "Up Next"),
+        ]
+        var configuration = TopShelfConfiguration(mergesUpNext: true)
+        let merged = TopShelfComposer.rows(configuration: configuration) { feeds[$0] }
+        XCTAssertEqual(merged.map(\.id), ["continueWatching"])
+        XCTAssertEqual(merged.first?.title, "Continue Watching")
+        XCTAssertEqual(merged.first?.entries.map(\.contentId), ["a", "b", "c", "d"])
+
+        configuration.mergesUpNext = false
+        XCTAssertEqual(TopShelfComposer.rows(configuration: configuration) { feeds[$0] }.map(\.id),
+                       ["continueWatching", "upNext"])
+        // Up Next alone still shows, in the merged row.
+        configuration = TopShelfConfiguration(mergesUpNext: true)
+        let upNextOnly = TopShelfComposer.rows(configuration: configuration) { $0 == .upNext ? feeds[$0] : nil }
+        XCTAssertEqual(upNextOnly.first?.entries.map(\.contentId), ["b", "a", "d"])
+    }
+
+    func testMergedUpNextFromAnOlderFeedFollowsContinueWatching() {
+        let merged = TopShelfComposer.homeOrdered(entries("cw", count: 2), entries("next", count: 2))
+        XCTAssertEqual(merged.map(\.contentId), ["cw-0", "cw-1", "next-0", "next-1"])
+        XCTAssertFalse(TopShelfConfiguration.default.mergesUpNext)
+    }
+
     // MARK: Trailers
 
     func testTrailersArePlayedUnlessTurnedOff() throws {
@@ -333,6 +417,12 @@ final class TopShelfLayoutTests: XCTestCase {
 
     private func entries(_ prefix: String, count: Int) -> [TopShelfEntry] {
         (0..<count).map { entry("\(prefix)-\($0)") }
+    }
+
+    private func posterEntry(_ id: String, poster: String?, backdrop: String? = nil,
+                             subtitle: String? = nil) -> TopShelfEntry {
+        TopShelfEntry(contentId: id, contentType: "movie", title: id, subtitle: subtitle, imageURL: poster,
+                      backdropURL: backdrop, progress: nil, action: .details)
     }
 
     private func entry(_ id: String) -> TopShelfEntry {
