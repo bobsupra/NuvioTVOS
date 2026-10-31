@@ -56,6 +56,42 @@ rm -rf "$OUTPUT_DIR/Payload" "$OUTPUT_DIR"/*.ipa
 mkdir -p "$OUTPUT_DIR/Payload"
 cp -R "$APP_PATH" "$OUTPUT_DIR/Payload/"
 
+# The archive is built without entitlements, so a sideloader re-signing the IPA
+# finds no App Group to register, and the Top Shelf extension never sees the
+# rows the app writes (the shelf shows only the app's name). Pseudo-sign the
+# app and its extensions with just the App Group from TopShelf.entitlements;
+# sideloaders read it when they re-sign. The other entitlements stay out, as a
+# free developer account can't provide them.
+APP_GROUP=$(/usr/libexec/PlistBuddy -c "Print :com.apple.security.application-groups:0" \
+  "$ROOT_DIR/tvosApp/TopShelf/TopShelf.entitlements" 2>/dev/null || true)
+if [[ -z "$APP_GROUP" ]]; then
+  echo "warning: no App Group in TopShelf.entitlements; the Top Shelf will stay empty after sideloading." >&2
+elif ! command -v ldid >/dev/null 2>&1; then
+  echo "warning: ldid not found (brew install ldid); the IPA has no App Group, so the Top Shelf will stay empty after sideloading." >&2
+else
+  echo "==> Embedding App Group ${APP_GROUP} (Top Shelf)..."
+  GROUP_ENTITLEMENTS="$(dirname "$ARCHIVE_DIR")/app-group.entitlements"
+  cat > "$GROUP_ENTITLEMENTS" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>${APP_GROUP}</string>
+	</array>
+</dict>
+</plist>
+PLIST
+  PAYLOAD_APP="$OUTPUT_DIR/Payload/NuvioTV.app"
+  # Extensions first: signing the app seals what it contains.
+  for BUNDLE in "$PAYLOAD_APP"/PlugIns/*.appex "$PAYLOAD_APP"; do
+    [[ -d "$BUNDLE" ]] || continue
+    EXECUTABLE=$(/usr/libexec/PlistBuddy -c "Print :CFBundleExecutable" "$BUNDLE/Info.plist")
+    ldid -S"$GROUP_ENTITLEMENTS" "$BUNDLE/$EXECUTABLE"
+  done
+fi
+
 (
   cd "$OUTPUT_DIR"
   zip -qry "NuvioTV-unsigned.ipa" Payload
