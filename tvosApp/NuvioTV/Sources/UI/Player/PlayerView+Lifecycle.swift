@@ -264,6 +264,18 @@ extension PlayerView {
     /// so each of these hands focus to whichever layer is now on top.
     var layersObservingFocus: some View {
         layersObservingPlayback
+            .onAppear {
+                guard viewModel.activeEngineKind == .mpv else { return }
+                viewModel.playerController.setPlayerControlsVisible(arePlaybackControlsVisible)
+            }
+            .onChange(of: arePlaybackControlsVisible) { _, isVisible in
+                guard viewModel.activeEngineKind == .mpv else { return }
+                viewModel.playerController.setPlayerControlsVisible(isVisible)
+            }
+            .onChange(of: viewModel.activeEngineKind) { _, engineKind in
+                guard engineKind == .mpv else { return }
+                viewModel.playerController.setPlayerControlsVisible(arePlaybackControlsVisible)
+            }
             .onChange(of: remoteInputFocused) { _, isFocused in
                 PlaybackTimelineRecorder.record(
                     isFocused ? .focusSinkFocused : .focusSinkUnfocused,

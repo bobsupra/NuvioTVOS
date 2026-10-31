@@ -95,7 +95,6 @@ struct SceneSongCard: View {
             .padding(.vertical, 16)
             .frame(width: 480, height: 236)
             .modifier(TvDetailsGlassBackground(filled: isCardFocused, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
-            .shadow(color: Color.black.opacity(isCardFocused ? 0.22 : 0.25), radius: isCardFocused ? 10 : 6, y: isCardFocused ? 5 : 3)
         }
         .buttonStyle(PosterCardButtonStyle())
         .focusEffectDisabledIfAvailable()

@@ -1,6 +1,11 @@
 import SwiftUI
 import AetherEngine
 
+enum PlayerSubtitleLayoutMetrics {
+    // Keeps the same subtitle-to-first-tab gap as InSight above the controls row.
+    static let controlsVisibleLiftPoints: CGFloat = 252
+}
+
 /// Host-rendered subtitle layer for Aether sessions.
 /// Placed above the video surface and below transport controls.
 struct PlayerSubtitleOverlay: View {
@@ -10,6 +15,7 @@ struct PlayerSubtitleOverlay: View {
     let videoNaturalSize: CGSize
     let aspectMode: PlayerAspectMode
     let style: SubtitleStyle
+    let controlsVisible: Bool
 
     private var textSize: CGFloat {
         min(max(CGFloat(style.textSize) / 100 * 55, 2), 125)
@@ -20,6 +26,9 @@ struct PlayerSubtitleOverlay: View {
         return min(configured, max(0.5, textSize * 0.3))
     }
     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
+    private var controlsVisibleOffset: CGFloat {
+        controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
+    }
     private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
@@ -151,6 +160,8 @@ struct PlayerSubtitleOverlay: View {
             }
             .frame(width: geo.size.width, height: geo.size.height)
         }
+        .offset(y: controlsVisibleOffset)
+        .animation(.easeInOut(duration: 0.22), value: controlsVisible)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }
@@ -264,6 +275,7 @@ struct MPVSubtitleOverlay: View {
     let videoNaturalSize: CGSize
     let aspectMode: PlayerAspectMode
     let style: SubtitleStyle
+    let controlsVisible: Bool
 
     private var textSize: CGFloat {
         min(max(CGFloat(style.textSize) / 100 * 55, 2), 125)
@@ -274,6 +286,9 @@ struct MPVSubtitleOverlay: View {
         return min(configured, max(0.5, textSize * 0.3))
     }
     private var isTopAligned: Bool { style.verticalAlignment.caseInsensitiveCompare("Top") == .orderedSame }
+    private var controlsVisibleOffset: CGFloat {
+        controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
+    }
     private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
@@ -317,6 +332,8 @@ struct MPVSubtitleOverlay: View {
                 )
             }
         }
+        .offset(y: controlsVisibleOffset)
+        .animation(.easeInOut(duration: 0.22), value: controlsVisible)
         .allowsHitTesting(false)
         .accessibilityHidden(true)
     }

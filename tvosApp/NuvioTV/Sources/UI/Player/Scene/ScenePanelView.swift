@@ -89,6 +89,7 @@ struct ScenePanelView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
         }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
         .onExitCommand {
             onDismiss()
         }
@@ -503,7 +504,6 @@ struct ScenePanelView: View {
                     .padding(.vertical, 16)
                     .frame(height: 256)
                     .modifier(TvDetailsGlassBackground(filled: isNextFocused, shape: RoundedRectangle(cornerRadius: 32, style: .continuous)))
-                    .shadow(color: Color.black.opacity(isNextFocused ? 0.22 : 0.25), radius: isNextFocused ? 10 : 6, y: isNextFocused ? 5 : 3)
                 }
                 .buttonStyle(PosterCardButtonStyle())
                 .focused($focusedCardID, equals: "upNext")

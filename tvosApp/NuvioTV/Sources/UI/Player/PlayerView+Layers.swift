@@ -14,16 +14,28 @@ enum PlayerWindowInputCapturePolicy {
     }
 }
 
-// The ZStack children of PlayerView.body, one property per original child so
-// the stack's arity and child order — and therefore SwiftUI's view identity and
-// transitions — are exactly as before.
+// Keep each PlayerView layer in a named property so the ZStack order stays explicit.
 extension PlayerView {
+    var arePlaybackControlsVisible: Bool {
+        (viewModel.showControls || viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0)
+            && !viewModel.showScenePanel
+            && !viewModel.isSceneDetailVisible
+            && !viewModel.showSettingsPanel
+            && !viewModel.showPauseOverlay
+            && !isLoadingOverlayVisible
+    }
+
+    private var isPlayerBottomFadeVisible: Bool {
+        arePlaybackControlsVisible || viewModel.showScenePanel || viewModel.isSceneDetailVisible
+    }
+
     @ViewBuilder
     var playerLayers: some View {
         ZStack {
             Color.black.ignoresSafeArea()
 
             videoSurfaceLayer
+            playerBottomFadeLayer
             postPlayRecommendationLayer
             remoteTouchCatcherLayer
             remoteSeekPressCatcherLayer
@@ -42,6 +54,13 @@ extension PlayerView {
             sidePanelLayer
             debugOverlayLayer
         }
+    }
+
+    var playerBottomFadeLayer: some View {
+        PlayerBottomFade()
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
+            .opacity(isPlayerBottomFadeVisible ? 1 : 0)
+            .animation(.easeInOut(duration: 0.2), value: isPlayerBottomFadeVisible)
     }
 
     @ViewBuilder
@@ -100,7 +119,8 @@ extension PlayerView {
                     subtitleDelaySeconds: Double(viewModel.subtitleDelayMs) / 1000.0,
                     videoNaturalSize: viewModel.videoNaturalSize,
                     aspectMode: viewModel.aspectMode,
-                    style: viewModel.subtitleStyle
+                    style: viewModel.subtitleStyle,
+                    controlsVisible: arePlaybackControlsVisible
                 )
                 .offset(y: viewModel.showScenePanel ? -430 : 0)
                 .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
@@ -109,7 +129,8 @@ extension PlayerView {
                     translation: viewModel.playerController.subtitleTranslationState,
                     videoNaturalSize: viewModel.videoNaturalSize,
                     aspectMode: viewModel.aspectMode,
-                    style: viewModel.subtitleStyle
+                    style: viewModel.subtitleStyle,
+                    controlsVisible: arePlaybackControlsVisible
                 )
                 .offset(y: viewModel.showScenePanel ? -430 : 0)
                 .ignoresSafeArea(edges: viewModel.postPlayState.isVisible ? [] : .all)
@@ -505,7 +526,7 @@ extension PlayerView {
                 }()
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))
-            .zIndex(15)
+            .zIndex(21)
         }
     }
 
@@ -521,7 +542,7 @@ extension PlayerView {
                 }
             )
             .transition(.opacity)
-            .zIndex(16)
+            .zIndex(22)
         }
     }
 
@@ -606,7 +627,7 @@ extension PlayerView {
             }
             .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottomLeading)
             .padding(.leading, 60)
-            .padding(.bottom, viewModel.showControls ? 120 : 54)
+            .padding(.bottom, viewModel.showControls ? 208 : 54)
             .transition(.move(edge: .bottom).combined(with: .opacity))
             .zIndex(3)
         }
@@ -746,6 +767,10 @@ extension PlayerView {
     var playerControlsLayer: some View {
         if viewModel.currentErrorDiagnostic == nil {
             let isSeekingOrControlsVisible = (viewModel.showControls || viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0) && !viewModel.showScenePanel && !viewModel.isSceneDetailVisible
+            let shouldShowControls = isSeekingOrControlsVisible
+                && !isLoadingOverlayVisible
+                && !viewModel.showSettingsPanel
+                && !viewModel.showPauseOverlay
             PlayerControls(
                 viewModel: viewModel,
                 didReportPlaybackStarted: didReportPlaybackStarted,
@@ -756,39 +781,11 @@ extension PlayerView {
                 onFocusNextEpisode: { focusNextEpisode(allowWhenControlsVisible: true) }
             )
             .offset(y: viewModel.showScenePanel ? -160 : 0)
-            .opacity(
-                isSeekingOrControlsVisible
-                    && !isLoadingOverlayVisible
-                    && !viewModel.showSettingsPanel
-                    && !viewModel.showPauseOverlay
-                ? 1 : 0
-            )
-            .scaleEffect(
-                isSeekingOrControlsVisible
-                    && !isLoadingOverlayVisible
-                    && !viewModel.showSettingsPanel
-                    && !viewModel.showPauseOverlay
-                ? 1 : 0.95
-            )
-            .allowsHitTesting(
-                isSeekingOrControlsVisible
-                    && !isLoadingOverlayVisible
-                    && !viewModel.showSettingsPanel
-                    && !viewModel.showPauseOverlay
-            )
-            .disabled(!isSeekingOrControlsVisible || isLoadingOverlayVisible || viewModel.showScenePanel || viewModel.isSceneDetailVisible)
-            .animation(.playerControls, value: viewModel.showControls)
-            .animation(.playerControls, value: didReportPlaybackStarted)
-            .animation(.playerControls, value: viewModel.isSwitchingSource)
-            .animation(.playerControls, value: viewModel.isAwaitingStreamStart)
-            .animation(.playerControls, value: viewModel.isAdvancingEpisode)
-            .animation(.playerControls, value: viewModel.showSettingsPanel)
-            .animation(.playerControls, value: viewModel.isScrubbing)
-            .animation(.playerControls, value: viewModel.isHoldingSeek)
-            .animation(.playerControls, value: viewModel.pendingSeekDelta)
-            .animation(.playerControls, value: viewModel.showPauseOverlay)
-            .animation(.playerControls, value: viewModel.showScenePanel)
-            .animation(.playerControls, value: viewModel.isSceneDetailVisible)
+            .opacity(shouldShowControls ? 1 : 0)
+            .allowsHitTesting(shouldShowControls)
+            .disabled(!shouldShowControls)
+            .animation(.easeInOut(duration: 0.2), value: shouldShowControls)
+            .animation(.easeInOut(duration: 0.2), value: viewModel.showScenePanel)
             .zIndex(20)
         }
     }

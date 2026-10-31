@@ -6063,7 +6063,6 @@ private struct TrailerSubtitleMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -6117,7 +6116,6 @@ private struct TrailerAudioMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -6206,6 +6204,10 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
             }
             .ignoresSafeArea()
 
+            PlayerBottomFade()
+                .opacity(showControls ? 1 : 0)
+                .animation(.easeInOut(duration: 0.2), value: showControls)
+
             // 3. Loading Indicator if preparing
             if !isReady && !isSurfaceReady {
                 VStack(spacing: 18) {
@@ -6247,31 +6249,19 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
             }
 
             // 5. Aether-style Player Controls Overlay
-            if showControls {
-                GlassControlsContainer {
-                    VStack {
-                        topBar
-                        Spacer()
-                        bottomControls
-                    }
-                    .onExitCommand(perform: handleControlsExit)
+            GlassControlsContainer {
+                VStack {
+                    Spacer(minLength: 0)
+                    bottomControls
                 }
-                .background(
-                    LinearGradient(
-                        stops: [
-                            .init(color: Color.black.opacity(0.72), location: 0),
-                            .init(color: Color.clear, location: 0.22),
-                            .init(color: Color.clear, location: 0.78),
-                            .init(color: Color.black.opacity(0.85), location: 1.0)
-                        ],
-                        startPoint: .top,
-                        endPoint: .bottom
-                    )
-                    .ignoresSafeArea()
-                    .allowsHitTesting(false)
-                )
-                .transition(.opacity)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .onExitCommand(perform: handleControlsExit)
             }
+            .opacity(showControls ? 1 : 0)
+            .allowsHitTesting(showControls)
+            .disabled(!showControls)
+            .accessibilityHidden(!showControls)
+            .animation(.easeInOut(duration: 0.2), value: showControls)
         }
         .onAppear {
             setupTimeObserver()
@@ -6334,55 +6324,40 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
         }
     }
 
-    // MARK: - Top bar
+    // MARK: - Playback title
 
-    private var topBar: some View {
-        Group {
-            if !isSeekingOrScrubbing {
-                VStack(spacing: 12) {
-                    HStack(alignment: .top, spacing: 24) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(meta.name)
-                                .font(.system(size: 38, weight: .bold))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
+    private var playbackTitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(spacing: 8) {
+                Text(L10n.string("details_trailer", fallback: "Trailer"))
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundColor(.white.opacity(0.76))
 
-                            HStack(spacing: 8) {
-                                Text(L10n.string("details_trailer", fallback: "Trailer"))
-                                    .font(.system(size: 21, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.68))
-                                    .lineLimit(1)
-
-                                if let year = meta.year {
-                                    Text("•")
-                                        .font(.system(size: 21, weight: .medium))
-                                        .foregroundColor(.white.opacity(0.4))
-                                    Text(String(year))
-                                        .font(.system(size: 21, weight: .medium))
-                                        .foregroundColor(.white.opacity(0.68))
-                                }
-                            }
-                        }
-
-                        Spacer()
-                    }
+                if let year = meta.year {
+                    Text("•")
+                        .font(.system(size: 21, weight: .medium))
+                        .foregroundColor(.white.opacity(0.48))
+                    Text(String(year))
+                        .font(.system(size: 21, weight: .medium))
+                        .foregroundColor(.white.opacity(0.76))
                 }
-                .padding(.horizontal, 60)
-                .padding(.top, 34)
-                .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
-                .transition(.opacity)
             }
+
+            Text(meta.name)
+                .font(.system(size: 38, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
         }
-        .animation(.playerControls, value: isSeekingOrScrubbing)
     }
 
     // MARK: - Bottom controls
 
     private var bottomControls: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if !isSeekingOrScrubbing {
+        VStack(alignment: .leading, spacing: 24) {
+            HStack(alignment: .bottom, spacing: 24) {
+                playbackTitle
+                Spacer(minLength: 24)
                 transportRow
-                    .transition(.opacity)
             }
             timelineBar
         }
@@ -6393,8 +6368,6 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
 
     private var transportRow: some View {
         HStack(spacing: 18) {
-            Spacer()
-
             TrailerSubtitleMenuButton(
                 noneOption: subtitleNoneOption,
                 options: subtitleOptions,
@@ -6427,7 +6400,6 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
             }
         }
         .onExitCommand(perform: handleControlsExit)
-        .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
     }
 
     private func glassIconButton<Icon: View>(
@@ -6448,7 +6420,6 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: size, height: size)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -6472,7 +6443,7 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
             GeometryReader { geo in
                 let w = geo.size.width
                 let targetX = min(max(w * progress, 0), w)
-                let trackHeight: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? 10 : 7
+                let trackHeight: CGFloat = 10
                 let h: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? trackHeight + 2 : trackHeight
                 let needleHeight: CGFloat = 22
                 let originalProgress = CGFloat(min(max(currentTime / max(duration, 0.001), 0), 1))
@@ -6502,12 +6473,11 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
                         Rectangle()
                             .fill(Color.white)
                             .frame(width: 2, height: needleHeight)
-                            .shadow(color: .black.opacity(0.45), radius: 1.5)
                             .position(x: targetX, y: bottomOfTrack - needleHeight / 2)
                     }
                 }
             }
-            .frame(height: (isTimelineFocused || isSeekingOrScrubbing) ? 16 : 11)
+            .frame(height: 16)
 
             if isSeekingOrScrubbing {
                 GeometryReader { geo in
@@ -6515,7 +6485,7 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
                     let targetX = min(max(w * progress, 60), w - 60)
                     HStack(spacing: 8) {
                         Text(PlayerTime.formatted(time: targetPosition))
-                            .font(.system(size: 26, weight: .bold).monospacedDigit())
+                            .font(.system(size: 22, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
 
                         let isForward = pendingSeekDelta >= 0
@@ -6523,17 +6493,34 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
                             .font(.system(size: 20, weight: .semibold))
                             .foregroundColor(.white)
                     }
-                    .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
                     .position(x: targetX, y: 14)
                 }
                 .frame(height: 28)
             } else {
-                HStack(spacing: 10) {
-                    Text(PlayerTime.formatted(time: targetPosition))
-                    Spacer()
-                    Text("-" + PlayerTime.formatted(time: max(0, duration - targetPosition)))
+                GeometryReader { geo in
+                    let elapsed = PlayerTime.formatted(time: targetPosition)
+                    let remaining = "-" + PlayerTime.formatted(time: max(0, duration - targetPosition))
+                    let elapsedHalfWidth = CGFloat(elapsed.count) * 6.5
+                    let remainingWidth = CGFloat(remaining.count) * 13
+                    let elapsedX = min(
+                        max(geo.size.width * progress, elapsedHalfWidth),
+                        max(elapsedHalfWidth, geo.size.width - elapsedHalfWidth - remainingWidth - 12)
+                    )
+
+                    ZStack {
+                        HStack {
+                            Spacer(minLength: 0)
+                            Text(remaining)
+                                .fixedSize()
+                        }
+                        Text(elapsed)
+                            .fixedSize()
+                            .position(x: elapsedX, y: 14)
+                    }
+                    .frame(width: geo.size.width, height: 28)
                 }
-                .font(.system(size: 22, weight: .bold))
+                .frame(height: 28)
+                .font(.system(size: 22, weight: .bold).monospacedDigit())
                 .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
             }
         }
@@ -6551,7 +6538,6 @@ private struct TvDetailsFullscreenTrailerOverlay: View {
         .onMoveCommand { direction in
             handleMove(direction, from: .timeline)
         }
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
         .animation(.easeOut(duration: 0.12), value: pendingSeekDelta)
     }

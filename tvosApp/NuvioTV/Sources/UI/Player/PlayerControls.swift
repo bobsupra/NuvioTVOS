@@ -32,10 +32,10 @@ struct PlayerControls: View {
     var body: some View {
         GlassControlsContainer {
             VStack {
-                topBar
-                Spacer()
+                Spacer(minLength: 0)
                 bottomControls
             }
+            .frame(maxWidth: .infinity, maxHeight: .infinity)
             .onExitCommand(perform: handleExit)
         }
         .onExitCommand(perform: handleExit)
@@ -403,62 +403,53 @@ struct PlayerControls: View {
         }
     }
 
-    // MARK: - Top bar
+    // MARK: - Playback title
 
-    private var isSeekingOrScrubbing: Bool {
-        viewModel.isScrubbing || viewModel.isHoldingSeek || viewModel.pendingSeekDelta != 0
+    private var playbackTitle: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            if let subtitle = playbackSubtitle {
+                Text(subtitle)
+                    .font(.system(size: 21, weight: .medium))
+                    .foregroundColor(.white.opacity(0.76))
+                    .lineLimit(1)
+            }
+
+            Text(viewModel.title)
+                .font(.system(size: 38, weight: .bold))
+                .foregroundColor(.white)
+                .lineLimit(1)
+        }
     }
 
-    private var topBar: some View {
-        Group {
-            if !isSeekingOrScrubbing {
-                VStack(spacing: 12) {
-                    HStack(alignment: .top, spacing: 24) {
-                        VStack(alignment: .leading, spacing: 4) {
-                            Text(viewModel.title)
-                                .font(.system(size: 38, weight: .bold))
-                                .foregroundColor(.white)
-                                .lineLimit(1)
-
-                            if !viewModel.subtitle.isEmpty {
-                                Text(viewModel.subtitle)
-                                    .font(.system(size: 21, weight: .medium))
-                                    .foregroundColor(.white.opacity(0.68))
-                                    .lineLimit(1)
-                            }
-                        }
-
-                        Spacer()
-                    }
-                }
-                .padding(.horizontal, 60)
-                .padding(.top, 34)
-                .shadow(color: .black.opacity(0.82), radius: 18, x: 0, y: 6)
-                .transition(.opacity)
-            }
-        }
-        .animation(.playerControls, value: isSeekingOrScrubbing)
+    private var playbackSubtitle: String? {
+        let subtitle = viewModel.subtitle.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !subtitle.isEmpty, subtitle != PlaybackMarkers.trailerSubtitle else { return nil }
+        return subtitle
+            .replacingOccurrences(of: " · E", with: ", E")
+            .replacingOccurrences(of: " · ", with: " • ")
     }
 
     // MARK: - Bottom controls
 
     private var bottomControls: some View {
-        VStack(alignment: .leading, spacing: 18) {
-            if !isSeekingOrScrubbing {
-                transportRow
+        VStack(alignment: .leading, spacing: 24) {
+            if !viewModel.isScrubbing {
+                HStack(alignment: .bottom, spacing: 24) {
+                    playbackTitle
+                    Spacer(minLength: 24)
+                    transportRow
+                }
                     .transition(.opacity)
             }
             timelineBar
         }
         .padding(.horizontal, 60)
         .padding(.bottom, 54)
-        .animation(.playerControls, value: isSeekingOrScrubbing)
+        .animation(.playerControls, value: viewModel.isScrubbing)
     }
 
     private var transportRow: some View {
         HStack(spacing: 18) {
-            Spacer()
-
             if didReportPlaybackStarted && viewModel.isPictureInPictureSupported && playerShowPiP {
                 glassIconButton(
                     size: 70,
@@ -561,7 +552,6 @@ struct PlayerControls: View {
             }
             .id("settings_button")
         }
-        .shadow(color: .black.opacity(0.74), radius: 20, x: 0, y: 8)
     }
 
     private func glassIconButton<Icon: View>(
@@ -589,7 +579,6 @@ struct PlayerControls: View {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: size, height: size)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: size, height: size)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -697,14 +686,12 @@ struct PlayerControls: View {
             Circle()
                 .fill(Color.red)
                 .frame(width: 12, height: 12)
-                .shadow(color: .red.opacity(0.65), radius: 7)
             Text(L10n.string("player_live", fallback: "LIVE"))
                 .font(.system(size: 22, weight: .bold))
                 .foregroundColor(.white.opacity(0.9))
             Spacer()
         }
         .frame(height: 44)
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
     }
 
     private var finiteTimelineBar: some View {
@@ -758,7 +745,6 @@ struct PlayerControls: View {
             // even if spatial focus already hopped to a transport button.
             handleMove(direction, from: .timeline)
         }
-        .shadow(color: .black.opacity(0.82), radius: 16, x: 0, y: 7)
         .animation(.easeOut(duration: 0.14), value: focusedControl)
         .animation(.easeOut(duration: 0.12), value: viewModel.pendingSeekDelta)
         .animation(.easeOut(duration: 0.16), value: viewModel.isScrubbing)
@@ -857,7 +843,6 @@ private struct PlayerSubtitleMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -956,7 +941,6 @@ private struct PlayerAudioMenuButton: View, Equatable {
                 .foregroundColor(isFocused ? .black : .white)
                 .frame(width: 70, height: 70)
                 .modifier(PlayerGlassCircleButtonBackground(filled: isFocused))
-                .shadow(color: .black.opacity(0.82), radius: 14, x: 0, y: 7)
                 .frame(width: 70, height: 70)
                 .clipShape(Circle())
                 .contentShape(Circle())
@@ -1120,7 +1104,7 @@ private struct PlayerTimelineBar: View {
             GeometryReader { geo in
                 let w = geo.size.width
                 let targetX = min(max(w * progress, 0), w)
-                let trackHeight: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? 10 : 7
+                let trackHeight: CGFloat = 10
                 let h: CGFloat = (isTimelineFocused || isSeekingOrScrubbing) ? trackHeight + 2 : trackHeight
                 let needleHeight: CGFloat = 22
                 let originalProgress = CGFloat(min(max(clock.position / duration, 0), 1))
@@ -1150,12 +1134,11 @@ private struct PlayerTimelineBar: View {
                         Rectangle()
                             .fill(Color.white)
                             .frame(width: 2, height: needleHeight)
-                            .shadow(color: .black.opacity(0.45), radius: 1.5)
                             .position(x: targetX, y: bottomOfTrack - needleHeight / 2)
                     }
                 }
             }
-            .frame(height: (isTimelineFocused || isSeekingOrScrubbing) ? 16 : 11)
+            .frame(height: 16)
 
             // Timestamps: when seeking or scrubbing, center the time and direction/speed directly beneath the needle
             if isSeekingOrScrubbing {
@@ -1164,7 +1147,7 @@ private struct PlayerTimelineBar: View {
                     let targetX = min(max(w * progress, 60), w - 60)
                     HStack(spacing: 8) {
                         Text(PlayerTime.formatted(time: targetPosition))
-                            .font(.system(size: 26, weight: .bold).monospacedDigit())
+                            .font(.system(size: 22, weight: .bold).monospacedDigit())
                             .foregroundColor(.white)
 
                         if isHoldingSeek || speedMultiplier != nil {
@@ -1186,17 +1169,34 @@ private struct PlayerTimelineBar: View {
                                 .foregroundColor(.white)
                         }
                     }
-                    .shadow(color: .black.opacity(0.85), radius: 6, x: 0, y: 2)
                     .position(x: targetX, y: 14)
                 }
                 .frame(height: 28)
             } else {
-                HStack(spacing: 10) {
-                    Text(PlayerTime.formatted(time: targetPosition))
-                    Spacer()
-                    Text("-" + PlayerTime.formatted(time: max(0, duration - targetPosition)))
+                GeometryReader { geo in
+                    let elapsed = PlayerTime.formatted(time: targetPosition)
+                    let remaining = "-" + PlayerTime.formatted(time: max(0, duration - targetPosition))
+                    let elapsedHalfWidth = CGFloat(elapsed.count) * 6.5
+                    let remainingWidth = CGFloat(remaining.count) * 13
+                    let elapsedX = min(
+                        max(geo.size.width * progress, elapsedHalfWidth),
+                        max(elapsedHalfWidth, geo.size.width - elapsedHalfWidth - remainingWidth - 12)
+                    )
+
+                    ZStack {
+                        HStack {
+                            Spacer(minLength: 0)
+                            Text(remaining)
+                                .fixedSize()
+                        }
+                        Text(elapsed)
+                            .fixedSize()
+                            .position(x: elapsedX, y: 14)
+                    }
+                    .frame(width: geo.size.width, height: 28)
                 }
-                .font(.system(size: 22, weight: .bold))
+                .frame(height: 28)
+                .font(.system(size: 22, weight: .bold).monospacedDigit())
                 .foregroundColor(.white.opacity(isTimelineFocused ? 0.82 : 0.54))
             }
         }
@@ -1477,6 +1477,25 @@ struct PlayerGlassCircleButtonBackground: ViewModifier {
         } else {
             content.background(.ultraThinMaterial, in: Circle())
         }
+    }
+}
+
+struct PlayerBottomFade: View {
+    var body: some View {
+        LinearGradient(
+            stops: [
+                .init(color: .black.opacity(0.48), location: 0),
+                .init(color: .black.opacity(0.36), location: 0.36),
+                .init(color: .clear, location: 0.5),
+                .init(color: .clear, location: 1)
+            ],
+            startPoint: .bottom,
+            endPoint: .top
+        )
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .ignoresSafeArea()
+        .allowsHitTesting(false)
+        .accessibilityHidden(true)
     }
 }
 

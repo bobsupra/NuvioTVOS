@@ -7238,9 +7238,11 @@ class PlayerViewModel: ObservableObject {
         if isScrubbing {
             cancelScrub()
         }
-        showScenePanel = true
-        setControlsAutoHideSuspended(true)
-        hideControls()
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showScenePanel = true
+            hideControls()
+            setControlsAutoHideSuspended(true)
+        }
         
         let context = buildSceneContext()
         sceneAudioTapBroker.updateEngine(aetherController?.engine)
@@ -7261,8 +7263,10 @@ class PlayerViewModel: ObservableObject {
     }
     
     func closeScene() {
-        showScenePanel = false
-        setControlsAutoHideSuspended(false)
+        withAnimation(.easeInOut(duration: 0.2)) {
+            showScenePanel = false
+            setControlsAutoHideSuspended(false)
+        }
         sceneViewModel.close()
     }
     

@@ -183,7 +183,6 @@ struct SceneDetailView: View {
                 RoundedRectangle(cornerRadius: 24, style: .continuous)
                     .stroke(Color.white.opacity(0.18), lineWidth: 1.5)
             )
-            .shadow(color: Color.black.opacity(0.55), radius: 20, y: 8)
         }
         .padding(.horizontal, 80)
         .padding(.top, 72)
@@ -243,7 +242,6 @@ struct SceneDetailView: View {
                 RoundedRectangle(cornerRadius: 28, style: .continuous)
                     .stroke(Color.white.opacity(0.18), lineWidth: 1.5)
             )
-            .shadow(color: Color.black.opacity(0.45), radius: 30, y: 10)
             Spacer()
         }
         .frame(maxWidth: .infinity, maxHeight: .infinity)

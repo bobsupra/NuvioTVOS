@@ -958,6 +958,8 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     private var desiredAudioSelection: DesiredTrackSelection?
     let subtitleTranslationState = MPVSubtitleTranslationState()
     private var isMPVSubtitleRendererHiddenForTranslation = false
+    private var playerControlsVisibleForSubtitles = false
+    private var subtitleStyleViewportHeight: CGFloat = 0
 
     // MARK: - Seek Watchdog Diagnostics
     private struct ActiveSeekWatchdog {
@@ -1075,6 +1077,11 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
     override func viewDidLayoutSubviews() {
         super.viewDidLayoutSubviews()
         layoutMetalLayer()
+        if playerControlsVisibleForSubtitles,
+           mpv != nil,
+           abs(view.bounds.height - subtitleStyleViewportHeight) > 1 {
+            applySubtitleStyle()
+        }
         attemptStartPendingLoad()
     }
 
@@ -2210,9 +2217,26 @@ final class MPVPlayerViewController: UIViewController, PlaybackEngineControlling
             setStringProperty("sub-pos", "0")
             setStringProperty("sub-align-y", "top")
         } else {
-            setStringProperty("sub-pos", "100")
+            let position: String
+            if playerControlsVisibleForSubtitles, view.bounds.height > 1 {
+                let liftPercent = min(
+                    100,
+                    Double(PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints / view.bounds.height * 100)
+                )
+                position = String(format: "%.2f", 100 - liftPercent)
+            } else {
+                position = "100"
+            }
+            setStringProperty("sub-pos", position)
             setStringProperty("sub-align-y", "bottom")
         }
+        subtitleStyleViewportHeight = view.bounds.height
+    }
+
+    func setPlayerControlsVisible(_ visible: Bool) {
+        guard playerControlsVisibleForSubtitles != visible else { return }
+        playerControlsVisibleForSubtitles = visible
+        applySubtitleStyle()
     }
 
     func destroyPlayer() {
