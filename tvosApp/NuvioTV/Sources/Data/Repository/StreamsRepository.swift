@@ -18,7 +18,7 @@ final class StreamsRepository: ObservableObject {
 
     /// Bounded per-add-on stream request timeout (seconds). Dead providers
     /// finish as failed without blocking the rest or smart autoplay forever.
-    static let streamRequestTimeout: TimeInterval = 30
+    static let streamRequestTimeout: TimeInterval = 15
 
     @Published private(set) var state = StreamsDiscoveryState()
 
@@ -198,11 +198,32 @@ final class StreamsRepository: ObservableObject {
 
         load(type: type, videoId: videoId, season: se.0, episode: se.1, forceRefresh: forceRefresh)
 
+        var firstPlayableTime: Date?
+        let playableGracePeriod: TimeInterval = 2.5
+        let maxWaitTimeout: TimeInterval = 12.0
+        let startTime = Date()
+
         // Wait until this key is no longer loading (or a newer key took over).
         while !Task.isCancelled {
             let snapshot = state
-            if snapshot.requestKey == key, snapshot.hasResolvedTargets, !snapshot.isAnyLoading {
-                return snapshot.allStreams
+            if snapshot.requestKey == key, snapshot.hasResolvedTargets {
+                if !snapshot.isAnyLoading {
+                    return snapshot.allStreams
+                }
+
+                let hasPlayable = snapshot.allStreams.contains { !$0.isNotPlayable && ($0.url != nil || $0.infoHash != nil) }
+                if hasPlayable {
+                    if firstPlayableTime == nil {
+                        firstPlayableTime = Date()
+                    } else if let first = firstPlayableTime, Date().timeIntervalSince(first) >= playableGracePeriod {
+                        print("[StreamsRepo] Early return for key=\(key) with \(snapshot.allStreams.count) streams (grace period elapsed, avoiding hung providers).")
+                        return snapshot.allStreams
+                    }
+                }
+            }
+            if Date().timeIntervalSince(startTime) >= maxWaitTimeout {
+                print("[StreamsRepo] Max wait timeout reached for key=\(key) (\(snapshot.allStreams.count) streams).")
+                return snapshot.requestKey == key ? snapshot.allStreams : []
             }
             if activeRequestKey != key, snapshot.requestKey != key {
                 // A different search replaced ours mid-wait; return whatever
