@@ -16530,6 +16530,7 @@ private struct UsenetSettingsSection: View {
     @State private var profile = UsenetSettings.profile().rawValue
     @State private var prefersOwnServers = UsenetSettings.prefersOwnServers()
     @State private var speedLimit = String(UsenetSettings.speedLimitMbps())
+    @State private var syncToAccount = UsenetSettings.syncChoice() ?? false
 
     var body: some View {
         SettingsGroup(
@@ -16582,6 +16583,24 @@ private struct UsenetSettingsSection: View {
                 isOn: $prefersOwnServers,
                 accentColor: accentColor
             )
+
+            // Written only from the toggle: a profile that never chose leaves
+            // the account's copy alone (see UsenetSettingsSync).
+            SettingsToggleRow(
+                title: L10n.string("usenet_sync_title", fallback: "Save to Nuvio Account"),
+                subtitle: L10n.string(
+                    "usenet_sync_subtitle",
+                    fallback: "Keep these servers and their passwords in this profile of your Nuvio account, so a reinstall or another Apple TV gets them back. Passwords are stored like debrid keys. Turning it off removes them from the account."
+                ),
+                isOn: Binding(
+                    get: { syncToAccount },
+                    set: { value in
+                        syncToAccount = value
+                        UsenetSettings.setSyncChoice(value)
+                    }
+                ),
+                accentColor: accentColor
+            )
         }
         .onChange(of: profile) { _, value in
             UsenetSettings.setProfile(UsenetMemoryProfile(rawValue: value) ?? .balanced)
@@ -16594,6 +16613,11 @@ private struct UsenetSettingsSection: View {
         }
         .onReceive(NotificationCenter.default.publisher(for: .usenetServersChanged)) { _ in
             model.reload()
+            // An account pull may have brought servers and settings in.
+            syncToAccount = UsenetSettings.syncChoice() ?? false
+            profile = UsenetSettings.profile().rawValue
+            prefersOwnServers = UsenetSettings.prefersOwnServers()
+            speedLimit = String(UsenetSettings.speedLimitMbps())
         }
         .sheet(isPresented: $isAddingServer) {
             UsenetServerEditSheet(server: nil, accentColor: accentColor)

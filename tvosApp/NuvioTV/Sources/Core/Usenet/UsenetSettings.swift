@@ -2,7 +2,8 @@ import Foundation
 import Security
 
 /// A Usenet provider saved in Settings. The password lives in Keychain
-/// (`UsenetCredentialStore`), never in UserDefaults, sync or exports.
+/// (`UsenetCredentialStore`), never in UserDefaults or exports; it reaches the
+/// account only when the profile opts in (`UsenetSettingsSync`).
 struct UsenetSavedServer: Codable, Identifiable, Equatable, Hashable {
     var id: String = UUID().uuidString
     var name: String
@@ -32,6 +33,26 @@ enum UsenetSettings {
     static let profileKey = "nuvio.tv.settings.integrations.usenetProfile"
     static let preferOwnServersKey = "nuvio.tv.settings.integrations.usenetPreferOwnServers"
     static let speedLimitKey = "nuvio.tv.settings.integrations.usenetSpeedLimit"
+    /// Whether this profile keeps its Usenet settings, passwords included, in
+    /// the Nuvio account. Absent until chosen on this device.
+    static let syncToAccountKey = "nuvio.tv.settings.integrations.usenetSyncToAccount"
+    /// Bumped when a password changes, which the server list alone doesn't show,
+    /// so the account sync notices.
+    static let credentialsRevisionKey = "nuvio.tv.settings.integrations.usenetCredentialsRevision"
+
+    /// The keys whose changes the account sync watches.
+    static let syncObservedKeys = [
+        serversKey, profileKey, preferOwnServersKey, speedLimitKey, syncToAccountKey, credentialsRevisionKey,
+    ]
+
+    /// Nil: never chosen on this device, so the account's copy is left alone.
+    static func syncChoice(store: UserDefaults = ProfileSettings.current) -> Bool? {
+        store.object(forKey: syncToAccountKey) as? Bool
+    }
+
+    static func setSyncChoice(_ value: Bool, store: UserDefaults = ProfileSettings.current) {
+        store.set(value, forKey: syncToAccountKey)
+    }
 
     /// Speed cap choices in Mbit/s; 0 means no cap.
     static let speedLimitOptions = [0, 200, 100, 50, 25]
@@ -63,7 +84,10 @@ enum UsenetSettings {
         } else {
             all.append(server)
         }
-        if let password { UsenetCredentialStore.save(password, forServerID: server.id) }
+        if let password {
+            UsenetCredentialStore.save(password, forServerID: server.id)
+            store.set(store.integer(forKey: credentialsRevisionKey) &+ 1, forKey: credentialsRevisionKey)
+        }
         setServers(all, store: store)
     }
 

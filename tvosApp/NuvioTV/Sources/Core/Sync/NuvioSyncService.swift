@@ -44,6 +44,13 @@ enum ProfileSettingsSnapshot {
                 snapshot[key] = value
             }
         }
+        // Usenet keeps its keys apart from SettingsKey; it syncs only when the
+        // profile opts in, which the export decides.
+        for key in UsenetSettings.syncObservedKeys {
+            if let value = defaults.object(forKey: key) {
+                snapshot[key] = value
+            }
+        }
         return snapshot
     }
 
@@ -3505,8 +3512,9 @@ final class NuvioAPIClient {
             ?? (features[Self.mdbListSettingsFeature] as? [String: Any])
         let themeFeature = (mobileFeatures[Self.themeSettingsFeature] as? [String: Any])
             ?? (features[Self.themeSettingsFeature] as? [String: Any])
+        let usenetFeature = features[UsenetSettingsSync.featureKey] as? [String: Any]
 
-        guard tvosFeature != nil || layoutSettingsFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil || posterCardStyleFeature != nil || playerFeature != nil || continueWatchingFeature != nil || androidTraktFeature != nil || mdbListFeature != nil || themeFeature != nil else {
+        guard tvosFeature != nil || layoutSettingsFeature != nil || debridFeature != nil || tmdbFeature != nil || streamBadgeFeature != nil || posterCardStyleFeature != nil || playerFeature != nil || continueWatchingFeature != nil || androidTraktFeature != nil || mdbListFeature != nil || themeFeature != nil || usenetFeature != nil else {
             return false
         }
 
@@ -3527,6 +3535,12 @@ final class NuvioAPIClient {
         )
         importMdbListSettings(mdbListFeature, localProfileId: localProfileId)
         ThemeSettingsSyncMapper.importPayload(themeFeature, localProfileId: localProfileId)
+        UsenetSettingsSync.importPayload(
+            usenetFeature,
+            store: ProfileSettings.store(for: localProfileId),
+            savePassword: { UsenetCredentialStore.save($0, forServerID: $1, profileScope: localProfileId) },
+            removePassword: { UsenetCredentialStore.remove(forServerID: $0, profileScope: localProfileId) }
+        )
         AddonCatalogRemovalStore.reconcile(in: ProfileSettings.store(for: localProfileId), profileID: localProfileId)
         return true
     }
@@ -3672,6 +3686,13 @@ final class NuvioAPIClient {
             existing: existingTheme
         )
         features[Self.themeSettingsFeature] = themePayload
+
+        // tvOS only, and only when the profile opted in (passwords included).
+        features[UsenetSettingsSync.featureKey] = UsenetSettingsSync.export(
+            store: profileDefaults,
+            existing: features[UsenetSettingsSync.featureKey] as? [String: Any],
+            password: { UsenetCredentialStore.password(forServerID: $0, profileScope: localProfileId) }
+        )
 
         settingsJSON["features"] = features
         if settingsJSON["version"] == nil { settingsJSON["version"] = 1 }
