@@ -8615,6 +8615,7 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
     @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
+    @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -8681,14 +8682,26 @@ private struct PlaybackSettingsView: View {
     private func commitSeekrApiKey() {
         let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if key != seekrApiKey { seekrApiKey = key }
+        checkSeekrApiKey()
+    }
+
+    /// Asks Seekr whether it accepts the key: when the settings open, on Done, and a moment
+    /// after any other change (the iPhone keyboard, the account sync). No preview lookup.
+    private func checkSeekrApiKey(afterNanoseconds delay: UInt64 = 0) {
+        seekrKeyCheckTask?.cancel()
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !key.isEmpty else {
+            seekrKeyCheckTask = nil
             seekrKeyCheck = .unchecked
             return
         }
-        seekrKeyCheck = .checking
-        Task { @MainActor in
+        seekrKeyCheckTask = Task { @MainActor in
+            if delay > 0 { try? await Task.sleep(nanoseconds: delay) }
+            guard !Task.isCancelled else { return }
+            seekrKeyCheck = .checking
             let valid = await SeekrTrickplay.validate(apiKey: key)
-            guard seekrApiKey == key else { return }
+            guard !Task.isCancelled,
+                  seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines) == key else { return }
             seekrKeyCheck = valid.map { $0 ? SeekrKeyCheck.valid : SeekrKeyCheck.invalid } ?? .unreachable
         }
     }
@@ -8827,6 +8840,12 @@ private struct PlaybackSettingsView: View {
                     onCommit: commitSeekrApiKey
                 )
                 .disabled(!seekPreviewEnabled)
+                .onAppear {
+                    if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onChange(of: seekrApiKey) { _, _ in
+                    checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
+                }
 
                 SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
