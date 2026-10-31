@@ -10943,7 +10943,7 @@ final class TVHomeStore: ObservableObject {
                     id: row.id,
                     title: row.title,
                     entries: row.items.prefix(15).map {
-                        TopShelfEntry(meta: $0, subtitle: nil, progress: nil, action: .details)
+                        TopShelfEntry(meta: $0, subtitle: nil, progress: nil, action: .details, screen: .home)
                     })
             }
         return Array(rows)

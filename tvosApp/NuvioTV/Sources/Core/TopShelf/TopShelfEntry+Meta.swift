@@ -6,8 +6,11 @@ import Foundation
 
 extension TopShelfEntry {
     /// A shelf entry for `meta`, carrying what the carousel details show.
+    /// `screen`: where the title comes from in the app, for the Custom
+    /// Posters setting's per-screen choice.
     init(meta: NuvioMeta, subtitle: String?, progress: Double?, action: TopShelfEntryAction,
-         airDate: String? = nil, homeOrder: Int? = nil) {
+         screen: CustomPosterScreen, airDate: String? = nil, homeOrder: Int? = nil) {
+        let custom = TopShelfCustomPosters.artwork(for: meta, screen: screen)
         self.init(
             contentId: meta.id,
             contentType: meta.type,
@@ -29,7 +32,9 @@ extension TopShelfEntry {
             imdbId: meta.imdbId,
             tmdbId: meta.tmdbId,
             imdbRating: meta.rating.flatMap { $0.isFinite && $0 > 0 ? $0 : nil },
-            homeOrder: homeOrder
+            homeOrder: homeOrder,
+            customPosterURL: custom.poster,
+            customLandscapeURL: custom.landscape
         )
     }
 
@@ -49,6 +54,23 @@ extension TopShelfEntry {
     private static func nonEmpty(_ text: String?) -> String? {
         guard let trimmed = text?.trimmingCharacters(in: .whitespacesAndNewlines), !trimmed.isEmpty else { return nil }
         return trimmed
+    }
+}
+
+/// The Custom Posters setting (Settings → Layout) applied to the shelf, so its
+/// posters and cards match the app's own: the active profile's URL pattern,
+/// for the screens it is turned on for.
+enum TopShelfCustomPosters {
+    static func artwork(for meta: NuvioMeta, screen: CustomPosterScreen) -> (poster: String?, landscape: String?) {
+        let store = ProfileSettings.current
+        let pattern = store.string(forKey: SettingsKey.customPosterURLPattern) ?? ""
+        guard !pattern.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return (nil, nil) }
+        let screens = store.string(forKey: SettingsKey.customPosterEnabledScreens)
+        func resolved(_ shape: String) -> String? {
+            CustomPosterURLResolver.resolve(
+                pattern: pattern, meta: meta, screen: screen, enabledScreens: screens, shape: shape)
+        }
+        return (resolved("poster"), resolved("landscape"))
     }
 }
 
@@ -73,6 +95,7 @@ enum TopShelfTodayFeed {
                 subtitle: subtitle.isEmpty ? nil : subtitle,
                 progress: nil,
                 action: .details,
+                screen: .home,
                 airDate: calendarEntry.date.iso)
         }
         // The calendar republishes often; write only what changed.

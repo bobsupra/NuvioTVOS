@@ -67,7 +67,7 @@ final class TopShelfContentProvider: TVTopShelfContentProvider {
         // The rendered card or poster; the raw artwork stands in until it exists.
         let imageURL = poster
             ? TopShelfFeedStore.posterArtworkURL(for: entry) ?? entry.posterSourceURL.flatMap(URL.init(string:))
-            : TopShelfFeedStore.artworkURL(for: entry) ?? entry.artworkSourceURL.flatMap(URL.init(string:))
+            : TopShelfFeedStore.artworkURL(for: entry) ?? entry.cardSourceURL.flatMap(URL.init(string:))
         if let url = imageURL {
             item.setImageURL(url, for: .screenScale1x)
             item.setImageURL(url, for: .screenScale2x)

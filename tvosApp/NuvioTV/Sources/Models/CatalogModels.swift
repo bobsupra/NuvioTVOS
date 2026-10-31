@@ -3601,6 +3601,7 @@ enum ContinueWatchingStore {
             subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
             progress: item.isUpNextEntry ? nil : fraction,
             action: .resume,
+            screen: .continueWatching,
             homeOrder: homeOrder
         )
     }
@@ -4341,7 +4342,7 @@ enum LibraryStore {
             .sorted { $0.addedAt > $1.addedAt }
             .prefix(15)
             .map { item in
-                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details)
+                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details, screen: .library)
             }
         TopShelfFeedStore.write(Array(entries), section: .library,
                                 title: L10n.string("nav_library", fallback: "Library"))

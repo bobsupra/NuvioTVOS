@@ -273,6 +273,26 @@ final class TopShelfLayoutTests: XCTestCase {
         XCTAssertTrue(name?.hasPrefix("top-shelf-") == true)
     }
 
+    func testCustomPostersComeFirstWithTheTitlesOwnArtworkAsFallback() throws {
+        let plain = TopShelfEntry(contentId: "tt1", contentType: "movie", title: "A", subtitle: nil,
+                                  imageURL: "https://img.test/p.jpg", backdropURL: "https://img.test/b.jpg",
+                                  progress: nil)
+        let custom = TopShelfEntry(contentId: "tt1", contentType: "movie", title: "A", subtitle: nil,
+                                   imageURL: "https://img.test/p.jpg", backdropURL: "https://img.test/b.jpg",
+                                   progress: nil, customPosterURL: "https://posters.test/p.jpg",
+                                   customLandscapeURL: "https://posters.test/l.jpg")
+        XCTAssertEqual(custom.posterSources,
+                       ["https://posters.test/p.jpg", "https://img.test/p.jpg", "https://img.test/b.jpg"])
+        XCTAssertEqual(custom.cardSources,
+                       ["https://posters.test/l.jpg", "https://img.test/b.jpg", "https://img.test/p.jpg"])
+        // The carousel's full-screen background stays the clean backdrop.
+        XCTAssertEqual(custom.carouselSources, ["https://img.test/b.jpg", "https://img.test/p.jpg"])
+        XCTAssertNotEqual(TopShelfFeedStore.posterArtworkName(for: custom),
+                          TopShelfFeedStore.posterArtworkName(for: plain))
+        XCTAssertEqual(plain.cardSourceURL, plain.artworkSourceURL)
+        XCTAssertEqual(try JSONDecoder().decode(TopShelfEntry.self, from: JSONEncoder().encode(custom)), custom)
+    }
+
     func testMergedUpNextSharesContinueWatchingInHomeOrder() {
         func item(_ id: String, _ order: Int?) -> TopShelfEntry {
             TopShelfEntry(contentId: id, contentType: "series", title: id, subtitle: nil, imageURL: nil,

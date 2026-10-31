@@ -94,6 +94,11 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
     /// Continue Watching and Up Next: the position on Home's Continue
     /// Watching row, so the two can share one shelf row in that order.
     public let homeOrder: Int?
+    /// The app's Custom Posters artwork for this title, portrait and wide,
+    /// when that setting covers the screen the entry comes from. Drawn in
+    /// place of the title's own poster and card art, which stay the fallback.
+    public let customPosterURL: String?
+    public let customLandscapeURL: String?
 
     public init(contentId: String, contentType: String, title: String,
                 subtitle: String?, imageURL: String?, backdropURL: String? = nil,
@@ -104,7 +109,7 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
                 logoURL: String? = nil, cast: [String]? = nil, directors: [String]? = nil,
                 carouselArtworkFileName: String? = nil, airDate: String? = nil,
                 imdbId: String? = nil, tmdbId: Int? = nil, imdbRating: Double? = nil,
-                homeOrder: Int? = nil) {
+                homeOrder: Int? = nil, customPosterURL: String? = nil, customLandscapeURL: String? = nil) {
         self.contentId = contentId
         self.contentType = contentType
         self.title = title
@@ -128,6 +133,8 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
         self.tmdbId = tmdbId
         self.imdbRating = imdbRating
         self.homeOrder = homeOrder
+        self.customPosterURL = customPosterURL
+        self.customLandscapeURL = customLandscapeURL
     }
 
     /// Artwork the card is rendered from: the backdrop, else the poster.
@@ -135,10 +142,23 @@ public struct TopShelfEntry: Codable, Equatable, Sendable {
         backdropURL ?? imageURL
     }
 
-    /// Artwork the poster is rendered from: the poster, else the backdrop.
-    var posterSourceURL: String? {
-        imageURL ?? backdropURL
+    /// Artwork the 16:9 card is rendered from: the custom wide artwork, else
+    /// the backdrop, else the poster.
+    var cardSourceURL: String? {
+        cardSources.first
     }
+
+    /// Artwork the poster is rendered from: the custom poster, else the
+    /// poster, else the backdrop.
+    var posterSourceURL: String? {
+        posterSources.first
+    }
+
+    /// Each render's artwork, best first; a URL that fails to load gives way
+    /// to the next.
+    var cardSources: [String] { [customLandscapeURL, backdropURL, imageURL].compactMap { $0 } }
+    var posterSources: [String] { [customPosterURL, imageURL, backdropURL].compactMap { $0 } }
+    var carouselSources: [String] { [backdropURL, imageURL].compactMap { $0 } }
 
     /// Deep link back into the app. Resumable entries go straight to
     /// Continue Watching playback (the app resolves URL-less synced and Next Up
@@ -529,7 +549,7 @@ public enum TopShelfFeedStore {
     /// setting, which can change without the feed being written again.
     private static func decorated(_ entry: TopShelfEntry) -> TopShelfEntry {
         var entry = entry
-        entry.artworkFileName = entry.artworkSourceURL == nil ? nil : artworkFileName(for: entry)
+        entry.artworkFileName = entry.cardSourceURL == nil ? nil : artworkFileName(for: entry)
         entry.carouselArtworkFileName = entry.artworkSourceURL == nil ? nil : carouselArtworkFileName(for: entry)
         return entry
     }
@@ -538,7 +558,7 @@ public enum TopShelfFeedStore {
         generatedName(for: [
             String(artworkRenderVersion),
             entry.contentId,
-            entry.artworkSourceURL ?? "",
+            entry.cardSourceURL ?? "",
             entry.subtitle ?? ""
         ])
     }
@@ -620,9 +640,18 @@ public enum TopShelfFeedStore {
             }
             guard let name, let container = containerURL else { continue }
             let destination = container.appendingPathComponent(name)
-            guard !FileManager.default.fileExists(atPath: destination.path),
-                  let sourceText = kind == .poster ? entry.posterSourceURL : entry.artworkSourceURL,
-                  let image = await downloadedImage(sourceText) else { continue }
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            let sources: [String]
+            switch kind {
+            case .card: sources = entry.cardSources
+            case .carousel: sources = entry.carouselSources
+            case .poster: sources = entry.posterSources
+            }
+            var loaded: UIImage?
+            for source in sources where loaded == nil {
+                loaded = await downloadedImage(source)
+            }
+            guard let image = loaded else { continue }
             let rendered: Data?
             switch kind {
             case .poster:
