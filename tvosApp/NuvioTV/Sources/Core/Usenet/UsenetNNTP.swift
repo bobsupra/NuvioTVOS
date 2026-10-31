@@ -279,9 +279,9 @@ actor UsenetNNTPConnection {
             // Authentication or permission problem — a per-segment retry won't help; surface it
             // so the job fails cleanly instead of silently punching holes.
             throw UsenetNNTPError.authenticationFailed(status.code)
-        case 400, 500:
-            // Service temporarily unavailable / shutting down / internal — transient, retry on a
-            // fresh connection.
+        case 205, 400, 500, 503:
+            // Closing the connection (205, often an idle timeout), service unavailable / shutting
+            // down / internal — transient, retry on a fresh connection.
             throw UsenetNNTPError.connectionClosed
         default:
             throw UsenetNNTPError.protocolError("unexpected BODY response \(status.code)")
@@ -300,7 +300,7 @@ actor UsenetNNTPConnection {
             return false
         case 480, 481, 482, 483, 502:
             throw UsenetNNTPError.authenticationFailed(status.code)
-        case 400, 500:
+        case 205, 400, 500, 503:
             throw UsenetNNTPError.connectionClosed
         default:
             throw UsenetNNTPError.protocolError("unexpected STAT response \(status.code)")

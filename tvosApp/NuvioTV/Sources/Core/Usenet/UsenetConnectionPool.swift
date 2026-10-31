@@ -101,13 +101,29 @@ struct UsenetWaitQueue<Element> {
 /// dropped connection is replaced and retried, a rejected login stops.
 /// A server that turns away one more connection while others are open has
 /// reached the plan's limit: the stream keeps to the connections it has.
+///
+/// Servers close connections that sit unused (a pause, a full buffer), often
+/// without the app noticing. A connection idle for longer than `maxIdle` is
+/// not used again, one that fails takes the server's other idle ones with it,
+/// and an article counts as missing only when a server says so: connections
+/// that keep failing are a network error, never a hole in the video.
 actor UsenetConnectionPool {
+    /// An idle connection and since when it waits.
+    struct IdleConnection {
+        let connection: UsenetNNTPConnection
+        let since: ContinuousClock.Instant
+    }
+
+    /// Longest a connection waits unused before it is closed instead of used:
+    /// providers drop idle connections after one to a few minutes.
+    static let maxIdle: Duration = .seconds(60)
+
     private struct ServerState {
         let config: UsenetServerConfig
         /// Connections this stream may open: `maxConnections`, lowered when
         /// the server turns one away.
         var limit: Int
-        var idle: [UsenetNNTPConnection] = []
+        var idle: [IdleConnection] = []
         var open = 0
         /// Each waiter is handed a released connection directly, or nil when
         /// a slot frees up (or the pool closes) and it should try again.
@@ -214,6 +230,9 @@ actor UsenetConnectionPool {
         var configuredConnections = 0
         /// Articles a later server had after the first one didn't.
         var fallbackArticles = 0
+        /// Connections replaced by fresh ones: dropped by the server, idle too
+        /// long, or gone with another one that was dropped.
+        var reconnects = 0
         var primaryHost = ""
         var serverCount = 0
     }
@@ -225,12 +244,14 @@ actor UsenetConnectionPool {
             totalConnections: servers.reduce(0) { $0 + $1.limit },
             configuredConnections: totalConnections,
             fallbackArticles: fallbackArticles,
+            reconnects: reconnects,
             primaryHost: servers.first?.config.host ?? "",
             serverCount: servers.count
         )
     }
 
     private var fallbackArticles = 0
+    private var reconnects = 0
 
     private enum Answer {
         case body(Data)
@@ -245,6 +266,8 @@ actor UsenetConnectionPool {
         // maybe by another device) is not a missing article.
         var refusal: UsenetNNTPError?
         var answered = false
+        // The last time a connection failed instead of answering.
+        var connectionError: UsenetNNTPError?
         for index in servers.indices {
             var attempt = 0
             while attempt < 3 {
@@ -256,6 +279,7 @@ actor UsenetConnectionPool {
                 } catch let error as UsenetNNTPError {
                     if case .authenticationFailed = error { authError = error; break }
                     if case .badGreeting = error { refusal = error; break }
+                    connectionError = error
                     if error.isTransient, attempt < 3 { continue }
                     break
                 }
@@ -284,6 +308,13 @@ actor UsenetConnectionPool {
                         attempt = 3
                     default:
                         discard(connection, from: index)
+                        connectionError = error
+                        // The others waiting idle most likely went with it (a pause, a
+                        // full buffer): the next attempt opens a fresh connection.
+                        if error.isTransient {
+                            reconnects += 1
+                            dropIdle(index)
+                        }
                         if !error.isTransient { attempt = 3 }
                     }
                 } catch {
@@ -298,13 +329,18 @@ actor UsenetConnectionPool {
         if let refusal, !answered {
             throw UsenetError.serverRejected(Self.describe(refusal))
         }
+        // No server said the article is gone: the connections failed. A network
+        // error the player reads again, not a hole that counts towards damage.
+        if !answered, let connectionError {
+            throw UsenetError.serverRejected(Self.describe(connectionError))
+        }
         return .missing
     }
 
     func shutdown() {
         closed = true
         for index in servers.indices {
-            let connections = servers[index].idle
+            let connections = servers[index].idle.map(\.connection)
             servers[index].idle = []
             servers[index].open = 0
             let waiters = servers[index].waiters.removeAll()
@@ -321,7 +357,8 @@ actor UsenetConnectionPool {
                          onConnected: (@Sendable () -> Void)? = nil) async throws -> UsenetNNTPConnection {
         while true {
             guard !closed else { throw CancellationError() }
-            if let connection = servers[index].idle.popLast() {
+            closeStaleIdle(index)
+            if let connection = servers[index].idle.popLast()?.connection {
                 if await connection.isClosed {
                     servers[index].open -= 1
                     continue
@@ -399,8 +436,45 @@ actor UsenetConnectionPool {
         if let waiter = servers[index].waiters.popFirst() {
             waiter.resume(returning: connection)
         } else {
-            servers[index].idle.append(connection)
+            servers[index].idle.append(IdleConnection(connection: connection, since: .now))
         }
+    }
+
+    /// Closes the server's connections that waited unused for longer than `maxIdle`.
+    private func closeStaleIdle(_ index: Int, now: ContinuousClock.Instant = .now) {
+        let split = Self.splitStale(servers[index].idle, now: now)
+        guard !split.stale.isEmpty else { return }
+        servers[index].idle = split.fresh
+        close(split.stale, from: index)
+    }
+
+    /// Closes every idle connection of the server: one failed, the others most likely too.
+    private func dropIdle(_ index: Int) {
+        let idle = servers[index].idle
+        guard !idle.isEmpty else { return }
+        servers[index].idle = []
+        close(idle, from: index)
+    }
+
+    private func close(_ entries: [IdleConnection], from index: Int) {
+        servers[index].open = max(0, servers[index].open - entries.count)
+        reconnects += entries.count
+        let host = servers[index].config.host
+        usenetLog.info("usenet: \(host, privacy: .public) closing \(entries.count) idle connection(s), opening fresh ones")
+        for _ in entries { wakeOne(index) }
+        let connections = entries.map(\.connection)
+        Task { for connection in connections { await connection.close() } }
+    }
+
+    /// The idle connections still fit to use and those that waited too long.
+    static func splitStale(_ idle: [IdleConnection], now: ContinuousClock.Instant)
+        -> (fresh: [IdleConnection], stale: [IdleConnection]) {
+        var fresh: [IdleConnection] = []
+        var stale: [IdleConnection] = []
+        for entry in idle {
+            if now - entry.since > maxIdle { stale.append(entry) } else { fresh.append(entry) }
+        }
+        return (fresh, stale)
     }
 
     private func discard(_ connection: UsenetNNTPConnection, from index: Int) {
