@@ -503,7 +503,9 @@ enum SubtitleStyleDefaults {
     static let textSize = 100        // percent, 5...220
     static let bold = false
     static let verticalAlignment = SubtitleVerticalPosition.bottom.rawValue
-    static let bottomOffset = 20     // 0...160, raises subtitles off the bottom edge
+    static let bottomOffset = 20     // Positive raises bottom-aligned captions; negative lowers them.
+    // Cancel the base 22-point margin at the minimum without moving text offscreen.
+    static let bottomOffsetRange = -22...160
     static let horizontalMargin = 25 // 0...200, left+right inset (mpv default is 25)
     static let letterSpacing = 0     // -8...40, negative squeezes, positive opens the text
     static let textColor = "#FFFFFF"
@@ -560,7 +562,9 @@ struct SubtitleStyle {
             textSize: min(220, max(5, intValue(SubtitleStyleKey.textSize, SubtitleStyleDefaults.textSize))),
             bold: boolValue(SubtitleStyleKey.bold, SubtitleStyleDefaults.bold),
             verticalAlignment: stringValue(SubtitleStyleKey.verticalAlignment, SubtitleStyleDefaults.verticalAlignment),
-            bottomOffset: intValue(SubtitleStyleKey.bottomOffset, SubtitleStyleDefaults.bottomOffset),
+            bottomOffset: min(SubtitleStyleDefaults.bottomOffsetRange.upperBound,
+                              max(SubtitleStyleDefaults.bottomOffsetRange.lowerBound,
+                                  intValue(SubtitleStyleKey.bottomOffset, SubtitleStyleDefaults.bottomOffset))),
             horizontalMargin: intValue(SubtitleStyleKey.horizontalMargin, SubtitleStyleDefaults.horizontalMargin),
             letterSpacing: intValue(SubtitleStyleKey.letterSpacing, SubtitleStyleDefaults.letterSpacing),
             textColorHex: stringValue(SubtitleStyleKey.textColor, SubtitleStyleDefaults.textColor),
@@ -603,8 +607,12 @@ struct SubtitleStyle {
 
     /// `sub-scale` — relative subtitle text size.
     var subScale: Double { min(max(Double(textSize) / 100.0, 0.05), 3.0) }
-    /// `sub-margin-y` — lifts captions off the bottom edge (22 is mpv's default).
-    var subMarginY: Int { 22 + min(max(bottomOffset, 0), 160) }
+    /// Shared vertical margin for mpv and host-rendered captions. Negative
+    /// adjustments reduce the existing 22-point base margin down to zero.
+    var subMarginY: Int {
+        22 + min(max(bottomOffset, SubtitleStyleDefaults.bottomOffsetRange.lowerBound),
+                 SubtitleStyleDefaults.bottomOffsetRange.upperBound)
+    }
     /// `sub-margin-x` — left+right screen inset in scaled pixels.
     var subMarginX: Int { min(max(horizontalMargin, 0), 200) }
     /// `sub-spacing` — extra letter spacing; negative squeezes, positive opens.
@@ -9463,9 +9471,9 @@ struct SubtitleStyleEditor: View {
 
                 SettingsStepperRow(
                     title: L10n.string("tvos_settings_vertical_position", fallback: "Vertical Position"),
-                    subtitle: L10n.string("tvos_settings_raise_captions_up_off_the_bottom_edge", fallback: "Raise captions up off the bottom edge"),
+                    subtitle: L10n.string("subtitle_vertical_position_adjustment_desc", fallback: "Increase to move captions away from the screen edge; decrease to move them closer"),
                     value: $bottomOffset,
-                    range: 0...160,
+                    range: SubtitleStyleDefaults.bottomOffsetRange,
                     step: 4,
                     suffix: "",
                     accentColor: accentColor
@@ -9604,7 +9612,7 @@ private struct SubtitlePreviewCard: View {
     }
 
     private var previewVerticalPadding: CGFloat {
-        22 + CGFloat(min(max(style.bottomOffset, 0), 160)) * 0.7
+        22 + CGFloat(style.subMarginY - 22) * 0.7
     }
 
     private var previewHorizontalPadding: CGFloat {

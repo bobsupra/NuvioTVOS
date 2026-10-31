@@ -491,6 +491,42 @@ final class PlayerControlsSettingsTests: XCTestCase {
         XCTAssertEqual(clampedMax.subScale, 2.2, accuracy: 0.001)
     }
 
+    func testSubtitleVerticalPositionAllowsNegativeAdjustmentsAndClampsAtScreenEdge() {
+        XCTAssertEqual(SubtitleStyle().subMarginY, 42)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: 0).subMarginY, 22)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: -2).subMarginY, 20)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: -22).subMarginY, 0)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: -100).subMarginY, 0)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: 160).subMarginY, 182)
+        XCTAssertEqual(SubtitleStyle(bottomOffset: 200).subMarginY, 182)
+    }
+
+    @MainActor
+    func testNegativeSubtitleVerticalPositionSurvivesReloadAndLiveApply() {
+        let defaults = ProfileSettings.current
+        let savedOffset = defaults.object(forKey: SubtitleStyleKey.bottomOffset)
+        defer {
+            if let savedOffset {
+                defaults.set(savedOffset, forKey: SubtitleStyleKey.bottomOffset)
+            } else {
+                defaults.removeObject(forKey: SubtitleStyleKey.bottomOffset)
+            }
+        }
+
+        defaults.set(-2, forKey: SubtitleStyleKey.bottomOffset)
+        XCTAssertEqual(SubtitleStyle.current.bottomOffset, -2)
+
+        let viewModel = PlayerViewModel(sessionCoordinator: PlaybackSessionCoordinator(
+            engineSettingProvider: { "MPVKit" },
+            loadDispatcher: { _, _, _ in }
+        ))
+        defer { viewModel.shutdown() }
+        defaults.set(-4, forKey: SubtitleStyleKey.bottomOffset)
+        viewModel.applySubtitleStyle()
+        XCTAssertEqual(viewModel.subtitleStyle.bottomOffset, -4)
+        XCTAssertEqual(viewModel.subtitleStyle.subMarginY, 18)
+    }
+
     func testSubtitleStyleFontAndPositionOptions() {
         var style = SubtitleStyle()
         XCTAssertEqual(style.mpvFontName, "")

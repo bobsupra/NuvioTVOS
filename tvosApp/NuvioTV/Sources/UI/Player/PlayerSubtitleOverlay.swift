@@ -29,7 +29,7 @@ struct PlayerSubtitleOverlay: View {
     private var controlsVisibleOffset: CGFloat {
         controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
     }
-    private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
+    private var verticalOffset: CGFloat { CGFloat(style.subMarginY) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
     private func textAppearance(alignment: TextAlignment) -> SubtitleTextAppearance {
@@ -289,7 +289,7 @@ struct MPVSubtitleOverlay: View {
     private var controlsVisibleOffset: CGFloat {
         controlsVisible && !isTopAligned ? -PlayerSubtitleLayoutMetrics.controlsVisibleLiftPoints : 0
     }
-    private var verticalOffset: CGFloat { CGFloat(22 + min(max(style.bottomOffset, 0), 160)) }
+    private var verticalOffset: CGFloat { CGFloat(style.subMarginY) }
     private var horizontalMargin: CGFloat { CGFloat(min(max(style.horizontalMargin, 0), 200)) }
 
     var body: some View {

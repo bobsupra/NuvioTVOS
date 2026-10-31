@@ -1713,6 +1713,7 @@ struct PlayerSettingsPanel: View {
         case aiTranslation
         case font
         case sizeMinus, sizePlus
+        case heightMinus, heightPlus
         case bold
         case position
         case color(String)
@@ -2239,6 +2240,23 @@ struct PlayerSettingsPanel: View {
                         plusKey: .sizePlus,
                         onMinus: { updateStyle { $0.textSize = max($0.textSize - 5, 5) } },
                         onPlus: { updateStyle { $0.textSize = min($0.textSize + 5, 220) } }
+                    )
+
+                    stepperRow(
+                        title: L10n.string("tvos_settings_vertical_position", fallback: "Vertical Position"),
+                        value: "\(style.bottomOffset)",
+                        minusKey: .heightMinus,
+                        plusKey: .heightPlus,
+                        onMinus: {
+                            updateStyle {
+                                $0.bottomOffset = max($0.bottomOffset - 4, SubtitleStyleDefaults.bottomOffsetRange.lowerBound)
+                            }
+                        },
+                        onPlus: {
+                            updateStyle {
+                                $0.bottomOffset = min($0.bottomOffset + 4, SubtitleStyleDefaults.bottomOffsetRange.upperBound)
+                            }
+                        }
                     )
 
                     cycleRow(
