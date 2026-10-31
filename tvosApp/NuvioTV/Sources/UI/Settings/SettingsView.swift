@@ -8661,22 +8661,24 @@ private struct PlaybackSettingsView: View {
         case unchecked, checking, valid, invalid, unreachable
     }
 
-    private var seekrKeySubtitle: String {
-        let saved = L10n.string("tvos_settings_seekr_api_key_subtitle", fallback: "Saved in your Nuvio account.")
-        let status: String
+    /// The key's check after "Saved in your Nuvio account.", colored: green accepted, red not.
+    private var seekrKeyStatus: (text: String, color: Color)? {
         switch seekrKeyCheck {
         case .unchecked:
-            return saved
+            return nil
         case .checking:
-            status = L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…")
+            return (L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…"),
+                    .white.opacity(0.56))
         case .valid:
-            status = "✓ " + L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key.")
+            return ("✓ " + L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key."),
+                    Color(red: 0.30, green: 0.85, blue: 0.45))
         case .invalid:
-            status = "✕ " + L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key.")
+            return ("✕ " + L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key."),
+                    Color(red: 1.0, green: 0.42, blue: 0.40))
         case .unreachable:
-            status = L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key.")
+            return (L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key."),
+                    Color(red: 1.0, green: 0.78, blue: 0.30))
         }
-        return saved + " " + status
     }
 
     private func commitSeekrApiKey() {
@@ -8917,10 +8919,12 @@ private struct PlaybackSettingsView: View {
 
                 SettingsNativeTextFieldRow(
                     title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
-                    subtitle: seekrKeySubtitle,
+                    subtitle: L10n.string("tvos_settings_seekr_api_key_subtitle", fallback: "Saved in your Nuvio account."),
                     placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
                     text: $seekrApiKey,
                     isSecure: true,
+                    status: seekrKeyStatus?.text,
+                    statusColor: seekrKeyStatus?.color ?? .white.opacity(0.56),
                     onCommit: commitSeekrApiKey
                 )
                 .disabled(!seekPreviewEnabled)
@@ -16417,13 +16421,15 @@ private struct SettingsNativeTextFieldRow: View {
     @Binding var text: String
     var isSecure: Bool = false
     var fieldWidth: CGFloat = 300
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
     var onCommit: () -> Void = {}
 
     @FocusState private var isFocused: Bool
 
     var body: some View {
         SettingsRowShell(isFocused: isFocused, accentColor: .white) {
-            SettingsRowText(title: title, subtitle: subtitle)
+            SettingsRowText(title: title, subtitle: subtitle, status: status, statusColor: statusColor)
 
             Spacer(minLength: 24)
 
@@ -16778,6 +16784,9 @@ private struct SettingsRowShell<Content: View>: View {
 private struct SettingsRowText: View {
     let title: String
     let subtitle: String
+    /// A status after the subtitle in its own color (a key's check, say).
+    var status: String? = nil
+    var statusColor: Color = .white.opacity(0.56)
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -16787,12 +16796,17 @@ private struct SettingsRowText: View {
                 .lineLimit(1)
                 .minimumScaleFactor(0.82)
 
-            Text(subtitle)
+            subtitleText
                 .font(.system(size: 17, weight: .medium))
-                .foregroundColor(.white.opacity(0.56))
                 .lineLimit(2)
                 .minimumScaleFactor(0.82)
         }
+    }
+
+    private var subtitleText: Text {
+        let base = Text(subtitle).foregroundColor(.white.opacity(0.56))
+        guard let status, !status.isEmpty else { return base }
+        return base + Text(" " + status).foregroundColor(statusColor)
     }
 }
 
