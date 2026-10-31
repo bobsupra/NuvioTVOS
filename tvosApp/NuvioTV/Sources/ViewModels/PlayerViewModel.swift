@@ -1321,6 +1321,7 @@ class PlayerViewModel: ObservableObject {
         let sNum = activeEpisodeNumbers?.season
         let eNum = activeEpisodeNumbers?.episode
         let expDur = expectedDurationSeconds
+        SeekPreviewDiagnostics.shared.updateSeekr("")
         trickplayResolveTask = Task { [weak self, activeGen = self.sessionCoordinator.loadGeneration] in
             let provider = await TrickplayResolver.shared.resolve(
                 contentId: contentId,
@@ -1329,11 +1330,27 @@ class PlayerViewModel: ObservableObject {
                 duration: expDur,
                 directTrickplayURL: directTPURL
             )
-            guard let self, let provider, !Task.isCancelled else { return }
-            await MainActor.run {
-                guard self.sessionCoordinator.loadGeneration == activeGen else { return }
-                self.sessionCoordinator.setExternalTrickplayProvider(provider)
+            guard let self, !Task.isCancelled else { return }
+            if let provider {
+                await MainActor.run {
+                    guard self.sessionCoordinator.loadGeneration == activeGen else { return }
+                    self.sessionCoordinator.setExternalTrickplayProvider(provider)
+                }
+                return
             }
+            // Seekr, with the profile's key; titles it doesn't have keep the player's previews.
+            guard await SeekrTrickplay.hasAPIKey(), self.isSeekPreviewEnabled, !self.isLiveStream else { return }
+            SeekPreviewDiagnostics.shared.updateSeekr("waiting for the file's length…")
+            guard let duration = await self.playingFileDuration(generation: activeGen) else { return }
+            let seekr = await SeekrTrickplay.shared.provider(
+                contentId: contentId,
+                season: sNum,
+                episode: eNum,
+                durationSeconds: duration
+            )
+            guard let seekr, !Task.isCancelled,
+                  self.sessionCoordinator.loadGeneration == activeGen else { return }
+            self.sessionCoordinator.setExternalTrickplayProvider(seekr)
         }
         // The coordinator owns initial seek and subtitle registration on both
         // backends; later progressive subtitle results still flow through the
@@ -4799,6 +4816,20 @@ class PlayerViewModel: ObservableObject {
 
     private var hasStartedPlayback: Bool {
         status == .playing || status == .paused || time.duration > 0 || clock.duration > 0
+    }
+
+    /// The playing file's length once it plays (Seekr picks its sprites by it), or nil when
+    /// this load is replaced or it doesn't play within two minutes.
+    private func playingFileDuration(generation: UInt64) async -> Double? {
+        for _ in 0..<240 {
+            guard !Task.isCancelled, sessionCoordinator.loadGeneration == generation else { return nil }
+            let duration = playbackDuration
+            if status == .playing || status == .paused, duration.isFinite, duration > 0 {
+                return duration
+            }
+            try? await Task.sleep(nanoseconds: 500_000_000)
+        }
+        return nil
     }
 
     private var playbackPosition: Double {

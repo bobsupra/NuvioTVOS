@@ -345,6 +345,8 @@ enum SettingsKey {
     static let playerShowAudio = "nuvio.tv.settings.playback.showAudio"
     static let seekPreviewEnabled = "nuvio.tv.settings.playback.seekPreviewEnabled"
     static let seekPreviewBeyondBuffer = "nuvio.tv.settings.playback.seekPreviewBeyondBuffer"
+    /// Seekr (seekr.tv) API key for seek previews; kept in the Nuvio account like the other settings.
+    static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -414,7 +416,7 @@ enum SettingsKey {
         subtitleLanguages, subtitleLanguage, subtitleLanguageSecondary, subtitleLanguageTertiary,
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
-        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, showLoadingStatus,
+        playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, showLoadingStatus,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8611,6 +8613,8 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.streamAutoPlayReuseBingeGroup) private var streamAutoPlayReuseBingeGroup = true
     @AppStorage(SettingsKey.seekPreviewEnabled) private var seekPreviewEnabled = true
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
+    @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
+    @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
     @AppStorage(SettingsKey.postPlayRecommendationsEnabled) private var postPlayRecommendationsEnabled = true
     @AppStorage(SettingsKey.trailersEnabled) private var trailersEnabled = true
@@ -8651,6 +8655,43 @@ private struct PlaybackSettingsView: View {
     private let diskCacheLimitOptions = ["5 GB", "10 GB", "20 GB", "30 GB", "50 GB"]
     private let streamSortModes = StreamSortOption.allCases.map(\.rawValue)
     private let lastLinkCacheOptions = ["1 Hour", "6 Hours", "12 Hours", "1 Day", "2 Days", "3 Days", "7 Days"]
+
+    private enum SeekrKeyCheck {
+        case unchecked, checking, valid, invalid, unreachable
+    }
+
+    private var seekrKeySubtitle: String {
+        switch seekrKeyCheck {
+        case .checking:
+            return L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…")
+        case .valid:
+            return L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key.")
+        case .invalid:
+            return L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key.")
+        case .unreachable:
+            return L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key.")
+        case .unchecked:
+            return L10n.string(
+                "tvos_settings_seekr_api_key_subtitle",
+                fallback: "Seek previews from seekr.tv first; titles Seekr doesn't have keep the player's own. Saved in your Nuvio account."
+            )
+        }
+    }
+
+    private func commitSeekrApiKey() {
+        let key = seekrApiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if key != seekrApiKey { seekrApiKey = key }
+        guard !key.isEmpty else {
+            seekrKeyCheck = .unchecked
+            return
+        }
+        seekrKeyCheck = .checking
+        Task { @MainActor in
+            let valid = await SeekrTrickplay.validate(apiKey: key)
+            guard seekrApiKey == key else { return }
+            seekrKeyCheck = valid.map { $0 ? SeekrKeyCheck.valid : SeekrKeyCheck.invalid } ?? .unreachable
+        }
+    }
 
     private func lastLinkCacheLabel(for hours: Int) -> String {
         switch hours {
@@ -8774,6 +8815,16 @@ private struct PlaybackSettingsView: View {
                     ),
                     isOn: $seekPreviewBeyondBuffer,
                     accentColor: accentColor
+                )
+                .disabled(!seekPreviewEnabled)
+
+                SettingsNativeTextFieldRow(
+                    title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
+                    subtitle: seekrKeySubtitle,
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $seekrApiKey,
+                    isSecure: true,
+                    onCommit: commitSeekrApiKey
                 )
                 .disabled(!seekPreviewEnabled)
 
