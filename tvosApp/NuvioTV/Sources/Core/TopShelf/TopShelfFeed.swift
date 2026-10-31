@@ -30,9 +30,11 @@ public let topShelfAppGroupID: String = {
 
 /// One Top Shelf row. Each section is mirrored to its own file so the stores
 /// that own them (Continue Watching, Library, Home) write independently.
-public enum TopShelfSection: String, Codable, CaseIterable {
+public enum TopShelfSection: String, Codable, CaseIterable, Sendable {
     case continueWatching
     case upNext
+    /// The calendar's titles coming out today (Home's Today row).
+    case today
     case library
     case catalog
 
@@ -44,7 +46,7 @@ public enum TopShelfSection: String, Codable, CaseIterable {
 }
 
 /// What selecting a card does.
-public enum TopShelfEntryAction: String, Codable {
+public enum TopShelfEntryAction: String, Codable, Sendable {
     /// Resume (or start the suggested episode) straight from the shelf.
     case resume
     /// Open the title's details page.
@@ -52,7 +54,7 @@ public enum TopShelfEntryAction: String, Codable {
 }
 
 /// One card on the Top Shelf row.
-public struct TopShelfEntry: Codable, Equatable {
+public struct TopShelfEntry: Codable, Equatable, Sendable {
     public let contentId: String
     public let contentType: String
     public let title: String
@@ -63,16 +65,51 @@ public struct TopShelfEntry: Codable, Equatable {
     public let backdropURL: String?
     /// Filename of the locally rendered card with its episode/time overlay.
     /// Optional so feeds written by earlier versions remain readable.
-    public let artworkFileName: String?
+    public internal(set) var artworkFileName: String?
+    /// Filename of the locally rendered full-screen carousel image (backdrop
+    /// with the title's logo).
+    public internal(set) var carouselArtworkFileName: String?
     /// Fractional progress 0...1, drawn as the card's progress bar.
     public let progress: Double?
     /// Nil in feeds written before actions existed, which were all resumable.
     public let action: TopShelfEntryAction?
 
+    // Carousel details. All optional: older feeds and sparse catalogs have none.
+    public let summary: String?
+    public let genres: [String]?
+    public let year: Int?
+    /// Release date as the metadata gives it (ISO 8601 date or date-time).
+    public let releaseDate: String?
+    public let runtimeMinutes: Int?
+    public let logoURL: String?
+    public let cast: [String]?
+    public let directors: [String]?
+    /// The day a Today entry comes out ("yyyy-MM-dd", local). The shelf drops
+    /// it once that day has passed, even when the app was not opened.
+    public let airDate: String?
+    /// What the app needs to look up the title's ratings for the carousel.
+    public let imdbId: String?
+    public let tmdbId: Int?
+    public let imdbRating: Double?
+    /// Continue Watching and Up Next: the position on Home's Continue
+    /// Watching row, so the two can share one shelf row in that order.
+    public let homeOrder: Int?
+    /// The app's Custom Posters artwork for this title, portrait and wide,
+    /// when that setting covers the screen the entry comes from. Drawn in
+    /// place of the title's own poster and card art, which stay the fallback.
+    public let customPosterURL: String?
+    public let customLandscapeURL: String?
+
     public init(contentId: String, contentType: String, title: String,
                 subtitle: String?, imageURL: String?, backdropURL: String? = nil,
                 progress: Double?, action: TopShelfEntryAction = .resume,
-                artworkFileName: String? = nil) {
+                artworkFileName: String? = nil,
+                summary: String? = nil, genres: [String]? = nil, year: Int? = nil,
+                releaseDate: String? = nil, runtimeMinutes: Int? = nil,
+                logoURL: String? = nil, cast: [String]? = nil, directors: [String]? = nil,
+                carouselArtworkFileName: String? = nil, airDate: String? = nil,
+                imdbId: String? = nil, tmdbId: Int? = nil, imdbRating: Double? = nil,
+                homeOrder: Int? = nil, customPosterURL: String? = nil, customLandscapeURL: String? = nil) {
         self.contentId = contentId
         self.contentType = contentType
         self.title = title
@@ -82,6 +119,22 @@ public struct TopShelfEntry: Codable, Equatable {
         self.progress = progress
         self.action = action
         self.artworkFileName = artworkFileName
+        self.summary = summary
+        self.genres = genres
+        self.year = year
+        self.releaseDate = releaseDate
+        self.runtimeMinutes = runtimeMinutes
+        self.logoURL = logoURL
+        self.cast = cast
+        self.directors = directors
+        self.carouselArtworkFileName = carouselArtworkFileName
+        self.airDate = airDate
+        self.imdbId = imdbId
+        self.tmdbId = tmdbId
+        self.imdbRating = imdbRating
+        self.homeOrder = homeOrder
+        self.customPosterURL = customPosterURL
+        self.customLandscapeURL = customLandscapeURL
     }
 
     /// Artwork the card is rendered from: the backdrop, else the poster.
@@ -89,27 +142,40 @@ public struct TopShelfEntry: Codable, Equatable {
         backdropURL ?? imageURL
     }
 
-    fileprivate func withArtworkFileName(_ artworkFileName: String?) -> TopShelfEntry {
-        TopShelfEntry(
-            contentId: contentId,
-            contentType: contentType,
-            title: title,
-            subtitle: subtitle,
-            imageURL: imageURL,
-            backdropURL: backdropURL,
-            progress: progress,
-            action: action ?? .resume,
-            artworkFileName: artworkFileName
-        )
+    /// Artwork the 16:9 card is rendered from: the custom wide artwork, else
+    /// the backdrop, else the poster.
+    var cardSourceURL: String? {
+        cardSources.first
     }
+
+    /// Artwork the poster is rendered from: the custom poster, else the
+    /// poster, else the backdrop.
+    var posterSourceURL: String? {
+        posterSources.first
+    }
+
+    /// Each render's artwork, best first; a URL that fails to load gives way
+    /// to the next.
+    var cardSources: [String] { [customLandscapeURL, backdropURL, imageURL].compactMap { $0 } }
+    var posterSources: [String] { [customPosterURL, imageURL, backdropURL].compactMap { $0 } }
+    var carouselSources: [String] { [backdropURL, imageURL].compactMap { $0 } }
 
     /// Deep link back into the app. Resumable entries go straight to
     /// Continue Watching playback (the app resolves URL-less synced and Next Up
     /// entries after opening); the rest open the details page.
     public var deepLinkURL: URL? {
+        link(host: (action ?? .resume) == .resume ? "continue-watching" : "details")
+    }
+
+    /// The title's details page, whatever selecting the card does.
+    public var detailsURL: URL? {
+        link(host: "details")
+    }
+
+    private func link(host: String) -> URL? {
         var components = URLComponents()
         components.scheme = "nuvio-tv"
-        components.host = (action ?? .resume) == .resume ? "continue-watching" : "details"
+        components.host = host
         components.queryItems = [
             URLQueryItem(name: "id", value: contentId),
             URLQueryItem(name: "type", value: contentType)
@@ -118,17 +184,104 @@ public struct TopShelfEntry: Codable, Equatable {
     }
 }
 
-public struct TopShelfFeed: Codable, Equatable {
+/// One Home catalog row in the catalog feed.
+public struct TopShelfFeedRow: Codable, Equatable, Sendable {
+    /// The Home row id, which Settings stores to choose it.
+    public let id: String
+    public let title: String?
+    public let entries: [TopShelfEntry]
+
+    public init(id: String, title: String?, entries: [TopShelfEntry]) {
+        self.id = id
+        self.title = title
+        self.entries = entries
+    }
+}
+
+public struct TopShelfFeed: Codable, Equatable, Sendable {
     public let entries: [TopShelfEntry]
     public let updatedAt: Date
     /// Row heading. Nil for the fixed sections, whose titles the extension owns
     /// unless the app supplies a localized one.
     public let title: String?
+    /// Catalog feed only: every Home catalog row, in Home order; Settings picks
+    /// which of them the shelf shows. Nil in the fixed sections and in catalog
+    /// feeds written before the choice existed.
+    public let rows: [TopShelfFeedRow]?
 
-    public init(entries: [TopShelfEntry], title: String? = nil, updatedAt: Date = Date()) {
+    public init(entries: [TopShelfEntry], title: String? = nil,
+                rows: [TopShelfFeedRow]? = nil, updatedAt: Date = Date()) {
         self.entries = entries
         self.title = title
+        self.rows = rows
         self.updatedAt = updatedAt
+    }
+
+    /// The catalog rows this feed offers. A feed from before rows existed is
+    /// its single first-catalog row.
+    public var catalogRows: [TopShelfFeedRow] {
+        if let rows { return rows }
+        return entries.isEmpty ? [] : [TopShelfFeedRow(id: Self.legacyCatalogRowID, title: title, entries: entries)]
+    }
+
+    static let legacyCatalogRowID = "catalog"
+
+    var allEntries: [TopShelfEntry] {
+        entries + (rows ?? []).flatMap(\.entries)
+    }
+}
+
+/// One rating drawn under the logo in the carousel image, as Nuvio's Details
+/// and hero show it: the provider's icon and the formatted score.
+public struct TopShelfRatingBadge: Codable, Equatable, Sendable {
+    public let source: String
+    public let name: String
+    /// Formatted as Nuvio shows it ("8.1", "85%").
+    public let value: String
+    /// A bundled icon (the app's asset catalog), else one to download.
+    public let iconAssetName: String?
+    public let iconURL: String?
+    /// Icon width at an icon height of 38.
+    public let iconWidth: Double
+
+    public init(source: String, name: String, value: String,
+                iconAssetName: String?, iconURL: String?, iconWidth: Double) {
+        self.source = source
+        self.name = name
+        self.value = value
+        self.iconAssetName = iconAssetName
+        self.iconURL = iconURL
+        self.iconWidth = iconWidth
+    }
+}
+
+/// Ratings fetched for carousel titles, kept next to the feeds so each title
+/// is looked up at most once a day.
+public enum TopShelfRatingsStore {
+    public struct Record: Codable, Equatable, Sendable {
+        public let badges: [TopShelfRatingBadge]
+        public let fetchedAt: Date
+    }
+
+    static let fileName = "ratings.json"
+    static let maximumAge: TimeInterval = 24 * 60 * 60
+
+    static func read(in directory: URL) -> [String: Record] {
+        guard let data = try? Data(contentsOf: directory.appendingPathComponent(fileName)),
+              let records = try? JSONDecoder().decode([String: Record].self, from: data) else { return [:] }
+        return records
+    }
+
+    static func write(_ records: [String: Record], in directory: URL) {
+        guard let data = try? JSONEncoder().encode(records) else { return }
+        TopShelfArtworkPruner.withFeedLock {
+            try? data.write(to: directory.appendingPathComponent(fileName), options: .atomic)
+        }
+    }
+
+    static func isFresh(_ record: Record?, now: Date = Date()) -> Bool {
+        guard let record else { return false }
+        return now.timeIntervalSince(record.fetchedAt) < maximumAge
     }
 }
 
@@ -155,13 +308,66 @@ final class TopShelfWriteCoordinator: @unchecked Sendable {
     }
 }
 
+/// Runs artwork refreshes one at a time; a request made during a pass runs
+/// one more pass after it, so the last feed and setting always win. Every
+/// caller returns once a pass that started after its request has finished.
+actor TopShelfArtworkRefresher {
+    static let shared = TopShelfArtworkRefresher()
+
+    private var isRunning = false
+    private var isPending = false
+    private var waiting: [CheckedContinuation<Void, Never>] = []
+
+    func refresh(_ pass: @Sendable () async -> Void) async {
+        isPending = true
+        guard !isRunning else {
+            await withCheckedContinuation { waiting.append($0) }
+            return
+        }
+        isRunning = true
+        while isPending {
+            isPending = false
+            await pass()
+        }
+        isRunning = false
+        let finished = waiting
+        waiting = []
+        finished.forEach { $0.resume() }
+    }
+}
+
 /// Reads/writes the feed in the shared App Group. All calls are no-ops when the
 /// group container isn't available (e.g. entitlement not provisioned), so the
 /// app never crashes or blocks on it.
 public enum TopShelfFeedStore {
-    private static let artworkRenderVersion = 3
+    // Version 4 / 2: drawn from the largest source the image host offers, the
+    // carousel at the screen's scale.
+    private static let artworkRenderVersion = 4
+    private static let carouselRenderVersion = 3
+    private static let posterRenderVersion = 1
     /// Rendered card size. 16:9, large enough for the 2x shelf scale.
     private static let artworkSize = CGSize(width: 1_280, height: 720)
+    /// Rendered carousel size: the full screen, in points. Drawn at the
+    /// screen's scale, so 3840x2160 pixels on a 4K TV.
+    private static let carouselArtworkSize = CGSize(width: 1_920, height: 1_080)
+    /// Rendered poster size, 2:3, in pixels: above what the 2x shelf shows.
+    private static let posterArtworkSize = CGSize(width: 1_000, height: 1_500)
+
+    /// What the configured style shows for each title.
+    enum ArtworkKind {
+        case card, carousel, poster
+
+        init(_ style: TopShelfConfiguration.Style) {
+            switch style {
+            case .carouselDetails, .carouselActions: self = .carousel
+            case .rows: self = .card
+            case .posters: self = .poster
+            }
+        }
+    }
+    /// Set by the app: the ratings the carousel shows for a title, in Nuvio's
+    /// own sources and order. Nil in the extension, which only reads them.
+    public static var ratingsProvider: (@Sendable (TopShelfEntry) async -> [TopShelfRatingBadge])?
     private static let writeCoordinators: [TopShelfSection: TopShelfWriteCoordinator] =
         Dictionary(uniqueKeysWithValues: TopShelfSection.allCases.map { ($0, TopShelfWriteCoordinator()) })
 
@@ -182,7 +388,7 @@ public enum TopShelfFeedStore {
     /// Where the feeds and artwork live. tvOS only allows writes under
     /// Library/Caches, App Group containers included: a write to the
     /// container root fails on device (the simulator allows it).
-    private static var containerURL: URL? {
+    static var containerURL: URL? {
         guard let base = groupContainerURL else { return nil }
         let directory = base.appendingPathComponent("Library/Caches/TopShelf", isDirectory: true)
         try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -200,53 +406,204 @@ public enum TopShelfFeedStore {
         section: TopShelfSection = .continueWatching,
         title: String? = nil
     ) {
+        commit(section: section) {
+            TopShelfFeed(entries: entries.map(decorated), title: title)
+        }
+    }
+
+    /// Mirrors every Home catalog row; Settings chooses which the shelf shows.
+    public static func writeCatalogRows(_ rows: [TopShelfFeedRow]) {
+        commit(section: .catalog) {
+            TopShelfFeed(
+                entries: [],
+                rows: rows.map { TopShelfFeedRow(id: $0.id, title: $0.title, entries: $0.entries.map(decorated)) })
+        }
+    }
+
+    /// The background refresh's write: returns once the shelf's artwork is
+    /// drawn, as the system suspends the app when the task completes.
+    static func writeCatalogRowsAndWait(_ rows: [TopShelfFeedRow]) async {
+        guard isAvailable, let writeCoordinator = writeCoordinators[.catalog] else { return }
+        let generation = writeCoordinator.beginWrite()
+        let feed = TopShelfFeed(
+            entries: [],
+            rows: rows.map { TopShelfFeedRow(id: $0.id, title: $0.title, entries: $0.entries.map(decorated)) })
+        guard writeCoordinator.commitIfCurrent(generation, commit: {
+            writeFeed(feed, section: .catalog)
+        }) else { return }
+        await refreshArtworkNow()
+    }
+
+    private static func commit(section: TopShelfSection, feed makeFeed: @escaping @Sendable () -> TopShelfFeed) {
         guard isAvailable, let writeCoordinator = writeCoordinators[section] else { return }
         let generation = writeCoordinator.beginWrite()
         Task.detached(priority: .utility) {
-            let decoratedEntries = entries.map { entry in
-                guard entry.artworkSourceURL != nil else { return entry }
-                return entry.withArtworkFileName(artworkFileName(for: entry))
-            }
+            let feed = makeFeed()
             guard writeCoordinator.commitIfCurrent(generation, commit: {
-                writeFeed(decoratedEntries, title: title, section: section)
+                writeFeed(feed, section: section)
             }) else { return }
+            await refreshArtworkNow()
+        }
+    }
 
+    /// Redraws the shelf for the current setting: renders the artwork the
+    /// chosen layout shows, removes what it no longer shows, and asks the
+    /// system to reload the shelf.
+    public static func refreshArtwork() {
+        guard isAvailable else { return }
+        Task.detached(priority: .utility) {
+            await refreshArtworkNow()
+        }
+    }
+
+    private static func refreshArtworkNow() async {
+        await TopShelfArtworkRefresher.shared.refresh {
+            guard let container = containerURL else { return }
+            let configuration = TopShelfConfigurationStore.load()
+            TopShelfConfigurationStore.mirror(configuration, in: container)
             #if canImport(UIKit)
-            await cacheArtwork(for: decoratedEntries)
-            #endif
-            if let container = containerURL {
-                TopShelfArtworkPruner.prune(in: container)
+            let rows = TopShelfComposer.rows(configuration: configuration) { read($0) }
+            let displayed = TopShelfComposer.displayedEntries(configuration: configuration, rows: rows)
+            let scale = await MainActor.run { min(max(UIScreen.main.scale, 1), 2) }
+            var ratings = TopShelfRatingsStore.read(in: container)
+            if configuration.style.isCarousel, let provider = ratingsProvider {
+                var changed = false
+                for entry in displayed where !TopShelfRatingsStore.isFresh(ratings[entry.contentId]) {
+                    let badges = await provider(entry)
+                    ratings[entry.contentId] = TopShelfRatingsStore.Record(badges: badges, fetchedAt: Date())
+                    changed = true
+                }
+                // Titles no longer on the shelf drop out, so the file stays small.
+                let shown = Set(rows.flatMap(\.entries).map(\.contentId))
+                let kept = ratings.filter { shown.contains($0.key) }
+                if changed || kept.count != ratings.count {
+                    ratings = kept
+                    TopShelfRatingsStore.write(ratings, in: container)
+                }
             }
+            await cacheArtwork(for: displayed, kind: ArtworkKind(configuration.style), ratings: ratings, scale: scale)
+            #endif
+            TopShelfArtworkPruner.prune(in: container)
             notifyTopShelfContentChanged()
         }
     }
 
-    /// Resolves a rendered artwork file that both the app and extension can
-    /// read from their shared App Group.
+    /// Resolves a rendered card that both the app and extension can read from
+    /// their shared App Group.
     public static func artworkURL(for entry: TopShelfEntry) -> URL? {
-        guard let artworkFileName = entry.artworkFileName,
-              let container = containerURL else { return nil }
-        let url = container.appendingPathComponent(artworkFileName)
+        existingArtwork(named: entry.artworkFileName)
+    }
+
+    /// Resolves the rendered full-screen carousel image: with the title's
+    /// ratings when it has them, else without.
+    public static func carouselArtworkURL(for entry: TopShelfEntry, ratings: [String: TopShelfRatingsStore.Record]) -> URL? {
+        existingArtwork(named: carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges))
+            ?? existingArtwork(named: entry.carouselArtworkFileName)
+    }
+
+    /// Resolves the rendered 2:3 poster with its episode/time pill.
+    public static func posterArtworkURL(for entry: TopShelfEntry) -> URL? {
+        existingArtwork(named: posterArtworkName(for: entry))
+    }
+
+    /// The poster render's name, from what is drawn on it. Derived rather than
+    /// stored, so feeds written before posters existed get them too.
+    static func posterArtworkName(for entry: TopShelfEntry) -> String? {
+        guard let source = entry.posterSourceURL else { return nil }
+        return generatedName(for: [
+            "poster",
+            String(posterRenderVersion),
+            entry.contentId,
+            source,
+            entry.subtitle ?? ""
+        ])
+    }
+
+    /// The ratings saved for the shelf's titles.
+    public static func savedRatings() -> [String: TopShelfRatingsStore.Record] {
+        containerURL.map(TopShelfRatingsStore.read(in:)) ?? [:]
+    }
+
+    /// The carousel render's name. Ratings change it, so new scores redraw it.
+    static func carouselImageName(for entry: TopShelfEntry, badges: [TopShelfRatingBadge]?) -> String? {
+        guard let base = entry.carouselArtworkFileName else { return nil }
+        guard let badges, !badges.isEmpty else { return base }
+        return generatedName(for: [base] + badges.map { "\($0.source)=\($0.value)" })
+    }
+
+    private static func existingArtwork(named name: String?) -> URL? {
+        guard let name, let container = containerURL else { return nil }
+        let url = container.appendingPathComponent(name)
         return FileManager.default.fileExists(atPath: url.path) ? url : nil
     }
 
-    private static func writeFeed(_ entries: [TopShelfEntry], title: String?, section: TopShelfSection) {
-        guard let url = feedFileURL(for: section) else { return }
-        let feed = TopShelfFeed(entries: entries, title: title)
-        guard let data = try? JSONEncoder().encode(feed) else { return }
+    private static func writeFeed(_ feed: TopShelfFeed, section: TopShelfSection) {
+        guard let url = feedFileURL(for: section),
+              let data = try? JSONEncoder().encode(feed) else { return }
         TopShelfArtworkPruner.withFeedLock {
             try? data.write(to: url, options: .atomic)
         }
     }
 
+    /// Names both renders up front. Which one gets drawn depends on the
+    /// setting, which can change without the feed being written again.
+    private static func decorated(_ entry: TopShelfEntry) -> TopShelfEntry {
+        var entry = entry
+        entry.artworkFileName = entry.cardSourceURL == nil ? nil : artworkFileName(for: entry)
+        entry.carouselArtworkFileName = entry.artworkSourceURL == nil ? nil : carouselArtworkFileName(for: entry)
+        return entry
+    }
+
     private static func artworkFileName(for entry: TopShelfEntry) -> String {
-        let source = [
+        generatedName(for: [
             String(artworkRenderVersion),
             entry.contentId,
-            entry.artworkSourceURL ?? "",
+            entry.cardSourceURL ?? "",
             entry.subtitle ?? ""
-        ]
-            .joined(separator: "\u{1F}")
+        ])
+    }
+
+    private static func carouselArtworkFileName(for entry: TopShelfEntry) -> String {
+        generatedName(for: [
+            "carousel",
+            String(carouselRenderVersion),
+            entry.contentId,
+            entry.artworkSourceURL ?? "",
+            entry.logoURL ?? ""
+        ])
+    }
+
+    /// The same image at the largest size its host serves, then the URL as
+    /// given. Catalogs hand out mid-size artwork (TMDB w1280, Cinemeta
+    /// "medium"), which a full-screen 4K shelf shows soft.
+    static func highResolutionCandidates(for text: String) -> [URL] {
+        guard let url = URL(string: text) else { return [] }
+        guard var components = URLComponents(url: url, resolvingAgainstBaseURL: false),
+              let host = components.host?.lowercased() else { return [url] }
+        var parts = components.path.split(separator: "/", omittingEmptySubsequences: false).map(String.init)
+        switch host {
+        case "image.tmdb.org":
+            // /t/p/<size>/<file>
+            guard parts.count > 4, parts[1] == "t", parts[2] == "p", parts[3] != "original" else { return [url] }
+            parts[3] = "original"
+        case "images.metahub.space":
+            // /<kind>/<size>/<imdb id>/img
+            guard parts.count > 3, ["small", "medium"].contains(parts[2]) else { return [url] }
+            parts[2] = "large"
+        case "assets.fanart.tv":
+            // /preview/<path> is a downscaled copy of /fanart/<path>.
+            guard parts.count > 2, parts[1] == "preview" else { return [url] }
+            parts[1] = "fanart"
+        default:
+            return [url]
+        }
+        components.path = parts.joined(separator: "/")
+        guard let upgraded = components.url, upgraded != url else { return [url] }
+        return [upgraded, url]
+    }
+
+    private static func generatedName(for parts: [String]) -> String {
+        let source = parts.joined(separator: "\u{1F}")
         var hash: UInt64 = 1_469_598_103_934_665_603 // FNV-1a offset basis
         for byte in source.utf8 {
             hash ^= UInt64(byte)
@@ -262,44 +619,83 @@ public enum TopShelfFeedStore {
     }
 
     #if canImport(UIKit)
-    private static func cacheArtwork(for entries: [TopShelfEntry]) async {
+    private static func cacheArtwork(
+        for entries: [TopShelfEntry],
+        kind: ArtworkKind,
+        ratings: [String: TopShelfRatingsStore.Record],
+        scale: CGFloat
+    ) async {
         #if DEBUG
         let start = DispatchTime.now().uptimeNanoseconds
-        print("[TVTrace] topShelf.cacheArtwork begin entries=\(entries.count) onMainActor=\(Thread.isMainThread)")
+        print("[TVTrace] topShelf.cacheArtwork begin entries=\(entries.count) kind=\(kind)")
         #endif
+        var icons: [String: UIImage] = [:]
         for entry in entries {
-            guard let destination = artworkURLDestination(for: entry),
-                  !FileManager.default.fileExists(atPath: destination.path),
-                  let sourceText = entry.artworkSourceURL,
-                  let sourceURL = URL(string: sourceText) else { continue }
-            #if DEBUG
-            let itemStart = DispatchTime.now().uptimeNanoseconds
-            print("[TVTrace] topShelf.cacheArtwork rendering entry=\(entry.contentId)")
-            #endif
-            do {
-                let (data, _) = try await URLSession.shared.data(from: sourceURL)
-                guard let image = UIImage(data: data),
-                      let rendered = renderedArtwork(from: image, subtitle: entry.subtitle) else { continue }
-                try rendered.write(to: destination, options: .atomic)
-                #if DEBUG
-                let elapsed = Double(DispatchTime.now().uptimeNanoseconds - itemStart) / 1_000_000
-                print("[TVTrace] topShelf.cacheArtwork finished entry=\(entry.contentId) size=\(rendered.count) bytes in \(String(format: "%.1f", elapsed))ms")
-                #endif
-            } catch {
-                continue
+            let badges = ratings[entry.contentId]?.badges ?? []
+            let name: String?
+            switch kind {
+            case .card: name = entry.artworkFileName
+            case .carousel: name = carouselImageName(for: entry, badges: badges)
+            case .poster: name = posterArtworkName(for: entry)
             }
+            guard let name, let container = containerURL else { continue }
+            let destination = container.appendingPathComponent(name)
+            guard !FileManager.default.fileExists(atPath: destination.path) else { continue }
+            let sources: [String]
+            switch kind {
+            case .card: sources = entry.cardSources
+            case .carousel: sources = entry.carouselSources
+            case .poster: sources = entry.posterSources
+            }
+            var loaded: UIImage?
+            for source in sources where loaded == nil {
+                loaded = await downloadedImage(source)
+            }
+            guard let image = loaded else { continue }
+            let rendered: Data?
+            switch kind {
+            case .poster:
+                rendered = renderedPoster(from: image, subtitle: entry.subtitle)
+            case .carousel:
+                var logo: UIImage?
+                if let logoText = entry.logoURL { logo = await downloadedImage(logoText) }
+                var drawn: [(icon: UIImage?, badge: TopShelfRatingBadge)] = []
+                for badge in badges {
+                    let icon = await ratingIcon(for: badge, cache: &icons)
+                    drawn.append((icon: icon, badge: badge))
+                }
+                rendered = renderedCarouselArtwork(from: image, logo: logo, ratings: drawn, scale: scale)
+            case .card:
+                rendered = renderedArtwork(from: image, subtitle: entry.subtitle)
+            }
+            guard let rendered else { continue }
+            try? rendered.write(to: destination, options: .atomic)
         }
         #if DEBUG
         let totalElapsed = Double(DispatchTime.now().uptimeNanoseconds - start) / 1_000_000
         print("[TVTrace] topShelf.cacheArtwork end totalMs=\(String(format: "%.1f", totalElapsed))")
         #endif
-        notifyTopShelfContentChanged()
     }
 
-    private static func artworkURLDestination(for entry: TopShelfEntry) -> URL? {
-        guard let artworkFileName = entry.artworkFileName,
-              let container = containerURL else { return nil }
-        return container.appendingPathComponent(artworkFileName)
+    /// A bundled provider icon, else the add-on's, downloaded once per pass.
+    private static func ratingIcon(for badge: TopShelfRatingBadge, cache: inout [String: UIImage]) async -> UIImage? {
+        if let asset = badge.iconAssetName, let image = UIImage(named: asset) { return image }
+        guard let url = badge.iconURL, let iconURL = URL(string: url) else { return nil }
+        if let cached = cache[url] { return cached }
+        guard let result = try? await URLSession.shared.data(from: iconURL),
+              let image = UIImage(data: result.0) else { return nil }
+        cache[url] = image
+        return image
+    }
+
+    /// The image at the largest size offered, else as given.
+    private static func downloadedImage(_ text: String) async -> UIImage? {
+        for url in highResolutionCandidates(for: text) {
+            guard let result = try? await URLSession.shared.data(from: url) else { continue }
+            if let http = result.1 as? HTTPURLResponse, !(200...299).contains(http.statusCode) { continue }
+            if let image = UIImage(data: result.0) { return image }
+        }
+        return nil
     }
 
     /// Renders a 16:9 card. Landscape art fills it; portrait art (a poster used
@@ -309,17 +705,7 @@ public enum TopShelfFeedStore {
         let size = artworkSize
         let renderer = UIGraphicsImageRenderer(size: size)
         let rendered = renderer.image { context in
-            UIColor.black.setFill()
-            context.fill(CGRect(origin: .zero, size: size))
-
-            let fillRect = aspectRect(for: image.size, in: size, fill: true)
-            let isLandscape = image.size.width >= image.size.height * 1.2
-            if isLandscape {
-                image.draw(in: fillRect)
-            } else {
-                image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)
-                image.draw(in: aspectRect(for: image.size, in: size, fill: false))
-            }
+            drawBackground(image, in: size, context: context)
 
             guard let subtitle else { return }
             let font = UIFont.systemFont(ofSize: 40, weight: .bold)
@@ -359,6 +745,150 @@ public enum TopShelfFeedStore {
         return rendered.jpegData(compressionQuality: 0.85)
     }
 
+    /// Renders a 2:3 poster as the shelf drew it before the 16:9 cards: the
+    /// poster filling the card, the episode and time left in a pill at the
+    /// top (the system draws the progress bar at the bottom). Landscape art
+    /// (no poster) sits centered over a dimmed, filled copy of itself.
+    private static func renderedPoster(from image: UIImage, subtitle: String?) -> Data? {
+        let size = posterArtworkSize
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let rendered = renderer.image { context in
+            UIColor.black.setFill()
+            context.fill(CGRect(origin: .zero, size: size))
+            let fillRect = aspectRect(for: image.size, in: size, fill: true)
+            if image.size.height >= image.size.width * 1.2 {
+                image.draw(in: fillRect)
+            } else {
+                image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)
+                image.draw(in: aspectRect(for: image.size, in: size, fill: false))
+            }
+
+            guard let subtitle else { return }
+            let style = NSMutableParagraphStyle()
+            style.alignment = .center
+            let attributes: [NSAttributedString.Key: Any] = [
+                .font: UIFont.systemFont(ofSize: 44, weight: .bold),
+                .foregroundColor: UIColor.white,
+                .paragraphStyle: style
+            ]
+            let textSize = (subtitle as NSString).size(withAttributes: attributes)
+            let horizontalPadding: CGFloat = 72
+            let pillWidth = min(size.width - 88, ceil(textSize.width) + horizontalPadding)
+            let pillHeight = max(108, ceil(textSize.height) + 36)
+            let pillRect = CGRect(x: (size.width - pillWidth) / 2, y: 44, width: pillWidth, height: pillHeight)
+            UIColor.black.withAlphaComponent(0.76).setFill()
+            UIBezierPath(roundedRect: pillRect, cornerRadius: pillHeight / 2).fill()
+            subtitle.draw(
+                in: CGRect(
+                    x: pillRect.minX + horizontalPadding / 2,
+                    y: pillRect.midY - ceil(textSize.height) / 2,
+                    width: pillRect.width - horizontalPadding,
+                    height: ceil(textSize.height)),
+                withAttributes: attributes)
+        }
+        return rendered.jpegData(compressionQuality: 0.88)
+    }
+
+    /// Where the logo's center sits, as a fraction of the image height. Logo
+    /// and ratings end above the system's arrow at mid-height.
+    private static let logoCenterHeight: CGFloat = 0.26
+
+    /// Renders a full-screen carousel image: the backdrop, darkened toward the
+    /// left edge where the system draws its text, with the title's logo there
+    /// and its ratings below the logo.
+    private static func renderedCarouselArtwork(
+        from image: UIImage,
+        logo: UIImage?,
+        ratings: [(icon: UIImage?, badge: TopShelfRatingBadge)],
+        scale: CGFloat
+    ) -> Data? {
+        let size = carouselArtworkSize
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = scale
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: size, format: format)
+        let rendered = renderer.image { context in
+            drawBackground(image, in: size, context: context)
+
+            let shade = [UIColor.black.withAlphaComponent(0.6).cgColor, UIColor.black.withAlphaComponent(0).cgColor]
+            if let gradient = CGGradient(colorsSpace: CGColorSpaceCreateDeviceRGB(), colors: shade as CFArray, locations: [0, 1]) {
+                context.cgContext.drawLinearGradient(
+                    gradient, start: .zero, end: CGPoint(x: size.width * 0.6, y: 0), options: [])
+            }
+
+            // The upper part: the system draws its previous-item arrow at the left edge
+            // around mid-height, and its buttons and summary in the lower third.
+            var ratingsTop = size.height * logoCenterHeight
+            if let logo, logo.size.width > 0, logo.size.height > 0 {
+                let maximum = CGSize(width: size.width * 0.34, height: size.height * 0.18)
+                let logoScale = min(maximum.width / logo.size.width, maximum.height / logo.size.height)
+                let logoSize = CGSize(width: logo.size.width * logoScale, height: logo.size.height * logoScale)
+                let origin = CGPoint(x: 120, y: size.height * logoCenterHeight - logoSize.height / 2)
+                logo.draw(in: CGRect(origin: origin, size: logoSize))
+                ratingsTop = origin.y + logoSize.height + 32
+            }
+            drawRatings(ratings, at: CGPoint(x: 120, y: ratingsTop), maximumX: size.width * 0.55)
+        }
+        return rendered.jpegData(compressionQuality: 0.85)
+    }
+
+    /// One row of provider icons with their scores, as on the Details page.
+    private static func drawRatings(
+        _ ratings: [(icon: UIImage?, badge: TopShelfRatingBadge)],
+        at origin: CGPoint,
+        maximumX: CGFloat
+    ) {
+        guard !ratings.isEmpty else { return }
+        let iconHeight: CGFloat = 40
+        let shadow = NSShadow()
+        shadow.shadowColor = UIColor.black.withAlphaComponent(0.7)
+        shadow.shadowBlurRadius = 6
+        shadow.shadowOffset = CGSize(width: 0, height: 1)
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 34, weight: .semibold),
+            .foregroundColor: UIColor.white,
+            .shadow: shadow
+        ]
+        var x = origin.x
+        for (icon, badge) in ratings {
+            // No icon: the provider's name stands in for it.
+            let text = icon == nil ? "\(badge.name) \(badge.value)" : badge.value
+            let textSize = (text as NSString).size(withAttributes: attributes)
+            let iconWidth = icon == nil ? 0 : iconHeight * CGFloat(badge.iconWidth / 38)
+            let width = iconWidth + (icon == nil ? 0 : 12) + ceil(textSize.width)
+            guard x + width <= maximumX else { break }
+            if let icon {
+                icon.draw(in: aspectRect(
+                    for: icon.size,
+                    in: CGSize(width: iconWidth, height: iconHeight),
+                    fill: false
+                ).offsetBy(dx: x, dy: origin.y))
+            }
+            let textX = x + iconWidth + (icon == nil ? 0 : 12)
+            (text as NSString).draw(
+                at: CGPoint(x: textX, y: origin.y + (iconHeight - textSize.height) / 2),
+                withAttributes: attributes)
+            x += width + 36
+        }
+    }
+
+    private static func drawBackground(_ image: UIImage, in size: CGSize, context: UIGraphicsImageRendererContext) {
+        UIColor.black.setFill()
+        context.fill(CGRect(origin: .zero, size: size))
+
+        let fillRect = aspectRect(for: image.size, in: size, fill: true)
+        let isLandscape = image.size.width >= image.size.height * 1.2
+        if isLandscape {
+            image.draw(in: fillRect)
+        } else {
+            image.draw(in: fillRect, blendMode: .normal, alpha: 0.35)
+            image.draw(in: aspectRect(for: image.size, in: size, fill: false))
+        }
+    }
+
     private static func aspectRect(for imageSize: CGSize, in size: CGSize, fill: Bool) -> CGRect {
         let widthScale = size.width / imageSize.width
         let heightScale = size.height / imageSize.height
@@ -384,7 +914,8 @@ public enum TopShelfFeedStore {
     }
 }
 
-/// Removes unreferenced generated artwork, preserving the persisted feed.
+/// Removes generated artwork the shelf no longer shows, preserving the
+/// persisted feeds.
 enum TopShelfArtworkPruner {
     private static let feedLock = NSLock()
 
@@ -397,21 +928,30 @@ enum TopShelfArtworkPruner {
 
     static func prune(in container: URL) {
         withFeedLock {
-            // Every section's feed references artwork; keep anything any of
-            // them still points at. A section that was never written is
+            // Keep both renders of every entry the chosen layout shows: a
+            // style switch reuses them. A section that was never written is
             // skipped, but an unreadable one (or none at all) stops cleanup
             // rather than risk deleting artwork it still uses.
-            var keep = Set<String>()
-            var readAnyFeed = false
+            var feeds: [TopShelfSection: TopShelfFeed] = [:]
             for section in TopShelfSection.allCases {
                 let feedURL = container.appendingPathComponent(section.feedFileName)
                 guard FileManager.default.fileExists(atPath: feedURL.path) else { continue }
                 guard let data = try? Data(contentsOf: feedURL),
                       let feed = try? JSONDecoder().decode(TopShelfFeed.self, from: data) else { return }
-                keep.formUnion(feed.entries.compactMap(\.artworkFileName))
-                readAnyFeed = true
+                feeds[section] = feed
             }
-            guard readAnyFeed else { return }
+            guard !feeds.isEmpty else { return }
+            let configuration = TopShelfConfigurationStore.read(in: container) ?? .default
+            let ratings = TopShelfRatingsStore.read(in: container)
+            let rows = TopShelfComposer.rows(configuration: configuration) { feeds[$0] }
+            let keep = Set(rows.flatMap(\.entries).flatMap { entry in
+                [
+                    entry.artworkFileName,
+                    entry.carouselArtworkFileName,
+                    TopShelfFeedStore.carouselImageName(for: entry, badges: ratings[entry.contentId]?.badges),
+                    TopShelfFeedStore.posterArtworkName(for: entry)
+                ].compactMap { $0 }
+            })
             guard let files = try? FileManager.default.contentsOfDirectory(
                 at: container,
                 includingPropertiesForKeys: [.isRegularFileKey, .isSymbolicLinkKey]

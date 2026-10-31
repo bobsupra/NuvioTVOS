@@ -3565,21 +3565,25 @@ enum ContinueWatchingStore {
         guard TopShelfFeedStore.isAvailable else { return }
         topShelfSnapshotLock.lock()
         defer { topShelfSnapshotLock.unlock() }
-        let allItems = items()
-        let inProgress = allItems.filter { !$0.isUpNextEntry }.prefix(10)
+        // Each entry keeps its place on Home's row, so the shelf can show both
+        // sections as one row in that order.
+        let allItems = Array(items().enumerated())
+        let inProgress = allItems.filter { !$0.element.isUpNextEntry }.prefix(10)
         // Unaired suggestions can't be played yet, so they stay off the shelf.
         let upNext = allItems
-            .filter { $0.isUpNextEntry && ($0.hasAired || $0.isAiringToday) }
+            .filter { $0.element.isUpNextEntry && ($0.element.hasAired || $0.element.isAiringToday) }
             .prefix(10)
         // Register these snapshots before any detached work can reorder them.
         // Mapping at most twenty cards is cheap; disk/network/artwork stay async.
-        TopShelfFeedStore.write(inProgress.map(topShelfEntry(for:)), section: .continueWatching,
+        TopShelfFeedStore.write(inProgress.map { topShelfEntry(for: $0.element, homeOrder: $0.offset) },
+                                section: .continueWatching,
                                 title: L10n.string("home_continue_watching", fallback: "Continue Watching"))
-        TopShelfFeedStore.write(upNext.map(topShelfEntry(for:)), section: .upNext,
+        TopShelfFeedStore.write(upNext.map { topShelfEntry(for: $0.element, homeOrder: $0.offset) },
+                                section: .upNext,
                                 title: L10n.string("cw_badge_next_up", fallback: "Up Next").capitalized)
     }
 
-    private static func topShelfEntry(for item: ContinueWatchingItem) -> TopShelfEntry {
+    private static func topShelfEntry(for item: ContinueWatchingItem, homeOrder: Int) -> TopShelfEntry {
         let fraction = item.duration > 0 ? min(max(item.position / item.duration, 0), 1) : nil
         var subtitleParts: [String] = []
         if let season = item.season, let episode = item.episode {
@@ -3593,13 +3597,12 @@ enum ContinueWatchingStore {
             subtitleParts.append("\(remaining) left")
         }
         return TopShelfEntry(
-            contentId: item.meta.id,
-            contentType: item.meta.type,
-            title: item.meta.name,
+            meta: item.meta,
             subtitle: subtitleParts.isEmpty ? nil : subtitleParts.joined(separator: "  ·  "),
-            imageURL: item.meta.posterUrl,
-            backdropURL: item.meta.backdropUrl,
-            progress: item.isUpNextEntry ? nil : fraction
+            progress: item.isUpNextEntry ? nil : fraction,
+            action: .resume,
+            screen: .continueWatching,
+            homeOrder: homeOrder
         )
     }
 
@@ -4339,16 +4342,7 @@ enum LibraryStore {
             .sorted { $0.addedAt > $1.addedAt }
             .prefix(15)
             .map { item in
-                TopShelfEntry(
-                    contentId: item.meta.id,
-                    contentType: item.meta.type,
-                    title: item.meta.name,
-                    subtitle: nil,
-                    imageURL: item.meta.posterUrl,
-                    backdropURL: item.meta.backdropUrl,
-                    progress: nil,
-                    action: .details
-                )
+                TopShelfEntry(meta: item.meta, subtitle: nil, progress: nil, action: .details, screen: .library)
             }
         TopShelfFeedStore.write(Array(entries), section: .library,
                                 title: L10n.string("nav_library", fallback: "Library"))
