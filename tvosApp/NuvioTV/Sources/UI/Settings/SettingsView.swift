@@ -8662,21 +8662,21 @@ private struct PlaybackSettingsView: View {
     }
 
     private var seekrKeySubtitle: String {
+        let saved = L10n.string("tvos_settings_seekr_api_key_subtitle", fallback: "Saved in your Nuvio account.")
+        let status: String
         switch seekrKeyCheck {
-        case .checking:
-            return L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…")
-        case .valid:
-            return L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key.")
-        case .invalid:
-            return L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key.")
-        case .unreachable:
-            return L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key.")
         case .unchecked:
-            return L10n.string(
-                "tvos_settings_seekr_api_key_subtitle",
-                fallback: "Seek previews from seekr.tv first; titles Seekr doesn't have keep the player's own. Saved in your Nuvio account."
-            )
+            return saved
+        case .checking:
+            status = L10n.string("tvos_settings_seekr_checking", fallback: "Checking the key with Seekr…")
+        case .valid:
+            status = "✓ " + L10n.string("tvos_settings_seekr_valid", fallback: "Seekr accepts the key.")
+        case .invalid:
+            status = "✕ " + L10n.string("tvos_settings_seekr_invalid", fallback: "Seekr doesn't accept this key.")
+        case .unreachable:
+            status = L10n.string("tvos_settings_seekr_unreachable", fallback: "Seekr couldn't be reached to check the key.")
         }
+        return saved + " " + status
     }
 
     private func commitSeekrApiKey() {
@@ -8831,22 +8831,6 @@ private struct PlaybackSettingsView: View {
                 )
                 .disabled(!seekPreviewEnabled)
 
-                SettingsNativeTextFieldRow(
-                    title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
-                    subtitle: seekrKeySubtitle,
-                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
-                    text: $seekrApiKey,
-                    isSecure: true,
-                    onCommit: commitSeekrApiKey
-                )
-                .disabled(!seekPreviewEnabled)
-                .onAppear {
-                    if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
-                }
-                .onChange(of: seekrApiKey) { _, _ in
-                    checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
-                }
-
                 SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
                     subtitle: L10n.string(
@@ -8902,6 +8886,30 @@ private struct PlaybackSettingsView: View {
                         options: diskCacheLimitOptions,
                         accentColor: accentColor
                     )
+                }
+            }
+
+            SettingsGroup(
+                title: L10n.string("tvos_settings_seekr_title", fallback: "Seekr"),
+                subtitle: L10n.string(
+                    "tvos_settings_seekr_subtitle",
+                    fallback: "Seekr (seekr.tv) serves ready-made seek-preview thumbnails for movies and series. With your own key, previews appear instantly and the player reads nothing from the video for them. Titles Seekr doesn't have keep the player's own previews. Get a key by signing up at seekr.tv. During the public beta, each key covers 20 movies and 70 episodes a day."
+                )
+            ) {
+                SettingsNativeTextFieldRow(
+                    title: L10n.string("tvos_settings_seekr_api_key", fallback: "Seekr API Key"),
+                    subtitle: seekrKeySubtitle,
+                    placeholder: L10n.string("debrid_not_set", fallback: "Not set"),
+                    text: $seekrApiKey,
+                    isSecure: true,
+                    onCommit: commitSeekrApiKey
+                )
+                .disabled(!seekPreviewEnabled)
+                .onAppear {
+                    if seekrKeyCheck == .unchecked { checkSeekrApiKey() }
+                }
+                .onChange(of: seekrApiKey) { _, _ in
+                    checkSeekrApiKey(afterNanoseconds: 1_000_000_000)
                 }
             }
 
