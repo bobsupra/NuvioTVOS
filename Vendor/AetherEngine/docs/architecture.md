@@ -470,9 +470,8 @@ Sources/AetherEngine/
 │   ├── AtmosDecoderPrimer.swift             Registers the system's Atmos decoders in the process once (creates an AVPlayer), which the renderer needs before it decodes compressed E-AC-3 as Atmos
 │   ├── Shaping/
 │   │   ├── AudioShaping.swift               `AudioShaping` (channel cap, dialogue lift, compressor) and `AudioShapingState`, the host's request and the published answer (AE#923)
-│   │   ├── AudioShapingMatrix.swift         The cap and the dialogue lift as one libswresample remix matrix (centre column, or a mid lift on stereo)
-│   │   ├── AudioDynamicsProcessor.swift     The compressor and the -1 dBFS peak limiter, linked across channels, on interleaved Float32
-│   │   └── AudioShapingSampleWriter.swift   Shaped Float32 into the bridge encoder's sample format
+│   │   ├── AudioShapingMatrix.swift         The cap and the centre lift as one libswresample remix matrix
+│   │   └── AudioShapingGraph.swift          The libavfilter graph after the remix: dialoguenhance + pan on stereo, acompressor, alimiter, aformat; runs on its own sample counter so its latency never reaches the timeline
 │   ├── Spatial/
 │   │   ├── SpatialBedOutput.swift           `SpatialBedFormat` (PCM or APAC, and the route rule `.render` uses), the bed buffers and packets, and `PCMBedPacker`, the 24-bit PCM sink beside `APACEncodePipeline`
 │   │   └── SoftwareAPACProducer.swift       SW path: TrueHD Atmos / DTS:X rendered into a speaker bed through `SpatialAudioBridge` as APAC or PCM, the packets handed to the audio renderer as sample buffers
@@ -541,7 +540,7 @@ Sources/AetherEngine/
 │   └── SubtitleDeliveryStatement.swift      Value + formatter for the #357 line stating what a drain tick did with the packets it found, so "nothing appeared on screen" is attributable from outside instead of inferred from an absent log line; `harvestHole` names the tick that decoded nothing on purpose, which would otherwise read as `empty` (#362); `landingWithheld=` counts the sets refused the landing because the ground between them and the playhead was never read (#416)
 ├── Disc/
 │   ├── DiscReader.swift                     Disc detection + routing: local `.iso` URLs and custom ISO readers into the demux path; enumerates titles and threads the selected one (DVD vs Blu-ray)
-│   ├── DiscImageMediaType.swift             The `Content-Type` values that send an extensionless HTTP URL to the disc adapter, and the process memo of URLs found to be discs (AE#860)
+│   ├── DiscImageMediaType.swift             The `Content-Type` values (and, under `application/octet-stream`, the sector-16 volume signatures) that send an extensionless HTTP URL to the disc adapter, and the process memo of URLs found to be discs (AE#860)
 │   ├── DiscMetadata.swift                   Public `TitleInfo` / `ChapterInfo` plus the internal disc title + chapter model (45 kHz ticks, extent keys)
 │   ├── ISO9660Reader.swift                  Read-only ISO9660 bridge-filesystem reader (DVD-Video images)
 │   ├── DVDIFOParser.swift                   DVD VMGI TT_SRPT title list + each VTS IFO program chain (per-title duration + chapters) and stream attribute tables (track languages, declared subpicture streams)
@@ -657,6 +656,7 @@ Sources/AetherEngine/
 │   ├── Issue99MuxerFailureRevive.swift      Bounded revive for a VOD pump that died with `muxerFailed` (#99): the first cut firing before any bridged audio reached the muxer (dec3 box) no longer ends the session
 │   ├── SlowServeSignal.swift                One-shot slow-serve timer arming the server's early chunked header (keeps TTFB under AVPlayer's ~3.5 s -12889 window, #93 round 3)
 │   ├── VideoSegmentProvider.swift           Native path: playlist-facing segment provider (live sliding window, restart heuristics, producer-coverage-gated sparse-hole waits #129)
+│   ├── MarchRateTracker.swift               Native path: the producer's march rate from segment completions, cut at restarts and backpressure parks, behind the provider's wait-or-restart decision for a short forward jump (#932)
 │   ├── HLSSegmentProducer.swift             Native path: pump loop reading from Demuxer, feeding MP4SegmentMuxer, cutting fragments keyframe-gated in decode order so the IRAP opens its segment (#92); SSAI program-switch detection + no-cut watchdog
 │   ├── VODSegmentCutter.swift               Native path: decode-order, keyframe-gated VOD segment cutter (the IRAP opens its segment, #92)
 │   ├── PlanBoundaryAxis.swift               Which axis a container stamps its index entries on, and therefore which packet timestamp the cutter gate may compare against a plan boundary: decode for a mov/mp4 sample table, presentation for a Matroska Cue (#358, AE#561)

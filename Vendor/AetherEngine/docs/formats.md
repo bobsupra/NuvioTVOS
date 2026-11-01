@@ -370,25 +370,40 @@ combination:
   route would otherwise make. A cap decides the bridge encoder like a source of that many channels
   would, so a 5.1 source capped to stereo is FLAC, not stereo E-AC-3. A source is never upmixed.
 - **Dialogue lift** (`dialogueGainDB`, up to 12 dB). On a source with a front centre the centre is
-  raised wherever it lands, discrete or folded. A stereo source has no centre, so the part both
-  channels share (the mid signal, where a mix pans its dialogue) is raised against their difference.
-  A mono source is left alone. The lift is applied in the remix matrix, so it costs nothing per
-  sample. Measured on a 5.1 fixture with a tone on the centre only and another tone on every other
-  channel, folded to stereo: a 6 dB lift moves the centre tone 6 dB against the other within 0.5 dB,
-  on the bridge and on the software decoder alike.
-- **Night mode** (`compressor`). A feed-forward compressor with a soft knee, one gain for all
+  raised wherever it lands, discrete or folded, in the remix matrix (no cost per sample). Measured
+  on a 5.1 fixture with a tone on the centre only and another tone on every other channel, folded
+  to stereo: 3, 6 and 9 dB asked move the centre tone 3.0, 6.0 and 9.0 dB against the other, on the
+  bridge and on the software decoder alike. A source without a centre that plays as stereo has its
+  dialogue extracted by libavfilter's `dialoguenhance` and folded back onto both sides with `pan`.
+  On a stereo fixture of a centred, gated 1 kHz tone over noise that differs between the sides,
+  3, 6 and 9 dB asked raise the tone 3.9, 7.4 and 10.6 dB against the noise. Chosen over a mid/side
+  lift after measuring both on a mix of centred speech and wide music: the mid/side lift gained
+  2.0 dB against the wide music at +6 dB, `dialoguenhance` 5.1 to 7.2 dB. Neither separates
+  speech from music mixed to the centre itself (0 to 1.2 dB), which no stereo method can. A mono
+  source is left alone.
+- **Night mode** (`compressor`). libavfilter's `acompressor`, peak detection, one gain for all
   channels so the image does not move. The `night` preset compresses everything above -30 dBFS
-  4:1 and adds 10 dB: a whisper at -40 dBFS comes up to -30, a full-scale passage comes down to
-  about -12.5.
+  4:1 and adds 10 dB; measured on a steady 1 kHz tone: 0 dBFS in comes out at -12.2 dBFS,
+  -20 at -17.2, -40 at -30.0.
 
-Whenever shaping is active a peak limiter at -1 dBFS runs last, which is what lets the fold stay
-unnormalized (normalizing a 5.1 fold costs 7.6 dB of level, the opposite of what someone who cannot
-hear the dialogue asked for) and the makeup gain be generous. It has no lookahead, because a
-lookahead would delay the audio against the video, so a transient above the ceiling is clamped
-within its first sample rather than ramped.
+Whenever shaping is active libavfilter's `alimiter` runs last, at -1 dBFS with a 5 ms lookahead and
+its own latency compensation, which is what lets the fold stay unnormalized (normalizing a 5.1 fold
+costs 7.6 dB of level, the opposite of what someone who cannot hear the dialogue asked for) and the
+makeup gain be generous. It replaced an instant-attack limiter after a measurement: on a steady
+overload its THD was -155 dB against -48.6, and on two tones under limiting bass hits its splatter
+above 3 kHz was -67 dB against -42 (relative to the tones), at the input's own floor.
 
-The FFmpeg build carries no libavfilter audio filters, so the matrix is handed to libswresample and
-the dynamics are the engine's own (`AudioDynamicsProcessor`).
+**Timing.** `dialoguenhance` delays its content by three quarters of its FFT window (1536 samples at
+48 kHz, 3072 at 96 kHz) and stamps its output with its input's timestamps regardless. The engine
+therefore runs the graph on a sample counter of its own, drops the delay's priming, pushes the same
+number of silent samples at the end of the stream and carries the timestamps itself, so output
+sample k is input sample k. Measured: an impulse at sample 60000 of a stereo source comes out of
+the bridge at sample 60000 with 96000 samples in and out, and the software decoder presents it at
+1.25000 s, its source time.
+
+The graph (`AudioShapingGraph`) needs FFmpegBuild 3.11.0 or later, which adds `abuffer`,
+`abuffersink`, `aformat`, `aresample`, `pan`, `dialoguenhance`, `acompressor` and `alimiter`.
+Where it cannot be built the remix still applies and the log says the dynamics do not.
 
 **What it costs.** Shaping needs PCM. While it is active a stream-copied track is decoded and
 bridged, so Atmos (E-AC-3 JOC) and every bitstream that used to pass through arrive as their channel
@@ -670,7 +685,7 @@ Decrypted disc images play through the normal decode path via a synthetic seekab
 
 Both: no decryption (CSS / AACS retail discs must be ripped decrypted first), no GPL nav libraries, no menus, BD-J, or multi-angle.
 
-A remote disc image is recognized by its `.iso` / `.img` / `.udf` extension or, on an extensionless URL, by the `Content-Type` of the opening response (`application/x-iso9660-image`, `application/x-cd-image`, `application/vnd.efi.iso`, `application/x-udf-image`, `application/x-raw-disk-image`; AE#860). The type only routes the open to the disc adapter, the ISO 9660 / UDF structure decides, and a body without one plays as ordinary media. It needs an origin that honours HTTP `Range`, because a disc image is a filesystem that only random access can walk. The range probe is judged at the response head: an origin that answers it with a 200 fails the load with an error naming the cause (the body is never downloaded), and a range answered wider than asked is cut where the range ends.
+A remote disc image is recognized by its `.iso` / `.img` / `.udf` extension or, on an extensionless URL, by the `Content-Type` of the opening response (`application/x-iso9660-image`, `application/x-cd-image`, `application/vnd.efi.iso`, `application/x-udf-image`, `application/x-raw-disk-image`; AE#860). An `application/octet-stream` answer routes there too when sector 16 of the body, already in the opening buffer, carries a volume descriptor identifier (`CD001`, `BEA01`, `NSR02`, `NSR03`); no extra request is made for it. The type or signature only routes the open to the disc adapter, the ISO 9660 / UDF structure decides, and a body without one plays as ordinary media. It needs an origin that honours HTTP `Range`, because a disc image is a filesystem that only random access can walk. The range probe is judged at the response head: an origin that answers it with a 200 fails the load with an error naming the cause (the body is never downloaded), and a range answered wider than asked is cut where the range ends.
 
 **Blu-ray folders.** A disc that was ripped as a `BDMV` folder rather than an image plays the same way through `MediaSource.custom` with a `DiscDirectoryReader`: the host lists the folder's files (path relative to the disc root, and size) and opens any one of them on request. `HTTPDiscDirectoryReader` is the ready-made one, with one URL per file, so an origin serves the disc as plain files over `Range` and never remuxes it. Recognition is the image path with files in place of UDF extents: the same bounded playlist scan and title selection, the selected title's `.m2ts` files concatenated in playlist order as one MPEG-TS, the same multi-clip timeline, chapters and STN track languages, and the same seek by the clips' EP maps when the folder carries `BDMV/CLIPINF`. A host that already knows the main playlist names it in `preferredPlaylist`, and only that playlist is read and published as the title. The concatenating reader opens a clip's file when the read reaches it and keeps at most three open. A controlled probe (`limits` or `cancellation`) does not recognize a folder yet; an uncontrolled `probe(source:)` and `load(source:)` do.
 
@@ -719,7 +734,7 @@ Read-only. NTLMv2 and guest auth (no Kerberos, which tvOS lacks). No writing, lo
 
 ## Live ingest, AES-128, SSAI
 
-A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), no media server in the data path. Segments are fetched through a bounded prefetch pipeline (up to 4 in flight, committed to the byte stream strictly in playlist order), so per-segment connection + TTFB latency overlaps and high-bitrate channels buffer ahead of real time (#177). Contract: MPEG-TS segments, including demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS) and packed-audio renditions (raw ADTS framed by ID3 timestamps). AES-128 clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`: the key is fetched once per clip and memoised, each segment decrypted (AES-128-CBC / PKCS7) before demux. SAMPLE-AES / keyless AES-128 (no `URI`), fMP4 playlists (`EXT-X-MAP`), and a key-fetch / decrypt failure terminate with a typed `HLSIngestError` so the host can fall back to a server-mediated URL. This is standard HLS clear-key, not FairPlay / Widevine.
+A live HLS upstream can be ingested directly via `HLSLiveIngestReader` (a public forward-only `IOReader`), no media server in the data path. Segments are fetched through a bounded prefetch pipeline (up to 4 in flight, committed to the byte stream strictly in playlist order), so per-segment connection + TTFB latency overlaps and high-bitrate channels buffer ahead of real time (#177). Contract: MPEG-TS segments, whole or as `EXT-X-BYTERANGE` sub-ranges of one resource (fetched with a `Range` request; an origin that answers 200 has the sub-range cut from the whole body), including demuxed-audio variants (`EXT-X-MEDIA` audio groups, fetched by a companion reader and merged by DTS) and packed-audio renditions (raw ADTS framed by ID3 timestamps). AES-128 clear-key segments (`EXT-X-KEY:METHOD=AES-128`, the standard FAST-channel scheme) are decrypted in-line by `HLSSegmentDecryptor`: the key is fetched once per clip and memoised, each segment decrypted (AES-128-CBC / PKCS7) before demux. SAMPLE-AES / keyless AES-128 (no `URI`), fMP4 playlists (`EXT-X-MAP`), and a key-fetch / decrypt failure terminate with a typed `HLSIngestError` so the host can fall back to a server-mediated URL. This is standard HLS clear-key, not FairPlay / Widevine.
 
 Server-side ad insertion (SSAI) plays through the direct path instead of bouncing to a server transcode at the ad break. FAST channels (Pluto and similar) splice ad creatives that restart the source clock and often carry a different video PID, resolution, and SPS than the program. The producer detects the program switch, parses the ad's SPS/PPS by hand (`H264SPS`) to build a fresh codec config, rotates the fMP4 muxer, and emits a versioned `#EXT-X-MAP` per discontinuity so AVPlayer resyncs cleanly across the init and resolution change; audio is re-anchored to the video timeline at every creative boundary (including amux creatives that mux audio on a separate source clock) and an `OutputTimestampSanitizer` keeps the stream monotonic across the splice. A no-cut stall watchdog sits underneath as a safety net: it tells a genuinely wedged pod (reading at full rate but unable to cut) from a slow source (a trickle) by read rate, and a wedge-classified stall whose video PTS is still advancing (a source delivering just below real time, #177) is held with the watchdog re-armed (bounded consecutive holds) instead of retuned; only a genuine wedge or an exhausted hold budget escalates to a host retune.
 

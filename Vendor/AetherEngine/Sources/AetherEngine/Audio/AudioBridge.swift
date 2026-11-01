@@ -201,12 +201,11 @@ final class AudioBridge: @unchecked Sendable {
     /// FLAC output stays bit-perfect (S16 would dither away the bottom 8 bits, audible in quiet passages).
     private var pcmSampleFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
 
-    /// AE#923. While shaping is active the resampler writes interleaved Float32 (`swrOutFmt`), the
-    /// dynamics run on that, and `AudioShapingSampleWriter` hands the encoder its own format: a fold
-    /// or a lift resampled straight into S16/S32 would be clipped inside libswresample before the
-    /// limiter ever saw it.
+    /// AE#923. While shaping is active the resampler writes interleaved Float32 (`swrOutFmt`) into
+    /// `AudioShapingGraph`, which ends in the encoder's own format: a fold or a lift resampled
+    /// straight into S16/S32 would be clipped inside libswresample before the limiter ever saw it.
     private let shaping: AudioShaping
-    private var dynamics: AudioDynamicsProcessor?
+    private var shapingGraph: AudioShapingGraph?
     private var swrOutFmt: AVSampleFormat = AV_SAMPLE_FMT_FLTP
     private var pcmBytesPerSample: Int32 = 4
     private var pcmBitsPerRawSample: Int32 = 32
@@ -473,7 +472,17 @@ final class AudioBridge: @unchecked Sendable {
         swrInRate = inRate
         av_channel_layout_copy(&swrInLayout, &inLayout)
 
-        swrOutFmt = self.shaping.isActive ? AV_SAMPLE_FMT_FLT : pcmSampleFmt
+        if self.shaping.isActive {
+            shapingGraph = AudioShapingGraph(shaping: self.shaping, sampleRate: sampleRate,
+                                             layout: &enc.pointee.ch_layout,
+                                             sourceHasCentre: AudioShapingMatrix.hasCentre(&inLayout),
+                                             outputFormat: pcmSampleFmt)
+            if shapingGraph == nil {
+                EngineLog.emit("[AudioBridge] AE#923 filter graph unavailable; the remix applies, the dynamics do not",
+                               category: .session)
+            }
+        }
+        swrOutFmt = shapingGraph != nil ? AV_SAMPLE_FMT_FLT : pcmSampleFmt
         let swrRet = swr_alloc_set_opts2(
             &swrCtx,
             &enc.pointee.ch_layout,
@@ -492,7 +501,6 @@ final class AudioBridge: @unchecked Sendable {
         if self.shaping.isActive {
             AudioShapingMatrix.apply(to: swrAllocated, input: &inLayout, output: &enc.pointee.ch_layout,
                                      dialogueGain: self.shaping.dialogueGain)
-            dynamics = AudioDynamicsProcessor(compressor: self.shaping.compressor, sampleRate: sampleRate)
         }
         let initRet = swr_init(swrCtx)
         guard initRet >= 0 else {
@@ -726,7 +734,7 @@ final class AudioBridge: @unchecked Sendable {
         if let swr = swrCtx {
             _ = swr_init(swr)
         }
-        dynamics?.reset()
+        shapingGraph?.reset()
         rebaseFromNextSourcePTS = true
     }
 
@@ -755,6 +763,9 @@ final class AudioBridge: @unchecked Sendable {
                 try? resampleAndPushIntoFIFO(srcFrame: sf, enc: enc, swr: swr, fifo: fifoPtr)
             }
         }
+
+        // AE#923: the shaping graph holds back its latency; drain it, sample-aligned, into the FIFO.
+        shapingGraph?.drain { planes, count, _ in writeShaped(planes, count: count, fifo: fifoPtr) }
 
         // 2. Encode the FIFO remainder, including the final partial
         //    frame (requireFull: false pads/short-frames it).
@@ -1089,7 +1100,6 @@ final class AudioBridge: @unchecked Sendable {
         }
         swr_free(&swrCtx)
         swrCtx = scratch
-        dynamics?.reset()
 
         av_channel_layout_uninit(&swrInLayout)
         av_channel_layout_copy(&swrInLayout, &sf.pointee.ch_layout)
@@ -1150,7 +1160,7 @@ final class AudioBridge: @unchecked Sendable {
         }
 
         let nChannels = enc.pointee.ch_layout.nb_channels
-        if dynamics != nil {
+        if shapingGraph != nil {
             resampleShapedIntoFIFO(srcFrame: sf, swr: swr, outNbSamples: outNbSamples,
                                        channels: Int(nChannels), fifo: fifo)
             return
@@ -1204,8 +1214,7 @@ final class AudioBridge: @unchecked Sendable {
     }
 
     /// AE#923: the shaped variant of the tail of `resampleAndPushIntoFIFO`. The resampler writes
-    /// interleaved Float32, the dynamics run in place, and the samples are written into the FIFO in
-    /// the encoder's own format.
+    /// interleaved Float32 into the shaping graph, which hands back the encoder's own format.
     private func resampleShapedIntoFIFO(
         srcFrame sf: UnsafeMutablePointer<AVFrame>,
         swr: OpaquePointer,
@@ -1227,15 +1236,16 @@ final class AudioBridge: @unchecked Sendable {
             stats.framesDroppedBeforeFIFO += 1
             return
         }
-        dynamics?.process(floats, frames: Int(produced), channels: channels)
-        let written = AudioShapingSampleWriter.write(
-            interleaved: floats, frames: Int(produced), channels: channels, format: pcmSampleFmt
-        ) { planes in
-            planes.withUnsafeMutableBufferPointer { buf in
-                buf.baseAddress!.withMemoryRebound(to: UnsafeMutableRawPointer?.self, capacity: buf.count) {
-                    av_audio_fifo_write(fifo, $0, produced)
-                }
-            }
+        // The bridge stamps from its own sample counter (`nextEncoderPTS`), so no pts rides along.
+        shapingGraph?.process(floats, frames: Int(produced), pts: nil) { planes, count, _ in
+            writeShaped(planes, count: count, fifo: fifo)
+        }
+    }
+
+    private func writeShaped(_ planes: [UnsafeMutableRawPointer?], count: Int, fifo: OpaquePointer) {
+        var ptrs = planes
+        let written = ptrs.withUnsafeMutableBufferPointer { buf in
+            av_audio_fifo_write(fifo, buf.baseAddress, Int32(count))
         }
         if written > 0 {
             stats.samplesEnqueued += Int64(written)

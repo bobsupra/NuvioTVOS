@@ -2435,6 +2435,10 @@ public final class HLSVideoEngine: @unchecked Sendable {
             producerFinished: isLiveSession ? nil : { [weak self] in
                 self?.currentProducerFinished ?? false
             },
+            // Throughput fallback of the forward-wait march-rate estimate.
+            sourceBytesFetched: isLiveSession ? nil : { [weak self] in
+                self?.demuxerBytesFetched ?? 0
+            },
             // #93 residual: the first producer may be anchored at the resume segment; without this
             // the cold-start heuristic (abs(index - lastRestartIndex) > 2) restarts it immediately.
             initialRestartIndex: initialProducerBaseIndex,

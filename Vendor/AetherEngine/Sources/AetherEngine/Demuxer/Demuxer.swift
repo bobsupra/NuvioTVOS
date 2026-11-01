@@ -779,8 +779,9 @@ public final class Demuxer: @unchecked Sendable {
         try openWithProvider(bridge, inputFormat: inputFormat, isLive: isLive)
     }
 
-    /// A remote disc image by URL extension or path, or an extensionless URL recognized by Content-Type.
-    /// This gates the HTTP disc adapter so ordinary media URLs retain the streaming AVIO reader.
+    /// A remote disc image (ISO 9660 / UDF / BDMV) by URL extension or path, or an extensionless URL
+    /// recognized by Content-Type or volume signature (AE#860). Gates the HTTP disc-adapter path so
+    /// a normal media URL keeps the optimized streaming AVIOReader open with no probe cost.
     static func isDiscImageURL(_ url: URL) -> Bool {
         let ext = url.pathExtension.lowercased()
         if ["iso", "img", "udf"].contains(ext) { return true }
@@ -820,14 +821,24 @@ public final class Demuxer: @unchecked Sendable {
             try openHTTPStream(url: url, extraHeaders: extraHeaders, isLive: isLive,
                                routesDiscMediaType: !isLive && !triedDisc)
         } catch AVIOReaderError.discImageMediaType {
-            // AE#860: an extensionless URL whose opening response declared a disc image. The type is
-            // only a hint; the disc readers confirm it, and a mislabelled body streams as before.
-            EngineLog.emit("[Demuxer] AE#860: the source declared a disc image type; trying the disc adapter", category: .demux)
-            if try openHTTPDiscImage(url: url, extraHeaders: extraHeaders, selectTitleID: selectTitleID) {
+            // AE#860: an extensionless URL whose opening response declared a disc image, or served
+            // `application/octet-stream` over a volume signature at sector 16. Either is only a hint;
+            // the disc readers confirm it, and a body that is no disc streams as before.
+            EngineLog.emit("[Demuxer] AE#860: the source declared a disc image type or carries a volume signature; trying the disc adapter", category: .demux)
+            // A hint is no promise of a filesystem: a structure that does not parse falls back the
+            // same way as none at all, where an `.iso` URL reports it.
+            let openedDisc: Bool
+            do {
+                openedDisc = try openHTTPDiscImage(url: url, extraHeaders: extraHeaders, selectTitleID: selectTitleID)
+            } catch let error as DiscError {
+                EngineLog.emit("[Demuxer] AE#860: \(error) behind the hint", category: .demux)
+                openedDisc = false
+            }
+            if openedDisc {
                 DiscImageMediaType.noteDiscImage(url)
                 return
             }
-            EngineLog.emit("[Demuxer] AE#860: no disc structure behind the declared type; opening it as ordinary media", category: .demux)
+            EngineLog.emit("[Demuxer] AE#860: no disc structure behind the hint; opening it as ordinary media", category: .demux)
             try openHTTPStream(url: url, extraHeaders: extraHeaders, isLive: isLive, routesDiscMediaType: false)
         }
     }

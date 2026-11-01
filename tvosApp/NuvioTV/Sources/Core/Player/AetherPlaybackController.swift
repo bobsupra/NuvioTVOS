@@ -4817,8 +4817,14 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     private func audioDetail(_ t: TrackInfo) -> String {
         var parts: [String] = []
         if !t.codec.isEmpty { parts.append(t.codec.uppercased()) }
-        if t.isAtmos {
+        let isTrueHDAtmos = t.codec.lowercased() == "truehd" && (
+            t.profile?.lowercased().contains("atmos") == true ||
+            t.name.lowercased().contains("atmos")
+        )
+        if t.isAtmos || isTrueHDAtmos {
             parts.append("Atmos")
+        } else if t.isDTSX || (t.codec.lowercased() == "dts" && (t.profile?.lowercased().contains("dts:x") == true || t.name.lowercased().contains("dts:x"))) {
+            parts.append("DTS:X")
         } else if t.channels > 0 {
             parts.append("\(t.channels) ch")
         }
@@ -4985,6 +4991,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
         let isLive = request.isLiveStream || request.isSports
         let preferDualLayerDolbyVision = ProfileSettings.current.bool(forKey: SettingsKey.preferDualLayerDolbyVision)
+        let upscalesLowResolutionVideo = ProfileSettings.current.object(forKey: SettingsKey.lowResUpscaling) as? Bool ?? true
+        let losslessAudioBridge = ProfileSettings.current.bool(forKey: SettingsKey.losslessAudioBridge)
         // Bound find_stream_info probe budget for remote VOD streams (#68).
         // The 50 MiB default reads over the network to completion for sparse attachments (fonts, cover art),
         // adding ~6-8s of startup latency. Bounding to 15 MiB / 10s safely resolves all video/audio tracks
@@ -4998,13 +5006,17 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             discImageHint: PlaybackBackendPolicy.isDiscImage(
                 request.videoURL.absoluteString, filename: request.filename),
             preferDualLayerDolbyVision: preferDualLayerDolbyVision,
+            upscalesLowResolutionVideo: upscalesLowResolutionVideo,
             matchContentEnabled: matchContent,
             panelIsInHDRMode: panelInHDR,
             panelPresentsDolbyVision: panelPresentsDV,
-            audioBridgeMode: .surroundCompat,
+            audioBridgeMode: losslessAudioBridge ? .lossless : .surroundCompat,
             // Read the active profile for each load; unsupported sources keep the normal bridge.
             objectAudioRendering: SpatialAudioSettings.rendering(),
             isLive: isLive,
+            liveJoinProfile: isLive ? .fastZap : .standard,
+            liveStartupGraceSeconds: isLive ? 0.5 : nil,
+            liveStartupSingleSegmentMinimumSeconds: isLive ? 1.5 : nil,
             liveEdgeCushionSeconds: isLive ? 3.0 : nil,
             liveJoinStartsImmediately: true,
             nativeRemoteHLS: isRemoteHLS,
@@ -5021,7 +5033,8 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
             externalSubtitles: externalRegistration.tracks,
             forwardBufferSegments: request.cacheProfile.aetherForwardBufferSegments(isBackedByHybridDiskCache: isLocalPlaybackCache),
             autoplay: request.autoplay,
-            audioDelaySeconds: request.audioDelaySeconds
+            audioDelaySeconds: request.audioDelaySeconds,
+            nativeVideoFrameRecovery: true
         )
 
         let start = request.resumePositionSeconds

@@ -5,6 +5,8 @@ import AetherEngine
 final class SpatialAudioSettingsTests: XCTestCase {
     func testDualLayerDolbyVisionPreferenceIsRegisteredForProfileSync() {
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.preferDualLayerDolbyVision))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.lowResUpscaling))
+        XCTAssertTrue(SettingsKey.all.contains(SettingsKey.losslessAudioBridge))
     }
 
     func testExistingProfilesRemainOffUntilEnabledAndCanDisableAgain() {
@@ -14,8 +16,8 @@ final class SpatialAudioSettingsTests: XCTestCase {
 
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .off)
         defaults.set(true, forKey: SettingsKey.trueHDSpatialAudio)
-        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .apac(.l916))
-        // A preference synced from a newer Apple TV must not activate APAC on an older OS.
+        XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .render(.l916))
+        // A preference synced from a newer Apple TV must not activate spatial rendering on an older OS.
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: false), .off)
         defaults.set(false, forKey: SettingsKey.trueHDSpatialAudio)
         XCTAssertEqual(SpatialAudioSettings.rendering(defaults: defaults, supportsAPAC: true), .off)
@@ -34,14 +36,14 @@ final class SpatialAudioSettingsTests: XCTestCase {
 
         ProfileSettings.setActiveProfile(firstID, isPrimary: false)
         ProfileSettings.current.set(true, forKey: SettingsKey.trueHDSpatialAudio)
-        XCTAssertEqual(SpatialAudioSettings.rendering(supportsAPAC: true), .apac(.l916))
+        XCTAssertEqual(SpatialAudioSettings.rendering(supportsAPAC: true), .render(.l916))
 
         ProfileSettings.setActiveProfile(secondID, isPrimary: false)
         ProfileSettings.current.set(false, forKey: SettingsKey.trueHDSpatialAudio)
         XCTAssertEqual(SpatialAudioSettings.rendering(supportsAPAC: true), .off)
 
         ProfileSettings.setActiveProfile(firstID, isPrimary: false)
-        XCTAssertEqual(SpatialAudioSettings.rendering(supportsAPAC: true), .apac(.l916))
+        XCTAssertEqual(SpatialAudioSettings.rendering(supportsAPAC: true), .render(.l916))
         XCTAssertTrue(SettingsKey.all.contains(SettingsKey.trueHDSpatialAudio))
     }
 }

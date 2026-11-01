@@ -1,8 +1,8 @@
 # Vendored playback dependencies
 
-## AetherEngine (pin 7.47.0)
+## AetherEngine (pin 7.53.1)
 
-Local pin of [AetherEngine 7.47.0](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.47.0), upstream commit `a1a70cd63c1fef89cffcf0e8110456807d0fab05`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.47 upgrade preserves Nuvio's custom APAC failure reporting and tests, non-Dolby-Vision supplemental-codecs guard, and native-host transport and first-frame behavior. DTS:X height channels still use FFmpegBuild 3.9.0's patched `dca` decoder through the `x_heights` option.
+Local pin of [AetherEngine 7.53.1](https://github.com/superuser404notfound/AetherEngine/releases/tag/7.53.1), upstream commit `0839aeee18dd0818c5c307a3c5ecba8ea3161b22`. Imports remain rewritten to the namespaced FFmpeg modules below, and Nuvio's static product, four enabled default traits, local FFmpeg path dependency, and host integration patches are retained. The 7.53.1 upgrade brings MetalFX/CoreML upscaling gating for tvOS 27.1 / Xcode 27.2 (#846), remote-HLS buffered position publishing (#935), forward seek march rate optimization (#932), AV1 Delayed RAP keyframe seek fix (#931), HLS ingest sub-range support (#928), HTTP probe range growth (#927), and libavfilter audio shaping (#923). Nuvio's custom remote playback startup patches, frame extraction, and local traits are preserved.
 
 Retain the local spatial-bridge patch that reports persistent APAC encoding failures independently of successful TrueHD decoding, along with its regression tests. The patch is merged with the 7.40 bed-split renderer and its telemetry reporting.
 
@@ -33,4 +33,4 @@ Local pin of [FFmpegBuild 3.9.0](https://github.com/superuser404notfound/FFmpegB
 
 Keep the AetherEngine patch surface minimal so rebases stay manageable.
 
-The Nuvio host offers an off-by-default setting for TrueHD Atmos and DTS:X spatial rendering to 9.1.6 APAC. LibTrueHD remains pinned to 3.0.0. DTS:X standard-presentation heights now come from FFmpegBuild 3.9.0's patched `dca` decoder; object presentations continue to use the ordinary audio bridge. APAC rendering requires tvOS 26 or later and a supported 48 kHz VOD source. TrueHD uses the source's channel presentation split into a speaker bed. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.
+The Nuvio host offers an off-by-default setting for TrueHD Atmos and DTS:X spatial rendering to 9.1.6 (.render(.l916), delivering multichannel LPCM for direct routes such as AirPods Pro and HDMI, and APAC over AirPlay). LibTrueHD remains pinned to 3.1.0. DTS:X standard-presentation heights come from FFmpegBuild's patched `dca` decoder; object presentations continue to use the ordinary audio bridge. Spatial rendering requires tvOS 26 or later and a supported 48 kHz VOD source. TrueHD uses the source's channel presentation split into a speaker bed. The engine retains its ordinary audio bridge for other content, including ordinary DTS-HD MA.

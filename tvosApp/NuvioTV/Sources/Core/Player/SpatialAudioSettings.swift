@@ -16,6 +16,6 @@ enum SpatialAudioSettings {
         guard supportsAPAC, defaults.bool(forKey: SettingsKey.trueHDSpatialAudio) else {
             return .off
         }
-        return .apac(.l916)
+        return .render(.l916)
     }
 }

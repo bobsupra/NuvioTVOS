@@ -70,7 +70,7 @@ func printUsage() {
       aetherctl serve [--no-dv] [--force-dv] [--dv-base-layer] [--start-position S] [--iframes] [--atmos-bed 7.1.4 [--bed-format apac|lpcm]] [--audio-index N] [--stereo auto|mono|sbs|ou] <url>
       aetherctl validate [--no-dv] [--force-dv] [--dv-base-layer] <url>
       aetherctl swdecode [--frames N] <url>
-      aetherctl play [--fel] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
+      aetherctl play [--fel] [--upscale] [--surface | --window] [--cycle-el SECONDS] [--dv-pin SPEC] [--seconds N] [--live] [--no-sw-escalation] [--fast-zap] [--live-start-immediately] [--live-cushion SECONDS] [--dvr-window N] [--subs <codec-or-lang>]
                  [--assert-dv] [--dv-base-layer]
                  [--start-position S] [--switch-audio <index>[@ms]]
                  [--teletext-page N] [--switch-teletext-page <page|auto>[@ms]]
@@ -83,7 +83,9 @@ func printUsage() {
                      [--audio-stats] [--host-calls play,extractor,setrate,pausestart,reloadlive,seekback,seekfar,pauseseek,pausereload,playreload,extplayreload,reloadnext] <url>
                      (full load+play session smoke test; --fel opts into the Profile 7
                       FEL dual-layer route (off by default, as in the engine, and only in
-                      a build with the DualLayerDolbyVision trait); --surface (or --window) presents
+                      a build with the DualLayerDolbyVision trait); --upscale opts into
+                      upscaling sub-1080p SDR video to the display (#846);
+                      --surface (or --window) presents
                       into a window; --cycle-el S flips the FEL residual every S
                       seconds, which needs --fel and a surface; --subs activates the first
                       matching embedded subtitle track and logs overlay cues;
@@ -767,6 +769,8 @@ if first == "play" {
     // route a host gets by default.
     let playFel = takeFlag("--fel", from: &rest)
     let playPreferDualLayerDV = playFel
+    // #846: `LoadOptions.upscalesLowResolutionVideo`, off by default as in the engine.
+    let playUpscale = takeFlag("--upscale", from: &rest)
     let playSurfaceFlag = takeFlag("--surface", from: &rest)
     let playWindowFlag = takeFlag("--window", from: &rest)
     let playAttachSurface = playSurfaceFlag || playWindowFlag
@@ -1101,6 +1105,7 @@ if first == "play" {
                  preserveASSMarkup: preserveASSMarkup,
                  dolbyVisionHandling: playDVHandling,
                  preferDualLayerDolbyVision: playPreferDualLayerDV,
+                 upscalesLowResolutionVideo: playUpscale,
                  attachSurface: playAttachSurface,
                  record: playRecord))
 }

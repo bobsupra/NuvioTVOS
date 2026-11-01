@@ -91,16 +91,14 @@ struct AudioShapingTests {
         #expect(plain[0 * 6 + 3] == 0, "LFE stays out of the fold")
     }
 
-    @Test("a stereo source gets a mid lift, which leaves the side signal alone")
-    func stereoMidLift() throws {
-        let g = 2.0
-        let m = try #require(withLayouts("stereo", "stereo") {
-            AudioShapingMatrix.coefficients(input: $0, output: $1, dialogueGain: g) })
-        // Mid (L = R = 1) comes out at g, side (L = 1, R = -1) at 1.
-        #expect(abs((m[0] + m[1]) - g) < 1e-12)
-        #expect(abs((m[0] - m[1]) - 1) < 1e-12)
-        #expect(abs((m[2] + m[3]) - g) < 1e-12)
-        #expect(abs((m[3] - m[2]) - 1) < 1e-12)
+    @Test("a source without a centre gets nothing from the matrix; the graph lifts it instead")
+    func noCentreNoMatrixLift() throws {
+        #expect(withLayouts("stereo", "stereo") { AudioShapingMatrix.coefficients(input: $0, output: $1, dialogueGain: 2) }
+                .map { $0 == [1, 0, 0, 1] } ?? false)
+        #expect(withLayouts("stereo", "stereo") { i, _ in AudioShapingMatrix.hasCentre(i) } == false)
+        #expect(withLayouts("5.1", "stereo") { i, _ in AudioShapingMatrix.hasCentre(i) })
+        #expect(withLayouts("mono", "mono") { i, _ in AudioShapingMatrix.hasCentre(i) } == false,
+                "a mono track is the whole mix, not a centre")
     }
 
     @Test("an unspecified order reads as the default order for its channel count")
@@ -114,65 +112,121 @@ struct AudioShapingTests {
         #expect(abs(m[2] - 2 * M_SQRT1_2) < 1e-9, "FC found at index 2 of the default 5.1 order")
     }
 
-    // MARK: - The dynamics
+    // MARK: - The filter graph
 
-    @Test("the static curve: unity below the knee, the ratio above it, continuous through it")
-    func staticCurve() {
-        let k = AudioShaping.Compressor(thresholdDB: -30, ratio: 4, kneeDB: 6)
-        #expect(AudioDynamicsProcessor.staticCurve(inputDB: -50, compressor: k) == -50)
-        #expect(abs(AudioDynamicsProcessor.staticCurve(inputDB: -10, compressor: k) - (-25)) < 1e-12)
-        let below = AudioDynamicsProcessor.staticCurve(inputDB: -33.0001, compressor: k)
-        let above = AudioDynamicsProcessor.staticCurve(inputDB: -26.9999, compressor: k)
-        #expect(abs(below - (-33.0001)) < 1e-3)
-        #expect(abs(above - (-30 + 3.0 / 4)) < 1e-3)
+    @Test("the chain: the limiter always, the compressor and the stereo enhancer only when asked")
+    func chainShape() {
+        let plain = AudioShapingGraph.chain(shaping: AudioShaping(maxChannels: 2), stereoDialogueEnhance: false,
+                                            outputFormat: AV_SAMPLE_FMT_FLT, layoutDescription: "stereo")
+        #expect(plain == "alimiter=limit=0.891251:attack=5.000000:release=50.000000:level=0:latency=1,"
+                + "aformat=sample_fmts=flt:channel_layouts=stereo")
+        let full = AudioShapingGraph.chain(shaping: AudioShaping(dialogueGainDB: 6, compressor: .night),
+                                           stereoDialogueEnhance: true, outputFormat: AV_SAMPLE_FMT_S16,
+                                           layoutDescription: "stereo")
+        #expect(full.hasPrefix("dialoguenhance=original=1:enhance=1:voice=2,pan=stereo|c0=c0+0.995262*c2|c1=c1+0.995262*c2,acompressor="))
+        #expect(full.contains("link=maximum:detection=peak"))
+        #expect(full.hasSuffix("aformat=sample_fmts=s16:channel_layouts=stereo"))
     }
 
-    private func sine(amplitude: Float, frames: Int, channels: Int, rate: Double = 48_000,
-                      hz: Double = 1000) -> [Float] {
-        var s = [Float](repeating: 0, count: frames * channels)
-        for f in 0..<frames {
-            let v = amplitude * Float(sin(2 * .pi * hz * Double(f) / rate))
-            for c in 0..<channels { s[f * channels + c] = v }
+    @Test("the stereo enhancer runs only on stereo out without a centre to lift")
+    func enhancerGate() {
+        let lift = AudioShaping(dialogueGainDB: 6)
+        #expect(AudioShapingGraph.usesStereoDialogueEnhance(shaping: lift, outputChannels: 2, sourceHasCentre: false))
+        #expect(!AudioShapingGraph.usesStereoDialogueEnhance(shaping: lift, outputChannels: 2, sourceHasCentre: true))
+        #expect(!AudioShapingGraph.usesStereoDialogueEnhance(shaping: lift, outputChannels: 6, sourceHasCentre: false))
+        #expect(!AudioShapingGraph.usesStereoDialogueEnhance(shaping: AudioShaping(compressor: .night),
+                                                              outputChannels: 2, sourceHasCentre: false))
+        #expect(AudioShapingGraph.dialogueEnhanceLatency(sampleRate: 48_000) == 1536)
+        #expect(AudioShapingGraph.dialogueEnhanceLatency(sampleRate: 44_100) == 1536)
+        #expect(AudioShapingGraph.dialogueEnhanceLatency(sampleRate: 96_000) == 3072)
+    }
+
+    /// Runs interleaved Float32 through a graph in `chunk`-sized pushes and drains it.
+    private func runGraph(_ input: [Float], channels: Int32, shaping: AudioShaping, sourceHasCentre: Bool = false,
+                          chunk: Int = 1000, pts: Int64? = 0) throws -> (out: [Float], pts: [(Int64?, Int)], latency: Int) {
+        var layout = AVChannelLayout()
+        defer { av_channel_layout_uninit(&layout) }
+        av_channel_layout_default(&layout, channels)
+        let graph = try #require(AudioShapingGraph(shaping: shaping, sampleRate: 48_000, layout: &layout,
+                                                   sourceHasCentre: sourceHasCentre, outputFormat: AV_SAMPLE_FMT_FLT))
+        var out: [Float] = []
+        var stamps: [(Int64?, Int)] = []
+        let ch = Int(channels)
+        let collect: ([UnsafeMutableRawPointer?], Int, Int64?) -> Void = { planes, count, p in
+            let base = planes[0]!.assumingMemoryBound(to: Float.self)
+            stamps.append((p, out.count / ch))
+            out.append(contentsOf: UnsafeBufferPointer(start: base, count: count * ch))
         }
-        return s
+        let frames = input.count / ch
+        var at = 0
+        input.withUnsafeBufferPointer { buf in
+            while at < frames {
+                let n = min(chunk, frames - at)
+                graph.process(buf.baseAddress! + at * ch, frames: n, pts: pts.map { $0 + Int64(at) }, emit: collect)
+                at += n
+            }
+        }
+        graph.drain(emit: collect)
+        return (out, stamps, graph.latency)
     }
 
-    private func peak(_ s: ArraySlice<Float>) -> Float { s.map { abs($0) }.max() ?? 0 }
+    private func noise(_ frames: Int, seed: UInt64, level: Float) -> [Float] {
+        var x = seed
+        return (0..<frames).map { _ in
+            x = x &* 6364136223846793005 &+ 1442695040888963407
+            return level * (Float(Int64(bitPattern: x >> 1) % 2_000_001) / 1_000_000 - 1)
+        }
+    }
 
-    @Test("the limiter holds every sample under the ceiling, from the first one")
-    func limiterHoldsCeiling() {
-        var p = AudioDynamicsProcessor(compressor: nil, sampleRate: 48_000)
-        var s = sine(amplitude: 2.5, frames: 4800, channels: 2)
-        s.withUnsafeMutableBufferPointer { p.process($0.baseAddress!, frames: 4800, channels: 2) }
-        let ceiling = Float(pow(10, AudioDynamicsProcessor.ceilingDBFS / 20))
-        #expect(peak(s[...]) <= ceiling + 1e-6)
+    @Test("the enhancer's latency is taken back out: same sample count, an impulse lands on its own sample")
+    func enhancerIsSampleAligned() throws {
+        let frames = 48_000
+        let l = noise(frames, seed: 1, level: 0.05), r = noise(frames, seed: 2, level: 0.05)
+        var input = [Float](repeating: 0, count: frames * 2)
+        for f in 0..<frames { input[2 * f] = l[f]; input[2 * f + 1] = r[f] }
+        input[2 * 30_000] = 0.6; input[2 * 30_000 + 1] = 0.6
+        let run = try runGraph(input, channels: 2, shaping: AudioShaping(dialogueGainDB: 6))
+        #expect(run.latency == 1536)
+        #expect(run.out.count == input.count, "every sample in comes out, priming dropped and tail drained")
+        let peak = stride(from: 0, to: run.out.count, by: 2).max { abs(run.out[$0]) < abs(run.out[$1]) }! / 2
+        #expect(peak == 30_000, "impulse at 30000 came out at \(peak)")
+    }
+
+    @Test("pts rides with its sample through the graph")
+    func ptsFollowsSamples() throws {
+        let input = noise(20_000 * 2, seed: 3, level: 0.05)
+        let run = try runGraph(input, channels: 2, shaping: AudioShaping(dialogueGainDB: 6), chunk: 777, pts: 1_000_000)
+        for (pts, index) in run.pts {
+            #expect(pts == 1_000_000 + Int64(index), "chunk at output sample \(index) carried \(String(describing: pts))")
+        }
+    }
+
+    @Test("the limiter holds every sample under -1 dBFS")
+    func limiterHoldsCeiling() throws {
+        let frames = 48_000
+        let input = (0..<frames).flatMap { f -> [Float] in
+            let v = 2.5 * Float(sin(2 * .pi * 1000 * Double(f) / 48_000)); return [v, v]
+        }
+        let run = try runGraph(input, channels: 2, shaping: AudioShaping(maxChannels: 2))
+        let ceiling = Float(pow(10, AudioShapingGraph.ceilingDBFS / 20))
+        #expect((run.out.map { abs($0) }.max() ?? 0) <= ceiling + 1e-4)
+        #expect(run.out.count == input.count)
     }
 
     @Test("night mode brings a loud passage down and a quiet one up")
-    func nightNarrowsTheRange() {
-        func settledPeakDB(amplitude: Float) -> Double {
-            var p = AudioDynamicsProcessor(compressor: .night, sampleRate: 48_000)
-            var s = sine(amplitude: amplitude, frames: 48_000, channels: 2)
-            s.withUnsafeMutableBufferPointer { p.process($0.baseAddress!, frames: 48_000, channels: 2) }
-            return 20 * log10(Double(peak(s[(s.count - 9600)...])))
+    func nightNarrowsTheRange() throws {
+        func settledPeakDB(amplitude: Float) throws -> Double {
+            let frames = 96_000
+            let input = (0..<frames).flatMap { f -> [Float] in
+                let v = amplitude * Float(sin(2 * .pi * 1000 * Double(f) / 48_000)); return [v, v]
+            }
+            let run = try runGraph(input, channels: 2, shaping: AudioShaping(compressor: .night))
+            return 20 * log10(Double(run.out.suffix(19_200).map { abs($0) }.max() ?? 0))
         }
-        let loud = settledPeakDB(amplitude: 1)          // 0 dBFS in
-        let quiet = settledPeakDB(amplitude: 0.01)      // -40 dBFS in
+        let loud = try settledPeakDB(amplitude: 1)
+        let quiet = try settledPeakDB(amplitude: 0.01)
         #expect(loud < -10 && loud > -15, "0 dBFS comes down to about -12.5, got \(loud)")
         #expect(quiet > -31 && quiet < -29, "-40 dBFS comes up to -30, got \(quiet)")
-    }
-
-    @Test("reset forgets the gain the previous passage left behind")
-    func resetForgets() {
-        var p = AudioDynamicsProcessor(compressor: .night, sampleRate: 48_000)
-        var loud = sine(amplitude: 1, frames: 48_000, channels: 1)
-        loud.withUnsafeMutableBufferPointer { p.process($0.baseAddress!, frames: 48_000, channels: 1) }
-        p.reset()
-        var quiet = sine(amplitude: 0.01, frames: 48, channels: 1)
-        quiet.withUnsafeMutableBufferPointer { p.process($0.baseAddress!, frames: 48, channels: 1) }
-        // A fresh processor starts at unity compressor gain plus the makeup; a stale one would still
-        // be ~22 dB into gain reduction.
-        #expect(peak(quiet[...]) > 0.02)
     }
 
     // MARK: - End to end
@@ -199,6 +253,40 @@ struct AudioShapingTests {
         str("RIFF"); u32(UInt32(36 + pcm.count)); str("WAVE")
         str("fmt "); u32(16); u16(1); u16(UInt16(channels)); u32(UInt32(rate))
         u32(UInt32(rate * channels * 2)); u16(UInt16(channels * 2)); u16(16)
+        str("data"); u32(UInt32(pcm.count)); d.append(pcm)
+        return d
+    }
+
+    /// Stereo WAV with no centre channel: a 1 kHz tone identical in both channels, switched on and
+    /// off every 150 ms the way speech comes and goes, over noise that differs between the two
+    /// sides. Optionally a full-scale-ish impulse in both channels at `impulseAt`.
+    private func makeStereoWAV(seconds: Double = 2, impulseAt: Int? = nil) -> Data {
+        let rate = 48_000
+        let frames = Int(Double(rate) * seconds)
+        var pcm = Data(capacity: frames * 4)
+        var seed: UInt64 = 9
+        func rnd() -> Double {
+            seed = seed &* 6364136223846793005 &+ 1442695040888963407
+            return Double(Int64(bitPattern: seed >> 1) % 2_000_001) / 1_000_000 - 1
+        }
+        for n in 0..<frames {
+            let t = Double(n) / Double(rate)
+            let on = Int(t / 0.15) % 2 == 0 ? 1.0 : 0.0
+            let centre = 0.1 * on * sin(2 * .pi * 1000 * t)
+            for _ in 0..<2 {
+                var v = centre + 0.1 * rnd()
+                if n == impulseAt { v = 0.7 }
+                let s = Int16(max(-1, min(1, v)) * 32767)
+                withUnsafeBytes(of: s.littleEndian) { pcm.append(contentsOf: $0) }
+            }
+        }
+        var d = Data()
+        func str(_ s: String) { d.append(s.data(using: .ascii)!) }
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { d.append(contentsOf: $0) } }
+        str("RIFF"); u32(UInt32(36 + pcm.count)); str("WAVE")
+        str("fmt "); u32(16); u16(1); u16(2); u32(UInt32(rate))
+        u32(UInt32(rate * 4)); u16(4); u16(16)
         str("data"); u32(UInt32(pcm.count)); d.append(pcm)
         return d
     }
@@ -233,10 +321,10 @@ struct AudioShapingTests {
     }
 
     /// Runs the fixture through a bridge and decodes what it encoded, channel 0 only.
-    private func bridgedLeftChannel(sourceChannels: Int, shaping: AudioShaping,
-                                    amplitude: Double = 0.25) throws -> (codec: AVCodecID, channels: Int32, left: [Float]) {
+    private func bridgedLeftChannel(sourceChannels: Int, shaping: AudioShaping, amplitude: Double = 0.25,
+                                    wav: Data? = nil) throws -> (codec: AVCodecID, channels: Int32, left: [Float]) {
         var result: (AVCodecID, Int32, [Float]) = (AV_CODEC_ID_NONE, 0, [])
-        try withAudioStream(makeDialogueWAV(channels: sourceChannels, amplitude: amplitude)) { stream, packets in
+        try withAudioStream(wav ?? makeDialogueWAV(channels: sourceChannels, amplitude: amplitude)) { stream, packets in
             let bridge = try AudioBridge(srcCodecpar: stream.pointee.codecpar, srcTimeBase: stream.pointee.time_base,
                                          mode: .surroundCompat, shaping: shaping)
             defer { bridge.close() }
@@ -305,7 +393,7 @@ struct AudioShapingTests {
     func bridgedLimiter() throws {
         let out = try bridgedLeftChannel(sourceChannels: 6, shaping: AudioShaping(maxChannels: 2, dialogueGainDB: 12),
                                          amplitude: 0.9)
-        let ceiling = Float(pow(10, AudioDynamicsProcessor.ceilingDBFS / 20))
+        let ceiling = Float(pow(10, AudioShapingGraph.ceilingDBFS / 20))
         #expect((out.left.map { abs($0) }.max() ?? 0) <= ceiling + 1e-3)
     }
 
@@ -345,5 +433,57 @@ struct AudioShapingTests {
         }
         let gained = ratioDB(lifted.left) - ratioDB(plain.left)
         #expect(abs(gained - 6) < 0.5, "centre against the rest moved by \(gained) dB, asked for 6")
+    }
+
+    @Test("a stereo source gets the dialogue extracted and lifted against the wide content")
+    func bridgedStereoEnhance() throws {
+        let plain = try bridgedLeftChannel(sourceChannels: 2, shaping: AudioShaping(maxChannels: 2), wav: makeStereoWAV())
+        let lifted = try bridgedLeftChannel(sourceChannels: 2, shaping: AudioShaping(dialogueGainDB: 6), wav: makeStereoWAV())
+        #expect(lifted.codec == AV_CODEC_ID_FLAC)
+        func ratioDB(_ s: [Float]) -> Double {
+            let body = Array(s.dropFirst(24_000).prefix(48_000))
+            return 20 * log10(level(body, hz: 1000) / level(body, hz: 3000))
+        }
+        let gained = ratioDB(lifted.left) - ratioDB(plain.left)
+        #expect(gained > 3, "the centred tone rose \(gained) dB against the wide noise")
+    }
+
+    @Test("the bridged stereo lift keeps the audio on the source's timeline, to the sample")
+    func bridgedEnhanceIsSampleAligned() throws {
+        let out = try bridgedLeftChannel(sourceChannels: 2, shaping: AudioShaping(dialogueGainDB: 9),
+                                         wav: makeStereoWAV(impulseAt: 60_000))
+        let peak = out.left.indices.max { abs(out.left[$0]) < abs(out.left[$1]) }!
+        #expect(abs(peak - 60_000) <= 1, "impulse at sample 60000 came out at \(peak)")
+        #expect(abs(out.left.count - 96_000) <= 1, "\(out.left.count) samples out for 96000 in")
+    }
+
+    @Test("the software decoder stamps the shaped stereo audio with its source time, to the sample")
+    func decoderEnhanceIsSampleAligned() throws {
+        try withAudioStream(makeStereoWAV(impulseAt: 60_000)) { stream, packets in
+            let decoder = AudioDecoder()
+            decoder.shaping = AudioShaping(dialogueGainDB: 9)
+            try decoder.open(stream: stream)
+            defer { decoder.close() }
+            var buffers: [CMSampleBuffer] = []
+            for p in packets { buffers.append(contentsOf: decoder.decode(packet: p)) }
+            buffers.append(contentsOf: decoder.drain())
+            var best: (value: Float, time: Double) = (0, -1)
+            var total = 0
+            for b in buffers {
+                let n = CMSampleBufferGetNumSamples(b)
+                total += n
+                let start = CMSampleBufferGetPresentationTimeStamp(b).seconds
+                let block = try #require(CMSampleBufferGetDataBuffer(b))
+                var data = [Float](repeating: 0, count: CMBlockBufferGetDataLength(block) / 4)
+                _ = data.withUnsafeMutableBytes {
+                    CMBlockBufferCopyDataBytes(block, atOffset: 0, dataLength: $0.count, destination: $0.baseAddress!)
+                }
+                for i in 0..<n where abs(data[i * 2]) > best.value {
+                    best = (abs(data[i * 2]), start + Double(i) / 48_000)
+                }
+            }
+            #expect(abs(best.time - 1.25) <= 1.0 / 48_000, "impulse at 1.25 s presented at \(best.time) s")
+            #expect(total == 96_000, "\(total) samples out for 96000 in")
+        }
     }
 }

@@ -10,13 +10,128 @@ the public-API contract.
 
 ## [Unreleased]
 
+_Nothing yet._
+
+## [7.53.1] - 2026-10-31
+
+### Fixed
+
+- **The engine builds for a tvOS device again under Xcode 27.2 (#846).**
+  The tvOS 27.2 SDK marks MetalFX's spatial scaler available from tvOS 27.1, so 7.53.0 failed to compile for
+  `appletvos` (the simulator build skips MetalFX and stayed green). The upscale stage now checks for tvOS 27.1
+  before it touches MetalFX; an older tvOS reports no MetalFX support, so the route is not taken there
+  (`metalFXUnsupported`), the same as on a device without MetalFX.
+
+- **The remote-HLS bypass publishes its buffered position (#935).** That route has no engine segment cache, so the
+  shared refresh returned early and `clock.bufferedPosition` stayed at 0 for the whole session, below `currentTime`
+  against its documented contract. It now follows the end of AVPlayer's loaded range contiguous with the playhead
+  (or a pending seek target), on every rendered-time tick and range change, so it also moves while paused. A
+  reroute to loopback no longer lets a late tick overwrite the cache frontier. `aetherctl play --native-hls` on a
+  40 s fMP4 VOD: `buf=0.00` before, `buf=40.00` after, playing, paused and after a seek.
+
+- **A short forward seek on a link near the media bitrate no longer waits for the producer to play the gap in real time (#932).**
+  A target 1 to 8 segments past the producer's front always waited for the march (`forwardWaitWindow`), and a march
+  can only advance at the link rate, so a +30 s seek on a 74 Mbps link to a 71.5 Mbps remux took 27 to 34 s while a
+  +60 s seek (a restart at the target) resumed in 4 to 5 s. A forward jump now waits only while the measured march
+  rate reaches the target sooner than the last measured restart did, and restarts at the target otherwise; the
+  segment being written is always waited for, and sequential playback (the next segment, or a retry of the same
+  one) is never treated as a jump. The rate is read only from segments written without a backpressure park, since a
+  parked producer writes at playback pace and not at the link rate, and a pause does not count as time spent writing.
+  Measured on an Apple TV 4K at about 70 Mbps: +30 s from 39 to 53 s down to 6 to 12 s, five +10 s presses from 30 s
+  to 11 s. On a fast link with the default forward window a jump 4 to 8 segments past the front now restarts where it
+  used to wait, because a measured restart costs less than the march's remaining distance; it resumed in 1.1 to 2.1 s
+  with no audible gap and no rebuilt audio bridge.
+- **A jump right after a restart no longer parks on the old march (#932).** Until the restarted producer sealed its first
+  segment, the highest sealed index still belonged to the producer before, so a target past it by more than the
+  window took the out-of-range restart, and `activeProducerCovers` (reading the new producer's base) vetoed it: the
+  request rode the march instead (20.5 s for one press of a remote burst). The march-rate decision now covers that
+  branch too and lifts the veto when it chooses the restart.
+- **A burst of remote presses restarts the producer at the first press and then once, at the last (#932).** A press within
+  1.5 s of a jump to another index holds its restart for 0.7 s and drops it when a newer target arrives.
+
+## [7.53.0] - 2026-10-30
+
+### Added
+
+- **Opt-in upscaling of SDR video below 1080p (#846).** `LoadOptions.upscalesLowResolutionVideo` (off by default)
+  routes an 8-bit SDR source whose coded size is below 1920x1080 to the software host, where every decoded frame
+  goes through Apple's `VTLowLatencySuperResolutionScaler` as far as its per-device limits allow (2x for SD, 1.5x
+  for 720p, read at runtime) and then MetalFX Spatial for the rest of the way to the display size, delivered as
+  square-pixel 420v in the source's own YCbCr matrix. 1080p and above, HDR, Dolby Vision and 10-bit sources keep
+  their route. The stage times every step and keeps itself inside the frame budget: an overrun first drops MetalFX
+  (ML only, the system scales the rest), a second one switches the stage off for the session, and a MetalFX overrun
+  is remembered for the process so the next title starts without it. Measured on an Apple TV 4K (A15): ML 3 to 8 ms
+  per frame, MetalFX to 4K 16 to 21 ms, so that box runs ML only. `$activeUpscale` (`UpscaleStatus`) reports the
+  plan, a degrade and a disable; turning the option on mid-session on a custom `IOReader` source is refused with
+  `SessionReloadRefusal.upscaleRouteNeedsFreshLoad`. Requires OS 26. Requested by cryptochrome.
+
+### Fixed
+
+- **An AV1 Matroska file built on forward key frames starts and seeks (AE#931, thanks @1096bimu).**
+  Such an encode can open every GOP with a Temporal Unit holding a Sequence Header and a hidden Key Frame
+  (`show_frame = 0`) that refreshes all eight reference slots, which decodes from a cold start. FFmpeg flagged
+  none of them as keyframes (`av1_parser` reports only a shown Key Frame and its verdict replaces the Matroska
+  block flag, and muxers leave the flag off too), so the file had no keyframe, no Cues and no index: the
+  loopback producer waited for a random access point that never came and wrote nothing (empty `init.mp4`,
+  `seg-0.m4s final finalize failed`), and the first seek on the software path ended the session with "could not
+  reposition". FFmpegBuild 3.11.1 carries the fix (FFmpeg PR 25607); a hidden Key Frame with a partial refresh,
+  as libaom writes, stays an inter frame. `Issue931AV1DelayedRAPTests` pins it through the Demuxer.
+
+- **An extensionless remote disc image served as `application/octet-stream` is recognized (AE#860, thanks @qoli).**
+  The AE#860 fix only routed a declared disc type, so an origin that labels everything `application/octet-stream`
+  still handed the ISO 9660 / UDF filesystem to libavformat raw. Under that generic type the open now reads the
+  volume descriptor identifier at sector 16 from the bytes it already has (`CD001`, `BEA01`, `NSR02`, `NSR03`), with
+  no extra request, and sends a match to the disc adapter. The signature is a hint like the type: `DiscReader` still
+  decides, and a body whose structure is missing or does not parse plays as ordinary media. The controlled probe
+  turns its disc probe on the same way.
+- **A backward seek no longer doubles the retained bitmap subtitle images (#929).** The AE#879 byte budget only
+  evicted history behind the playhead, so after a seek back the old position's floor and lead counted as cues ahead
+  and stayed until playback reached them again: on a dense PGS track (4 MB images every 3 s, seek from 144 s back to
+  20 s) the retained images grew from 165 MB to 246 MB and held there. Cues starting beyond the decode lead that the
+  drain has not reached yet are now evicted first, furthest first, since the drain decodes them again from the packet
+  store on its way there; history behind is evicted only after them.
+- **A controlled HTTP probe no longer pays one round trip per 64 KiB (#927).** `probe(url:limits:)` read a known-size
+  source in fixed 64 KiB ranges, one at a time, so the playback analysis depth it keeps (up to 50 MiB) cost ~800
+  serial requests: 0.48 s against a local origin, and a 30 s `timedOut` once each response took 100 ms. A range that
+  continues the previous one in full now doubles, up to 4 MiB, with a request budget in proportion to its size, so it
+  needs the throughput a 64 KiB range needed in 2 s and a stall still ends at the 2 s idle timeout; a seek starts over
+  at 64 KiB, and no range outgrows the input allowance still left. The same 71 MB MPEG-PS probes in 23 requests: 2.8 s at 100 ms per response, 7.4 s at
+  300 ms, with the same streams and duration. Input accounting, the deadline, cancellation and the preview's 64 KiB
+  window are unchanged. Reported with a reproducer by qoli.
+
+- **A live stream refused in the text shape no longer storms the panel (#925).** An Xtream panel at its connection
+  cap answers HTTP 200 with a short `text/plain` notice ("CONNECTION LIMIT REACHED ...") instead of a 509. The raw
+  live reader took the notice as media, the connection ended, and the reconnect counted those bytes as progress and
+  asked again at once: 436 requests in 10 s against a test origin holding the slot. A live 2xx with a `text/*` type
+  and a Content-Length of at most 64 KiB is now held outside the stream until its body is complete and then decided
+  by that body: a notice is the 509 it means (a refused open fails typed as `.sourceRateLimited`, a refusal
+  mid-stream takes the live refusal ladder of one second per attempt for up to a minute), while a playlist, an MPEG-DASH
+  manifest or TS bytes carry on as before, so a playlist served as text still reaches the AE#140 reroute. A text type
+  without a length stays a stream, since a mislabelled TS feed never ends. Reported with a measured fork fix by
+  TheMothX (Crivid IPTV Player).
+- **HLS ingest reads `EXT-X-BYTERANGE` segments as their sub-range.**
+  A packager that writes one file per stream lists every segment as a byte range of that file. The live and VOD
+  ingest ignored the tag and fetched the URI whole, so each 2 s segment delivered the entire file: a live channel
+  replayed its first seconds and never reached the playlist's edge. The parser now reads
+  `#EXT-X-BYTERANGE:<length>[@<offset>]` (an omitted offset continues the previous sub-range of the same URI,
+  and a playlist where that is undefined is refused, as RFC 8216 requires), and the segment is fetched with a
+  `Range` request, on the persistent HTTP/1.1 path as well. An origin that ignores `Range` and answers 200 with
+  the whole resource has the sub-range cut from it; one whose 206 starts elsewhere or ends short, or whose resource
+  is too short for the range, fails the segment rather than playing the wrong bytes. The VOD carriage probe reads
+  the first segment's own range too, so a single-file VOD is not refused for the size of its whole file. Those
+  failures and a malformed tag report the new `HLSIngestDiagnosticReason.invalidByteRange` (`invalid_byte_range`).
+
+## [7.52.0] - 2026-10-29
+
 ### Added
 
 - **Audio shaping: a channel cap, a dialogue lift and night mode (#923).** A host can now ask the engine to shape the
   audio before it reaches the output, through `LoadOptions.audioShaping` and, mid-session, `setAudioShaping(_:)`:
-  fold to at most N channels, raise the dialogue (the centre channel, or the mid signal of a stereo source) by up to
-  12 dB, and compress the dynamic range (`AudioShaping.Compressor.night`). A -1 dBFS limiter keeps all of it from
-  clipping. The common complaint it answers is a 5.1 film folded to TV speakers burying its dialogue under the score.
+  fold to at most N channels, raise the dialogue (the centre channel, or on a stereo source the dialogue that
+  libavfilter's `dialoguenhance` extracts) by up to 12 dB, and compress the dynamic range (`acompressor`,
+  `AudioShaping.Compressor.night`). A -1 dBFS lookahead limiter (`alimiter`) keeps all of it from clipping, and the
+  enhancer's 32 ms latency is taken back out so the audio stays on the source's timeline to the sample. Needs
+  FFmpegBuild 3.11.0. The common complaint it answers is a 5.1 film folded to TV speakers burying its dialogue under the score.
   Until now a host could only get this by having its server re-encode the audio, which threw away passthrough for
   every film and restarted the stream on every toggle. Shaping needs PCM, so while it is on a stream-copied track is
   bridged (Atmos arrives as its bed), and `$audioShapingState` says whether the session carries it.
@@ -29,7 +144,9 @@ the public-API contract.
 
 ### Changed
 
-- **FFmpegBuild 3.10.2.** Only the privacy manifests above; the FFmpeg code is byte-identical to 3.10.1.
+- **FFmpegBuild 3.11.0.** libavfilter gains the audio shaping filters above (`abuffer`, `abuffersink`, `aformat`,
+  `aresample`, `pan`, `dialoguenhance`, `acompressor`, `alimiter`) and `idet`, `fieldmatch` and `decimate` for inverse
+  telecine (#853, not used by the engine yet), all LGPL. 3.10.2 before it added only the privacy manifests above.
 - **A weekly Xcode 26.3 build (#883).** A best-effort workflow builds the package for tvOS and iOS with Xcode 26.3
   (Swift 6.2) every Monday and by hand before a release, so a host still on Xcode 26 hears about a break before the
   release does. It is not a required check and the supported toolchain stays Xcode 27.

@@ -8,8 +8,9 @@ ignores an enabled preference synced from a newer device.
 
 For supported 48 kHz TrueHD Atmos and DTS:X video-on-demand sources, the engine decodes the
 object presentation and timed metadata, renders to a fixed 9.1.6 (16-channel) bed,
-encodes APAC, and plays through the native HLS/AVPlayer path. The upstream bitrate
-default is 320 kbps per output channel (5.12 Mbps for this layout).
+delivers it according to route capability (lossless 24-bit PCM for HDMI and AirPods spatial audio,
+or APAC for AirPlay), and plays through the native HLS/AVPlayer path. The upstream bitrate
+default for APAC is 320 kbps per output channel (5.12 Mbps for this layout).
 
 APAC is lossy. This is not TrueHD or DTS-HD bitstream passthrough and does not send the
 original dynamic objects to the receiver for independent rendering. Other source

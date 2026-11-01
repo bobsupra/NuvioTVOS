@@ -7,15 +7,13 @@ import AetherLibswresample
 /// The downmix is libswresample's own (`swr_build_matrix2` with its default levels: centre and
 /// surrounds at -3 dB, LFE dropped), so a capped session folds exactly the way an uncapped one
 /// already did whenever the route forced a fold. The dialogue lift is applied to that matrix rather
-/// than as a separate pass, so it costs nothing per sample:
-///
-/// - a source with a front centre gets that input column scaled, wherever the centre lands;
-/// - a source with front left and right but no centre gets a mid/side lift on those two inputs
-///   (`L' = aL + bR`, `R' = bL + aR` with `a = (g+1)/2`, `b = (g-1)/2`), which raises what the two
-///   channels share, where a stereo mix pans its dialogue, and leaves their difference alone.
+/// than as a separate pass, so it costs nothing per sample: a source with a front centre gets that
+/// input column scaled, wherever the centre lands. A source without a centre is lifted in
+/// `AudioShapingGraph` instead (`dialoguenhance`), which separates the dialogue from wide content
+/// where a matrix can only raise everything the two sides share.
 ///
 /// The matrix is not normalized: a fold that sums past full scale, and a lift on top of it, is caught
-/// by the limiter in `AudioDynamicsProcessor`, which runs whenever shaping is active. Normalizing
+/// by the limiter in `AudioShapingGraph`, which runs whenever shaping is active. Normalizing
 /// instead would buy headroom by turning everything down by the worst-case sum (7.6 dB on a 5.1 fold),
 /// which is the opposite of what a viewer who cannot hear the dialogue asked for.
 enum AudioShapingMatrix {
@@ -74,21 +72,25 @@ enum AudioShapingMatrix {
         guard lift > 1 else { return matrix }
 
         let centre = Int(av_channel_layout_index_from_channel(input, AV_CHAN_FRONT_CENTER))
-        let left = Int(av_channel_layout_index_from_channel(input, AV_CHAN_FRONT_LEFT))
-        let right = Int(av_channel_layout_index_from_channel(input, AV_CHAN_FRONT_RIGHT))
         if centre >= 0 {
             for o in 0..<outCount { matrix[o * inCount + centre] *= lift }
-        } else if left >= 0, right >= 0 {
-            let a = (lift + 1) / 2
-            let b = (lift - 1) / 2
-            for o in 0..<outCount {
-                let l = matrix[o * inCount + left]
-                let r = matrix[o * inCount + right]
-                matrix[o * inCount + left] = a * l + b * r
-                matrix[o * inCount + right] = b * l + a * r
-            }
         }
         return matrix
+    }
+
+    /// Whether the source carries a front centre the matrix can lift. Read in the default order for
+    /// an unspecified layout, like `coefficients`. A mono source counts as no centre: its one channel
+    /// is the whole mix, not the dialogue.
+    static func hasCentre(_ layout: UnsafePointer<AVChannelLayout>) -> Bool {
+        guard layout.pointee.nb_channels > 1 else { return false }
+        var resolved = AVChannelLayout()
+        defer { av_channel_layout_uninit(&resolved) }
+        if layout.pointee.order == AV_CHANNEL_ORDER_UNSPEC {
+            av_channel_layout_default(&resolved, layout.pointee.nb_channels)
+        } else {
+            av_channel_layout_copy(&resolved, layout)
+        }
+        return av_channel_layout_index_from_channel(&resolved, AV_CHAN_FRONT_CENTER) >= 0
     }
 
     /// Hand the matrix to an allocated, not yet initialized resampler. Returns false when the

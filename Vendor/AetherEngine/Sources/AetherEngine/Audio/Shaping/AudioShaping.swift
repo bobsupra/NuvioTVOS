@@ -10,9 +10,9 @@ import Foundation
 /// render never passes through a PCM stage the engine could shape. `AetherEngine.audioShapingState`
 /// says whether a session is actually carrying it.
 ///
-/// libavfilter's audio filters are not in the FFmpeg build, so the channel work is a matrix handed
-/// to libswresample (`AudioShapingMatrix`) and the dynamics are the engine's own
-/// (`AudioDynamicsProcessor`).
+/// The channel work is a remix matrix handed to libswresample (`AudioShapingMatrix`); the stereo
+/// dialogue lift and the dynamics are libavfilter's `dialoguenhance`, `acompressor` and `alimiter`
+/// (`AudioShapingGraph`).
 public struct AudioShaping: Sendable, Equatable, Hashable {
 
     /// Upper bound on the channels the session outputs; nil keeps the source's (today's behaviour).
@@ -21,9 +21,10 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
 
     /// Gain on the dialogue, in dB, clamped to 0...`maxDialogueGainDB`. On a source with a front
     /// centre channel that channel is raised wherever it lands (kept discrete, or folded into a
-    /// downmix). On a stereo source, which has no centre to raise, the part common to both channels
-    /// (the mid signal, where a mix pans its dialogue) is raised against the difference instead. A
-    /// mono source has nothing to separate dialogue from and is left alone.
+    /// downmix). A source without a centre that plays as stereo gets the dialogue extracted from
+    /// the mix (libavfilter's `dialoguenhance`) and folded back onto both sides at this gain, which
+    /// costs the audio a fixed latency the engine takes back out of the timeline. A mono source has
+    /// nothing to separate dialogue from and is left alone.
     public var dialogueGainDB: Double
 
     /// Dynamic-range compression; nil is off.
@@ -39,10 +40,10 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
     /// and starts sounding like a separate speaker.
     public static let maxDialogueGainDB: Double = 12
 
-    /// A feed-forward compressor with a soft knee, linked across every channel so the stereo image
-    /// and the surround field do not move when one channel is loud. A peak limiter at
-    /// `AudioDynamicsProcessor.ceilingDBFS` runs after it whenever shaping is active, so neither the
-    /// makeup gain nor the dialogue lift can clip.
+    /// A feed-forward compressor with a soft knee (libavfilter's `acompressor`, peak detection),
+    /// linked across every channel so the stereo image and the surround field do not move when one
+    /// channel is loud. A lookahead limiter at -1 dBFS (`alimiter`) runs after it whenever shaping is
+    /// active, so neither the makeup gain nor the dialogue lift can clip.
     public struct Compressor: Sendable, Equatable, Hashable {
         /// Level above which the gain is reduced, in dBFS (clamped to -60...0).
         public var thresholdDB: Double
@@ -54,7 +55,7 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
         public var attackMilliseconds: Double
         /// How fast it lets go again, in milliseconds (clamped to 10...2000).
         public var releaseMilliseconds: Double
-        /// Width of the soft knee around the threshold, in dB (clamped to 0...24).
+        /// Width of the soft knee around the threshold, in dB (clamped to 0...18, acompressor's range).
         public var kneeDB: Double
 
         public init(thresholdDB: Double, ratio: Double, makeupGainDB: Double = 0,
@@ -81,7 +82,7 @@ public struct AudioShaping: Sendable, Equatable, Hashable {
                        makeupGainDB: Self.clamp(makeupGainDB, 0, 24, fallback: 0),
                        attackMilliseconds: Self.clamp(attackMilliseconds, 0.1, 200, fallback: 10),
                        releaseMilliseconds: Self.clamp(releaseMilliseconds, 10, 2000, fallback: 250),
-                       kneeDB: Self.clamp(kneeDB, 0, 24, fallback: 0))
+                       kneeDB: Self.clamp(kneeDB, 0, 18, fallback: 0))
         }
 
         static func clamp(_ v: Double, _ lo: Double, _ hi: Double, fallback: Double) -> Double {

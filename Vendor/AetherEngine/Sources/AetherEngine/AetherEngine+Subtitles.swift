@@ -702,8 +702,15 @@ extension AetherEngine {
                 if Self.pruneCues(&cues, before: playhead - subtitleCueRetentionSeconds) {
                     didMutate = true
                 }
+                // AE#929: a cue the cursor has not reached yet is decoded again on the way, so past
+                // the lead it costs nothing to drop. After a backward seek that is the old
+                // position's whole floor and lead, which otherwise stays until playback gets there.
+                let reDecodedAfter = max(playhead + Self.subtitleDrainLeadSeconds
+                                             + Self.subtitleForwardPrefetchLeadMarginSeconds,
+                                         subtitleDrainCursors[channel]?.lastDecodedPts ?? .infinity)
                 if Self.pruneCues(&cues, toBitmapBytes: Self.subtitleCueBitmapByteBudget,
-                                  endedBefore: playhead - Self.subtitleCueBitmapFloorSeconds) {
+                                  endedBefore: playhead - Self.subtitleCueBitmapFloorSeconds,
+                                  startingAfter: reDecodedAfter) {
                     didMutate = true
                 }
             }
@@ -1467,13 +1474,20 @@ extension AetherEngine {
     /// first until the bitmap total fits `budget`; cues past it (the offset floor and everything
     /// ahead) are never touched, so the total can stay above budget. A backward seek re-decodes its
     /// window from the packet store (`.resetAndDecode`), which is what brings an evicted cue back.
+    /// AE#929: cues starting after `reDecodedAfter` go first, furthest first, since the drain cursor
+    /// has not reached them and decodes them again when it does.
     nonisolated static func pruneCues(_ cues: inout [SubtitleCue], toBitmapBytes budget: Int,
-                                      endedBefore cutoff: Double) -> Bool {
+                                      endedBefore cutoff: Double,
+                                      startingAfter reDecodedAfter: Double = .infinity) -> Bool {
         var total = cues.reduce(0) { $0 + $1.bitmapBytes }
         guard total > budget else { return false }
-        let evictable = cues.indices
+        let ahead = cues.indices
+            .filter { cues[$0].startTime > reDecodedAfter && cues[$0].bitmapBytes > 0 }
+            .sorted { cues[$0].startTime > cues[$1].startTime }
+        let behind = cues.indices
             .filter { cues[$0].endTime < cutoff && cues[$0].bitmapBytes > 0 }
             .sorted { cues[$0].endTime < cues[$1].endTime }
+        let evictable = ahead + behind
         var drop = Set<Int>()
         for index in evictable where total > budget {
             total -= cues[index].bitmapBytes

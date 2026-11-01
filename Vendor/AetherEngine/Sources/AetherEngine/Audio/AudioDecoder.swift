@@ -82,7 +82,7 @@ final class AudioDecoder: @unchecked Sendable {
 
     /// AE#923. Set before `open`; a change mid-session arrives as a new decoder or a re-anchor.
     var shaping = AudioShaping()
-    private var dynamics: AudioDynamicsProcessor?
+    private var shapingGraph: AudioShapingGraph?
 
     func open(stream: UnsafeMutablePointer<AVStream>) throws {
         guard let codecpar = stream.pointee.codecpar else {
@@ -229,11 +229,15 @@ final class AudioDecoder: @unchecked Sendable {
         if shaping.isActive {
             AudioShapingMatrix.apply(to: swr, input: &inLayout, output: &outLayout,
                                      dialogueGain: shaping.dialogueGain)
-            dynamics = AudioDynamicsProcessor(compressor: shaping.clamped.compressor, sampleRate: sampleRate)
+            shapingGraph = AudioShapingGraph(shaping: shaping, sampleRate: sampleRate, layout: &outLayout,
+                                             sourceHasCentre: AudioShapingMatrix.hasCentre(&inLayout),
+                                             outputFormat: AV_SAMPLE_FMT_FLT)
             EngineLog.emit("[AudioDecoder] AE#923 shaping \(shaping.summary): "
-                           + "\(frameChannels)ch -> \(channels)ch", category: .swPlayback)
+                           + "\(frameChannels)ch -> \(channels)ch"
+                           + (shapingGraph == nil ? ", filter graph unavailable, dynamics off" : ""),
+                           category: .swPlayback)
         } else {
-            dynamics = nil
+            shapingGraph = nil
         }
         guard swr_init(swr) >= 0 else {
             swr_free(&swrContext)
@@ -268,7 +272,7 @@ final class AudioDecoder: @unchecked Sendable {
         // Re-anchor the gapless clock to the post-seek PTS on the next emitted buffer.
         clock.reset()
         audioProcessor.reset()
-        dynamics?.reset()
+        shapingGraph?.reset()
         #if DEBUG
         _loggedZeroConvert = false
         #endif
@@ -313,6 +317,8 @@ final class AudioDecoder: @unchecked Sendable {
                 }
             }
         }
+        // The shaping graph holds back its latency; the drain pushes it out, sample-aligned.
+        shapingGraph?.drain { planes, count, pts in appendShaped(planes, count: count, pts: pts) }
         // Force-emit whatever is left below the coalescing threshold (emitPending only needs > 0 samples).
         if let sampleBuffer = emitPending() { results.append(sampleBuffer) }
         return results
@@ -437,10 +443,17 @@ final class AudioDecoder: @unchecked Sendable {
         }
         #endif
         guard convertedSamples > 0 else { return }
-        if dynamics != nil {
+        if let graph = shapingGraph {
+            // The graph runs on its own sample count; the pts rides along in samples and comes back
+            // with the output sample it belongs to (see AudioShapingGraph, Timing).
+            let pts: Int64? = frame.pointee.pts == Self.noPTS ? nil
+                : av_rescale_q(frame.pointee.pts, timeBase, AVRational(num: 1, den: sampleRate))
             tempBuffer.withMemoryRebound(to: Float.self, capacity: Int(convertedSamples) * Int(channels)) {
-                dynamics?.process($0, frames: Int(convertedSamples), channels: Int(channels))
+                graph.process($0, frames: Int(convertedSamples), pts: pts) { planes, count, pts in
+                    appendShaped(planes, count: count, pts: pts)
+                }
             }
+            return
         }
 
         let sampleFrames = Int(convertedSamples)
@@ -460,6 +473,18 @@ final class AudioDecoder: @unchecked Sendable {
 
         pendingBytes.append(tempBuffer, count: sampleFrames * bytesPerSample)
         pendingSampleCount += sampleFrames
+    }
+
+    private static let noPTS: Int64 = -0x7FFFFFFFFFFFFFFF - 1
+
+    /// One shaped output chunk (interleaved Float32, `channels` wide) into the accumulator.
+    private func appendShaped(_ planes: [UnsafeMutableRawPointer?], count: Int, pts: Int64?) {
+        guard count > 0, let base = planes.first ?? nil else { return }
+        if pendingSampleCount == 0 {
+            pendingStartPTS = pts.map { CMTime(value: $0, timescale: sampleRate) } ?? .invalid
+        }
+        pendingBytes.append(base.assumingMemoryBound(to: UInt8.self), count: count * Int(channels) * 4)
+        pendingSampleCount += count
     }
 
     /// Build a CMSampleBuffer from the pending accumulator and reset it. Nil if nothing pending.

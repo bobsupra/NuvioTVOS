@@ -1499,10 +1499,8 @@ extension HeavyDualLayerSuites {
             defer { decoder.close() }
             let reported = LockedCounter()
             decoder.onFatalDecodeError = { _ in reported.increment() }
-            let lines = LockedCounter()
-            let previous = EngineLog.handler
-            EngineLog.handler = { line in if line.contains("failed to open the primary decoder") { lines.increment() } }
-            defer { EngineLog.handler = previous }
+            let capture = EngineLogCapture()
+            defer { capture.end() }
 
             for i in 0..<5 {
                 let pkt = try Self.inBandPacket(pts: Int64(i) * 3000)
@@ -1512,7 +1510,7 @@ extension HeavyDualLayerSuites {
             }
             #expect(primary.openCount == 1, "the open was retried on a later packet")
             #expect(reported.value == 1)
-            #expect(lines.value == 1)
+            #expect(capture.matching("failed to open the primary decoder").count == 1)
             #expect(decoder.fatalDecodeError is FailingOpenFakeDecoder.OpenFailed)
             #expect(primary.decodeCount == 0)
         }
@@ -1524,10 +1522,8 @@ extension HeavyDualLayerSuites {
             let built = LockedCounter()
             decoder.makeEnhancementDecoder = { built.increment(); return enhancement }
             defer { decoder.close() }
-            let lines = LockedCounter()
-            let previous = EngineLog.handler
-            EngineLog.handler = { line in if line.contains("failed to initialize EL decoder") { lines.increment() } }
-            defer { EngineLog.handler = previous }
+            let capture = EngineLogCapture()
+            defer { capture.end() }
 
             for i in 0..<5 {
                 let pkt = try Self.inBandPacket(pts: Int64(i) * 3000)
@@ -1537,7 +1533,7 @@ extension HeavyDualLayerSuites {
             }
             #expect(enhancement.openCount == 1, "the open was retried on a later packet")
             #expect(built.value == 1, "a new session was built for a later packet")
-            #expect(lines.value == 1)
+            #expect(capture.matching("failed to initialize EL decoder").count == 1)
             #expect(decoder.enhancementDecoderOpenError is FailingOpenFakeDecoder.OpenFailed)
             #expect(decoder.fatalDecodeError == nil, "a missing enhancement layer leaves the base layer to show")
             // close() starts the next session clean.
@@ -2402,16 +2398,9 @@ extension HeavyDualLayerSuites {
 
         @Test("per-frame logs (queue, bypass, drop) are NOT emitted at default info level")
         func fel14PerFrameLogsNotEmittedAtDefaultInfoLevel() throws {
-            let prevHandler = EngineLog.handler
-            defer { EngineLog.handler = prevHandler }
-
-            var emittedLines: [String] = []
-            let logLock = NSLock()
-            EngineLog.handler = { line in
-                logLock.lock()
-                emittedLines.append(line)
-                logLock.unlock()
-            }
+            // A capture, not a swapped handler: other suites log while this one runs.
+            let capture = EngineLogCapture()
+            defer { capture.end() }
 
             let decoder = DualLayerVideoDecoder(composer: ImmediateFakeComposer())
             defer { decoder.close() }
@@ -2431,17 +2420,17 @@ extension HeavyDualLayerSuites {
             let buf3 = try #require(Self.enhancementLayer())
             decoder.handleEnhancementLayerFrame(elBuffer: buf3, pts: Self.pts(3))
 
-            logLock.lock()
-            let captured = emittedLines
-            logLock.unlock()
+            let captured = capture.lines
 
+            // "compose failed (" only: "compose failed after writing began" is a dropped frame, logged
+            // at info on purpose, and a concurrent compose test emits it.
             let forbiddenPrefixes = [
                 "[DualLayerVideoDecoder] queued base layer",
                 "[DualLayerVideoDecoder] queued enhancement layer",
                 "[DualLayerVideoDecoder] bypass,",
                 "[DualLayerVideoDecoder] dropped stale enhancement layer",
                 "[DualLayerVideoDecoder] pruned enhancement layer",
-                "[DualLayerVideoDecoder] compose failed"
+                "[DualLayerVideoDecoder] compose failed ("
             ]
             for prefix in forbiddenPrefixes {
                 let found = captured.filter { $0.contains(prefix) }
