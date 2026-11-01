@@ -357,6 +357,13 @@ enum SettingsKey {
     static let seekrApiKey = "nuvio.tv.settings.playback.seekrApiKey"
     /// Whether Seekr is asked at all (on by default); the key stays saved while it is off.
     static let seekrEnabled = "nuvio.tv.settings.playback.seekrEnabled"
+    /// The opening's and the ending's color on the timeline ("#RRGGBB", see `PlaybackChapters.colorChoices`).
+    static let timelineOpeningColor = "nuvio.tv.settings.playback.timelineOpeningColor"
+    static let timelineEndingColor = "nuvio.tv.settings.playback.timelineEndingColor"
+    /// Whether the opening and the ending are colored on the timeline (on by default).
+    static let timelineSegmentsEnabled = "nuvio.tv.settings.playback.timelineSegmentsEnabled"
+    /// Whether a swipe seek stops for a moment on chapter and opening / ending edges (on by default).
+    static let timelineSnapEnabled = "nuvio.tv.settings.playback.timelineSnapEnabled"
     static let showLoadingStatus = "nuvio.tv.settings.playback.showLoadingStatus"
     static let audioDelayPersistEnabled = "nuvio.tv.settings.playback.audioDelayPersistEnabled"
     static let persistentAudioDelayMs = "nuvio.tv.settings.playback.persistentAudioDelayMs"
@@ -427,6 +434,7 @@ enum SettingsKey {
         forcedSubtitles, subtitleSize, frameRateMatching, networkCache, hybridDiskCacheEnabled, hybridDiskCacheLimitGB, playbackTrackSelections, showAudioLanguages,
         externalPlayerForwardSubtitles, assOverrideMode,
         playerShowPiP, playerShowEpisodes, playerShowSources, playerShowSubtitles, playerShowAudio, playerButtonOrder, seekPreviewEnabled, seekPreviewBeyondBuffer, seekrApiKey, seekrEnabled, showLoadingStatus,
+        timelineOpeningColor, timelineEndingColor, timelineSegmentsEnabled, timelineSnapEnabled,
         audioDelayPersistEnabled, persistentAudioDelayMs,
         sceneFeatureEnabled, sceneTabOrder, sceneTabDisabled,
         fastNavigation, smoothFocus, playbackDiagnostics, playbackDebug, focusHighlighter,
@@ -8656,6 +8664,10 @@ private struct PlaybackSettingsView: View {
     @AppStorage(SettingsKey.seekPreviewBeyondBuffer) private var seekPreviewBeyondBuffer = false
     @AppStorage(SettingsKey.seekrApiKey) private var seekrApiKey = ""
     @AppStorage(SettingsKey.seekrEnabled) private var seekrEnabled = false
+    @AppStorage(SettingsKey.timelineOpeningColor) private var timelineOpeningColor = PlaybackChapters.defaultOpeningColor
+    @AppStorage(SettingsKey.timelineEndingColor) private var timelineEndingColor = PlaybackChapters.defaultEndingColor
+    @AppStorage(SettingsKey.timelineSegmentsEnabled) private var timelineSegmentsEnabled = true
+    @AppStorage(SettingsKey.timelineSnapEnabled) private var timelineSnapEnabled = true
     @State private var seekrKeyCheck: SeekrKeyCheck = .unchecked
     @State private var seekrKeyCheckTask: Task<Void, Never>?
     @AppStorage(SettingsKey.showLoadingStatus) private var showLoadingStatus = true
@@ -8903,6 +8915,48 @@ private struct PlaybackSettingsView: View {
                     accentColor: accentColor
                 )
                 .disabled(!seekPreviewEnabled)
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_timeline_segments", fallback: "Opening & Ending on the Timeline"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_segments_subtitle",
+                        fallback: "Color the opening and the ending on the timeline"
+                    ),
+                    isOn: $timelineSegmentsEnabled,
+                    accentColor: accentColor
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_opening_color", fallback: "Opening Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_opening_color_subtitle",
+                        fallback: "The opening on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineOpeningColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
+                )
+
+                SubtitleColorRow(
+                    title: L10n.string("tvos_settings_timeline_ending_color", fallback: "Ending Color"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_ending_color_subtitle",
+                        fallback: "The ending on the timeline and its badge in Chapters"
+                    ),
+                    selection: $timelineEndingColor,
+                    accentColor: accentColor,
+                    colors: PlaybackChapters.colorChoices
+                )
+
+                SettingsToggleRow(
+                    title: L10n.string("tvos_settings_timeline_snap", fallback: "Snap While Seeking"),
+                    subtitle: L10n.string(
+                        "tvos_settings_timeline_snap_subtitle",
+                        fallback: "A swipe stops for a moment at chapter starts and at the opening's and the ending's edges"
+                    ),
+                    isOn: $timelineSnapEnabled,
+                    accentColor: accentColor
+                )
 
                 SettingsToggleRow(
                     title: L10n.string("playback_show_loading_status", fallback: "Show loading status"),
@@ -9796,6 +9850,8 @@ private struct InSightSectionsSettingsSection: View {
 
     private func subtitle(for tab: SceneTab) -> String {
         switch tab {
+        case .chapters:
+            return L10n.string("tvos_settings_insight_chapters_subtitle", fallback: "The file's chapters, with stills")
         case .scene:
             return L10n.string("tvos_settings_insight_scene_subtitle", fallback: "Cast and song recognition")
         case .info:
@@ -10222,6 +10278,7 @@ private struct SubtitleColorRow: View {
     let subtitle: String
     @Binding var selection: String
     let accentColor: Color
+    var colors: [String] = SubtitlePalette.colors
 
     var body: some View {
         HStack(spacing: 20) {
@@ -10229,7 +10286,7 @@ private struct SubtitleColorRow: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
 
             HStack(spacing: 12) {
-                ForEach(SubtitlePalette.colors, id: \.self) { hex in
+                ForEach(colors, id: \.self) { hex in
                     SubtitleColorSwatchButton(
                         hex: hex,
                         isSelected: selection.caseInsensitiveCompare(hex) == .orderedSame,

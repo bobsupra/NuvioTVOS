@@ -56,7 +56,8 @@ final class SceneViewModel: ObservableObject {
         overview: String?,
         runtime: String?,
         nextEpisode: NuvioVideo?,
-        playbackInfo: ScenePlaybackInfo? = nil
+        playbackInfo: ScenePlaybackInfo? = nil,
+        hasChapters: Bool = false
     ) {
         self.infoTitle = title
         self.infoYear = year.map(String.init)
@@ -71,7 +72,8 @@ final class SceneViewModel: ObservableObject {
             self.playbackInfo = playbackInfo
         }
         
-        var tabs: [SceneTab] = [.scene, .info]
+        // The file's chapters are a tab of their own (ordered with the others in InSight Sections).
+        var tabs: [SceneTab] = hasChapters ? [.chapters, .scene, .info] : [.scene, .info]
         if nextEpisode != nil {
             tabs.append(.upNext)
         }

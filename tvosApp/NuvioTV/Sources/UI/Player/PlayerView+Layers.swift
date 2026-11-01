@@ -523,6 +523,32 @@ extension PlayerView {
                     if watchPartyOwner?.presentation?.mount.isCurrent == true { return "party.catchUp" }
                     guard let room = watchPartyOwner?.service?.session, let party = room.party else { return "party.create" }
                     return party.hostMemberID == room.memberID ? "party.hostOnly" : "party.lobby"
+                }(),
+                chaptersContent: viewModel.chapters.isEmpty ? nil : { focus, focusContext in
+                    AnyView(PlayerChaptersRow(
+                        viewModel: viewModel,
+                        clock: viewModel.clock,
+                        thumbnails: viewModel.chapterThumbnails,
+                        focusedCardID: focus,
+                        focusContext: focusContext,
+                        onSelect: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        },
+                        onDismiss: {
+                            withAnimation(.playerControls) {
+                                viewModel.closeScene()
+                                focusRemoteInput()
+                            }
+                        }
+                    ))
+                },
+                chaptersFocusTarget: {
+                    let chapters = viewModel.chapters
+                    guard !chapters.isEmpty else { return "chapter-0" }
+                    return PlayerChaptersRow.focusID(of: chapters[viewModel.currentChapterIndex ?? 0])
                 }()
             )
             .transition(.move(edge: .bottom).combined(with: .opacity))

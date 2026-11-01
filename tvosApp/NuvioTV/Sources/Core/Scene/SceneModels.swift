@@ -5,6 +5,7 @@ import AVFoundation
 // MARK: - Scene Tab
 
 enum SceneTab: String, CaseIterable, Identifiable, Sendable {
+    case chapters = "Chapters"
     case info = "Info"
     case scene = "Scene"
     case upNext = "Up Next"
@@ -15,6 +16,8 @@ enum SceneTab: String, CaseIterable, Identifiable, Sendable {
     var localizedTitle: String {
         let isNorwegian = Locale.preferredLanguages.first?.hasPrefix("nb") == true || Locale.preferredLanguages.first?.hasPrefix("no") == true
         switch self {
+        case .chapters:
+            return L10n.string("player_chapters", fallback: "Chapters")
         case .info:
             return "Info"
         case .scene:

@@ -151,6 +151,10 @@ final class SeekPreviewLaneTests: XCTestCase {
             .allowed)
     }
 
+    func testChapterStillsLoadWhateverTheBufferOrOption() {
+        XCTAssertEqual(SeekPreviewNetworkPolicy.chapterThumbnails(), .allowed)
+    }
+
     func testUsenetPreviewsDoNotWaitForThePausedConnection() {
         XCTAssertEqual(
             SeekPreviewNetworkPolicy.aether(

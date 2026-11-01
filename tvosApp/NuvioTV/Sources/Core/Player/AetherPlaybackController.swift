@@ -2686,6 +2686,16 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
     }
     private(set) var audioTracks: [PlaybackTrackInfo] = []
     private(set) var subtitleTracks: [PlaybackTrackInfo] = []
+    /// Matroska / MP4 chapters, already on the playback axis (`seek(to:)`).
+    var chapters: [PlaybackChapter] {
+        guard !isAwaitingEngineLoad else { return [] }
+        return PlaybackChapters.chapters(
+            from: engine.mediaChapters.map {
+                (id: $0.id, name: $0.name, start: $0.startSeconds, duration: $0.durationSeconds)
+            },
+            totalDuration: engine.duration
+        )
+    }
     var discTitles: [PlaybackDiscTitleInfo] {
         engine.discTitles.map {
             PlaybackDiscTitleInfo(
@@ -3382,18 +3392,19 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
                 guard let self else { return false }
                 return self.loadGeneration == generation && self.thumbnailSourceContext == context
             },
-            admission: { [weak self] in
-                self?.seekPreviewNetworkDecision() ?? .busy
+            admission: { [weak self] purpose in
+                self?.seekPreviewNetworkDecision(for: purpose) ?? .busy
             },
             localFrame: { seconds, maxDistance in
                 await index.nearest(seconds: seconds, maxDistance: maxDistance, generation: generation)
             })
     }
 
-    private func seekPreviewNetworkDecision() -> SeekPreviewNetworkPolicy.Decision {
+    private func seekPreviewNetworkDecision(for purpose: SeekPreviewLane.Purpose) -> SeekPreviewNetworkPolicy.Decision {
         guard !isAwaitingEngineLoad else { return .busy }
         let telemetry = engine.liveTelemetry
         let phase = engine.playbackPhase
+        if purpose == .chapter { return SeekPreviewNetworkPolicy.chapterThumbnails() }
         let containerBitrate = engine.sourceVideoBitrate > 0 ? Double(engine.sourceVideoBitrate) / 1_000_000 : nil
         return SeekPreviewNetworkPolicy.aether(
             beyondBuffer: SeekPreviewNetworkPolicy.beyondBufferEnabled,
@@ -3417,6 +3428,27 @@ final class AetherPlaybackController: UIViewController, PlaybackEngineControllin
 
     var prefetchesScrubThumbnailsInBackground: Bool {
         SeekPreviewLaneHost.mayServe(thumbnailSourceContext)
+    }
+
+    /// A chapter's still for the Chapters panel: the external storyboard's (the add-on's
+    /// trickplay, the trickplay server or Seekr), else one held near it, else the preview
+    /// lane's keyframe; sources the lane does not serve keep the ordinary preview path.
+    func chapterThumbnail(atSeconds seconds: Double, duration: Double) async -> CGImage? {
+        let generation = loadGeneration
+        guard !isAwaitingEngineLoad, let context = thumbnailSourceContext else { return nil }
+        if let external = externalTrickplayProvider, let image = await external.thumbnail(at: seconds) {
+            return loadGeneration == generation ? image : nil
+        }
+        if let near = await hybridThumbnailIndex.nearest(seconds: seconds, maxDistance: 2.5, generation: generation) {
+            return near
+        }
+        guard loadGeneration == generation else { return nil }
+        guard SeekPreviewLaneHost.mayServe(context) else {
+            if let cached = await cachedScrubThumbnail(atSeconds: seconds, duration: duration) { return cached }
+            return await scrubThumbnail(atSeconds: seconds, maxWidth: 320, precise: false)
+        }
+        guard let lane = await previewLane(for: context), loadGeneration == generation else { return nil }
+        return await lane.image(at: seconds, duration: duration, purpose: .chapter)
     }
 
     func prefetchScrubThumbnails(around seconds: Double, direction: Double, duration: Double) {

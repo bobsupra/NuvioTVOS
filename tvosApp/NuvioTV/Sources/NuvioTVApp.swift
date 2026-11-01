@@ -10833,10 +10833,13 @@ enum TVPlayerButtonOrder {
 /// Profile-scoped order and visibility for InSight panel tabs.
 enum TVSceneTabOrder {
     static let changedNotification = Notification.Name("nuvio.tv.sceneTabOrder.changed")
-    static let defaultOrder: [SceneTab] = [.scene, .info, .upNext, .watchParty]
+    /// Chapters first: they show only for a file that has them, and the panel then opens on
+    /// the playing chapter. A saved order without them gets them at the end.
+    static let defaultOrder: [SceneTab] = [.chapters, .scene, .info, .upNext, .watchParty]
 
     static func stableID(for tab: SceneTab) -> String {
         switch tab {
+        case .chapters: return "chapters"
         case .scene: return "scene"
         case .info: return "info"
         case .upNext: return "up_next"
@@ -10921,6 +10924,7 @@ enum TVSceneTabOrder {
 
     private static func sceneTab(for rawID: String) -> SceneTab? {
         switch rawID.trimmingCharacters(in: .whitespacesAndNewlines).lowercased() {
+        case "chapters": return .chapters
         case "scene", "insight", "in_sight": return .scene
         case "info": return .info
         case "up_next", "up next", "upnext": return .upNext

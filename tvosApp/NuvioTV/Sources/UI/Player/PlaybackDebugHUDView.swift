@@ -222,6 +222,15 @@ struct PlaybackDebugHUDView: View {
                     hasDot: true,
                     dotColor: info.stallsCount > 1 ? .red : (info.stallsCount == 1 ? .yellow : .green)
                 )
+                let chapterStills = SeekPreviewDiagnostics.shared.chapterLine
+                if !chapterStills.isEmpty {
+                    hudRow(
+                        label: "Chapters",
+                        value: chapterStills,
+                        hasDot: true,
+                        dotColor: chapterStills.contains("done") ? .green : (chapterStills.contains("waiting") ? .yellow : .gray)
+                    )
+                }
                 let seekr = SeekPreviewDiagnostics.shared.seekrLine
                 if !seekr.isEmpty {
                     hudRow(
