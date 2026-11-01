@@ -15,11 +15,14 @@ public struct TopShelfConfiguration: Codable, Equatable, Sendable {
         case carouselDetails
         /// Full-screen carousel with the title and the two buttons only.
         case carouselActions
-        /// Labeled rows of 16:9 cards, one per source.
+        /// Labeled rows of 16:9 landscape cards, one per source.
         case rows
         /// Labeled rows of 2:3 posters, one per source (the shelf before the
         /// 16:9 cards).
         case posters
+
+        /// The action-only carousel was removed; the details carousel remains.
+        public static let allCases: [Style] = [.carouselDetails, .rows, .posters]
 
         public var isCarousel: Bool { self == .carouselDetails || self == .carouselActions }
     }
@@ -108,12 +111,24 @@ public enum TopShelfConfigurationStore {
     public static func load() -> TopShelfConfiguration {
         if let data = UserDefaults.standard.data(forKey: defaultsKey),
            let configuration = try? JSONDecoder().decode(TopShelfConfiguration.self, from: data) {
-            return configuration
+            return removingActionOnlyCarousel(from: configuration)
         }
         if let directory = TopShelfFeedStore.containerURL, let configuration = read(in: directory) {
-            return configuration
+            return removingActionOnlyCarousel(from: configuration)
         }
         return .default
+    }
+
+    /// Convert configurations saved with the removed action-only carousel to
+    /// the remaining carousel style.
+    private static func removingActionOnlyCarousel(
+        from configuration: TopShelfConfiguration
+    ) -> TopShelfConfiguration {
+        guard configuration.style == .carouselActions else { return configuration }
+        var updated = configuration
+        updated.style = .carouselDetails
+        save(updated)
+        return updated
     }
 
     /// Saves the choice and redraws the shelf with it.

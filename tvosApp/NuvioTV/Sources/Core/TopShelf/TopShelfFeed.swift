@@ -340,9 +340,8 @@ actor TopShelfArtworkRefresher {
 /// group container isn't available (e.g. entitlement not provisioned), so the
 /// app never crashes or blocks on it.
 public enum TopShelfFeedStore {
-    // Version 4 / 2: drawn from the largest source the image host offers, the
-    // carousel at the screen's scale.
-    private static let artworkRenderVersion = 4
+    // Card artwork version 5; carousel artwork version 3.
+    private static let artworkRenderVersion = 5
     private static let carouselRenderVersion = 3
     private static let posterRenderVersion = 1
     /// Rendered card size. 16:9, large enough for the 2x shelf scale.
@@ -700,7 +699,8 @@ public enum TopShelfFeedStore {
 
     /// Renders a 16:9 card. Landscape art fills it; portrait art (a poster used
     /// when no backdrop exists) sits centered over a dimmed, filled copy of
-    /// itself rather than being cropped to a sliver.
+    /// itself rather than being cropped to a sliver. Episode and time-left text
+    /// sits in a pill at the top-right.
     private static func renderedArtwork(from image: UIImage, subtitle: String?) -> Data? {
         let size = artworkSize
         let renderer = UIGraphicsImageRenderer(size: size)
@@ -722,8 +722,8 @@ public enum TopShelfFeedStore {
             let pillWidth = min(maximumPillWidth, ceil(textSize.width) + horizontalPadding)
             let pillHeight = max(88, ceil(textSize.height) + 32)
             let pillRect = CGRect(
-                x: (size.width - pillWidth) / 2,
-                y: size.height - pillHeight - 40,
+                x: size.width - pillWidth - 40,
+                y: 40,
                 width: pillWidth,
                 height: pillHeight
             )
