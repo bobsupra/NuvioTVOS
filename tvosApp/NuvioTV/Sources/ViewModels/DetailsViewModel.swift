@@ -9,7 +9,7 @@ import Foundation
 import Combine
 import AetherEngine
 
-struct DetailsBackgroundResolutionIdentity: Equatable {
+struct DetailsBackgroundResolutionIdentity: Equatable, Sendable {
     let streamID: String
     let episodeID: String?
     let candidate: NuvioStream
@@ -32,7 +32,7 @@ struct DetailsBackgroundResolutionIdentity: Equatable {
     }
 }
 
-struct DetailsSavedPlaybackTarget: Equatable {
+struct DetailsSavedPlaybackTarget: Equatable, Sendable {
     let url: URL
     let httpHeaders: [String: String]
 }
@@ -1027,7 +1027,7 @@ class DetailsViewModel: ObservableObject {
                 if let active = snapshot.requestKey, active != key, snapshot.hasResolvedTargets {
                     break
                 }
-                try? await Task.sleep(nanoseconds: 80_000_000)
+                try? await Task.sleep(nanoseconds: 250_000_000)
             }
         }
     }
@@ -1164,14 +1164,21 @@ class DetailsViewModel: ObservableObject {
         guard let tmdbVideos, !tmdbVideos.isEmpty else { return existing }
         guard let existing, !existing.isEmpty else { return tmdbVideos }
 
-        var bySeasonEp: [String: NuvioVideo] = [:]
+        struct SeasonEpKey: Hashable {
+            let season: Int
+            let episode: Int
+        }
+
+        var bySeasonEp: [SeasonEpKey: NuvioVideo] = [:]
+        bySeasonEp.reserveCapacity(existing.count)
         for video in existing {
-            bySeasonEp["\(video.season):\(video.episode)"] = video
+            bySeasonEp[SeasonEpKey(season: video.season, episode: video.episode)] = video
         }
 
         var result: [NuvioVideo] = []
+        result.reserveCapacity(max(existing.count, tmdbVideos.count))
         for tmdb in tmdbVideos {
-            let key = "\(tmdb.season):\(tmdb.episode)"
+            let key = SeasonEpKey(season: tmdb.season, episode: tmdb.episode)
             if let ex = bySeasonEp.removeValue(forKey: key) {
                 let tmdbTitle = nonEmpty(tmdb.title)
                 let titleToUse: String

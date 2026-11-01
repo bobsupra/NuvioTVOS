@@ -1,7 +1,7 @@
 import Foundation
 
 /// Release quality tier matching Android TV's `DebridStreamQuality`.
-enum DebridStreamQuality: Int, Codable, Comparable, CaseIterable {
+enum DebridStreamQuality: Int, Codable, Comparable, CaseIterable, Sendable {
     case unknown = 0
     case scr = 1
     case tc = 2
@@ -41,7 +41,7 @@ enum DebridStreamQuality: Int, Codable, Comparable, CaseIterable {
 
 /// Parsed quality / delivery tags from a stream card or last-watched fingerprint.
 /// Used for ranking, resume matching, and lightweight source badges.
-struct StreamQualityTags: Equatable, Codable {
+struct StreamQualityTags: Equatable, Codable, Sendable {
     var resolution: Int = 0
     var isDolbyVision: Bool = false
     var isHDR: Bool = false

@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import NuvioTV
 
@@ -252,5 +253,52 @@ final class TrailerSettingsTests: XCTestCase {
 
         let bgEnabled = testDefaults.bool(forKey: SettingsKey.backgroundTrailersEnabled)
         XCTAssertFalse(bgEnabled, "Background trailers setting must remain disabled regardless of handoff")
+    }
+
+    func testTrailerPlaybackSourceMakePlayerItemSingleVideo() async {
+        let source = TrailerPlaybackSource(
+            videoUrl: "https://trailerio.test/video.mp4",
+            audioUrl: nil,
+            qualityLabel: "1080p (MP4)"
+        )
+        let item = await source.makePlayerItem(preferredForwardBufferDuration: 2.0)
+        XCTAssertNotNil(item)
+        XCTAssertEqual(item?.preferredForwardBufferDuration, 2.0)
+        XCTAssertEqual(item?.preferredPeakBitRate, 0)
+        XCTAssertEqual(item?.preferredMaximumResolution, .zero)
+        XCTAssertTrue(item?.asset is AVURLAsset)
+    }
+
+    func testTrailerPlaybackSourceMakePlayerItemInvalidURL() async {
+        let source = TrailerPlaybackSource(
+            videoUrl: "",
+            audioUrl: nil
+        )
+        let item = await source.makePlayerItem()
+        XCTAssertNil(item)
+    }
+
+    func testTrailerPlaybackSourceCarriesAudioURLForAdaptivePairs() async {
+        let state = TrailerResolverTestState()
+        let resolver = YouTubeTrailerResolver(
+            preferredLanguageProvider: { "en-US" },
+            configurationIdentityProvider: { state.configuration },
+            trailerYouTubeIdProvider: { _ in "ge_ABjtYx88" },
+            refreshedTrailerIdsProvider: { _ in nil },
+            trailerioProvider: { _, _ in nil },
+            youtubeSourceProvider: { _, _, _, isPreview in
+                TrailerPlaybackSource(
+                    videoUrl: "https://googlevideo.test/video.mp4",
+                    audioUrl: "https://googlevideo.test/audio.m4a",
+                    qualityLabel: "1080p (Adaptive)"
+                )
+            }
+        )
+        let meta = NuvioMeta(id: "tmdb:804616", name: "F1: The Movie", type: "movie")
+        let source = await resolver.resolvePreview(for: meta)
+        XCTAssertNotNil(source)
+        XCTAssertEqual(source?.videoUrl, "https://googlevideo.test/video.mp4")
+        XCTAssertEqual(source?.audioUrl, "https://googlevideo.test/audio.m4a")
+        XCTAssertEqual(source?.qualityLabel, "1080p (Adaptive)")
     }
 }

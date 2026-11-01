@@ -1701,9 +1701,10 @@ final class CinemetaCatalogRepository: CatalogRepository {
         }
     }
 
-    /// Home toggles are keyed by add-on, media type and catalog ID. Search-only
-    /// endpoints have no Home row of their own, so they follow the visibility
-    /// of the add-on's browseable catalogs of the same media type (if any).
+    /// Home toggles are keyed by add-on, media type and catalog ID.
+    /// Dedicated search-only endpoints (`!catalog.eligibleForHome`) belong strictly
+    /// to Search, so they remain active as long as the add-on itself is enabled.
+    /// Home-eligible catalogs follow the user's Home visibility toggles.
     static func shouldSearchCatalog(
         _ catalog: AddonManifestCatalog,
         in catalogs: [AddonManifestCatalog],
@@ -1717,20 +1718,13 @@ final class CinemetaCatalogRepository: CatalogRepository {
               !disabledAddonNames.contains(TVHomeCatalogOrder.normalizedAddonSourceName(addonName)) else {
             return false
         }
-        func isDisabled(_ candidate: AddonManifestCatalog) -> Bool {
-            disabledKeys.contains(TVHomeCatalogOrder.catalogSettingsKey(
-                addonId: addonID, contentType: candidate.type, catalogId: candidate.id
-            ))
-        }
-        guard !isDisabled(catalog) else { return false }
-        guard !catalog.eligibleForHome else { return true }
+        // Dedicated search endpoints have no Home row; they are active if the add-on is enabled.
+        guard catalog.eligibleForHome else { return true }
 
-        let browseable = catalogs.filter {
-            $0.type == catalog.type && $0.eligibleForHome
-                && (!$0.requiresGenre || $0.firstGenreOption != nil)
-        }
-        // A search-only add-on with no Home catalogs must remain searchable.
-        return browseable.isEmpty || browseable.contains(where: { !isDisabled($0) })
+        let catalogKey = TVHomeCatalogOrder.catalogSettingsKey(
+            addonId: addonID, contentType: catalog.type, catalogId: catalog.id
+        )
+        return !disabledKeys.contains(catalogKey)
     }
 
     func search(query: String) async throws -> [NuvioMeta] {
@@ -2129,14 +2123,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
         let resolvedCatalogId = sort ?? catalogId
         let skip = max(page - 1, 0) * 100
         let targetBaseURL = await baseURL(forAddonId: nil, contentType: contentType, catalogId: resolvedCatalogId) ?? baseURL
-        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
+        let rawItems = try await fetchCatalog(
             sourceBaseURL: targetBaseURL,
             type: contentType,
             catalogId: resolvedCatalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        ))
+        )
+        let items: [NuvioMeta]
+        if TmdbDetailsService.useHomeEnrichment {
+            let initialCount = min(18, rawItems.count)
+            let initialBatch = await TmdbDetailsService.localizedMetadata(for: Array(rawItems.prefix(initialCount)))
+            items = initialBatch + Array(rawItems.dropFirst(initialCount))
+        } else {
+            items = rawItems
+        }
         cacheMetadata(items, context: metadataContext)
         return CatalogPage(
             items: items,
@@ -2191,14 +2193,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
             sourceBaseURL = baseURL
         }
 
-        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
+        let rawItems = try await fetchCatalog(
             sourceBaseURL: sourceBaseURL,
             type: contentType,
             catalogId: catalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        ))
+        )
+        let items: [NuvioMeta]
+        if TmdbDetailsService.useHomeEnrichment {
+            let initialCount = min(18, rawItems.count)
+            let initialBatch = await TmdbDetailsService.localizedMetadata(for: Array(rawItems.prefix(initialCount)))
+            items = initialBatch + Array(rawItems.dropFirst(initialCount))
+        } else {
+            items = rawItems
+        }
         cacheMetadata(items, context: metadataContext)
         return CatalogPage(
             items: items,
@@ -2216,14 +2226,22 @@ final class CinemetaCatalogRepository: CatalogRepository {
     ) async throws -> CatalogPage {
         let metadataContext = Self.metadataCacheContext
         let targetBaseURL = await baseURL(forAddonId: nil, contentType: contentType, catalogId: catalogId) ?? baseURL
-        let items = await TmdbDetailsService.localizedMetadata(for: try await fetchCatalog(
+        let rawItems = try await fetchCatalog(
             sourceBaseURL: targetBaseURL,
             type: contentType,
             catalogId: catalogId,
             skip: skip == 0 ? nil : skip,
             search: nil,
             genre: genre
-        ))
+        )
+        let items: [NuvioMeta]
+        if TmdbDetailsService.useHomeEnrichment {
+            let initialCount = min(18, rawItems.count)
+            let initialBatch = await TmdbDetailsService.localizedMetadata(for: Array(rawItems.prefix(initialCount)))
+            items = initialBatch + Array(rawItems.dropFirst(initialCount))
+        } else {
+            items = rawItems
+        }
         cacheMetadata(items, context: metadataContext)
         return CatalogPage(
             items: items,
@@ -2399,7 +2417,14 @@ final class CinemetaCatalogRepository: CatalogRepository {
             search: nil,
             genre: resolvedGenre
         )
-        let items = await TmdbDetailsService.localizedMetadata(for: rawItems)
+        let items: [NuvioMeta]
+        if TmdbDetailsService.useHomeEnrichment {
+            let initialCount = min(18, rawItems.count)
+            let initialBatch = await TmdbDetailsService.localizedMetadata(for: Array(rawItems.prefix(initialCount)))
+            items = initialBatch + Array(rawItems.dropFirst(initialCount))
+        } else {
+            items = rawItems
+        }
         cacheMetadata(items, context: metadataContext)
         return CatalogPage(
             items: items,

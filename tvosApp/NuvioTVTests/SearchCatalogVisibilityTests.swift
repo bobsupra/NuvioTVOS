@@ -36,19 +36,24 @@ final class SearchCatalogVisibilityTests: XCTestCase {
         XCTAssertTrue(isAllowed(movies, in: sources))
     }
 
-    func testSearchOnlyEndpointFollowsRemainingVisibleHomeCatalogsOfSameType() throws {
+    func testSearchOnlyEndpointRemainsSearchableRegardlessOfHomeCatalogToggles() throws {
         let searchOnly = try catalog(
-            #"{"type":"movie","id":"search","extra":[{"name":"search","isRequired":true}]}"#
+            #"{"type":"movie","id":"search.movie","extra":[{"name":"search","isRequired":true}]}"#
         )
         let popular = try catalog(#"{"type":"movie","id":"popular"}"#)
         let topRated = try catalog(#"{"type":"movie","id":"top_rated"}"#)
         let sources = [searchOnly, popular, topRated]
 
         XCTAssertFalse(searchOnly.eligibleForHome)
-        XCTAssertTrue(isAllowed(searchOnly, in: sources, disabled: ["fixture.addon_movie_popular"]))
-        XCTAssertFalse(isAllowed(
+        // Remains searchable even if all Home rows of the same type are disabled,
+        // and even if its own key appears in disabled keys (e.g., from account sync).
+        XCTAssertTrue(isAllowed(
             searchOnly, in: sources,
-            disabled: ["fixture.addon_movie_popular", "fixture.addon_movie_top_rated"]
+            disabled: [
+                "fixture.addon_movie_popular",
+                "fixture.addon_movie_top_rated",
+                "fixture.addon_movie_search.movie"
+            ]
         ))
     }
 

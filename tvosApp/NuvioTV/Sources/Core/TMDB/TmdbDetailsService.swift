@@ -540,11 +540,37 @@ enum TmdbDetailsService {
             return num
         }
 
+        // For series with many seasons, avoid mass TMDB API hammering (e.g. 20-40 seasons).
+        // Cinemeta already provides the full catalog episode list for the series.
+        // Fetch TMDB enrichment for the active season, initial season, and recent/ongoing seasons.
+        let targetSeasonNumbers: [Int]
+        let maxFetchCount = 6
+        if seasonNumbers.count > maxFetchCount {
+            var selected = Set<Int>()
+            if seasonNumbers.contains(1) { selected.insert(1) }
+            let activeSeason = ContinueWatchingStore.item(for: meta)?.episodeNumbers?.season
+                ?? ContinueWatchingStore.item(for: meta.id)?.episodeNumbers?.season
+                ?? (meta.videos ?? []).first(where: { $0.season > 0 })?.season
+            if let activeSeason, seasonNumbers.contains(activeSeason) {
+                selected.insert(activeSeason)
+                if seasonNumbers.contains(activeSeason + 1) {
+                    selected.insert(activeSeason + 1)
+                }
+            }
+            let regularSeasons = seasonNumbers.filter { $0 > 0 }
+            for s in regularSeasons.suffix(3) {
+                selected.insert(s)
+            }
+            targetSeasonNumbers = seasonNumbers.filter { selected.contains($0) }
+        } else {
+            targetSeasonNumbers = seasonNumbers
+        }
+
         // Bounded batching (max 4 seasons at a time) to prevent memory spikes on massive series (e.g. 20-40 seasons)
         var allVideos: [NuvioVideo] = []
         let batchSize = 4
-        for i in stride(from: 0, to: seasonNumbers.count, by: batchSize) {
-            let chunk = Array(seasonNumbers[i..<min(i + batchSize, seasonNumbers.count)])
+        for i in stride(from: 0, to: targetSeasonNumbers.count, by: batchSize) {
+            let chunk = Array(targetSeasonNumbers[i..<min(i + batchSize, targetSeasonNumbers.count)])
             let chunkVideos = await withTaskGroup(of: [NuvioVideo].self) { group in
                 for seasonNum in chunk {
                     group.addTask {

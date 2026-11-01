@@ -109,6 +109,7 @@ struct DetailsScreen: View {
     @State private var preResolvedEpisode: NuvioVideo? = nil
     @State private var preResolvedEpisodeSubtitle: String = ""
     @State private var preFetchDebridTask: Task<Void, Never>? = nil
+    @State private var backgroundPreResolutionTask: Task<Void, Never>? = nil
     @State private var preResolvedDuration: TimeInterval? = nil
     @State private var streamDiscoveryDuration: TimeInterval? = nil
     @State private var playbackPrewarmer: DetailsPlaybackPrewarmer
@@ -994,15 +995,19 @@ struct DetailsScreen: View {
 
     private func cleanupPreFetchedResources() {
         playbackPrewarmer.endContext()
-        if preFetchDebridTask != nil || preResolvedURL != nil {
+        if preFetchDebridTask != nil || preResolvedURL != nil || backgroundPreResolutionTask != nil {
             print("[PreFetch] 🛑 Details view dismissed — cancelled pending background pre-resolution tasks and cleaned up pre-loaded resources.")
         }
+        backgroundPreResolutionTask?.cancel()
+        backgroundPreResolutionTask = nil
         resetPreResolutionCandidate()
         streamDiscoveryDuration = nil
     }
 
     private func resetPreResolutionCandidate() {
         preResolutionGeneration &+= 1
+        backgroundPreResolutionTask?.cancel()
+        backgroundPreResolutionTask = nil
         preFetchDebridTask?.cancel()
         preFetchDebridTask = nil
         preResolutionIdentity = nil
@@ -1023,7 +1028,7 @@ struct DetailsScreen: View {
         if let meta = viewModel.uiState.meta,
            (isSmartPlaybackPending || isResolvingDebrid || isPreparingPlayback || isPreparingInitialPlayback) && !isStreamPickerPresented {
             PlayerLoadingOverlay(
-                backdropUrl: meta.backgroundUrl ?? meta.posterUrl,
+                backdropUrl: meta.backgroundUrl ?? meta.landscapePosterUrl ?? meta.posterUrl,
                 logoUrl: meta.logoUrl,
                 title: meta.name,
                 message: detailsLoadingMessage,
@@ -1091,110 +1096,151 @@ struct DetailsScreen: View {
             streamDiscoveryDuration = Date().timeIntervalSince(start)
         }
 
-        let debrid = DebridResolver(store: ProfileSettings.current)
-        let cachedOnlyPreference = (ProfileSettings.current.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
-        let cachedOnly = SmartPlaybackSelector.effectiveCachedOnly(
-            cachedOnlyPreference,
-            contentType: meta.type
-        )
+        // If a debrid link is already actively resolving in the background for this target,
+        // do not run redundant auto-selection passes that would compete or churn.
+        guard preFetchDebridTask == nil else { return }
 
+        let debrid = DebridResolver(store: ProfileSettings.current)
+        let debridIsEnabled = debrid.isEnabled
+        let torrentIsEnabled = TorrentSettings.isEnabled()
+        let cachedOnlyPreference = (ProfileSettings.current.object(forKey: SettingsKey.cachedOnlyStreams) as? Bool) ?? false
         let activeProfileId = ProfileSettings.activeProfileID
         let preferredTags = LastStreamQualityStore.load(metaId: meta.id, profileId: activeProfileId)
         let preserveAddonOrder = (ProfileSettings.current.object(forKey: SettingsKey.preserveAddonStreamOrder) as? Bool) ?? false
+        let sortRaw = ProfileSettings.current.string(forKey: SettingsKey.streamSortOption)
+        let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
+        let preferBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
+        let reuseBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
+        let smartStreamUseTopResult = self.smartStreamUseTopResult
+        let smartStreamQuality = self.smartStreamQuality
+        let subtitleLanguagePreferences = self.subtitleLanguagePreferences
+        let smartSubtitleMatching = self.smartSubtitleMatching
+        let smartStreamSelection = self.smartStreamSelection
+        let streamGroups = viewModel.uiState.streamGroups
+        let isLoadingStreams = viewModel.uiState.isLoadingStreams
+        let resolutionGeneration = self.preResolutionGeneration
 
-        let candidateStream: NuvioStream?
-        if smartStreamUseTopResult || preserveAddonOrder {
-            let sortRaw = ProfileSettings.current.string(forKey: SettingsKey.streamSortOption)
-            let sortOption = sortRaw.flatMap(StreamSortOption.init(rawValueOrSync:)) ?? .quality
-            let displayed = StreamPickerListBuilder.displayedStreams(
-                streams: streams,
-                groups: viewModel.uiState.streamGroups,
-                selectedAddonId: nil,
-                sortOption: sortOption,
-                includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
-                cachedOnly: cachedOnly,
-                preserveAddonStreams: preserveAddonOrder
-            )
-            let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
-            let pool: [NuvioStream]
-            if preserveAddonOrder {
-                pool = available
-            } else {
-                let valid = available.filter {
-                    !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
+        backgroundPreResolutionTask?.cancel()
+        backgroundPreResolutionTask = Task { @MainActor in
+            let candidate: NuvioStream? = await Task.detached(priority: .utility) {
+                guard !Task.isCancelled else { return nil }
+                let cachedOnly = SmartPlaybackSelector.effectiveCachedOnly(
+                    cachedOnlyPreference,
+                    contentType: meta.type
+                )
+
+                let candidateStream: NuvioStream?
+                if smartStreamUseTopResult || preserveAddonOrder {
+                    let displayed = StreamPickerListBuilder.displayedStreams(
+                        streams: streams,
+                        groups: streamGroups,
+                        selectedAddonId: nil,
+                        sortOption: sortOption,
+                        includeDebrid: debridIsEnabled || torrentIsEnabled,
+                        cachedOnly: cachedOnly,
+                        preserveAddonStreams: preserveAddonOrder
+                    )
+                    let available = displayed.filter { $0.unavailabilityReason == nil && !$0.isNotPlayable }
+                    let pool: [NuvioStream]
+                    if preserveAddonOrder {
+                        pool = available
+                    } else {
+                        let valid = available.filter {
+                            !SmartPlaybackSelector.isLowQualityOrTicketStream($0) && StreamPickerListBuilder.resolution(for: $0) >= 720
+                        }
+                        pool = valid.isEmpty ? available : valid
+                    }
+                    if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
+                        let matching = pool.first { stream in
+                            let tags = StreamQualityTags.parse(stream: stream)
+                            if let pbg = preferredTags.bingeGroup, let sbg = tags.bingeGroup,
+                               pbg.compare(sbg, options: .caseInsensitive) == .orderedSame {
+                                return true
+                            }
+                            if let pfp = preferredTags.releaseFingerprint, let sfp = tags.releaseFingerprint,
+                               pfp.compare(sfp, options: .caseInsensitive) == .orderedSame {
+                                return true
+                            }
+                            return false
+                        }
+                        candidateStream = matching ?? pool.first
+                    } else {
+                        candidateStream = pool.first
+                    }
+                } else {
+                    candidateStream = SmartPlaybackSelector.bestStream(
+                        from: streams,
+                        qualityPreference: smartStreamQuality,
+                        subtitleLanguages: subtitleLanguagePreferences,
+                        shouldMatchSubtitles: smartSubtitleMatching,
+                        includeDebrid: debridIsEnabled || torrentIsEnabled,
+                        preferredTags: preferredTags,
+                        cachedOnly: cachedOnly
+                    )
                 }
-                pool = valid.isEmpty ? available : valid
-            }
-            let preferBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayPreferBingeGroup) as? Bool) ?? true
-            let reuseBingeGroup = (ProfileSettings.current.object(forKey: SettingsKey.streamAutoPlayReuseBingeGroup) as? Bool) ?? true
-            if (preferBingeGroup || reuseBingeGroup), let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
-                let matching = pool.first { stream in
-                    let tags = StreamQualityTags.parse(stream: stream)
-                    if let pbg = preferredTags.bingeGroup, let sbg = tags.bingeGroup,
-                       pbg.compare(sbg, options: .caseInsensitive) == .orderedSame {
+
+                guard !Task.isCancelled, let candidate = candidateStream else { return nil }
+
+                let isIdealMatch: Bool = {
+                    if candidate.isNotPlayable { return false }
+                    if !isLoadingStreams { return true }
+                    if preserveAddonOrder {
+                        if debridIsEnabled, cachedOnly {
+                            return candidate.isLikelyCached
+                        }
                         return true
                     }
-                    if let pfp = preferredTags.releaseFingerprint, let sfp = tags.releaseFingerprint,
-                       pfp.compare(sfp, options: .caseInsensitive) == .orderedSame {
-                        return true
+                    if SmartPlaybackSelector.isLowQualityOrTicketStream(candidate) { return false }
+                    let tags = StreamQualityTags.parse(stream: candidate)
+                    let res = tags.resolution > 0 ? tags.resolution : SmartPlaybackSelector.inferredResolution(for: candidate)
+                    let targetRes = (smartStreamQuality == "720p") ? 720 : 1080
+
+                    if let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
+                        let matchesBingeGroup = (preferredTags.bingeGroup != nil && tags.bingeGroup?.compare(preferredTags.bingeGroup!, options: .caseInsensitive) == .orderedSame)
+                        let matchesFingerprint = (preferredTags.releaseFingerprint != nil && tags.releaseFingerprint?.compare(preferredTags.releaseFingerprint!, options: .caseInsensitive) == .orderedSame)
+                        guard matchesBingeGroup || matchesFingerprint else {
+                            return false
+                        }
                     }
-                    return false
-                }
-                candidateStream = matching ?? pool.first
-            } else {
-                candidateStream = pool.first
+
+                    if debridIsEnabled,
+                       SmartPlaybackSelector.effectiveCachedOnly(true, contentType: meta.type) {
+                        return (candidate.isLikelyCached || tags.isCached) && res >= targetRes
+                    }
+                    return res >= targetRes
+                }()
+
+                guard !Task.isCancelled, isIdealMatch else { return nil }
+                return candidate
+            }.value
+
+            guard !Task.isCancelled,
+                  self.isDetailsPlaybackContextActive,
+                  !self.didHandOffPlayback,
+                  self.preResolutionGeneration == resolutionGeneration else { return }
+
+            guard let candidate else {
+                self.resetPreResolutionCandidate()
+                return
             }
-        } else {
-            candidateStream = SmartPlaybackSelector.bestStream(
-                from: streams,
-                qualityPreference: smartStreamQuality,
-                subtitleLanguages: subtitleLanguagePreferences,
-                shouldMatchSubtitles: smartSubtitleMatching,
-                includeDebrid: debrid.isEnabled || TorrentSettings.isEnabled(),
-                preferredTags: preferredTags,
-                cachedOnly: cachedOnly
+
+            self.applyPreResolvedCandidate(
+                candidate,
+                currentStreamId: currentStreamId,
+                currentEpisode: currentEpisode,
+                meta: meta,
+                smartStreamSelection: smartStreamSelection
             )
         }
+    }
 
-        guard let candidate = candidateStream else {
-            resetPreResolutionCandidate()
-            return
-        }
-
-        let isIdealMatch: Bool = {
-            if candidate.isNotPlayable { return false }
-            if !viewModel.uiState.isLoadingStreams { return true }
-            if preserveAddonOrder {
-                if debrid.isEnabled, cachedOnly {
-                    return candidate.isLikelyCached
-                }
-                return true
-            }
-            if SmartPlaybackSelector.isLowQualityOrTicketStream(candidate) { return false }
-            let tags = StreamQualityTags.parse(stream: candidate)
-            let res = tags.resolution > 0 ? tags.resolution : SmartPlaybackSelector.inferredResolution(for: candidate)
-            let targetRes = (smartStreamQuality == "720p") ? 720 : 1080
-
-            if let preferredTags, preferredTags.bingeGroup != nil || preferredTags.releaseFingerprint != nil {
-                let matchesBingeGroup = (preferredTags.bingeGroup != nil && tags.bingeGroup?.compare(preferredTags.bingeGroup!, options: .caseInsensitive) == .orderedSame)
-                let matchesFingerprint = (preferredTags.releaseFingerprint != nil && tags.releaseFingerprint?.compare(preferredTags.releaseFingerprint!, options: .caseInsensitive) == .orderedSame)
-                guard matchesBingeGroup || matchesFingerprint else {
-                    return false
-                }
-            }
-
-            if debrid.isEnabled,
-               SmartPlaybackSelector.effectiveCachedOnly(true, contentType: meta.type) {
-                return (candidate.isLikelyCached || tags.isCached) && res >= targetRes
-            }
-            return res >= targetRes
-        }()
-
-        guard isIdealMatch else {
-            resetPreResolutionCandidate()
-            return
-        }
-
+    private func applyPreResolvedCandidate(
+        _ candidate: NuvioStream,
+        currentStreamId: String,
+        currentEpisode: NuvioVideo?,
+        meta: NuvioMeta,
+        smartStreamSelection: Bool
+    ) {
         let identity = DetailsBackgroundResolutionIdentity(
             streamID: currentStreamId,
             episodeID: currentEpisode?.id,
@@ -1812,22 +1858,22 @@ actor YouTubeTrailerResolver {
     private func scoreTrailerioLink(_ provider: String, url: String) -> Int {
         let p = provider.lowercased()
         var score = 0
-        if p.contains("apple tv") {
-            score += 1000
-        } else if p.contains("rotten tomatoes") || p.contains("fandango") {
-            score += 800
+        if p.contains("rotten tomatoes") || p.contains("fandango") {
+            score += 1200
         } else if p.contains("plex") {
-            score += 700
+            score += 1100
+        } else if p.contains("apple tv") {
+            score += 900
         } else if p.contains("mubi") {
-            score += 500
+            score += 700
         } else if p.contains("imdb") {
-            score += 300
+            score += 500
         }
 
         if p.contains("4k") || p.contains("2160p") {
-            score += 400
+            score += 500
         } else if p.contains("1080p") {
-            score += 300
+            score += 400
         } else if p.contains("720p") {
             score += 200
         }
@@ -1837,7 +1883,9 @@ actor YouTubeTrailerResolver {
         }
 
         let u = url.lowercased()
-        if u.contains(".m3u8") || u.contains(".mp4") {
+        if u.contains(".mp4") {
+            score += 200
+        } else if u.contains(".m3u8") {
             score += 100
         }
 
@@ -2206,7 +2254,7 @@ actor YouTubeTrailerResolver {
         return nil
     }
 
-    /// Returns an integrated preview stream and the headers required by its
+    /// Returns an HD trailer preview stream and the headers required by its
     /// originating YouTube client.
     func resolvePreview(youtubeVideoId: String, title: String?, year: String?) async -> TrailerPlaybackSource? {
         guard Self.isYouTubeVideoId(youtubeVideoId) else { return nil }
@@ -2229,7 +2277,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: false,
-            preferIntegratedStream: true
+            preferIntegratedStream: false
         ) {
             previewCache[youtubeVideoId] = (source, Date())
             return source
@@ -2240,7 +2288,7 @@ actor YouTubeTrailerResolver {
         if let source = await resolveWithInnertube(
             videoId: youtubeVideoId,
             forceRefreshConfig: true,
-            preferIntegratedStream: true
+            preferIntegratedStream: false
         ) {
             previewCache[youtubeVideoId] = (source, Date())
             return source
@@ -2484,7 +2532,26 @@ actor YouTubeTrailerResolver {
             )
         }
 
-        // 6. Fall back to standard progressive (e.g. 360p)
+        // 6. Check for HD adaptive video (>= 720p) if audio was not paired
+        if let bestAdaptive = await firstReachable(
+            sortedAdaptiveVideo.filter { $0.height >= 720 },
+            includeReferer: false
+        ) {
+            let label = "\(bestAdaptive.height)p (Adaptive Video)"
+            let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] video-only | Available: \(availableSummary)"
+            return TrailerPlaybackSource(
+                videoUrl: bestAdaptive.url,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestAdaptive.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
+        // 7. Fall back to standard progressive (e.g. 360p)
         if let progressiveMatch = await firstReachable(
             sortedProgressive,
             includeReferer: false
@@ -2503,28 +2570,7 @@ actor YouTubeTrailerResolver {
             )
         }
 
-        // 7. For preview: fall back to best adaptive video if no integrated stream exists.
-        // On Apple TV, card previews are muted by default and play the video track directly.
-        if preferIntegratedStream,
-           let bestAdaptive = await firstReachable(
-               sortedAdaptiveVideo,
-               includeReferer: false
-           ) {
-            let label = "\(bestAdaptive.height)p (Adaptive Video)"
-            let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] preview | Available: \(availableSummary)"
-            return TrailerPlaybackSource(
-                videoUrl: bestAdaptive.url,
-                audioUrl: nil,
-                requestHeaders: requestHeaders(
-                    for: bestAdaptive.clientKey,
-                    includeReferer: false
-                ),
-                qualityLabel: label,
-                diagnostics: diag
-            )
-        }
-
-        // 8. For full player: Fall back to any adaptive pair
+        // 8. Fall back to any adaptive pair
         if !preferIntegratedStream,
            let pair = await firstReachableAdaptivePair(
                videos: unthrottledAdaptiveVideo,
@@ -2538,6 +2584,25 @@ actor YouTubeTrailerResolver {
                 audioUrl: pair.audio.url,
                 requestHeaders: requestHeaders(
                     for: pair.video.clientKey,
+                    includeReferer: false
+                ),
+                qualityLabel: label,
+                diagnostics: diag
+            )
+        }
+
+        // 9. Fall back to any reachable adaptive video
+        if let bestAdaptive = await firstReachable(
+            sortedAdaptiveVideo,
+            includeReferer: false
+        ) {
+            let label = "\(bestAdaptive.height)p (Adaptive Video)"
+            let diag = "TRAILER: \(label) [\(bestAdaptive.clientKey)] fallback | Available: \(availableSummary)"
+            return TrailerPlaybackSource(
+                videoUrl: bestAdaptive.url,
+                audioUrl: nil,
+                requestHeaders: requestHeaders(
+                    for: bestAdaptive.clientKey,
                     includeReferer: false
                 ),
                 qualityLabel: label,
@@ -3344,7 +3409,7 @@ enum SmartPlaybackSelector {
 
 /// How the stream picker orders results. `.default` keeps the add-ons' own
 /// order (usually already best-first); the others re-rank across all sources.
-enum StreamSortOption: String, CaseIterable, Identifiable {
+enum StreamSortOption: String, CaseIterable, Identifiable, Sendable {
     case `default` = "Default"
     case quality = "Quality"
     case size = "Size"
@@ -3784,25 +3849,13 @@ struct TvDetailsContent: View {
             }
 
             guard let playbackSource,
-                  let url = URL(string: playbackSource.videoUrl),
                   !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else {
                 return
             }
 
-            let asset: AVURLAsset
-            if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
-                asset = AVURLAsset(
-                    url: url,
-                    options: [AVURLAssetHTTPUserAgentKey: userAgent]
-                )
-            } else {
-                asset = AVURLAsset(url: url)
-            }
+            guard let item = await playbackSource.makePlayerItem() else { return }
+            guard !Task.isCancelled, isBackgroundTrailerAllowed(hasHandoff: hasHandoff) else { return }
 
-            let item = AVPlayerItem(asset: asset)
-            item.preferredForwardBufferDuration = 2.0
-            item.preferredPeakBitRate = 0
-            item.preferredMaximumResolution = .zero
             trailerPlayer.replaceCurrentItem(with: item)
 
             if let handoffTime = handoff?.time, handoffTime > 0.1 {
@@ -3853,32 +3906,20 @@ struct TvDetailsContent: View {
             let playbackSource: TrailerPlaybackSource?
             if let source = handoff?.playbackSource {
                 playbackSource = source
-            } else if let source = await YouTubeTrailerResolver.shared.resolvePreview(for: meta) {
+            } else if let source = await YouTubeTrailerResolver.shared.resolve(for: meta) {
                 playbackSource = source
             } else {
-                playbackSource = await YouTubeTrailerResolver.shared.resolve(for: meta)
+                playbackSource = await YouTubeTrailerResolver.shared.resolvePreview(for: meta)
             }
 
             guard let playbackSource,
-                  let url = URL(string: playbackSource.videoUrl),
                   !Task.isCancelled else {
                 return
             }
 
-            let asset: AVURLAsset
-            if let userAgent = playbackSource.requestHeaders["User-Agent"], !userAgent.isEmpty {
-                asset = AVURLAsset(
-                    url: url,
-                    options: [AVURLAssetHTTPUserAgentKey: userAgent]
-                )
-            } else {
-                asset = AVURLAsset(url: url)
-            }
+            guard let item = await playbackSource.makePlayerItem() else { return }
+            guard !Task.isCancelled else { return }
 
-            let item = AVPlayerItem(asset: asset)
-            item.preferredForwardBufferDuration = 2.0
-            item.preferredPeakBitRate = 0
-            item.preferredMaximumResolution = .zero
             trailerPlayer.replaceCurrentItem(with: item)
 
             if let handoffTime = handoff?.time, handoffTime > 0.1 {
@@ -4069,12 +4110,6 @@ struct TvDetailsContent: View {
                         if focusedDetailsSection != .episodes {
                             focusedDetailsSection = .episodes
                             withAnimation(.easeOut(duration: TvDetailsScrollTiming.duration)) {
-                                scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
-                            }
-                        } else {
-                            var transaction = Transaction(animation: nil)
-                            transaction.disablesAnimations = true
-                            withTransaction(transaction) {
                                 scrollProxy.scrollTo(TvDetailsScrollID.episodesSection, anchor: .top)
                             }
                         }
@@ -4465,7 +4500,9 @@ struct TvDetailsContent: View {
                 }
                 .onPreferenceChange(TvDetailsScrollOffsetKey.self) { minY in
                     let newOffset = max(0, -minY)
-                    if abs(newOffset - scrollOffset) > 2 {
+                    let wasScrolled = scrollOffset > 30
+                    let isScrolled = newOffset > 30
+                    if wasScrolled != isScrolled {
                         scrollOffset = newOffset
                     }
                 }
@@ -4914,24 +4951,55 @@ private struct TvDetailsBackdrop: View {
     @AppStorage(SettingsKey.amoled) private var amoled = false
     @AppStorage(SettingsKey.bodyColor) private var bodyColor = SettingsBackground.charcoal.rawValue
 
+    @State private var backdropImage: UIImage?
+
+    private var targetArtworkURL: URL? {
+        for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
+            let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty, let url = URL(string: trimmed) {
+                return url
+            }
+        }
+        return nil
+    }
+
+    init(
+        meta: NuvioMeta,
+        blurRadius: CGFloat = 0,
+        player: AVPlayer? = nil,
+        isTrailerVisible: Bool = false,
+        onTrailerReadyForDisplay: (() -> Void)? = nil
+    ) {
+        self.meta = meta
+        self.blurRadius = blurRadius
+        self.player = player
+        self.isTrailerVisible = isTrailerVisible
+        self.onTrailerReadyForDisplay = onTrailerReadyForDisplay
+
+        var cachedInitial: UIImage? = nil
+        for candidate in [meta.backgroundUrl, meta.landscapePosterUrl, meta.posterUrl] {
+            let trimmed = candidate?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            if !trimmed.isEmpty, let url = URL(string: trimmed) {
+                if let cached = BackdropImageCache.shared.cachedImage(for: url) {
+                    cachedInitial = cached
+                    break
+                }
+            }
+        }
+        _backdropImage = State(initialValue: cachedInitial)
+    }
+
     var body: some View {
         let backdropColor = Color.nuvioBackground(amoled: amoled, body: bodyColor)
 
         ZStack {
-            if let imageUrl = meta.backgroundUrl ?? meta.posterUrl,
-               let url = URL(string: imageUrl.trimmingCharacters(in: .whitespacesAndNewlines)) {
-                AsyncImage(url: url) { phase in
-                    if case .success(let image) = phase {
-                        image
-                            .resizable()
-                            .scaledToFill()
-                    } else {
-                        backdropColor
-                    }
-                }
-                .blur(radius: blurRadius, opaque: true)
-                .animation(.easeInOut(duration: 0.35), value: blurRadius)
-                .ignoresSafeArea()
+            if let backdropImage {
+                Image(uiImage: backdropImage)
+                    .resizable()
+                    .scaledToFill()
+                    .blur(radius: blurRadius, opaque: true)
+                    .animation(.easeInOut(duration: 0.35), value: blurRadius)
+                    .ignoresSafeArea()
             } else {
                 backdropColor.ignoresSafeArea()
             }
@@ -4967,6 +5035,18 @@ private struct TvDetailsBackdrop: View {
             }
 
         }
+        .task(id: targetArtworkURL) {
+            guard let url = targetArtworkURL else {
+                backdropImage = nil
+                return
+            }
+            if let cached = BackdropImageCache.shared.cachedImage(for: url) {
+                backdropImage = cached
+            } else if let loaded = await BackdropImageCache.shared.image(for: url) {
+                guard !Task.isCancelled else { return }
+                backdropImage = loaded
+            }
+        }
         .ignoresSafeArea()
     }
 }
@@ -4997,7 +5077,7 @@ private struct TvDetailsLogo: View {
 
     private var titleFallback: some View {
         Text(meta.name)
-            .font(.system(size: 58, weight: .heavy))
+            .font(.appFont(size: 58, weight: .bold))
             .foregroundColor(.white)
             .lineLimit(2)
             .minimumScaleFactor(0.74)
@@ -5206,7 +5286,7 @@ private struct TvDetailsActionButton: View {
 
                 if let title {
                     Text(title)
-                        .font(.system(size: 32, weight: .medium))
+                        .font(.appFont(size: 32, weight: .medium))
                         .lineLimit(1)
                         .accessibilityHidden(true)
                 }
@@ -5274,7 +5354,7 @@ private struct TvDetailsSummary: View {
         VStack(alignment: .leading, spacing: 0) {
             if let creatorLine {
                 Text(creatorLine)
-                    .font(.system(size: 28, weight: .regular))
+                    .font(.appFont(size: 28, weight: .regular))
                     .foregroundColor(.white.opacity(0.65))
                     .padding(.bottom, 24)
             }
@@ -5286,7 +5366,7 @@ private struct TvDetailsSummary: View {
 
             if let description = meta.description, !description.isEmpty {
                 Text(description)
-                    .font(.system(size: 30, weight: .regular))
+                    .font(.appFont(size: 30, weight: .regular))
                     .foregroundColor(.white)
                     .lineSpacing(8)
                     .lineLimit(5)
@@ -5298,7 +5378,7 @@ private struct TvDetailsSummary: View {
                 VStack(alignment: .leading, spacing: 16) {
                     if !primaryMetaItems.isEmpty {
                         Text(primaryMetaItems.joined(separator: "  •  "))
-                            .font(.system(size: 27, weight: .medium))
+                            .font(.appFont(size: 27, weight: .medium))
                             .foregroundColor(.white.opacity(0.60))
                             .lineLimit(2)
                     }
@@ -5309,7 +5389,7 @@ private struct TvDetailsSummary: View {
                                 HStack(spacing: 10) {
                                     if let certificationLabel {
                                         Text(certificationLabel)
-                                            .font(.system(size: 22, weight: .semibold))
+                                            .font(.appFont(size: 22, weight: .semibold))
                                             .foregroundColor(.white.opacity(0.88))
                                     }
 
@@ -5321,7 +5401,7 @@ private struct TvDetailsSummary: View {
 
                                     if let statusLabel {
                                         Text(statusLabel)
-                                            .font(.system(size: 22, weight: .semibold))
+                                            .font(.appFont(size: 22, weight: .semibold))
                                             .foregroundColor(.white.opacity(0.88))
                                     }
                                 }
@@ -5335,7 +5415,7 @@ private struct TvDetailsSummary: View {
 
                             if !secondaryMetaItems.isEmpty {
                                 Text(((certificationLabel != nil || statusLabel != nil) ? "•  " : "") + secondaryMetaItems.joined(separator: "  •  "))
-                                    .font(.system(size: 24, weight: .medium))
+                                    .font(.appFont(size: 24, weight: .medium))
                                     .foregroundColor(.white.opacity(0.88))
                                     .lineLimit(1)
                             }
@@ -5455,7 +5535,7 @@ private struct TvDetailsRatingsRow: View {
                         TvRatingIcon(visual: badge.visual, height: 38)
 
                         Text(badge.formattedValue)
-                            .font(.system(size: 28, weight: .regular))
+                            .font(.appFont(size: 28, weight: .semibold))
                             .foregroundColor(.white.opacity(0.62))
                     }
                 }
@@ -6983,7 +7063,25 @@ private struct TvDetailsPersonCard: View {
 
 private struct TvEpisodeGuideInput: Equatable {
     let metaID: String
+    let videosCount: Int
+    let firstVideoID: String?
+    let lastVideoID: String?
     let videos: [NuvioVideo]
+
+    init(metaID: String, videos: [NuvioVideo]) {
+        self.metaID = metaID
+        self.videosCount = videos.count
+        self.firstVideoID = videos.first?.id
+        self.lastVideoID = videos.last?.id
+        self.videos = videos
+    }
+
+    static func == (lhs: TvEpisodeGuideInput, rhs: TvEpisodeGuideInput) -> Bool {
+        guard lhs.metaID == rhs.metaID else { return false }
+        guard lhs.videosCount == rhs.videosCount else { return false }
+        guard lhs.firstVideoID == rhs.firstVideoID, lhs.lastVideoID == rhs.lastVideoID else { return false }
+        return lhs.videos == rhs.videos
+    }
 }
 
 private struct TvEpisodeLookupIdentity: Equatable {
@@ -7001,6 +7099,7 @@ private struct TvEpisodeGuide {
     let episodes: [NuvioVideo]
     let seasons: [Int]
     let episodesBySeason: [Int: [NuvioVideo]]
+    let airedRegularEpisodes: [NuvioVideo]
 
     init(metaID: String, videos: [NuvioVideo], revision: Int) {
         self.metaID = metaID
@@ -7019,6 +7118,7 @@ private struct TvEpisodeGuide {
         episodes = ordered
         episodesBySeason = grouped
         seasons = orderedSeasons
+        airedRegularEpisodes = CatalogWatchedPolicy.airedRegularEpisodes(ordered)
     }
 
     func defaultSeason() -> Int {
@@ -7276,7 +7376,7 @@ private final class TvDetailsEpisodeCache: ObservableObject {
                 watchedEpisodeKeys: displayWatchedKeys,
                 episodeWatchCounts: episodeWatchCounts,
                 watchedSummary: WatchedEpisodeSummary.make(
-                    videos: guide.episodes,
+                    airedEpisodes: guide.airedRegularEpisodes,
                     watchedEpisodeKeys: displayWatchedKeys
                 ),
                 seasonIsWatched: seasonIsWatched
@@ -7491,7 +7591,7 @@ private struct TvDetailsEpisodes: View {
         watchedEpisodeKeys = watchedKeys
         self.episodeWatchCounts = episodeWatchCounts
         watchedSummary = WatchedEpisodeSummary.make(
-            videos: episodeGuide.episodes,
+            airedEpisodes: episodeGuide.airedRegularEpisodes,
             watchedEpisodeKeys: watchedKeys
         )
         refreshSeasonWatchedState(for: seasonEpisodes, watchedKeys: watchedKeys)
@@ -7692,30 +7792,41 @@ private struct TvDetailsEpisodes: View {
     @ViewBuilder
     private var seasonSelector: some View {
         if seasons.count > 1 {
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 22) {
-                    ForEach(seasons, id: \.self) { season in
-                        TvSeasonPill(
-                            title: seasonTitle(season),
-                            isSelected: season == selectedSeason,
-                            onFocus: onFocus,
-                            onMoveUp: onMoveUpFromSeason,
-                            onBack: onBack,
-                            action: {
-                                userDidSelectSeason = true
-                                selectedSeason = season
-                                episodeScrollIndex = 0
-                            }
-                        )
+            ScrollViewReader { scrollProxy in
+                ScrollView(.horizontal, showsIndicators: false) {
+                    LazyHStack(spacing: 22) {
+                        ForEach(seasons, id: \.self) { season in
+                            TvSeasonPill(
+                                title: seasonTitle(season),
+                                isSelected: season == selectedSeason,
+                                onFocus: onFocus,
+                                onMoveUp: onMoveUpFromSeason,
+                                onBack: onBack,
+                                action: {
+                                    userDidSelectSeason = true
+                                    selectedSeason = season
+                                    episodeScrollIndex = 0
+                                }
+                            )
+                            .id(season)
+                        }
+                    }
+                    .padding(.trailing, 96)
+                    .padding(.vertical, 8)
+                }
+                .scrollClipDisabledIfAvailable()
+                // The pills are the strip's other focus target, and the one the
+                // engine picked when an episode's picker closed.
+                .disabled(effectiveFocusRestriction != nil)
+                .onAppear {
+                    scrollProxy.scrollTo(selectedSeason, anchor: .center)
+                }
+                .onChange(of: selectedSeason) { _, newSeason in
+                    withAnimation(.easeOut(duration: 0.2)) {
+                        scrollProxy.scrollTo(newSeason, anchor: .center)
                     }
                 }
-                .padding(.trailing, 96)
-                .padding(.vertical, 8)
             }
-            .scrollClipDisabledIfAvailable()
-            // The pills are the strip's other focus target, and the one the
-            // engine picked when an episode's picker closed.
-            .disabled(effectiveFocusRestriction != nil)
         } else {
             Text(seasonTitle(selectedSeason))
                 .font(.system(size: 32, weight: .semibold))
@@ -7790,7 +7901,15 @@ private struct TvSeasonPill: View {
                 .foregroundColor(isSelected || isFocused ? .black : .white.opacity(0.66))
                 .padding(.horizontal, 30)
                 .frame(height: 70)
-                .modifier(TvDetailsGlassBackground(filled: isSelected || isFocused, shape: Capsule()))
+                .background {
+                    if isSelected || isFocused {
+                        Capsule().fill(Color.white)
+                    } else {
+                        Capsule()
+                            .fill(Color.white.opacity(0.12))
+                            .background(Color.black.opacity(0.25), in: Capsule())
+                    }
+                }
         }
         .buttonStyle(PosterCardButtonStyle())
         .focused($isFocused)
